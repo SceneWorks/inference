@@ -178,17 +178,12 @@ fn quantize_map(
 /// Load a component dir's safetensors into one key→`Array` map (a duplicate key is a corrupt
 /// snapshot → error). SANA ships one flat file per component, but `from_dir` handles a sharded set too.
 fn load_map(dir: &Path) -> Result<HashMap<String, Array>> {
-    let w = Weights::from_dir(dir)?;
     let mut map: HashMap<String, Array> = HashMap::new();
-    for k in w.keys().map(str::to_string).collect::<Vec<_>>() {
-        let v = w.get(&k).expect("listed key").clone();
-        if map.insert(k.clone(), v).is_some() {
-            return Err(Error::Msg(format!(
-                "sana convert: duplicate key `{k}` in {}",
-                dir.display()
-            )));
-        }
-    }
+    mlx_gen::quant::merge_weights_unique(
+        &mut map,
+        &Weights::from_dir(dir)?,
+        &format!("sana convert: {}", dir.display()),
+    )?;
     Ok(map)
 }
 

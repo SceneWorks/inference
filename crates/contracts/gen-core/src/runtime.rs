@@ -4,15 +4,15 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::SystemTime;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -203,6 +203,28 @@ fn windows_path_stamp(path: &Path, follow: bool) -> std::io::Result<WindowsFileS
         file_id: id.FileId.Identifier,
         change_time: basic.ChangeTime,
     })
+}
+
+/// The canonical object a path resolves to, plus that object's stat fingerprint.
+///
+/// A replacement-sensitive identity for a resolved file or directory when a full [`ArtifactSeal`]
+/// is not wanted (a directory symlink, or a digest other than whole-file SHA-256). Two captures are
+/// equal only when the path still resolves to the same, unmodified object.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ResolvedFileIdentity {
+    pub canonical_path: PathBuf,
+    pub fingerprint: FileStatFingerprint,
+}
+
+impl ResolvedFileIdentity {
+    pub fn capture(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let canonical_path = std::fs::canonicalize(path)?;
+        let fingerprint = stat_fingerprint(&canonical_path, true)?;
+        Ok(Self {
+            canonical_path,
+            fingerprint,
+        })
+    }
 }
 
 fn stat_fingerprint(path: &Path, follow: bool) -> std::io::Result<FileStatFingerprint> {
@@ -744,6 +766,97 @@ fn forget_proven_digests_for(path: &Path) {
         .retain(|identity, _| identity.loader_path != path);
 }
 
+/// Per-key mutual exclusion for expensive one-time work such as a full-content hash.
+///
+/// Callers that memoize a result per key claim the key, re-check their memo, and only then do the
+/// work, so concurrent first uses of one key do the work once instead of once per caller. The
+/// [`SingleFlightGuard`] releases the key on every exit path, including unwinding, so a caller
+/// that fails or panics while holding it never strands the callers waiting on it.
+pub struct SingleFlight<K> {
+    busy: Mutex<HashSet<K>>,
+    released: Condvar,
+}
+
+/// Holds one key of a [`SingleFlight`] until dropped.
+pub struct SingleFlightGuard<'a, K: Eq + std::hash::Hash> {
+    flight: &'a SingleFlight<K>,
+    key: Option<K>,
+}
+
+/// Longest a waiter sleeps before re-running its cancellation check.
+const SINGLE_FLIGHT_WAIT_SLICE: Duration = Duration::from_millis(50);
+
+impl<K: Eq + std::hash::Hash + Clone> Default for SingleFlight<K> {
+    fn default() -> Self {
+        Self {
+            busy: Mutex::new(HashSet::new()),
+            released: Condvar::new(),
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash + Clone> SingleFlight<K> {
+    /// Block until no other caller holds `key`, then hold it until the returned guard drops.
+    ///
+    /// `check` runs between bounded waits, so a cancelled caller stops waiting with its error.
+    pub fn claim(
+        &self,
+        key: K,
+        mut check: impl FnMut() -> crate::Result<()>,
+    ) -> crate::Result<SingleFlightGuard<'_, K>> {
+        loop {
+            {
+                let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+                if busy.insert(key.clone()) {
+                    return Ok(SingleFlightGuard {
+                        flight: self,
+                        key: Some(key),
+                    });
+                }
+                let _ = self
+                    .released
+                    .wait_timeout(busy, SINGLE_FLIGHT_WAIT_SLICE)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            check()?;
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash> Drop for SingleFlightGuard<'_, K> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.flight
+                .busy
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&key);
+        }
+        self.flight.released.notify_all();
+    }
+}
+
+/// Loader paths that reached the seal's single-flight claim, so a test can tell a waiter is parked.
+#[cfg(test)]
+fn seal_claim_attempts() -> &'static Mutex<Vec<PathBuf>> {
+    static ATTEMPTS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    ATTEMPTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn record_seal_claim_attempt(path: &Path) {
+    seal_claim_attempts()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(path.to_path_buf());
+}
+
+/// Seal identities whose cold content read is in progress; see [`SingleFlight`].
+fn seal_flights() -> &'static SingleFlight<SealIdentity> {
+    static FLIGHTS: OnceLock<SingleFlight<SealIdentity>> = OnceLock::new();
+    FLIGHTS.get_or_init(SingleFlight::default)
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -1081,13 +1194,26 @@ impl ArtifactSeal {
         check: &mut impl FnMut() -> crate::Result<()>,
         observe: &mut impl FnMut(&ArtifactSealProgress),
     ) -> crate::Result<Self> {
-        check()?;
-        let pinned = Self::capture_identity(path)?;
-        check()?;
-        // Only AFTER `capture_identity`'s self-verification is the identity worth trusting as a
-        // memo key: the lookup below is allowed to stand in for the content read precisely because
-        // everything it compares has just been re-verified against the filesystem.
-        let identity = pinned.seal_identity();
+        let (pinned, identity, _flight) = loop {
+            check()?;
+            let pinned = Self::capture_identity(path)?;
+            check()?;
+            // Only AFTER `capture_identity`'s self-verification is the identity worth trusting as a
+            // memo key: the lookup below is allowed to stand in for the content read precisely
+            // because everything it compares has just been re-verified against the filesystem.
+            let identity = pinned.seal_identity();
+            #[cfg(test)]
+            record_seal_claim_attempt(&pinned.loader_path);
+            // Concurrent first pins of one identity read it once: later callers wait here and then
+            // hit the memo the first caller filled.
+            let flight = seal_flights().claim(identity.clone(), &mut *check)?;
+            // A waiter may have blocked for a whole content read, so the identity it captured
+            // before waiting must be proven again before the memo may stand in for its content:
+            // a file replaced or rewritten meanwhile is re-captured (and re-read) instead.
+            if pinned.ensure_unchanged().is_ok() {
+                break (pinned, identity, flight);
+            }
+        };
         if let Some(sha256) = proven_digest(&identity) {
             check()?;
             observe(&seal_progress(
@@ -1168,6 +1294,11 @@ impl ArtifactSeal {
     /// Full-content digest captured exactly once when this seal was acquired.
     pub fn content_sha256(&self) -> &[u8; 32] {
         &self.sha256
+    }
+
+    /// [`content_sha256`](Self::content_sha256) as 64 lowercase hex digits.
+    pub fn content_sha256_hex(&self) -> String {
+        hex_lower(&self.sha256)
     }
 
     /// Number of full-content reads performed by this sealed artifact in test builds.
@@ -4101,6 +4232,117 @@ mod tests {
             second.content_sha256(),
             "the reused digest must be the one the first pin proved"
         );
+    }
+
+    /// Concurrent first pins of one file read it once; the other callers reuse the memo.
+    #[test]
+    fn concurrent_first_pins_of_one_file_read_it_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("transformer.safetensors");
+        std::fs::write(&file, vec![7_u8; 4 * 1024 * 1024]).expect("write fixture");
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let file = file.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let before = test_full_hash_work_count();
+                    let seal = ArtifactSeal::pin(&file).expect("pin regular file");
+                    (test_full_hash_work_count() - before, *seal.content_sha256())
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("pin thread"))
+            .collect();
+        assert_eq!(results.iter().map(|(reads, _)| reads).sum::<usize>(), 1);
+        assert!(results.iter().all(|(_, digest)| *digest == results[0].1));
+    }
+
+    /// A waiter that parked on another caller's read re-proves its captured identity before it
+    /// trusts the memo: a file rewritten while it waited is re-read, never sealed with the old
+    /// digest. MUTATION: drop the post-claim `ensure_unchanged` and the waiter returns `stale`.
+    #[test]
+    fn a_waiter_does_not_seal_a_file_rewritten_while_it_waited() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("enhancer.safetensors");
+        std::fs::write(&file, b"original weights").expect("write fixture");
+        let loader_path = std::path::absolute(&file).expect("absolute path");
+        let identity = ArtifactSeal::capture_identity(&file)
+            .expect("capture identity")
+            .seal_identity();
+        // Stand in for the first caller: hold the identity's flight while "hashing".
+        let held = seal_flights()
+            .claim(identity.clone(), || Ok(()))
+            .expect("first claim");
+        let attempts_before = seal_claim_attempts()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| **path == loader_path)
+            .count();
+        let waiter = {
+            let file = file.clone();
+            std::thread::spawn(move || ArtifactSeal::pin(&file).map(|seal| *seal.content_sha256()))
+        };
+        while seal_claim_attempts()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| **path == loader_path)
+            .count()
+            == attempts_before
+        {
+            std::thread::yield_now();
+        }
+        // The first caller "finishes" with the old identity's digest, then the file changes before
+        // the parked waiter resumes.
+        let stale = [0xAA_u8; 32];
+        remember_proven_digest(identity, stale);
+        std::fs::write(&file, b"REWRITTEN WEIGHT").expect("rewrite fixture");
+        drop(held);
+        let digest = waiter.join().expect("waiter thread").expect("re-pin");
+        assert_ne!(
+            digest, stale,
+            "a waiter must not seal the pre-rewrite digest"
+        );
+        let expected: [u8; 32] = Sha256::digest(b"REWRITTEN WEIGHT").into();
+        assert_eq!(digest, expected);
+    }
+
+    /// A holder that panics releases its key, so later claimants are never stranded.
+    /// MUTATION: make `SingleFlightGuard::drop` a no-op and the second claim never returns.
+    #[test]
+    fn a_panicking_single_flight_holder_releases_its_key() {
+        let flight = Arc::new(SingleFlight::<u32>::default());
+        let holder = {
+            let flight = Arc::clone(&flight);
+            std::thread::spawn(move || {
+                let _guard = flight.claim(7, || Ok(())).expect("first claim");
+                panic!("injected panic while holding the key");
+            })
+        };
+        assert!(holder.join().is_err());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = Arc::clone(&flight);
+        std::thread::spawn(move || {
+            let _ = sender.send(waiter.claim(7, || Ok(())).map(|_| ()));
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(60))
+            .expect("a later claimant must not wait forever on an abandoned key")
+            .expect("claim after the holder unwound");
+    }
+
+    /// A waiter stops waiting as soon as its cancellation check fails.
+    #[test]
+    fn a_cancelled_single_flight_waiter_returns_its_error() {
+        let flight = SingleFlight::<u32>::default();
+        let _held = flight.claim(1, || Ok(())).expect("first claim");
+        let result = flight.claim(1, || Err(crate::Error::Canceled));
+        assert!(matches!(result, Err(crate::Error::Canceled)));
     }
 
     /// The memo is keyed on the seal's own unchanged-predicate, so a mutation cannot hit it.

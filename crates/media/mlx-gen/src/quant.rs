@@ -582,9 +582,26 @@ ArtifactInput,
 
 /// Recursively copy a directory's files, resolving symlinks (HF snapshots symlink into
 /// `../../blobs/…`) to real bytes so the assembled tier is self-contained and HF-uploadable. This is
-/// the symlink-resolving copy the six sibling converters share (the F-045 unification point where
+/// the symlink-resolving copy the sibling converters share (the sc-9108 unification point where
 /// krea's non-deref'ing copy is brought into line).
+///
+/// A symlinked subdirectory is followed, but a directory symlink that leads back to one of the
+/// directories being copied (a cycle) is a typed error rather than unbounded recursion → stack
+/// overflow (sc-5330, the hardening bernini's private copy carried).
 pub fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    copy_dir_guarded(src, dst, &mut Vec::new())
+}
+
+fn copy_dir_guarded(src: &Path, dst: &Path, ancestors: &mut Vec<std::path::PathBuf>) -> Result<()> {
+    let canonical = std::fs::canonicalize(src)?;
+    if ancestors.contains(&canonical) {
+        return Err(crate::Error::Msg(format!(
+            "quant convert: directory symlink cycle at {} (resolves to {})",
+            src.display(),
+            canonical.display()
+        )));
+    }
+    ancestors.push(canonical);
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -597,10 +614,27 @@ pub fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
         }
         let target = dst.join(entry.file_name());
         if path.is_dir() {
-            copy_dir(&path, &target)?;
+            copy_dir_guarded(&path, &target, ancestors)?;
         } else {
             let real = std::fs::canonicalize(&path)?;
             std::fs::copy(&real, &target)?;
+        }
+    }
+    ancestors.pop();
+    Ok(())
+}
+
+/// Merge every tensor of `w` into `map`, refusing a key `map` already holds (overlapping shards or
+/// variants are a corrupt snapshot). `context` prefixes the error (e.g. `"sdxl convert: unet"`).
+pub fn merge_weights_unique(
+    map: &mut HashMap<String, Array>,
+    w: &Weights,
+    context: &str,
+) -> Result<()> {
+    for k in w.keys() {
+        let v = w.get(k).expect("listed key").clone();
+        if map.insert(k.to_string(), v).is_some() {
+            return Err(crate::Error::Msg(format!("{context}: duplicate key `{k}`")));
         }
     }
     Ok(())
@@ -632,6 +666,33 @@ pub fn copy_turnkey_assets(src_root: &Path, dst_root: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// sc-5330: a directory symlink back to an ancestor is refused instead of recursing forever,
+    /// while a file symlink is still copied as its target's bytes and a non-cyclic directory
+    /// symlink is still followed.
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_refuses_a_directory_symlink_cycle_and_derefs_file_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let blobs = tmp.path().join("blobs");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join("blob"), b"payload").unwrap();
+        std::os::unix::fs::symlink(blobs.join("blob"), src.join("sub/config.json")).unwrap();
+        std::os::unix::fs::symlink(&blobs, src.join("linked")).unwrap();
+
+        let ok = tmp.path().join("ok");
+        super::copy_dir(&src, &ok).unwrap();
+        let copied = ok.join("sub/config.json");
+        assert!(!std::fs::symlink_metadata(&copied).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&copied).unwrap(), b"payload");
+        assert_eq!(std::fs::read(ok.join("linked/blob")).unwrap(), b"payload");
+
+        std::os::unix::fs::symlink(&src, src.join("sub/loop")).unwrap();
+        let err = super::copy_dir(&src, &tmp.path().join("cyclic")).unwrap_err();
+        assert!(err.to_string().contains("symlink cycle"), "{err}");
+    }
+
     use super::*;
 
     fn marker_fixture(tmp: &tempfile::TempDir, body: Option<&str>) -> std::path::PathBuf {

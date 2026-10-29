@@ -59,9 +59,11 @@ pub struct Sd3ClipPad {
 /// Resolve one CLIP tokenizer directory's configured pad token id (sc-9581): read
 /// `<dir>/tokenizer_config.json` `pad_token` (a bare string like `"!"`/`"<|endoftext|>"`, or an
 /// `AddedToken`-shaped object with a `content` field) and look that string up in `<dir>/vocab.json`.
-/// Falls back to [`CLIP_EOS_ID`] if the config or vocab entry is absent (diffusers pads bigG with `!`
-/// and L with eos; the fallback keeps L correct even without a config). A present but unreadable or
-/// malformed config is an error: silently substituting eos would corrupt bigG conditioning.
+/// Falls back to [`CLIP_EOS_ID`] only if the config or its `pad_token` is absent (diffusers pads bigG
+/// with `!` and L with eos; the fallback keeps L correct even without a config). A present but
+/// unreadable or malformed config, and — once a pad token is configured — a missing, unreadable or
+/// malformed `vocab.json` or a pad token absent from it, are errors: silently substituting eos would
+/// corrupt bigG conditioning, and nothing else reads `tokenizer_2/vocab.json` to catch it.
 pub fn resolve_clip_pad_id(dir: &Path) -> Result<i32> {
     let cfg = dir.join("tokenizer_config.json");
     let config = match mlx_gen::gen_core::__model_input_reader!(
@@ -85,17 +87,28 @@ ArtifactInput,
     let Some(pad_str) = pad_str else {
         return Ok(CLIP_EOS_ID);
     };
-    Ok(mlx_gen::gen_core::__model_input_reader!(
+    let vocab_path = dir.join("vocab.json");
+    let vocab = mlx_gen::gen_core::__model_input_reader!(
 std::fs::read_to_string(dir.join("vocab.json")),
 "crates/media/mlx-gen/mlx-gen-sd3/src/loader.rs::resolve_clip_pad_id::std::fs::read_to_string@4607",
 ArtifactInput,
 dir.join("vocab.json"),
 |__model_input_path| std::fs::read_to_string(__model_input_path)
 )
-    .ok()
-    .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, i32>>(&s).ok())
-    .and_then(|vocab| vocab.get(&pad_str).copied())
-    .unwrap_or(CLIP_EOS_ID))
+    .map_err(|error| {
+        Error::Msg(format!(
+            "sd3: read {} (pad token {pad_str:?} configured): {error}",
+            vocab_path.display()
+        ))
+    })?;
+    let vocab = serde_json::from_str::<std::collections::HashMap<String, i32>>(&vocab)
+        .map_err(|error| Error::Msg(format!("sd3: parse {}: {error}", vocab_path.display())))?;
+    vocab.get(&pad_str).copied().ok_or_else(|| {
+        Error::Msg(format!(
+            "sd3: configured pad token {pad_str:?} is not in {}",
+            vocab_path.display()
+        ))
+    })
 }
 
 /// Resolve BOTH CLIP encoders' pad ids for a snapshot (sc-9581): `tokenizer/` (L, eos=49407) and

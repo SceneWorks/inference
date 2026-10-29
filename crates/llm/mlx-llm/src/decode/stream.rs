@@ -877,37 +877,10 @@ pub(crate) fn default_seed() -> u64 {
 
 pub use super::cancel::CancelFlag;
 
-/// Test-only MLX evaluation probe: whether `array` is materialized (mlx-c's internal
-/// `_mlx_array_is_available`, linked through mlx-rs). A timer whose region ends while this is still
-/// false measured lazy graph construction, not GPU completion.
-#[cfg(test)]
-pub(crate) fn mlx_array_is_available(array: &Array) -> bool {
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct RawMlxArray {
-        ctx: *mut std::ffi::c_void,
-    }
-    extern "C" {
-        fn _mlx_array_is_available(res: *mut bool, arr: RawMlxArray) -> std::ffi::c_int;
-    }
-    let handle = array.as_ptr();
-    assert_eq!(
-        std::mem::size_of_val(&handle),
-        std::mem::size_of::<RawMlxArray>()
-    );
-    // SAFETY: mlx-c's `mlx_array` is `struct { void* ctx; }`, mirrored by `RawMlxArray` (sizes
-    // asserted above); the call only reads the handle, which `array` keeps alive.
-    let raw: RawMlxArray = unsafe { std::mem::transmute_copy(&handle) };
-    let mut available = false;
-    // SAFETY: `available` is a valid out-pointer and `raw` a live array handle.
-    let status = unsafe { _mlx_array_is_available(&mut available, raw) };
-    assert_eq!(status, 0, "mlx-c availability probe failed");
-    available
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::weights::is_available;
 
     struct FixedDecoder;
 
@@ -1086,10 +1059,7 @@ mod tests {
         ) -> Result<Array> {
             let base = Array::from_slice(&[0.0_f32, 1.0, -1.0], &[1, 3]);
             let logits = base.multiply(Array::from_f32(2.0))?;
-            assert!(
-                !mlx_array_is_available(&logits),
-                "the probe must see lazy logits"
-            );
+            assert!(!is_available(&logits), "the probe must see lazy logits");
             self.produced.borrow_mut().push(logits.clone());
             Ok(logits)
         }
@@ -1104,7 +1074,7 @@ mod tests {
     impl crate::campaign::Observer for BoundaryProbe {
         fn phase(&mut self, name: &'static str) {
             let produced = self.produced.borrow();
-            let complete = produced.iter().all(mlx_array_is_available);
+            let complete = produced.iter().all(is_available);
             self.phases.push((name, produced.len(), complete));
         }
 
@@ -1311,7 +1281,7 @@ mod tests {
                 let produced = produced.borrow();
                 boundaries.push((
                     produced.len(),
-                    mlx_array_is_available(logits) && produced.iter().all(mlx_array_is_available),
+                    is_available(logits) && produced.iter().all(is_available),
                 ));
             },
         )

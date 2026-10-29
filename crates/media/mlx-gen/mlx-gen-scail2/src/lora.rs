@@ -49,6 +49,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use mlx_gen::adapters::read_scalar_alpha;
 use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterSpec, Error, Result};
@@ -160,10 +161,6 @@ fn f32a(x: &Array) -> Result<Array> {
 }
 
 /// Read a scalar `.alpha` as f32 regardless of on-disk dtype.
-fn read_alpha(a: &Array) -> Result<f32> {
-    Ok(a.as_dtype(Dtype::Float32)?.as_slice::<f32>()[0])
-}
-
 fn strip_namespace(key: &str) -> &str {
     PREFIXES
         .iter()
@@ -210,7 +207,7 @@ fn merge_one(w: &mut Weights, spec: &AdapterSpec, report: &mut DiffPatchReport) 
         match role {
             Role::Down => parts.down = Some(lw.require(&key)?.clone()),
             Role::Up => parts.up = Some(lw.require(&key)?.clone()),
-            Role::Alpha => parts.alpha = Some(read_alpha(lw.require(&key)?)?),
+            Role::Alpha => parts.alpha = Some(read_scalar_alpha(lw.require(&key)?, &key)?),
             Role::Diff => parts.diff = Some(lw.require(&key)?.clone()),
             Role::DiffB => parts.diff_b = Some(lw.require(&key)?.clone()),
         }

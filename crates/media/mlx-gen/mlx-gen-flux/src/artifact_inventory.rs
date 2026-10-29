@@ -1,8 +1,8 @@
 //! Exact file-identity and content pins for FLUX.1 deferred-materialization eligibility.
 //!
 //! A streamable snapshot has one visible `model.safetensors` in each required component directory.
-//! Each file is canonicalized, pinned by mutation-sensitive Unix identity, SHA-256 hashed with a
-//! process-local coalescing cache, and header-validated against the selected dense/Q4/Q8 tier. The
+//! Each file is pinned by the shared [`ArtifactSeal`] (mutation-sensitive entry/target identity and
+//! a once-per-identity SHA-256), and header-validated against the selected dense/Q4/Q8 tier. The
 //! composite digest covers the four model/config pairs plus the T5 `tokenizer_2/tokenizer.json`
 //! consumed by prompt conditioning; it is evidence input only and never grants production
 //! calibration by itself.
@@ -10,59 +10,33 @@
 use mlx_gen::gen_core::weightsmeta::{
     safetensors_path_tensor_headers, Dtype, SafetensorsTensorHeader,
 };
-use mlx_gen::gen_core::{Error as CoreError, Result as CoreResult};
+use mlx_gen::gen_core::{ArtifactSeal, Error as CoreError, Result as CoreResult};
 use mlx_gen::{LoadSpec, OffloadPolicy, Precision, Quant, WeightsSource};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::File;
-use std::io::{BufReader, Read};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, OnceLock};
 
 pub(crate) const COMPONENTS: [&str; 4] = ["text_encoder", "text_encoder_2", "transformer", "vae"];
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ArtifactFileIdentity {
-    canonical_path: PathBuf,
-    device: u64,
-    inode: u64,
-    size: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SourceEntryIdentity {
-    absolute_path: PathBuf,
-    is_symlink: bool,
-    symlink_target: Option<PathBuf>,
-    device: u64,
-    inode: u64,
-    size: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
-}
-
+/// One verified snapshot file: the shared [`ArtifactSeal`] (entry, parent chain, resolution and
+/// target identity plus the once-per-identity, single-flight content digest) and that digest in
+/// hex.
 #[derive(Clone, Debug)]
 pub(crate) struct PinnedArtifact {
-    source: SourceEntryIdentity,
-    identity: ArtifactFileIdentity,
+    seal: ArtifactSeal,
     digest: String,
 }
 
 impl PinnedArtifact {
     fn verify_file(path: &Path) -> CoreResult<Self> {
-        pinned_artifact(path)
+        let seal = ArtifactSeal::pin(path)?;
+        let digest = seal.content_sha256_hex();
+        Ok(Self { seal, digest })
     }
 
     pub(crate) fn canonical_path(&self) -> &Path {
-        &self.identity.canonical_path
+        self.seal.canonical_target_path()
     }
 
     /// Snapshot entry consumed by format-dispatching runtime loaders.
@@ -73,7 +47,7 @@ impl PinnedArtifact {
     /// entry, its symlink target, and the resolved canonical file are all checked by
     /// [`ensure_unchanged`](Self::ensure_unchanged) around every load/materialization boundary.
     pub(crate) fn loader_path(&self) -> &Path {
-        &self.source.absolute_path
+        self.seal.loader_path()
     }
 
     pub(crate) fn digest(&self) -> &str {
@@ -81,39 +55,7 @@ impl PinnedArtifact {
     }
 
     pub(crate) fn ensure_unchanged(&self) -> CoreResult<()> {
-        let source = source_entry_identity(&self.source.absolute_path).map_err(|error| {
-            CoreError::Msg(format!(
-                "flux1: pinned snapshot entry is no longer readable: {error}"
-            ))
-        })?;
-        if source != self.source {
-            return Err(CoreError::Unsupported(
-                "flux1: pinned snapshot entry or symlink target changed after verification"
-                    .to_owned(),
-            ));
-        }
-        let current = file_identity(&self.identity.canonical_path).map_err(|error| {
-            CoreError::Msg(format!(
-                "flux1: pinned packed artifact is no longer readable: {error}"
-            ))
-        })?;
-        if current != self.identity {
-            return Err(CoreError::Unsupported(
-                "flux1: pinned packed artifact was replaced or mutated after verification"
-                    .to_owned(),
-            ));
-        }
-        let resolved = file_identity(&self.source.absolute_path).map_err(|error| {
-            CoreError::Msg(format!(
-                "flux1: pinned snapshot entry no longer resolves: {error}"
-            ))
-        })?;
-        if resolved != self.identity {
-            return Err(CoreError::Unsupported(
-                "flux1: pinned snapshot entry resolves to a different canonical target".to_owned(),
-            ));
-        }
-        Ok(())
+        self.seal.ensure_unchanged()
     }
 }
 
@@ -185,199 +127,6 @@ impl PackedArtifactInventory {
     }
 }
 
-fn source_entry_identity(path: &Path) -> std::io::Result<SourceEntryIdentity> {
-    let absolute_path = std::path::absolute(path)?;
-    let metadata = std::fs::symlink_metadata(&absolute_path)?;
-    let is_symlink = metadata.file_type().is_symlink();
-    Ok(SourceEntryIdentity {
-        symlink_target: is_symlink
-            .then(|| std::fs::read_link(&absolute_path))
-            .transpose()?,
-        absolute_path,
-        is_symlink,
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        size: metadata.size(),
-        modified_seconds: metadata.mtime(),
-        modified_nanoseconds: metadata.mtime_nsec(),
-        changed_seconds: metadata.ctime(),
-        changed_nanoseconds: metadata.ctime_nsec(),
-    })
-}
-
-fn file_identity(path: &Path) -> std::io::Result<ArtifactFileIdentity> {
-    let canonical_path = std::fs::canonicalize(path)?;
-    let metadata = std::fs::metadata(&canonical_path)?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", canonical_path.display()),
-        ));
-    }
-    Ok(ArtifactFileIdentity {
-        canonical_path,
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        size: metadata.size(),
-        modified_seconds: metadata.mtime(),
-        modified_nanoseconds: metadata.mtime_nsec(),
-        changed_seconds: metadata.ctime(),
-        changed_nanoseconds: metadata.ctime_nsec(),
-    })
-}
-
-#[derive(Clone, Debug)]
-enum DigestState {
-    Hashing,
-    Ready(String),
-}
-
-struct DigestCache {
-    entries: Mutex<HashMap<ArtifactFileIdentity, DigestState>>,
-    ready: Condvar,
-}
-
-fn digest_cache() -> &'static DigestCache {
-    static CACHE: OnceLock<DigestCache> = OnceLock::new();
-    CACHE.get_or_init(|| DigestCache {
-        entries: Mutex::new(HashMap::new()),
-        ready: Condvar::new(),
-    })
-}
-
-#[cfg(test)]
-fn hash_operation_counts() -> &'static Mutex<HashMap<PathBuf, u64>> {
-    static COUNTS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
-    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-#[cfg(test)]
-type HashHook = Box<dyn FnOnce() + Send>;
-
-#[cfg(test)]
-fn hash_completion_hooks() -> &'static Mutex<HashMap<PathBuf, HashHook>> {
-    static HOOKS: OnceLock<Mutex<HashMap<PathBuf, HashHook>>> = OnceLock::new();
-    HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn hash_exact_file(identity: &ArtifactFileIdentity) -> CoreResult<String> {
-    #[cfg(test)]
-    {
-        *hash_operation_counts()
-            .lock()
-            .map_err(|_| CoreError::Msg("flux1: hash-count lock poisoned".to_owned()))?
-            .entry(identity.canonical_path.clone())
-            .or_default() += 1;
-    }
-    let file = File::open(&identity.canonical_path).map_err(|error| {
-        CoreError::Msg(format!(
-            "flux1: open {} for hashing: {error}",
-            identity.canonical_path.display()
-        ))
-    })?;
-    let opened = file.metadata().map_err(|error| {
-        CoreError::Msg(format!(
-            "flux1: stat open {}: {error}",
-            identity.canonical_path.display()
-        ))
-    })?;
-    if opened.dev() != identity.device || opened.ino() != identity.inode {
-        return Err(CoreError::Unsupported(
-            "flux1: packed artifact changed before hashing began".to_owned(),
-        ));
-    }
-    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
-    loop {
-        let count = reader.read(&mut buffer).map_err(|error| {
-            CoreError::Msg(format!(
-                "flux1: hash {}: {error}",
-                identity.canonical_path.display()
-            ))
-        })?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    #[cfg(test)]
-    if let Some(hook) = hash_completion_hooks()
-        .lock()
-        .map_err(|_| CoreError::Msg("flux1: hash-hook lock poisoned".to_owned()))?
-        .remove(&identity.canonical_path)
-    {
-        hook();
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn pinned_artifact(path: &Path) -> CoreResult<PinnedArtifact> {
-    loop {
-        let source = source_entry_identity(path)
-            .map_err(|error| CoreError::Msg(format!("flux1: lstat {}: {error}", path.display())))?;
-        let identity = file_identity(&source.absolute_path)
-            .map_err(|error| CoreError::Msg(format!("flux1: stat {}: {error}", path.display())))?;
-        let cache = digest_cache();
-        let mut entries = cache
-            .entries
-            .lock()
-            .map_err(|_| CoreError::Msg("flux1: digest cache lock poisoned".to_owned()))?;
-        match entries.get(&identity).cloned() {
-            Some(DigestState::Ready(digest)) => {
-                drop(entries);
-                if source_entry_identity(&source.absolute_path).ok().as_ref() == Some(&source)
-                    && file_identity(&source.absolute_path).ok().as_ref() == Some(&identity)
-                {
-                    return Ok(PinnedArtifact {
-                        source,
-                        identity,
-                        digest,
-                    });
-                }
-            }
-            Some(DigestState::Hashing) => {
-                entries = cache
-                    .ready
-                    .wait(entries)
-                    .map_err(|_| CoreError::Msg("flux1: digest cache wait poisoned".to_owned()))?;
-                drop(entries);
-            }
-            None => {
-                entries.insert(identity.clone(), DigestState::Hashing);
-                drop(entries);
-                let digest = hash_exact_file(&identity);
-                let unchanged = source_entry_identity(&source.absolute_path).ok().as_ref()
-                    == Some(&source)
-                    && file_identity(&source.absolute_path).ok().as_ref() == Some(&identity);
-                let mut entries = cache
-                    .entries
-                    .lock()
-                    .map_err(|_| CoreError::Msg("flux1: digest cache lock poisoned".to_owned()))?;
-                entries.remove(&identity);
-                let result = match (unchanged, digest) {
-                    (true, Ok(digest)) => {
-                        entries
-                            .retain(|cached, _| cached.canonical_path != identity.canonical_path);
-                        entries.insert(identity.clone(), DigestState::Ready(digest.clone()));
-                        Ok(PinnedArtifact {
-                            source,
-                            identity,
-                            digest,
-                        })
-                    }
-                    (false, _) => Err(CoreError::Unsupported(
-                        "flux1: packed artifact changed while its content was hashed".to_owned(),
-                    )),
-                    (true, Err(error)) => Err(error),
-                };
-                cache.ready.notify_all();
-                return result;
-            }
-        }
-    }
-}
-
 pub(crate) fn structurally_streamable(provider_id: &str, spec: &LoadSpec) -> bool {
     matches!(provider_id, crate::FLUX1_SCHNELL_ID | crate::FLUX1_DEV_ID)
         && matches!(spec.offload_policy, OffloadPolicy::Sequential)
@@ -396,29 +145,12 @@ pub(crate) fn structurally_streamable(provider_id: &str, spec: &LoadSpec) -> boo
 }
 
 fn visible_safetensors(dir: &Path) -> CoreResult<Vec<OsString>> {
-    let entries = std::fs::read_dir(dir).map_err(|error| {
+    mlx_gen::gen_core::weightsmeta::visible_safetensors(dir).map_err(|error| {
         CoreError::Msg(format!(
             "flux1: read packed component {}: {error}",
             dir.display()
         ))
-    })?;
-    let mut names = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            CoreError::Msg(format!(
-                "flux1: enumerate packed component {}: {error}",
-                dir.display()
-            ))
-        })?;
-        let path = entry.path();
-        if !mlx_gen::gen_core::weightsmeta::is_hidden_file(&path)
-            && path.extension().is_some_and(|ext| ext == "safetensors")
-        {
-            names.push(entry.file_name());
-        }
-    }
-    names.sort();
-    Ok(names)
+    })
 }
 
 fn single_component_artifact(
@@ -921,7 +653,6 @@ pub(crate) fn write_test_snapshot(root: &Path, quant: Option<Quant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Barrier};
 
     fn unique_root(tmp: &tempfile::TempDir, label: &str) -> PathBuf {
         tmp.path().join(format!(
@@ -1419,26 +1150,6 @@ mod tests {
     }
 
     #[test]
-    fn replacement_between_hash_and_post_stat_is_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = unique_root(&tmp, "hash-replacement");
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("model.safetensors");
-        std::fs::write(&path, [1_u8; 32]).unwrap();
-        let canonical = std::fs::canonicalize(&path).unwrap();
-        let replacement = root.join("replacement.safetensors");
-        std::fs::write(&replacement, [2_u8; 32]).unwrap();
-        let target = path.clone();
-        hash_completion_hooks().lock().unwrap().insert(
-            canonical,
-            Box::new(move || std::fs::rename(&replacement, &target).unwrap()),
-        );
-        let error = PinnedArtifact::verify_file(&path).unwrap_err().to_string();
-        assert!(error.contains("changed while"));
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
     fn same_path_same_size_content_mutation_gets_a_new_digest() {
         let tmp = tempfile::tempdir().unwrap();
         let root = unique_root(&tmp, "content-mutation");
@@ -1450,52 +1161,6 @@ mod tests {
         assert!(first.ensure_unchanged().is_err());
         let second = PinnedArtifact::verify_file(&path).unwrap();
         assert_ne!(first.digest(), second.digest());
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn concurrent_first_use_hashes_one_file_identity_once() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = unique_root(&tmp, "coalesced-hash");
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("model.safetensors");
-        std::fs::write(&path, vec![7_u8; 4 * 1024 * 1024]).unwrap();
-        let canonical = std::fs::canonicalize(&path).unwrap();
-        let before = hash_operation_counts()
-            .lock()
-            .unwrap()
-            .get(&canonical)
-            .copied()
-            .unwrap_or(0);
-        let barrier = Arc::new(Barrier::new(8));
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                let path = path.clone();
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    PinnedArtifact::verify_file(&path)
-                        .unwrap()
-                        .digest()
-                        .to_owned()
-                })
-            })
-            .collect();
-        let digests: Vec<_> = threads
-            .into_iter()
-            .map(|thread| thread.join().unwrap())
-            .collect();
-        assert!(digests.iter().all(|digest| digest == &digests[0]));
-        assert_eq!(
-            hash_operation_counts()
-                .lock()
-                .unwrap()
-                .get(&canonical)
-                .copied()
-                .unwrap_or(0)
-                - before,
-            1
-        );
         std::fs::remove_dir_all(root).ok();
     }
 }

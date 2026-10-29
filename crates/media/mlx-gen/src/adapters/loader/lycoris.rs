@@ -6,32 +6,13 @@
 
 use super::*;
 
-/// Read a scalar adapter value (an `alpha`) as `f32`, regardless of its on-disk dtype. Trained
-/// adapters store `alpha` in their compute dtype: real kohya/BFL FLUX LoRAs ship it **bf16** (sc-2657),
-/// and `Array::as_slice::<f32>()` `unwrap`s a hard dtype-mismatch (it never casts), so reading a bf16
-/// scalar that way panics. Cast to f32 first (exact for the small integer alphas these files carry, and
-/// a no-op when already f32); a `[]`- or `[1]`-shaped scalar both read as a one-element slice.
-///
-/// A size-0 `alpha` tensor (a malformed third-party adapter file) has no data pointer to borrow, so
-/// `as_slice` — `try_as_slice().unwrap()` — would panic rather than fall through to the trailing
-/// `first()`. Guard it like [`crate::array::host_i32`] so one bad file fails its single job with a
-/// typed error instead of aborting the worker.
+/// Read a present `alpha` scalar as `f32` through the shared [`crate::adapters::read_scalar_alpha`]
+/// (any on-disk dtype; a size-0 tensor or a NaN/inf value is a typed error naming the malformed
+/// file, never a panic or a silently mis-scaled adapter, sc-5281/sc-27447). The callers only
+/// reach here for an `alpha` key that exists, so the result is always `Some`; the `Option` keeps
+/// their "alpha absent" plumbing uniform.
 pub(super) fn scalar_alpha(a: &Array) -> Result<Option<f32>> {
-    if a.size() == 0 {
-        // The callers only reach here for an `alpha` key that *exists* (`w.require(..)`), so a
-        // present-but-empty tensor is a malformed file — NOT an absent alpha. Returning `Ok(None)`
-        // here would be indistinguishable from "no alpha key", silently falling back to the
-        // `alpha == rank ⇒ scale 1.0` default and mis-scaling the adapter while reporting success.
-        // Fail this one job with a typed error instead (sc-5281, matching the contract documented above).
-        return Err(Error::Msg(
-            "scalar_alpha: alpha tensor present but empty (size 0) — malformed adapter file".into(),
-        ));
-    }
-    Ok(a.as_dtype(Dtype::Float32)?
-        .try_as_slice::<f32>()
-        .map_err(|e| Error::Msg(format!("scalar_alpha: not a readable scalar array: {e}")))?
-        .first()
-        .copied())
+    crate::adapters::read_scalar_alpha(a, "scalar_alpha").map(Some)
 }
 
 /// Outcome of installing an adapter file: how many target modules were adapted, and any

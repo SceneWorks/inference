@@ -2914,7 +2914,6 @@ dependencies = [
  "mlx-gen-flux",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
- "sha2",
  "tempfile",
 ]
 
@@ -2943,6 +2942,7 @@ dependencies = [
  "mlx-gen-z-image",
  "mlx-llm",
  "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
@@ -3008,7 +3008,6 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
- "sha2",
  "tempfile",
 ]
 

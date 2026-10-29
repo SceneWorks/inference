@@ -34,6 +34,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::adapters::loader::{
     is_loha_keys, is_lokr, is_lokr_keys, parse_loha_thirdparty, parse_lokr, parse_lokr_thirdparty,
 };
+use mlx_gen::adapters::read_scalar_alpha;
 use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
@@ -174,18 +175,6 @@ pub fn lora_target_inventory(w: &Weights) -> (Vec<String>, Vec<String>) {
         }
     }
     (video, audio)
-}
-
-/// Read a scalar `.alpha` as f32 regardless of on-disk dtype (real files ship it bf16; a direct
-/// `as_slice::<f32>()` would panic on a dtype mismatch). A `[]`- or `[1]`-shaped scalar both read.
-fn read_alpha(a: &Array) -> Result<f32> {
-    // Adapter files are external input; an empty `.alpha` tensor would panic on `[0]`. Read the first
-    // element defensively and error on an empty tensor instead (F-010).
-    a.as_dtype(Dtype::Float32)?
-        .as_slice::<f32>()
-        .first()
-        .copied()
-        .ok_or_else(|| Error::Msg("ltx_2_3 adapter: empty .alpha tensor".into()))
 }
 
 /// Per-pass user strengths for one adapter: `spec.pass_scales` (one per distilled stage, validated
@@ -358,7 +347,7 @@ fn apply_one(
         match role {
             Role::Down => parts.down = Some(w.require(&key)?.clone()),
             Role::Up => parts.up = Some(w.require(&key)?.clone()),
-            Role::Alpha => parts.alpha = Some(read_alpha(w.require(&key)?)?),
+            Role::Alpha => parts.alpha = Some(read_scalar_alpha(w.require(&key)?, &key)?),
         }
     }
 

@@ -151,9 +151,11 @@ pub struct TensorInfo {
 }
 
 impl TensorInfo {
-    /// Total element count (`shape.product()`).
+    /// Total element count (`shape.product()`). [`GgufFile::parse`] rejects a shape whose product
+    /// overflows `usize`; a hand-built shape that overflows saturates (and then fails the block
+    /// length / data range checks) rather than wrapping.
     pub fn num_elements(&self) -> usize {
-        self.shape.iter().product()
+        self.shape.iter().fold(1usize, |n, &d| n.saturating_mul(d))
     }
 }
 
@@ -252,6 +254,15 @@ impl GgufFile {
                 ne.push(c.u64()? as usize);
             }
             ne.reverse();
+            if ne
+                .iter()
+                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                .is_none()
+            {
+                return Err(Error::Msg(format!(
+                    "gguf: tensor {name:?} element count overflows"
+                )));
+            }
             let ggml_type = c.u32()?;
             let offset = c.u64()?;
             tensors.push(TensorInfo {
@@ -265,8 +276,12 @@ impl GgufFile {
         let alignment = metadata
             .get("general.alignment")
             .and_then(MetaValue::as_u64)
-            .unwrap_or(DEFAULT_ALIGNMENT)
-            .max(1);
+            .unwrap_or(DEFAULT_ALIGNMENT);
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(Error::Msg(format!(
+                "gguf: invalid general.alignment {alignment} (must be a nonzero power of two)"
+            )));
+        }
 
         // The data section begins at the first alignment boundary at or after the header end.
         let header_end = c.pos() as u64;
@@ -508,6 +523,74 @@ mod tests {
         b.extend_from_slice(&0u64.to_le_bytes()); // metadata_count
 
         assert!(matches!(GgufFile::parse(b), Err(Error::Msg(_))));
+    }
+
+    /// A one-tensor header with the given GGML `ne` dims and optional `general.alignment`.
+    fn header_with(ne: &[u64], alignment: Option<u32>) -> Vec<u8> {
+        let push_str = |b: &mut Vec<u8>, s: &str| {
+            b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            b.extend_from_slice(s.as_bytes());
+        };
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
+        b.extend_from_slice(&u64::from(alignment.is_some()).to_le_bytes()); // metadata_count
+        if let Some(alignment) = alignment {
+            push_str(&mut b, "general.alignment");
+            b.extend_from_slice(&T_UINT32.to_le_bytes());
+            b.extend_from_slice(&alignment.to_le_bytes());
+        }
+        push_str(&mut b, "w");
+        b.extend_from_slice(&(ne.len() as u32).to_le_bytes());
+        for d in ne {
+            b.extend_from_slice(&d.to_le_bytes());
+        }
+        b.extend_from_slice(&0u32.to_le_bytes()); // type F32
+        b.extend_from_slice(&0u64.to_le_bytes()); // offset
+        b.resize(b.len() + 64, 0);
+        b
+    }
+
+    #[test]
+    fn rejects_overflowing_element_count() {
+        let err = GgufFile::parse(header_with(&[u64::MAX / 2, 4], None)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Msg(m) if m.contains("element count overflows")),
+            "{err}"
+        );
+        assert!(GgufFile::parse(header_with(&[4, 2], None)).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_alignment() {
+        for bad in [0u32, 3, 48] {
+            let err = GgufFile::parse(header_with(&[4], Some(bad))).unwrap_err();
+            assert!(
+                matches!(&err, Error::Msg(m) if m.contains("alignment")),
+                "{bad}: {err}"
+            );
+        }
+        assert_eq!(
+            GgufFile::parse(header_with(&[4], Some(64)))
+                .unwrap()
+                .alignment,
+            64
+        );
+    }
+
+    #[test]
+    fn saturated_element_count_fails_the_length_check() {
+        let info = TensorInfo {
+            name: "w".into(),
+            shape: vec![usize::MAX, 2],
+            ggml_type: 0,
+            offset: 0,
+        };
+        assert_eq!(info.num_elements(), usize::MAX);
+        assert!(
+            super::super::dequant::tensor_byte_len(info.ggml_type, info.num_elements()).is_err()
+        );
     }
 
     #[test]

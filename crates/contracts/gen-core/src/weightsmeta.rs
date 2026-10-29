@@ -177,6 +177,23 @@ pub fn is_hidden_file(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with('.'))
 }
 
+/// The non-hidden `*.safetensors` entries directly inside `dir`, by file name, sorted.
+///
+/// This is the shard membership a component-directory pin records and re-checks: hidden entries
+/// ([`is_hidden_file`]) are never shards, and subdirectories are not descended into.
+pub fn visible_safetensors(dir: impl AsRef<Path>) -> std::io::Result<Vec<std::ffi::OsString>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !is_hidden_file(&path) && path.extension().is_some_and(|ext| ext == "safetensors") {
+            names.push(entry.file_name());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 /// The hidden directory Candle writes its content-addressed **device-format weight cache** into,
 /// beside the source component it was derived from (`<component>/.candle-device-format-v1/`,
 /// SC-16096). Every packed q4/q8 component that has ever been opened for block streaming carries
@@ -203,12 +220,12 @@ pub fn is_hidden_dir(path: &Path) -> bool {
 /// (sc-27314): refuse to allocate an arbitrary buffer from an untrusted 8-byte length prefix. A
 /// header past it is a corrupt or mis-detected file (e.g. an AppleDouble `._` sidecar), not a real
 /// checkpoint. Readers may apply a tighter bound of their own first (`flux3::checkpoint`'s 16 MiB).
-pub(crate) const MAX_SAFETENSORS_HEADER: u64 = 100_000_000;
+pub const MAX_SAFETENSORS_HEADER: u64 = 100_000_000;
 
 /// Read and validate a safetensors 8-byte length prefix: bounded by [`MAX_SAFETENSORS_HEADER`],
 /// and the header must end inside a `file_len`-byte file. Returns the header length and the
 /// absolute offset where the tensor data begins; the reader is left at the start of the header.
-pub(crate) fn read_safetensors_header_len(
+pub fn read_safetensors_header_len(
     reader: &mut impl Read,
     file_len: u64,
     path: &Path,
@@ -245,7 +262,7 @@ pub(crate) fn read_safetensors_header_len(
 
 /// [`read_safetensors_header_len`] followed by the header bytes themselves. Returns the raw JSON
 /// header and the data start; the reader is left immediately after the header.
-pub(crate) fn read_safetensors_header(
+pub fn read_safetensors_header(
     reader: &mut impl Read,
     file_len: u64,
     path: &Path,

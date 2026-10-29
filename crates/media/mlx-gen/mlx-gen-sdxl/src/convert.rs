@@ -94,16 +94,11 @@ fn load_component_map(dir: &Path, stem: &str) -> Result<HashMap<String, Array>> 
     files.sort();
     let mut map: HashMap<String, Array> = HashMap::new();
     for f in files {
-        let w = Weights::from_file(&f)?;
-        for k in w.keys().map(str::to_string).collect::<Vec<_>>() {
-            let v = w.get(&k).expect("listed key").clone();
-            if map.insert(k.clone(), v).is_some() {
-                return Err(Error::Msg(format!(
-                    "sdxl convert: duplicate key `{k}` across `{stem}` shards in {}",
-                    dir.display()
-                )));
-            }
-        }
+        mlx_gen::quant::merge_weights_unique(
+            &mut map,
+            &Weights::from_file(&f)?,
+            &format!("sdxl convert: `{stem}` shards in {}", dir.display()),
+        )?;
     }
     Ok(map)
 }

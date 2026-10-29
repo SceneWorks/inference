@@ -290,8 +290,9 @@ pub use runtime::{
     CancelFlag, FileStatFingerprint, HdrFrameSink, HdrOutputFrame, IdentityWeights, LoadPhase,
     LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy, PidWeights,
     PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame, PreviewSink, Progress,
-    PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant, WeightsSource,
-    Yue2ArMode, Yue2ComputePolicy, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT,
+    PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant,
+    ResolvedFileIdentity, SingleFlight, SingleFlightGuard, WeightsSource, Yue2ArMode,
+    Yue2ComputePolicy, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT,
     COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT, LTX_SPATIAL_UPSCALER_COMPONENT,
     VAE_COMPONENT,
 };
