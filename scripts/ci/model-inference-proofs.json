@@ -182408,7 +182408,7 @@
           "minimum_collections": 1,
           "minimum_items": 1,
           "readers": [
-            "crates/media/mlx-gen/mlx-gen-ltx/src/model.rs::resolve_gemma_quant::std::fs::read_to_string@34760"
+            "crates/media/mlx-gen/mlx-gen-ltx/src/model/load.rs::resolve_gemma_quant::std::fs::read_to_string@3041"
           ],
           "required_grade": "reader-binding",
           "role": "artifact-input",
@@ -182782,7 +182782,7 @@
           "minimum_collections": 1,
           "minimum_items": 1,
           "readers": [
-            "crates/media/mlx-gen/mlx-gen-ltx/src/model.rs::resolve_gemma_quant::std::fs::read_to_string@34760"
+            "crates/media/mlx-gen/mlx-gen-ltx/src/model/load.rs::resolve_gemma_quant::std::fs::read_to_string@3041"
           ],
           "required_grade": "reader-binding",
           "role": "artifact-input",
@@ -182954,7 +182954,7 @@
           "minimum_collections": 1,
           "minimum_items": 1,
           "readers": [
-            "crates/media/mlx-gen/mlx-gen-ltx/src/model.rs::resolve_gemma_quant::std::fs::read_to_string@34760"
+            "crates/media/mlx-gen/mlx-gen-ltx/src/model/load.rs::resolve_gemma_quant::std::fs::read_to_string@3041"
           ],
           "required_grade": "reader-binding",
           "role": "artifact-input",
@@ -183126,7 +183126,7 @@
           "minimum_collections": 1,
           "minimum_items": 1,
           "readers": [
-            "crates/media/mlx-gen/mlx-gen-ltx/src/model.rs::resolve_gemma_quant::std::fs::read_to_string@34760"
+            "crates/media/mlx-gen/mlx-gen-ltx/src/model/load.rs::resolve_gemma_quant::std::fs::read_to_string@3041"
           ],
           "required_grade": "reader-binding",
           "role": "artifact-input",
@@ -185302,7 +185302,7 @@
           "minimum_collections": 1,
           "minimum_items": 1,
           "readers": [
-            "crates/media/mlx-gen/mlx-gen-ltx/src/model.rs::resolve_gemma_quant::std::fs::read_to_string@34760"
+            "crates/media/mlx-gen/mlx-gen-ltx/src/model/load.rs::resolve_gemma_quant::std::fs::read_to_string@3041"
           ],
           "required_grade": "reader-binding",
           "role": "artifact-input",
@@ -185441,7 +185441,7 @@
           "minimum_collections": 1,
           "minimum_items": 1,
           "readers": [
-            "crates/media/mlx-gen/mlx-gen-ltx/src/model.rs::resolve_gemma_quant::std::fs::read_to_string@34760"
+            "crates/media/mlx-gen/mlx-gen-ltx/src/model/load.rs::resolve_gemma_quant::std::fs::read_to_string@3041"
           ],
           "required_grade": "reader-binding",
           "role": "artifact-input",
@@ -185580,7 +185580,7 @@
           "minimum_collections": 1,
           "minimum_items": 1,
           "readers": [
-            "crates/media/mlx-gen/mlx-gen-ltx/src/model.rs::resolve_gemma_quant::std::fs::read_to_string@34760"
+            "crates/media/mlx-gen/mlx-gen-ltx/src/model/load.rs::resolve_gemma_quant::std::fs::read_to_string@3041"
           ],
           "required_grade": "reader-binding",
           "role": "artifact-input",
@@ -185719,7 +185719,7 @@
           "minimum_collections": 1,
           "minimum_items": 1,
           "readers": [
-            "crates/media/mlx-gen/mlx-gen-ltx/src/model.rs::resolve_gemma_quant::std::fs::read_to_string@34760"
+            "crates/media/mlx-gen/mlx-gen-ltx/src/model/load.rs::resolve_gemma_quant::std::fs::read_to_string@3041"
           ],
           "required_grade": "reader-binding",
           "role": "artifact-input",
@@ -185858,7 +185858,7 @@
           "minimum_collections": 1,
           "minimum_items": 1,
           "readers": [
-            "crates/media/mlx-gen/mlx-gen-ltx/src/model.rs::resolve_gemma_quant::std::fs::read_to_string@34760"
+            "crates/media/mlx-gen/mlx-gen-ltx/src/model/load.rs::resolve_gemma_quant::std::fs::read_to_string@3041"
           ],
           "required_grade": "reader-binding",
           "role": "artifact-input",

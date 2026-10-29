@@ -75,7 +75,7 @@
       "finding": "persistent reference-image K/V extract and splice seam"
     },
     {
-      "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
+      "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline/denoise.rs",
       "symbol": "build_cache",
       "sourceNeedle": "fn build_cache",
       "finding": "per-generate evaluated text cross-K/V seam"

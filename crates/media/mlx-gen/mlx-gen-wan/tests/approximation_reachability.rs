@@ -475,6 +475,29 @@ fn crate_code(relative: &str) -> String {
     strip_comments(&crate_source(relative))
 }
 
+/// `src/model.rs` and the production submodules it is split into under `src/model/` (sc-27342),
+/// comment-stripped. `src/model/tests.rs` is the test module, not production code, so it is left out.
+fn model_code() -> String {
+    let dir = format!("{}/src/model", env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|error| panic!("read {dir}: {error}"))
+        .map(|entry| {
+            entry
+                .expect("model/ entry")
+                .file_name()
+                .into_string()
+                .unwrap()
+        })
+        .filter(|name| name.ends_with(".rs") && name != "tests.rs")
+        .collect();
+    files.sort();
+    let mut code = crate_code("src/model.rs");
+    for file in files {
+        code.push_str(&crate_code(&format!("src/model/{file}")));
+    }
+    code
+}
+
 /// Remove Rust comments from `source`, preserving literals.
 ///
 /// Literal-aware on purpose: a `//` inside a string is not a comment, and blindly stripping it would
@@ -647,7 +670,7 @@ fn every_unwired_denoise_route_has_a_refusal_call_site() {
     // MINOR 5: the helper's doc asserted a guard on three routes, but the MoE routes had no call site at
     // all — `Wan14b::generate_impl` never resolved a plan. The helper takes the route name as a string,
     // so no test of the helper can distinguish "this route refuses" from "this string round-trips".
-    let model = crate_code("src/model.rs");
+    let model = model_code();
     for route in [
         "TI2V mask-blend",
         "curated unified solver",
@@ -715,7 +738,7 @@ fn every_mechanism_bridge_refuses_a_policy_inert_over_the_trajectory() {
     // definition. The property is **guard before construction**, asserted per bridge body — not literal
     // adjacency to the opening brace, which would have reddened on a benign `let _ = steps;` or a
     // `debug_assert!` above the guard while the guard still did its job.
-    let model = crate_code("src/model.rs");
+    let model = model_code();
     assert!(
         model.contains("fn refuse_inert_over_trajectory("),
         "the guard the bridges call must be defined here"

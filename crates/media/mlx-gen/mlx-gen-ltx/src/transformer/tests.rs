@@ -63,8 +63,18 @@ fn controlled_path_uses_actual_indices_for_resident_and_streamed_blocks() {
     // Structural mutation proof: the resident and streamed loops for both AV and video-only
     // execution must derive their per-block calls from the materialized/enumerated `index`,
     // not a fixed STG layer or a mode that silently becomes a whole-block skip.
-    let source = include_str!("../transformer.rs");
-    // The tests live in their own file, so `transformer.rs` holds only production uses.
+    // The tests live in their own file, so `transformer.rs` and its production submodules
+    // (sc-27342) hold only production uses.
+    let source = [
+        include_str!("../transformer.rs"),
+        include_str!("attention.rs"),
+        include_str!("av_block.rs"),
+        include_str!("av_dit.rs"),
+        include_str!("linear.rs"),
+        include_str!("video_block.rs"),
+        include_str!("video_dit.rs"),
+    ]
+    .concat();
     let production_index_uses = source.matches("perturbation.attention_plan(index)").count();
     assert_eq!(
         production_index_uses, 4,
