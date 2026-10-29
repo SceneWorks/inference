@@ -8,7 +8,7 @@
 //! `Module` system (hand-rolled `&self` forwards over raw `Array`s), so training uses the **functional
 //! autograd**: the trainable factors live OUTSIDE the model in a [`LoraParams`] map, re-injected each
 //! step into the target [`AdaptableLinear`](mlx_gen::adapters::AdaptableLinear)s via the shared core
-//! seam ([`mlx_gen::train::lora`]), stepped with `keyed_value_and_grad` + the core [`TrainOptimizer`] +
+//! seam ([`mlx_gen::train::lora`]), stepped with `keyed_value_and_grad` + the core [`TrainOptimizer`](mlx_gen::TrainOptimizer) +
 //! `clip_grad_norm`. The injection mirrors the inference reload op-for-op (the [`crate::adapters`]
 //! apply path), so the trained adapter round-trips through that loader.
 //!
