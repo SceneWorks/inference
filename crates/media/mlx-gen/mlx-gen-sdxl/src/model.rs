@@ -1302,19 +1302,63 @@ impl Sdxl {
         // sc-26270: the request's iOS quantum scope (cache policy for the whole generate, every
         // component load and quantum inside it). A no-op off device.
         let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
+        let request = self.resolve_request(req)?;
 
+        self.residency.run_staged_request_scoped(
+            request.stage_residency,
+            false,
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            |text: &(ClipTextEncoder, ClipTextEncoder)| {
+                encode_conditioning_windows(&text.0, &text.1, &request.tokens)
+            },
+            // Materialize the conditioning + pooled while the encoders are still alive (Sequential
+            // only) — MLX is lazy, so an un-evaluated output keeps the encoders referenced through the
+            // graph and the drop would free nothing (cf. Wan's `encode_text_staged`).
+            |enc| match enc {
+                Some(enc) => Ok(mlx_rs::transforms::eval([&enc.0, &enc.1])?),
+                None => Ok(()),
+            },
+            // ── Phase B (denoise): the heavy render components (U-Net + control/IP + VAE + PiD) run
+            // every image's denoise against the `heavy` borrow — identical for both residencies — and
+            // hand the evaluated latents to phase C. `on_progress` is threaded through the seam
+            // (F-179) and shadows the outer sink here.
+            |heavy_owned: &SdxlHeavyOwned, enc, on_progress| {
+                self.denoise_phase(&request, heavy_owned, enc, on_progress)
+            },
+            // Materialize every final latent while the U-Net is still alive: MLX is lazy, so an
+            // un-evaluated latent keeps the whole denoise graph — and through it the U-Net — referenced,
+            // and the shed below would free nothing.
+            |(finals, _pid): &SdxlDenoised| Ok(mlx_rs::transforms::eval(finals.iter())?),
+            // ── Phase C (decode): on a staged request the U-Net, control branches and IP encoder
+            // have been dropped (`StagedHeavy::shed_dit`) and the cache cleared before this runs; a
+            // resident request decodes against the warm bundle exactly as before.
+            |view: SdxlDecodeView<'_>, denoised: SdxlDenoised, on_progress| {
+                decode_phase(
+                    &view,
+                    denoised,
+                    &mut final_latent_observer,
+                    request.decode_tiling.as_ref(),
+                    &req.cancel,
+                    on_progress,
+                )
+            },
+        )
+    }
+
+    /// Everything the request resolves before the residency lifecycle starts: the sampling route,
+    /// the image roles (validated), the tokenized prompt windows and the memory-ladder rungs.
+    fn resolve_request<'r>(&self, req: &'r GenerationRequest) -> Result<SdxlRequest<'r>> {
         let sampling = crate::sampling::ResolvedSampling::resolve(req)?;
         let sampler_name = sampling.sampler_name();
         let is_accel = sampling.route().is_acceleration();
         let use_curated = sampling.route().is_curated();
-        let steps = sampling.steps();
-        let cfg = sampling.guidance();
-        let cfg_on = cfg > 1.0;
+        let cfg_on = sampling.guidance() > 1.0;
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let reference = self.resolve_reference(req)?;
-        let mask_img = self.resolve_mask(req)?;
-        let max_time = self.sampler.max_time();
+        let mask = self.resolve_mask(req)?;
 
         // Acceleration variants are txt2img-only in v1 (epic 2755 "Image-only v1"); reject an init
         // image rather than silently ignoring it.
@@ -1323,7 +1367,7 @@ impl Sdxl {
             is_accel,
             use_curated,
             reference.is_some(),
-            mask_img.is_some(),
+            mask.is_some(),
         )?;
         // ControlNet (sc-3058; MultiControlNet sc-3378): each `Control` conditioning pairs, in order,
         // with a loaded control branch (`spec.control` + `spec.extra_controls`); their residuals are
@@ -1336,16 +1380,16 @@ impl Sdxl {
             req.guidance,
             control_reqs.len(),
             self.control_count,
-            mask_img.is_some(),
+            mask.is_some(),
         )?;
 
-        // ── Phase A: text encode (epic 10834 Phase 1, sc-10839; sc-11125). Seed-independent (no RNG)
-        // — tokenizing above the residency lifecycle, then hoisting the encode above the control/IP
-        // builds and the per-image loop, is byte-identical to the F-068 order. Under `Sequential` the
-        // shared seam LOADS the dual CLIP encoders, encodes, materializes, then DROPS them +
-        // `clear_cache()` so their ~1 GB frees before the U-Net/control/IP bundle loads below —
-        // bounding peak to `max(encoders, U-Net+VAE)`. Under `Resident` it borrows the warm encoders
-        // (byte-identical to the pre-sc-10839 `encode_conditioning`).
+        // ── Phase A input: text tokens (epic 10834 Phase 1, sc-10839; sc-11125). Seed-independent
+        // (no RNG) — tokenizing above the residency lifecycle, then hoisting the encode above the
+        // control/IP builds and the per-image loop, is byte-identical to the F-068 order. Under
+        // `Sequential` the shared seam LOADS the dual CLIP encoders, encodes, materializes, then
+        // DROPS them + `clear_cache()` so their ~1 GB frees before the U-Net/control/IP bundle
+        // loads — bounding peak to `max(encoders, U-Net+VAE)`. Under `Resident` it borrows the
+        // warm encoders (byte-identical to the pre-sc-10839 `encode_conditioning`).
         // sc-20528: a prompt past CLIP's 77-token context is split into windows, not truncated. The
         // window count is decided ONCE here, as the max over both CFG rows, so `[cond, uncond]` stay
         // stackable and the negative prompt takes exactly the same path as the positive one. A
@@ -1389,155 +1433,41 @@ impl Sdxl {
         }))
         .with_cfg_batching(sampling.cfg_batching());
 
-        self.residency.run_staged_request_scoped(
+        Ok(SdxlRequest {
+            req,
+            sampling,
+            base_seed,
+            reference,
+            mask,
+            control_reqs,
+            tokens,
             stage_residency,
-            false,
-            &req.cancel,
-            req.use_pid,
-            on_progress,
-            |text: &(ClipTextEncoder, ClipTextEncoder)| {
-                encode_conditioning_windows(&text.0, &text.1, &tokens)
-            },
-            // Materialize the conditioning + pooled while the encoders are still alive (Sequential
-            // only) — MLX is lazy, so an un-evaluated output keeps the encoders referenced through the
-            // graph and the drop would free nothing (cf. Wan's `encode_text_staged`).
-            |enc| match enc {
-                Some(enc) => Ok(mlx_rs::transforms::eval([&enc.0, &enc.1])?),
-                None => Ok(()),
-            },
-            // ── Phase B (denoise): the heavy render components (U-Net + control/IP + VAE + PiD) run
-            // every image's denoise against the `heavy` borrow — identical for both residencies — and
-            // hand the evaluated latents to phase C. `on_progress` is threaded through the seam
-            // (F-179) and shadows the outer sink here.
-            |heavy_owned: &SdxlHeavyOwned, enc, on_progress| -> Result<SdxlDenoised> {
+            decode_tiling,
+            forward_plan,
+        })
+    }
+
+    /// Phase B: prepare the seed-independent conditioning, encode the init, resolve the PiD
+    /// `from_ldm` plan, then denoise every output serially through the shared stage skeleton.
+    fn denoise_phase(
+        &self,
+        request: &SdxlRequest<'_>,
+        heavy_owned: &SdxlHeavyOwned,
+        (conditioning, pooled): (mlx_rs::Array, mlx_rs::Array),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<SdxlDenoised> {
+        let req = request.req;
         let heavy = heavy_owned.as_ref();
-        let (conditioning, pooled) = enc;
-
-        // Build the ControlNet contexts once (seed-independent): preprocess each control image to
-        // [0,1] NHWC and CFG-batch it to match the U-Net input, paired by order with a loaded branch.
-        let mut control_ctxs: Vec<ControlContext> = Vec::with_capacity(control_reqs.len());
-        for ((image, scale), cn) in control_reqs.iter().zip(heavy.controls) {
-            let img = preprocess_control_image(image, req.width, req.height)?;
-            let img = if cfg_on {
-                concatenate_axis(&[&img, &img], 0)?
-            } else {
-                img
-            };
-            control_ctxs.push(ControlContext {
-                controlnet: cn,
-                // Precompute the step-invariant conditioning embedding once per run (F-069).
-                cond_embed: cn.embed_cond(&img)?,
-                scale: *scale,
-            });
-        }
-
-        // IP-Adapter (sc-3059): when the model carries IP weights and a Reference is present (no
-        // mask/control/accel), the Reference is the image prompt (txt2img + IP), NOT an img2img init.
-        // The IP scale rides the Reference `strength` field (default 0.6). Tokens are seed-independent
-        // → built once, CFG-batched with a zeros uncond row so the negative pass gets no IP signal.
-        let ip_mode = uses_ip_reference(heavy_owned.has_ip_adapter()?,reference.is_some(),mask_img.is_some(),control_reqs.len(),is_accel);
-        let ip_scale = ip_reference_scale(reference.and_then(|(_, s)| s));
-        let ip_tokens = if ip_mode {
-            let (image, _) = reference.expect("reference present in ip_mode");
-            Some(heavy_owned.ip_tokens(
-                image,
-                cfg_on,
-                sheds_ip_image_encoder(stage_residency),
-            )?)
-        } else {
-            None
-        };
-
+        let (mode, guidance) = prepare_conditioning(request, heavy_owned, &heavy)?;
         let time_ids = text_time_ids(pooled.shape()[0]);
         let latent_shape = [1, (req.height / 8) as i32, (req.width / 8) as i32, 4];
-        // img2img/inpaint init latents (the f32 VAE encode) and the inpaint mask are seed-independent
-        // too (F-068). `init_latents` is Some exactly for the ancestral img2img/inpaint paths — a
-        // Reference that is neither an accel run nor an IP image prompt; `mask_latent` adds the mask.
-        let init_latents = match reference {
-            // sc-26270: the bounded-decode rung's tiling bounds the encode too.
-            Some((image, _)) if !is_accel && !ip_mode => Some(encode_init_latents_tiled(
-                heavy.vae,
-                image,
-                req.width,
-                req.height,
-                decode_tiling.as_ref(),
-                Some(&req.cancel),
-            )?),
-            _ => None,
-        };
-        let mask_latent = match mask_img {
-            Some(mask) if init_latents.is_some() => {
-                Some(preprocess_mask(mask, req.width, req.height)?)
-            }
-            _ => None,
-        };
-
-        // PiD decode overlay (epic 7840, sc-7848) + `from_ldm` early-stop (sc-8049). SDXL is the lone
-        // **variance-preserving** PiD student. Its two denoise paths keep the latent in DIFFERENT frames,
-        // so the from_ldm capture is handled per-path:
-        //   • ancestral (the default; txt2img / img2img / control / IP via `denoise_core`) stores the
-        //     latent ALREADY renormalized to the VP frame `(x0+σε)/√(σ²+1)` = `√(1−σ_vp²)·x0 + σ_vp·ε`
-        //     at every node (see `EulerSampler::step`/`add_noise`), so a truncated x_k is handed to PiD
-        //     as-is (no rescale);
-        //   • curated (opt-in k-diffusion) stores RAW VE latents `x0+σ·ε`, so a truncated x_k is mapped
-        //     into the VP frame by the plan's rescale (`1/√(1+σ²)`) before decode.
-        // Both stay 0.13025-normalized throughout (the loop runs in the scaled latent space `vae.decode`
-        // consumes), so no extra normalization is applied. The plan is image-independent (the schedule is
-        // fixed by steps / scheduler / strength), so resolve it once here and mint the decoder at the
-        // achieved degrade σ. The clean σ=0 decode (`vp_plan = None`) is byte-identical to before. The
-        // few-step accel path (decode-bound → no from_ldm benefit, sc-7993) and the inpaint mask-blend
-        // (needs the full schedule to σ=0) keep the clean decode; a from_ldm request on either errors
-        // loudly rather than silently dropping the knob.
-        let vp_plan: Option<VpCapturePlan> = if req.use_pid && req.pid_capture_sigma.is_some() {
-            if is_accel || mask_latent.is_some() {
-                return Err(Error::Msg(format!(
-                    "{}: pid_capture_sigma (from_ldm early-stop) is not supported on the SDXL {} path \
-                     (it keeps the clean σ=0 decode); use the standard ancestral or curated denoise for \
-                     from_ldm (sc-8049)",
-                    self.descriptor.id,
-                    if is_accel {
-                        "few-step accel"
-                    } else {
-                        "inpaint mask-blend"
-                    }
-                )));
-            }
-            // Resolve the VP capture against the EXACT σ schedule this run will denoise, so `keep` and the
-            // achieved degrade σ agree with the truncated trajectory. (This mirrors the per-path schedule
-            // build in the count loop below — deterministic host math, no RNG, so it does not perturb the
-            // ancestral noise stream.)
-            let edm_sigmas = if use_curated {
-                let full_sigmas = sampling.curated_full_sigmas(&self.alpha_schedule)?;
-                if init_latents.is_some() {
-                    let strength = resolve_strength(
-                        reference.and_then(|(_, strength)| strength),
-                        DEFAULT_STRENGTH,
-                    );
-                    curated_strength_schedule(&full_sigmas, steps, strength)
-                } else {
-                    full_sigmas
-                }
-            } else {
-                let (eff, start_time) = if init_latents.is_some() {
-                    let strength = resolve_strength(
-                        reference.and_then(|(_, strength)| strength),
-                        DEFAULT_STRENGTH,
-                    );
-                    ancestral_strength_schedule(steps, max_time, strength)
-                } else {
-                    (steps, max_time)
-                };
-                AncestralEuler::new(&self.sampler, eff, start_time)?.edm_sigmas()
-            };
-            vp_capture_plan(&edm_sigmas, req.pid_capture_sigma)
-        } else {
-            None
-        };
+        let init = build_init_latents(request, heavy.vae, mode)?;
+        let vp_plan = self.resolve_vp_plan(request, &init)?;
         let capture_sigma = vp_plan.map(|p| p.sigma).unwrap_or(0.0);
         let pid_decoder = resolve_pid_decoder_at_sigma(
             heavy.pid,
             req,
-            base_seed,
+            request.base_seed,
             self.descriptor.id,
             capture_sigma,
         )?;
@@ -1545,125 +1475,474 @@ impl Sdxl {
         mlx_gen::diagnostics::record_phase_boundary(
             mlx_gen::diagnostics::BenchmarkPhaseBoundary::DenoiseStart,
         );
+        let plan = SdxlRenderPlan {
+            request,
+            unet: heavy.unet,
+            sampler: &self.sampler,
+            alpha_schedule: &self.alpha_schedule,
+            guidance: &guidance,
+            init: &init,
+            conditioning: &conditioning,
+            pooled: &pooled,
+            time_ids: &time_ids,
+            latent_shape,
+            vp_plan,
+        };
         // The common serial owner seeds before this closure and retains the appended latents
         // through every subsequent output, exactly as the historical inline count loop did.
-        let finals = collect_serial_latents(req.count, base_seed, |seed, finals| {
-
-            // Curated unified-sampler path (epic 7114, sc-7121): k-diffusion VE-σ sampling over a
-            // `DiscreteModelSampling`, additive alongside the bespoke ancestral default. The latents
-            // live in raw σ-space; the curated solver + scheduler are selected per request. Supports
-            // txt2img / img2img / ControlNet / IP-Adapter (inpaint is guarded out above).
-            if use_curated {
-                let ms = DiscreteModelSampling::sdxl(&self.alpha_schedule);
-                let full_sigmas = sampling.curated_full_sigmas(&self.alpha_schedule)?;
-                let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
-                // Raw k-diffusion σ-space init: txt2img `ε·σ_max`; img2img runs the strength-tail of the
-                // schedule, seeded `x₀ + ε·σ_start` (diffusers EulerDiscrete add_noise). A strength that
-                // rounds to 0 effective steps leaves the schedule at `[0.0]` → the init is returned.
-                let (run_sigmas, init) = if let Some(x_0) = &init_latents {
-                    let strength = resolve_strength(
-                        reference.and_then(|(_, strength)| strength),
-                        DEFAULT_STRENGTH,
-                    );
-                    let rs = curated_strength_schedule(&full_sigmas, steps, strength);
-                    let init = add(x_0, &multiply(&noise, scalar(rs[0]))?)?;
-                    (rs, init)
-                } else {
-                    let init = multiply(&noise, scalar(full_sigmas[0]))?;
-                    (full_sigmas, init)
-                };
-                // PiD from_ldm early-stop (sc-8049): truncate the curated k-diffusion schedule to the
-                // VP-capture `keep` nodes so the solver stops at the achieved degrade σ; the clean path
-                // (`vp_plan = None`) runs the full schedule byte-identically.
-                let keep_sigmas: &[f32] = match &vp_plan {
-                    Some(p) => &run_sigmas[..p.keep],
-                    None => &run_sigmas,
-                };
-                let ip = ip_tokens.as_ref().map(|t| (t, ip_scale));
-                // CFG++ (sc-8256): opt-in via `guidance_method == "cfg_pp"`, only with a CFG++-compatible
-                // base solver (euler/ddim/dpmpp_2m) and an active guidance gap (`cfg > 1`). Anything else
-                // — including `cfg_pp` on an incompatible sampler — falls back to the plain curated path
-                // (N3, never a hard-fail), so the default is byte-untouched.
-                let want_cfgpp = matches!(sampling.route(), crate::sampling::SamplingRoute::CfgPp(_));
-                let latents = if want_cfgpp {
-                    denoise_cfgpp_with_preview(
-                        heavy.unet,
-                        Some(sampler_name),
-                        &ms,
-                        keep_sigmas,
-                        init,
-                        &conditioning,
-                        &pooled,
-                        &time_ids,
-                        cfg,
-                        &req.cancel,
-                        on_progress,
-                        &req.preview,
-                        &control_ctxs,
-                        ip,
-                        None,
-                        forward_plan,
-                    )?
-                } else {
-                    denoise_curated_with_preview(
-                        heavy.unet,
-                        Some(sampler_name),
-                        &ms,
-                        keep_sigmas,
-                        init,
-                        &conditioning,
-                        &pooled,
-                        &time_ids,
-                        cfg,
-                        seed,
-                        &req.cancel,
-                        on_progress,
-                        &req.preview,
-                        &control_ctxs,
-                        ip,
-                        None,
-                        forward_plan,
-                    )?
-                };
-                // Curated latents live in RAW VE σ-space (`x0+σ·ε`); an early-stop leaves x_k at σ>0, so
-                // map it into the student's VP frame with the plan's rescale (`1/√(1+σ²)`) before decode.
-                // The clean path (`vp_plan = None`) leaves it byte-identical. (sc-8049)
-                let latents = match &vp_plan {
-                    Some(p) => multiply(&latents, scalar(p.rescale))?,
-                    None => latents,
-                };
+        let finals = collect_serial_latents(req.count, request.base_seed, |seed, finals| {
+            crate::stages::run_output(&plan, seed, on_progress, |latents, _| {
                 mlx_gen::sampler::diagnostic_sampling_tensor(
-                    "sdxl", "serial-final-latent", finals.len() as u64, 1, &latents,
+                    "sdxl",
+                    "serial-final-latent",
+                    finals.len() as u64,
+                    1,
+                    &latents,
                 );
                 finals.push(latents);
-                return Ok(());
-            }
+                Ok(())
+            })
+        })?;
+        Ok((finals, pid_decoder))
+    }
 
-            // Build the run's sampler + its seeded init latents. The denoise loop is driven entirely
-            // by the sampler's own schedule (`sampler.num_steps()`), so the trait owns the per-step
-            // timestep, the input scaling, and the step math.
-            let (latents, sampler, blend): (
-                mlx_rs::Array,
-                Box<dyn DiffusionSampler + '_>,
-                Option<InpaintBlend>,
-            ) = if is_accel {
-                // Few-step acceleration (txt2img): unit-noise prior scaled into the sampler's space.
-                let s = sampling.build_acceleration_sampler(&self.alpha_schedule, seed)?;
-                let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
-                let lat = s.scale_initial_noise(&noise)?;
-                (lat, s, None)
-            } else if let (Some(x_0), Some(mask_latent)) = (&init_latents, &mask_latent) {
+    /// PiD decode overlay (epic 7840, sc-7848) + `from_ldm` early-stop (sc-8049). SDXL is the lone
+    /// **variance-preserving** PiD student. Its two denoise paths keep the latent in DIFFERENT
+    /// frames, so the from_ldm capture is handled per-path:
+    ///   • ancestral (the default; txt2img / img2img / control / IP via `denoise_core`) stores the
+    ///     latent ALREADY renormalized to the VP frame `(x0+σε)/√(σ²+1)` = `√(1−σ_vp²)·x0 + σ_vp·ε`
+    ///     at every node (see `EulerSampler::step`/`add_noise`), so a truncated x_k is handed to PiD
+    ///     as-is (no rescale);
+    ///   • curated (opt-in k-diffusion) stores RAW VE latents `x0+σ·ε`, so a truncated x_k is mapped
+    ///     into the VP frame by the plan's rescale (`1/√(1+σ²)`) before decode.
+    ///
+    /// Both stay 0.13025-normalized throughout (the loop runs in the scaled latent space
+    /// `vae.decode` consumes), so no extra normalization is applied. The plan is image-independent
+    /// (the schedule is fixed by steps / scheduler / strength), so it is resolved once and the
+    /// decoder is minted at the achieved degrade σ. The clean σ=0 decode (`None`) is byte-identical
+    /// to before. The few-step accel path (decode-bound → no from_ldm benefit, sc-7993) and the
+    /// inpaint mask-blend (needs the full schedule to σ=0) keep the clean decode; a from_ldm request
+    /// on either errors loudly rather than silently dropping the knob.
+    fn resolve_vp_plan(
+        &self,
+        request: &SdxlRequest<'_>,
+        init: &SdxlInitLatents,
+    ) -> Result<Option<VpCapturePlan>> {
+        let req = request.req;
+        if !(req.use_pid && req.pid_capture_sigma.is_some()) {
+            return Ok(None);
+        }
+        let is_accel = request.sampling.route().is_acceleration();
+        let is_inpaint = matches!(init, SdxlInitLatents::Inpaint { .. });
+        if is_accel || is_inpaint {
+            return Err(Error::Msg(format!(
+                "{}: pid_capture_sigma (from_ldm early-stop) is not supported on the SDXL {} path \
+                 (it keeps the clean σ=0 decode); use the standard ancestral or curated denoise for \
+                 from_ldm (sc-8049)",
+                self.descriptor.id,
+                if is_accel {
+                    "few-step accel"
+                } else {
+                    "inpaint mask-blend"
+                }
+            )));
+        }
+        // Resolve the VP capture against the EXACT σ schedule this run will denoise, so `keep` and
+        // the achieved degrade σ agree with the truncated trajectory. (This mirrors the per-path
+        // schedule build in `build_init` — deterministic host math, no RNG, so it does not perturb
+        // the ancestral noise stream.)
+        let steps = request.sampling.steps();
+        let max_time = self.sampler.max_time();
+        let init_strength = init
+            .requested_strength()
+            .map(|strength| resolve_strength(strength, DEFAULT_STRENGTH));
+        let edm_sigmas = if request.sampling.route().is_curated() {
+            let full_sigmas = request.sampling.curated_full_sigmas(&self.alpha_schedule)?;
+            match init_strength {
+                Some(strength) => curated_strength_schedule(&full_sigmas, steps, strength),
+                None => full_sigmas,
+            }
+        } else {
+            let (eff, start_time) = match init_strength {
+                Some(strength) => ancestral_strength_schedule(steps, max_time, strength),
+                None => (steps, max_time),
+            };
+            AncestralEuler::new(&self.sampler, eff, start_time)?.edm_sigmas()
+        };
+        Ok(vp_capture_plan(&edm_sigmas, req.pid_capture_sigma))
+    }
+}
+
+/// The request-level SDXL plan resolved before the residency lifecycle (sc-27336): sampling,
+/// validated image roles, tokens and the memory-ladder rungs. Borrowed by every later stage.
+struct SdxlRequest<'r> {
+    req: &'r GenerationRequest,
+    sampling: crate::sampling::ResolvedSampling,
+    base_seed: u64,
+    reference: Option<(&'r Image, Option<f32>)>,
+    mask: Option<&'r Image>,
+    control_reqs: Vec<(&'r Image, f32)>,
+    tokens: crate::ChunkedTokens,
+    stage_residency: bool,
+    decode_tiling: Option<mlx_gen::tiling::TilingConfig>,
+    forward_plan: crate::plan::SdxlForwardPlan<'r>,
+}
+
+/// The role the request's Reference / Mask / Control inputs play (sc-27336), resolved once from
+/// the validated request and the loaded bundle's IP presence. Exactly one mode holds, so the stage
+/// functions pattern-match instead of re-deriving it from coupled `Option`s.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SdxlMode<'r> {
+    /// No Reference (an acceleration request is always this or [`Self::Control`] with no init).
+    Txt2Img,
+    /// The Reference is the img2img init; `strength` is the raw requested strength.
+    Img2Img {
+        image: &'r Image,
+        strength: Option<f32>,
+    },
+    /// The Reference is the IP-Adapter image prompt (sc-3059), not an init.
+    Ip { image: &'r Image, scale: f32 },
+    /// ControlNet residuals (sc-3058), optionally on an img2img init from the Reference.
+    Control {
+        init: Option<(&'r Image, Option<f32>)>,
+    },
+    /// Masked inpaint (sc-3057) over the Reference.
+    Inpaint {
+        image: &'r Image,
+        strength: Option<f32>,
+        mask: &'r Image,
+    },
+}
+
+impl<'r> SdxlMode<'r> {
+    /// The mode matrix. IP mode needs loaded IP weights and a Reference with no mask, control or
+    /// acceleration ([`uses_ip_reference`]); otherwise a non-accelerated Reference is an init
+    /// (inpaint when masked, ControlNet-on-img2img when controlled, plain img2img otherwise). A Mask
+    /// with no init and Control with a Mask are refused by [`validate_image_roles`] /
+    /// [`validate_control_roles`] before this runs.
+    pub(crate) fn resolve(
+        has_ip_adapter: bool,
+        reference: Option<(&'r Image, Option<f32>)>,
+        mask: Option<&'r Image>,
+        control_count: usize,
+        is_accel: bool,
+    ) -> Self {
+        if let Some((image, strength)) = reference {
+            if uses_ip_reference(
+                has_ip_adapter,
+                true,
+                mask.is_some(),
+                control_count,
+                is_accel,
+            ) {
+                return Self::Ip {
+                    image,
+                    scale: ip_reference_scale(strength),
+                };
+            }
+            if !is_accel {
+                return match mask {
+                    Some(mask) => Self::Inpaint {
+                        image,
+                        strength,
+                        mask,
+                    },
+                    None if control_count > 0 => Self::Control {
+                        init: Some((image, strength)),
+                    },
+                    None => Self::Img2Img { image, strength },
+                };
+            }
+        }
+        if control_count > 0 {
+            Self::Control { init: None }
+        } else {
+            Self::Txt2Img
+        }
+    }
+}
+
+/// The seed-independent guidance inputs the denoise reads besides the text conditioning.
+enum SdxlGuidance<'h> {
+    /// Text conditioning only.
+    Plain,
+    /// The IP image-prompt tokens (CFG-batched with a zeros uncond row when CFG is on).
+    Ip { tokens: mlx_rs::Array, scale: f32 },
+    /// One context per loaded ControlNet branch, paired by order.
+    Control(Vec<ControlContext<'h>>),
+}
+
+impl SdxlGuidance<'_> {
+    /// The `(controls, ip)` pair the curated / CFG++ denoise takes.
+    fn curated_inputs(&self) -> (&[ControlContext<'_>], Option<(&mlx_rs::Array, f32)>) {
+        match self {
+            Self::Plain => (&[], None),
+            Self::Ip { tokens, scale } => (&[], Some((tokens, *scale))),
+            Self::Control(contexts) => (contexts.as_slice(), None),
+        }
+    }
+}
+
+/// The seed-independent init (F-068): img2img / inpaint init latents are the f32 VAE encode and
+/// the inpaint mask its preprocess — computed once, not per output.
+enum SdxlInitLatents {
+    /// Start from the seeded prior.
+    Noise,
+    /// img2img (or ControlNet-on-img2img) from the encoded Reference.
+    Image {
+        x0: mlx_rs::Array,
+        strength: Option<f32>,
+    },
+    /// Masked inpaint over the encoded Reference.
+    Inpaint {
+        x0: mlx_rs::Array,
+        mask: mlx_rs::Array,
+        strength: Option<f32>,
+    },
+}
+
+impl SdxlInitLatents {
+    /// The raw requested strength of an init-image start, `None` for a prior start.
+    fn requested_strength(&self) -> Option<Option<f32>> {
+        match self {
+            Self::Noise => None,
+            Self::Image { strength, .. } | Self::Inpaint { strength, .. } => Some(*strength),
+        }
+    }
+}
+
+/// Stage 1 (sc-27336 `prepare_conditioning`): the ControlNet contexts, the request mode and the IP
+/// tokens — all seed-independent, built once against the heavy bundle.
+fn prepare_conditioning<'r, 'h>(
+    request: &SdxlRequest<'r>,
+    heavy_owned: &SdxlHeavyOwned,
+    heavy: &SdxlHeavy<'h>,
+) -> Result<(SdxlMode<'r>, SdxlGuidance<'h>)> {
+    let req = request.req;
+    let cfg_on = request.sampling.guidance() > 1.0;
+    // Build the ControlNet contexts once (seed-independent): preprocess each control image to
+    // [0,1] NHWC and CFG-batch it to match the U-Net input, paired by order with a loaded branch.
+    let mut control_ctxs: Vec<ControlContext> = Vec::with_capacity(request.control_reqs.len());
+    for ((image, scale), cn) in request.control_reqs.iter().zip(heavy.controls) {
+        let img = preprocess_control_image(image, req.width, req.height)?;
+        let img = if cfg_on {
+            concatenate_axis(&[&img, &img], 0)?
+        } else {
+            img
+        };
+        control_ctxs.push(ControlContext {
+            controlnet: cn,
+            // Precompute the step-invariant conditioning embedding once per run (F-069).
+            cond_embed: cn.embed_cond(&img)?,
+            scale: *scale,
+        });
+    }
+
+    // IP-Adapter (sc-3059): when the model carries IP weights and a Reference is present (no
+    // mask/control/accel), the Reference is the image prompt (txt2img + IP), NOT an img2img init.
+    // The IP scale rides the Reference `strength` field (default 0.6). Tokens are seed-independent
+    // → built once, CFG-batched with a zeros uncond row so the negative pass gets no IP signal.
+    let mode = SdxlMode::resolve(
+        heavy_owned.has_ip_adapter()?,
+        request.reference,
+        request.mask,
+        request.control_reqs.len(),
+        request.sampling.route().is_acceleration(),
+    );
+    let guidance = match mode {
+        SdxlMode::Ip { image, scale } => SdxlGuidance::Ip {
+            tokens: heavy_owned.ip_tokens(
+                image,
+                cfg_on,
+                sheds_ip_image_encoder(request.stage_residency),
+            )?,
+            scale,
+        },
+        SdxlMode::Control { .. } => SdxlGuidance::Control(control_ctxs),
+        SdxlMode::Txt2Img | SdxlMode::Img2Img { .. } | SdxlMode::Inpaint { .. } => {
+            SdxlGuidance::Plain
+        }
+    };
+    Ok((mode, guidance))
+}
+
+/// The seed-independent half of stage 2 (`build_init`): encode the init image (sc-26270: the
+/// bounded-decode rung's tiling bounds the encode too) and preprocess the inpaint mask.
+fn build_init_latents(
+    request: &SdxlRequest<'_>,
+    vae: &Autoencoder,
+    mode: SdxlMode<'_>,
+) -> Result<SdxlInitLatents> {
+    let req = request.req;
+    let encode = |image: &Image| {
+        encode_init_latents_tiled(
+            vae,
+            image,
+            req.width,
+            req.height,
+            request.decode_tiling.as_ref(),
+            Some(&req.cancel),
+        )
+    };
+    Ok(match mode {
+        SdxlMode::Img2Img { image, strength }
+        | SdxlMode::Control {
+            init: Some((image, strength)),
+        } => SdxlInitLatents::Image {
+            x0: encode(image)?,
+            strength,
+        },
+        SdxlMode::Inpaint {
+            image,
+            strength,
+            mask,
+        } => {
+            let x0 = encode(image)?;
+            SdxlInitLatents::Inpaint {
+                x0,
+                mask: preprocess_mask(mask, req.width, req.height)?,
+                strength,
+            }
+        }
+        SdxlMode::Txt2Img | SdxlMode::Ip { .. } | SdxlMode::Control { init: None } => {
+            SdxlInitLatents::Noise
+        }
+    })
+}
+
+/// Stages 2–3 for one SDXL output, over the request's prepared conditioning (sc-27336).
+struct SdxlRenderPlan<'a> {
+    request: &'a SdxlRequest<'a>,
+    unet: &'a UNet2DConditionModel,
+    sampler: &'a EulerSampler,
+    alpha_schedule: &'a AlphaSchedule,
+    guidance: &'a SdxlGuidance<'a>,
+    init: &'a SdxlInitLatents,
+    conditioning: &'a mlx_rs::Array,
+    pooled: &'a mlx_rs::Array,
+    time_ids: &'a mlx_rs::Array,
+    latent_shape: [i32; 4],
+    vp_plan: Option<VpCapturePlan>,
+}
+
+/// What an SDXL output's start keeps alive until its final latent has been collected — the same
+/// locals the historical inline loop held to the end of each iteration.
+enum SdxlInit<'a> {
+    /// Curated k-diffusion (epic 7114, sc-7121): the model sampling, the run schedule and the drawn
+    /// noise.
+    Curated {
+        ms: DiscreteModelSampling,
+        run_sigmas: Vec<f32>,
+        _noise: mlx_rs::Array,
+    },
+    /// The ancestral / acceleration sampler.
+    Ancestral {
+        sampler: Box<dyn DiffusionSampler + 'a>,
+    },
+    /// The masked-inpaint ancestral sampler and its per-step blend.
+    Inpaint {
+        sampler: Box<dyn DiffusionSampler + 'a>,
+        blend: InpaintBlend<'a>,
+    },
+}
+
+impl<'a> crate::stages::FamilyStages for SdxlRenderPlan<'a> {
+    type Start = mlx_rs::Array;
+    type Retained = SdxlInit<'a>;
+
+    fn build_init(&self, seed: u64) -> Result<(mlx_rs::Array, SdxlInit<'a>)> {
+        if self.request.sampling.route().is_curated() {
+            self.build_curated_init()
+        } else {
+            self.build_ancestral_init(seed)
+        }
+    }
+
+    fn denoise(
+        &self,
+        latents: mlx_rs::Array,
+        init: &SdxlInit<'a>,
+        seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<mlx_rs::Array> {
+        match init {
+            SdxlInit::Curated { ms, run_sigmas, .. } => {
+                self.denoise_curated(ms, run_sigmas, latents, seed, on_progress)
+            }
+            SdxlInit::Ancestral { sampler, .. } => {
+                self.denoise_ancestral(sampler.as_ref(), None, latents, on_progress)
+            }
+            SdxlInit::Inpaint { sampler, blend } => {
+                self.denoise_ancestral(sampler.as_ref(), Some(blend), latents, on_progress)
+            }
+        }
+    }
+}
+
+impl<'a> SdxlRenderPlan<'a> {
+    /// Curated unified-sampler path (epic 7114, sc-7121): k-diffusion VE-σ sampling over a
+    /// `DiscreteModelSampling`, additive alongside the bespoke ancestral default. The latents live
+    /// in raw σ-space; the curated solver + scheduler are selected per request. Supports
+    /// txt2img / img2img / ControlNet / IP-Adapter (inpaint is refused by `validate_image_roles`).
+    fn build_curated_init(&self) -> Result<(mlx_rs::Array, SdxlInit<'a>)> {
+        let steps = self.request.sampling.steps();
+        let ms = DiscreteModelSampling::sdxl(self.alpha_schedule);
+        let full_sigmas = self
+            .request
+            .sampling
+            .curated_full_sigmas(self.alpha_schedule)?;
+        let noise = mlx_rs::random::normal::<f32>(&self.latent_shape, None, None, None)?;
+        // Raw k-diffusion σ-space init: txt2img `ε·σ_max`; img2img runs the strength-tail of the
+        // schedule, seeded `x₀ + ε·σ_start` (diffusers EulerDiscrete add_noise). A strength that
+        // rounds to 0 effective steps leaves the schedule at `[0.0]` → the init is returned.
+        let (run_sigmas, init) = match self.init {
+            SdxlInitLatents::Image { x0, strength }
+            | SdxlInitLatents::Inpaint { x0, strength, .. } => {
+                let strength = resolve_strength(*strength, DEFAULT_STRENGTH);
+                let rs = curated_strength_schedule(&full_sigmas, steps, strength);
+                let init = add(x0, &multiply(&noise, scalar(rs[0]))?)?;
+                (rs, init)
+            }
+            SdxlInitLatents::Noise => {
+                let init = multiply(&noise, scalar(full_sigmas[0]))?;
+                (full_sigmas, init)
+            }
+        };
+        Ok((
+            init,
+            SdxlInit::Curated {
+                ms,
+                run_sigmas,
+                _noise: noise,
+            },
+        ))
+    }
+
+    /// Build the run's ancestral (or acceleration) sampler + its seeded init latents. The denoise
+    /// loop is driven entirely by the sampler's own schedule (`sampler.num_steps()`), so the trait
+    /// owns the per-step timestep, the input scaling, and the step math.
+    fn build_ancestral_init(&self, seed: u64) -> Result<(mlx_rs::Array, SdxlInit<'a>)> {
+        let steps = self.request.sampling.steps();
+        let max_time = self.sampler.max_time();
+        if self.request.sampling.route().is_acceleration() {
+            // Few-step acceleration (txt2img): unit-noise prior scaled into the sampler's space.
+            let s = self
+                .request
+                .sampling
+                .build_acceleration_sampler(self.alpha_schedule, seed)?;
+            let noise = mlx_rs::random::normal::<f32>(&self.latent_shape, None, None, None)?;
+            let lat = s.scale_initial_noise(&noise)?;
+            return Ok((lat, SdxlInit::Ancestral { sampler: s }));
+        }
+        Ok(match self.init {
+            SdxlInitLatents::Inpaint { x0, mask, strength } => {
                 // Masked inpaint (sc-3057): same ancestral img2img start, but keep the FIXED prior
                 // noise so the per-step blend can pin the black (keep) region to the init noised to
                 // each step's σ. Default strength 0.85 (the worker's inpaint default).
-                let strength = resolve_strength(
-                    reference.and_then(|(_, strength)| strength),
-                    INPAINT_DEFAULT_STRENGTH,
-                );
-                let (eff, start_step) =
-                    ancestral_strength_schedule(steps, max_time, strength);
-                let noise = mlx_rs::random::normal::<f32>(&latent_shape, None, None, None)?;
-                let x_t = self.sampler.add_noise_with(x_0, &noise, start_step)?;
+                let strength = resolve_strength(*strength, INPAINT_DEFAULT_STRENGTH);
+                let (eff, start_step) = ancestral_strength_schedule(steps, max_time, strength);
+                let noise = mlx_rs::random::normal::<f32>(&self.latent_shape, None, None, None)?;
+                let x_t = self.sampler.add_noise_with(x0, &noise, start_step)?;
                 // The kept region is noised to each step's "next" time `t_prev` (schedule[i].1).
                 let t_prev: Vec<f32> = self
                     .sampler
@@ -1671,157 +1950,227 @@ impl Sdxl {
                     .into_iter()
                     .map(|(_, tp)| tp)
                     .collect();
-                let blend = InpaintBlend::new(
-                    &self.sampler,
-                    mask_latent.clone(),
-                    x_0.clone(),
-                    noise,
-                    t_prev,
-                );
+                let blend =
+                    InpaintBlend::new(self.sampler, mask.clone(), x0.clone(), noise, t_prev);
                 (
                     x_t,
-                    Box::new(AncestralEuler::new(&self.sampler, eff, start_step)?),
-                    Some(blend),
+                    SdxlInit::Inpaint {
+                        sampler: Box::new(AncestralEuler::new(self.sampler, eff, start_step)?),
+                        blend,
+                    },
                 )
-            } else if let Some(x_0) = &init_latents {
+            }
+            SdxlInitLatents::Image { x0, strength } => {
                 // img2img (ancestral; the vendored `generate_latents_from_image`): start at
                 // `max_time·strength`, run `int(steps·strength)` steps — NO min-1 floor (strength ≤
                 // 1/steps ⇒ 0 steps ⇒ init returned unchanged, dodging the σ=0 ancestral `σ_up` 0/0
                 // → NaN).
-                let strength = resolve_strength(
-                    reference.and_then(|(_, strength)| strength),
-                    DEFAULT_STRENGTH,
-                );
-                let (eff, start_step) =
-                    ancestral_strength_schedule(steps, max_time, strength);
-                let x_t = self.sampler.add_noise(x_0, start_step)?;
-                // PiD from_ldm early-stop (sc-8049): truncate to the VP-capture `keep` steps; the stored
-                // ancestral latent is already the VP frame, so it is handed to PiD as-is. Clean path
-                // (`vp_plan = None`) keeps the full schedule.
-                let sampler = AncestralEuler::new(&self.sampler, eff, start_step)?;
-                (
-                    x_t,
-                    Box::new(match &vp_plan {
-                        Some(p) => sampler.truncate_to(p.keep - 1),
-                        None => sampler,
-                    }),
-                    None,
-                )
-            } else {
+                let strength = resolve_strength(*strength, DEFAULT_STRENGTH);
+                let (eff, start_step) = ancestral_strength_schedule(steps, max_time, strength);
+                let x_t = self.sampler.add_noise(x0, start_step)?;
+                // PiD from_ldm early-stop (sc-8049): truncate to the VP-capture `keep` steps; the
+                // stored ancestral latent is already the VP frame, so it is handed to PiD as-is.
+                // Clean path (`vp_plan = None`) keeps the full schedule.
+                let sampler = AncestralEuler::new(self.sampler, eff, start_step)?;
+                (x_t, self.ancestral(sampler))
+            }
+            SdxlInitLatents::Noise => {
                 // txt2img (ancestral): seeded prior.
-                let prior = self.sampler.sample_prior(&latent_shape)?;
-                // PiD from_ldm early-stop (sc-8049): truncate to the VP-capture `keep` steps (see the
-                // img2img arm); clean path (`vp_plan = None`) keeps the full schedule.
-                let sampler = AncestralEuler::new(&self.sampler, steps, max_time)?;
-                (
-                    prior,
-                    Box::new(match &vp_plan {
-                        Some(p) => sampler.truncate_to(p.keep - 1),
-                        None => sampler,
-                    }),
-                    None,
-                )
-            };
-
-            let d = Denoiser::with_plan(heavy.unet, sampler.as_ref(), forward_plan);
-            let latents = if let Some(tokens) = &ip_tokens {
-                denoise_ip_with_preview(
-                    &d,
-                    latents,
-                    &conditioning,
-                    &pooled,
-                    &time_ids,
-                    cfg,
-                    &req.cancel,
-                    on_progress,
-                    &req.preview,
-                    tokens,
-                    ip_scale,
-                )?
-            } else if !control_ctxs.is_empty() {
-                denoise_multi_control_with_preview(
-                    &d,
-                    latents,
-                    &conditioning,
-                    &pooled,
-                    &time_ids,
-                    cfg,
-                    &req.cancel,
-                    on_progress,
-                    &req.preview,
-                    &control_ctxs,
-                )?
-            } else if let Some(b) = &blend {
-                denoise_inpaint_with_preview(
-                    &d,
-                    latents,
-                    &conditioning,
-                    &pooled,
-                    &time_ids,
-                    cfg,
-                    &req.cancel,
-                    on_progress,
-                    &req.preview,
-                    b,
-                )?
-            } else {
-                denoise_with_preview(
-                    &d,
-                    latents,
-                    &conditioning,
-                    &pooled,
-                    &time_ids,
-                    cfg,
-                    &req.cancel,
-                    on_progress,
-                    &req.preview,
-                )?
-            };
-
-            mlx_gen::sampler::diagnostic_sampling_tensor(
-                "sdxl", "serial-final-latent", finals.len() as u64, 1, &latents,
-            );
-            finals.push(latents);
-            Ok(())
-        })?;
-                Ok((finals, pid_decoder))
-            },
-            // Materialize every final latent while the U-Net is still alive: MLX is lazy, so an
-            // un-evaluated latent keeps the whole denoise graph — and through it the U-Net — referenced,
-            // and the shed below would free nothing.
-            |(finals, _pid): &SdxlDenoised| Ok(mlx_rs::transforms::eval(finals.iter())?),
-            // ── Phase C (decode): on a staged request the U-Net, control branches and IP encoder
-            // have been dropped (`StagedHeavy::shed_dit`) and the cache cleared before this runs; a
-            // resident request decodes against the warm bundle exactly as before.
-            |view: SdxlDecodeView<'_>, (finals, pid_decoder): SdxlDenoised, on_progress| {
-                let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-                let mut images = Vec::with_capacity(finals.len());
-                for (output, latents) in finals.iter().enumerate() {
-                    mlx_gen::ios_quantum::diagnostic_metadata("sdxl", "serial-decode-start", &[
-                        ("schema", 1), ("output", output as u64),
-                        ("retained_latents", finals.len() as u64),
-                        ("retained_latent_bytes", finals.iter().map(mlx_gen::ios_quantum::bytes).sum()),
-                        ("completed_images", images.len() as u64),
-                    ]);
-                    if let Some(observer) = final_latent_observer.as_deref_mut() {
-                        observer(view.vae, latents, pid_ref)?;
-                    }
-                    mlx_gen::diagnostics::record_phase_boundary(
-                        mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
-                    );
-                    on_progress(Progress::Decoding);
-                    images.push(crate::pipeline::decode_image_tiled(
-                        view.vae,
-                        latents,
-                        pid_ref,
-                        decode_tiling.as_ref(),
-                        Some(&req.cancel),
-                    )?);
-                }
-                Ok(GenerationOutput::Images(images))
-            },
-        )
+                let prior = self.sampler.sample_prior(&self.latent_shape)?;
+                // PiD from_ldm early-stop (sc-8049): truncate to the VP-capture `keep` steps (see
+                // the img2img arm); clean path (`vp_plan = None`) keeps the full schedule.
+                let sampler = AncestralEuler::new(self.sampler, steps, max_time)?;
+                (prior, self.ancestral(sampler))
+            }
+        })
     }
+
+    /// An ancestral sampler truncated to the VP-capture `keep` steps when `from_ldm` asks for it.
+    fn ancestral(&self, sampler: AncestralEuler<'a>) -> SdxlInit<'a> {
+        SdxlInit::Ancestral {
+            sampler: Box::new(match &self.vp_plan {
+                Some(p) => sampler.truncate_to(p.keep - 1),
+                None => sampler,
+            }),
+        }
+    }
+
+    fn denoise_curated(
+        &self,
+        ms: &DiscreteModelSampling,
+        run_sigmas: &[f32],
+        init: mlx_rs::Array,
+        seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<mlx_rs::Array> {
+        let req = self.request.req;
+        let sampling = &self.request.sampling;
+        // PiD from_ldm early-stop (sc-8049): truncate the curated k-diffusion schedule to the
+        // VP-capture `keep` nodes so the solver stops at the achieved degrade σ; the clean path
+        // (`vp_plan = None`) runs the full schedule byte-identically.
+        let keep_sigmas: &[f32] = match &self.vp_plan {
+            Some(p) => &run_sigmas[..p.keep],
+            None => run_sigmas,
+        };
+        let (controls, ip) = self.guidance.curated_inputs();
+        // CFG++ (sc-8256): opt-in via `guidance_method == "cfg_pp"`, only with a CFG++-compatible
+        // base solver (euler/ddim/dpmpp_2m) and an active guidance gap (`cfg > 1`). Anything else —
+        // including `cfg_pp` on an incompatible sampler — falls back to the plain curated path (N3,
+        // never a hard-fail), so the default is byte-untouched.
+        let latents = if matches!(sampling.route(), crate::sampling::SamplingRoute::CfgPp(_)) {
+            denoise_cfgpp_with_preview(
+                self.unet,
+                Some(sampling.sampler_name()),
+                ms,
+                keep_sigmas,
+                init,
+                self.conditioning,
+                self.pooled,
+                self.time_ids,
+                sampling.guidance(),
+                &req.cancel,
+                on_progress,
+                &req.preview,
+                controls,
+                ip,
+                None,
+                self.request.forward_plan,
+            )?
+        } else {
+            denoise_curated_with_preview(
+                self.unet,
+                Some(sampling.sampler_name()),
+                ms,
+                keep_sigmas,
+                init,
+                self.conditioning,
+                self.pooled,
+                self.time_ids,
+                sampling.guidance(),
+                seed,
+                &req.cancel,
+                on_progress,
+                &req.preview,
+                controls,
+                ip,
+                None,
+                self.request.forward_plan,
+            )?
+        };
+        // Curated latents live in RAW VE σ-space (`x0+σ·ε`); an early-stop leaves x_k at σ>0, so map
+        // it into the student's VP frame with the plan's rescale (`1/√(1+σ²)`) before decode. The
+        // clean path (`vp_plan = None`) leaves it byte-identical. (sc-8049)
+        crate::stages::rescale_ve_capture(latents, self.vp_plan.as_ref())
+    }
+
+    fn denoise_ancestral(
+        &self,
+        sampler: &dyn DiffusionSampler,
+        blend: Option<&InpaintBlend>,
+        latents: mlx_rs::Array,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<mlx_rs::Array> {
+        let req = self.request.req;
+        let cfg = self.request.sampling.guidance();
+        let d = Denoiser::with_plan(self.unet, sampler, self.request.forward_plan);
+        if let Some(b) = blend {
+            return denoise_inpaint_with_preview(
+                &d,
+                latents,
+                self.conditioning,
+                self.pooled,
+                self.time_ids,
+                cfg,
+                &req.cancel,
+                on_progress,
+                &req.preview,
+                b,
+            );
+        }
+        match self.guidance {
+            SdxlGuidance::Ip { tokens, scale } => denoise_ip_with_preview(
+                &d,
+                latents,
+                self.conditioning,
+                self.pooled,
+                self.time_ids,
+                cfg,
+                &req.cancel,
+                on_progress,
+                &req.preview,
+                tokens,
+                *scale,
+            ),
+            SdxlGuidance::Control(contexts) => denoise_multi_control_with_preview(
+                &d,
+                latents,
+                self.conditioning,
+                self.pooled,
+                self.time_ids,
+                cfg,
+                &req.cancel,
+                on_progress,
+                &req.preview,
+                contexts,
+            ),
+            SdxlGuidance::Plain => denoise_with_preview(
+                &d,
+                latents,
+                self.conditioning,
+                self.pooled,
+                self.time_ids,
+                cfg,
+                &req.cancel,
+                on_progress,
+                &req.preview,
+            ),
+        }
+    }
+}
+
+/// Phase C (stage 4): decode every retained final latent, in order, through the VAE (or the PiD
+/// decoder minted in phase B), offering each to the correctness-only observer first.
+fn decode_phase(
+    view: &SdxlDecodeView<'_>,
+    (finals, pid_decoder): SdxlDenoised,
+    final_latent_observer: &mut Option<FinalLatentObserver<'_>>,
+    decode_tiling: Option<&mlx_gen::tiling::TilingConfig>,
+    cancel: &mlx_gen::CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<GenerationOutput> {
+    let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+    let mut images = Vec::with_capacity(finals.len());
+    for (output, latents) in finals.iter().enumerate() {
+        mlx_gen::ios_quantum::diagnostic_metadata(
+            "sdxl",
+            "serial-decode-start",
+            &[
+                ("schema", 1),
+                ("output", output as u64),
+                ("retained_latents", finals.len() as u64),
+                (
+                    "retained_latent_bytes",
+                    finals.iter().map(mlx_gen::ios_quantum::bytes).sum(),
+                ),
+                ("completed_images", images.len() as u64),
+            ],
+        );
+        if let Some(observer) = final_latent_observer.as_deref_mut() {
+            observer(view.vae, latents, pid_ref)?;
+        }
+        mlx_gen::diagnostics::record_phase_boundary(
+            mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
+        );
+        images.push(crate::stages::decode_output(
+            view.vae,
+            latents,
+            pid_ref,
+            decode_tiling,
+            cancel,
+            on_progress,
+        )?);
+    }
+    Ok(GenerationOutput::Images(images))
 }
 
 impl Sdxl {
@@ -2123,6 +2472,56 @@ pub const ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryReg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-27336: the typed SDXL mode matrix — which role the Reference / Mask / Control inputs
+    /// play — weights-free.
+    #[test]
+    fn mode_matrix_assigns_each_image_role_once() {
+        let image = Image::default();
+        let mask = Image::default();
+        let reference = Some((&image, Some(0.4)));
+        assert!(matches!(
+            SdxlMode::resolve(true, None, None, 0, false),
+            SdxlMode::Txt2Img
+        ));
+        assert!(matches!(
+            SdxlMode::resolve(false, None, None, 2, true),
+            SdxlMode::Control { init: None }
+        ));
+        // Loaded IP weights + a bare Reference: the image prompt, its strength the IP scale.
+        assert!(matches!(
+            SdxlMode::resolve(true, reference, None, 0, false),
+            SdxlMode::Ip { scale, .. } if scale == 0.4
+        ));
+        assert!(matches!(
+            SdxlMode::resolve(true, Some((&image, None)), None, 0, false),
+            SdxlMode::Ip { scale, .. } if scale == IP_DEFAULT_SCALE
+        ));
+        // Without IP weights the Reference is the init.
+        assert!(matches!(
+            SdxlMode::resolve(false, reference, None, 0, false),
+            SdxlMode::Img2Img { strength: Some(s), .. } if s == 0.4
+        ));
+        // A mask or a control owns the request even with IP weights loaded.
+        assert!(matches!(
+            SdxlMode::resolve(true, reference, Some(&mask), 0, false),
+            SdxlMode::Inpaint { strength: Some(s), .. } if s == 0.4
+        ));
+        assert!(matches!(
+            SdxlMode::resolve(true, reference, None, 1, false),
+            SdxlMode::Control { init: Some(_) }
+        ));
+        // Acceleration is txt2img-only: its Reference is refused by `validate_image_roles` and is
+        // never an init here.
+        assert!(validate_image_roles("lightning", true, false, true, false).is_err());
+        assert!(matches!(
+            SdxlMode::resolve(false, reference, None, 0, true),
+            SdxlMode::Txt2Img
+        ));
+        // A Mask needs its Reference, and never combines with Control.
+        assert!(validate_image_roles("euler_ancestral", false, false, false, true).is_err());
+        assert!(validate_control_roles("euler_ancestral", None, 1, 1, true).is_err());
+    }
 
     /// Feature-end review (SC-22667, E1): the snapshot footprint must price the exact file each
     /// component load resolves, at the width that load materializes it in.
