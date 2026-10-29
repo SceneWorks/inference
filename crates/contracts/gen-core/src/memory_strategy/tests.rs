@@ -277,7 +277,7 @@ fn implemented(strategy: MemoryStrategy) -> MemoryStrategyCapability {
     }
 }
 
-fn adopted_contract() -> MemoryProviderContract {
+pub(super) fn adopted_contract() -> MemoryProviderContract {
     let mut strategies: Vec<_> = MemoryStrategy::ALL.into_iter().map(implemented).collect();
     strategies[2].parameters.decode_tile_edges = vec![512, 384];
     strategies[2].parameters.decode_overlaps = vec![64];
@@ -326,7 +326,7 @@ fn adopted_contract() -> MemoryProviderContract {
     }
 }
 
-fn admitted_context(contract: &MemoryProviderContract) -> MemoryRunContext {
+pub(super) fn admitted_context(contract: &MemoryProviderContract) -> MemoryRunContext {
     let calibration = contract.calibration.as_ref().expect("calibration");
     MemoryRunContext {
         reference_resources: None,
@@ -1155,7 +1155,7 @@ fn standard_safety_check_runs_tier_route_and_budget_gates() {
     ));
 }
 
-fn pid_contract() -> MemoryProviderContract {
+pub(super) fn pid_contract() -> MemoryProviderContract {
     let mut contract = adopted_contract();
     contract.strategies[2].parameters.decode_tile_edges = vec![512, 2048];
     contract.strategies[2].parameters.decode_overlaps = vec![64, 256];

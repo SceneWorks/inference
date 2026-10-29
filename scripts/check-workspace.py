@@ -2754,6 +2754,305 @@ def check_candle_gen_raw_mmap_seam(root: Path) -> None:
         )
 
 
+# --- sc-27307 (F-328): provider memory-strategy skeletons are hoisted into gen-core's
+# `ProviderMemoryProfile`. A provider supplies a profile (data plus explicit override hooks) and the
+# `standard_*` functions own each skeleton once. A skeleton function a provider still defines counts
+# as BESPOKE unless its body delegates to a profile (names a `*PROFILE` const); the bespoke set is a
+# ratchet: a new bespoke copy fails, and so does an allowlisted entry that has since been converted
+# (delete it). Every entry names the genuine implementation difference that keeps it bespoke.
+# Every provider source file: most skeletons live in `memory_strategy.rs`, but sibling routes keep
+# theirs in `block_memory_strategy.rs`, `memory_strategy_2_5.rs`, `i2v_memory_strategy.rs`, `lib.rs`
+# or `model.rs`, and a ratchet that only watched one file name would invite the next copy elsewhere.
+MEMORY_PROFILE_SOURCE_ROOT = Path("crates/media")
+MEMORY_PROFILE_SOURCE_GLOB = "*/*/src/**/*.rs"
+MEMORY_PROFILE_SKELETONS = (
+    "architecture_facts",
+    "safety_check",
+    "registered_safety_check",
+    "registered_begin_request",
+    "registered_valid_fixture",
+    "production_calibration_fingerprint",
+)
+MEMORY_PROFILE_SKELETON_FN = re.compile(
+    r"\bfn\s+(" + "|".join(MEMORY_PROFILE_SKELETONS) + r")\b\s*[<(]"
+)
+MEMORY_PROFILE_DELEGATION = re.compile(r"\b[A-Z][A-Z0-9_]*PROFILE\b")
+# One shared reason: MLX publishes preset-mirrored geometry with no weights-free guard to hoist.
+_MLX_PRESET_ARCHITECTURE = (
+    "per-model geometry derived from crate presets or configs; MLX publishes it without the weights-free Snapshot guard, so this is data with no skeleton"
+)
+BESPOKE_MEMORY_SKELETONS: dict[tuple[str, str], str] = {
+    ("candle-gen-anima", "registered_begin_request"): (
+        "route gate binds the context overlay to the loaded adapter-stack identity derived from the LoadSpec, which a contract+context+tier gate cannot see"
+    ),
+    ("candle-gen-anima", "safety_check"): (
+        "route gate binds the context overlay to the loaded adapter-stack identity derived from the LoadSpec, which a contract+context+tier gate cannot see"
+    ),
+    ("candle-gen-chroma", "registered_valid_fixture"): (
+        "estimate-authority StagedResidency fixture bound to a synthesized exact turnkey LoadSpec"
+    ),
+    ("candle-gen-flux3", "architecture_facts"): (
+        "reads the already-parsed package Flux3Config the caller resolved, not a snapshot root"
+    ),
+    ("candle-gen-ideogram", "registered_valid_fixture"): (
+        "multi-route probe that keeps the first route its own validate_route admits, bound to a synthesized exact LoadSpec"
+    ),
+    ("candle-gen-instantid", "architecture_facts"): (
+        "snapshot proof is InstantIdPaths.sdxl_base, not the LoadSpec weights directory"
+    ),
+    ("candle-gen-instantid", "safety_check"): (
+        "gate binds the prepared InstantIdMemoryIdentity (PiD, face-restore, overlay key)"
+    ),
+    ("candle-gen-kolors", "architecture_facts"): (
+        "takes the caller's sealed snapshot root, not the LoadSpec weights directory"
+    ),
+    ("candle-gen-krea", "architecture_facts"): (
+        "snapshot root also resolves from BASE_SNAPSHOT_COMPONENT on single-file import routes, which the Snapshot guard (weights dir only) does not"
+    ),
+    ("candle-gen-ltx", "architecture_facts"): (
+        "LTX-2.5 derivation reads the caller-resolved Option<&LtxBundle>, not just the snapshot root"
+    ),
+    ("candle-gen-ltx", "registered_begin_request"): (
+        "LTX-2.5 gate binds the context overlay to the loaded adapter-stack identity, which a contract+context+tier gate cannot see"
+    ),
+    ("candle-gen-ltx", "registered_safety_check"): (
+        "LTX-2.5 gate binds the context overlay to the loaded adapter-stack identity, which a contract+context+tier gate cannot see"
+    ),
+    ("candle-gen-ltx", "safety_check"): (
+        "LTX-2.5 gate binds the context overlay to the loaded adapter-stack identity, which a contract+context+tier gate cannot see"
+    ),
+    ("candle-gen-minimax-h3", "architecture_facts"): (
+        "reads the DiT partition the component resolver charged, which can live outside the snapshot root"
+    ),
+    ("candle-gen-minimax-h3", "safety_check"): (
+        "deliberately tier-blind gen-core default for an uncalibrated resident-only route; a profile always binds a loaded tier"
+    ),
+    ("candle-gen-moss-image", "architecture_facts"): (
+        "geometry is read from the authenticated Sources package config, not a snapshot root"
+    ),
+    ("candle-gen-moss-image", "safety_check"): (
+        "before-gate reads the raw LoadSpec edit component to admit one to four edit references"
+    ),
+    ("candle-gen-qwen-image", "architecture_facts"): (
+        "guard accepts an existing single-file ComfyUI import as a resolved pipeline; the Snapshot source accepts directories only"
+    ),
+    ("candle-gen-sana", "registered_begin_request"): (
+        "admission runs through the sealed snapshot and the stateful AdmissionRegistry"
+    ),
+    ("candle-gen-sana", "registered_safety_check"): (
+        "admission runs through the sealed snapshot and the stateful AdmissionRegistry"
+    ),
+    ("candle-gen-sana", "registered_valid_fixture"): (
+        "fixtures override the evidence revision to the sealed request revision"
+    ),
+    ("candle-gen-sana", "safety_check"): (
+        "admission runs through the sealed snapshot and the stateful AdmissionRegistry, which clears on refusal"
+    ),
+    ("candle-gen-scail2", "production_calibration_fingerprint"): (
+        "spelled from the same CALIBRATION_* consts the artifact receipt hashes, so the consts stay the single source"
+    ),
+    ("candle-gen-scail2", "safety_check"): (
+        "binds the sealed artifact receipt and its PreparedMemory identity"
+    ),
+    ("candle-gen-sd3", "production_calibration_fingerprint"): (
+        "already a const fn lookup returning one static fingerprint per route, with no tier axis"
+    ),
+    ("candle-gen-sd3", "registered_begin_request"): (
+        "sealed receipt plus the stateful AdmissionRegistry"
+    ),
+    ("candle-gen-sd3", "registered_safety_check"): (
+        "tier and route come from a sealed artifact receipt validated against the caller's contract"
+    ),
+    ("candle-gen-sd3", "registered_valid_fixture"): (
+        "estimated-authority fixtures with their own budget, geometry and evidence revision"
+    ),
+    ("candle-gen-sdxl", "registered_begin_request"): (
+        "binds SdxlArtifactSeal, or the spec's overlay identity on the weights-free path"
+    ),
+    ("candle-gen-sdxl", "registered_safety_check"): (
+        "binds SdxlArtifactSeal, or the spec's overlay identity on the weights-free path"
+    ),
+    ("candle-gen-sdxl", "safety_check"): (
+        "binds SdxlArtifactSeal, refusing an optimized context without one"
+    ),
+    ("candle-gen-sensenova", "registered_valid_fixture"): (
+        "route set depends on the strategy (VQA has no rung-4 route) as well as the provider id"
+    ),
+    ("candle-gen-supra2", "architecture_facts"): (
+        "already a one-line delegate to the shared gen_core::supra2::memory_architecture_facts over the resolved bundle config"
+    ),
+    ("candle-gen-svd", "safety_check"): (
+        "validates against the PreparedSvdMemory receipt"
+    ),
+    ("candle-gen-wan", "architecture_facts"): (
+        "I2V derivation is a per-route preset or loader parse keyed by WanI2vRoute, not a LoadSpec"
+    ),
+    ("candle-gen-wan", "safety_check"): (
+        "I2V admission is the shared gen_core::wan_i2v_memory::validate_context over a PreparedWanI2vMemory receipt"
+    ),
+    ("mlx-gen-anima", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-bernini", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-bernini", "registered_valid_fixture"): (
+        "multi-request v2v/r2v/rv2v/mv2v/ads2v fixture assembly with provider requests and reference receipts"
+    ),
+    ("mlx-gen-chroma", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-chroma", "registered_begin_request"): (
+        "route gate reads the loaded LoadSpec (route mode, references, overlay, PiD overlay)"
+    ),
+    ("mlx-gen-chroma", "safety_check"): (
+        "route gate reads the loaded LoadSpec (route mode, references, overlay, PiD overlay)"
+    ),
+    ("mlx-gen-flux", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-flux", "registered_begin_request"): (
+        "route gate reads the loaded LoadSpec (route mode, references, overlay, PiD overlay)"
+    ),
+    ("mlx-gen-flux", "registered_safety_check"): (
+        "route gate reads the loaded LoadSpec (route mode, references, overlay, PiD overlay)"
+    ),
+    ("mlx-gen-flux", "registered_valid_fixture"): (
+        "route, PiD flag, overlay and request conditioning all derive from the LoadSpec (control, IP-Adapter)"
+    ),
+    ("mlx-gen-flux", "safety_check"): (
+        "route gate reads the loaded LoadSpec (route mode, references, overlay, PiD overlay)"
+    ),
+    ("mlx-gen-flux2", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-flux2", "safety_check"): (
+        "decision rewrite: a budget rejection becomes a user-facing unified-memory sizing message"
+    ),
+    ("mlx-gen-flux3", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-ideogram", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-instantid", "safety_check"): (
+        "gate binds the prepared InstantIdMemoryIdentity (PiD, face-restore, overlay key)"
+    ),
+    ("mlx-gen-iris", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-krea", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-krea", "registered_valid_fixture"): (
+        "synthesizes executable requests per route set, with a raw-only phased route and per-route PiD permission"
+    ),
+    ("mlx-gen-krea-realtime", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-krea-realtime", "safety_check"): (
+        "re-derives the expected contract from the LoadSpec and binds sealed artifact and request receipts"
+    ),
+    ("mlx-gen-lens", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-ltx", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-ltx", "registered_begin_request"): (
+        "gate binds the context to the loaded route's overlay receipt derived from the LoadSpec"
+    ),
+    ("mlx-gen-ltx", "registered_safety_check"): (
+        "gate binds the context to the loaded route's overlay receipt derived from the LoadSpec"
+    ),
+    ("mlx-gen-ltx", "safety_check"): (
+        "gate binds the context to the loaded route's overlay receipt derived from the LoadSpec"
+    ),
+    ("mlx-gen-mage", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-mage", "registered_begin_request"): (
+        "admission is Mage's own request_context_error plus a resident fit gate, not the shared pipeline"
+    ),
+    ("mlx-gen-mage", "registered_valid_fixture"): (
+        "fixture tier carries component precision floors and overrides peak and budget from the generation-peak table"
+    ),
+    ("mlx-gen-minimax-h3", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-qwen-image", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-qwen-image-2-1", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-sana", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-scail2", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-scail2", "safety_check"): (
+        "validates the prepared artifact receipt and PreparedMemory identity"
+    ),
+    ("mlx-gen-sd3", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-sdxl", "architecture_facts"): (
+        "a pure function over a UNetConfig/VaeConfig pair shared with kolors: per-model config data, no skeleton"
+    ),
+    ("mlx-gen-sensenova", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-svd", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-svd", "safety_check"): (
+        "validates against the PreparedSvdMemory receipt"
+    ),
+    ("mlx-gen-wan", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+    ("mlx-gen-wan", "safety_check"): (
+        "I2V admission is the shared gen_core::wan_i2v_memory::validate_context over a PreparedWanI2vMemory receipt"
+    ),
+    ("mlx-gen-z-image", "architecture_facts"): _MLX_PRESET_ARCHITECTURE,
+}
+
+
+def _fn_body_span(text: str, signature_end: int) -> tuple[int, int] | None:
+    """Span of the body of the fn whose signature starts before ``signature_end``.
+
+    ``None`` for a body-less declaration (a trait method signature ending in ``;``).
+    """
+    depth = 0
+    index = signature_end
+    while index < len(text):
+        char = text[index]
+        if char in "([<":
+            depth += 1
+        elif char in ")]>":
+            depth -= 1
+        elif char == ";" and depth <= 0:
+            return None
+        elif char == "{" and depth <= 0:
+            return index, _match_brace(text, index)
+        index += 1
+    return None
+
+
+def bespoke_memory_skeletons(root: Path) -> dict[tuple[str, str], list[str]]:
+    """Production skeleton definitions that do not delegate to a `ProviderMemoryProfile`."""
+    found: dict[tuple[str, str], list[str]] = {}
+    base = root / MEMORY_PROFILE_SOURCE_ROOT
+    if not base.is_dir():
+        return found
+    test_only = _test_only_files(base)
+    for path in sorted(base.glob(MEMORY_PROFILE_SOURCE_GLOB)):
+        relative = path.relative_to(root)
+        parts = path.relative_to(base).parts
+        if (
+            path in test_only
+            or path.name == "tests.rs"
+            or path.stem.endswith("_tests")
+            or not SOURCE_LINT_IGNORED_PARTS.isdisjoint(parts)
+            or not TEST_TARGET_DIRS.isdisjoint(parts[3:])
+        ):
+            continue
+        crate = parts[1]
+        raw = path.read_text(encoding="utf-8")
+        text = strip_rust_comments(_blank_spans(raw, _cfg_test_spans(raw)), strip_literals=True)
+        for match in MEMORY_PROFILE_SKELETON_FN.finditer(text):
+            span = _fn_body_span(text, match.end() - 1)
+            if span is None or MEMORY_PROFILE_DELEGATION.search(text[span[0] : span[1]]):
+                continue
+            found.setdefault((crate, match.group(1)), []).append(
+                f"{relative}:{_line_of(text, match.start())}"
+            )
+    return found
+
+
+def memory_profile_ratchet_errors(root: Path) -> list[str]:
+    found = bespoke_memory_skeletons(root)
+    errors = [
+        f"{crate}::{skeleton} is a new bespoke memory-strategy skeleton ({', '.join(sites)}); "
+        "supply a `ProviderMemoryProfile` and delegate to its `standard_*` function, or add an "
+        "allowlist entry naming the genuine implementation difference"
+        for (crate, skeleton), sites in sorted(found.items())
+        if (crate, skeleton) not in BESPOKE_MEMORY_SKELETONS
+    ]
+    errors += [
+        f"{crate}::{skeleton} no longer defines a bespoke skeleton; delete its "
+        "BESPOKE_MEMORY_SKELETONS entry so the ratchet tightens"
+        for crate, skeleton in sorted(BESPOKE_MEMORY_SKELETONS)
+        if (crate, skeleton) not in found
+    ]
+    return errors
+
+
+def check_memory_profile_ratchet(root: Path) -> None:
+    """Fail when the set of bespoke provider memory-strategy skeletons moves (sc-27307)."""
+    errors = memory_profile_ratchet_errors(root)
+    if errors:
+        fail("provider memory-strategy skeleton ratchet (sc-27307):\n  " + "\n  ".join(errors))
+
+
 def _rust_const_declarations(source: str) -> dict[str, str]:
     """Map every visibility-carrying ``const`` in a Rust source to its value text.
 
@@ -3635,6 +3934,7 @@ def main() -> int:
         check_audio_hub_layout_derivation(ROOT)
         check_test_temp_dir_guards(ROOT)
         check_candle_gen_raw_mmap_seam(ROOT)
+        check_memory_profile_ratchet(ROOT)
         check_cross_backend_geometry(metadata, ROOT)
     except (AssertionError, json.JSONDecodeError) as error:
         print(f"workspace gate: FAIL: {error}", file=sys.stderr)
@@ -3649,6 +3949,7 @@ def main() -> int:
         "no $HOME-derived snapshot paths, no audio hub-layout re-derivations, "
         "no unguarded test temp roots, "
         "no raw candle-gen mmap sites outside the loader seam, "
+        "no new bespoke provider memory-strategy skeletons, "
         "no cross-backend geometry drift)"
     )
     return 0

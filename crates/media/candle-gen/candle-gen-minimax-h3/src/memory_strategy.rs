@@ -1131,9 +1131,26 @@ pub fn calibration_tier_label(bits: Option<i32>) -> Option<&'static str> {
 fn production_calibration_fingerprint(components: &ComponentBytes) -> Option<String> {
     let dit_dir = components.dit_dir.as_ref()?;
     let bits = crate::tier::MiniMaxH3TierPaths::staged_bits(dit_dir).ok()?;
-    let tier = calibration_tier_label(bits)?;
-    Some(format!("minimax-h3-{tier}-candle-staged-joint-av-v1"))
+    Some(
+        MEMORY_PROFILE
+            .fingerprint?
+            .render("", calibration_tier_label(bits)?),
+    )
 }
+
+/// The Candle MiniMax-H3 memory profile (sc-27307). Only the fingerprint spelling is profile
+/// data: the safety check is the deliberately tier-blind shared default (no optimized rung, no
+/// route gate), and the architecture facts read the DiT partition the component resolver charged,
+/// which may sit outside the snapshot root.
+const MEMORY_PROFILE: candle_gen::gen_core::ProviderMemoryProfile =
+    candle_gen::gen_core::ProviderMemoryProfile {
+        fingerprint: Some(candle_gen::gen_core::MemoryFingerprintTable {
+            template: "minimax-h3-{tier}-candle-staged-joint-av-v1",
+            routes: &[(MODEL_ID, "")],
+            pins: &[],
+        }),
+        ..candle_gen::gen_core::ProviderMemoryProfile::STANDARD
+    };
 
 fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
     MemoryProviderContract {

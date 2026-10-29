@@ -36,11 +36,12 @@
 //! namespace, which can never equal a production string.
 
 use mlx_gen::gen_core::{
-    standard_memory_strategy_safety_check, Error as CoreError, MemoryBackendRealization,
-    MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryPhase, MemoryProviderContract,
-    MemoryRequestScope, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategySupport, Result as CoreResult,
+    standard_safety_check, Error as CoreError, MemoryBackendRealization, MemoryCalibrationIdentity,
+    MemoryFingerprintTable, MemoryFixturePhases, MemoryFixtureRoute, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryPhase,
+    MemoryProfileFixtures, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, ProviderMemoryProfile,
+    Result as CoreResult,
 };
 use mlx_gen::{LoadSpec, OffloadPolicy, Precision, Quant, WeightsSource};
 
@@ -96,12 +97,27 @@ fn validate_provider(provider_id: &str) -> CoreResult<()> {
 
 /// The kebab route token for a registered provider id, or `None` for an id this crate does not own.
 fn route_label(provider_id: &str) -> Option<&'static str> {
-    match provider_id {
-        crate::MODEL_ID => Some("ideogram-4"),
-        crate::MODEL_ID_TURBO => Some("ideogram-4-turbo"),
-        _ => None,
-    }
+    MEMORY_PROFILE.fingerprint?.route(provider_id)
 }
+
+/// The Ideogram MLX memory profile (sc-27307): the requested tier with no provider gate, one
+/// text-to-image fixture per implemented optimized rung (staged when it engages rung 1 — rung 1 IS
+/// the phase schedule here), and the production fingerprint spelling.
+const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    fixtures: MemoryProfileFixtures::routes(&[
+        MemoryFixtureRoute::TEXT_TO_IMAGE.with_phases(MemoryFixturePhases::WhenStaged)
+    ])
+    .implemented_only(),
+    fingerprint: Some(MemoryFingerprintTable {
+        template: "{route}-{tier}-mlx-shared-ladder-v1",
+        routes: &[
+            (crate::MODEL_ID, "ideogram-4"),
+            (crate::MODEL_ID_TURBO, "ideogram-4-turbo"),
+        ],
+        pins: &[],
+    }),
+    ..ProviderMemoryProfile::STANDARD
+};
 
 /// The label a PROVEN artifact tier carries inside a production calibration string.
 ///
@@ -297,9 +313,9 @@ pub fn production_calibration_fingerprint(
     provider_id: &str,
     artifact_tier: Option<Quant>,
 ) -> Option<String> {
-    let route = route_label(provider_id)?;
-    let tier = calibration_tier_label(artifact_tier)?;
-    Some(format!("{route}-{tier}-mlx-shared-ladder-v1"))
+    MEMORY_PROFILE
+        .fingerprint?
+        .fingerprint(provider_id, calibration_tier_label(artifact_tier)?)
 }
 
 /// Per-surface static behavior identity for the weights-free declaration surface.
@@ -516,15 +532,15 @@ pub(crate) fn safety_check(
     quant: Option<Quant>,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    standard_memory_strategy_safety_check(
+    standard_safety_check(
+        &MEMORY_PROFILE,
         contract,
         context,
-        Some(MemoryNumericTier {
+        MemoryNumericTier {
             precision,
             quant,
             component_precision_floors: &[],
-        }),
-        None,
+        },
     )
 }
 
@@ -533,7 +549,7 @@ pub(crate) fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check(contract, spec.precision, spec.quantize, context)
+    mlx_gen::gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 pub(crate) fn registered_valid_fixture(
@@ -541,27 +557,7 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> CoreResult<Vec<mlx_gen::gen_core::MemoryBehaviorFixture>> {
-    if !strategy.is_optimized()
-        || contract
-            .capability(strategy)
-            .is_none_or(|capability| capability.support != MemoryStrategySupport::Implemented)
-    {
-        return Ok(Vec::new());
-    }
-    let context = mlx_gen::gen_core::standard_memory_behavior_context(
-        contract,
-        strategy,
-        mlx_gen::request_scope::loaded_tier(spec),
-        mlx_gen::gen_core::MemoryBehaviorRoute {
-            mode: mlx_gen::gen_core::MemoryMode::TextToImage,
-            reference_count: 0,
-            use_pid: false,
-            // Read off the contract this fixture is built for: rung 1 IS the phase schedule here.
-            has_phases: contract.engages(strategy, MemoryStrategy::StagedResidency),
-            overlay: None,
-        },
-    )?;
-    Ok(vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(context)])
+    mlx_gen::gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 /// The refusal a bounded-decode selection earns on this provider.
@@ -618,11 +614,28 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    mlx_gen::gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_tier: MemoryNumericTier,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     begin_request_with_cleanup(
         provider_id,
         contract,
-        spec.precision,
-        spec.quantize,
+        loaded_tier.precision,
+        loaded_tier.quant,
         context,
         mlx_gen::request_scope::MlxScopeCleanup::None,
     )
@@ -1048,6 +1061,56 @@ mod tests {
                 "{provider}"
             );
             assert!(production_calibration_fingerprint(provider, None).is_none());
+        }
+    }
+}
+
+/// sc-27307: every published production calibration fingerprint, byte for byte, so moving the
+/// spelling onto the shared `MemoryFingerprintTable` cannot restamp a record.
+#[cfg(test)]
+mod sc27307_fingerprint_pins {
+    use super::*;
+
+    #[test]
+    fn every_fingerprint_cell_is_pinned() {
+        for (provider, quant, expected) in [
+            (
+                crate::MODEL_ID,
+                None,
+                Some("ideogram-4-bf16-mlx-shared-ladder-v1"),
+            ),
+            (
+                crate::MODEL_ID,
+                Some(Quant::Q4),
+                Some("ideogram-4-q4-mlx-shared-ladder-v1"),
+            ),
+            (
+                crate::MODEL_ID,
+                Some(Quant::Q8),
+                Some("ideogram-4-q8-mlx-shared-ladder-v1"),
+            ),
+            (crate::MODEL_ID, Some(Quant::Nvfp4), None),
+            (
+                crate::MODEL_ID_TURBO,
+                None,
+                Some("ideogram-4-turbo-bf16-mlx-shared-ladder-v1"),
+            ),
+            (
+                crate::MODEL_ID_TURBO,
+                Some(Quant::Q4),
+                Some("ideogram-4-turbo-q4-mlx-shared-ladder-v1"),
+            ),
+            (
+                crate::MODEL_ID_TURBO,
+                Some(Quant::Q8),
+                Some("ideogram-4-turbo-q8-mlx-shared-ladder-v1"),
+            ),
+            ("ideogram_unknown", Some(Quant::Q4), None),
+        ] {
+            assert_eq!(
+                production_calibration_fingerprint(provider, quant).as_deref(),
+                expected
+            );
         }
     }
 }

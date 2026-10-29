@@ -619,18 +619,32 @@ pub fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) ->
     if !has_base_cell(provider_id, spec) {
         return None;
     }
-    let route = match provider_id {
-        crate::FLUX1_SCHNELL_ID => "schnell",
-        crate::FLUX1_DEV_ID => "dev",
-        _ => return None,
-    };
+    let table = MEMORY_PROFILE.fingerprint?;
+    let route = table.route(provider_id)?;
     let tier = calibration_tier_label(spec)?;
-    Some(if provider_id == crate::FLUX1_DEV_ID && tier == "q4" {
-        MEMORY_CALIBRATION_FINGERPRINT.to_owned()
-    } else {
-        format!("flux1-{route}-{tier}-mlx-shared-ladder-v1")
-    })
+    Some(table.render(route, tier))
 }
+
+/// The FLUX.1 MLX memory profile (sc-27307). Only the fingerprint spelling is profile data: the
+/// safety gate, fixtures and begin path read the loaded `LoadSpec` (the route mode, references and
+/// overlay it implies, and its PiD overlay), which a profile gate deliberately cannot see, so they
+/// stay provider-owned.
+const MEMORY_PROFILE: mlx_gen::gen_core::ProviderMemoryProfile =
+    mlx_gen::gen_core::ProviderMemoryProfile {
+        fingerprint: Some(mlx_gen::gen_core::MemoryFingerprintTable {
+            template: "flux1-{route}-{tier}-mlx-shared-ladder-v1",
+            routes: &[
+                (crate::FLUX1_SCHNELL_ID, "schnell"),
+                (crate::FLUX1_DEV_ID, "dev"),
+            ],
+            pins: &[mlx_gen::gen_core::MemoryFingerprintPin {
+                route: "dev",
+                tier: "q4",
+                fingerprint: MEMORY_CALIBRATION_FINGERPRINT,
+            }],
+        }),
+        ..mlx_gen::gen_core::ProviderMemoryProfile::STANDARD
+    };
 
 /// Fail closed unless the real-weight runner is bound to the exact measured production key.
 pub fn validate_runner_gate(
@@ -2389,5 +2403,64 @@ mod tests {
             registered_safety_check(&spec, &runtime, &context),
             MemorySafetyDecision::Reject { .. }
         ));
+    }
+}
+
+/// sc-27307: every published production calibration fingerprint, byte for byte, so moving the
+/// spelling onto the shared `MemoryFingerprintTable` cannot restamp a record.
+#[cfg(test)]
+mod sc27307_fingerprint_pins {
+    use super::*;
+
+    #[test]
+    fn every_fingerprint_cell_is_pinned() {
+        let base = LoadSpec::new(mlx_gen::WeightsSource::Dir("/sc27307-flux-pin".into()));
+        let q4 = base.clone().with_quant(mlx_gen::Quant::Q4);
+        let q8 = base.clone().with_quant(mlx_gen::Quant::Q8);
+        for (provider, spec, expected) in [
+            (
+                crate::FLUX1_DEV_ID,
+                &base,
+                Some("flux1-dev-bf16-mlx-shared-ladder-v1"),
+            ),
+            (
+                crate::FLUX1_DEV_ID,
+                &q4,
+                Some("flux1-dev-q4-mlx-shared-ladder-2026-08-03-v1"),
+            ),
+            (
+                crate::FLUX1_DEV_ID,
+                &q8,
+                Some("flux1-dev-q8-mlx-shared-ladder-v1"),
+            ),
+            (
+                crate::FLUX1_SCHNELL_ID,
+                &base,
+                Some("flux1-schnell-bf16-mlx-shared-ladder-v1"),
+            ),
+            (
+                crate::FLUX1_SCHNELL_ID,
+                &q4,
+                Some("flux1-schnell-q4-mlx-shared-ladder-v1"),
+            ),
+            (
+                crate::FLUX1_SCHNELL_ID,
+                &q8,
+                Some("flux1-schnell-q8-mlx-shared-ladder-v1"),
+            ),
+            (crate::FLUX1_DEV_CONTROL_ID, &q4, None),
+            ("flux1_unknown", &q4, None),
+        ] {
+            assert_eq!(
+                production_calibration_fingerprint(provider, spec).as_deref(),
+                expected,
+                "{provider}"
+            );
+        }
+        let nvfp4 = base.clone().with_quant(mlx_gen::Quant::Nvfp4);
+        assert_eq!(
+            production_calibration_fingerprint(crate::FLUX1_DEV_ID, &nvfp4),
+            None
+        );
     }
 }

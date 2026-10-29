@@ -972,11 +972,31 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// publishes `MemoryArchitectureFacts::default()`: nothing that *would* be loaded is resolved
 /// there, so no axis is knowable.
 fn architecture_facts(route: Sd35Route, spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    gen_core::standard_architecture_facts(&MEMORY_PROFILE, route.provider_id(), spec)
+}
+
+/// The Candle SD3.5 memory profile (sc-27307). Admission, fixtures and `begin_request` stay
+/// provider-owned: they bind the sealed artifact receipt and the stateful [`AdmissionRegistry`]
+/// under a structural-estimate handshake, which the profile's contract/context/tier hooks cannot
+/// carry. The profile owns the snapshot-guarded architecture facts.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn architecture_facts_from_snapshot(
+    provider_id: &str,
+    _root: &std::path::Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    if af::snapshot_root(spec).is_none() {
+    // `provider_id` is the route's own id (`architecture_facts`), so it always resolves.
+    let Ok(route) = Sd35Route::from_provider(provider_id) else {
         return gen_core::MemoryArchitectureFacts::default();
-    }
+    };
     // The same variant -> preset selection `pipeline::Variant::config` performs at load.
     let config = match route {
         Sd35Route::Large | Sd35Route::LargeTurbo => crate::config::Sd3Config::large(),

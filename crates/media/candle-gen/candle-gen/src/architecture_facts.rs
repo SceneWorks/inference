@@ -37,11 +37,12 @@ use serde_json::Value;
 ///   instead degrades per axis: an empty directory yields `None` for every axis it would have read.
 ///
 /// A single-file import is likewise not a component snapshot.
+///
+/// The predicate itself is [`gen_core::resolved_snapshot_root`], the guard
+/// [`gen_core::standard_architecture_facts`] applies to a provider profile's
+/// [`gen_core::MemoryArchitectureSource::Snapshot`] derivation (sc-27307).
 pub fn snapshot_root(spec: &gen_core::LoadSpec) -> Option<&Path> {
-    match &spec.weights {
-        gen_core::WeightsSource::Dir(root) if root.is_dir() => Some(root.as_path()),
-        _ => None,
-    }
+    gen_core::resolved_snapshot_root(spec)
 }
 
 /// Narrow a geometry constant the loader already holds — a field of the crate's own model config

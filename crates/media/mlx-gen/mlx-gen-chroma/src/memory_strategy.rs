@@ -642,16 +642,32 @@ pub fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) ->
     if !has_base_cell(provider_id, spec) {
         return None;
     }
-    let route = variant_for(provider_id).ok()?.id().replace("chroma1_", "");
+    let table = MEMORY_PROFILE.fingerprint?;
+    let route = table.route(provider_id)?;
     let tier = calibration_tier_label(requested_tier(spec))?;
-    Some(
-        if provider_id == crate::CHROMA1_BASE_ID && tier == CALIBRATED_TIER {
-            MEMORY_CALIBRATION_FINGERPRINT.to_owned()
-        } else {
-            format!("chroma1-{route}-{tier}-mlx-shared-ladder-v1")
-        },
-    )
+    Some(table.render(route, tier))
 }
+
+/// The Chroma MLX memory profile (sc-27307). Only the fingerprint spelling is profile data: the
+/// safety gate and the begin path read the loaded `LoadSpec` (its route mode, overlay and PiD
+/// overlay), which a profile gate deliberately cannot see, so they stay provider-owned.
+const MEMORY_PROFILE: mlx_gen::gen_core::ProviderMemoryProfile =
+    mlx_gen::gen_core::ProviderMemoryProfile {
+        fingerprint: Some(mlx_gen::gen_core::MemoryFingerprintTable {
+            template: "chroma1-{route}-{tier}-mlx-shared-ladder-v1",
+            routes: &[
+                (crate::CHROMA1_HD_ID, "hd"),
+                (crate::CHROMA1_BASE_ID, "base"),
+                (crate::CHROMA1_FLASH_ID, "flash"),
+            ],
+            pins: &[mlx_gen::gen_core::MemoryFingerprintPin {
+                route: "base",
+                tier: CALIBRATED_TIER,
+                fingerprint: MEMORY_CALIBRATION_FINGERPRINT,
+            }],
+        }),
+        ..mlx_gen::gen_core::ProviderMemoryProfile::STANDARD
+    };
 
 /// Whether `spec` on `provider_id` is a load with a measurable base cell at all: a registered
 /// Chroma route, the clean base route (no adapter/control/IP/identity/external-TE/PiD axis), bf16
@@ -2066,5 +2082,68 @@ mod tests {
         assert_eq!(window_stack_depth(), cfg.num_single_layers);
         assert!(window_stack_depth() >= cfg.num_layers);
         assert!(window_stack_depth() >= mlx_gen_flux::T5_BLOCKS);
+    }
+}
+
+/// sc-27307: every published production calibration fingerprint, byte for byte, so moving the
+/// spelling onto the shared `MemoryFingerprintTable` cannot restamp a record.
+#[cfg(test)]
+mod sc27307_fingerprint_pins {
+    use super::*;
+
+    #[test]
+    fn every_fingerprint_cell_is_pinned() {
+        let base = LoadSpec::new(mlx_gen::WeightsSource::Dir("/sc27307-chroma-pin".into()));
+        for (quant, base_fp, hd, flash) in [
+            (
+                Some(mlx_gen::Quant::Q4),
+                "chroma1-base-q4-mlx-shared-ladder-2026-08-05-v1",
+                "chroma1-hd-q4-mlx-shared-ladder-v1",
+                "chroma1-flash-q4-mlx-shared-ladder-v1",
+            ),
+            (
+                Some(mlx_gen::Quant::Q8),
+                "chroma1-base-q8-mlx-shared-ladder-v1",
+                "chroma1-hd-q8-mlx-shared-ladder-v1",
+                "chroma1-flash-q8-mlx-shared-ladder-v1",
+            ),
+        ] {
+            let spec = base.clone().with_quant(quant.unwrap());
+            for (provider, expected) in [
+                (crate::CHROMA1_BASE_ID, base_fp),
+                (crate::CHROMA1_HD_ID, hd),
+                (crate::CHROMA1_FLASH_ID, flash),
+            ] {
+                assert_eq!(
+                    production_calibration_fingerprint(provider, &spec).as_deref(),
+                    Some(expected)
+                );
+            }
+            assert_eq!(
+                production_calibration_fingerprint("chroma1_unknown", &spec),
+                None
+            );
+        }
+        for (provider, expected) in [
+            (
+                crate::CHROMA1_BASE_ID,
+                "chroma1-base-bf16-mlx-shared-ladder-v1",
+            ),
+            (crate::CHROMA1_HD_ID, "chroma1-hd-bf16-mlx-shared-ladder-v1"),
+            (
+                crate::CHROMA1_FLASH_ID,
+                "chroma1-flash-bf16-mlx-shared-ladder-v1",
+            ),
+        ] {
+            assert_eq!(
+                production_calibration_fingerprint(provider, &base).as_deref(),
+                Some(expected)
+            );
+        }
+        let nvfp4 = base.clone().with_quant(mlx_gen::Quant::Nvfp4);
+        assert_eq!(
+            production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &nvfp4),
+            None
+        );
     }
 }

@@ -237,11 +237,24 @@ pub fn resolved_numeric_tier(spec: &LoadSpec) -> Result<mlx_gen::gen_core::Memor
 /// [`production_calibration_identity`] — which proves the tier against the packed marker in the
 /// snapshot's own `config.json` — may turn one of these strings into a contract identity.
 pub fn production_calibration_fingerprint(provider_id: &str, tier: &str) -> Option<String> {
-    if provider_id != MODEL_ID || !matches!(tier, "bf16" | "q4" | "q8") {
+    if !matches!(tier, "bf16" | "q4" | "q8") {
         return None;
     }
-    Some(format!("krea-realtime-14b-{tier}-mlx-resident-ladder-v1"))
+    MEMORY_PROFILE.fingerprint?.fingerprint(provider_id, tier)
 }
+
+/// The Krea Realtime MLX memory profile (sc-27307). Only the fingerprint spelling is profile data:
+/// admission re-derives the expected contract from the `LoadSpec` and binds the sealed artifact and
+/// request receipts, state a profile gate deliberately cannot see.
+const MEMORY_PROFILE: mlx_gen::gen_core::ProviderMemoryProfile =
+    mlx_gen::gen_core::ProviderMemoryProfile {
+        fingerprint: Some(mlx_gen::gen_core::MemoryFingerprintTable {
+            template: "{route}-{tier}-mlx-resident-ladder-v1",
+            routes: &[(MODEL_ID, "krea-realtime-14b")],
+            pins: &[],
+        }),
+        ..mlx_gen::gen_core::ProviderMemoryProfile::STANDARD
+    };
 
 /// The production identity of `spec`, bound to the tier of the artifact actually on disk.
 ///
@@ -1392,5 +1405,40 @@ mod tests {
             loaded_safety_check(&spec, &contract, WORKER_SEALED_ARTIFACT, &context),
             MemorySafetyDecision::Accept
         ));
+    }
+}
+
+/// sc-27307: every published production calibration fingerprint, byte for byte, so moving the
+/// spelling onto the shared `MemoryFingerprintTable` cannot restamp a record.
+#[cfg(test)]
+mod sc27307_fingerprint_pins {
+    use super::*;
+
+    #[test]
+    fn every_fingerprint_cell_is_pinned() {
+        for (provider, tier, expected) in [
+            (
+                MODEL_ID,
+                "bf16",
+                Some("krea-realtime-14b-bf16-mlx-resident-ladder-v1"),
+            ),
+            (
+                MODEL_ID,
+                "q4",
+                Some("krea-realtime-14b-q4-mlx-resident-ladder-v1"),
+            ),
+            (
+                MODEL_ID,
+                "q8",
+                Some("krea-realtime-14b-q8-mlx-resident-ladder-v1"),
+            ),
+            (MODEL_ID, "nvfp4", None),
+            ("krea_unknown", "q4", None),
+        ] {
+            assert_eq!(
+                production_calibration_fingerprint(provider, tier).as_deref(),
+                expected
+            );
+        }
     }
 }

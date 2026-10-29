@@ -74,6 +74,18 @@ pub fn production_calibration_fingerprint(artifact_tier: MemoryNumericTier) -> O
     ))
 }
 
+/// The Candle SCAIL-2 memory profile (sc-27307). Admission stays provider-owned
+/// ([`safety_check`] binds the sealed artifact receipt and its prepared identity, which the
+/// profile's contract/context/tier hooks cannot carry), and so does the fingerprint, which is
+/// spelled from the same `CALIBRATION_*` keys the receipt hashes. The profile owns the
+/// snapshot-guarded architecture facts.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
 /// The identity a **sealed** receipt publishes, or `None` when the cell cannot be proven.
 ///
 /// Withheld — never a load failure — when:
@@ -890,11 +902,16 @@ fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
 /// A weights-free contract — no materialized snapshot directory — publishes
 /// `MemoryArchitectureFacts::default()`.
 fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    gen_core::standard_architecture_facts(&MEMORY_PROFILE, PROVIDER_ID, spec)
+}
+
+fn architecture_facts_from_snapshot(
+    _provider_id: &str,
+    root: &std::path::Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    let Some(root) = af::snapshot_root(spec) else {
-        return gen_core::MemoryArchitectureFacts::default();
-    };
     let Ok(config) = crate::config::Scail2Config::from_model_dir(root) else {
         return gen_core::MemoryArchitectureFacts::default();
     };
@@ -1864,5 +1881,35 @@ pub(crate) mod tests {
         let mut moved = LoadSpec::new(WeightsSource::Dir(renamed)).with_quant(Quant::Q4);
         moved.resolved_route = Some(PROVIDER_ID.to_owned());
         assert!(PreparedMemory::prepare(&moved).is_err());
+    }
+
+    /// sc-27307: every production calibration fingerprint, byte for byte, pinned before the table
+    /// conversion and after it.
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        let tier = |quant| MemoryNumericTier {
+            precision: gen_core::Precision::Bf16,
+            quant,
+            component_precision_floors: &[],
+        };
+        for (quant, expected) in [
+            (None, Some("scail2-14b-bf16-candle-resident-eager-v1")),
+            (
+                Some(gen_core::Quant::Q4),
+                Some("scail2-14b-q4-candle-resident-eager-v1"),
+            ),
+            (
+                Some(gen_core::Quant::Q8),
+                Some("scail2-14b-q8-candle-resident-eager-v1"),
+            ),
+            (Some(gen_core::Quant::Nvfp4), None),
+            (Some(gen_core::Quant::Fp8Rowwise), None),
+        ] {
+            assert_eq!(
+                production_calibration_fingerprint(tier(quant)).as_deref(),
+                expected,
+                "{quant:?}"
+            );
+        }
     }
 }

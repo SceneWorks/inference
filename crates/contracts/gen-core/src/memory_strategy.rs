@@ -189,6 +189,9 @@ pub use decode_quality::*;
 mod run;
 pub use run::*;
 
+mod profile;
+pub use profile::*;
+
 mod evidence;
 pub use evidence::*;
 

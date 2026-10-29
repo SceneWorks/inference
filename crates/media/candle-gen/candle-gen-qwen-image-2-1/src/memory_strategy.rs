@@ -85,11 +85,12 @@ use std::path::Path;
 
 use candle_gen::gen_core::{
     self, LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryBehaviorFixture,
-    MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization, PrefixKvCacheMode,
-    ResidentRequestMemory, WeightsSource,
+    MemoryCalibrationIdentity, MemoryFixtureOverlay, MemoryFixturePhases, MemoryFixtureRoute,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode,
+    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryProfileFixtures,
+    MemoryProfileGates, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization,
+    PrefixKvCacheMode, ProviderMemoryProfile, ResidentRequestMemory, WeightsSource,
 };
 
 use crate::config::{Variant, MAX_REFERENCE_IMAGES};
@@ -567,12 +568,13 @@ pub fn asset_facts_at(
 /// crate's `production()` constants, so an imported or converted snapshot with a different geometry
 /// publishes *its* geometry. The one literal is `patch_size`: 2.1's latents are **unpatched**
 /// (`patch_size == 1` in the released config), so a latent token is a latent cell.
-fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+fn architecture_facts_from_snapshot(
+    _provider_id: &str,
+    root: &Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    let Some(root) = af::snapshot_root(spec) else {
-        return gen_core::MemoryArchitectureFacts::default();
-    };
     let dit = af::component_config(root, "transformer");
     let vae = af::component_config(root, "vae");
     gen_core::MemoryArchitectureFacts {
@@ -595,7 +597,9 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
 /// The numeric tier this generator actually runs.
 ///
 /// `component_precision_floors` is **empty and stays empty**: a tier is a whole-pipeline contract
-/// here, so no component is resident above the selected width.
+/// here, so no component is resident above the selected width — the profile's
+/// [`gen_core::MemoryProfileTier::Requested`] tier.
+#[cfg(test)]
 fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
     MemoryNumericTier {
         precision: spec.precision,
@@ -804,7 +808,8 @@ pub fn weights_free_memory_strategy_contract(
         },
     );
     contract.load_shape = spec.load_shape;
-    contract.architecture_facts = architecture_facts(spec);
+    contract.architecture_facts =
+        gen_core::standard_architecture_facts(&MEMORY_PROFILE, provider_id, spec);
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         match variant {
             Variant::Base => MEMORY_CALIBRATION_FINGERPRINT,
@@ -878,52 +883,69 @@ fn validate_decode(
     )
 }
 
+/// The Candle Qwen-Image 2.1 memory profile (sc-27307): the requested tier, this route's own
+/// text-to-image/reference-count/PiD/decode gate inside the shared pipeline, a staged adapter-keyed
+/// text-to-image fixture for each implemented rung, and snapshot-read architecture facts.
+const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    gates: MemoryProfileGates::within(route_gate),
+    // The loaded adapter stack is part of the route identity (the 2512 edit route's convention),
+    // so a fixture for an adapted load is keyed apart from a plain one.
+    fixtures: MemoryProfileFixtures::routes(&[MemoryFixtureRoute::TEXT_TO_IMAGE
+        .with_phases(MemoryFixturePhases::Always)
+        .with_overlay(MemoryFixtureOverlay::WhenAdapters("lora"))])
+    .implemented_only(),
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..ProviderMemoryProfile::STANDARD
+};
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<()> {
+    let provider_id = contract.provider_id.as_str();
+    if !matches!(context.mode, MemoryMode::TextToImage) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: this story's route is text-to-image; got {:?}",
+            context.mode
+        )));
+    }
+    // References are PRICED, not refused: sc-24110 advertises Reference/MultiReference on this
+    // route, and each condition image is an extra joint-sequence block worth
+    // [`REFERENCE_FIT_TOKENS`]. The only reference gate here is the count the joint layout can
+    // express; per-image validation belongs to `crate::reference`, so a bad reference stays a
+    // request refusal rather than becoming a memory refusal.
+    if context.geometry.reference_count as usize > MAX_REFERENCE_IMAGES {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: {} reference images exceed the {MAX_REFERENCE_IMAGES} the joint layout \
+             can express",
+            context.geometry.reference_count
+        )));
+    }
+    if context.use_pid {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: there is no PiD decoder on this route"
+        )));
+    }
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        validate_decode(
+            provider_id,
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        )?;
+    }
+    Ok(())
+}
+
 /// The provider safety check: the shared handshake, then this route's own gate.
 pub fn safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let provider_id = contract.provider_id.as_str();
-    let route_gate = || {
-        if !matches!(context.mode, MemoryMode::TextToImage) {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{provider_id}: this story's route is text-to-image; got {:?}",
-                context.mode
-            )));
-        }
-        // References are PRICED, not refused: sc-24110 advertises Reference/MultiReference on this
-        // route, and each condition image is an extra joint-sequence block worth
-        // [`REFERENCE_FIT_TOKENS`]. The only reference gate here is the count the joint layout can
-        // express; per-image validation belongs to `crate::reference`, so a bad reference stays a
-        // request refusal rather than becoming a memory refusal.
-        if context.geometry.reference_count as usize > MAX_REFERENCE_IMAGES {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{provider_id}: {} reference images exceed the {MAX_REFERENCE_IMAGES} the joint layout \
-                 can express",
-                context.geometry.reference_count
-            )));
-        }
-        if context.use_pid {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{provider_id}: there is no PiD decoder on this route"
-            )));
-        }
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-            validate_decode(
-                provider_id,
-                context.selection.parameters.decode_tile_edge,
-                context.selection.parameters.decode_overlap,
-            )?;
-        }
-        Ok(())
-    };
-    gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(loaded_tier(spec)),
-        Some(&route_gate),
-    )
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 pub(crate) fn registered_valid_fixture(
@@ -931,30 +953,7 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> gen_core::Result<Vec<MemoryBehaviorFixture>> {
-    if !strategy.is_optimized()
-        || !matches!(
-            contract.capability(strategy).map(|c| &c.support),
-            Some(MemoryStrategySupport::Implemented)
-        )
-    {
-        return Ok(Vec::new());
-    }
-    Ok(vec![MemoryBehaviorFixture::new(
-        gen_core::standard_memory_behavior_context(
-            contract,
-            strategy,
-            loaded_tier(spec),
-            MemoryBehaviorRoute {
-                mode: MemoryMode::TextToImage,
-                reference_count: 0,
-                use_pid: false,
-                has_phases: true,
-                // The loaded adapter stack is part of the route identity (the 2512 edit route's
-                // convention), so a fixture for an adapted load is keyed apart from a plain one.
-                overlay: (!spec.adapters.is_empty()).then(|| "lora".to_owned()),
-            },
-        )?,
-    )])
+    gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 pub(crate) fn registered_begin_request(
@@ -962,7 +961,7 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    begin_request_for(MODEL_ID, spec, contract, context)
+    gen_core::standard_begin_request(&MEMORY_PROFILE, MODEL_ID, spec, contract, context, scope)
 }
 
 /// [`registered_begin_request`] for the Turbo id (sc-25901).
@@ -981,9 +980,16 @@ pub(crate) fn begin_request_for(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(gen_core::Error::Unsupported(reason));
-    }
+    gen_core::standard_begin_request(&MEMORY_PROFILE, provider_id, spec, contract, context, scope)
+}
+
+fn scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     let config = candle_gen::request_scope::CandleRequestScopeConfig::new(
         provider_id,
         candle_gen::default_device()?,

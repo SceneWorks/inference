@@ -778,26 +778,41 @@ pub(crate) fn validate_request_memory(
     })
 }
 
+/// The LTX-2.5 MLX memory profile (sc-27307): the tier the split bundle proves
+/// ([`resolved_numeric_tier`]) and the published-decode-domain gate inside the shared pipeline.
+const LTX_2_5_MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::Resolved(profile_tier),
+    gates: gen_core::MemoryProfileGates::within(decode_gate),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn profile_tier(
+    spec: &LoadSpec,
+    _contract: &MemoryProviderContract,
+) -> gen_core::Result<MemoryNumericTier> {
+    resolved_numeric_tier(spec)
+}
+
+fn decode_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<()> {
+    if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode) {
+        validate_decode(
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     loaded_tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode) {
-            validate_decode(
-                context.selection.parameters.decode_tile_edge,
-                context.selection.parameters.decode_overlap,
-            )?;
-        }
-        Ok(())
-    };
-    gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(loaded_tier),
-        Some(&route_gate),
-    )
+    gen_core::standard_safety_check(&LTX_2_5_MEMORY_PROFILE, contract, context, loaded_tier)
 }
 
 fn registered_safety_check(
@@ -815,10 +830,12 @@ fn registered_safety_check(
         memory_strategy_contract(spec)
     };
     match expected {
-        Ok(expected) if expected == *contract => match resolved_numeric_tier(spec) {
-            Ok(tier) => safety_check(contract, tier, context),
-            Err(error) => MemorySafetyDecision::rejected(error),
-        },
+        Ok(expected) if expected == *contract => gen_core::standard_registered_safety_check(
+            &LTX_2_5_MEMORY_PROFILE,
+            spec,
+            contract,
+            context,
+        ),
         Ok(_) => MemorySafetyDecision::Reject {
             reason: "ltx_2_5: caller contract differs from the exact registered load contract"
                 .to_owned(),
@@ -879,9 +896,26 @@ fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    gen_core::standard_begin_request(
+        &LTX_2_5_MEMORY_PROFILE,
+        LTX_2_5_MODEL_ID,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    _provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     begin_with_cleanup(
         contract,
-        resolved_numeric_tier(spec)?,
+        loaded_tier,
         context,
         mlx_gen::request_scope::MlxScopeCleanup::None,
     )

@@ -502,14 +502,22 @@ fn resident_components(
 /// literal that would keep saying 2 if a variant ever repacked. `vae_temporal_scale` stays `None`: the FLUX.2
 /// `AutoencoderKLFlux2` is an **image** autoencoder with no temporal axis, and a structurally
 /// absent axis is declared absent rather than zero (E2).
-fn architecture_facts(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+///
+/// Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
+/// pipeline has been resolved there, so no axis is knowable and every one stays `None` (the
+/// profile's snapshot guard). The derivation is keyed by the variant id it is called with.
+fn architecture_facts_from_snapshot(
+    variant_id: &str,
+    _root: &std::path::Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
-    // pipeline has been resolved there, so no axis is knowable and every one stays `None`.
-    if af::snapshot_root(spec).is_none() {
-        return gen_core::MemoryArchitectureFacts::default();
-    }
+    let variant = if variant_id == Flux2Variant::Klein9b.id() {
+        Flux2Variant::Klein9b
+    } else {
+        Flux2Variant::Dev
+    };
     let config = variant.config();
     gen_core::MemoryArchitectureFacts {
         attention_heads: af::declared(config.num_heads),
@@ -754,7 +762,11 @@ pub(crate) fn composed_provider_contract_for(
 
     Ok(MemoryProviderContract {
         phase_facts: None,
-        architecture_facts: architecture_facts(variant, spec),
+        architecture_facts: gen_core::standard_architecture_facts(
+            &MEMORY_PROFILE,
+            variant.id(),
+            spec,
+        ),
         provider_id: profile.provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -941,23 +953,40 @@ fn route_is_supported(provider_id: &str, context: &MemoryRunContext) -> bool {
     }
 }
 
-pub fn validate_context(
+/// The Candle FLUX.2 memory profile (sc-27307): the artifact-resolved tier, the route/batch/PiD/
+/// phase refusals after the shared pipeline (where the hand-rolled gate ran them), the four
+/// published behavior routes and the snapshot-gated preset geometry.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::Resolved(profile_tier),
+    rejection: gen_core::MemoryRejectionRendering::ValidationError,
+    gates: gen_core::MemoryProfileGates::after(route_gate),
+    fixtures: gen_core::MemoryProfileFixtures::routes(&[
+        gen_core::MemoryFixtureRoute::TEXT_TO_IMAGE,
+        gen_core::MemoryFixtureRoute::new(gen_core::MemoryFixtureMode::Edit, 1),
+        gen_core::MemoryFixtureRoute::new(gen_core::MemoryFixtureMode::Other("character_image"), 1),
+        gen_core::MemoryFixtureRoute::new(
+            gen_core::MemoryFixtureMode::Other("style_variations"),
+            1,
+        ),
+    ]),
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn profile_tier(
+    spec: &LoadSpec,
+    _contract: &MemoryProviderContract,
+) -> gen_core::Result<MemoryNumericTier> {
+    resolved_numeric_tier(spec)
+}
+
+fn route_gate(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
-    loaded_quant: Option<Quant>,
+    _loaded_tier: MemoryNumericTier,
 ) -> gen_core::Result<()> {
-    if let MemorySafetyDecision::Reject { reason } = gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(MemoryNumericTier {
-            precision: Precision::Bf16,
-            quant: loaded_quant,
-            component_precision_floors: &[],
-        }),
-        None,
-    ) {
-        return Err(gen_core::Error::Unsupported(reason));
-    }
     if !route_is_supported(&contract.provider_id, context) {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: unsupported memory route mode={} references={} overlay={:?}",
@@ -988,12 +1017,38 @@ pub fn validate_context(
     Ok(())
 }
 
+fn loaded_tier(loaded_quant: Option<Quant>) -> MemoryNumericTier {
+    MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant: loaded_quant,
+        component_precision_floors: &[],
+    }
+}
+
+pub fn validate_context(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_quant: Option<Quant>,
+) -> gen_core::Result<()> {
+    gen_core::standard_validate_context(
+        &MEMORY_PROFILE,
+        contract,
+        context,
+        loaded_tier(loaded_quant),
+    )
+}
+
 pub fn admission_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
     loaded_quant: Option<Quant>,
 ) -> MemorySafetyDecision {
-    MemorySafetyDecision::from_validation(validate_context(contract, context, loaded_quant))
+    gen_core::standard_safety_check(
+        &MEMORY_PROFILE,
+        contract,
+        context,
+        loaded_tier(loaded_quant),
+    )
 }
 
 pub(crate) fn validate_registered_generator_context(
@@ -1453,10 +1508,7 @@ pub fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match resolved_quant(spec) {
-        Ok(quant) => admission_safety_check(contract, context, quant),
-        Err(error) => MemorySafetyDecision::rejected(error),
-    }
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 pub fn registered_valid_fixture(
@@ -1464,47 +1516,7 @@ pub fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
-    if !strategy.is_optimized() {
-        return Ok(Vec::new());
-    }
-    let tier = resolved_numeric_tier(spec)?;
-    let routes = [
-        gen_core::MemoryBehaviorRoute {
-            mode: MemoryMode::TextToImage,
-            reference_count: 0,
-            use_pid: false,
-            has_phases: false,
-            overlay: None,
-        },
-        gen_core::MemoryBehaviorRoute {
-            mode: MemoryMode::Edit,
-            reference_count: 1,
-            use_pid: false,
-            has_phases: false,
-            overlay: None,
-        },
-        gen_core::MemoryBehaviorRoute {
-            mode: MemoryMode::Other("character_image".to_owned()),
-            reference_count: 1,
-            use_pid: false,
-            has_phases: false,
-            overlay: None,
-        },
-        gen_core::MemoryBehaviorRoute {
-            mode: MemoryMode::Other("style_variations".to_owned()),
-            reference_count: 1,
-            use_pid: false,
-            has_phases: false,
-            overlay: None,
-        },
-    ];
-    routes
-        .into_iter()
-        .map(|route| {
-            gen_core::standard_memory_behavior_context(contract, strategy, tier, route)
-                .map(gen_core::MemoryBehaviorFixture::new)
-        })
-        .collect()
+    gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 pub fn registered_begin_request(
@@ -1512,7 +1524,28 @@ pub fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    validate_context(contract, context, resolved_quant(spec)?)?;
+    let provider_id = if contract.provider_id == FLUX2_DEV_ID {
+        FLUX2_DEV_ID
+    } else {
+        FLUX2_KLEIN_9B_ID
+    };
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    _provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     Ok(Some(Box::new(Flux2MemoryScope::new(
         Device::Cpu,
         contract,

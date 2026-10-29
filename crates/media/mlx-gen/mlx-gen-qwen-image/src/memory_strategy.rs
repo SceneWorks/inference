@@ -469,34 +469,75 @@ fn contract_with_asset_facts_and_streamability(
     Ok(contract)
 }
 
+/// The Qwen-Image MLX memory profile (sc-27307): requested tier, the route-aware decode gate, and
+/// one text-to-image fixture plus its PiD copy whenever the strategy engages rung 2.
+const MEMORY_PROFILE: mlx_gen::gen_core::ProviderMemoryProfile =
+    mlx_gen::gen_core::ProviderMemoryProfile {
+        gates: mlx_gen::gen_core::MemoryProfileGates::within(decode_route_gate),
+        fixtures: mlx_gen::gen_core::MemoryProfileFixtures::TEXT_TO_IMAGE
+            .with_pid(mlx_gen::gen_core::MemoryFixturePid::WhenBoundedDecode),
+        ..mlx_gen::gen_core::ProviderMemoryProfile::STANDARD
+    };
+
+/// The edit route's profile: one single-reference edit fixture.
+const EDIT_MEMORY_PROFILE: mlx_gen::gen_core::ProviderMemoryProfile =
+    mlx_gen::gen_core::ProviderMemoryProfile {
+        fixtures: mlx_gen::gen_core::MemoryProfileFixtures::routes(&[
+            mlx_gen::gen_core::MemoryFixtureRoute::new(
+                mlx_gen::gen_core::MemoryFixtureMode::Edit,
+                1,
+            ),
+        ])
+        .with_pid(mlx_gen::gen_core::MemoryFixturePid::WhenBoundedDecode),
+        ..MEMORY_PROFILE
+    };
+
+/// The control route's profile: one single-reference image-to-image fixture.
+const CONTROL_MEMORY_PROFILE: mlx_gen::gen_core::ProviderMemoryProfile =
+    mlx_gen::gen_core::ProviderMemoryProfile {
+        fixtures: mlx_gen::gen_core::MemoryProfileFixtures::routes(&[
+            mlx_gen::gen_core::MemoryFixtureRoute::new(
+                mlx_gen::gen_core::MemoryFixtureMode::ImageToImage,
+                1,
+            ),
+        ])
+        .with_pid(mlx_gen::gen_core::MemoryFixturePid::WhenBoundedDecode),
+        ..MEMORY_PROFILE
+    };
+
+fn decode_route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<()> {
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        let routes = decode_routes(&contract.provider_id)?;
+        routes
+            .validate(
+                context.use_pid,
+                context.selection.parameters.decode_tile_edge,
+                context.selection.parameters.decode_overlap,
+            )
+            .map_err(CoreError::Unsupported)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     precision: Precision,
     quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-            let routes = decode_routes(&contract.provider_id)?;
-            routes
-                .validate(
-                    context.use_pid,
-                    context.selection.parameters.decode_tile_edge,
-                    context.selection.parameters.decode_overlap,
-                )
-                .map_err(CoreError::Unsupported)?;
-        }
-        Ok(())
-    };
-    mlx_gen::gen_core::standard_memory_strategy_safety_check(
+    mlx_gen::gen_core::standard_safety_check(
+        &MEMORY_PROFILE,
         contract,
         context,
-        Some(MemoryNumericTier {
+        MemoryNumericTier {
             precision,
             quant,
             component_precision_floors: &[],
-        }),
-        Some(&route_gate),
+        },
     )
 }
 
@@ -505,7 +546,7 @@ pub(crate) fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check(contract, spec.precision, spec.quantize, context)
+    mlx_gen::gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 pub(crate) fn registered_valid_fixture(
@@ -513,43 +554,14 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> CoreResult<Vec<mlx_gen::gen_core::MemoryBehaviorFixture>> {
-    if !strategy.is_optimized() {
-        return Ok(Vec::new());
-    }
-    let (mode, has_reference) = if contract.provider_id.ends_with("_edit") {
-        (mlx_gen::gen_core::MemoryMode::Edit, true)
+    let profile = if contract.provider_id.ends_with("_edit") {
+        &EDIT_MEMORY_PROFILE
     } else if contract.provider_id.ends_with("_control") {
-        (mlx_gen::gen_core::MemoryMode::ImageToImage, true)
+        &CONTROL_MEMORY_PROFILE
     } else {
-        (mlx_gen::gen_core::MemoryMode::TextToImage, false)
+        &MEMORY_PROFILE
     };
-    let tier = mlx_gen::request_scope::loaded_tier(spec);
-    let route = |use_pid| mlx_gen::gen_core::MemoryBehaviorRoute {
-        mode: mode.clone(),
-        reference_count: u32::from(has_reference),
-        use_pid,
-        has_phases: false,
-        overlay: None,
-    };
-    let mut fixtures = vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(
-        mlx_gen::gen_core::standard_memory_behavior_context(
-            contract,
-            strategy,
-            tier,
-            route(false),
-        )?,
-    )];
-    if contract.engages(strategy, MemoryStrategy::BoundedDecode) {
-        fixtures.push(mlx_gen::gen_core::MemoryBehaviorFixture::new(
-            mlx_gen::gen_core::standard_memory_behavior_context(
-                contract,
-                strategy,
-                tier,
-                route(true),
-            )?,
-        ));
-    }
-    Ok(fixtures)
+    mlx_gen::gen_core::standard_registered_valid_fixture(profile, spec, contract, strategy)
 }
 
 pub(crate) fn registered_begin_request(
@@ -558,11 +570,28 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    mlx_gen::gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_tier: MemoryNumericTier,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
     begin_request_with_cleanup(
         provider_id,
         contract,
-        spec.precision,
-        spec.quantize,
+        loaded_tier.precision,
+        loaded_tier.quant,
         context,
         mlx_gen::request_scope::MlxScopeCleanup::None,
     )

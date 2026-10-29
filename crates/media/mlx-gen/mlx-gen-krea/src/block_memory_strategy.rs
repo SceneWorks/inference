@@ -114,15 +114,23 @@ pub fn production_calibration_fingerprint(provider_id: &str, tier: &str) -> Opti
     if !matches!(tier, "bf16" | "q4" | "q8") {
         return None;
     }
-    let route = match provider_id {
-        crate::model::KREA_2_TURBO_ID => "turbo",
-        crate::model::KREA_2_RAW_ID => "raw",
-        crate::model::KREA_2_EDIT_ID => "edit",
-        crate::model::KREA_2_TURBO_EDIT_ID => "turbo-edit",
-        _ => return None,
-    };
-    Some(format!("krea-2-{route}-{tier}-mlx-shared-ladder-v1"))
+    KREA_BLOCK_MEMORY_PROFILE
+        .fingerprint?
+        .fingerprint(provider_id, tier)
 }
+
+/// The base Krea fingerprint spelling (sc-27307): one template over the four base routes.
+const FINGERPRINTS: mlx_gen::gen_core::MemoryFingerprintTable =
+    mlx_gen::gen_core::MemoryFingerprintTable {
+        template: "krea-2-{route}-{tier}-mlx-shared-ladder-v1",
+        routes: &[
+            (crate::model::KREA_2_TURBO_ID, "turbo"),
+            (crate::model::KREA_2_RAW_ID, "raw"),
+            (crate::model::KREA_2_EDIT_ID, "edit"),
+            (crate::model::KREA_2_TURBO_EDIT_ID, "turbo-edit"),
+        ],
+        pins: &[],
+    };
 
 /// The tier token proven from the ARTIFACT, never from `LoadSpec::quantize` alone.
 ///
@@ -842,34 +850,62 @@ pub(crate) fn native_dit_transformer_bytes(
     })
 }
 
+/// The base Krea MLX memory profile (sc-27307): the tier is the base's packed width resolved from
+/// the load plan (`effective_base_quant_tier`) at the requested precision, and the typed-route plus
+/// route-aware decode gate runs inside the shared pipeline.
+const KREA_BLOCK_MEMORY_PROFILE: mlx_gen::gen_core::ProviderMemoryProfile =
+    mlx_gen::gen_core::ProviderMemoryProfile {
+        tier: mlx_gen::gen_core::MemoryProfileTier::Resolved(profile_tier),
+        gates: mlx_gen::gen_core::MemoryProfileGates::within(route_gate),
+        fingerprint: Some(FINGERPRINTS),
+        ..mlx_gen::gen_core::ProviderMemoryProfile::STANDARD
+    };
+
+fn profile_tier(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+) -> CoreResult<MemoryNumericTier> {
+    let provider_id = contract.provider_id.as_str();
+    Ok(MemoryNumericTier {
+        precision: spec.precision,
+        quant: crate::model::effective_base_quant_tier(spec, provider_id)?,
+        component_precision_floors: &[],
+    })
+}
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<()> {
+    validate_memory_behavior_route(contract.provider_id.as_str(), context)?;
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        decode_routes(contract.provider_id.as_str())?
+            .validate(
+                context.use_pid,
+                context.selection.parameters.decode_tile_edge,
+                context.selection.parameters.decode_overlap,
+            )
+            .map_err(CoreError::Unsupported)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     precision: Precision,
     quant: Option<mlx_gen::Quant>,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        validate_memory_behavior_route(contract.provider_id.as_str(), context)?;
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-            decode_routes(contract.provider_id.as_str())?
-                .validate(
-                    context.use_pid,
-                    context.selection.parameters.decode_tile_edge,
-                    context.selection.parameters.decode_overlap,
-                )
-                .map_err(CoreError::Unsupported)?;
-        }
-        Ok(())
-    };
-    mlx_gen::gen_core::standard_memory_strategy_safety_check(
+    mlx_gen::gen_core::standard_safety_check(
+        &KREA_BLOCK_MEMORY_PROFILE,
         contract,
         context,
-        Some(MemoryNumericTier {
+        MemoryNumericTier {
             precision,
             quant,
             component_precision_floors: &[],
-        }),
-        Some(&route_gate),
+        },
     )
 }
 
@@ -934,10 +970,12 @@ pub(crate) fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match crate::model::effective_base_quant_tier(spec, &contract.provider_id) {
-        Ok(quant) => safety_check(contract, spec.precision, quant, context),
-        Err(error) => MemorySafetyDecision::rejected(error),
-    }
+    mlx_gen::gen_core::standard_registered_safety_check(
+        &KREA_BLOCK_MEMORY_PROFILE,
+        spec,
+        contract,
+        context,
+    )
 }
 
 pub(crate) fn registered_valid_fixture(
@@ -1070,11 +1108,28 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    mlx_gen::gen_core::standard_begin_request(
+        &KREA_BLOCK_MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_tier: MemoryNumericTier,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
     begin_request_with_cleanup(
         provider_id,
         contract,
-        spec.precision,
-        crate::model::effective_base_quant_tier(spec, provider_id)?,
+        loaded_tier.precision,
+        loaded_tier.quant,
         context,
         mlx_gen::request_scope::MlxScopeCleanup::None,
     )
@@ -2715,6 +2770,41 @@ mod tests {
         assert_eq!(
             edit.asset_facts.conditioning_bytes - t2i.asset_facts.conditioning_bytes,
             vision_bytes
+        );
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_pin_tests {
+    use super::*;
+
+    /// sc-27307: every production calibration fingerprint the base Krea routes publish, pinned
+    /// byte for byte before the spelling moved into a `MemoryFingerprintTable`.
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        for (provider_id, route) in [
+            (crate::model::KREA_2_TURBO_ID, "turbo"),
+            (crate::model::KREA_2_RAW_ID, "raw"),
+            (crate::model::KREA_2_EDIT_ID, "edit"),
+            (crate::model::KREA_2_TURBO_EDIT_ID, "turbo-edit"),
+        ] {
+            for tier in ["bf16", "q4", "q8"] {
+                assert_eq!(
+                    production_calibration_fingerprint(provider_id, tier),
+                    Some(format!("krea-2-{route}-{tier}-mlx-shared-ladder-v1"))
+                );
+            }
+            for tier in ["nvfp4", "fp8r", "", "Q4"] {
+                assert_eq!(production_calibration_fingerprint(provider_id, tier), None);
+            }
+        }
+        assert_eq!(
+            production_calibration_fingerprint("krea_2_unknown", "q4"),
+            None
+        );
+        assert_eq!(
+            production_calibration_fingerprint(crate::model::KREA_2_TURBO_ID, "q4").as_deref(),
+            Some("krea-2-turbo-q4-mlx-shared-ladder-v1")
         );
     }
 }

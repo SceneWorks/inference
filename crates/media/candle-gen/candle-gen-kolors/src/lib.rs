@@ -151,13 +151,15 @@ impl Generator for KolorsGenerator {
                 };
             }
         };
-        match memory_strategy::validate_context(&self.memory_contract, context, tier) {
-            Ok(()) => gen_core::MemorySafetyDecision::from_validation(
-                self.memory_admission.approve(context),
-            ),
-            Err(error) => {
+        match memory_strategy::safety_check(&self.memory_contract, context, tier) {
+            gen_core::MemorySafetyDecision::Accept => {
+                gen_core::MemorySafetyDecision::from_validation(
+                    self.memory_admission.approve(context),
+                )
+            }
+            reject => {
                 self.memory_admission.clear_approval();
-                gen_core::MemorySafetyDecision::rejected(error)
+                reject
             }
         }
     }

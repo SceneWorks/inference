@@ -365,12 +365,13 @@ pub fn adapter_overlay(
 /// runs through), `attention_heads` / `head_dim` its attention geometry and `patch_size` the pixel
 /// patch. There is no latent and no autoencoder on any Iris task, so the three VAE axes are
 /// structurally absent.
-fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+fn architecture_facts_from_snapshot(
+    _model_id: &str,
+    root: &std::path::Path,
+    spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    let Some(root) = af::snapshot_root(spec) else {
-        return gen_core::MemoryArchitectureFacts::default();
-    };
     let Ok(config) = IrisConfig::from_dir(root) else {
         return gen_core::MemoryArchitectureFacts::default();
     };
@@ -387,6 +388,15 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
         activation_dtype_width: u32::try_from(compute_dtype(spec).size_in_bytes()).ok(),
     }
 }
+
+/// The Candle Iris memory profile (sc-27307): only the snapshot-gated geometry is profile data;
+/// this crate publishes contracts, not a registered safety/behavior surface.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
 
 /// The numeric tier a load of `spec` runs: the precision and the tier it names (only generation
 /// accepts one, and it packs the text tower and the backbone at that same tier — sc-26266).
@@ -452,7 +462,8 @@ fn base_contract(model_id: &str, task: IrisTask, spec: &LoadSpec) -> MemoryProvi
         },
     );
     contract.load_shape = spec.load_shape;
-    contract.architecture_facts = architecture_facts(spec);
+    contract.architecture_facts =
+        gen_core::standard_architecture_facts(&MEMORY_PROFILE, model_id, spec);
     let fingerprint = calibration_fingerprint_for(task, spec.precision, spec.quantize);
     contract.calibration = Some(MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
     contract.resident_request_memory = ResidentRequestMemory::PreserveLoadDefaults;

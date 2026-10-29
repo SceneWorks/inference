@@ -62,13 +62,24 @@ pub fn calibration_tier_label(bits: i32) -> Option<&'static str> {
 /// `quantize_config.json` and reconciles it against `spec.quantize`, so a crossed request never
 /// reaches here.
 fn production_calibration_fingerprint(bits: i32) -> Option<String> {
-    let tier = calibration_tier_label(bits)?;
-    Some(if tier == CALIBRATED_TIER {
-        CALIBRATION_FINGERPRINT.to_owned()
-    } else {
-        format!("sc-20772-ltx-2-3-candle-{tier}-i2v-v1")
-    })
+    Some(
+        MEMORY_PROFILE
+            .fingerprint?
+            .render("", calibration_tier_label(bits)?),
+    )
 }
+
+/// The fingerprint spelling: one route, one key per artifact-proven tier. The calibrated q4 cell is
+/// pinned to [`CALIBRATION_FINGERPRINT`], which the template happens to spell identically.
+const FINGERPRINTS: gen_core::MemoryFingerprintTable = gen_core::MemoryFingerprintTable {
+    template: "sc-20772-ltx-2-3-candle-{tier}-i2v-v1",
+    routes: &[(MODEL_ID, "")],
+    pins: &[gen_core::MemoryFingerprintPin {
+        route: "",
+        tier: CALIBRATED_TIER,
+        fingerprint: CALIBRATION_FINGERPRINT,
+    }],
+};
 pub const DECODE_OVERLAP: u32 = 64;
 pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 448, 384, 320, 256, 192];
 const SHIPPED_GEOMETRIES: &[(u32, u32)] =
@@ -363,12 +374,13 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
 ///
 /// A weights-free contract (the registry's sentinel surface, which is not on disk) publishes
 /// `MemoryArchitectureFacts::default()`.
-fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+fn architecture_facts_from_snapshot(
+    _provider_id: &str,
+    _root: &std::path::Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    if af::snapshot_root(spec).is_none() {
-        return gen_core::MemoryArchitectureFacts::default();
-    }
     let video = crate::config::AvConfig::ltx_2_3().video;
     gen_core::MemoryArchitectureFacts {
         attention_heads: af::declared(video.num_heads),
@@ -397,7 +409,7 @@ fn build_contract(
     ];
     Ok(MemoryProviderContract {
         phase_facts: None,
-        architecture_facts: architecture_facts(spec),
+        architecture_facts: gen_core::standard_architecture_facts(&MEMORY_PROFILE, MODEL_ID, spec),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -623,6 +635,42 @@ fn route_gate(
     Ok(())
 }
 
+/// The Candle LTX-2.3 memory profile (sc-27307): the route gate inside the shared pipeline, the
+/// snapshot-gated preset geometry and the fingerprint spelling.
+///
+/// The registry tier is the spec's requested quantization, the same tier the loaded generator
+/// admits at (`contract_for_loaded`, sc-22737). The hand-rolled registry check pinned q4 for every
+/// spec, so a q8 production contract — a shipped, fingerprinted cell its loaded generator admits —
+/// was refused at registry admission (sc-27307 drift fix). The spec cannot cross the artifact
+/// here: [`registered_contract_identity`] runs first and rebuilds the contract from the same spec,
+/// whose tier directory reconciles `spec.quantize` against its config, and the weights-free
+/// witness requires exactly q4.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::Resolved(registered_tier),
+    gates: gen_core::MemoryProfileGates::within(profile_route_gate),
+    fingerprint: Some(FINGERPRINTS),
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn registered_tier(
+    spec: &LoadSpec,
+    _contract: &MemoryProviderContract,
+) -> gen_core::Result<MemoryNumericTier> {
+    Ok(numeric_tier(spec.quantize))
+}
+
+fn profile_route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<()> {
+    route_gate(contract, context)
+}
+
+#[cfg(test)]
 pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
@@ -643,12 +691,7 @@ pub(crate) fn safety_check_for_tier(
     loaded_tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(loaded_tier),
-        Some(&|| route_gate(contract, context)),
-    )
+    gen_core::standard_safety_check(&MEMORY_PROFILE, contract, context, loaded_tier)
 }
 
 fn registered_safety_check(
@@ -659,7 +702,7 @@ fn registered_safety_check(
     if let Err(error) = registered_contract_identity(spec, contract) {
         return MemorySafetyDecision::rejected(error);
     }
-    safety_check(contract, context)
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 struct LtxMemoryScope {
@@ -775,6 +818,7 @@ impl MemoryRequestScope for LtxMemoryScope {
     }
 }
 
+#[cfg(test)]
 fn begin(
     contract: &MemoryProviderContract,
     device: Device,
@@ -818,7 +862,24 @@ fn registered_begin_request(
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     registered_contract_identity(spec, contract)?;
-    begin(contract, Device::Cpu, context)
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        MODEL_ID,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    _provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    begin_request(contract, loaded_tier, Device::Cpu, context)
 }
 
 fn registered_valid_fixtures(
@@ -1360,6 +1421,50 @@ mod tests {
         }
     }
 
+    /// sc-27307: registry admission decides exactly as the loaded generator does. The hand-rolled
+    /// registry check pinned q4, so the q8 cell's own context was refused here while its loaded
+    /// generator admitted it.
+    #[test]
+    fn registry_admits_the_tier_its_loaded_generator_admits() {
+        for bits in SHIPPED_PACKED_BITS {
+            let snapshot = ltx_candle_tier_dir(bits);
+            let spec = ltx_candle_tier_spec(snapshot.path(), bits);
+            let contract = memory_strategy_contract(&spec).unwrap();
+            let tier = numeric_tier(spec.quantize);
+            let mut context = gen_core::standard_memory_behavior_context(
+                &contract,
+                MemoryStrategy::Resident,
+                tier,
+                MemoryBehaviorRoute {
+                    mode: MemoryMode::Other("image_to_video".into()),
+                    reference_count: 1,
+                    use_pid: false,
+                    has_phases: false,
+                    overlay: Some(reference_axis(768, 512)),
+                },
+            )
+            .unwrap();
+            context.geometry.width = 768;
+            context.geometry.height = 512;
+            context.geometry.frames = 97;
+            assert_eq!(
+                registered_safety_check(&spec, &contract, &context),
+                safety_check_for_tier(&contract, tier, &context),
+                "{bits}-bit"
+            );
+            assert_eq!(
+                registered_safety_check(&spec, &contract, &context),
+                MemorySafetyDecision::Accept,
+                "{bits}-bit"
+            );
+            context.selection.tier.quant = Some(if bits == 4 { Quant::Q8 } else { Quant::Q4 });
+            assert!(matches!(
+                registered_safety_check(&spec, &contract, &context),
+                MemorySafetyDecision::Reject { .. }
+            ));
+        }
+    }
+
     /// **The artifact decides.** A q8 tier asked for as q4 is refused rather than published under
     /// the q4 key, and bf16 is not a Candle cell at all — the worker resolves no dense off-Mac tier
     /// (`video_jobs/candle.rs#candle_ltx_bundle_tier_across_revisions` returns `None` for `Bf16`).
@@ -1718,6 +1823,28 @@ mod tests {
                 ),
                 "{crossed:?} must not be admitted"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_pin_tests {
+    use super::*;
+
+    /// sc-27307: every production calibration fingerprint this lane publishes, pinned byte for byte
+    /// before the spelling moved into a `MemoryFingerprintTable`.
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        assert_eq!(
+            production_calibration_fingerprint(4).as_deref(),
+            Some("sc-20772-ltx-2-3-candle-q4-i2v-v1")
+        );
+        assert_eq!(
+            production_calibration_fingerprint(8).as_deref(),
+            Some("sc-20772-ltx-2-3-candle-q8-i2v-v1")
+        );
+        for bits in [0, 2, 3, 6, 16] {
+            assert_eq!(production_calibration_fingerprint(bits), None, "{bits}");
         }
     }
 }

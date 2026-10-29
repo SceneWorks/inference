@@ -39,13 +39,12 @@
 
 use mlx_gen::asset_facts::ResidentProjection;
 use mlx_gen::gen_core::{
-    standard_memory_strategy_safety_check, Error as CoreError, GenerationMemory,
-    MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
+    Error as CoreError, GenerationMemory, MemoryBackendRealization, MemoryBehaviorFixture,
     MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
     MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
     MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory,
-    Result as CoreResult, TransformerComponent,
+    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, ProviderMemoryProfile,
+    ResidentRequestMemory, Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, WeightsSource};
 
@@ -290,20 +289,57 @@ pub fn requested_tier(spec: &LoadSpec) -> Option<mlx_gen::Quant> {
 /// [`memory_strategy_contract`] — which proves that tier against the artifact's own packed width
 /// before publishing — may turn one of these strings into a production contract identity.
 pub fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<String> {
-    let route = route_label(provider_id)?;
+    let table = match spec.offload_policy {
+        OffloadPolicy::Sequential => SEQUENTIAL_FINGERPRINT_PROFILE.fingerprint?,
+        OffloadPolicy::Resident => RESIDENT_FINGERPRINT_PROFILE.fingerprint?,
+    };
+    let route = table.route(provider_id)?;
     let tier = calibration_tier_label(requested_tier(spec))?;
-    let policy = policy_label(spec.offload_policy);
-    Some(
-        if provider_id == CALIBRATED_ROUTE && tier == CALIBRATED_TIER {
-            match spec.offload_policy {
-                OffloadPolicy::Sequential => MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
-                OffloadPolicy::Resident => RESIDENT_MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
-            }
-        } else {
-            format!("sana-{route}-{tier}-mlx-full-ladder-v1-{policy}")
-        },
-    )
+    Some(table.render(route, tier))
 }
+
+/// The fingerprint spelling under one offload policy: the policy is the template's suffix, and the
+/// calibrated `(base, q4)` cell keeps the string it was measured under (sc-27307).
+const fn fingerprint_table(
+    policy: OffloadPolicy,
+    calibrated: &'static [mlx_gen::gen_core::MemoryFingerprintPin],
+) -> mlx_gen::gen_core::MemoryFingerprintTable {
+    mlx_gen::gen_core::MemoryFingerprintTable {
+        template: match policy {
+            OffloadPolicy::Sequential => "sana-{route}-{tier}-mlx-full-ladder-v1-sequential",
+            OffloadPolicy::Resident => "sana-{route}-{tier}-mlx-full-ladder-v1-resident",
+        },
+        routes: &[
+            (crate::MODEL_ID, "base"),
+            (crate::SPRINT_MODEL_ID, "sprint"),
+        ],
+        pins: calibrated,
+    }
+}
+
+const SEQUENTIAL_FINGERPRINT_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    fingerprint: Some(fingerprint_table(
+        OffloadPolicy::Sequential,
+        &[mlx_gen::gen_core::MemoryFingerprintPin {
+            route: "base",
+            tier: CALIBRATED_TIER,
+            fingerprint: MEMORY_CALIBRATION_FINGERPRINT,
+        }],
+    )),
+    ..MEMORY_PROFILE
+};
+
+const RESIDENT_FINGERPRINT_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    fingerprint: Some(fingerprint_table(
+        OffloadPolicy::Resident,
+        &[mlx_gen::gen_core::MemoryFingerprintPin {
+            route: "base",
+            tier: CALIBRATED_TIER,
+            fingerprint: RESIDENT_MEMORY_CALIBRATION_FINGERPRINT,
+        }],
+    )),
+    ..MEMORY_PROFILE
+};
 
 /// The weights-free registry-conformance identity: the same (provider, tier, policy) coordinate in
 /// a namespace that can never collide with a production string, so a fixture contract can never be
@@ -732,35 +768,47 @@ pub(crate) fn validate_request_memory(
     Ok(())
 }
 
+/// The SANA MLX memory profile (sc-27307): requested tier, the native-decode route gate inside the
+/// shared pipeline, and one text-to-image fixture per implemented rung, phased under `Sequential`.
+const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    gates: mlx_gen::gen_core::MemoryProfileGates::within(decode_route_gate),
+    fixtures: mlx_gen::gen_core::MemoryProfileFixtures::routes(&[
+        mlx_gen::gen_core::MemoryFixtureRoute::TEXT_TO_IMAGE
+            .with_phases(mlx_gen::gen_core::MemoryFixturePhases::WhenSequentialOffload),
+    ])
+    .implemented_only(),
+    ..ProviderMemoryProfile::STANDARD
+};
+
+fn decode_route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
+) -> CoreResult<()> {
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        if context.use_pid {
+            return Err(CoreError::Unsupported(format!(
+                "{}: SANA has no PiD decoder; mlx-gen-pid is used only for Gemma-2 conditioning",
+                contract.provider_id
+            )));
+        }
+        decode_routes(&contract.provider_id)?
+            .validate(
+                false,
+                context.selection.parameters.decode_tile_edge,
+                context.selection.parameters.decode_overlap,
+            )
+            .map_err(CoreError::Unsupported)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-            if context.use_pid {
-                return Err(CoreError::Unsupported(format!(
-                    "{}: SANA has no PiD decoder; mlx-gen-pid is used only for Gemma-2 conditioning",
-                    contract.provider_id
-                )));
-            }
-            decode_routes(&contract.provider_id)?
-                .validate(
-                    false,
-                    context.selection.parameters.decode_tile_edge,
-                    context.selection.parameters.decode_overlap,
-                )
-                .map_err(CoreError::Unsupported)?;
-        }
-        Ok(())
-    };
-    standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(mlx_gen::request_scope::loaded_tier(spec)),
-        Some(&route_gate),
-    )
+    mlx_gen::gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 pub(crate) fn registered_valid_fixture(
@@ -768,28 +816,7 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> CoreResult<Vec<MemoryBehaviorFixture>> {
-    if !matches!(
-        contract
-            .capability(strategy)
-            .map(|capability| &capability.support),
-        Some(MemoryStrategySupport::Implemented)
-    ) || !strategy.is_optimized()
-    {
-        return Ok(Vec::new());
-    }
-    let context = mlx_gen::gen_core::standard_memory_behavior_context(
-        contract,
-        strategy,
-        mlx_gen::request_scope::loaded_tier(spec),
-        MemoryBehaviorRoute {
-            mode: mlx_gen::gen_core::MemoryMode::TextToImage,
-            reference_count: 0,
-            use_pid: false,
-            has_phases: matches!(spec.offload_policy, OffloadPolicy::Sequential),
-            overlay: None,
-        },
-    )?;
-    Ok(vec![MemoryBehaviorFixture::new(context)])
+    mlx_gen::gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 pub(crate) fn registered_begin_request(
@@ -797,6 +824,23 @@ pub(crate) fn registered_begin_request(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    mlx_gen::gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
     begin_with_cleanup(
         provider_id,
@@ -1927,5 +1971,65 @@ mod tests {
         );
         assert!(resident.pid_decode_routes.is_none());
         assert!(sequential.pid_decode_routes.is_none());
+    }
+}
+
+/// sc-27307: every production calibration fingerprint this family can publish, pinned byte for
+/// byte across the move to a [`mlx_gen::gen_core::MemoryFingerprintTable`].
+#[cfg(test)]
+mod fingerprint_pin_tests {
+    use super::*;
+
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        let cell = |provider: &str, quant: Option<mlx_gen::Quant>, policy: OffloadPolicy| {
+            let mut spec = LoadSpec::new(WeightsSource::Dir("/sc-27307-absent-sana".into()))
+                .with_offload_policy(policy);
+            spec.quantize = quant;
+            production_calibration_fingerprint(provider, &spec)
+        };
+        let mut seen = Vec::new();
+        for provider in [crate::MODEL_ID, crate::SPRINT_MODEL_ID, "not_sana"] {
+            for quant in [
+                None,
+                Some(mlx_gen::Quant::Q4),
+                Some(mlx_gen::Quant::Q8),
+                Some(mlx_gen::Quant::Nvfp4),
+            ] {
+                for policy in [OffloadPolicy::Sequential, OffloadPolicy::Resident] {
+                    seen.push(cell(provider, quant, policy));
+                }
+            }
+        }
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            seen,
+            vec![
+                some("sana-base-bf16-mlx-full-ladder-v1-sequential"),
+                some("sana-base-bf16-mlx-full-ladder-v1-resident"),
+                some("sana-mlx-full-ladder-2026-08-06-v1-sequential"),
+                some("sana-mlx-full-ladder-2026-08-06-v1-resident"),
+                some("sana-base-q8-mlx-full-ladder-v1-sequential"),
+                some("sana-base-q8-mlx-full-ladder-v1-resident"),
+                None,
+                None,
+                some("sana-sprint-bf16-mlx-full-ladder-v1-sequential"),
+                some("sana-sprint-bf16-mlx-full-ladder-v1-resident"),
+                some("sana-sprint-q4-mlx-full-ladder-v1-sequential"),
+                some("sana-sprint-q4-mlx-full-ladder-v1-resident"),
+                some("sana-sprint-q8-mlx-full-ladder-v1-sequential"),
+                some("sana-sprint-q8-mlx-full-ladder-v1-resident"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ]
+        );
     }
 }

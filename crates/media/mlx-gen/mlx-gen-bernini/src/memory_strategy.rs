@@ -72,12 +72,13 @@
 //! * **`TransformerComponent::TextEncoder` / `Both`.** See [`TRANSFORMER_WINDOW_COMPONENTS`].
 
 use mlx_gen::gen_core::{
-    standard_memory_strategy_safety_check, Error as CoreError, MemoryBackendRealization,
-    MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
-    MemoryNumericTier, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport,
-    ResidentRequestMemory, Result as CoreResult, TransformerComponent,
+    Error as CoreError, MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
+    MemoryCalibrationIdentity, MemoryFingerprintTable, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
+    MemoryProfileGates, MemoryProfileTier, MemoryProviderContract, MemoryRequestScope,
+    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategySupport, ProviderMemoryProfile, ResidentRequestMemory, Result as CoreResult,
+    TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec};
@@ -975,11 +976,7 @@ pub fn calibration_tier_label(quant: Option<mlx_gen::Quant>) -> Option<&'static 
 /// The route token one provider id contributes to its identity: the full planner+renderer pipeline
 /// the `bernini` / `bernini_image` catalog entries resolve to, and the renderer-only sibling.
 pub fn calibration_route(provider_id: &str) -> Option<&'static str> {
-    match provider_id {
-        FULL_ID => Some("image"),
-        RENDERER_ID => Some("renderer"),
-        _ => None,
-    }
+    MEMORY_PROFILE.fingerprint?.route(provider_id)
 }
 
 /// The tier [`MEMORY_CALIBRATION_FINGERPRINT`] names.
@@ -1009,12 +1006,13 @@ pub const CALIBRATED_TIER: &str = "q4";
 /// below is the one that mints it, so the retained string is produced rather than special-cased
 /// (`the_measured_cell_keeps_its_retained_string` asserts the two agree).
 pub fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<String> {
-    let route = calibration_route(provider_id)?;
+    let table = MEMORY_PROFILE.fingerprint?;
+    let route = table.route(provider_id)?;
     if spec.precision != mlx_gen::Precision::Bf16 {
         return None;
     }
     let tier = calibration_tier_label(resolved_numeric_tier(spec).ok()?.quant)?;
-    Some(format!("bernini-{route}-{tier}-mlx-dual-expert-ladder-v1"))
+    Some(table.render(route, tier))
 }
 
 /// The public contract for a loaded provider.
@@ -1245,285 +1243,308 @@ fn validate_attention(size: u32) -> CoreResult<()> {
     Ok(())
 }
 
+/// The Bernini MLX memory profile (sc-27307): this provider's route gate, its fingerprint spelling,
+/// and the admitted tier, which depends on the contract's calibration identity ([`admitted_tier`]:
+/// the weights-free declaration admits the requested tier, a production `bernini` load the
+/// artifact-proven one). The multi-request behavior fixtures stay provider-owned.
+const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    tier: MemoryProfileTier::Resolved(admitted_tier),
+    gates: MemoryProfileGates::within(route_gate),
+    fingerprint: Some(MemoryFingerprintTable {
+        template: "bernini-{route}-{tier}-mlx-dual-expert-ladder-v1",
+        routes: &[(FULL_ID, "image"), (RENDERER_ID, "renderer")],
+        pins: &[],
+    }),
+    ..ProviderMemoryProfile::STANDARD
+};
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<()> {
+    let mode = context.mode.as_key();
+    let axes: Vec<_> = context
+        .overlay
+        .as_deref()
+        .unwrap_or_default()
+        .split('+')
+        .filter(|axis| !axis.is_empty())
+        .collect();
+    let expected_provider_mode = match mode {
+        "video_to_video" if context.geometry.reference_count == 1 => "provider_video_mode:v2v",
+        "reference_to_video" if (1..=8).contains(&context.geometry.reference_count) => {
+            "provider_video_mode:r2v"
+        }
+        "reference_video_to_video" if (2..=9).contains(&context.geometry.reference_count) => {
+            "provider_video_mode:rv2v"
+        }
+        "multi_video_to_video" if (2..=8).contains(&context.geometry.reference_count) => {
+            "provider_video_mode:mv2v"
+        }
+        "ads2v" if (3..=10).contains(&context.geometry.reference_count) => {
+            "provider_video_mode:ads2v"
+        }
+        _ => {
+            return Err(CoreError::Unsupported(format!(
+                "{}: Bernini memory evidence covers exact video_to_video/one-clip, \
+                 reference_to_video/1-8-image, reference_video_to_video/one-clip-plus-1-8-image, \
+                 multi_video_to_video/2-8-clip, or \
+                 ads2v/source-plus-reference-clip-plus-1-8-image routes",
+                contract.provider_id
+            )))
+        }
+    };
+    if !context.has_reference || !axes.contains(&expected_provider_mode) {
+        return Err(CoreError::Unsupported(format!(
+            "{}: Bernini memory evidence requires the exact provider task {expected_provider_mode}",
+            contract.provider_id
+        )));
+    }
+    let reference_axis = axes
+        .iter()
+        .copied()
+        .find(|axis| is_reference_receipt_axis(axis));
+    let seal_axis = axes
+        .iter()
+        .copied()
+        .find(|axis| axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN));
+    let exact_receipt = reference_receipt_from_overlay(context.overlay.as_deref());
+    let mv2v_axis = axes.iter().copied().find(|axis| is_mv2v_receipt_axis(axis));
+    let mv2v_seal = axes
+        .iter()
+        .copied()
+        .find(|axis| axis.starts_with(MV2V_SEAL_DOMAIN));
+    let ads2v_axis = axes
+        .iter()
+        .copied()
+        .find(|axis| is_ads2v_receipt_axis(axis));
+    let ads2v_seal = axes
+        .iter()
+        .copied()
+        .find(|axis| axis.starts_with(ADS2V_SEAL_DOMAIN));
+    let reference_axis_count = axes
+        .iter()
+        .filter(|axis| is_reference_receipt_axis(axis))
+        .count();
+    let seal_axis_count = axes
+        .iter()
+        .filter(|axis| axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN))
+        .count();
+    let mv2v_axis_count = axes
+        .iter()
+        .filter(|axis| is_mv2v_receipt_axis(axis))
+        .count();
+    let mv2v_seal_count = axes
+        .iter()
+        .filter(|axis| axis.starts_with(MV2V_SEAL_DOMAIN))
+        .count();
+    let ads2v_axis_count = axes
+        .iter()
+        .filter(|axis| is_ads2v_receipt_axis(axis))
+        .count();
+    let ads2v_seal_count = axes
+        .iter()
+        .filter(|axis| axis.starts_with(ADS2V_SEAL_DOMAIN))
+        .count();
+    let receipt_has_video = reference_axis.is_some_and(reference_receipt_has_video);
+    if mode == "reference_to_video"
+        && (reference_axis.and_then(receipt_count) != Some(context.geometry.reference_count)
+            || receipt_has_video
+            || seal_axis.is_none()
+            || exact_receipt.is_none())
+    {
+        return Err(CoreError::Unsupported(format!(
+            "{}: Bernini r2v memory evidence requires an ordered MLX reference receipt for all {} images",
+            contract.provider_id, context.geometry.reference_count
+        )));
+    }
+    if mode == "reference_video_to_video"
+        && (reference_axis.and_then(receipt_count) != Some(context.geometry.reference_count - 1)
+            || !receipt_has_video
+            || !reference_axis.is_some_and(|axis| {
+                rv2v_receipt_matches_context(&contract.provider_id, axis, context)
+            })
+            || seal_axis.is_none()
+            || exact_receipt.is_none())
+    {
+        return Err(CoreError::Unsupported(format!(
+            "{}: Bernini rv2v memory evidence requires one normalized clip plus an ordered MLX receipt for all {} images",
+            contract.provider_id,
+            context.geometry.reference_count - 1
+        )));
+    }
+    if mode == "video_to_video" && (reference_axis.is_some() || seal_axis.is_some()) {
+        return Err(CoreError::Unsupported(
+            "bernini V2V cannot carry an R2V image receipt".to_owned(),
+        ));
+    }
+    if mode == "multi_video_to_video"
+        && (source_receipt_from_overlay(context.overlay.as_deref()).is_none()
+            || mv2v_axis.is_none()
+            || mv2v_seal.is_none()
+            || mv2v_axis_count != 1
+            || mv2v_seal_count != 1
+            || reference_axis_count != 0
+            || seal_axis_count != 0
+            || !mv2v_axis.is_some_and(|axis| {
+                axis.contains(&format!(":count-{}:", context.geometry.reference_count))
+                    && axis.matches("video-").count() == context.geometry.reference_count as usize
+                    && axis.contains(&format!(
+                        "source-ids-{}",
+                        mv2v_source_ids(context.geometry.reference_count as usize).join(",")
+                    ))
+            }))
+    {
+        return Err(CoreError::Unsupported(format!(
+            "{}: Bernini mv2v memory evidence requires ordered normalized receipts for all {} source clips",
+            contract.provider_id, context.geometry.reference_count
+        )));
+    }
+    if mode == "ads2v"
+        && (source_receipt_from_overlay(context.overlay.as_deref()).is_none()
+            || ads2v_axis.is_none()
+            || ads2v_seal.is_none()
+            || ads2v_axis_count != 1
+            || ads2v_seal_count != 1
+            || reference_axis_count != 0
+            || seal_axis_count != 0
+            || mv2v_axis_count != 0
+            || mv2v_seal_count != 0
+            || !ads2v_axis.is_some_and(|axis| {
+                axis.contains(&format!(":count-{}:", context.geometry.reference_count))
+                    && axis.matches("source-video:").count() == 1
+                    && axis.matches("reference-video:").count() == 1
+                    && axis.matches("image-").count()
+                        == context.geometry.reference_count.saturating_sub(2) as usize
+                    && axis.contains(&format!(
+                        "source-ids-{}",
+                        ads2v_source_ids(context.geometry.reference_count as usize).join(",")
+                    ))
+            }))
+    {
+        return Err(CoreError::Unsupported(format!(
+            "{}: Bernini ads2v memory evidence requires ordered source/reference clips and 1-8 ordered images",
+            contract.provider_id
+        )));
+    }
+    if axes.iter().any(|axis| {
+        *axis != expected_provider_mode
+            && !is_reference_receipt_axis(axis)
+            && !axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN)
+            && !is_mv2v_receipt_axis(axis)
+            && !axis.starts_with(MV2V_SEAL_DOMAIN)
+            && !is_ads2v_receipt_axis(axis)
+            && !axis.starts_with(ADS2V_SEAL_DOMAIN)
+    }) {
+        return Err(CoreError::Unsupported(
+            "bernini MLX memory evidence contains an unknown or crossed overlay axis".to_owned(),
+        ));
+    }
+    validate_geometry(context.geometry.width, context.geometry.height)?;
+    if !matches!(context.geometry.frames, 45 | 61 | 77) {
+        return Err(CoreError::Unsupported(format!(
+            "{}: Bernini V2V memory evidence covers exactly 45, 61, or 77 frames, got {}",
+            contract.provider_id, context.geometry.frames
+        )));
+    }
+    // sc-15839 review defect, Resident+PiD admission. Bernini decodes through the Wan z16 VAE and
+    // the crate carries no `mlx-gen-pid` dependency at all, so a PiD selection would silently
+    // execute the ordinary native decode — a different strategy than the selector chose. Reject
+    // at admission rather than degrade.
+    if context.use_pid {
+        return Err(CoreError::Unsupported(format!(
+            "{}: bernini decodes through the Wan z16 AutoencoderKLWan and has no PiD student; \
+             the overlay is not implementable on this provider",
+            contract.provider_id
+        )));
+    }
+    // sc-18609. `MemoryRunContext::has_phases` describes the request's multi-phase denoise
+    // (`GenerationRequest::phases`, epic 13879), which only the Krea MLX family reads — NOT this
+    // contract's `MemoryPhase` lifecycle, which is a different axis and is always present here.
+    // Nothing in this crate reads `req.phases`, so a phased admission would record evidence for a
+    // trajectory Bernini cannot run. Reject it rather than silently render the single-phase one.
+    if context.has_phases {
+        return Err(CoreError::Unsupported(format!(
+            "{}: bernini runs a single-phase denoise; the multi-phase request trajectory is not \
+             implemented on this provider",
+            contract.provider_id
+        )));
+    }
+    // sc-15839 review defect, unconstrained batch geometry. `max_count: 1` on both descriptors,
+    // so a batched admission would record evidence for a route `validate` rejects anyway.
+    if context.geometry.batch != 1 {
+        return Err(CoreError::Unsupported(format!(
+            "{}: bernini renders one image per request (max_count = 1); got batch {}",
+            contract.provider_id, context.geometry.batch
+        )));
+    }
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        validate_decode(
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        )?;
+    }
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedAttention) {
+        if let Some(size) = context.selection.parameters.attention_chunk_size {
+            validate_attention(size)?;
+        }
+    }
+    if contract.engages(
+        context.selection.strategy,
+        MemoryStrategy::BoundedTransformerResidency,
+    ) {
+        if !contract.lifecycle.transformer_window_materialization {
+            return Err(CoreError::Unsupported(format!(
+                "{}: bounded transformer residency requires a DeferredMaterialization load",
+                contract.provider_id
+            )));
+        }
+        // The scope AND the cadence are checked here as well as by the shared parameter
+        // validator, so a request that reached the provider by another path still cannot ask for
+        // a scope this family does not implement or a cadence that would mis-align the low
+        // expert's first window.
+        let component = context.selection.parameters.window_component();
+        if !TRANSFORMER_WINDOW_COMPONENTS.contains(&component) {
+            return Err(CoreError::Unsupported(format!(
+                "{}: transformer window component {component:?} is not implemented; bernini \
+                 releases every conditioning network before either expert loads, so a window \
+                 over them cannot move the request peak",
+                contract.provider_id
+            )));
+        }
+        if let Some(size) = context.selection.parameters.transformer_window_size {
+            validate_window(size)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        let mode = context.mode.as_key();
-        let axes: Vec<_> = context
-            .overlay
-            .as_deref()
-            .unwrap_or_default()
-            .split('+')
-            .filter(|axis| !axis.is_empty())
-            .collect();
-        let expected_provider_mode = match mode {
-            "video_to_video" if context.geometry.reference_count == 1 => "provider_video_mode:v2v",
-            "reference_to_video" if (1..=8).contains(&context.geometry.reference_count) => {
-                "provider_video_mode:r2v"
-            }
-            "reference_video_to_video" if (2..=9).contains(&context.geometry.reference_count) => {
-                "provider_video_mode:rv2v"
-            }
-            "multi_video_to_video" if (2..=8).contains(&context.geometry.reference_count) => {
-                "provider_video_mode:mv2v"
-            }
-            "ads2v" if (3..=10).contains(&context.geometry.reference_count) => {
-                "provider_video_mode:ads2v"
-            }
-            _ => {
-                return Err(CoreError::Unsupported(format!(
-                    "{}: Bernini memory evidence covers exact video_to_video/one-clip, \
-                     reference_to_video/1-8-image, reference_video_to_video/one-clip-plus-1-8-image, \
-                     multi_video_to_video/2-8-clip, or \
-                     ads2v/source-plus-reference-clip-plus-1-8-image routes",
-                    contract.provider_id
-                )))
-            }
-        };
-        if !context.has_reference || !axes.contains(&expected_provider_mode) {
-            return Err(CoreError::Unsupported(format!(
-                "{}: Bernini memory evidence requires the exact provider task {expected_provider_mode}",
-                contract.provider_id
-            )));
-        }
-        let reference_axis = axes
-            .iter()
-            .copied()
-            .find(|axis| is_reference_receipt_axis(axis));
-        let seal_axis = axes
-            .iter()
-            .copied()
-            .find(|axis| axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN));
-        let exact_receipt = reference_receipt_from_overlay(context.overlay.as_deref());
-        let mv2v_axis = axes.iter().copied().find(|axis| is_mv2v_receipt_axis(axis));
-        let mv2v_seal = axes
-            .iter()
-            .copied()
-            .find(|axis| axis.starts_with(MV2V_SEAL_DOMAIN));
-        let ads2v_axis = axes
-            .iter()
-            .copied()
-            .find(|axis| is_ads2v_receipt_axis(axis));
-        let ads2v_seal = axes
-            .iter()
-            .copied()
-            .find(|axis| axis.starts_with(ADS2V_SEAL_DOMAIN));
-        let reference_axis_count = axes
-            .iter()
-            .filter(|axis| is_reference_receipt_axis(axis))
-            .count();
-        let seal_axis_count = axes
-            .iter()
-            .filter(|axis| axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN))
-            .count();
-        let mv2v_axis_count = axes
-            .iter()
-            .filter(|axis| is_mv2v_receipt_axis(axis))
-            .count();
-        let mv2v_seal_count = axes
-            .iter()
-            .filter(|axis| axis.starts_with(MV2V_SEAL_DOMAIN))
-            .count();
-        let ads2v_axis_count = axes
-            .iter()
-            .filter(|axis| is_ads2v_receipt_axis(axis))
-            .count();
-        let ads2v_seal_count = axes
-            .iter()
-            .filter(|axis| axis.starts_with(ADS2V_SEAL_DOMAIN))
-            .count();
-        let receipt_has_video = reference_axis.is_some_and(reference_receipt_has_video);
-        if mode == "reference_to_video"
-            && (reference_axis.and_then(receipt_count) != Some(context.geometry.reference_count)
-                || receipt_has_video
-                || seal_axis.is_none()
-                || exact_receipt.is_none())
-        {
-            return Err(CoreError::Unsupported(format!(
-                "{}: Bernini r2v memory evidence requires an ordered MLX reference receipt for all {} images",
-                contract.provider_id, context.geometry.reference_count
-            )));
-        }
-        if mode == "reference_video_to_video"
-            && (reference_axis.and_then(receipt_count)
-                != Some(context.geometry.reference_count - 1)
-                || !receipt_has_video
-                || !reference_axis.is_some_and(|axis| {
-                    rv2v_receipt_matches_context(&contract.provider_id, axis, context)
-                })
-                || seal_axis.is_none()
-                || exact_receipt.is_none())
-        {
-            return Err(CoreError::Unsupported(format!(
-                "{}: Bernini rv2v memory evidence requires one normalized clip plus an ordered MLX receipt for all {} images",
-                contract.provider_id,
-                context.geometry.reference_count - 1
-            )));
-        }
-        if mode == "video_to_video" && (reference_axis.is_some() || seal_axis.is_some()) {
-            return Err(CoreError::Unsupported(
-                "bernini V2V cannot carry an R2V image receipt".to_owned(),
-            ));
-        }
-        if mode == "multi_video_to_video"
-            && (source_receipt_from_overlay(context.overlay.as_deref()).is_none()
-                || mv2v_axis.is_none()
-                || mv2v_seal.is_none()
-                || mv2v_axis_count != 1
-                || mv2v_seal_count != 1
-                || reference_axis_count != 0
-                || seal_axis_count != 0
-                || !mv2v_axis.is_some_and(|axis| {
-                    axis.contains(&format!(":count-{}:", context.geometry.reference_count))
-                        && axis.matches("video-").count()
-                            == context.geometry.reference_count as usize
-                        && axis.contains(&format!(
-                            "source-ids-{}",
-                            mv2v_source_ids(context.geometry.reference_count as usize).join(",")
-                        ))
-                }))
-        {
-            return Err(CoreError::Unsupported(format!(
-                "{}: Bernini mv2v memory evidence requires ordered normalized receipts for all {} source clips",
-                contract.provider_id, context.geometry.reference_count
-            )));
-        }
-        if mode == "ads2v"
-            && (source_receipt_from_overlay(context.overlay.as_deref()).is_none()
-                || ads2v_axis.is_none()
-                || ads2v_seal.is_none()
-                || ads2v_axis_count != 1
-                || ads2v_seal_count != 1
-                || reference_axis_count != 0
-                || seal_axis_count != 0
-                || mv2v_axis_count != 0
-                || mv2v_seal_count != 0
-                || !ads2v_axis.is_some_and(|axis| {
-                    axis.contains(&format!(":count-{}:", context.geometry.reference_count))
-                        && axis.matches("source-video:").count() == 1
-                        && axis.matches("reference-video:").count() == 1
-                        && axis.matches("image-").count()
-                            == context.geometry.reference_count.saturating_sub(2) as usize
-                        && axis.contains(&format!(
-                            "source-ids-{}",
-                            ads2v_source_ids(context.geometry.reference_count as usize).join(",")
-                        ))
-                }))
-        {
-            return Err(CoreError::Unsupported(format!(
-                "{}: Bernini ads2v memory evidence requires ordered source/reference clips and 1-8 ordered images",
-                contract.provider_id
-            )));
-        }
-        if axes.iter().any(|axis| {
-            *axis != expected_provider_mode
-                && !is_reference_receipt_axis(axis)
-                && !axis.starts_with(R2V_REFERENCE_SEAL_DOMAIN)
-                && !is_mv2v_receipt_axis(axis)
-                && !axis.starts_with(MV2V_SEAL_DOMAIN)
-                && !is_ads2v_receipt_axis(axis)
-                && !axis.starts_with(ADS2V_SEAL_DOMAIN)
-        }) {
-            return Err(CoreError::Unsupported(
-                "bernini MLX memory evidence contains an unknown or crossed overlay axis"
-                    .to_owned(),
-            ));
-        }
-        validate_geometry(context.geometry.width, context.geometry.height)?;
-        if !matches!(context.geometry.frames, 45 | 61 | 77) {
-            return Err(CoreError::Unsupported(format!(
-                "{}: Bernini V2V memory evidence covers exactly 45, 61, or 77 frames, got {}",
-                contract.provider_id, context.geometry.frames
-            )));
-        }
-        // sc-15839 review defect, Resident+PiD admission. Bernini decodes through the Wan z16 VAE and
-        // the crate carries no `mlx-gen-pid` dependency at all, so a PiD selection would silently
-        // execute the ordinary native decode — a different strategy than the selector chose. Reject
-        // at admission rather than degrade.
-        if context.use_pid {
-            return Err(CoreError::Unsupported(format!(
-                "{}: bernini decodes through the Wan z16 AutoencoderKLWan and has no PiD student; \
-                 the overlay is not implementable on this provider",
-                contract.provider_id
-            )));
-        }
-        // sc-18609. `MemoryRunContext::has_phases` describes the request's multi-phase denoise
-        // (`GenerationRequest::phases`, epic 13879), which only the Krea MLX family reads — NOT this
-        // contract's `MemoryPhase` lifecycle, which is a different axis and is always present here.
-        // Nothing in this crate reads `req.phases`, so a phased admission would record evidence for a
-        // trajectory Bernini cannot run. Reject it rather than silently render the single-phase one.
-        if context.has_phases {
-            return Err(CoreError::Unsupported(format!(
-                "{}: bernini runs a single-phase denoise; the multi-phase request trajectory is not \
-                 implemented on this provider",
-                contract.provider_id
-            )));
-        }
-        // sc-15839 review defect, unconstrained batch geometry. `max_count: 1` on both descriptors,
-        // so a batched admission would record evidence for a route `validate` rejects anyway.
-        if context.geometry.batch != 1 {
-            return Err(CoreError::Unsupported(format!(
-                "{}: bernini renders one image per request (max_count = 1); got batch {}",
-                contract.provider_id, context.geometry.batch
-            )));
-        }
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-            validate_decode(
-                context.selection.parameters.decode_tile_edge,
-                context.selection.parameters.decode_overlap,
-            )?;
-        }
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedAttention) {
-            if let Some(size) = context.selection.parameters.attention_chunk_size {
-                validate_attention(size)?;
-            }
-        }
-        if contract.engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        ) {
-            if !contract.lifecycle.transformer_window_materialization {
-                return Err(CoreError::Unsupported(format!(
-                    "{}: bounded transformer residency requires a DeferredMaterialization load",
-                    contract.provider_id
-                )));
-            }
-            // The scope AND the cadence are checked here as well as by the shared parameter
-            // validator, so a request that reached the provider by another path still cannot ask for
-            // a scope this family does not implement or a cadence that would mis-align the low
-            // expert's first window.
-            let component = context.selection.parameters.window_component();
-            if !TRANSFORMER_WINDOW_COMPONENTS.contains(&component) {
-                return Err(CoreError::Unsupported(format!(
-                    "{}: transformer window component {component:?} is not implemented; bernini \
-                     releases every conditioning network before either expert loads, so a window \
-                     over them cannot move the request peak",
-                    contract.provider_id
-                )));
-            }
-            if let Some(size) = context.selection.parameters.transformer_window_size {
-                validate_window(size)?;
-            }
-        }
-        Ok(())
-    };
-    let loaded_tier = if contract.provider_id != FULL_ID
+    mlx_gen::gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
+}
+
+/// The admitted tier: the requested fixture tier for every route but the full production route, and
+/// for a full-route contract carrying the static weights-free calibration; otherwise the tier the
+/// production artifact proves.
+fn admitted_tier(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+) -> CoreResult<MemoryNumericTier> {
+    if contract.provider_id != FULL_ID
         || contract
             .calibration
             .as_ref()
             .is_some_and(|identity| identity.fingerprint == STATIC_CALIBRATION)
     {
-        fixture_tier(spec)
+        Ok(fixture_tier(spec))
     } else {
-        match resolved_numeric_tier(spec) {
-            Ok(tier) => tier,
-            Err(error) => return MemorySafetyDecision::rejected(error),
-        }
-    };
-    standard_memory_strategy_safety_check(contract, context, Some(loaded_tier), Some(&route_gate))
+        resolved_numeric_tier(spec)
+    }
 }
 
 fn fixture_tier(spec: &LoadSpec) -> MemoryNumericTier {
@@ -1918,6 +1939,23 @@ pub(crate) fn registered_begin_request(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    mlx_gen::gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _admitted_tier: MemoryNumericTier,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
     begin_with_cleanup(
         provider_id,
@@ -3452,6 +3490,47 @@ mod tests {
             production_calibration_fingerprint(FULL_ID, &packed_spec).unwrap(),
             "bernini-image-q8-mlx-dual-expert-ladder-v1"
         );
+    }
+
+    /// sc-27307: every published `(provider, tier)` fingerprint, byte for byte, so moving the
+    /// spelling onto the shared `MemoryFingerprintTable` cannot restamp a record.
+    #[test]
+    fn sc27307_every_fingerprint_cell_is_pinned() {
+        for (bits, image, renderer) in [
+            (
+                None,
+                "bernini-image-bf16-mlx-dual-expert-ladder-v1",
+                "bernini-renderer-bf16-mlx-dual-expert-ladder-v1",
+            ),
+            (
+                Some(4),
+                "bernini-image-q4-mlx-dual-expert-ladder-v1",
+                "bernini-renderer-q4-mlx-dual-expert-ladder-v1",
+            ),
+            (
+                Some(8),
+                "bernini-image-q8-mlx-dual-expert-ladder-v1",
+                "bernini-renderer-q8-mlx-dual-expert-ladder-v1",
+            ),
+        ] {
+            let root = tier_snapshot(bits);
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+            assert_eq!(
+                production_calibration_fingerprint(FULL_ID, &spec).as_deref(),
+                Some(image)
+            );
+            assert_eq!(
+                production_calibration_fingerprint(RENDERER_ID, &spec).as_deref(),
+                Some(renderer)
+            );
+            assert_eq!(
+                production_calibration_fingerprint("not_a_bernini", &spec),
+                None
+            );
+            let mut fp32 = spec.clone();
+            fp32.precision = mlx_gen::Precision::Fp32;
+            assert_eq!(production_calibration_fingerprint(FULL_ID, &fp32), None);
+        }
     }
 
     #[test]

@@ -11,9 +11,10 @@ use candle_gen::gen_core::{
     MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
     MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
     MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategyPrerequisite,
-    MemoryStrategySupport, MemoryWindowMaterialization, PerComponentBytes, Precision, Quant,
+    MemoryProfileGates, MemoryProfileTier, MemoryProviderContract, MemoryRequestScope,
+    MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategyCapability, MemoryStrategyPrerequisite, MemoryStrategySupport,
+    MemoryWindowMaterialization, PerComponentBytes, Precision, ProviderMemoryProfile, Quant,
     TransformerComponent, WeightsSource,
 };
 
@@ -567,15 +568,38 @@ pub(crate) fn evidence_identity_and_tier(
     Ok((calibration, resolved_numeric_tier(spec, provider_id)?))
 }
 
-pub(crate) fn validate_context(
-    provider_id: &str,
+/// The Candle Qwen-Image memory profile (sc-27307): the snapshot's packed transformer width names
+/// the tier and the native-VAE refusals run after the shared pipeline admits. The bespoke edit
+/// route layers its own load-spec-bound gate ([`validate_edit_route`], the artifact recipe) on top.
+const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    tier: MemoryProfileTier::Resolved(profile_tier),
+    rejection: gen_core::MemoryRejectionRendering::ValidationError,
+    gates: MemoryProfileGates::after(native_vae_route_gate),
+    ..ProviderMemoryProfile::STANDARD
+};
+
+fn profile_tier(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+) -> gen_core::Result<MemoryNumericTier> {
+    let provider_id = contract.provider_id.as_str();
+    resolved_numeric_tier(spec, provider_id)
+}
+
+fn bf16_tier(loaded_quant: Option<Quant>) -> MemoryNumericTier {
+    MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant: loaded_quant,
+        component_precision_floors: &[],
+    }
+}
+
+fn native_vae_route_gate(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
-    loaded_quant: Option<Quant>,
+    _loaded_tier: MemoryNumericTier,
 ) -> gen_core::Result<()> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(contract, context, loaded_quant) {
-        return Err(gen_core::Error::Unsupported(reason));
-    }
+    let provider_id = &contract.provider_id;
     if context.has_phases {
         return Err(gen_core::Error::Unsupported(format!(
             "{provider_id}: optimized memory strategies do not cover multi-phase denoise"
@@ -587,6 +611,15 @@ pub(crate) fn validate_context(
         )));
     }
     Ok(())
+}
+
+pub(crate) fn validate_context(
+    _provider_id: &str,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_quant: Option<Quant>,
+) -> gen_core::Result<()> {
+    gen_core::standard_validate_context(&MEMORY_PROFILE, contract, context, bf16_tier(loaded_quant))
 }
 
 /// Validate the request axes owned by the bespoke Qwen-Image-Edit route. The shared safety check
@@ -649,23 +682,6 @@ pub(crate) fn validate_edit_context(
 ) -> gen_core::Result<()> {
     validate_context("qwen_image_edit", contract, context, loaded_quant)?;
     validate_edit_route(context, has_adapters)
-}
-
-pub(crate) fn safety_check(
-    contract: &MemoryProviderContract,
-    context: &MemoryRunContext,
-    loaded_quant: Option<Quant>,
-) -> MemorySafetyDecision {
-    gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(MemoryNumericTier {
-            precision: Precision::Bf16,
-            quant: loaded_quant,
-            component_precision_floors: &[],
-        }),
-        None,
-    )
 }
 
 pub(crate) fn admission_safety_check(
@@ -883,6 +899,8 @@ impl Drop for QwenMemoryScope {
     }
 }
 
+/// The weights-free twin of [`admission_safety_check`]. The bespoke edit route first binds its
+/// artifact recipe and adapter overlay, which only the load spec names.
 pub(crate) fn registered_safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -899,12 +917,12 @@ pub(crate) fn registered_safety_check(
             return MemorySafetyDecision::rejected(error);
         }
     }
-    match snapshot_quant_tier(spec, &contract.provider_id) {
-        Ok(quant) => {
+    match MEMORY_PROFILE.tier.resolve(spec, contract) {
+        Ok(tier) => {
             let result = if contract.provider_id == "qwen_image_edit" {
-                validate_edit_context(contract, context, quant, !spec.adapters.is_empty())
+                validate_edit_context(contract, context, tier.quant, !spec.adapters.is_empty())
             } else {
-                validate_context(&contract.provider_id, contract, context, quant)
+                gen_core::standard_validate_context(&MEMORY_PROFILE, contract, context, tier)
             };
             MemorySafetyDecision::from_validation(result)
         }
@@ -917,38 +935,40 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
+    if contract.provider_id != "qwen_image_edit" {
+        return gen_core::standard_registered_valid_fixture(
+            &MEMORY_PROFILE,
+            spec,
+            contract,
+            strategy,
+        );
+    }
+    // The edit route's fixture carries an exact base-artifact receipt for its recipe gate.
     if !strategy.is_optimized() {
         return Ok(Vec::new());
     }
-    let edit = contract.provider_id == "qwen_image_edit";
     let context = gen_core::standard_memory_behavior_context(
         contract,
         strategy,
         resolved_numeric_tier(spec, &contract.provider_id)?,
         gen_core::MemoryBehaviorRoute {
-            mode: if edit {
-                MemoryMode::Edit
-            } else {
-                MemoryMode::TextToImage
-            },
-            reference_count: u32::from(edit),
+            mode: MemoryMode::Edit,
+            reference_count: 1,
             use_pid: false,
             has_phases: false,
-            overlay: (edit && !spec.adapters.is_empty()).then(|| "lora".to_owned()),
+            overlay: (!spec.adapters.is_empty()).then(|| "lora".to_owned()),
         },
     )?;
-    let mut fixture = gen_core::MemoryBehaviorFixture::new(context);
-    if edit {
-        let exact_base = std::path::PathBuf::from("models--SceneWorks--qwen-image-edit-2511-mlx")
-            .join("snapshots")
-            .join("0dfbf3a018bcee42d77de14494c35f97a7531def")
-            .join("bf16");
-        let mut exact_spec = spec.clone();
-        exact_spec.weights = WeightsSource::Dir(exact_base);
-        exact_spec.resolved_route = Some(crate::edit::EDIT_2511_BASE_ROUTE.to_owned());
-        fixture = fixture.with_load_spec(exact_spec);
-    }
-    Ok(vec![fixture])
+    let exact_base = std::path::PathBuf::from("models--SceneWorks--qwen-image-edit-2511-mlx")
+        .join("snapshots")
+        .join("0dfbf3a018bcee42d77de14494c35f97a7531def")
+        .join("bf16");
+    let mut exact_spec = spec.clone();
+    exact_spec.weights = WeightsSource::Dir(exact_base);
+    exact_spec.resolved_route = Some(crate::edit::EDIT_2511_BASE_ROUTE.to_owned());
+    Ok(vec![
+        gen_core::MemoryBehaviorFixture::new(context).with_load_spec(exact_spec)
+    ])
 }
 
 pub(crate) fn registered_begin_request(
@@ -957,18 +977,32 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if provider_id == "qwen_image_edit" {
-        let recipe = crate::edit::validate_memory_artifact_recipe(spec)
-            .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
-        crate::edit::validate_memory_recipe_context(recipe, context)
-            .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+    if provider_id != "qwen_image_edit" {
+        return gen_core::standard_begin_request(
+            &MEMORY_PROFILE,
+            provider_id,
+            spec,
+            contract,
+            context,
+            registered_scope,
+        );
     }
+    let recipe = crate::edit::validate_memory_artifact_recipe(spec)
+        .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+    crate::edit::validate_memory_recipe_context(recipe, context)
+        .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
     let quant = snapshot_quant_tier(spec, provider_id)?;
-    if provider_id == "qwen_image_edit" {
-        validate_edit_context(contract, context, quant, !spec.adapters.is_empty())?;
-    } else {
-        validate_context(provider_id, contract, context, quant)?;
-    }
+    validate_edit_context(contract, context, quant, !spec.adapters.is_empty())?;
+    registered_scope(provider_id, spec, contract, context, bf16_tier(quant))
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     Ok(Some(Box::new(QwenMemoryScope::new(
         provider_id,
         Device::Cpu,

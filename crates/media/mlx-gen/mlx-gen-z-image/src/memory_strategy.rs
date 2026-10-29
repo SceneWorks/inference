@@ -148,14 +148,16 @@ use mlx_gen::asset_facts::{
     projected_safetensors_bytes, projected_safetensors_tensors, projected_tensor_headers_bytes,
     ResidentProjection,
 };
+use mlx_gen::gen_core::standard_safety_check;
 use mlx_gen::gen_core::{
     Error as CoreError, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
-    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
-    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
-    MemoryRunContext, MemoryRuntimeSemantics, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport,
-    Result as CoreResult, TransformerComponent,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFixtureMode,
+    MemoryFixturePid, MemoryFixtureRoute, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryProfileFixtures, MemoryProfileGates, MemoryProfileTier, MemoryProviderContract,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRuntimeSemantics,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters,
+    MemoryStrategySupport, ProviderMemoryProfile, Result as CoreResult, TransformerComponent,
 };
 #[cfg(test)]
 use mlx_gen::gen_core::{GenerationMemory, MemoryGeometry, MemoryRunOutcome};
@@ -889,6 +891,71 @@ fn control_resident_components(
 ///
 /// `Resident` returns `None`, which is the historical fast path (`GenerationRequest::memory`
 /// untouched).
+/// The Z-Image MLX memory profile (sc-27307): the data the shared safety, registry, fixture and
+/// begin-request skeletons are parameterised over. The tier is the artifact's packed width (see
+/// [`loaded_tier`]), and the one provider-owned refusal is the route-aware decode gate.
+pub(crate) const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    tier: MemoryProfileTier::Resolved(profile_tier),
+    gates: MemoryProfileGates::within(decode_route_gate),
+    fixtures: MemoryProfileFixtures::TEXT_TO_IMAGE.with_pid(MemoryFixturePid::WhenPidDecodeRoutes),
+    ..ProviderMemoryProfile::STANDARD
+};
+
+/// The control variants' profile: the same skeletons, with a single-reference image-to-image
+/// behavior fixture.
+pub(crate) const CONTROL_MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    fixtures: MemoryProfileFixtures::routes(&[MemoryFixtureRoute::new(
+        MemoryFixtureMode::ImageToImage,
+        1,
+    )])
+    .with_pid(MemoryFixturePid::WhenPidDecodeRoutes),
+    ..MEMORY_PROFILE
+};
+
+fn profile_tier(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+) -> CoreResult<MemoryNumericTier> {
+    let provider_id = contract.provider_id.as_str();
+    loaded_tier(spec, provider_id)
+}
+
+fn decode_route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<()> {
+    // Route-aware decode-parameter validation (SC-15510).
+    //
+    // SC-15615 had to REFUSE rungs 2+ on the PiD route outright, because the super-resolving student
+    // planned its own tile edge/overlap from `mlx_gen_pid::budget` and never read this contract's
+    // parameters — admitting a selection would have executed a different strategy than the selector
+    // chose. That is now reconciled rather than refused: `mint_planned_decoder_with_tiling` honours an
+    // explicit plan and validates it against the planner's own invariants, so the PiD route is a
+    // first-class rung-2 route with its own candidate domain.
+    //
+    // The domains do not overlap — the native VAE tiles the output at 512-768 px, the PiD student
+    // tiles a `scale×` super-resolved output at 2048 px — so a selection built for one route is
+    // rejected on the other rather than silently re-planned. The static `validate_selection` above
+    // sees only the published union, which is why this check exists.
+    // SC-15805: ask the contract whether this selection ENGAGES rung 2 rather than re-deriving it
+    // from the enum's numeric order. Same answer for every shipping z-image load; the difference is
+    // that the cost-order default now lives in exactly one documented place.
+    // SC-15775: the check itself is the shared `DecodeRoutes` gate rather than a per-provider match,
+    // so the next PiD-eligible adopter inherits it instead of re-deriving (or forgetting) it.
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        let routes = decode_routes(contract.provider_id.as_str())?;
+        routes
+            .validate(
+                context.use_pid,
+                context.selection.parameters.decode_tile_edge,
+                context.selection.parameters.decode_overlap,
+            )
+            .map_err(CoreError::Unsupported)?;
+    }
+    Ok(())
+}
+
 /// The provider safety check every Z-Image variant shares: the calibration handshake, then the shared
 /// contract's own selection validation, then the budget. Defense in depth only — it can reject, it can
 /// never swap in a different strategy or numeric tier.
@@ -897,110 +964,20 @@ pub(crate) fn safety_check(
     loaded_tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        // Route-aware decode-parameter validation (SC-15510).
-        //
-        // SC-15615 had to REFUSE rungs 2+ on the PiD route outright, because the super-resolving student
-        // planned its own tile edge/overlap from `mlx_gen_pid::budget` and never read this contract's
-        // parameters — admitting a selection would have executed a different strategy than the selector
-        // chose. That is now reconciled rather than refused: `mint_planned_decoder_with_tiling` honours an
-        // explicit plan and validates it against the planner's own invariants, so the PiD route is a
-        // first-class rung-2 route with its own candidate domain.
-        //
-        // The domains do not overlap — the native VAE tiles the output at 512-768 px, the PiD student
-        // tiles a `scale×` super-resolved output at 2048 px — so a selection built for one route is
-        // rejected on the other rather than silently re-planned. The static `validate_selection` above
-        // sees only the published union, which is why this check exists.
-        // SC-15805: ask the contract whether this selection ENGAGES rung 2 rather than re-deriving it
-        // from the enum's numeric order. Same answer for every shipping z-image load; the difference is
-        // that the cost-order default now lives in exactly one documented place.
-        // SC-15775: the check itself is the shared `DecodeRoutes` gate rather than a per-provider match,
-        // so the next PiD-eligible adopter inherits it instead of re-deriving (or forgetting) it.
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-            let routes = decode_routes(contract.provider_id.as_str())?;
-            routes
-                .validate(
-                    context.use_pid,
-                    context.selection.parameters.decode_tile_edge,
-                    context.selection.parameters.decode_overlap,
-                )
-                .map_err(CoreError::Unsupported)?;
-        }
-        Ok(())
-    };
-    mlx_gen::gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(loaded_tier),
-        Some(&route_gate),
-    )
+    standard_safety_check(&MEMORY_PROFILE, contract, context, loaded_tier)
 }
 
-pub(crate) fn registered_safety_check(
-    spec: &LoadSpec,
-    contract: &MemoryProviderContract,
-    context: &MemoryRunContext,
-) -> MemorySafetyDecision {
-    match loaded_tier(spec, &contract.provider_id) {
-        Ok(tier) => safety_check(contract, tier, context),
-        Err(error) => MemorySafetyDecision::rejected(error),
-    }
-}
-
-pub(crate) fn registered_valid_fixture(
-    spec: &LoadSpec,
-    contract: &MemoryProviderContract,
-    strategy: MemoryStrategy,
-) -> CoreResult<Vec<mlx_gen::gen_core::MemoryBehaviorFixture>> {
-    if !strategy.is_optimized() {
-        return Ok(Vec::new());
-    }
-    let tier = loaded_tier(spec, &contract.provider_id)?;
-    let is_control = contract.provider_id.ends_with("_control");
-    let route = |use_pid| mlx_gen::gen_core::MemoryBehaviorRoute {
-        mode: if is_control {
-            mlx_gen::gen_core::MemoryMode::ImageToImage
-        } else {
-            mlx_gen::gen_core::MemoryMode::TextToImage
-        },
-        reference_count: u32::from(is_control),
-        use_pid,
-        has_phases: false,
-        overlay: None,
-    };
-    let mut fixtures = vec![mlx_gen::gen_core::MemoryBehaviorFixture::new(
-        mlx_gen::gen_core::standard_memory_behavior_context(
-            contract,
-            strategy,
-            tier,
-            route(false),
-        )?,
-    )];
-    if contract.pid_decode_routes.is_some()
-        && contract.engages(strategy, MemoryStrategy::BoundedDecode)
-    {
-        fixtures.push(mlx_gen::gen_core::MemoryBehaviorFixture::new(
-            mlx_gen::gen_core::standard_memory_behavior_context(
-                contract,
-                strategy,
-                tier,
-                route(true),
-            )?,
-        ));
-    }
-    Ok(fixtures)
-}
-
-pub(crate) fn registered_begin_request(
+pub(crate) fn registered_scope(
     provider_id: &'static str,
-    spec: &LoadSpec,
+    _spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
+    loaded_tier: MemoryNumericTier,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
     begin_request_with_cleanup(
         provider_id,
         contract,
-        loaded_tier(spec, provider_id)?,
+        loaded_tier,
         context,
         mlx_gen::request_scope::MlxScopeCleanup::None,
     )

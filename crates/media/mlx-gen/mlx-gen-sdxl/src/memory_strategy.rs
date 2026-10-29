@@ -180,14 +180,16 @@
 //! selection. The scope below is defense in depth: it can reject a selection, never substitute one.
 
 use mlx_gen::gen_core::{
-    adapter_stack_resident_bytes, standard_memory_strategy_safety_check, AdapterResidencyMode,
-    Error as CoreError, MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
-    MemoryCalibrationIdentity, MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryParameterRanges, MemoryPhase,
-    MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent,
-    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite,
-    MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult, TransformerComponent,
+    adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError,
+    MemoryBackendRealization, MemoryBehaviorFixture, MemoryCalibrationIdentity,
+    MemoryComponentKind, MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities,
+    MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory,
+    Result as CoreResult, TransformerComponent,
 };
+#[cfg(test)]
+use mlx_gen::gen_core::{MemoryBehaviorRoute, MemoryMode};
 use mlx_gen::request_scope::loaded_tier;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, WeightsSource};
@@ -1295,6 +1297,94 @@ fn validate_window(size: u32) -> CoreResult<()> {
     mlx_gen::request_scope::validate_calibrated_window("sdxl", size, TRANSFORMER_WINDOW_SIZES)
 }
 
+/// The SDXL MLX memory profile (sc-27307): requested tier, the route gate inside the shared
+/// pipeline, and one phased text-to-image fixture (plus its PiD copy when rung 2 has a PiD route)
+/// per implemented rung. Rung 1 is request-scoped, and every optimized selection engages it by cost
+/// order — which is also rung 4's declared prerequisite — hence the phases.
+const MEMORY_PROFILE: mlx_gen::gen_core::ProviderMemoryProfile =
+    mlx_gen::gen_core::ProviderMemoryProfile {
+        gates: mlx_gen::gen_core::MemoryProfileGates::within(route_gate),
+        fixtures: mlx_gen::gen_core::MemoryProfileFixtures::routes(&[
+            mlx_gen::gen_core::MemoryFixtureRoute::TEXT_TO_IMAGE
+                .with_phases(mlx_gen::gen_core::MemoryFixturePhases::Always),
+        ])
+        .implemented_only()
+        .with_pid(mlx_gen::gen_core::MemoryFixturePid::WhenPidDecodeRoutes),
+        ..mlx_gen::gen_core::ProviderMemoryProfile::STANDARD
+    };
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
+) -> CoreResult<()> {
+    // SDXL advertises txt2img, img2img, inpaint, control and IP-Adapter reference routes, so the
+    // mode axis is deliberately permissive — unlike a text-to-image-only family. What is NOT
+    // permissive is the geometry: a bounded decode must name a geometry from the route it will
+    // actually execute on.
+    if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode) {
+        let capability = contract.capability(MemoryStrategy::BoundedDecode);
+        let sealed = capability
+            .is_some_and(|capability| !capability.parameters.decode_geometry_policies.is_empty());
+        if !sealed {
+            // Route-blind rung 2 (sc-26268): the domain of the route this request runs.
+            if !capability.is_some_and(|capability| {
+                matches!(capability.support, MemoryStrategySupport::Implemented)
+            }) {
+                return Err(refuse_decode(
+                    &contract.provider_id,
+                    context.selection.parameters.decode_tile_edge,
+                    context.selection.parameters.decode_overlap,
+                ));
+            }
+            let (edge, overlap) = resolve_decode_geometry(
+                context.use_pid,
+                context.selection.parameters.decode_tile_edge,
+                context.selection.parameters.decode_overlap,
+            );
+            validate_route_blind_decode(&contract.provider_id, context.use_pid, edge, overlap)?;
+        }
+    }
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedAttention) {
+        return Err(CoreError::Unsupported(format!(
+            "{}: bounded attention is not selectable on this provider (rung 3 is declared \
+             Missing): it moves the peak 0.00% at both measured scopes (the request and the \
+             U-Net seam), and \
+             the query-row chunking axis is not bit-exact on Metal, which an fp16 \
+             chaos-sensitive schedule amplifies to a different image — see \
+             memory_strategy::ATTENTION_SUPPORT",
+            contract.provider_id
+        )));
+    }
+    if contract.engages(
+        context.selection.strategy,
+        MemoryStrategy::BoundedTransformerResidency,
+    ) {
+        if !contract.lifecycle.transformer_window_materialization {
+            return Err(CoreError::Unsupported(format!(
+                "{}: bounded transformer residency requires a DeferredMaterialization load over \
+                 a snapshot directory whose adapters (if any) are replayable — see \
+                 memory_strategy::streamable",
+                contract.provider_id
+            )));
+        }
+        // The scope AND the size are checked here as well as by the shared parameter validator,
+        // so a request that reached the provider by another path still cannot ask for a scope
+        // this family does not implement or a cadence it never measured.
+        let component = context.selection.parameters.window_component();
+        if !TRANSFORMER_WINDOW_COMPONENTS.contains(&component) {
+            return Err(CoreError::Unsupported(format!(
+                "{}: transformer window component {component:?} is not implemented",
+                contract.provider_id
+            )));
+        }
+        if let Some(size) = context.selection.parameters.transformer_window_size {
+            validate_window(size)?;
+        }
+    }
+    Ok(())
+}
+
 /// The provider safety check: the calibration handshake and tier match, then the shared contract's
 /// own selection validation, then this provider's route gate, then the budget. Defense in depth
 /// only — it can reject, never swap in a different strategy or tier.
@@ -1303,80 +1393,7 @@ pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        // SDXL advertises txt2img, img2img, inpaint, control and IP-Adapter reference routes, so the
-        // mode axis is deliberately permissive — unlike a text-to-image-only family. What is NOT
-        // permissive is the geometry: a bounded decode must name a geometry from the route it will
-        // actually execute on.
-        if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode) {
-            let capability = contract.capability(MemoryStrategy::BoundedDecode);
-            let sealed = capability.is_some_and(|capability| {
-                !capability.parameters.decode_geometry_policies.is_empty()
-            });
-            if !sealed {
-                // Route-blind rung 2 (sc-26268): the domain of the route this request runs.
-                if !capability.is_some_and(|capability| {
-                    matches!(capability.support, MemoryStrategySupport::Implemented)
-                }) {
-                    return Err(refuse_decode(
-                        &contract.provider_id,
-                        context.selection.parameters.decode_tile_edge,
-                        context.selection.parameters.decode_overlap,
-                    ));
-                }
-                let (edge, overlap) = resolve_decode_geometry(
-                    context.use_pid,
-                    context.selection.parameters.decode_tile_edge,
-                    context.selection.parameters.decode_overlap,
-                );
-                validate_route_blind_decode(&contract.provider_id, context.use_pid, edge, overlap)?;
-            }
-        }
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedAttention) {
-            return Err(CoreError::Unsupported(format!(
-                "{}: bounded attention is not selectable on this provider (rung 3 is declared \
-                 Missing): it moves the peak 0.00% at both measured scopes (the request and the \
-                 U-Net seam), and \
-                 the query-row chunking axis is not bit-exact on Metal, which an fp16 \
-                 chaos-sensitive schedule amplifies to a different image — see \
-                 memory_strategy::ATTENTION_SUPPORT",
-                contract.provider_id
-            )));
-        }
-        if contract.engages(
-            context.selection.strategy,
-            MemoryStrategy::BoundedTransformerResidency,
-        ) {
-            if !contract.lifecycle.transformer_window_materialization {
-                return Err(CoreError::Unsupported(format!(
-                    "{}: bounded transformer residency requires a DeferredMaterialization load over \
-                     a snapshot directory whose adapters (if any) are replayable — see \
-                     memory_strategy::streamable",
-                    contract.provider_id
-                )));
-            }
-            // The scope AND the size are checked here as well as by the shared parameter validator,
-            // so a request that reached the provider by another path still cannot ask for a scope
-            // this family does not implement or a cadence it never measured.
-            let component = context.selection.parameters.window_component();
-            if !TRANSFORMER_WINDOW_COMPONENTS.contains(&component) {
-                return Err(CoreError::Unsupported(format!(
-                    "{}: transformer window component {component:?} is not implemented",
-                    contract.provider_id
-                )));
-            }
-            if let Some(size) = context.selection.parameters.transformer_window_size {
-                validate_window(size)?;
-            }
-        }
-        Ok(())
-    };
-    standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(loaded_tier(spec)),
-        Some(&route_gate),
-    )
+    mlx_gen::gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 pub(crate) fn registered_valid_fixture(
@@ -1384,46 +1401,7 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> CoreResult<Vec<MemoryBehaviorFixture>> {
-    if !strategy.is_optimized()
-        || !matches!(
-            contract.capability(strategy).map(|c| &c.support),
-            Some(MemoryStrategySupport::Implemented)
-        )
-    {
-        return Ok(Vec::new());
-    }
-    let tier = loaded_tier(spec);
-    let route = |use_pid| MemoryBehaviorRoute {
-        mode: MemoryMode::TextToImage,
-        reference_count: 0,
-        use_pid,
-        // Rung 1 is request-scoped, and every optimized selection engages it by cost order — which
-        // is also rung 4's declared prerequisite.
-        has_phases: true,
-        overlay: None,
-    };
-    let mut fixtures = vec![MemoryBehaviorFixture::new(
-        mlx_gen::gen_core::standard_memory_behavior_context(
-            contract,
-            strategy,
-            tier,
-            route(false),
-        )?,
-    )];
-    // sc-26268: the PiD route of rung 2 is a distinct admitted domain, so it gets its own fixture.
-    if contract.pid_decode_routes.is_some()
-        && contract.engages(strategy, MemoryStrategy::BoundedDecode)
-    {
-        fixtures.push(MemoryBehaviorFixture::new(
-            mlx_gen::gen_core::standard_memory_behavior_context(
-                contract,
-                strategy,
-                tier,
-                route(true),
-            )?,
-        ));
-    }
-    Ok(fixtures)
+    mlx_gen::gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 pub(crate) fn registered_begin_request(
@@ -1431,6 +1409,23 @@ pub(crate) fn registered_begin_request(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    mlx_gen::gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
     begin_with_cleanup(
         provider_id,

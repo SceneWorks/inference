@@ -1294,15 +1294,16 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// The snapshot root still gates the whole function. The geometry is compiled in, but a
 /// weights-free contract has resolved no pipeline at all, and claiming a shape for a surface with
 /// no snapshot behind it would make the registry's placeholder look like read evidence.
-fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+fn architecture_facts_from_snapshot(
+    _provider_id: &str,
+    _root: &Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
     use candle_gen_wan::config::{
         TransformerConfig, Vae16Config, VAE16_STRIDE_SPATIAL, VAE16_STRIDE_TEMPORAL,
     };
 
-    if af::snapshot_root(spec).is_none() {
-        return gen_core::MemoryArchitectureFacts::default();
-    }
     let dit = TransformerConfig::t2v_14b();
     let vae = Vae16Config::wan21();
     gen_core::MemoryArchitectureFacts {
@@ -1363,7 +1364,11 @@ fn contract(
     };
     MemoryProviderContract {
         phase_facts: None,
-        architecture_facts: architecture_facts(spec),
+        architecture_facts: gen_core::standard_architecture_facts(
+            &MEMORY_PROFILE,
+            provider_id,
+            spec,
+        ),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1487,13 +1492,14 @@ fn calibration_tier_label(packing: ComponentPacking) -> &'static str {
 
 /// The route token one provider id contributes to its identity — the same two routes the MLX
 /// sibling names, so a cell's key differs across the lanes only in the lane token.
-fn calibration_route(provider_id: &str) -> Option<&'static str> {
-    match provider_id {
-        crate::bernini::MODEL_ID => Some("image"),
-        crate::pipeline::MODEL_ID => Some("renderer"),
-        _ => None,
-    }
-}
+const FINGERPRINTS: gen_core::MemoryFingerprintTable = gen_core::MemoryFingerprintTable {
+    template: "bernini-{route}-{tier}-candle-dual-expert-ladder-v1",
+    routes: &[
+        (crate::bernini::MODEL_ID, "image"),
+        (crate::pipeline::MODEL_ID, "renderer"),
+    ],
+    pins: &[],
+};
 
 /// The production calibration identity for one `(provider, artifact-proven tier)` cell.
 ///
@@ -1518,14 +1524,12 @@ fn production_calibration_fingerprint(
     spec: &LoadSpec,
     packing: ComponentPacking,
 ) -> Option<String> {
-    let route = calibration_route(provider_id)?;
     if !spec.adapters.is_empty() {
         return None;
     }
-    let tier = calibration_tier_label(packing);
-    Some(format!(
-        "bernini-{route}-{tier}-candle-dual-expert-ladder-v1"
-    ))
+    MEMORY_PROFILE
+        .fingerprint?
+        .fingerprint(provider_id, calibration_tier_label(packing))
 }
 
 /// The production calibration identity of one Candle Bernini load, derived **once** for every seam
@@ -1857,18 +1861,32 @@ fn route_ok(contract: &MemoryProviderContract, context: &MemoryRunContext) -> ge
     Ok(())
 }
 
+/// The Candle Bernini memory profile (sc-27307): the requested tier, the route gate
+/// ([`route_ok`]) inside the shared pipeline, the snapshot-gated preset geometry and the
+/// fingerprint spelling. Its behavior fixtures are provider-owned (multi-request assembly).
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    gates: gen_core::MemoryProfileGates::within(profile_route_gate),
+    fingerprint: Some(FINGERPRINTS),
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn profile_route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<()> {
+    route_ok(contract, context)
+}
+
 pub fn safety_check(
     contract: &MemoryProviderContract,
     loaded_tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let gate = || route_ok(contract, context);
-    gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(loaded_tier),
-        Some(&gate),
-    )
+    gen_core::standard_safety_check(&MEMORY_PROFILE, contract, context, loaded_tier)
 }
 
 pub fn registered_safety_check(
@@ -1876,7 +1894,7 @@ pub fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check(contract, tier(spec), context)
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 fn validate_still_request(request: &GenerationRequest) -> gen_core::Result<()> {
@@ -2313,7 +2331,7 @@ pub fn registered_valid_fixtures(
 }
 
 pub fn registered_begin_request(
-    provider_id: &str,
+    provider_id: &'static str,
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
@@ -2329,7 +2347,24 @@ pub fn registered_begin_request(
     // creates a second, racy asset read between contract construction and request configuration.
     // Use the same spec-derived tier as the paired registered safety check; real lazy loads still
     // revalidate their sealed contract at the component-load boundary.
-    begin_request(contract, tier(spec), Device::Cpu, context)
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    _provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    begin_request(contract, loaded_tier, Device::Cpu, context)
 }
 
 pub fn begin_request(
@@ -3877,5 +3912,50 @@ mod tests {
         assert!(error.to_string().contains("changed after"), "{error}");
         let refreshed = memory_strategy_contract(crate::pipeline::MODEL_ID, &spec).unwrap();
         assert_ne!(refreshed, sealed);
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_pin_tests {
+    use super::*;
+
+    /// sc-27307: every production calibration fingerprint this lane publishes, pinned byte for byte
+    /// before the spelling moved into a `MemoryFingerprintTable`.
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        let spec = LoadSpec::new(gen_core::WeightsSource::Dir("/pin".into()));
+        for (provider_id, route) in [
+            (crate::bernini::MODEL_ID, "image"),
+            (crate::pipeline::MODEL_ID, "renderer"),
+        ] {
+            for (packing, tier) in [
+                (ComponentPacking::Dense, "bf16"),
+                (ComponentPacking::Q4, "q4"),
+                (ComponentPacking::Q8, "q8"),
+            ] {
+                assert_eq!(
+                    production_calibration_fingerprint(provider_id, &spec, packing).as_deref(),
+                    Some(format!("bernini-{route}-{tier}-candle-dual-expert-ladder-v1").as_str())
+                );
+            }
+        }
+        assert_eq!(
+            production_calibration_fingerprint("not_bernini", &spec, ComponentPacking::Q4),
+            None
+        );
+        let mut adapted = spec.clone();
+        adapted.adapters.push(gen_core::AdapterSpec::new(
+            "/pin/lora.safetensors".into(),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        assert_eq!(
+            production_calibration_fingerprint(
+                crate::bernini::MODEL_ID,
+                &adapted,
+                ComponentPacking::Dense
+            ),
+            None
+        );
     }
 }

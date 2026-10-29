@@ -264,6 +264,15 @@ pub use memory_strategy::{
     MEMORY_DECODE_QUALITY_ABI, MEMORY_EVIDENCE_SCHEMA_VERSION, MEMORY_EVIDENCE_V1_PREFIX,
     MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI,
 };
+pub use memory_strategy::{
+    resolved_snapshot_root, standard_architecture_facts, standard_begin_request,
+    standard_registered_safety_check, standard_registered_valid_fixture, standard_safety_check,
+    standard_validate_context, MemoryArchitectureSource, MemoryFingerprintPin,
+    MemoryFingerprintTable, MemoryFixtureMode, MemoryFixtureOverlay, MemoryFixturePhases,
+    MemoryFixturePid, MemoryFixtureRoute, MemoryProfileFixtures, MemoryProfileGate,
+    MemoryProfileGates, MemoryProfileScope, MemoryProfileTier, MemoryProfileTierResolver,
+    MemoryRejectionRendering, ProviderMemoryProfile,
+};
 pub use registry::{
     candle_memory_contract_surface_specs, candle_nvfp4_memory_contract_surface_specs,
     candle_publisher_memory_contract_surface_specs, mlx_memory_contract_surface_specs,

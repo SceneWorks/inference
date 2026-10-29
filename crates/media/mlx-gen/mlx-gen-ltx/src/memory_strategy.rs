@@ -73,12 +73,24 @@ pub fn calibration_tier_label(quant: Option<Quant>) -> Option<&'static str> {
 /// `None` for a packed width this family does not ship — withheld, never a failed load.
 pub fn production_calibration_fingerprint(tier: &MemoryNumericTier) -> Option<String> {
     let label = calibration_tier_label(tier.quant)?;
-    Some(if label == CALIBRATED_TIER {
-        CALIBRATION_FINGERPRINT.to_owned()
-    } else {
-        format!("sc-20772-ltx-2-3-{label}-mlx-memory-ladder-v2")
-    })
+    Some(FINGERPRINT_PROFILE.fingerprint?.render("", label))
 }
+
+/// The LTX-2.3 fingerprint spelling (sc-27307): one route, keyed by tier, with the measured q8 cell
+/// keeping the identity it was calibrated under. The route-aware admission gate stays provider-owned
+/// (it binds the context to the loaded route's overlay receipt, which only the `LoadSpec` names).
+const FINGERPRINT_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    fingerprint: Some(gen_core::MemoryFingerprintTable {
+        template: "sc-20772-ltx-2-3-{tier}-mlx-memory-ladder-v2",
+        routes: &[],
+        pins: &[gen_core::MemoryFingerprintPin {
+            route: "",
+            tier: CALIBRATED_TIER,
+            fingerprint: CALIBRATION_FINGERPRINT,
+        }],
+    }),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
 const STATIC_CALIBRATION_FINGERPRINT: &str = "sc-20772-ltx-2-3-mlx-registry-behavior-v2";
 
 pub const DECODE_OVERLAP: u32 = 64;
@@ -2772,5 +2784,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("geometry disagrees"), "{error}");
+    }
+}
+
+/// sc-27307: every production calibration fingerprint this family can publish, pinned byte for
+/// byte across the move to a [`gen_core::MemoryFingerprintTable`].
+#[cfg(test)]
+mod fingerprint_pin_tests {
+    use super::*;
+
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        let seen: Vec<_> = [None, Some(Quant::Q4), Some(Quant::Q8), Some(Quant::Nvfp4)]
+            .into_iter()
+            .map(|quant| {
+                production_calibration_fingerprint(&MemoryNumericTier {
+                    precision: mlx_gen::Precision::Bf16,
+                    quant,
+                    component_precision_floors: &[],
+                })
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                Some("sc-20772-ltx-2-3-bf16-mlx-memory-ladder-v2".to_owned()),
+                Some("sc-20772-ltx-2-3-q4-mlx-memory-ladder-v2".to_owned()),
+                Some("sc-20772-ltx-2-3-mlx-memory-ladder-v2".to_owned()),
+                None,
+            ]
+        );
     }
 }

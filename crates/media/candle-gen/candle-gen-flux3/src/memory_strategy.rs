@@ -47,13 +47,16 @@ use candle_gen::gen_core::flux3::{
 use candle_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, SafetensorsTensorHeader};
 use candle_gen::gen_core::{
     self, Error as CoreError, LoadShape, LoadSpec, MemoryArchitectureFacts, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
-    MemoryCalibrationIdentity, MemoryContractSurfaceSpec, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization, Precision, Quant,
-    ResidentRequestMemory, Result as CoreResult,
+    MemoryBackendRealization, MemoryBehaviorFixture, MemoryCalibrationIdentity,
+    MemoryContractSurfaceSpec, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryPhase, MemoryProviderContract,
+    MemoryRequestScope, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategySupport, MemoryWindowMaterialization, Precision, Quant, ResidentRequestMemory,
+    Result as CoreResult,
 };
+
+#[cfg(test)]
+use candle_gen::gen_core::{MemoryBehaviorRoute, MemoryMode};
 
 use crate::model::MODEL_ID;
 
@@ -83,7 +86,9 @@ pub const TRANSFORMER_WINDOW_NOT_ENABLED: &str =
 
 /// The numeric tier a spec loads: its precision and its DiT storage tier (`None` dense, or the
 /// GGML Q4_1 / Q8_0 package `LoadSpec::quantize` selects). No component is resident above the
-/// selected width; the encoder and autoencoder keep their own representations.
+/// selected width; the encoder and autoencoder keep their own representations. Production resolves
+/// it through the profile's [`gen_core::MemoryProfileTier::Requested`].
+#[cfg(test)]
 fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
     MemoryNumericTier {
         precision: spec.precision,
@@ -696,31 +701,43 @@ pub fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
+}
+
+/// The Candle FLUX.3 memory profile (sc-27307): the requested tier, the route gate inside the
+/// shared pipeline, and one phased text-to-image fixture per implemented optimized rung.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    gates: gen_core::MemoryProfileGates::within(route_gate),
+    fixtures: gen_core::MemoryProfileFixtures::routes(&[
+        gen_core::MemoryFixtureRoute::TEXT_TO_IMAGE
+            .with_phases(gen_core::MemoryFixturePhases::Always),
+    ])
+    .implemented_only(),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<()> {
     let id = contract.provider_id.as_str();
-    let route_gate = || {
-        gen_core::flux3::references::validate_memory_route(
-            &context.mode,
-            context.geometry.reference_count,
-        )?;
-        if context.use_pid {
-            return Err(CoreError::Unsupported(format!(
-                "{id}: there is no PiD decoder on this route"
-            )));
-        }
-        if context.geometry.frames > 1 {
-            return Err(CoreError::Unsupported(format!(
-                "{id}: a still-image route cannot admit {} frames",
-                context.geometry.frames
-            )));
-        }
-        Ok(())
-    };
-    gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(loaded_tier(spec)),
-        Some(&route_gate),
-    )
+    gen_core::flux3::references::validate_memory_route(
+        &context.mode,
+        context.geometry.reference_count,
+    )?;
+    if context.use_pid {
+        return Err(CoreError::Unsupported(format!(
+            "{id}: there is no PiD decoder on this route"
+        )));
+    }
+    if context.geometry.frames > 1 {
+        return Err(CoreError::Unsupported(format!(
+            "{id}: a still-image route cannot admit {} frames",
+            context.geometry.frames
+        )));
+    }
+    Ok(())
 }
 
 /// One provider-owned valid context per implemented optimized rung (staged residency).
@@ -729,27 +746,7 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> CoreResult<Vec<MemoryBehaviorFixture>> {
-    if !strategy.is_optimized()
-        || !matches!(
-            contract.capability(strategy).map(|c| &c.support),
-            Some(MemoryStrategySupport::Implemented)
-        )
-    {
-        return Ok(Vec::new());
-    }
-    let context = gen_core::standard_memory_behavior_context(
-        contract,
-        strategy,
-        loaded_tier(spec),
-        MemoryBehaviorRoute {
-            mode: MemoryMode::TextToImage,
-            reference_count: 0,
-            use_pid: false,
-            has_phases: true,
-            overlay: None,
-        },
-    )?;
-    Ok(vec![MemoryBehaviorFixture::new(context)])
+    gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 /// The executable admission seam: the shared Candle request scope, whose `configure_request`
@@ -760,10 +757,17 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
-        return Err(CoreError::Unsupported(reason));
-    }
     let id = route_id(&contract.provider_id)?;
+    gen_core::standard_begin_request(&MEMORY_PROFILE, id, spec, contract, context, request_scope)
+}
+
+fn request_scope(
+    id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     let config = candle_gen::request_scope::CandleRequestScopeConfig::new(
         id,
         candle_gen::default_device()?,

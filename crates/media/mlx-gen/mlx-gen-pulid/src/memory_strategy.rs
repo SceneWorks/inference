@@ -31,11 +31,12 @@
 use std::path::{Path, PathBuf};
 
 use mlx_gen::gen_core::{
-    standard_memory_strategy_safety_check, ArtifactSeal, Error as CoreError, MemoryBehaviorFixture,
+    standard_registered_safety_check, ArtifactSeal, Error as CoreError, MemoryBehaviorFixture,
     MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency,
-    MemoryFormulaKind, MemoryMode, MemoryOptimizationAuthority, MemoryProviderContract,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, Result as CoreResult,
+    MemoryFingerprintPin, MemoryFingerprintTable, MemoryFormulaKind, MemoryMode, MemoryNumericTier,
+    MemoryOptimizationAuthority, MemoryProfileGates, MemoryProviderContract, MemoryRequestScope,
+    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    ProviderMemoryProfile, Result as CoreResult,
 };
 use mlx_gen::{LoadSpec, WeightsSource};
 
@@ -66,11 +67,7 @@ pub fn production_calibration_fingerprint(spec: &LoadSpec) -> Option<String> {
         return None;
     }
     let tier = mlx_gen_flux::memory_strategy::calibration_tier_label(&base)?;
-    Some(if tier == "q4" {
-        MEMORY_CALIBRATION_FINGERPRINT.to_owned()
-    } else {
-        format!("pulid-flux-dev-{tier}-mlx-shared-ladder-v1")
-    })
+    Some(MEMORY_PROFILE.fingerprint?.render("flux-dev", tier))
 }
 
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen_flux::memory_strategy::ATTENTION_CHUNK_SIZE;
@@ -332,44 +329,63 @@ pub fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route = || {
-        if context.mode != MemoryMode::ImageToImage
-            || context.geometry.reference_count != 1
-            || context.use_pid
-            || context.has_phases
-            || context.overlay.as_deref() != Some("identity")
-        {
-            return Err(CoreError::Msg("pulid_flux: memory route requires one identity reference, overlay=identity, native VAE decode, and no request phases".into()));
-        }
-        // sc-20569 twin: `claims_measured_evidence` is the same envelope/structure discriminator the
-        // SenseNova and FLUX route gates use. An optimized rung admitted behind a legacy/estimated
-        // authority has NOT claimed to be graded against the measured cell, so it must degrade to
-        // admission instead of refusing; only a `Calibrated` claim off the measured cell fails
-        // closed, because admitting THAT would grade a request against evidence captured at a
-        // different geometry.
-        let claims_measured_evidence =
-            context.optimization_authority == MemoryOptimizationAuthority::Calibrated;
-        if contract
-            .calibration
-            .as_ref()
-            .is_some_and(|id| id.fingerprint == MEMORY_CALIBRATION_FINGERPRINT)
-            && context.selection.strategy.is_optimized()
-            && claims_measured_evidence
-            && (context.geometry.width != 1024
-                || context.geometry.height != 1024
-                || context.geometry.batch != 1
-                || context.geometry.frames != 1)
-        {
-            return Err(CoreError::Msg("pulid_flux: calibrated geometry is exactly 1024x1024, batch 1, one frame/reference".into()));
-        }
-        Ok(())
-    };
-    standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(mlx_gen::request_scope::loaded_tier(spec)),
-        Some(&route),
-    )
+    standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
+}
+
+/// The PuLID-FLUX MLX memory profile (sc-27307): the requested tier, the identity-route gate, and the
+/// fingerprint spelling of its one FLUX.1-dev backbone route.
+const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    gates: MemoryProfileGates::within(route_gate),
+    fingerprint: Some(MemoryFingerprintTable {
+        template: "pulid-{route}-{tier}-mlx-shared-ladder-v1",
+        routes: &[(crate::pulid_flux::MODEL_ID, "flux-dev")],
+        pins: &[MemoryFingerprintPin {
+            route: "flux-dev",
+            tier: "q4",
+            fingerprint: MEMORY_CALIBRATION_FINGERPRINT,
+        }],
+    }),
+    ..ProviderMemoryProfile::STANDARD
+};
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<()> {
+    if context.mode != MemoryMode::ImageToImage
+        || context.geometry.reference_count != 1
+        || context.use_pid
+        || context.has_phases
+        || context.overlay.as_deref() != Some("identity")
+    {
+        return Err(CoreError::Msg("pulid_flux: memory route requires one identity reference, overlay=identity, native VAE decode, and no request phases".into()));
+    }
+    // sc-20569 twin: `claims_measured_evidence` is the same envelope/structure discriminator the
+    // SenseNova and FLUX route gates use. An optimized rung admitted behind a legacy/estimated
+    // authority has NOT claimed to be graded against the measured cell, so it must degrade to
+    // admission instead of refusing; only a `Calibrated` claim off the measured cell fails
+    // closed, because admitting THAT would grade a request against evidence captured at a
+    // different geometry.
+    let claims_measured_evidence =
+        context.optimization_authority == MemoryOptimizationAuthority::Calibrated;
+    if contract
+        .calibration
+        .as_ref()
+        .is_some_and(|id| id.fingerprint == MEMORY_CALIBRATION_FINGERPRINT)
+        && context.selection.strategy.is_optimized()
+        && claims_measured_evidence
+        && (context.geometry.width != 1024
+            || context.geometry.height != 1024
+            || context.geometry.batch != 1
+            || context.geometry.frames != 1)
+    {
+        return Err(CoreError::Msg(
+            "pulid_flux: calibrated geometry is exactly 1024x1024, batch 1, one frame/reference"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn registered_fixture(
@@ -401,6 +417,23 @@ pub fn registered_begin_request(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
+    mlx_gen::gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        crate::pulid_flux::MODEL_ID,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    _provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope>>> {
     begin_with(
         spec,
@@ -1246,6 +1279,36 @@ mod tests {
         assert_eq!(
             MEMORY_CALIBRATION_FINGERPRINT,
             "pulid-flux-dev-q4-mlx-shared-ladder-2026-08-04-v1"
+        );
+    }
+}
+
+/// sc-27307: every published production calibration fingerprint, byte for byte, so moving the
+/// spelling onto the shared `MemoryFingerprintTable` cannot restamp a record.
+#[cfg(test)]
+mod sc27307_fingerprint_pins {
+    use super::*;
+
+    #[test]
+    fn every_fingerprint_cell_is_pinned() {
+        let base = LoadSpec::new(WeightsSource::Dir("/sc27307-pulid-pin".into()));
+        assert_eq!(
+            production_calibration_fingerprint(&base).as_deref(),
+            Some("pulid-flux-dev-bf16-mlx-shared-ladder-v1")
+        );
+        assert_eq!(
+            production_calibration_fingerprint(&base.clone().with_quant(mlx_gen::Quant::Q4))
+                .as_deref(),
+            Some("pulid-flux-dev-q4-mlx-shared-ladder-2026-08-04-v1")
+        );
+        assert_eq!(
+            production_calibration_fingerprint(&base.clone().with_quant(mlx_gen::Quant::Q8))
+                .as_deref(),
+            Some("pulid-flux-dev-q8-mlx-shared-ladder-v1")
+        );
+        assert_eq!(
+            production_calibration_fingerprint(&base.with_quant(mlx_gen::Quant::Nvfp4)),
+            None
         );
     }
 }

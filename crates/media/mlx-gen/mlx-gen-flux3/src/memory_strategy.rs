@@ -39,13 +39,16 @@ use mlx_gen::gen_core::flux3::{Flux3Config, GenerationResources};
 use mlx_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, SafetensorsTensorHeader};
 use mlx_gen::gen_core::{
     self, Error as CoreError, LoadShape, MemoryArchitectureFacts, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
-    MemoryCalibrationIdentity, MemoryContractSurfaceSpec, MemoryContractSurfaceTier,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategySupport, Precision, Quant, ResidentRequestMemory,
+    MemoryBackendRealization, MemoryBehaviorFixture, MemoryCalibrationIdentity,
+    MemoryContractSurfaceSpec, MemoryContractSurfaceTier, MemoryFixturePhases, MemoryFixtureRoute,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryNumericTier,
+    MemoryPhase, MemoryProfileFixtures, MemoryProfileGates, MemoryProviderContract,
+    MemoryRequestScope, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategySupport, Precision, ProviderMemoryProfile, Quant, ResidentRequestMemory,
     Result as CoreResult,
 };
+#[cfg(test)]
+use mlx_gen::gen_core::{MemoryBehaviorRoute, MemoryMode};
 use mlx_gen::LoadSpec;
 
 use crate::model::MODEL_ID;
@@ -536,30 +539,41 @@ pub fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        gen_core::flux3::references::validate_memory_route(
-            &context.mode,
-            context.geometry.reference_count,
-        )?;
-        if context.use_pid {
-            return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: there is no PiD decoder on this route"
-            )));
-        }
-        if context.geometry.frames > 1 {
-            return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: a still-image route cannot admit {} frames",
-                context.geometry.frames
-            )));
-        }
-        Ok(())
-    };
-    gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(mlx_gen::request_scope::loaded_tier(spec)),
-        Some(&route_gate),
-    )
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
+}
+
+/// The FLUX 3 MLX memory profile (sc-27307): the requested tier, the still-image reference-route
+/// gate, and one staged text-to-image fixture per implemented optimized rung.
+const MEMORY_PROFILE: ProviderMemoryProfile = ProviderMemoryProfile {
+    gates: MemoryProfileGates::within(route_gate),
+    fixtures: MemoryProfileFixtures::routes(&[
+        MemoryFixtureRoute::TEXT_TO_IMAGE.with_phases(MemoryFixturePhases::Always)
+    ])
+    .implemented_only(),
+    ..ProviderMemoryProfile::STANDARD
+};
+
+fn route_gate(
+    _contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<()> {
+    gen_core::flux3::references::validate_memory_route(
+        &context.mode,
+        context.geometry.reference_count,
+    )?;
+    if context.use_pid {
+        return Err(CoreError::Unsupported(format!(
+            "{MODEL_ID}: there is no PiD decoder on this route"
+        )));
+    }
+    if context.geometry.frames > 1 {
+        return Err(CoreError::Unsupported(format!(
+            "{MODEL_ID}: a still-image route cannot admit {} frames",
+            context.geometry.frames
+        )));
+    }
+    Ok(())
 }
 
 /// One provider-owned valid context per implemented optimized rung (staged residency).
@@ -568,27 +582,7 @@ pub(crate) fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> CoreResult<Vec<MemoryBehaviorFixture>> {
-    if !strategy.is_optimized()
-        || !matches!(
-            contract.capability(strategy).map(|c| &c.support),
-            Some(MemoryStrategySupport::Implemented)
-        )
-    {
-        return Ok(Vec::new());
-    }
-    let context = gen_core::standard_memory_behavior_context(
-        contract,
-        strategy,
-        mlx_gen::request_scope::loaded_tier(spec),
-        MemoryBehaviorRoute {
-            mode: MemoryMode::TextToImage,
-            reference_count: 0,
-            use_pid: false,
-            has_phases: true,
-            overlay: None,
-        },
-    )?;
-    Ok(vec![MemoryBehaviorFixture::new(context)])
+    gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 /// The executable admission seam: the shared MLX request scope, whose `configure_request`
@@ -599,13 +593,30 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
-    mlx_gen::request_scope::admit(safety_check(spec, contract, context))?;
+    let provider_id = if contract.provider_id == gen_core::flux3::BASE_MODEL_ID {
+        gen_core::flux3::BASE_MODEL_ID
+    } else {
+        MODEL_ID
+    };
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        admitted_scope,
+    )
+}
+
+fn admitted_scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     let config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        if contract.provider_id == gen_core::flux3::BASE_MODEL_ID {
-            gen_core::flux3::BASE_MODEL_ID
-        } else {
-            MODEL_ID
-        },
+        provider_id,
         context.geometry,
         contract.generation_memory(&context.selection),
         context.use_pid,

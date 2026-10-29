@@ -987,9 +987,26 @@ pub fn sdxl_unet_family_architecture_facts(
 /// Snapshot-scoped facts for the SDXL routes: the weights-free contract surface (the registry's
 /// sentinel path, or a single-file import) resolves no snapshot, so no axis is knowable there.
 fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
-    if candle_gen::architecture_facts::snapshot_root(spec).is_none() {
-        return gen_core::MemoryArchitectureFacts::default();
-    }
+    gen_core::standard_architecture_facts(&MEMORY_PROFILE, crate::MODEL_ID, spec)
+}
+
+/// The Candle SDXL memory profile (sc-27307). Admission and `begin_request` stay provider-owned:
+/// a sealed contract binds the exact [`SdxlArtifactSeal`] and a weights-free one the spec's own
+/// overlay identity, neither of which the profile's contract/context/tier hooks can carry, and the
+/// behavior fixtures each carry the exact `LoadSpec` their overlay requires. The profile owns the
+/// snapshot-guarded architecture facts.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn architecture_facts_from_snapshot(
+    _provider_id: &str,
+    _root: &std::path::Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     sdxl_unet_family_architecture_facts(ACTIVATION_DTYPE)
 }
 

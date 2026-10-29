@@ -138,44 +138,52 @@ pub fn resolved_numeric_tier(
     candle_gen_flux::memory_strategy::resolved_numeric_tier(&base_spec(paths), PROVIDER_ID)
 }
 
-/// Provider-owned safety check for the bespoke identity route.
-pub fn safety_check(
-    paths: &PulidFluxPaths,
-    contract: &MemoryProviderContract,
+/// The PuLID-FLUX memory profile (sc-27307): the shared pipeline, then the identity-route refusals
+/// once it has admitted. The tier is the FLUX base snapshot's, resolved from [`PulidFluxPaths`]
+/// rather than a [`LoadSpec`], so [`safety_check`] resolves it before entering the profile.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    gates: gen_core::MemoryProfileGates::after(identity_route_gate),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn identity_route_gate(
+    _contract: &MemoryProviderContract,
     context: &MemoryRunContext,
-) -> MemorySafetyDecision {
-    let tier = match resolved_numeric_tier(paths) {
-        Ok(tier) => tier,
-        Err(error) => return MemorySafetyDecision::rejected(error),
-    };
-    if let MemorySafetyDecision::Reject { reason } =
-        gen_core::standard_memory_strategy_safety_check(contract, context, Some(tier), None)
-    {
-        return MemorySafetyDecision::Reject { reason };
-    }
+    _loaded_tier: gen_core::MemoryNumericTier,
+) -> gen_core::Result<()> {
     if context.mode != MemoryMode::Other("character_image".to_owned())
         || !context.has_reference
         || context.geometry.batch != 1
         || context.geometry.reference_count != 1
         || context.overlay.as_deref() != Some("identity")
     {
-        return MemorySafetyDecision::Reject {
-            reason: format!(
-                "{PROVIDER_ID}: memory admission is bound to one character_image identity reference"
-            ),
-        };
+        return Err(gen_core::Error::Msg(format!(
+            "{PROVIDER_ID}: memory admission is bound to one character_image identity reference"
+        )));
     }
     if context.has_phases {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{PROVIDER_ID}: multi-phase denoise is not covered"),
-        };
+        return Err(gen_core::Error::Msg(format!(
+            "{PROVIDER_ID}: multi-phase denoise is not covered"
+        )));
     }
     if context.use_pid {
-        return MemorySafetyDecision::Reject {
-            reason: format!("{PROVIDER_ID}: PiD has no admitted native-VAE memory ladder"),
-        };
+        return Err(gen_core::Error::Msg(format!(
+            "{PROVIDER_ID}: PiD has no admitted native-VAE memory ladder"
+        )));
     }
-    MemorySafetyDecision::Accept
+    Ok(())
+}
+
+/// Provider-owned safety check for the bespoke identity route.
+pub fn safety_check(
+    paths: &PulidFluxPaths,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    match resolved_numeric_tier(paths) {
+        Ok(tier) => gen_core::standard_safety_check(&MEMORY_PROFILE, contract, context, tier),
+        Err(error) => MemorySafetyDecision::rejected(error),
+    }
 }
 
 pub fn validate_context(

@@ -70,10 +70,56 @@ pub fn production_calibration_fingerprint(
             "Mage-Flow does not ship the {quant:?} numeric tier"
         ))
     })?;
-    Ok(format!(
-        "mage-flow-cuda-{}-{tier}-shared-ladder-v3",
-        provider_id.replace('_', "-")
-    ))
+    MEMORY_PROFILE
+        .fingerprint
+        .and_then(|table| table.fingerprint(provider_id, tier))
+        .ok_or_else(|| {
+            gen_core::Error::Unsupported(format!("unknown Mage-Flow memory provider {provider_id}"))
+        })
+}
+
+/// `mage-flow-cuda-<provider>-<tier>-shared-ladder-v3`, the provider id dashed.
+const FINGERPRINTS: gen_core::MemoryFingerprintTable = gen_core::MemoryFingerprintTable {
+    template: "mage-flow-cuda-{route}-{tier}-shared-ladder-v3",
+    routes: &[
+        (config::MODEL_ID, "mage-flow"),
+        (config::BASE_MODEL_ID, "mage-flow-base"),
+        (config::TURBO_MODEL_ID, "mage-flow-turbo"),
+        (config::EDIT_MODEL_ID, "mage-flow-edit"),
+        (config::EDIT_BASE_MODEL_ID, "mage-flow-edit-base"),
+        (config::EDIT_TURBO_MODEL_ID, "mage-flow-edit-turbo"),
+    ],
+    pins: &[],
+};
+
+/// The Candle Mage-Flow memory profile (sc-27307): the request tier with its component floors,
+/// the route/batch refusals after the shared pipeline (where the hand-rolled gate ran them), the
+/// snapshot-gated config geometry, and one text-to-image behavior fixture ([`EDIT_MEMORY_PROFILE`]
+/// carries the edit routes' one-reference fixture).
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::Resolved(profile_tier),
+    rejection: gen_core::MemoryRejectionRendering::ValidationError,
+    gates: gen_core::MemoryProfileGates::after(route_gate),
+    fingerprint: Some(FINGERPRINTS),
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+const EDIT_MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    fixtures: gen_core::MemoryProfileFixtures::routes(&[gen_core::MemoryFixtureRoute::new(
+        gen_core::MemoryFixtureMode::Edit,
+        1,
+    )]),
+    ..MEMORY_PROFILE
+};
+
+fn profile_tier(
+    spec: &LoadSpec,
+    _contract: &MemoryProviderContract,
+) -> gen_core::Result<MemoryNumericTier> {
+    resolved_numeric_tier(spec)
 }
 
 fn streamable(spec: &LoadSpec) -> bool {
@@ -487,12 +533,13 @@ pub(crate) fn loaded_component_bytes(
 ///
 /// A weights-free contract (the registry's sentinel surface path, or a single-file import)
 /// publishes `MemoryArchitectureFacts::default()`.
-fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+fn architecture_facts_from_snapshot(
+    _provider_id: &str,
+    root: &std::path::Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    let Some(root) = af::snapshot_root(spec) else {
-        return gen_core::MemoryArchitectureFacts::default();
-    };
     // The exact reader the pipeline uses, over the exact file it reads. `Err` — a missing file, a
     // partial config, a drifted geometry — means the loader would refuse this snapshot, and a trunk
     // that never constructs has no axes to declare.
@@ -601,7 +648,11 @@ pub(crate) fn provider_contract_with_components(
 
     Ok(MemoryProviderContract {
         phase_facts: None,
-        architecture_facts: architecture_facts(spec),
+        architecture_facts: gen_core::standard_architecture_facts(
+            &MEMORY_PROFILE,
+            provider_id,
+            spec,
+        ),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -724,25 +775,11 @@ fn route_is_supported(provider_id: &str, context: &MemoryRunContext) -> bool {
     }
 }
 
-pub fn validate_context(
+fn route_gate(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
-    loaded_quant: Option<Quant>,
+    _loaded_tier: MemoryNumericTier,
 ) -> gen_core::Result<()> {
-    if let MemorySafetyDecision::Reject { reason } = gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(MemoryNumericTier {
-            precision: Precision::Bf16,
-            quant: loaded_quant,
-            component_precision_floors: crate::quant::active_component_precision_floors(
-                loaded_quant,
-            ),
-        }),
-        None,
-    ) {
-        return Err(gen_core::Error::Unsupported(reason));
-    }
     if !route_is_supported(&contract.provider_id, context) {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: unsupported memory route mode={} references={} overlay={:?}",
@@ -761,14 +798,48 @@ pub fn validate_context(
     Ok(())
 }
 
+fn loaded_tier(loaded_quant: Option<Quant>) -> MemoryNumericTier {
+    MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant: loaded_quant,
+        component_precision_floors: crate::quant::active_component_precision_floors(loaded_quant),
+    }
+}
+
+pub fn validate_context(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_quant: Option<Quant>,
+) -> gen_core::Result<()> {
+    gen_core::standard_validate_context(
+        &MEMORY_PROFILE,
+        contract,
+        context,
+        loaded_tier(loaded_quant),
+    )
+}
+
+/// [`validate_context`] as a decision: the shared pipeline's reason is reported once, not
+/// re-rendered through a second `unsupported: ` prefix.
+pub fn safety_check(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_quant: Option<Quant>,
+) -> MemorySafetyDecision {
+    gen_core::standard_safety_check(
+        &MEMORY_PROFILE,
+        contract,
+        context,
+        loaded_tier(loaded_quant),
+    )
+}
+
 pub fn registered_safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    MemorySafetyDecision::from_validation(
-        resolved_quant(spec).and_then(|quant| validate_context(contract, context, quant)),
-    )
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1171,34 +1242,12 @@ pub fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
-    if !strategy.is_optimized() {
-        return Ok(Vec::new());
-    }
-    let route = if is_edit(&contract.provider_id) {
-        gen_core::MemoryBehaviorRoute {
-            mode: MemoryMode::Edit,
-            reference_count: 1,
-            use_pid: false,
-            has_phases: false,
-            overlay: None,
-        }
+    let profile = if is_edit(&contract.provider_id) {
+        &EDIT_MEMORY_PROFILE
     } else {
-        gen_core::MemoryBehaviorRoute {
-            mode: MemoryMode::TextToImage,
-            reference_count: 0,
-            use_pid: false,
-            has_phases: false,
-            overlay: None,
-        }
+        &MEMORY_PROFILE
     };
-    Ok(vec![gen_core::MemoryBehaviorFixture::new(
-        gen_core::standard_memory_behavior_context(
-            contract,
-            strategy,
-            resolved_numeric_tier(spec)?,
-            route,
-        )?,
-    )])
+    gen_core::standard_registered_valid_fixture(profile, spec, contract, strategy)
 }
 
 pub fn registered_begin_request(
@@ -1206,7 +1255,29 @@ pub fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    validate_context(contract, context, resolved_quant(spec)?)?;
+    // The id only names the route to the scope hook, which builds one scope for every route.
+    let provider_id = PROVIDER_IDS
+        .iter()
+        .copied()
+        .find(|id| *id == contract.provider_id)
+        .unwrap_or(config::MODEL_ID);
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    _provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     Ok(Some(Box::new(MageMemoryScope::new(
         Device::Cpu,
         contract,
@@ -1973,5 +2044,52 @@ mod tests {
                 ..Default::default()
             }]);
         });
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_pin_tests {
+    use super::*;
+
+    /// sc-27307: every production calibration fingerprint this lane publishes, pinned byte for byte
+    /// before the spelling moved into a `MemoryFingerprintTable`.
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        for (provider_id, route) in [
+            (config::MODEL_ID, "mage-flow"),
+            (config::BASE_MODEL_ID, "mage-flow-base"),
+            (config::TURBO_MODEL_ID, "mage-flow-turbo"),
+            (config::EDIT_MODEL_ID, "mage-flow-edit"),
+            (config::EDIT_BASE_MODEL_ID, "mage-flow-edit-base"),
+            (config::EDIT_TURBO_MODEL_ID, "mage-flow-edit-turbo"),
+        ] {
+            for (quant, tier) in [
+                (None, "bf16"),
+                (Some(Quant::Q4), "q4"),
+                (Some(Quant::Q8), "q8"),
+            ] {
+                assert_eq!(
+                    production_calibration_fingerprint(provider_id, quant).unwrap(),
+                    format!("mage-flow-cuda-{route}-{tier}-shared-ladder-v3")
+                );
+            }
+            for quant in [Quant::Nvfp4, Quant::Fp8Rowwise] {
+                assert_eq!(
+                    production_calibration_fingerprint(provider_id, Some(quant))
+                        .unwrap_err()
+                        .to_string(),
+                    format!(
+                        "unsupported: Mage-Flow does not ship the {:?} numeric tier",
+                        Some(quant)
+                    )
+                );
+            }
+        }
+        assert_eq!(
+            production_calibration_fingerprint("mage_unknown", None)
+                .unwrap_err()
+                .to_string(),
+            "unsupported: unknown Mage-Flow memory provider mage_unknown"
+        );
     }
 }

@@ -139,12 +139,13 @@ fn asset_facts(spec: &LoadSpec, variant: Variant) -> gen_core::Result<MemoryAsse
 ///
 /// A weights-free contract — the registry's sentinel surface path, or a single-file import —
 /// publishes `MemoryArchitectureFacts::default()`.
-fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+fn architecture_facts_from_snapshot(
+    _provider_id: &str,
+    _root: &Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    if af::snapshot_root(spec).is_none() {
-        return gen_core::MemoryArchitectureFacts::default();
-    }
     let dit = crate::config::DitConfig::anima();
     gen_core::MemoryArchitectureFacts {
         attention_heads: af::declared(dit.num_attention_heads),
@@ -157,6 +158,25 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
         vae_temporal_scale: None,
         activation_dtype_width: u32::try_from(FLOAT_WIDTH).ok(),
     }
+}
+
+/// The Anima Candle memory profile (sc-27307): the native-bf16 tier, the snapshot-gated preset
+/// geometry, and one plain text-to-image behavior fixture. The safety check stays provider-owned:
+/// its route gate binds the context's overlay to the loaded adapter stack identity, which the
+/// tier-only profile gate does not see.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::Resolved(profile_tier),
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn profile_tier(
+    spec: &LoadSpec,
+    _contract: &MemoryProviderContract,
+) -> gen_core::Result<MemoryNumericTier> {
+    resolved_numeric_tier(spec, spec.quantize)
 }
 
 /// The executable contract for a real Anima load: identical to [`weights_free_contract`] except
@@ -190,7 +210,8 @@ pub fn weights_free_contract(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
     );
-    contract.architecture_facts = architecture_facts(spec);
+    contract.architecture_facts =
+        gen_core::standard_architecture_facts(&MEMORY_PROFILE, provider_id, spec);
     contract.load_shape = spec.load_shape;
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
@@ -319,23 +340,7 @@ pub fn registered_valid_fixture(
     contract: &MemoryProviderContract,
     strategy: MemoryStrategy,
 ) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
-    if !strategy.is_optimized() {
-        return Ok(Vec::new());
-    }
-    Ok(vec![gen_core::MemoryBehaviorFixture::new(
-        gen_core::standard_memory_behavior_context(
-            contract,
-            strategy,
-            resolved_numeric_tier(spec, spec.quantize)?,
-            gen_core::MemoryBehaviorRoute {
-                mode: MemoryMode::TextToImage,
-                reference_count: 0,
-                use_pid: false,
-                has_phases: false,
-                overlay: None,
-            },
-        )?,
-    )])
+    gen_core::standard_registered_valid_fixture(&MEMORY_PROFILE, spec, contract, strategy)
 }
 
 /// Weights-free executable admission seam.  It mirrors the loaded provider's validation before

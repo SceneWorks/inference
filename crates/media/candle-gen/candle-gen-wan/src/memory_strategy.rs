@@ -636,21 +636,42 @@ pub fn production_calibration_fingerprint(
     if tier == Some(Quant::Nvfp4) {
         return None;
     }
-    if tier == CALIBRATED_TIER {
-        return Some(
-            match policy {
-                OffloadPolicy::Resident => CALIBRATION_FINGERPRINT_RESIDENT,
-                OffloadPolicy::Sequential => CALIBRATION_FINGERPRINT_SEQUENTIAL,
-            }
-            .to_owned(),
-        );
-    }
-    Some(format!(
-        "sc-19223-wan2-2-ti2v-5b-candle-{}-{}-load-v1",
-        tier_label(tier),
-        policy_label(policy)
-    ))
+    Some(
+        MEMORY_PROFILE
+            .fingerprint?
+            .render(policy_label(policy), tier_label(tier)),
+    )
 }
+
+/// The Candle Wan 2.2 TI2V-5B memory profile (sc-27307): this route's plain text-to-video gate
+/// inside the shared pipeline, the `(tier, policy)` fingerprint spelling, and the snapshot-guarded
+/// architecture facts. The registry resolves its weights-free tier through
+/// [`REGISTERED_MEMORY_PROFILE`].
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    gates: gen_core::MemoryProfileGates::within(route_gate),
+    fingerprint: Some(gen_core::MemoryFingerprintTable {
+        // The table's route axis carries the offload policy: one provider, keyed `(tier, policy)`.
+        template: "sc-19223-wan2-2-ti2v-5b-candle-{tier}-{route}-load-v1",
+        routes: &[],
+        // The two SC-19223 strings, folded into the [`CALIBRATED_TIER`] (`bf16`) cell byte-identical.
+        pins: &[
+            gen_core::MemoryFingerprintPin {
+                route: policy_label(OffloadPolicy::Resident),
+                tier: tier_label(CALIBRATED_TIER),
+                fingerprint: CALIBRATION_FINGERPRINT_RESIDENT,
+            },
+            gen_core::MemoryFingerprintPin {
+                route: policy_label(OffloadPolicy::Sequential),
+                tier: tier_label(CALIBRATED_TIER),
+                fingerprint: CALIBRATION_FINGERPRINT_SEQUENTIAL,
+            },
+        ],
+    }),
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
 
 /// The weights-free registry-conformance TABLE: the same `(tier, policy)` coordinate inside the
 /// isolated [`WEIGHTS_FREE_FINGERPRINT_PREFIX`] namespace, which no production string can enter.
@@ -753,11 +774,16 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
 /// `MemoryArchitectureFacts::default()`: nothing about the pipeline that *would* load has been
 /// resolved, so no axis is knowable.
 fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    gen_core::standard_architecture_facts(&MEMORY_PROFILE, MODEL_ID, spec)
+}
+
+fn architecture_facts_from_snapshot(
+    _provider_id: &str,
+    _root: &Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    if af::snapshot_root(spec).is_none() {
-        return gen_core::MemoryArchitectureFacts::default();
-    }
     let dit = TransformerConfig::ti2v_5b();
     let vae = crate::config::VaeConfig::ti2v_5b();
     let tiling = crate::Ti2vProviderVae::VAE_TILING;
@@ -929,54 +955,54 @@ fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> gen_core::Result<
     )
 }
 
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<()> {
+    if context.mode.as_key() != "text_to_video"
+        || context.geometry.reference_count != 0
+        || context.has_reference
+        || context.use_pid
+        || context.has_phases
+        || context.overlay.is_some()
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: calibrated memory route is plain, single-phase text_to_video without references, PiD, or overlays"
+        )));
+    }
+    let geometry = context.geometry;
+    let area = u64::from(geometry.width) * u64::from(geometry.height);
+    if geometry.batch != 1
+        || !(MIN_SIZE..=1280).contains(&geometry.width)
+        || !(MIN_SIZE..=1280).contains(&geometry.height)
+        || !geometry.width.is_multiple_of(SIZE_MULTIPLE)
+        || !geometry.height.is_multiple_of(SIZE_MULTIPLE)
+        || area > MAX_AREA_5B as u64
+        || geometry.frames == 0
+        || geometry.frames as usize > MAX_WAN_FRAMES
+        || !((geometry.frames - 1).is_multiple_of(4))
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: unsupported calibrated geometry {}x{}x{} frames={}",
+            geometry.width, geometry.height, geometry.batch, geometry.frames
+        )));
+    }
+    if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
+        validate_decode(
+            context.selection.parameters.decode_tile_edge,
+            context.selection.parameters.decode_overlap,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     loaded_tier: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    let route_gate = || {
-        if context.mode.as_key() != "text_to_video"
-            || context.geometry.reference_count != 0
-            || context.has_reference
-            || context.use_pid
-            || context.has_phases
-            || context.overlay.is_some()
-        {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_ID}: calibrated memory route is plain, single-phase text_to_video without references, PiD, or overlays"
-            )));
-        }
-        let geometry = context.geometry;
-        let area = u64::from(geometry.width) * u64::from(geometry.height);
-        if geometry.batch != 1
-            || !(MIN_SIZE..=1280).contains(&geometry.width)
-            || !(MIN_SIZE..=1280).contains(&geometry.height)
-            || !geometry.width.is_multiple_of(SIZE_MULTIPLE)
-            || !geometry.height.is_multiple_of(SIZE_MULTIPLE)
-            || area > MAX_AREA_5B as u64
-            || geometry.frames == 0
-            || geometry.frames as usize > MAX_WAN_FRAMES
-            || !((geometry.frames - 1).is_multiple_of(4))
-        {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_ID}: unsupported calibrated geometry {}x{}x{} frames={}",
-                geometry.width, geometry.height, geometry.batch, geometry.frames
-            )));
-        }
-        if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
-            validate_decode(
-                context.selection.parameters.decode_tile_edge,
-                context.selection.parameters.decode_overlap,
-            )?;
-        }
-        Ok(())
-    };
-    gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(loaded_tier),
-        Some(&route_gate),
-    )
+    gen_core::standard_safety_check(&MEMORY_PROFILE, contract, context, loaded_tier)
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -985,11 +1011,17 @@ pub(crate) fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match registered_tier(spec, contract) {
-        Ok(tier) => safety_check(contract, tier, context),
-        Err(error) => MemorySafetyDecision::rejected(error),
-    }
+    gen_core::standard_registered_safety_check(&REGISTERED_MEMORY_PROFILE, spec, contract, context)
 }
+
+/// The registry's profile: [`MEMORY_PROFILE`] with the weights-free tier [`registered_tier`]
+/// reads off the contract (the registry fixture vs a real snapshot).
+#[cfg(any(feature = "cuda", test))]
+const REGISTERED_MEMORY_PROFILE: gen_core::ProviderMemoryProfile =
+    gen_core::ProviderMemoryProfile {
+        tier: gen_core::MemoryProfileTier::Resolved(registered_tier),
+        ..MEMORY_PROFILE
+    };
 
 #[cfg(any(feature = "cuda", test))]
 pub(crate) fn registered_valid_fixtures(
@@ -1082,9 +1114,7 @@ fn begin_with_device(
     device: Device,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(contract, loaded_tier, context) {
-        return Err(gen_core::Error::Unsupported(reason));
-    }
+    gen_core::standard_validate_context(&MEMORY_PROFILE, contract, context, loaded_tier)?;
     let mut config = candle_gen::request_scope::CandleRequestScopeConfig::new(
         MODEL_ID,
         device,
@@ -1115,12 +1145,25 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    begin_with_device(
+    gen_core::standard_begin_request(
+        &REGISTERED_MEMORY_PROFILE,
+        MODEL_ID,
+        spec,
         contract,
-        registered_tier(spec, contract)?,
-        Device::Cpu,
         context,
+        registered_scope,
     )
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn registered_scope(
+    _provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    begin_with_device(contract, loaded_tier, Device::Cpu, context)
 }
 
 /// Validate and extract the selected rung-2 maximum tile edge from the actual request carrier.
@@ -2272,5 +2315,62 @@ mod tests {
             registered_safety_check(&spec, &contract, &context),
             MemorySafetyDecision::Reject { .. }
         ));
+    }
+
+    /// sc-27307: every production calibration fingerprint, byte for byte, pinned before the table
+    /// conversion and after it.
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        use OffloadPolicy::{Resident, Sequential};
+        for (tier, policy, expected) in [
+            (
+                None,
+                Resident,
+                Some("sc-19223-wan2-2-ti2v-5b-candle-resident-load-v1"),
+            ),
+            (
+                None,
+                Sequential,
+                Some("sc-19223-wan2-2-ti2v-5b-candle-sequential-load-v1"),
+            ),
+            (
+                Some(Quant::Q4),
+                Resident,
+                Some("sc-19223-wan2-2-ti2v-5b-candle-q4-resident-load-v1"),
+            ),
+            (
+                Some(Quant::Q4),
+                Sequential,
+                Some("sc-19223-wan2-2-ti2v-5b-candle-q4-sequential-load-v1"),
+            ),
+            (
+                Some(Quant::Q8),
+                Resident,
+                Some("sc-19223-wan2-2-ti2v-5b-candle-q8-resident-load-v1"),
+            ),
+            (
+                Some(Quant::Q8),
+                Sequential,
+                Some("sc-19223-wan2-2-ti2v-5b-candle-q8-sequential-load-v1"),
+            ),
+            (
+                Some(Quant::Fp8Rowwise),
+                Resident,
+                Some("sc-19223-wan2-2-ti2v-5b-candle-fp8r-resident-load-v1"),
+            ),
+            (
+                Some(Quant::Fp8Rowwise),
+                Sequential,
+                Some("sc-19223-wan2-2-ti2v-5b-candle-fp8r-sequential-load-v1"),
+            ),
+            (Some(Quant::Nvfp4), Resident, None),
+            (Some(Quant::Nvfp4), Sequential, None),
+        ] {
+            assert_eq!(
+                production_calibration_fingerprint(tier, policy).as_deref(),
+                expected,
+                "{tier:?} {policy:?}"
+            );
+        }
     }
 }

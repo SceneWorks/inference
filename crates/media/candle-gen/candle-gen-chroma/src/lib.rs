@@ -152,18 +152,20 @@ impl Generator for ChromaGenerator {
                 ),
             };
         }
-        match memory_strategy::validate_context(
+        match memory_strategy::safety_check(
             self.descriptor.id,
             &self.memory_contract,
             context,
             self.load_receipt.as_ref().and_then(|receipt| receipt.tier),
         ) {
-            Ok(()) => gen_core::MemorySafetyDecision::from_validation(
-                self.memory_admission.approve(context),
-            ),
-            Err(error) => {
+            gen_core::MemorySafetyDecision::Accept => {
+                gen_core::MemorySafetyDecision::from_validation(
+                    self.memory_admission.approve(context),
+                )
+            }
+            reject => {
                 self.memory_admission.clear_approval();
-                gen_core::MemorySafetyDecision::rejected(error)
+                reject
             }
         }
     }

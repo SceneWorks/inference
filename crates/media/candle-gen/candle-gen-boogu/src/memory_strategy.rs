@@ -669,12 +669,13 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// A weights-free contract — the registry's sentinel surface path, a single-file import, or a
 /// snapshot whose transformer config cannot be parsed — publishes
 /// `MemoryArchitectureFacts::default()`.
-fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+fn architecture_facts_from_snapshot(
+    _provider_id: &str,
+    root: &Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    let Some(root) = af::snapshot_root(spec) else {
-        return gen_core::MemoryArchitectureFacts::default();
-    };
     let Ok(config) = crate::config::BooguConfig::from_snapshot(root) else {
         return gen_core::MemoryArchitectureFacts::default();
     };
@@ -718,7 +719,7 @@ fn build_contract(
     ];
     MemoryProviderContract {
         phase_facts: None,
-        architecture_facts: architecture_facts(spec),
+        architecture_facts: gen_core::standard_architecture_facts(&MEMORY_PROFILE, provider, spec),
         provider_id: provider.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -806,12 +807,26 @@ fn weights_free_contract(
     ))
 }
 
-fn validate_route(
-    provider: &str,
+/// The Candle Boogu memory profile (sc-27307): the route identity runs before the shared pipeline
+/// (it refused first in the hand-rolled gate), and the geometry is snapshot-config derived. The
+/// registry's tier stays provider-owned: it re-seals the artifact receipt against the caller's
+/// contract, which a spec-only tier resolver cannot do.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::Resolved(registered_tier),
+    rejection: gen_core::MemoryRejectionRendering::ValidationError,
+    gates: gen_core::MemoryProfileGates::before(route_identity_gate),
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn route_identity_gate(
     contract: &MemoryProviderContract,
-    numeric: MemoryNumericTier,
     context: &MemoryRunContext,
+    _numeric: MemoryNumericTier,
 ) -> gen_core::Result<()> {
+    let provider = contract.provider_id.as_str();
     if contract.calibration.is_none()
         && (context.calibration_abi != 0
             || !context.calibration_fingerprint.is_empty()
@@ -856,21 +871,25 @@ fn validate_route(
             "{provider}: request crossed the admitted route/mode/reference/PiD/geometry identity"
         )));
     }
-    candle_gen::request_scope::admit(gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(numeric),
-        None,
-    ))
+    Ok(())
+}
+
+fn validate_route(
+    _provider: &str,
+    contract: &MemoryProviderContract,
+    numeric: MemoryNumericTier,
+    context: &MemoryRunContext,
+) -> gen_core::Result<()> {
+    gen_core::standard_validate_context(&MEMORY_PROFILE, contract, context, numeric)
 }
 
 pub(crate) fn safety_check(
-    provider: &str,
+    _provider: &str,
     contract: &MemoryProviderContract,
     numeric: MemoryNumericTier,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    MemorySafetyDecision::from_validation(validate_route(provider, contract, numeric, context))
+    gen_core::standard_safety_check(&MEMORY_PROFILE, contract, context, numeric)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1347,10 +1366,15 @@ pub fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match registered_numeric_tier(&contract.provider_id, spec, contract) {
-        Ok(numeric) => safety_check(&contract.provider_id, contract, numeric, context),
-        Err(error) => MemorySafetyDecision::rejected(error),
-    }
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
+}
+
+/// The registry tier: re-sealed from the artifact receipt and bound to the caller's contract.
+fn registered_tier(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+) -> gen_core::Result<MemoryNumericTier> {
+    registered_numeric_tier(&contract.provider_id, spec, contract)
 }
 
 fn weights_free_spec(provider: &str, spec: &LoadSpec) -> gen_core::Result<LoadSpec> {

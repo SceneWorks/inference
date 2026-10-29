@@ -683,9 +683,45 @@ pub fn calibration_tier_label(quant: Option<Quant>) -> Option<&'static str> {
 pub fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<String> {
     let route = route_label(spec_route(provider_id, spec))?;
     let tier = calibration_tier_label(spec.quantize)?;
-    Some(format!(
-        "sensenova-u1-{route}-{tier}-candle-request-memory-ladder-v1"
-    ))
+    Some(MEMORY_PROFILE.fingerprint?.render(route, tier))
+}
+
+/// The Candle SenseNova-U1 memory profile (sc-27307): a bf16 compute tier at the requested
+/// quantization, this family's route/batch gate after the shared pipeline admits, the (route, tier)
+/// fingerprint spelling, and snapshot-read architecture facts. The behavior fixtures stay
+/// provider-owned: their route set depends on the strategy (VQA has no rung-4 route) as well as on
+/// the provider id.
+const MEMORY_PROFILE: gen_core::ProviderMemoryProfile = gen_core::ProviderMemoryProfile {
+    tier: gen_core::MemoryProfileTier::FixedPrecision(Precision::Bf16),
+    rejection: gen_core::MemoryRejectionRendering::ValidationError,
+    gates: gen_core::MemoryProfileGates::after(route_gate),
+    fingerprint: Some(gen_core::MemoryFingerprintTable {
+        template: "sensenova-u1-{route}-{tier}-candle-request-memory-ladder-v1",
+        // The route label comes from the spec's resolved catalog route ([`route_label`]), not
+        // from the provider id, so the table is rendered by label.
+        routes: &[],
+        pins: &[],
+    }),
+    architecture: Some(gen_core::MemoryArchitectureSource::Snapshot(
+        architecture_facts_from_snapshot,
+    )),
+    ..gen_core::ProviderMemoryProfile::STANDARD
+};
+
+fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<()> {
+    validate_route(&contract.provider_id, context)
+}
+
+fn bf16_tier(quant: Option<Quant>) -> MemoryNumericTier {
+    MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant,
+        component_precision_floors: &[],
+    }
 }
 
 /// The weights-free registry-conformance identity: the same (route, tier) coordinate in a namespace
@@ -731,11 +767,16 @@ pub fn weights_free_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) 
 /// A weights-free contract — the registry's sentinel surface path, or a single-file import —
 /// publishes `MemoryArchitectureFacts::default()`: no config has been resolved to read.
 fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    gen_core::standard_architecture_facts(&MEMORY_PROFILE, crate::MODEL_ID, spec)
+}
+
+fn architecture_facts_from_snapshot(
+    _provider_id: &str,
+    root: &Path,
+    _spec: &LoadSpec,
+) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    let Some(root) = af::snapshot_root(spec) else {
-        return gen_core::MemoryArchitectureFacts::default();
-    };
     // The exact file `NeoChatConfig::from_dir` parses.
     let config = af::component_config(root, "");
     let llm = config.as_ref().and_then(|config| config.get("llm_config"));
@@ -915,33 +956,23 @@ fn validate_route(provider_id: &str, context: &MemoryRunContext) -> gen_core::Re
 }
 
 pub(crate) fn validate_context(
-    provider_id: &str,
+    _provider_id: &str,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
     quant: Option<Quant>,
 ) -> gen_core::Result<()> {
-    if let MemorySafetyDecision::Reject { reason } = gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(MemoryNumericTier {
-            precision: Precision::Bf16,
-            quant,
-            component_precision_floors: &[],
-        }),
-        None,
-    ) {
-        return Err(gen_core::Error::Unsupported(reason));
-    }
-    validate_route(provider_id, context)
+    gen_core::standard_validate_context(&MEMORY_PROFILE, contract, context, bf16_tier(quant))
 }
 
+/// The decision form of [`validate_context`]: the refusal is that error's rendering, so the
+/// registry and a request scope refuse with the same text.
 pub(crate) fn safety_check(
-    provider_id: &str,
+    _provider_id: &str,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
     quant: Option<Quant>,
 ) -> MemorySafetyDecision {
-    MemorySafetyDecision::from_validation(validate_context(provider_id, contract, context, quant))
+    gen_core::standard_safety_check(&MEMORY_PROFILE, contract, context, bf16_tier(quant))
 }
 
 pub(crate) fn request_scope(
@@ -982,7 +1013,7 @@ pub(crate) fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check(&contract.provider_id, contract, context, spec.quantize)
+    gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
 }
 
 pub(crate) fn validate_direct_operation_identity(
@@ -1013,7 +1044,23 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    validate_context(provider_id, contract, context, spec.quantize)?;
+    gen_core::standard_begin_request(
+        &MEMORY_PROFILE,
+        provider_id,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _loaded_tier: MemoryNumericTier,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     Ok(Some(Box::new(request_scope(
         provider_id,
         Device::Cpu,
@@ -2317,5 +2364,53 @@ mod tests {
             safety_check(crate::MODEL_ID, &contract, &context, None),
             MemorySafetyDecision::Reject { .. }
         ));
+    }
+
+    /// sc-27307: every production calibration fingerprint, byte for byte, pinned before the table
+    /// conversion and after it — six routes by three tiers, plus the unshipped cells.
+    #[test]
+    fn production_calibration_fingerprints_are_pinned() {
+        let routes = [
+            ("sensenova_u1_8b", "quality"),
+            ("sensenova_u1_8b_fast", "fast"),
+            ("sensenova_u1_8b_infographic_v2", "infographic2"),
+            ("sensenova_u1_8b_infographic_v2_fast", "infographic2-fast"),
+            ("sensenova_u1_8b_infographic_v3", "infographic3"),
+            ("sensenova_u1_8b_infographic_v3_fast", "infographic3-fast"),
+        ];
+        for (route, slug) in routes {
+            for (quant, tier) in [
+                (None, "bf16"),
+                (Some(Quant::Q4), "q4"),
+                (Some(Quant::Q8), "q8"),
+            ] {
+                let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir("/pin".into()));
+                spec.quantize = quant;
+                spec.resolved_route = Some(route.to_owned());
+                assert_eq!(
+                    production_calibration_fingerprint(crate::MODEL_ID, &spec),
+                    Some(format!(
+                        "sensenova-u1-{slug}-{tier}-candle-request-memory-ladder-v1"
+                    )),
+                    "{route} {tier}"
+                );
+            }
+        }
+        let mut plain = LoadSpec::new(gen_core::WeightsSource::Dir("/pin".into()));
+        assert_eq!(
+            production_calibration_fingerprint(crate::MODEL_ID_FAST, &plain).as_deref(),
+            Some("sensenova-u1-fast-bf16-candle-request-memory-ladder-v1")
+        );
+        plain.quantize = Some(Quant::Nvfp4);
+        assert_eq!(
+            production_calibration_fingerprint(crate::MODEL_ID, &plain),
+            None
+        );
+        plain.quantize = None;
+        plain.resolved_route = Some("sensenova_unknown".to_owned());
+        assert_eq!(
+            production_calibration_fingerprint(crate::MODEL_ID, &plain),
+            None
+        );
     }
 }
