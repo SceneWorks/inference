@@ -78,6 +78,9 @@ mod fl2va_conditioning;
 #[path = "fl2va_first_light.rs"]
 mod fl2va_first_light;
 
+#[path = "int8_gemm_parity.rs"]
+mod int8_gemm_parity;
+
 #[path = "joint_denoise.rs"]
 mod joint_denoise;
 

@@ -3,10 +3,16 @@
 
 use crate::{weights::Weights, Result};
 use gen_core::convrot_int8::{ConvRotInt8, MAX_DESCRIPTOR_BYTES};
-use mlx_rs::{fast::MetalKernel, ops::matmul, transforms::eval, Array, Dtype};
-use std::cell::RefCell;
+use mlx_rs::{ops::matmul, transforms::eval, Array, Dtype};
+#[cfg(any(test, feature = "test-support"))]
+use {mlx_rs::fast::MetalKernel, std::cell::RefCell};
 
-const QUANT: &str = r#"
+/// The original serial kernels (sc-26683), kept ONLY as the parity reference for the tiled path in
+/// [`crate::int8_gemm`]: one row per thread for the quantizer and one 32-lane SIMD group per output
+/// element for the dot product. Correct, but every activation row re-reads the whole weight, which
+/// made H3 take ~47 minutes per denoise step on Metal (sc-26691). Never on a production route.
+#[cfg(any(test, feature = "test-support"))]
+const REFERENCE_QUANT: &str = r#"
 uint row = thread_position_in_grid.x;
 if (row >= M) return;
 float peak = 0.0f;
@@ -21,7 +27,9 @@ for (uint j=0; j<K; ++j) {
     q[row*K+j] = char(isnan(z) ? -128.0f : clamp(rint(z), -128.0f, 127.0f));
 }
 "#;
-const PROJECT: &str = r#"
+/// See [`REFERENCE_QUANT`]. Shared verbatim (same name and source) with the W4A8 reference.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) const REFERENCE_PROJECT: &str = r#"
 uint lane = thread_position_in_threadgroup.x;
 uint out = thread_position_in_grid.y;
 uint row = thread_position_in_grid.z;
@@ -34,24 +42,30 @@ if (lane == 0) {
 }
 "#;
 
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     // MetalKernel is thread-affine; never place one in a Send provider/model base.
-    // These handles capture no arrays and share MLX's existing compiled-pipeline cache.
-    static KERNELS: RefCell<Option<(MetalKernel, MetalKernel)>> = const { RefCell::new(None) };
+    static REFERENCE_KERNELS: RefCell<Option<(MetalKernel, MetalKernel)>> = const { RefCell::new(None) };
 }
 
-fn kernels<T>(f: impl FnOnce(&MetalKernel, &MetalKernel) -> Result<T>) -> Result<T> {
+#[cfg(any(test, feature = "test-support"))]
+fn reference_kernels<T>(f: impl FnOnce(&MetalKernel, &MetalKernel) -> Result<T>) -> Result<T> {
     crate::nn::prepare_retained_compilation_thread();
-    KERNELS.with(|cache| {
+    REFERENCE_KERNELS.with(|cache| {
         let mut cache = cache.borrow_mut();
         if cache.is_none() {
             *cache = Some((
-                MetalKernel::new("sc_convrot_int8_quant_v1", &["x"], &["q", "s"], QUANT)?,
+                MetalKernel::new(
+                    "sc_convrot_int8_quant_v1",
+                    &["x"],
+                    &["q", "s"],
+                    REFERENCE_QUANT,
+                )?,
                 MetalKernel::new(
                     "sc_convrot_int8_project_v1",
                     &["q", "w", "sx", "sw", "b"],
                     &["y"],
-                    PROJECT,
+                    REFERENCE_PROJECT,
                 )?,
             ));
         }
@@ -157,17 +171,16 @@ impl ConvRotLinear {
         }))
     }
 
-    /// Native signed integer dot, FP32 row-scale epilogue, one output rounding after bias.
-    pub fn forward(&self, x: &Array) -> Result<Array> {
+    /// Validated activation geometry plus the source-dtype rotation (Kitchen's
+    /// `_rotate_activation`, NOT a permanent float weight), shared by [`Self::forward`] and the
+    /// test-only reference.
+    fn rotate(&self, x: &Array) -> Result<(Array, usize)> {
         let d = self.descriptor;
         if x.shape().last() != Some(&(d.in_features as i32))
             || !matches!(x.dtype(), Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16)
         {
             return Err("ConvRot INT8 activation shape/dtype mismatch".into());
         }
-        let k = d.in_features as i32;
-        let n = d.out_features as i32;
-        let g = d.rotation_group as i32;
         let rows = x.size() / d.in_features;
         if rows == 0
             || rows > i32::MAX as usize
@@ -178,11 +191,66 @@ impl ConvRotLinear {
         {
             return Err("ConvRot INT8 activation exceeds native index geometry".into());
         }
-        let m = rows as i32;
-        // Rotation in the source dtype, as Kitchen's _rotate_activation, NOT a permanent float weight.
+        let (m, k, g) = (rows as i32, d.in_features as i32, d.rotation_group as i32);
         let rotated =
             matmul(&x.reshape(&[-1, g])?, &self.rotation.as_dtype(x.dtype())?)?.reshape(&[m, k])?;
-        kernels(|quant, project| {
+        Ok((rotated, rows))
+    }
+
+    /// The F32 epilogue bias: the stored bias rounded to the activation dtype first, as the S4
+    /// ConvRot authority adds it.
+    fn epilogue_bias(&self, x: &Array) -> Result<Array> {
+        Ok(match &self.bias {
+            Some(b) => b.as_dtype(x.dtype())?.as_dtype(Dtype::Float32)?,
+            None => mlx_rs::ops::zeros::<f32>(&[self.descriptor.out_features as i32])?,
+        })
+    }
+
+    fn output_shape(&self, x: &Array) -> Vec<i32> {
+        let mut shape = x.shape().to_vec();
+        *shape.last_mut().unwrap() = self.descriptor.out_features as i32;
+        shape
+    }
+
+    /// Native signed integer dot, FP32 row-scale epilogue, one output rounding after bias.
+    ///
+    /// The dot is [`crate::int8_gemm`]'s tiled kernel: exact int32 accumulation through windowed
+    /// FP32 `simdgroup_matrix` products, bit-identical to the serial reference (that module states
+    /// the exactness bound).
+    pub fn forward(&self, x: &Array) -> Result<Array> {
+        let d = self.descriptor;
+        let (rotated, rows) = self.rotate(x)?;
+        let (codes, scales) = crate::int8_gemm::quantize_rows(
+            &rotated,
+            rows,
+            d.in_features,
+            x.dtype(),
+            crate::int8_gemm::Numerator::ConvRot,
+        )?;
+        let bias = self.epilogue_bias(x)?;
+        let y = crate::int8_gemm::project(
+            &codes,
+            &scales,
+            crate::int8_gemm::Weight::ConvRot { codes: &self.codes },
+            &self.scales,
+            &bias,
+            rows,
+            d.out_features,
+            d.in_features,
+            x.dtype(),
+        )?;
+        Ok(y.reshape(&self.output_shape(x))?)
+    }
+
+    /// The original serial kernels (sc-26683): the parity reference for [`Self::forward`]. Test
+    /// support only; it is orders of magnitude slower and never on a production route.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn forward_reference(&self, x: &Array) -> Result<Array> {
+        let d = self.descriptor;
+        let (rotated, rows) = self.rotate(x)?;
+        let (m, k, n) = (rows as i32, d.in_features as i32, d.out_features as i32);
+        let bias = self.epilogue_bias(x)?;
+        reference_kernels(|quant, project| {
             let mut q = quant
                 .apply()
                 .inputs([&rotated])
@@ -205,10 +273,6 @@ impl ConvRotLinear {
                 .into_iter();
             let codes = q.next().ok_or("ConvRot quantizer returned no codes")?;
             let scales = q.next().ok_or("ConvRot quantizer returned no scales")?;
-            let bias = match &self.bias {
-                Some(b) => b.as_dtype(x.dtype())?.as_dtype(Dtype::Float32)?,
-                None => mlx_rs::ops::zeros::<f32>(&[n])?,
-            };
             let mut out = project
                 .apply()
                 .inputs([&codes, &self.codes, &scales, &self.scales, &bias])
@@ -219,9 +283,7 @@ impl ConvRotLinear {
                 .grid(32, n, m)
                 .thread_group(32, 1, 1)
                 .run()?;
-            let mut shape = x.shape().to_vec();
-            *shape.last_mut().unwrap() = n;
-            Ok(out.remove(0).reshape(&shape)?)
+            Ok(out.remove(0).reshape(&self.output_shape(x))?)
         })
     }
 

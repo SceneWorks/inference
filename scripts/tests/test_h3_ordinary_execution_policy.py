@@ -267,6 +267,16 @@ ROUTE_NAMES = {
         "mixed_w4a8_and_convrot_layers_keep_their_own_arithmetic",
     ],
     ("candle", "convrot_int8"): ["native_projections_match_pinned_kitchen"],
+    ("mlx", "convrot_int8"): ["native_projections_match_pinned_kitchen"],
+    # sc-26691: the tiled INT8 GEMM's Metal parity/throughput bodies (raw projection kernels on
+    # synthetic and real-slice operands, not model execution, but Metal compute all the same).
+    ("mlx", "int8_gemm_parity"): [
+        "tiled_convrot_matches_serial_reference_on_random_codes",
+        "extreme_accumulation_beyond_f32_integer_range_is_exact",
+        "tiled_w4a8_matches_serial_reference_on_random_packed_codes",
+        "real_checkpoint_slice_matches_serial_reference",
+        "microbench_h3_projection_shapes",
+    ],
     ("candle", "adaln_evict_memory"): ["the_evicted_adaln_weights_leave_the_cuda_pool"],
 }
 
@@ -295,6 +305,8 @@ SKIPS = {
 # (workflow job id, backend, module) -> the manual route that executes it.
 ROUTES = [
     ("synthetic-w4a8-mlx", "mlx", "w4a8_compare"),
+    ("synthetic-w4a8-mlx", "mlx", "convrot_int8"),
+    ("synthetic-w4a8-mlx", "mlx", "int8_gemm_parity"),
     ("synthetic-w4a8-mlx", "mlx", "adaln_cache"),
     ("synthetic-w4a8-mlx", "mlx", "adaln_evict_memory"),
     ("synthetic-w4a8-mlx", "mlx", "adapter_topology"),
