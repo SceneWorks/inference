@@ -279251,6 +279251,7 @@
     "target": "candle_gen",
     "target_kind": "lib",
     "fqn": "train::projection::tests::cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient",
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
     "source": "crates/media/candle-gen/candle-gen/src/train/projection.rs",
     "cargo_target_metadata": {
       "name": "candle_gen",
@@ -279280,6 +279281,8 @@
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen/src/train/projection.rs::train::projection::tests::cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient/fixed_cuda",
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1,
         "environment": {},
         "cargo_features": [
           "cuda",

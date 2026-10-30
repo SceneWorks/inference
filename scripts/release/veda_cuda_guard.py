@@ -91,7 +91,8 @@ def process_identities(uuid: str, processes: list[list[str]]) -> list[tuple[str,
 
 def sample_baseline(device: dict, out: Path, phase: str,
                     baseline: dict | None = None, idle_check=None, identity_key=None,
-                    permit_bounded_growth: bool = False) -> tuple[dict, dict]:
+                    permit_bounded_growth: bool = False,
+                    require_stable_contexts: bool = True) -> tuple[dict, dict]:
     """Admit one physical UUID only after bounded, stable driver observations."""
     samples = []
     started = time.monotonic()
@@ -113,7 +114,7 @@ def sample_baseline(device: dict, out: Path, phase: str,
             if index == 0 and baseline is None:
                 baseline = dict(uuid=device["uuid"], reserved_baseline_mib=current["used_mib"],
                                 process_identities=identities)
-            if (identities != baseline["process_identities"]
+            if ((require_stable_contexts and identities != baseline["process_identities"])
                     or (not permit_bounded_growth and
                         (current["used_mib"] > baseline["reserved_baseline_mib"] or
                          (index and current["used_mib"] > samples[index - 1]["selected_used_mib"])))):
@@ -158,9 +159,11 @@ def claim_device(out: Path):
 
 
 def verify_idle(device: dict, out: Path, phase: str, baseline: dict, idle_check=None,
-                identity_key=None, permit_bounded_growth: bool = False):
+                identity_key=None, permit_bounded_growth: bool = False,
+                require_stable_contexts: bool = True):
     sample_baseline(device, out, phase, baseline, idle_check=idle_check,
-                    identity_key=identity_key, permit_bounded_growth=permit_bounded_growth)
+                    identity_key=identity_key, permit_bounded_growth=permit_bounded_growth,
+                    require_stable_contexts=require_stable_contexts)
 
 
 def persist_receipt(out: Path, receipt: dict):

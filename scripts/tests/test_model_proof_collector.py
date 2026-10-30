@@ -72,6 +72,7 @@ class Collector(unittest.TestCase):
         self.assertEqual(proof.gpu_peak_observation(multi),
                          'global-used-upper-bound-sampled/not-child-attributed')
 
+    @unittest.skipIf(os.name == 'nt', 'Unix proxy contract; Windows pinned binaries have separate tests')
     def test_toolchain_uses_declaration_and_verified_proxies_for_actual_commands(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
