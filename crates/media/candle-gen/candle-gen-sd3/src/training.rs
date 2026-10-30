@@ -594,6 +594,7 @@ impl Sd3Trainer {
             if req.cancel.is_cancelled() {
                 break;
             }
+            candle_gen::train::profile::cohort_begin_step(device)?;
             let sample = step_sample(aux_driver.as_mut(), step, &schedule);
             let (x0, conditioning, mask_weight) = &cache[sample.entry];
             let noise = flow_match::sample_noise(
@@ -631,6 +632,7 @@ impl Sd3Trainer {
                 update_idx += 1;
             }
             steps_run = step;
+            candle_gen::train::profile::cohort_end_step(device, last_loss, &set.vars, "sd3")?;
             on_progress(TrainingProgress::Training {
                 step,
                 total: cfg.steps,

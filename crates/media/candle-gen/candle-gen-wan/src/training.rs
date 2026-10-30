@@ -1265,6 +1265,10 @@ impl WanMoeTrainer {
             .map(|(x0, _, weight)| (x0, weight))
             .collect();
 
+        for expert in &experts {
+            candle_gen::train::profile::cohort_capture_initial(&expert.set.vars)?;
+        }
+
         // --- train loop (alternating experts) ---
         // Checkpointing is strictly request-controlled. Production 14B runs should opt in because
         // Candle's dense backward materializes frozen-base gradients, but a false flag must retain
@@ -1276,6 +1280,7 @@ impl WanMoeTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
+            candle_gen::train::profile::cohort_begin_step(device)?;
             let ei = expert_index(step, dual); // dual: odd → high; dense: the single expert
                                                // Index by the expert's own visit count, not the raw step — else on an even-sized
                                                // dataset each expert stays parity-locked to a disjoint half (sc-11157 / F-082).
@@ -1336,6 +1341,16 @@ impl WanMoeTrainer {
                 apply_update(ex, accum, cfg)?;
             }
 
+            candle_gen::train::profile::cohort_end_step(
+                device,
+                last_loss,
+                &experts[ei].set.vars,
+                if ei == 0 {
+                    "wan-expert-0"
+                } else {
+                    "wan-expert-1"
+                },
+            )?;
             on_progress(TrainingProgress::Training {
                 step,
                 total: cfg.steps,

@@ -38,6 +38,7 @@ use crate::transformer::{
 };
 
 fn rms_diff(norm: &RmsNorm, x: &Tensor) -> Result<Tensor> {
+    candle_gen::train::profile::cohort_reuse("lens:shared-differentiable-RMS");
     candle_gen::train::norm::rms_norm_cast_before_weight(x, norm.weight(), norm.eps())
 }
 
@@ -463,6 +464,7 @@ impl LensTransformerTrain {
         let hidden = __model_proof_output!(self.img_in.forward(hidden_states))?;
         let encoder =
             if text_feats.len() == 1 && self.prepared_encoder_ids.contains(&text_feats[0].id()) {
+                candle_gen::train::profile::cohort_reuse("lens:frozen-caption-storage-hit");
                 text_feats[0].clone()
             } else {
                 self.embed_text(text_feats)?
@@ -477,7 +479,12 @@ impl LensTransformerTrain {
             txt_cos,
             txt_sin,
         } = match self.prepared_geometry.get(&(txt_len, frame, h, w)) {
-            Some(geometry) => geometry.clone(),
+            Some(geometry) => {
+                candle_gen::train::profile::cohort_reuse(
+                    "lens:rope-storage-hit;E3-already-fused-native-QKV",
+                );
+                geometry.clone()
+            }
             None => {
                 let (img_cos, img_sin) = self.rope.img_cos_sin(frame, h, w, &self.device)?;
                 let (txt_cos, txt_sin) = self.rope.txt_cos_sin(txt_len, h, w, &self.device)?;

@@ -431,3 +431,99 @@ fn lens_trainer_emits_preview_samples() {
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::lens_trainer_emits_preview_samples");
 }
+
+#[cfg(feature = "model-inference-proof")]
+fn bounded_output_root() -> PathBuf {
+    let root = PathBuf::from(
+        std::env::var_os("MODEL_PROOF_OUTPUT_DIR")
+            .expect("manual model-proof executor must own the retained output directory"),
+    );
+    let path = root.join("cohort_acceptance");
+    std::fs::create_dir_all(&path).unwrap();
+    path
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, dir: &Path) {
+    let peak = sampler.stop();
+    assert!(peak > 0, "must observe selected physical CUDA device");
+    std::fs::write(
+        dir.join("peak_device_bytes.txt"),
+        (peak * 1024 * 1024).to_string(),
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn bounded_render_finite_with_adapter(path: &Path, kind: AdapterKind) {
+    let spec = LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![AdapterSpec::new(
+        path.to_path_buf(),
+        1.0,
+        kind,
+    )]);
+    let g = candle_gen_lens::provider_registry()
+        .unwrap()
+        .load("lens", &spec)
+        .expect("load lens generator with adapter");
+    let req = GenerationRequest {
+        prompt: "a solid colour swatch".into(),
+        width: 256,
+        height: 256,
+        steps: Some(4),
+        seed: Some(7),
+        ..Default::default()
+    };
+    let out = g.generate(&req, &mut |_| {}).expect("adapted generate");
+    let GenerationOutput::Images(images) = out else {
+        panic!("expected images");
+    };
+    assert_eq!(images.len(), 1);
+    candle_gen::testkit::save_image_png(
+        &bounded_output_root().join("adapter_sample.png"),
+        &images[0],
+    );
+    for im in &images {
+        assert_eq!((im.width, im.height), (256, 256));
+        assert_eq!(im.pixels.len(), 256 * 256 * 3, "RGB8 buffer");
+        assert!(
+            im.pixels.iter().any(|&p| p != 0),
+            "rendered image should not be all-black"
+        );
+    }
+}
+#[test]
+#[cfg(feature = "model-inference-proof")]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn lens_bounded_acceleration_acceptance() {
+    let tmp = bounded_output_root().join("data");
+    let retained = bounded_output_root();
+    let sampler = candle_gen::testkit::PeakSampler::start_rendered();
+    let out =
+        candle_gen::train::profile::with_bounded_cohort(&retained.join("metrics.json"), || {
+            run(&tmp, "bounded.safetensors", NetworkType::Lora, 4)
+        });
+    bounded_peak(sampler, &retained);
+
+    assert_eq!(
+        read_meta(&out.adapter_path)
+            .get("networkType")
+            .map(String::as_str),
+        Some("lora")
+    );
+    let tensors =
+        candle_gen::candle_core::safetensors::load(&out.adapter_path, &Device::Cpu).unwrap();
+    assert!(
+        tensors
+            .keys()
+            .any(|k| k.ends_with(".attn.img_qkv.lora_A.weight")),
+        "adapter should carry bare-dotted fused-QKV LoRA keys"
+    );
+    let n = count_targets(&out.adapter_path, AdapterKind::Lora);
+    assert!(n > 0, "adapter should contain LoRA targets");
+
+    assert_reloads(&out.adapter_path, AdapterKind::Lora);
+    bounded_render_finite_with_adapter(&out.adapter_path, AdapterKind::Lora);
+    println!("[lens-lora] e2e OK — {n} targets reload + merge, image renders finite");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::lens_bounded_acceleration_acceptance");
+}

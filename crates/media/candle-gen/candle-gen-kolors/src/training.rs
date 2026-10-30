@@ -637,6 +637,7 @@ impl KolorsTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
+            candle_gen::train::profile::cohort_begin_step(device)?;
             let sample = step_sample(aux_driver.as_mut(), step, &sample_order);
             let index = sample.entry;
             let (x0, context, pooled, mask_weight) = &cache[index];
@@ -672,9 +673,12 @@ impl KolorsTrainer {
                 let divisor = accumulation_divisor(step, accum);
                 scale_grads(&mut grads, &set.vars, 1.0 / divisor as f64)?;
                 // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                candle_gen::train::profile::cohort_before_update(&grads, &set.vars)?;
                 adapter_optimizer_step(&mut optimizer, &mut grads, &set, cfg, update, cfg.seed)?;
+                candle_gen::train::profile::cohort_after_update();
                 update += 1;
             }
+            candle_gen::train::profile::cohort_end_step(device, last_loss, &set.vars, "kolors")?;
             on_progress(TrainingProgress::Training {
                 step,
                 total: cfg.steps,

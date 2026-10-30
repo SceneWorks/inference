@@ -11,6 +11,7 @@ fn layer_norm_training(norm: &nn::LayerNorm, x: &Tensor) -> Result<Tensor> {
     if !x.track_op() && !norm.weight().track_op() {
         return __model_proof_output!(norm.forward(x));
     }
+    candle_gen::train::profile::cohort_reuse("sdxl-or-kolors:differentiable-LayerNorm");
     let xf = x.to_dtype(DType::F32)?;
     let centered = xf.broadcast_sub(&xf.mean_keepdim(D::Minus1)?)?;
     let variance = centered.sqr()?.mean_keepdim(D::Minus1)?;
@@ -347,6 +348,7 @@ impl CrossAttention {
             match &self.training_pack {
                 Some(pack) if self.self_attention => {
                     let values = pack.forward_lora(xs, &[&self.to_q, &self.to_k, &self.to_v])?;
+                    candle_gen::train::profile::cohort_reuse("sdxl:actual-frozen-projection-pack");
                     (values[0].clone(), values[1].clone(), values[2].clone())
                 }
                 _ => (
@@ -363,6 +365,9 @@ impl CrossAttention {
                 .find(|(id, _, _, _, _)| *id == context.id());
             let (key, value) = match key {
                 Some((_, k_id, v_id, key, value)) => {
+                    candle_gen::train::profile::cohort_reuse(
+                        "sdxl-or-kolors:frozen-cross-base-KV-storage-hit",
+                    );
                     if self.to_k.dense_base().map(|b| b.weight().id()) != Some(*k_id)
                         || self.to_v.dense_base().map(|b| b.weight().id()) != Some(*v_id)
                     {

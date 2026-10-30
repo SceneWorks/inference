@@ -47,6 +47,7 @@ use candle_gen::train::projection::FrozenProjectionPack;
 use candle_transformers::models::z_image::preprocess::{prepare_inputs, PreparedInputs};
 
 fn rms_diff(norm: &RmsNorm, x: &Tensor) -> Result<Tensor> {
+    candle_gen::train::profile::cohort_reuse("z-image:shared-differentiable-RMS");
     candle_gen::train::norm::rms_norm_cast_before_weight(x, norm.weight(), norm.eps())
 }
 
@@ -214,7 +215,10 @@ impl ZImageAttention {
         // Project to Q, K, V (through the LoRA-adapted projections).
         let projected = match &self.qkv_pack {
             Some(pack) => {
-                pack.forward_lora(hidden_states, &[&self.to_q, &self.to_k, &self.to_v])?
+                let output =
+                    pack.forward_lora(hidden_states, &[&self.to_q, &self.to_k, &self.to_v])?;
+                candle_gen::train::profile::cohort_reuse("zimage:actual-frozen-QKV-pack");
+                output
             }
             None => vec![
                 self.to_q.forward(hidden_states)?,
@@ -661,12 +665,17 @@ impl ZImageTransformer2DModel {
             .iter()
             .find(|(id, _, _)| *id == caption.id())
         {
-            Some((_, mask, length)) => Ok(PreparedInputs {
-                latents: x.unsqueeze(2)?,
-                cap_feats: caption.clone(),
-                cap_mask: mask.clone(),
-                text_lengths: vec![*length],
-            }),
+            Some((_, mask, length)) => {
+                candle_gen::train::profile::cohort_reuse(
+                    "zimage:frozen-caption-and-mask-storage-hit",
+                );
+                Ok(PreparedInputs {
+                    latents: x.unsqueeze(2)?,
+                    cap_feats: caption.clone(),
+                    cap_mask: mask.clone(),
+                    text_lengths: vec![*length],
+                })
+            }
             None => prepare_inputs(x, std::slice::from_ref(caption), x.device()),
         }
     }
@@ -862,7 +871,12 @@ impl ZImageTransformer2DModel {
                 .training_geometry
                 .get(&(b, f, h, w, cap_feats.id(), cap_mask.id()))
             {
-                Some(geometry) => geometry.clone(),
+                Some(geometry) => {
+                    candle_gen::train::profile::cohort_reuse(
+                        "zimage:exact-geometry-mask-storage-hit",
+                    );
+                    geometry.clone()
+                }
                 None => self.build_training_geometry(x, cap_feats, cap_mask)?,
             };
         let TrainingGeometry {

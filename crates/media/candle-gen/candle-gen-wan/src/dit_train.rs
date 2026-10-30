@@ -33,6 +33,7 @@ use crate::config::TransformerConfig;
 use crate::transformer::{linear, ln_no_affine, timestep_sinusoid};
 
 fn rms(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+    candle_gen::train::profile::cohort_reuse("wan:shared-differentiable-RMS");
     candle_gen::train::norm::rms_norm_diff(x, &weight.to_dtype(DType::F32)?, eps)
 }
 
@@ -144,10 +145,12 @@ impl TrainAttention {
                     );
                 }
                 let values = pack.forward_lora(hidden, &[&self.to_q, &self.to_k, &self.to_v])?;
+                candle_gen::train::profile::cohort_reuse("wan:actual-frozen-projection-pack");
                 (values[0].clone(), values[1].clone(), values[2].clone())
             }
             Some(pack) => {
                 let values = pack.forward_lora(context, &[&self.to_k, &self.to_v])?;
+                candle_gen::train::profile::cohort_reuse("wan:actual-frozen-projection-pack");
                 (
                     self.to_q.forward(hidden)?,
                     values[0].clone(),
@@ -390,6 +393,7 @@ impl WanTransformerTrain {
     /// linears (PixArtAlphaTextProjection). Frozen — no adapter targets here.
     pub fn embed_text(&self, prompt_embeds: &Tensor) -> Result<Tensor> {
         if self.prepared_context_ids.contains(&prompt_embeds.id()) {
+            candle_gen::train::profile::cohort_reuse("wan:expert-owned-caption-storage-hit");
             return Ok(prompt_embeds.clone());
         }
         let x = prompt_embeds.to_dtype(self.dtype)?;

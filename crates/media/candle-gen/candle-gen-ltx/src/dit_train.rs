@@ -45,6 +45,7 @@ fn gated(x: &Tensor, out: &Tensor, gate: &Tensor) -> Result<Tensor> {
 }
 
 fn rms_noweight(x: &Tensor, eps: f64) -> Result<Tensor> {
+    candle_gen::train::profile::cohort_reuse("ltx:shared-differentiable-RMS");
     candle_gen::train::norm::rms_normalize_f32(x, eps)?.to_dtype(x.dtype())
 }
 
@@ -172,6 +173,11 @@ impl TrainAttention {
             &self.to_v,
             self.gate.lora(),
         )?;
+        candle_gen::train::profile::cohort_reuse(if self.packs.active() {
+            "ltx23:actual-dense-pack"
+        } else {
+            "ltx23:native-incompatible-projection-fallback"
+        });
         let q = rms_weighted(&q.contiguous()?, &self.q_norm, self.eps)?;
         let k = rms_weighted(&k.contiguous()?, &self.k_norm, self.eps)?;
         let mut q = self.to_heads(&q)?;
@@ -430,7 +436,10 @@ impl LtxDiT {
             .iter()
             .find(|(id, _, _)| *id == positions.id())
         {
-            Some((_, cos, sin)) => (cos.clone(), sin.clone()),
+            Some((_, cos, sin)) => {
+                candle_gen::train::profile::cohort_reuse("ltx23:rope-storage-hit");
+                (cos.clone(), sin.clone())
+            }
             None => precompute_split_freqs_nd(
                 positions,
                 inner,

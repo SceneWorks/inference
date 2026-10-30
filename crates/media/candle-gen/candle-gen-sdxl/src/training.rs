@@ -1117,6 +1117,7 @@ impl SdxlTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
+            candle_gen::train::profile::cohort_begin_step(device)?;
             let sample = step_sample(aux_driver.as_mut(), step, &schedule);
             let (x0, cond, mask_weight) = &cache[sample.entry];
             let t = sample_timestep(cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64));
@@ -1157,10 +1158,13 @@ impl SdxlTrainer {
                 let divisor = accumulation_divisor(step, accum);
                 scale_grads(&mut avg, &lora_set.vars, 1.0 / divisor as f64)?;
                 // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                candle_gen::train::profile::cohort_before_update(&avg, &lora_set.vars)?;
                 adapter_optimizer_step(&mut opt, &mut avg, &lora_set, cfg, update_idx, cfg.seed)?;
+                candle_gen::train::profile::cohort_after_update();
                 update_idx += 1;
             }
 
+            candle_gen::train::profile::cohort_end_step(device, last_loss, &lora_set.vars, "sdxl")?;
             on_progress(TrainingProgress::Training {
                 step,
                 total: cfg.steps,

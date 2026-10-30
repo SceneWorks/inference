@@ -337,6 +337,7 @@ fn to_heads(x: &Tensor, heads: usize, head_dim: usize, norm: Option<&RmsNorm>) -
     let x = x.reshape((b, s, heads, head_dim))?;
     let x = match norm {
         Some(n) if x.track_op() || n.weight().track_op() => {
+            candle_gen::train::profile::cohort_reuse("sd3:differentiable-QK-RMS");
             candle_gen::train::norm::rms_norm_cast_before_weight(&x, n.weight(), n.eps())?
         }
         Some(n) => n.forward(&x)?,
@@ -373,7 +374,11 @@ fn project_qkv(
     layers: [&QLinear; 3],
 ) -> Result<Vec<Tensor>> {
     match pack {
-        Some(pack) => pack.forward_adapt(x, &layers),
+        Some(pack) => {
+            let output = pack.forward_adapt(x, &layers)?;
+            candle_gen::train::profile::cohort_reuse("sd3:actual-frozen-QKV-pack");
+            Ok(output)
+        }
         None => layers.iter().map(|p| p.forward(x)).collect(),
     }
 }
@@ -1169,6 +1174,7 @@ impl Sd3Transformer {
                     "prepared SD3 context invalidated by context embedder change"
                 );
             }
+            candle_gen::train::profile::cohort_reuse("sd3:frozen-context-storage-hit");
             context.to_dtype(img.dtype())?
         } else {
             self.context_embedder

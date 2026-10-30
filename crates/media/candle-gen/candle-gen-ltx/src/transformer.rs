@@ -220,6 +220,7 @@ impl Attention {
     ) -> Result<Tensor> {
         let ctx = context.unwrap_or(x);
         let (q, k, v, gate_logits) = if self.training_packs.active() {
+            candle_gen::train::profile::cohort_reuse("ltx25:actual-compatible-dense-pack");
             self.training_packs.forward(
                 x,
                 context,
@@ -229,6 +230,9 @@ impl Attention {
                 self.gate.lora(),
             )?
         } else {
+            candle_gen::train::profile::cohort_reuse(
+                "ltx25:native-incompatible-projection-fallback",
+            );
             (
                 self.to_q.forward(x)?,
                 self.to_k.forward(ctx)?,
@@ -240,6 +244,7 @@ impl Attention {
         // half-precision rounding. A tracked projection must retain its upstream graph.
         let normalize = |x: &Tensor, weight: &Tensor| -> Result<Tensor> {
             if x.track_op() || weight.track_op() {
+                candle_gen::train::profile::cohort_reuse("ltx25:differentiable-QK-RMS");
                 candle_gen::train::norm::rms_norm_cast_before_weight(x, weight, self.eps)
             } else {
                 rms_norm(&x.contiguous()?, weight, self.eps as f32)
@@ -1307,6 +1312,7 @@ impl AvDiT {
                     && entry.heads == heads
                     && entry.max_pos == max_pos
             }) {
+                candle_gen::train::profile::cohort_reuse("ltx25:exact-grid-rope-storage-hit");
                 return Ok((entry.cos.clone(), entry.sin.clone()));
             }
         }

@@ -1768,7 +1768,14 @@ fn ltx25_video_grid(
     let mut max = (0, 0, 0);
     for item in items {
         let path = PathBuf::from(required_prepared_path(item)?);
-        let metadata = safetensors_file_metadata(&path).map_err(|error| {
+        let metadata = candle_gen::gen_core::__model_input_reader!(
+            safetensors_file_metadata(&path),
+            "candle-gen-ltx::training::validate_prepared_ltx25_bundle/header-configuration",
+            Configuration,
+            &path,
+            |actual_path| safetensors_file_metadata(actual_path)
+        )
+        .map_err(|error| {
             CandleError::Msg(format!(
                 "{MODEL_25_ID} trainer: could not read prepared bundle header `{}`: {error}",
                 path.display()
@@ -3535,11 +3542,16 @@ impl FlowMatchTrainer for LtxTrainer {
                     &conn_cfg,
                     &audio_conn_cfg,
                 )?;
-                let tokenizer = Ltx25Tokenizer::from_packed_te_file(
-                    bundle
-                        .require(LtxComponent::TextEncoder)
-                        .map_err(|e| CandleError::Msg(e.to_string()))?
-                        .path(),
+                let tokenizer_path = bundle
+                    .require(LtxComponent::TextEncoder)
+                    .map_err(|e| CandleError::Msg(e.to_string()))?
+                    .path();
+                let tokenizer = candle_gen::gen_core::__model_input_reader!(
+                    Ltx25Tokenizer::from_packed_te_file(tokenizer_path),
+                    "candle-gen-ltx::training::LtxTrainer::cache/ltx25-tokenizer",
+                    Tokenizer,
+                    tokenizer_path,
+                    |actual_path| Ltx25Tokenizer::from_packed_te_file(actual_path)
                 )?;
                 let tokenizer = TrainingTokenizer::Gemma4(tokenizer);
                 let encoder = TrainingTextEncoder::Gemma4(Box::new(encoder));
