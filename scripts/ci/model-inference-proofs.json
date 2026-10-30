@@ -279245,5 +279245,61 @@
       "source_identity": "crates/media/candle-gen/candle-gen/src/train/projection.rs::train::projection::tests::packed_base_preserves_independent_adapter_gradients_and_updates",
       "requirements": []
     }
+  },
+  {
+    "package": "candle-gen",
+    "target": "candle_gen",
+    "target_kind": "lib",
+    "fqn": "train::projection::tests::cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient",
+    "source": "crates/media/candle-gen/candle-gen/src/train/projection.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "crates/media/candle-gen/candle-gen/src/train/projection.rs::train::projection::tests::cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient; fixed BF16 CUDA input [2,5,64], widths [128,32,32,4], rank4 f32 masters, scales [0.5,-1.7,1,0.125], mixed biases; matched f32 oracle, every factor gradient, numerical comparator negative controls, live updates and preparation refusal",
+    "configuration_source": "crates/media/candle-gen/candle-gen/src/train/projection.rs::train::projection::tests::cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient",
+    "required_environment": [],
+    "device_witness": "Source-owned successful frozen packed base and learned LoRA outputs; explicit tensor device/dtype assertions before host comparison; all BF16 and matched f32 computation on the selected CUDA device",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen/src/train/projection.rs::train::projection::tests::cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Fixed BF16 CUDA prepared Q/K/V/gate pack, fused and separate outputs and all eight live factor gradients against matched f32 oracle at Iris BF16 noise bounds, direct magnitude/relative-norm/cosine checks, missing residual and wrong-scale negative controls, same-pack live update, order/dtype/invalidation and live-base refusal controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen/src/train/projection.rs::train::projection::tests::cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient",
+      "requirements": []
+    }
   }
 ]

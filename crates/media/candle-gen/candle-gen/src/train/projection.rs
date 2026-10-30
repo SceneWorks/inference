@@ -416,4 +416,282 @@ mod tests {
         println!("\nMODEL_INFERENCE_BODY_COMPLETED train::projection::tests::packed_base_preserves_independent_adapter_gradients_and_updates");
         Ok(())
     }
+
+    #[cfg(feature = "cuda")]
+    fn bf16_projection_close(
+        name: &str,
+        actual: &Tensor,
+        separate: &Tensor,
+        f32_reference: &Tensor,
+    ) -> candle_core::Result<bool> {
+        assert_eq!(actual.dims(), separate.dims(), "{name}: shape");
+        assert_eq!(actual.dims(), f32_reference.dims(), "{name}: f32 shape");
+        let host = |t: &Tensor| t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>();
+        let (actual, separate, reference) = (host(actual)?, host(separate)?, host(f32_reference)?);
+        let (mut max_direct, mut max_plain, mut max_actual, mut peak) = (0f64, 0f64, 0f64, 0f64);
+        let (
+            mut direct2,
+            mut plain2,
+            mut actual2,
+            mut reference2,
+            mut separate2,
+            mut norm2,
+            mut dot,
+        ) = (0f64, 0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
+        for ((&a, &s), &r) in actual.iter().zip(&separate).zip(&reference) {
+            assert!(
+                a.is_finite() && s.is_finite() && r.is_finite(),
+                "{name}: non-finite value"
+            );
+            let (a, s, r) = (f64::from(a), f64::from(s), f64::from(r));
+            max_direct = max_direct.max((a - s).abs());
+            max_plain = max_plain.max((s - r).abs());
+            max_actual = max_actual.max((a - r).abs());
+            peak = peak.max(r.abs());
+            direct2 += (a - s).powi(2);
+            plain2 += (s - r).powi(2);
+            actual2 += (a - r).powi(2);
+            reference2 += r * r;
+            separate2 += s * s;
+            norm2 += a * a;
+            dot += a * s;
+        }
+        assert!(
+            reference2 > 0.0 && separate2 > 0.0 && norm2 > 0.0,
+            "{name}: vacuous zero reference"
+        );
+        // Same scale-sensitive BF16 policy as Iris tests/common::assert_ac_bf16_noise_only:
+        // error vs matched f32 <= 2 * separate-BF16 error + 1e-3 of the f32 norm,
+        // cosine >= .999. Apply the policy to values AND every adapter factor gradient.
+        // The direct (fused,separate) bounds follow by the triangle inequality (2+1),
+        // with max-absolute checks as well as L2 so local errors cannot hide in cosine.
+        let (noise_factor, noise_floor, min_cosine) = (2.0, 1e-3, 0.999);
+        let plain_error = (plain2 / reference2).sqrt();
+        let actual_error = (actual2 / reference2).sqrt();
+        let direct_error = (direct2 / reference2).sqrt();
+        let cosine = dot / (norm2 * separate2).sqrt();
+        let accepted = actual_error <= noise_factor * plain_error + noise_floor
+            && max_actual <= noise_factor * max_plain + noise_floor * peak
+            && direct_error <= (noise_factor + 1.0) * plain_error + noise_floor
+            && max_direct <= (noise_factor + 1.0) * max_plain + noise_floor * peak
+            && cosine >= min_cosine;
+        eprintln!(
+            "{name}: max_direct={max_direct:.6e} max_f32_plain={max_plain:.6e} max_f32_actual={max_actual:.6e} peak={peak:.6e} relative_direct={direct_error:.6e} relative_f32_plain={plain_error:.6e} relative_f32_actual={actual_error:.6e} cosine={cosine:.9} accepted={accepted}"
+        );
+        Ok(accepted)
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient(
+    ) -> candle_core::Result<()> {
+        let device = Device::new_cuda(0)?;
+        // One fixed small GQA-like configuration: Q has four times the KV width,
+        // while the per-head gate is narrower still. K/V have distinct values/targets.
+        let widths = [128, 32, 32, 4];
+        let paths = ["attn.to_q", "attn.to_k", "attn.to_v", "attn.to_gate"];
+        let scales = [0.5, -1.7, 1.0, 0.125];
+        let values = |rows: usize, cols: usize, salt: usize| {
+            Tensor::from_vec(
+                (0..rows * cols)
+                    .map(|i| (((i * 37 + salt * 13) % 101) as f32 - 50.0) / 256.0)
+                    .collect::<Vec<_>>(),
+                (rows, cols),
+                &device,
+            )
+        };
+        let mut layers = Vec::new();
+        let mut factors = Vec::new();
+        for (i, &width) in widths.iter().enumerate() {
+            let weight = values(width, 64, i + 1)?.to_dtype(DType::BF16)?;
+            let bias = if i % 2 == 0 {
+                Some(
+                    values(1, width, i + 11)?
+                        .reshape(width)?
+                        .to_dtype(DType::BF16)?,
+                )
+            } else {
+                None
+            };
+            let mut layer =
+                LoraLinear::from_linear(Linear::new(weight, bias), 64, width, paths[i].into());
+            let down = Var::from_tensor(&values(4, 64, i + 21)?)?;
+            let up = Var::from_tensor(&values(width, 4, i + 31)?)?;
+            layer.install_lora(down.as_tensor().clone(), up.as_tensor().clone(), scales[i]);
+            factors.push((down, up));
+            layers.push(layer);
+        }
+        let x = values(10, 64, 41)?
+            .reshape((2, 5, 64))?
+            .to_dtype(DType::BF16)?;
+        // Keep the original independent allocations as the reference. The prepared
+        // layers must actually use the pack's replacement slices, not this snapshot.
+        let originals = layers.clone();
+        // Start the f32 oracle from the SAME quantized base/input values, not a
+        // higher precision pre-quantization fixture. The same live f32 master Vars
+        // feed both graphs. Only activation/factor GEMM rounding differs; no model,
+        // input, adapter scale or objective changes can inflate the BF16 noise budget.
+        let f32_x = x.to_dtype(DType::F32)?;
+        let f32_layers = originals
+            .iter()
+            .map(|layer| {
+                let mut reference = layer.clone();
+                let base = layer.dense_base().unwrap();
+                reference.replace_dense_base(Linear::new(
+                    base.weight().to_dtype(DType::F32)?,
+                    base.bias().map(|b| b.to_dtype(DType::F32)).transpose()?,
+                ));
+                Ok(reference)
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let f32_outputs = f32_layers
+            .iter()
+            .map(|layer| __model_proof_output!(layer.forward(&f32_x)))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let pack = FrozenProjectionPack::prepare_lora(&mut layers.iter_mut().collect::<Vec<_>>())?
+            .expect("fixed frozen BF16 CUDA projections must prepare");
+        assert_eq!(pack.widths(), widths);
+        assert_eq!(
+            pack.resident_bytes(),
+            widths.iter().sum::<usize>() * (64 + 1) * 2
+        );
+        for (i, layer) in layers.iter().enumerate() {
+            assert_eq!(layer.path(), paths[i]);
+            assert_ne!(
+                layer.dense_base().unwrap().weight().id(),
+                originals[i].dense_base().unwrap().weight().id()
+            );
+            assert_eq!(layer.dense_base().unwrap().bias().is_some(), i % 2 == 0);
+        }
+        let separate = originals
+            .iter()
+            .map(|layer| __model_proof_output!(layer.forward(&x)))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let refs = layers.iter().collect::<Vec<_>>();
+        let fused = __model_proof_output!(pack.forward_lora(&x, &refs), tensors)?;
+        for (i, (actual, reference)) in fused.iter().zip(&separate).enumerate() {
+            assert_eq!(actual.dtype(), DType::BF16);
+            assert!(actual.device().same_device(&device));
+            assert_eq!(actual.dims(), &[2, 5, widths[i]]);
+            assert!(bf16_projection_close(
+                paths[i],
+                actual,
+                reference,
+                &f32_outputs[i]
+            )?);
+        }
+        // An output-dependent f32 loss checks gradients as well as reachability:
+        // wrong frozen widths/order/biases must affect the cotangents, too.
+        let loss = |ys: &[Tensor]| {
+            Tensor::cat(ys, D::Minus1)?
+                .to_dtype(DType::F32)?
+                .sqr()?
+                .sum_all()
+        };
+        let actual_grads = loss(&fused)?.backward()?;
+        let reference_grads = loss(&separate)?.backward()?;
+        let f32_grads = loss(&f32_outputs)?.backward()?;
+        for (i, (down, up)) in factors.iter().enumerate() {
+            for (factor_name, factor) in [("down", down), ("up", up)] {
+                let actual = actual_grads
+                    .get(factor)
+                    .expect("every live factor gradient");
+                let reference = reference_grads
+                    .get(factor)
+                    .expect("every reference factor gradient");
+                assert_eq!(actual.dtype(), DType::F32);
+                let oracle = f32_grads
+                    .get(factor)
+                    .expect("every f32 reference factor gradient");
+                assert!(bf16_projection_close(
+                    &format!("{}.{factor_name}", paths[i]),
+                    actual,
+                    reference,
+                    oracle
+                )?);
+                assert!(!bf16_projection_close(
+                    "negative: gradient scale",
+                    &(reference * 1.5)?,
+                    reference,
+                    oracle
+                )?);
+            }
+        }
+        // Negative controls prove that the numerical comparator notices a missing
+        // residual and an adapter-scale error, even if directions remain similar.
+        let mut missing = originals[0].clone();
+        missing.clear();
+        let missing_y = __model_proof_output!(missing.forward(&x))?;
+        assert!(!bf16_projection_close(
+            "negative: missing residual",
+            &missing_y,
+            &separate[0],
+            &f32_outputs[0]
+        )?);
+        let residual = (&separate[0].to_dtype(DType::F32)? - &missing_y.to_dtype(DType::F32)?)?;
+        let wrong_scale = (&missing_y.to_dtype(DType::F32)? + (residual * 1.5)?)?;
+        assert!(!bf16_projection_close(
+            "negative: residual scale",
+            &wrong_scale,
+            &separate[0],
+            &f32_outputs[0]
+        )?);
+        // Reuse the same pack after changing every master factor: casts/residuals
+        // must read live Vars rather than retaining a prepared adapter snapshot.
+        for (down, up) in &factors {
+            down.set(&down.affine(1.25, 0.015625)?)?;
+            up.set(&up.affine(0.75, -0.03125)?)?;
+        }
+        let updated = __model_proof_output!(pack.forward_lora(&x, &refs), tensors)?;
+        for (i, layer) in originals.iter().enumerate() {
+            let reference = __model_proof_output!(layer.forward(&x))?;
+            let f32_reference = __model_proof_output!(f32_layers[i].forward(&f32_x))?;
+            assert!(bf16_projection_close(
+                paths[i],
+                &updated[i],
+                &reference,
+                &f32_reference
+            )?);
+            assert!(
+                (&updated[i].to_dtype(DType::F32)? - &fused[i].to_dtype(DType::F32)?)?
+                    .abs()?
+                    .max_all()?
+                    .to_scalar::<f32>()?
+                    > 0.0,
+                "{} must observe its live factor update",
+                paths[i]
+            );
+        }
+        assert!(pack
+            .forward_lora(&x, &[&layers[0], &layers[2], &layers[1], &layers[3]])
+            .is_err());
+        assert!(pack.forward_lora(&x.to_dtype(DType::F32)?, &refs).is_err());
+        // Full-training weights refuse preparation; their ordinary path stays usable.
+        let variable = Var::from_tensor(originals[0].dense_base().unwrap().weight())?;
+        layers[0].replace_dense_base(Linear::new(
+            variable.as_tensor().clone(),
+            originals[0].dense_base().unwrap().bias().cloned(),
+        ));
+        assert!(pack
+            .forward_lora(&x, &layers.iter().collect::<Vec<_>>())
+            .is_err());
+        assert!(
+            FrozenProjectionPack::prepare_lora(&mut layers.iter_mut().collect::<Vec<_>>())?
+                .is_none()
+        );
+        let fallback = __model_proof_output!(layers[0].forward(&x))?;
+        assert_eq!(fallback.dims(), &[2, 5, widths[0]]);
+        let fallback_reference = __model_proof_output!(originals[0].forward(&x))?;
+        let fallback_f32_reference = __model_proof_output!(f32_layers[0].forward(&f32_x))?;
+        assert!(bf16_projection_close(
+            "refused live-base fallback",
+            &fallback,
+            &fallback_reference,
+            &fallback_f32_reference
+        )?);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train::projection::tests::cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient");
+        Ok(())
+    }
 }
