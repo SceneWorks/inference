@@ -107,7 +107,15 @@ pub(crate) fn sdpa_diff_budgeted(
     scale: f64,
     budget: usize,
 ) -> Result<Tensor> {
-    candle_gen::sdpa_budgeted_bhsd(q, k, v, scale, None, |s| softmax(s, D::Minus1), budget)
+    candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
+        q,
+        k,
+        v,
+        scale,
+        None,
+        |s| softmax(s, D::Minus1),
+        budget,
+    )
 }
 
 /// Build a frozen base `Linear` (no bias) from the mmap'd `Weights` and wrap it as a trainable

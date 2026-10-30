@@ -100,6 +100,7 @@ pub mod rope;
 // Fused-attention dispatch (sc-26691): FlashAttention-2 for unmasked bf16/f16 CUDA attention when the
 // build enables `flash-attn`, the planned budgeted path above for everything else.
 pub mod fused_attention;
+pub mod training_attention;
 pub use fused_attention::{sdpa_dispatch_bhsd, AttentionKernel, FlashRefusal};
 
 // Shared launch-bound-safe conv2d (sc-24114): candle's CUDA im2col launch truncates its element count
