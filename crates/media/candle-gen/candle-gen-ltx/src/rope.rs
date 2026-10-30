@@ -232,3 +232,79 @@ pub fn create_audio_position_grid(audio_frames: usize, device: &Device) -> Resul
     }
     Tensor::from_vec(data, (1, 1, t, 2), device)
 }
+
+/// Run-owned canonical handles for exact immutable position grids. Shape alone is
+/// insufficient: FPS, reference ordering and offset positions all affect RoPE.
+/// Values are compared only during preparation; forwards retain their identity fast path.
+#[derive(Default)]
+pub(crate) struct TrainingPositionInterner {
+    entries: Vec<(Vec<u32>, Tensor)>,
+}
+
+impl TrainingPositionInterner {
+    pub(crate) fn intern(&mut self, positions: Tensor) -> Result<Tensor> {
+        if positions.track_op() {
+            return Ok(positions); // A live variable must never acquire frozen-cache identity.
+        }
+        let bits = positions
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .into_iter()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>();
+        if let Some((_, existing)) = self.entries.iter().find(|(values, existing)| {
+            *values == bits
+                && existing.dims() == positions.dims()
+                && existing.dtype() == positions.dtype()
+                && existing.device().same_device(positions.device())
+        }) {
+            return Ok(existing.clone());
+        }
+        self.entries.push((bits, positions.clone()));
+        Ok(positions)
+    }
+}
+
+/// Two f32 RoPE tables of [1, heads, sequence, (dim / 2) / heads].
+/// Construction uses host vectors and uploads each output once, so no additional
+/// device temporary is needed. Already retained tables are absent from current free.
+pub(crate) fn split_freqs_bytes(sequence: usize, dim: usize, heads: usize) -> u64 {
+    (sequence as u64)
+        .saturating_mul(heads as u64)
+        .saturating_mul((dim / 2 / heads) as u64)
+        .saturating_mul(8)
+}
+
+#[cfg(test)]
+mod training_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn independent_equal_grids_share_storage_but_distinct_positions_do_not() -> Result<()> {
+        let mut interner = TrainingPositionInterner::default();
+        let grid = || Tensor::from_vec(vec![0f32, 1., 1., 2.], (1, 1, 2, 2), &Device::Cpu);
+        let first = grid()?;
+        let second = grid()?;
+        assert_ne!(first.id(), second.id());
+        let a = interner.intern(first)?;
+        let b = interner.intern(second)?;
+        assert_eq!(a.id(), b.id());
+        let different = interner.intern(Tensor::from_vec(
+            vec![0f32, 0.5, 0.5, 1.],
+            (1, 1, 2, 2),
+            &Device::Cpu,
+        )?)?;
+        assert_ne!(a.id(), different.id());
+        assert_eq!(interner.entries.len(), 2);
+        // Raw geometry math only, no learned model construction or forward.
+        let (cos, sin) = precompute_split_freqs_nd(&a, 8, 10_000., &[20], 2, &Device::Cpu)?;
+        let bytes = split_freqs_bytes(2, 8, 2);
+        assert_eq!(bytes, (cos.elem_count() + sin.elem_count()) as u64 * 4);
+        assert_eq!(split_freqs_bytes(4096, 4096, 32), 64 * 1024 * 1024);
+        use candle_gen::train::flow_match::check_preparation_memory;
+        assert!(check_preparation_memory("new table", bytes, 0, bytes).is_ok());
+        assert!(check_preparation_memory("new table", bytes, 0, bytes - 1).is_err());
+        assert!(check_preparation_memory("existing table", 0, 0, 0).is_ok());
+        Ok(())
+    }
+}

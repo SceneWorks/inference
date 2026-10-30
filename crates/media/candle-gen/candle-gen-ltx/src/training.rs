@@ -3704,6 +3704,7 @@ impl FlowMatchTrainer for LtxTrainer {
             }
             TrainingDiT::Ltx25(dit) => {
                 dit.prepare_training()?;
+                let mut position_interner = crate::rope::TrainingPositionInterner::default();
                 for item in cache {
                     if let TrainingCached::Ltx25(example) = item {
                         let effective = |base: Option<&Tensor>,
@@ -3734,6 +3735,16 @@ impl FlowMatchTrainer for LtxTrainer {
                                                 "missing reference positions {key}"
                                             ))
                                         })?;
+                                    // New concatenated positions overlap both existing grids.
+                                    flow_match::check_preparation_memory(
+                                        "LTX reference geometry",
+                                        (base.elem_count() + reference.elem_count()) as u64 * 4,
+                                        0,
+                                        flow_match::device_training_budget_bytes(
+                                            base.device(),
+                                            "LTX reference geometry",
+                                        ),
+                                    )?;
                                     Ok(Some(Tensor::cat(&[base, reference], 2)?))
                                 }
                                 None => Ok(Some(base.clone())),
@@ -3743,11 +3754,15 @@ impl FlowMatchTrainer for LtxTrainer {
                             video: effective(
                                 example.positions.video.as_ref(),
                                 &example.conditioning.video,
-                            )?,
+                            )?
+                            .map(|positions| position_interner.intern(positions))
+                            .transpose()?,
                             audio: effective(
                                 example.positions.audio.as_ref(),
                                 &example.conditioning.audio,
-                            )?,
+                            )?
+                            .map(|positions| position_interner.intern(positions))
+                            .transpose()?,
                         };
                         dit.prepare_training_positions(
                             positions.video.as_ref(),

@@ -468,22 +468,10 @@ impl AnimaTrainer {
             .collect::<Vec<_>>();
         let geometry_bytes = dit.training_geometry_bytes(&latent_inputs)?
             + conditioner.training_geometry_bytes(&conditioner_inputs)?;
-        let base = std::fs::metadata(
-            root.join("diffusion_models")
-                .join(Variant::Base.dit_filename()),
-        )
-        .map_err(|error| CandleError::Msg(format!("{LABEL}: geometry admission: {error}")))?
-        .len();
-        let edge = edges.iter().copied().max().unwrap_or(0);
-        let aux = candle_gen_perceptual::perceptual_footprint(
-            cfg,
-            &anima_decoder(),
-            candle_gen_perceptual::AuxGeometry::image(edge, cache.len()),
-        );
-        flow_match::check_aux_memory(
+        flow_match::check_preparation_memory(
             LABEL,
-            base,
-            aux.saturating_add(geometry_bytes),
+            geometry_bytes,
+            0,
             flow_match::device_training_budget_bytes(device, LABEL),
         )?;
         dit.prepare_training(&cache.iter().map(|entry| &entry.0).collect::<Vec<_>>())?;

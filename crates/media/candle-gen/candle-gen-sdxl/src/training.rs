@@ -1039,10 +1039,10 @@ impl SdxlTrainer {
         }
         let contexts = contexts.into_values().collect::<Vec<_>>();
         let preparation_bytes = unet.training_preparation_bytes(&contexts)? as u64;
-        flow_match::check_aux_memory(
+        flow_match::check_preparation_memory(
             LABEL,
-            flow_match::component_bytes(&self.root, "unet", LABEL)?,
             preparation_bytes,
+            0,
             flow_match::device_training_budget_bytes(device, LABEL),
         )?;
         unet.prepare_training(&contexts)?;

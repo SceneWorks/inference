@@ -358,18 +358,12 @@ impl IrisDiT {
                 });
             }
         }
-        let previous = cache.ropes[slot].as_ref().map_or(0, |(_, r)| {
-            (r.cos.elem_count() + r.sin.elem_count()) as u64 * 4
-        });
         let bytes = height as u64 * width as u64 * head as u64 * 4;
         if self.training_geometry_admission {
-            candle_gen::train::flow_match::check_aux_memory(
+            candle_gen::train::flow_match::check_preparation_memory(
                 "Iris geometry",
-                self.resident_weight_bytes,
-                cache
-                    .resident_bytes()
-                    .saturating_sub(previous)
-                    .saturating_add(bytes),
+                bytes,
+                0,
                 candle_gen::train::flow_match::device_training_budget_bytes(
                     &self.device,
                     "Iris geometry",
@@ -744,19 +738,12 @@ impl IrisDiT {
                 return Ok(table.clone());
             }
         }
-        let previous = cache
-            .position
-            .as_ref()
-            .map_or(0, |(_, t)| t.elem_count() as u64 * 4);
         let bytes = height as u64 * width as u64 * dim as u64 * 4;
         if self.training_geometry_admission {
-            candle_gen::train::flow_match::check_aux_memory(
+            candle_gen::train::flow_match::check_preparation_memory(
                 "Iris position",
-                self.resident_weight_bytes,
-                cache
-                    .resident_bytes()
-                    .saturating_sub(previous)
-                    .saturating_add(bytes),
+                bytes,
+                0,
                 candle_gen::train::flow_match::device_training_budget_bytes(
                     &self.device,
                     "Iris position",

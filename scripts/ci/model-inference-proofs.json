@@ -306907,8 +306907,29 @@
           "role": "tensor-input",
           "readers": [
             "candle-core::safetensors::MmapedSafetensors::multi",
-            "candle-core::safetensors::MmapedSafetensors::new",
-            "candle-core::safetensors::load"
+            "candle-core::safetensors::MmapedSafetensors::new"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-text-config",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/config.rs::from_dir::std::fs::read_to_string@50697"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::tokenizer::TextTokenizer::from_file"
           ],
           "minimum_collections": 1,
           "minimum_items": 1,

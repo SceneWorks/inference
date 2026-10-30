@@ -47,6 +47,24 @@ class InputReceipts(unittest.TestCase):
         roles.start(); grades.start()
         self.addCleanup(roles.stop); self.addCleanup(grades.stop)
 
+    def test_flux3_bounded_requires_base_tensors_text_config_and_tokenizer(self):
+        registry = json.loads((ROOT / 'scripts/ci/model-inference-proofs.json').read_text(encoding='utf-8'))
+        case = next(row for row in registry if row['fqn'] == 'real_weights::flux3_bounded_acceleration_acceptance')
+        requirements = case['input_contract']['requirements']
+        self.assertEqual({r['slot'] for r in requirements},
+                         {'flux3-source-tensors', 'flux3-text-config', 'flux3-tokenizer'})
+        events = [event(item('/MOCK-ONLY/' + r['slot']), scope=case['fqn'],
+                        reader=r['readers'][0], role=r['role']) for r in requirements]
+        self.assertEqual(inputs.assess_inputs(case, ''.join(events))['input_grade'], 'successful-reader-binding')
+        for omitted in range(len(events)):
+            with self.subTest(omitted=requirements[omitted]['slot']), self.assertRaises(ValueError):
+                inputs.assess_inputs(case, ''.join(e for i, e in enumerate(events) if i != omitted))
+        # A generated-adapter reload receipt cannot substitute for base source weights.
+        reload = event(item('/MOCK-ONLY/adapter.safetensors'), scope=case['fqn'],
+                       reader='candle-core::safetensors::load', role='tensor-input')
+        with self.assertRaises(ValueError):
+            inputs.assess_inputs(case, reload + ''.join(events[1:]))
+
     def test_source_defined_fixture_remains_source_bound_without_checkpoint_claim(self):
         result = inputs.assess_inputs(row('source-defined'), '')
         self.assertEqual(result['input_grade'], 'source-defined')

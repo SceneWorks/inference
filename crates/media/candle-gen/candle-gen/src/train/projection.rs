@@ -121,6 +121,34 @@ impl FrozenProjectionPack {
             }
             widths.push(out);
         }
+        // Packing temporarily overlaps the old resident bases. A failed optional
+        // pack keeps the separate projections; never charge all model weights again.
+        let output_rows = widths.iter().sum::<usize>() as u64;
+        let weight_bytes = output_rows
+            .saturating_mul(in_features as u64)
+            .saturating_mul(dtype.size_in_bytes() as u64);
+        let bias_bytes = if bases.iter().any(|b| b.bias().is_some()) {
+            // New concatenated bias plus temporary zero-fill slots for absent biases.
+            let zeros = bases
+                .iter()
+                .zip(&widths)
+                .filter(|(b, _)| b.bias().is_none())
+                .map(|(_, width)| *width as u64)
+                .sum::<u64>();
+            output_rows
+                .saturating_add(zeros)
+                .saturating_mul(dtype.size_in_bytes() as u64)
+        } else {
+            0
+        };
+        if weight_bytes.saturating_add(bias_bytes)
+            > super::flow_match::device_training_budget_bytes(
+                first.device(),
+                "projection preparation",
+            )
+        {
+            return Ok(None);
+        }
         let weight = Tensor::cat(&bases.iter().map(Linear::weight).collect::<Vec<_>>(), 0)?;
         let bias = if bases.iter().any(|b| b.bias().is_some()) {
             let biases = bases

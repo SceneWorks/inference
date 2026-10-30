@@ -717,8 +717,8 @@ pub fn combine_terms(
 pub const TRAIN_SAFE_FRAC: f64 = 0.85;
 
 /// This device's training memory budget in bytes: a CUDA device's effective free memory ×
-/// [`TRAIN_SAFE_FRAC`]; `u64::MAX` (nothing to compare against) on CPU/Metal or when free memory
-/// cannot be read (logged — a candle OOM is a catchable error, not a process kill).
+/// [`TRAIN_SAFE_FRAC`]; `u64::MAX` (nothing to compare against) on CPU/Metal. Free memory
+/// probe failure on CUDA yields zero: unknown headroom cannot admit new allocations.
 pub fn device_training_budget_bytes(device: &Device, label: &str) -> u64 {
     if !device.is_cuda() {
         return u64::MAX;
@@ -728,11 +728,30 @@ pub fn device_training_budget_bytes(device: &Device, label: &str) -> u64 {
         None => {
             eprintln!(
                 "{label}: could not read the device's free memory; the auxiliary-model memory \
-                 preflight cannot refuse this run"
+                 preflight cannot admit additional allocations"
             );
-            u64::MAX
+            0
         }
     }
+}
+
+/// Admit upcoming allocations against CURRENT free memory after loading. Resident weights,
+/// auxiliary models and existing cache entries are already excluded by the probe. A replacement
+/// must include its entire new allocation, even when an old cache entry will later be dropped;
+/// `workspace_bytes` covers extra temporary buffers overlapping those new allocations.
+pub fn check_preparation_memory(
+    label: &str,
+    allocation_bytes: u64,
+    workspace_bytes: u64,
+    budget_bytes: u64,
+) -> Result<()> {
+    let need = allocation_bytes.saturating_add(workspace_bytes);
+    if need <= budget_bytes {
+        return Ok(());
+    }
+    Err(CandleError::Msg(format!(
+        "{label}: preparation needs {allocation_bytes} additional bytes + {workspace_bytes} temporary bytes, exceeding current free training budget {budget_bytes} bytes"
+    )))
 }
 
 /// On-disk bytes of a snapshot component's `.safetensors` (the trained model's resident weights —
@@ -2941,5 +2960,26 @@ mod tests {
         let b = capture_run(0.0, 0.05, 3, 2);
         assert_ne!(clean, a, "gradient noise must reach the trained adapter");
         assert_eq!(a, b, "seeded gradient noise must reproduce");
+    }
+}
+
+#[cfg(test)]
+mod preparation_admission_tests {
+    use super::check_preparation_memory;
+
+    #[test]
+    fn current_free_admission_prices_new_allocations_and_replacement_overlap() {
+        let gib = 1u64 << 30;
+        // Ten GiB is already loaded; the six GiB free budget must not price it again.
+        let budget = (6.0 * 0.85 * gib as f64) as u64;
+        assert!(check_preparation_memory("near fit", gib / 10, 0, budget).is_ok());
+        assert!(check_preparation_memory("too large", 6 * gib, 0, budget).is_err());
+        // An existing two-GiB cache remains live during replacement. Its bytes are
+        // already absent from free; neither add them again nor subtract them from need.
+        assert!(check_preparation_memory("replace", 2 * gib, 0, 2 * gib).is_ok());
+        assert!(check_preparation_memory("overlap", 2 * gib, 1, 2 * gib).is_err());
+        assert!(check_preparation_memory("resident hit", 0, 0, 0).is_ok());
+        assert!(check_preparation_memory("unknown", 1, 0, 0).is_err());
+        assert!(check_preparation_memory("overflow", u64::MAX, 1, 12).is_err());
     }
 }

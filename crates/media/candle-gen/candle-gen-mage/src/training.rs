@@ -781,10 +781,10 @@ impl MageTrainer {
             .iter()
             .map(|sample| (&sample.text, &sample.layout))
             .collect::<Vec<_>>();
-        check_aux_memory(
+        candle_gen::train::flow_match::check_preparation_memory(
             LABEL,
-            component_bytes(&self.dirs.transformer, "", LABEL)?,
-            aux_bytes.saturating_add(transformer.training_preparation_bytes(&inputs)),
+            transformer.training_preparation_bytes(&inputs),
+            transformer.training_preparation_workspace_bytes(&inputs),
             device_training_budget_bytes(&self.device, LABEL),
         )?;
         transformer.prepare_training(&inputs)?;

@@ -602,6 +602,36 @@ impl MageTransformer {
         bytes as u64
     }
 
+    /// Maximum deterministic scratch during the sequential preparation above.
+    /// RoPE keeps its f32 angles and one f32 trig output while casting. Frozen
+    /// text normalization can overlap its input cast, f32 full-width intermediates,
+    /// reduction rows and weight cast; retained norm/output tensors are priced separately.
+    pub(crate) fn training_preparation_workspace_bytes(
+        &self,
+        inputs: &[(&Tensor, &PackLayout)],
+    ) -> u64 {
+        inputs
+            .iter()
+            .map(|(text, layout)| {
+                let rope = layout.image_tokens() as u64 * (HEAD_DIM / 2) as u64 * 8;
+                let norm = if !self.text_norm.track_op()
+                    && self.text_in.dense_base().is_some_and(|base| {
+                        !base.weight().track_op() && !base.bias().is_some_and(Tensor::track_op)
+                    }) {
+                    let elements = text.elem_count() as u64;
+                    let width = *text.dims().last().expect("validated text rank") as u64;
+                    elements * (12 + self.dtype.size_in_bytes() as u64)
+                        + width * 4
+                        + elements / width * 12
+                } else {
+                    0
+                };
+                rope.max(norm)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     pub(crate) fn prepare_training(&mut self, inputs: &[(&Tensor, &PackLayout)]) -> Result<()> {
         if let MageBlocks::Resident(blocks) = &mut self.blocks {
             for block in blocks {

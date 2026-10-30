@@ -1187,6 +1187,114 @@ struct TrainingRopeTable {
     sin: Tensor,
 }
 
+/// Retain only explicitly prepared immutable grids. Their canonical handles come from
+/// TrainingPositionInterner, so equal bucket/reference contents share one allocation.
+#[allow(clippy::too_many_arguments)]
+fn prepare_rope_table(
+    cache: &mut Vec<TrainingRopeTable>,
+    positions: &Tensor,
+    dim: usize,
+    heads: usize,
+    max_pos: Vec<i32>,
+    theta: f64,
+    device: &Device,
+    budget: u64,
+) -> Result<()> {
+    if positions.track_op()
+        || cache.iter().any(|entry| {
+            entry.positions.matches(positions)
+                && entry.dim == dim
+                && entry.heads == heads
+                && entry.max_pos == max_pos
+        })
+    {
+        return Ok(());
+    }
+    // Older tables already reduce current free; charge just the new full pair.
+    // Both outputs upload from host buffers: no extra device workspace or evicted
+    // allocation can be credited before it has actually been released.
+    candle_gen::train::flow_match::check_preparation_memory(
+        "LTX training geometry",
+        crate::rope::split_freqs_bytes(positions.dim(2)?, dim, heads),
+        0,
+        budget,
+    )
+    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+    let effective = if max_pos.len() == 1 && positions.dim(1)? != 1 {
+        time_axis(positions)?
+    } else {
+        positions.clone()
+    };
+    let (cos, sin) = precompute_split_freqs_nd(&effective, dim, theta, &max_pos, heads, device)?;
+    cache.push(TrainingRopeTable {
+        positions: TensorIdentity::new(positions),
+        dim,
+        heads,
+        max_pos,
+        cos,
+        sin,
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod prepared_rope_admission_tests {
+    use super::*;
+
+    #[test]
+    fn equivalent_grids_reuse_tables_and_new_tables_require_incremental_headroom() -> Result<()> {
+        let device = Device::Cpu;
+        let mut interner = crate::rope::TrainingPositionInterner::default();
+        let a = interner.intern(Tensor::from_vec(
+            vec![0f32, 1., 1., 2.],
+            (1, 1, 2, 2),
+            &device,
+        )?)?;
+        let b = interner.intern(Tensor::from_vec(
+            vec![0f32, 1., 1., 2.],
+            (1, 1, 2, 2),
+            &device,
+        )?)?;
+        let c = interner.intern(Tensor::from_vec(
+            vec![0f32, 0.5, 0.5, 1.],
+            (1, 1, 2, 2),
+            &device,
+        )?)?;
+        let bytes = crate::rope::split_freqs_bytes(2, 8, 2);
+        let mut cache = Vec::new();
+        prepare_rope_table(&mut cache, &a, 8, 2, vec![20], 10_000., &device, bytes)?;
+        let (cos, sin) = (cache[0].cos.id(), cache[0].sin.id());
+        prepare_rope_table(&mut cache, &b, 8, 2, vec![20], 10_000., &device, 0)?;
+        assert_eq!(cache.len(), 1);
+        assert_eq!((cache[0].cos.id(), cache[0].sin.id()), (cos, sin));
+        assert!(
+            prepare_rope_table(&mut cache, &c, 8, 2, vec![20], 10_000., &device, bytes - 1)
+                .is_err()
+        );
+        assert_eq!(cache.len(), 1);
+        prepare_rope_table(&mut cache, &c, 8, 2, vec![20], 10_000., &device, bytes)?;
+        assert_eq!(cache.len(), 2);
+        let variable = candle_gen::candle_core::Var::from_tensor(&a)?;
+        let live = interner.intern(variable.as_tensor().clone())?;
+        assert!(live.track_op());
+        prepare_rope_table(&mut cache, &live, 8, 2, vec![20], 10_000., &device, 0)?;
+        assert_eq!(
+            cache.len(),
+            2,
+            "live positions must not become frozen entries"
+        );
+        assert_ne!(cache[1].cos.id(), cos);
+        assert_eq!(
+            cache
+                .iter()
+                .map(|t| (t.cos.elem_count() + t.sin.elem_count()) as u64 * 4)
+                .sum::<u64>(),
+            2 * bytes
+        );
+        Ok(())
+    }
+}
+
 pub struct AvDiT {
     video: AvStream,
     audio: AvStream,
@@ -1256,33 +1364,20 @@ impl AvDiT {
                 vec![self.cfg.cross_max_pos],
             ),
         ] {
-            if let Some(positions) = positions {
-                let (cos, sin) = self.training_freqs(
+            if let (Some(positions), Some(cache)) = (positions, &self.training_rope) {
+                prepare_rope_table(
+                    &mut candle_gen::lock_recover(cache),
                     positions,
                     dim,
-                    self.cfg.video.rope_theta,
-                    &max_pos,
                     heads,
+                    max_pos,
+                    self.cfg.video.rope_theta,
                     &self.device,
+                    candle_gen::train::flow_match::device_training_budget_bytes(
+                        &self.device,
+                        "LTX training geometry",
+                    ),
                 )?;
-                if let Some(cache) = &self.training_rope {
-                    let mut cache = candle_gen::lock_recover(cache);
-                    if !cache.iter().any(|entry| {
-                        entry.positions.matches(positions)
-                            && entry.dim == dim
-                            && entry.heads == heads
-                            && entry.max_pos == max_pos
-                    }) {
-                        cache.push(TrainingRopeTable {
-                            positions: TensorIdentity::new(positions),
-                            dim,
-                            heads,
-                            max_pos,
-                            cos,
-                            sin,
-                        });
-                    }
-                }
             }
         }
         Ok(())
@@ -1307,7 +1402,8 @@ impl AvDiT {
         let cache = self.training_rope.as_ref().map(candle_gen::lock_recover);
         if let Some(cache) = &cache {
             if let Some(entry) = cache.iter().find(|entry| {
-                entry.positions.matches(positions)
+                !positions.track_op()
+                    && entry.positions.matches(positions)
                     && entry.dim == dim
                     && entry.heads == heads
                     && entry.max_pos == max_pos

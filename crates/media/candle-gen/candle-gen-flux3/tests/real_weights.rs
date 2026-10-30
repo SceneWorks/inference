@@ -448,10 +448,11 @@ fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, root: &std::path::Pat
 #[cfg(feature = "model-inference-proof")]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn flux3_bounded_acceleration_acceptance() {
-    use candle_gen::gen_core::flux3::{training::options::OPTIONS_KEY, BASE_MODEL_ID};
+    use candle_gen::gen_core::flux3::BASE_MODEL_ID;
     use candle_gen::gen_core::{
         AdapterKind, AdapterSpec, TrainingConfig, TrainingItem, TrainingRequest,
     };
+    use gen_core_flux3::training::options::OPTIONS_KEY;
     let root = bounded_root();
     let base = env_dir("FLUX3_BASE_PACKAGE_DIR");
     let input = root.join("input.png");
