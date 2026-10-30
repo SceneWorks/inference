@@ -697,7 +697,11 @@ fn require_stored(method: zip::CompressionMethod, who: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_entry(zip: &mut zip::ZipArchive<std::fs::File>, name: &str, who: &str) -> Result<Vec<u8>> {
+fn read_entry(
+    zip: &mut zip::ZipArchive<load_progress::reader::ProgressReader<std::fs::File>>,
+    name: &str,
+    who: &str,
+) -> Result<Vec<u8>> {
     let mut entry = zip
         .by_name(name)
         .map_err(|e| Error::Msg(format!("read {name} for {who}: {e}")))?;
@@ -730,9 +734,10 @@ pub fn state_dict_entries(root: &PthValue) -> Result<Vec<(String, PthTensorSpec)
 /// An opened `torch.save` archive: the parsed object graph plus lazy access to storage blobs.
 pub struct PthArchive {
     path: PathBuf,
-    zip: zip::ZipArchive<std::fs::File>,
+    zip: zip::ZipArchive<load_progress::reader::ProgressReader<std::fs::File>>,
     prefix: String,
     root: PthValue,
+    progress: load_progress::reader::SourceProgress,
 }
 
 impl PthArchive {
@@ -741,6 +746,10 @@ impl PthArchive {
         let path = path.as_ref().to_path_buf();
         let file = std::fs::File::open(&path)
             .map_err(|e| Error::Msg(format!("open {}: {e}", path.display())))?;
+        let progress =
+            load_progress::reader::SourceProgress::new(&path, Some(file.metadata()?.len()));
+        let _operation = progress.operation();
+        let file = progress.reader(file)?;
         let mut zip = zip::ZipArchive::new(file)
             .map_err(|e| Error::Msg(format!("read zip {}: {e}", path.display())))?;
         let names: Vec<String> = zip
@@ -761,6 +770,7 @@ impl PthArchive {
             zip,
             prefix,
             root,
+            progress,
         })
     }
 
@@ -775,6 +785,7 @@ impl PthArchive {
     }
 
     fn read_blob(&mut self, key: &str, who: &str) -> Result<Vec<u8>> {
+        let _operation = self.progress.operation();
         let name = format!("{}data/{key}", self.prefix);
         read_entry(&mut self.zip, &name, who)
     }
@@ -1168,5 +1179,40 @@ mod tests {
         assert_eq!(seen.len(), 7, "{seen:?}");
         assert!(seen.contains(&("1.num_batches_tracked".into(), PthDtype::I64, vec![])));
         assert!(seen.contains(&("0.weight".into(), PthDtype::F32, vec![2, 4, 3, 3])));
+    }
+    #[test]
+    fn lazy_archive_reads_keep_request_and_never_double_count_source() {
+        use gen_core::LoadActivityObserver;
+        use std::sync::{Arc, Mutex};
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../gen-core/tests/fixtures/latent_perceptual/tiny_bn_state_dict.pth");
+        let total = std::fs::metadata(&path).unwrap().len();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let mut archive = {
+            let _observer = LoadActivityObserver::new(move |v| output.lock().unwrap().push(v));
+            PthArchive::open(&path).unwrap()
+        };
+        assert_eq!(events.lock().unwrap().last(), Some(&None));
+        let _other = LoadActivityObserver::new(|_| panic!("wrong archive request"));
+        let spec = archive.root().flatten_tensors().first().unwrap().1.clone();
+        archive.read_tensor("test", &spec).unwrap();
+        let first = events
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .last()
+            .unwrap()
+            .bytes_read;
+        archive.read_tensor("test", &spec).unwrap();
+        let events = events.lock().unwrap();
+        assert!(first > 0 && first <= total);
+        assert_eq!(events.iter().flatten().last().unwrap().bytes_read, first);
+        assert!(events
+            .iter()
+            .flatten()
+            .all(|v| v.bytes_read <= total && v.total_bytes == Some(total)));
+        assert_eq!(events.last(), Some(&None));
     }
 }

@@ -334,6 +334,12 @@ pub const SD_VAE: ComponentPin = ComponentPin {
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| Error::Msg(format!("supra2: open {}: {e}", path.display())))?;
+    let activity = gen_core::LoadActivityScope::file(
+        gen_core::LoadActivityPhase::Verifying,
+        path,
+        Some(file.metadata()?.len()),
+    );
+    let mut bytes_read = 0u64;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
@@ -342,6 +348,8 @@ pub fn sha256_file(path: &Path) -> Result<String> {
             break;
         }
         hasher.update(&buf[..n]);
+        bytes_read += n as u64;
+        activity.update(bytes_read);
     }
     Ok(format!("{:x}", hasher.finalize()))
 }

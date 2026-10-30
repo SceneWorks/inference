@@ -672,7 +672,20 @@ pub fn read_pth_tensor_info<P: AsRef<std::path::Path>>(
     verbose: bool,
     key: Option<&str>,
 ) -> Result<Vec<TensorInfo>> {
-    let file = std::fs::File::open(file)?;
+    let path = file.as_ref();
+    let total = std::fs::metadata(path)?.len();
+    let progress = load_progress::reader::SourceProgress::new(path, Some(total));
+    read_pth_tensor_info_with_progress(path, verbose, key, &progress)
+}
+
+fn read_pth_tensor_info_with_progress(
+    path: &std::path::Path,
+    verbose: bool,
+    key: Option<&str>,
+    progress: &load_progress::reader::SourceProgress,
+) -> Result<Vec<TensorInfo>> {
+    let _operation = progress.operation();
+    let file = progress.reader(std::fs::File::open(path)?)?;
     let zip_reader = std::io::BufReader::new(file);
     let mut zip = zip::ZipArchive::new(zip_reader)?;
     let zip_file_names = zip
@@ -743,19 +756,27 @@ pub fn read_pth_tensor_info<P: AsRef<std::path::Path>>(
 pub struct PthTensors {
     tensor_infos: HashMap<String, TensorInfo>,
     path: std::path::PathBuf,
+    progress: load_progress::reader::SourceProgress,
     // We do not store a zip reader as it needs mutable access to extract data. Instead we
     // re-create a zip reader for each tensor.
 }
 
 impl PthTensors {
     pub fn new<P: AsRef<std::path::Path>>(path: P, key: Option<&str>) -> Result<Self> {
-        let tensor_infos = read_pth_tensor_info(path.as_ref(), false, key)?;
+        let total = std::fs::metadata(path.as_ref())?.len();
+        let progress = load_progress::reader::SourceProgress::new(path.as_ref(), Some(total));
+        let tensor_infos =
+            read_pth_tensor_info_with_progress(path.as_ref(), false, key, &progress)?;
         let tensor_infos = tensor_infos
             .into_iter()
             .map(|ti| (ti.name.to_string(), ti))
             .collect();
         let path = path.as_ref().to_owned();
-        Ok(Self { tensor_infos, path })
+        Ok(Self {
+            tensor_infos,
+            path,
+            progress,
+        })
     }
 
     pub fn tensor_infos(&self) -> &HashMap<String, TensorInfo> {
@@ -769,7 +790,9 @@ impl PthTensors {
             Some(tensor_info) => tensor_info,
         };
         // We hope that the file has not changed since first reading it.
-        let zip_reader = std::io::BufReader::new(std::fs::File::open(&self.path)?);
+        let _operation = self.progress.operation();
+        let zip_reader =
+            std::io::BufReader::new(self.progress.reader(std::fs::File::open(&self.path)?)?);
         let mut zip = zip::ZipArchive::new(zip_reader)?;
         let mut reader = zip.by_name(&tensor_info.path)?;
         let is_fortran_contiguous = tensor_info.layout.is_fortran_contiguous();
@@ -871,4 +894,40 @@ pub fn read_all_with_key<P: AsRef<std::path::Path>>(
 /// * `path` - Path to the pth file.
 pub fn read_all<P: AsRef<std::path::Path>>(path: P) -> Result<Vec<(String, Tensor)>> {
     read_all_with_key(path, None)
+}
+
+#[cfg(test)]
+mod load_progress_tests {
+    use super::*;
+    use load_progress::LoadActivityObserver;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn pth_lazy_load_retains_request_and_deduplicates_ranges() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fortran_tensor_3d.pth");
+        let archive = {
+            let _observer = LoadActivityObserver::new(move |v| output.lock().unwrap().push(v));
+            PthTensors::new(&path, None).unwrap()
+        };
+        let _other = LoadActivityObserver::new(|_| panic!("lazy PTH changed request"));
+        let name = archive.tensor_infos().keys().next().unwrap();
+        archive.get(name).unwrap().unwrap();
+        let first = events
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .last()
+            .unwrap()
+            .bytes_read;
+        archive.get(name).unwrap().unwrap();
+        let events = events.lock().unwrap();
+        let last = events.iter().flatten().last().unwrap();
+        assert_eq!(last.bytes_read, first);
+        assert!(last.bytes_read <= last.total_bytes.unwrap());
+        assert_eq!(events.last(), Some(&None));
+    }
 }

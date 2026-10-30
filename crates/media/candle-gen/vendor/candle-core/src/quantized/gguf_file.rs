@@ -5,7 +5,9 @@
 use super::{GgmlDType, QTensor};
 use crate::{Context, Device, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use load_progress::reader::SourceProgress;
 use std::collections::HashMap;
+use std::io::Seek;
 
 pub const DEFAULT_ALIGNMENT: u64 = 32;
 
@@ -87,6 +89,7 @@ pub struct Content {
     pub metadata: HashMap<String, Value>,
     pub tensor_infos: HashMap<String, TensorInfo>,
     pub tensor_data_offset: u64,
+    progress: SourceProgress,
 }
 
 fn read_string<R: std::io::Read>(reader: &mut R, magic: &VersionedMagic) -> Result<String> {
@@ -394,6 +397,21 @@ impl ValueType {
 
 impl Content {
     pub fn read<R: std::io::Seek + std::io::Read>(reader: &mut R) -> Result<Self> {
+        Self::read_with_path(reader, "<unknown GGUF source>")
+    }
+
+    /// Parse a source with its file identity, retaining the originating request for lazy tensors.
+    pub fn read_with_path<R: std::io::Seek + std::io::Read>(
+        reader: &mut R,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
+        let position = reader.stream_position()?;
+        let total = reader.seek(std::io::SeekFrom::End(0))?;
+        reader.seek(std::io::SeekFrom::Start(position))?;
+        let progress = SourceProgress::new(path, Some(total));
+        let _operation = progress.operation();
+        let mut tracked = progress.reader(reader)?;
+        let reader = &mut tracked;
         let magic = VersionedMagic::read(reader)?;
 
         let tensor_count = match magic {
@@ -464,6 +482,7 @@ impl Content {
             metadata,
             tensor_infos,
             tensor_data_offset,
+            progress,
         })
     }
 
@@ -477,7 +496,9 @@ impl Content {
             Some(tensor_info) => tensor_info,
             None => crate::bail!("cannot find tensor info for {name}"),
         };
-        tensor_info.read(reader, self.tensor_data_offset, device)
+        let _operation = self.progress.operation();
+        let mut tracked = self.progress.reader(reader)?;
+        tensor_info.read(&mut tracked, self.tensor_data_offset, device)
     }
 }
 
@@ -536,4 +557,65 @@ pub fn write<W: std::io::Seek + std::io::Write>(
         w.write_all(&vec![0u8; padding])?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod load_progress_tests {
+    use super::*;
+    use load_progress::LoadActivityObserver;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn lazy_tensor_reads_report_unique_ranges_to_originating_request() {
+        // A raw F32 container. Parsing/loading bytes performs no model or learned computation.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x4655_4747u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.push(b'w');
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let header_len = bytes.len() as u64;
+        bytes.resize(64, 0); // Alignment padding is not read and must not be charged.
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let mut reader = std::io::Cursor::new(bytes);
+        let content = {
+            let _observer = LoadActivityObserver::new(move |v| output.lock().unwrap().push(v));
+            Content::read_with_path(&mut reader, "transformer/test.gguf").unwrap()
+        };
+        assert_eq!(events.lock().unwrap().last(), Some(&None));
+        let _other = LoadActivityObserver::new(|_| panic!("lazy read changed request"));
+        for _ in 0..2 {
+            content.tensor(&mut reader, "w", &Device::Cpu).unwrap();
+            assert_eq!(events.lock().unwrap().last(), Some(&None));
+        }
+        let events = events.lock().unwrap();
+        let last = events.iter().flatten().last().unwrap();
+        assert_eq!(last.bytes_read, header_len + 4);
+        assert_eq!(last.total_bytes, Some(68));
+        assert_eq!(last.component, "transformer");
+    }
+
+    #[test]
+    fn malformed_header_clears_loading() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let _observer = LoadActivityObserver::new(move |v| output.lock().unwrap().push(v));
+        assert!(
+            Content::read_with_path(&mut std::io::Cursor::new(vec![0; 3]), "bad.gguf").is_err()
+        );
+        assert_eq!(events.lock().unwrap().last(), Some(&None));
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .any(|v| v.bytes_read == 3));
+    }
 }

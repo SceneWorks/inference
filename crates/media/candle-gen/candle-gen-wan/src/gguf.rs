@@ -561,11 +561,12 @@ impl GgufDit {
             path: path.display().to_string(),
             defect: format!("open: {e}"),
         })?;
-        let content =
-            gguf_file::Content::read(&mut file).map_err(|e| GgufPlanError::Container {
+        let content = gguf_file::Content::read_with_path(&mut file, path).map_err(|e| {
+            GgufPlanError::Container {
                 path: path.display().to_string(),
                 defect: format!("parse: {e}"),
-            })?;
+            }
+        })?;
         let GgufDitPlan { plan, .. } = compile_gguf_dit_plan(path, &content, mapping, codecs)?;
 
         let mut tensors: HashMap<String, Arc<QTensor>> = HashMap::with_capacity(plan.tensors.len());
@@ -1398,7 +1399,7 @@ mod tests {
         tensors.insert("blocks.0.self_attn.q.weight".into(), qt);
         let path = write_gguf(&tmp, &tensors, "q4k-golden");
         let mut file = std::fs::File::open(&path).unwrap();
-        let content = gguf_file::Content::read(&mut file).unwrap();
+        let content = gguf_file::Content::read_with_path(&mut file, path).unwrap();
         assert_eq!(
             content.tensor_infos["blocks.0.self_attn.q.weight"].ggml_dtype,
             GgmlDType::Q4K

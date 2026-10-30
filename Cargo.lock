@@ -1254,6 +1254,7 @@ dependencies = [
  "core-llm",
  "core-llm-testkit",
  "half",
+ "sceneworks-load-progress",
  "serde_json",
  "sha2",
  "tempfile",
@@ -3239,6 +3240,7 @@ dependencies = [
  "memmap2",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
+ "sceneworks-load-progress",
  "serde",
  "serde_json",
  "sha2",
@@ -3975,6 +3977,7 @@ version = "0.1.0"
 dependencies = [
  "safetensors 0.4.5",
  "sceneworks-gen-core",
+ "sceneworks-load-progress",
  "serde",
  "serde_json",
  "sha2",
