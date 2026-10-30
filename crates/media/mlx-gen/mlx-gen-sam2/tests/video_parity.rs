@@ -14,6 +14,7 @@
 //!   PYTHONPATH=/tmp/sam2-mlx/src ~/mlx-flux-venv/bin/python tools/dump_sam2_video_golden.py --size large
 //!   cargo test -p mlx-gen-sam2 --release --test integration video_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::{cosine_f64_sums, iou_bool, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_sam2::{Sam2ModelSize, Sam2VideoPredictor};
 use mlx_rs::{Array, Dtype};
@@ -53,36 +54,6 @@ fn flat(a: &Array) -> Vec<f32> {
         .to_vec()
 }
 
-/// Cosine similarity of two flat logit maps.
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (&x, &y) in a.iter().zip(b) {
-        dot += x as f64 * y as f64;
-        na += (x as f64).powi(2);
-        nb += (y as f64).powi(2);
-    }
-    (dot / (na.sqrt() * nb.sqrt())) as f32
-}
-
-/// IoU of the thresholded (`> 0`) binary masks — the metric that actually matters for a track.
-fn iou(a: &[f32], b: &[f32]) -> f32 {
-    let (mut inter, mut union) = (0u64, 0u64);
-    for (&x, &y) in a.iter().zip(b) {
-        let (xa, yb) = (x > 0.0, y > 0.0);
-        if xa && yb {
-            inter += 1;
-        }
-        if xa || yb {
-            union += 1;
-        }
-    }
-    if union == 0 {
-        1.0
-    } else {
-        inter as f32 / union as f32
-    }
-}
-
 #[test]
 #[ignore = "needs local golden from tools/dump_sam2_video_golden.py --size large"]
 fn video_propagation_matches_mlx_reference_large() {
@@ -117,8 +88,11 @@ fn video_propagation_matches_mlx_reference_large() {
             .reshape(&[256 * 256])
             .unwrap();
         let want_v = flat(&ref_frame);
-        let c = cosine(&got, &want_v);
-        let i = iou(&got, &want_v);
+        let c = cosine_f64_sums(&got, &want_v, Denom::Exact) as f32;
+        let i = iou_bool(
+            got.iter().map(|&x| x > 0.0),
+            want_v.iter().map(|&y| y > 0.0),
+        );
         println!("frame {frame_idx}: cosine {c:.6} IoU {i:.6}");
         worst_cos = worst_cos.min(c);
         worst_iou = worst_iou.min(i);
@@ -174,8 +148,11 @@ fn video_reverse_propagation_matches_mlx_reference_large() {
             .reshape(&[256 * 256])
             .unwrap();
         let want_v = flat(&ref_frame);
-        let c = cosine(&got, &want_v);
-        let i = iou(&got, &want_v);
+        let c = cosine_f64_sums(&got, &want_v, Denom::Exact) as f32;
+        let i = iou_bool(
+            got.iter().map(|&x| x > 0.0),
+            want_v.iter().map(|&y| y > 0.0),
+        );
         println!("frame {frame_idx}: cosine {c:.6} IoU {i:.6}");
         worst_cos = worst_cos.min(c);
         worst_iou = worst_iou.min(i);

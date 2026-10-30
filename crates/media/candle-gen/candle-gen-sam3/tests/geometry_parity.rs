@@ -17,8 +17,9 @@
 
 use std::path::Path;
 
-use crate::support::{cosine, iou, max_abs_diff};
+use crate::support::max_abs_diff;
 use candle_gen::default_device;
+use candle_gen::testkit::{tensor_cosine_device_sums, tensor_iou, Denom};
 use candle_gen_sam3::{Sam3GeometryConfig, Sam3GeometryEncoder, Sam3ImageSegmenter, Weights};
 
 fn load_weights(path: &str, device: &candle_gen::candle_core::Device) -> Weights {
@@ -86,7 +87,7 @@ fn geometry_encoder_matches_oracle() {
         .expect("geometry forward");
 
     let want = fx.require("geo_output").unwrap();
-    let cos = cosine(&out, &want);
+    let cos = tensor_cosine_device_sums(&out, &want, Denom::Exact);
     let maxabs = max_abs_diff(&out, &want);
     println!(
         "geometry prompt tokens: cosine={cos:.7} max_abs={maxabs:.5} shape={:?}",
@@ -146,7 +147,7 @@ fn pvs_box_prompt_matches_oracle() {
             .unwrap()
             .reshape((288, 288))
             .unwrap();
-        let m = iou(&inst.mask, &want);
+        let m = tensor_iou(&inst.mask, &want);
         worst_iou = worst_iou.min(m);
         println!("  instance {i}: score={:.3} mask IoU={:.4}", inst.score, m);
     }

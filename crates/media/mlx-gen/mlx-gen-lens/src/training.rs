@@ -1250,6 +1250,7 @@ fn encode_buckets(
 #[cfg(test)]
 mod first_step_repro {
     use super::*;
+    use mlx_gen::testing::{cosine_device_sums_f32, Denom};
     use mlx_gen::train::lora::build_lora_targets;
     use mlx_rs::memory::{clear_cache, get_active_memory, get_peak_memory, reset_peak_memory};
     use mlx_rs::random;
@@ -1663,28 +1664,6 @@ mod first_step_repro {
         println!("MODEL_INFERENCE_BODY_COMPLETED training::first_step_repro::bf16_peak_below_f32_no_silent_repromotion");
     }
 
-    /// Flattened cosine over all elements (f32).
-    fn forward_cosine(a: &Array, b: &Array) -> f32 {
-        let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
-        let b = b.as_dtype(Dtype::Float32).unwrap().reshape(&[-1]).unwrap();
-        let dot = a.multiply(&b).unwrap().sum(None).unwrap().item::<f32>();
-        let na = a
-            .multiply(&a)
-            .unwrap()
-            .sum(None)
-            .unwrap()
-            .item::<f32>()
-            .sqrt();
-        let nb = b
-            .multiply(&b)
-            .unwrap()
-            .sum(None)
-            .unwrap()
-            .item::<f32>()
-            .sqrt();
-        dot / (na * nb)
-    }
-
     /// sc-5188 — bf16 inference FIDELITY (the inference-side complement to the memory guard, and the
     /// guard the bf16 path never had — which is exactly why the re-promotion hid). With the fix the
     /// bf16 DiT forward genuinely runs bf16 (fed bf16 inputs, as the pipeline does); this asserts that
@@ -1717,7 +1696,7 @@ mod first_step_repro {
             dit.forward(&x0_b, &feats_b, Some(&mask), &timestep, 1, latent, latent)
                 .unwrap()
         };
-        let cos = forward_cosine(&out_f32, &out_bf16);
+        let cos = cosine_device_sums_f32(&out_f32, &out_bf16, Denom::Exact);
         eprintln!("[sc-5188] bf16-vs-f32 DiT forward cosine {cos:.6}");
         assert!(
             cos > 0.99,

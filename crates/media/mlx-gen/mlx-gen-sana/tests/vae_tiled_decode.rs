@@ -14,6 +14,7 @@
 //! Weights-free and unit-scale: deterministic synthetic tensors, a narrow channel width, and a
 //! latent a few cells across.
 
+use mlx_gen::testing::max_abs_diff_host;
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
 use mlx_gen::CancelFlag;
@@ -208,14 +209,6 @@ fn latent(h: i32, w_: i32) -> Array {
     Array::from_slice(&data, &[1, c, h, w_])
 }
 
-fn max_abs(a: &Array, b: &Array) -> f32 {
-    a.as_slice::<f32>()
-        .iter()
-        .zip(b.as_slice::<f32>())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f32, f32::max)
-}
-
 /// Mean absolute error relative to the reference's own scale — the seam-tolerant measure the Wan
 /// tiling gate uses, since a max-abs on random weights is dominated by a handful of edge pixels.
 fn mean_rel(got: &Array, want: &Array) -> f64 {
@@ -260,7 +253,7 @@ fn dcae_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
     })
     .unwrap();
     assert_eq!(
-        max_abs(&bounded, &lazy),
+        max_abs_diff_host(&bounded, &lazy),
         0.0,
         "barriers preserve DC-AE arithmetic"
     );
@@ -274,7 +267,7 @@ fn dcae_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
         })
         .unwrap();
     assert_eq!(
-        max_abs(&bounded_encoder, &lazy_encoder),
+        max_abs_diff_host(&bounded_encoder, &lazy_encoder),
         0.0,
         "img2img encoder barriers preserve arithmetic"
     );
@@ -428,7 +421,7 @@ fn head_then_tail_is_exactly_the_dense_decode() {
     dense.eval().unwrap();
     composed.eval().unwrap();
     assert_eq!(composed.shape(), dense.shape());
-    assert_eq!(max_abs(&dense, &composed), 0.0);
+    assert_eq!(max_abs_diff_host(&dense, &composed), 0.0);
 
     #[cfg(target_os = "macos")]
     crate::common::quantum_metal_guard::record_model_inference_device();
@@ -484,7 +477,7 @@ fn per_crop_whole_decoder_attention_is_observably_wrong() {
     dense.eval().unwrap();
     per_crop.eval().unwrap();
     assert_eq!(per_crop.shape(), dense.shape());
-    let delta = max_abs(&dense, &per_crop);
+    let delta = max_abs_diff_host(&dense, &per_crop);
     assert!(
         delta > 1e-2,
         "per-crop whole-decoder attention must be observably different from the dense decode: \

@@ -17,6 +17,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::{cosine_host_f64, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::Image;
 use mlx_gen_kolors::ip_adapter::load_kolors_ip_adapter;
@@ -59,22 +60,6 @@ fn rel(a: &Array, b: &Array) -> (f32, f32) {
     (max_d / peak, mean_d / mabs)
 }
 
-/// Cosine similarity (the meaningful fidelity metric for a conditioning tensor — robust to the
-/// element-wise cross-backend f32 noise that inflates peak-rel on a deep transformer).
-fn cosine(a: &Array, b: &Array) -> f64 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap().as_dtype(Dtype::Float32).unwrap();
-    let b = b.reshape(&[n]).unwrap().as_dtype(Dtype::Float32).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (&x, &y) in a.iter().zip(b) {
-        dot += x as f64 * y as f64;
-        na += (x as f64) * (x as f64);
-        nb += (y as f64) * (y as f64);
-    }
-    dot / (na.sqrt() * nb.sqrt()).max(1e-30)
-}
-
 fn golden_image(g: &Weights) -> Image {
     let gi = g.require("image").unwrap();
     let sh = gi.shape();
@@ -113,7 +98,11 @@ fn kolors_ip_components_match_reference() {
     let encoder = ClipVisionEncoder::from_weights(&enc_w, &VisionConfig::vit_l_14_336()).unwrap();
     let penult = encoder.penultimate(g.require("pixels").unwrap()).unwrap();
     let (ep, em) = rel(&penult, g.require("penultimate").unwrap());
-    let ec = cosine(&penult, g.require("penultimate").unwrap());
+    let ec = cosine_host_f64(
+        &penult,
+        g.require("penultimate").unwrap(),
+        Denom::FloorAt(1e-30),
+    );
     println!("encoder penultimate: peak_rel={ep:.3e} mean_rel={em:.3e} cosine={ec:.6}");
     // The penultimate is layer 23 of a 24-layer ViT — the torch-CPU-vs-MLX-Metal f32 noise
     // accumulates over the depth to ~1.7e-2 *peak* (a single worst element), but the tensor is

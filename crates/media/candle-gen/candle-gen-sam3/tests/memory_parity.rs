@@ -7,9 +7,9 @@
 
 use std::path::Path;
 
-use crate::support::cosine;
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::default_device;
+use candle_gen::testkit::{tensor_cosine_device_sums, Denom};
 use candle_gen_sam3::{Sam3Tracker, Weights};
 
 fn scalar(t: &Tensor) -> f32 {
@@ -55,7 +55,7 @@ fn memory_encoder_matches_oracle() {
             .unwrap(); // [1,1152,1152,1]
         let want = to_nhwc(&fx.require(key).unwrap());
         assert_eq!(got.dims(), want.dims(), "{key} shape");
-        let c = cosine(&got, &want);
+        let c = tensor_cosine_device_sums(&got, &want, Denom::Exact);
         println!("{key}: cosine={c:.7}");
         assert!(c > 0.9999, "{key} cosine {c}");
     }
@@ -68,8 +68,8 @@ fn memory_encoder_matches_oracle() {
     let want_pos = to_nhwc(&fx.require("maskmem_pos_enc").unwrap());
     assert_eq!(out.features.dims(), want_feat.dims(), "features shape");
     assert_eq!(out.pos.dims(), want_pos.dims(), "pos shape");
-    let cf = cosine(&out.features, &want_feat);
-    let cp = cosine(&out.pos, &want_pos);
+    let cf = tensor_cosine_device_sums(&out.features, &want_feat, Denom::Exact);
+    let cp = tensor_cosine_device_sums(&out.pos, &want_pos, Denom::Exact);
     println!("maskmem_features: cosine={cf:.7}\nmaskmem_pos_enc: cosine={cp:.7}");
     assert!(cf > 0.999, "features cosine {cf}");
     assert!(cp > 0.99999, "pos_enc cosine {cp}");
@@ -86,7 +86,7 @@ fn memory_encoder_matches_oracle() {
     let out_occ = tracker
         .encode_new_memory(&pix_feat, &pred_high_res, -1.0, false)
         .expect("encode_new_memory occluded");
-    let co = cosine(&out_occ.features, &expected_occ);
+    let co = tensor_cosine_device_sums(&out_occ.features, &expected_occ, Denom::Exact);
     println!("occlusion-add: cosine={co:.7}");
     assert!(co > 0.999, "occlusion-add cosine {co}");
 

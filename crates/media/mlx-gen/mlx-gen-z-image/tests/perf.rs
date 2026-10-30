@@ -27,6 +27,7 @@ use mlx_rs::{random, Array, Dtype};
 
 use crate::common;
 use common::snapshot_opt as snapshot;
+use mlx_gen::testing::max_abs_diff_f32;
 
 /// The Fun-Controlnet-Union checkpoint: env `CONTROL_WEIGHTS`, else the first `.safetensors` in the
 /// HF cache. `None` ⇒ the control test skips.
@@ -52,13 +53,6 @@ fn median(mut xs: Vec<f64>) -> f64 {
     xs[xs.len() / 2]
 }
 
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(&a, &b).unwrap()).unwrap();
-    mlx_rs::ops::max(&d, None).unwrap().item::<f32>()
-}
-
 /// Warm A/B + real-weight bit-exact check for one forward closure. Returns the eager output dtype.
 fn ab<F: Fn() -> Array>(label: &str, run: F) -> Dtype {
     set_compile_glue(false);
@@ -68,7 +62,7 @@ fn ab<F: Fn() -> Array>(label: &str, run: F) -> Dtype {
     set_compile_glue(false);
     assert_eq!(comp0.shape(), eager0.shape(), "{label} v shape");
     assert_eq!(comp0.dtype(), eager0.dtype(), "{label} dtype preserved");
-    let max_diff = max_abs_diff(&comp0, &eager0);
+    let max_diff = max_abs_diff_f32(&comp0, &eager0);
 
     let warmup = 2usize;
     let iters = 6usize;

@@ -9,9 +9,7 @@
 //!
 //! Run: `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test integration vae_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{abs, max as max_op, subtract};
-use mlx_rs::Array;
-
+use mlx_gen::testing::peak_rel_native;
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::config::LtxVaeConfig;
 use mlx_gen_ltx::tiling::{TilingConfig, VaeTiling};
@@ -36,13 +34,6 @@ fn base_dir() -> std::path::PathBuf {
         .join("Library/Application Support/SceneWorks/data/models/mlx/ltx_2_3_base_q8")
 }
 
-/// `max|Δ| / max|ref|`.
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(got, want).unwrap()).unwrap();
-    let denom = max_op(abs(want).unwrap(), None).unwrap().item::<f32>();
-    max_op(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
-}
-
 fn build() -> (LtxVideoVae, Weights) {
     let dir = base_dir();
     let cfg = LtxVaeConfig::from_model_dir(&dir).expect("embedded_config.json vae block");
@@ -61,7 +52,7 @@ fn decode_matches_reference() {
     let want = g.require("dec_out").unwrap();
     let got = vae.decode(dec_in).expect("decode");
     assert_eq!(got.shape(), want.shape(), "decode output shape");
-    let pr = peak_rel(&got, want);
+    let pr = peak_rel_native(&got, want, Some(1e-12));
     eprintln!("decode peak_rel = {pr:.3e} shape={:?}", got.shape());
     assert!(pr < 5e-3, "decode peak_rel {pr:.3e} too high");
     crate::model_inference_device::record_model_inference_device();
@@ -76,7 +67,7 @@ fn encode_matches_reference() {
     let want = g.require("enc_out").unwrap();
     let got = vae.encode(enc_in).expect("encode");
     assert_eq!(got.shape(), want.shape(), "encode output shape");
-    let pr = peak_rel(&got, want);
+    let pr = peak_rel_native(&got, want, Some(1e-12));
     eprintln!("encode peak_rel = {pr:.3e} shape={:?}", got.shape());
     assert!(pr < 5e-3, "encode peak_rel {pr:.3e} too high");
     crate::model_inference_device::record_model_inference_device();
@@ -108,7 +99,7 @@ fn lazy_encoder_matches_eager() {
     let got_eager = eager.encode(enc_in).expect("eager encode");
     let got_lazy = lazy.encode(enc_in).expect("lazy encode");
     assert_eq!(got_lazy.shape(), got_eager.shape(), "lazy vs eager shape");
-    let pr = peak_rel(&got_lazy, &got_eager);
+    let pr = peak_rel_native(&got_lazy, &got_eager, Some(1e-12));
     eprintln!("lazy-vs-eager encode peak_rel = {pr:.3e}");
     assert_eq!(
         pr, 0.0,
@@ -124,7 +115,7 @@ fn lazy_encoder_matches_eager() {
     );
     let got_reloaded = lazy.encode(enc_in).expect("reloaded lazy encode");
     assert_eq!(
-        peak_rel(&got_reloaded, &got_eager),
+        peak_rel_native(&got_reloaded, &got_eager, Some(1e-12)),
         0.0,
         "a later conditioned request reconstructs the exact encoder"
     );
@@ -152,7 +143,7 @@ fn decode_tiled_matches_reference() {
         .decode_tiled(sp_in, &sp_cfg, &Default::default())
         .expect("decode_tiled spatial");
     assert_eq!(sp_got.shape(), sp_want.shape(), "spatial tiled shape");
-    let sp_pr = peak_rel(&sp_got, sp_want);
+    let sp_pr = peak_rel_native(&sp_got, sp_want, Some(1e-12));
     eprintln!(
         "decode_tiled spatial peak_rel = {sp_pr:.3e} shape={:?}",
         sp_got.shape()
@@ -171,7 +162,7 @@ fn decode_tiled_matches_reference() {
         .decode_tiled(tp_in, &tp_cfg, &Default::default())
         .expect("decode_tiled temporal");
     assert_eq!(tp_got.shape(), tp_want.shape(), "temporal tiled shape");
-    let tp_pr = peak_rel(&tp_got, tp_want);
+    let tp_pr = peak_rel_native(&tp_got, tp_want, Some(1e-12));
     eprintln!(
         "decode_tiled temporal peak_rel = {tp_pr:.3e} shape={:?}",
         tp_got.shape()

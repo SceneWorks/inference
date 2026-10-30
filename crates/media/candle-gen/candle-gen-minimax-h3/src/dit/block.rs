@@ -771,7 +771,7 @@ mod tests {
         let got = packed.forward(&temb).expect("packed modulation");
         let want = dense.forward(&temb).expect("dense modulation");
         for (i, (g, w)) in got.tables().zip(want.tables()).enumerate() {
-            let drift = crate::quant::testkit::rel_max_abs(g, w);
+            let drift = candle_gen::testkit::tensor_peak_rel_or_abs(g, w);
             println!("[adaln] table {i} packed-vs-dense rel-max-abs = {drift:.3e}");
             assert!(
                 drift < 5e-3,

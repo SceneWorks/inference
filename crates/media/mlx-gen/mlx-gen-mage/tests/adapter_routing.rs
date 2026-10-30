@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableHost;
+use mlx_gen::testing::max_abs_diff_f32;
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterKind, AdapterSpec};
 use mlx_gen_mage::config::MageFlowConfig;
@@ -106,19 +107,6 @@ fn probe(t: &MageTransformer, cfg: &MageFlowConfig) -> Array {
     .unwrap();
     let sigma = Array::from_slice(&[0.5f32], &[1]);
     t.forward(&img, &txt, &sigma, &ctx).unwrap()
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let n: i32 = a.shape().iter().product();
-    let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
-    a.subtract(&b)
-        .unwrap()
-        .abs()
-        .unwrap()
-        .max(None)
-        .unwrap()
-        .item::<f32>()
 }
 
 /// Write a diffusers/PEFT adapter targeting `paths`, sized off the fixture's own base weights so
@@ -243,7 +231,7 @@ fn the_dit_exposes_its_whole_linear_surface_to_community_adapters() {
     assert!(report.unmatched_paths.is_empty(), "{report:?}");
 
     let after = probe(&t, &cfg);
-    let delta = max_abs_diff(&before, &after);
+    let delta = max_abs_diff_f32(&before, &after);
     assert!(
         delta > 1e-4,
         "the reloaded head/timestep adapter must change the velocity (max_abs {delta})"

@@ -625,6 +625,7 @@ mod tests {
     use candle_gen::candle_core::Device;
     use candle_gen::candle_nn::{Linear, Module};
     use candle_gen::quant::MLX_GROUP_SIZE;
+    use candle_gen::testkit::tensor_cosine;
     use std::collections::HashMap;
 
     #[test]
@@ -686,18 +687,6 @@ mod tests {
         (wq, s, b, grid)
     }
 
-    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (x, y) in a.iter().zip(&b) {
-            dot += (*x as f64) * (*y as f64);
-            na += (*x as f64) * (*x as f64);
-            nb += (*y as f64) * (*y as f64);
-        }
-        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
-    }
-
     /// A packed DiT projection (`.scales` present) loads packed and its dequant-dense forward matches
     /// the affine grid bit-exact on CPU; a dense sibling (no `.scales`) stays dense. Group size 64
     /// (Anima's tier), the `AdaptLinear::detect` default. This is the pack → load → forward CPU validation.
@@ -737,10 +726,10 @@ mod tests {
             None,
         );
         let x = Tensor::randn(0f32, 1f32, (4usize, in_dim), &dev).unwrap();
-        let cos = cosine(
+        let cos = tensor_cosine(
             &packed.forward(&x).unwrap(),
             &__model_proof_output!(grid_lin.forward(&x)).unwrap(),
-        );
+        ) as f32;
         assert!(
             cos > 0.99999,
             "packed vs affine-grid cosine {cos:.6} (CPU dequant-dense)"

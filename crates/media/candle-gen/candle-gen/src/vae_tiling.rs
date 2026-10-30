@@ -541,6 +541,7 @@ where
 #[cfg(test)]
 mod global_group_norm_tests {
     use super::*;
+    use crate::testkit::tensor_max_abs_diff;
     use candle_core::Device;
     use candle_nn::Module;
 
@@ -560,19 +561,6 @@ mod global_group_norm_tests {
     fn ramp(n: usize, base: f32, step: f32) -> Tensor {
         let data = (0..n).map(|i| base + i as f32 * step).collect::<Vec<_>>();
         Tensor::from_vec(data, n, &Device::Cpu).unwrap()
-    }
-
-    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
-        (a - b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
     }
 
     /// Applied to the whole activation, the global-statistics normalize must reproduce candle's own
@@ -606,7 +594,7 @@ mod global_group_norm_tests {
         let global = GlobalGroupNorm::new(&x, &weight, &bias, groups, 1e-6).unwrap();
         let got = global.apply(&x).unwrap();
         assert_eq!(got.dims(), dense.dims());
-        let delta = max_abs(&got, &dense);
+        let delta = tensor_max_abs_diff(&got, &dense);
         assert!(
             delta == 0.0,
             "the whole-activation apply must BE candle's GroupNorm, not merely approximate it: \
@@ -649,12 +637,12 @@ mod global_group_norm_tests {
                 };
                 let bounded = GlobalGroupNorm::new(&x, &weight, &bias, groups, 1e-6).unwrap();
                 assert_eq!(
-                    max_abs(&bounded.mean, &reference.mean),
+                    tensor_max_abs_diff(&bounded.mean, &reference.mean),
                     0.0,
                     "mean {dtype:?}/{groups}"
                 );
                 assert_eq!(
-                    max_abs(&bounded.std, &reference.std),
+                    tensor_max_abs_diff(&bounded.std, &reference.std),
                     0.0,
                     "std {dtype:?}/{groups}"
                 );
@@ -667,7 +655,11 @@ mod global_group_norm_tests {
                         .unwrap()
                         .to_dtype(DType::F32)
                         .unwrap();
-                    assert_eq!(max_abs(&actual, &expected), 0.0, "apply {dtype:?}/{groups}");
+                    assert_eq!(
+                        tensor_max_abs_diff(&actual, &expected),
+                        0.0,
+                        "apply {dtype:?}/{groups}"
+                    );
                 }
             }
         }
@@ -719,7 +711,7 @@ mod global_group_norm_tests {
         )
         .unwrap();
         assert_eq!(tiled.dims(), dense.dims());
-        let delta = max_abs(&tiled, &dense);
+        let delta = tensor_max_abs_diff(&tiled, &dense);
         assert!(
             delta < 2e-5,
             "global-stat tiled layer diverged from dense GroupNorm+conv: max|delta|={delta:.3e}"
@@ -739,7 +731,7 @@ mod global_group_norm_tests {
         )
         .unwrap();
         assert!(
-            max_abs(&per_crop, &dense) > 1e-3,
+            tensor_max_abs_diff(&per_crop, &dense) > 1e-3,
             "per-crop normalization must be observably different from the dense layer"
         );
 

@@ -640,6 +640,7 @@ impl QEmbedding {
 mod tests {
     use super::*;
     use candle_gen::candle_core::{DType, Device};
+    use candle_gen::testkit::tensor_cosine;
 
     /// The Krea tier's MLX quant group size (64, read from `config.json` at load — pinned here as the
     /// hosted value so the fixtures exercise the real tier's grouping).
@@ -678,18 +679,6 @@ mod tests {
         (wq, s, b, grid)
     }
 
-    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (x, y) in a.iter().zip(&b) {
-            dot += (*x as f64) * (*y as f64);
-            na += (*x as f64) * (*x as f64);
-            nb += (*y as f64) * (*y as f64);
-        }
-        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
-    }
-
     /// A group-64 packed `QLinear` forward matches a dense linear built from the SAME affine grid the
     /// pack represents — bit-exact (the Q4 → Q4_1 repack is lossless, both forwards dequant-to-dense
     /// -matmul). Uses a `to_out.0`-style output-projection shape.
@@ -709,7 +698,7 @@ mod tests {
         assert!(!dense.is_packed());
 
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        let cos = cosine(&packed.forward(&x)?, &dense.forward(&x)?);
+        let cos = tensor_cosine(&packed.forward(&x)?, &dense.forward(&x)?) as f32;
         assert!(
             cos > 0.99999,
             "group-64 packed vs affine-grid cosine {cos:.6}"
@@ -927,7 +916,7 @@ mod tests {
         let lin_cpu = QLinear::convrot_int8(w_i8_cpu, pc.scale.clone(), G, None, &cpu)?;
         let y_ref = lin_cpu.forward(&x.to_device(&cpu)?)?.to_dtype(DType::F32)?;
 
-        let cos = cosine(&y_cuda, &y_ref);
+        let cos = tensor_cosine(&y_cuda, &y_ref) as f32;
         let num = (y_cuda.sub(&y_ref)?)
             .sqr()?
             .mean_all()?

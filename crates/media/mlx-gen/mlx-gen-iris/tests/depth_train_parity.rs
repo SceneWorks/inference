@@ -28,6 +28,7 @@ use mlx_gen_iris::train::optim::{IrisOptimizer, Params};
 use mlx_rs::{Array, Dtype};
 
 use crate::common::{fixture, fixtures, host_f32, on_cpu};
+use mlx_gen::testing::peak_rel_slices;
 
 fn golden_batch(g: &mlx_gen::weights::Weights) -> DepthBatch {
     let depth = host_f32(g.require("depth").unwrap());
@@ -68,15 +69,6 @@ fn golden_batch(g: &mlx_gen::weights::Weights) -> DepthBatch {
     }
 }
 
-fn peak_rel(got: &[f32], want: &[f32]) -> f32 {
-    let peak = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-12);
-    got.iter()
-        .zip(want)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0f32, f32::max)
-        / peak
-}
-
 fn setup() -> (DepthModel, Params) {
     let dir = fixtures().join("tiny-depth");
     let export = TaskExport::from_dir(&dir, IrisTask::Depth, "test").unwrap();
@@ -113,7 +105,11 @@ fn one_step_matches_the_torch_oracle_body() {
         let step = DepthStep::new(&batch, &loss_plan);
 
         let pred = model.predict(&params, &step.rgb).unwrap();
-        let rel = peak_rel(&host_f32(&pred), &host_f32(g.require("pred0").unwrap()));
+        let rel = peak_rel_slices(
+            &host_f32(&pred),
+            &host_f32(g.require("pred0").unwrap()),
+            Some(1e-12),
+        );
         eprintln!("pred0: {rel:.3e} of peak");
         assert!(rel <= 1e-4);
 
@@ -145,7 +141,7 @@ fn one_step_matches_the_torch_oracle_body() {
         let mut want_grads: HashMap<&str, Vec<f32>> = HashMap::new();
         for k in &selected {
             let want = host_f32(g.require(&format!("grad/{k}")).unwrap());
-            let rel = peak_rel(&host_f32(&grads[k.as_str()]), &want);
+            let rel = peak_rel_slices(&host_f32(&grads[k.as_str()]), &want, Some(1e-12));
             eprintln!("grad {k}: {rel:.3e} of peak");
             assert!(rel <= 1e-3, "{k}");
             want_grads.insert(k.as_str(), want);

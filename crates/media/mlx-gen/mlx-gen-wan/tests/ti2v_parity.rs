@@ -172,6 +172,7 @@ fn wan_ti2v_mask_blend_matches_reference() {
 #[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn conditioning_strength_changes_the_ti2v_render() {
+    use mlx_gen::testing::peak_rel_slices;
     let w = fixture();
     let cfg = tiny_cfg();
     let dit = WanTransformer::from_weights(&w, &cfg).expect("build DiT");
@@ -205,18 +206,6 @@ fn conditioning_strength_changes_the_ti2v_render() {
         .to_vec()
     };
 
-    /// `max|a−b| / max|b|` — the per-element worst case, normalized. A single frame that failed to
-    /// respond to the knob shows up here; it does not in a norm or a cosine.
-    fn rel_max_abs(a: &[f32], b: &[f32]) -> f32 {
-        let max_d = a
-            .iter()
-            .zip(b)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0f32, f32::max);
-        let scale = b.iter().map(|y| y.abs()).fold(0f32, f32::max).max(1e-9);
-        max_d / scale
-    }
-
     let full = render(1.0);
     // The full pin is unchanged by this story: same construction, byte-identical output.
     assert_eq!(
@@ -226,7 +215,7 @@ fn conditioning_strength_changes_the_ti2v_render() {
     );
 
     let partial = render(0.6);
-    let rel = rel_max_abs(&partial, &full);
+    let rel = peak_rel_slices(&partial, &full, Some(1e-9));
     println!("[ti2v strength 0.6 vs 1.0] rel_max_abs={rel:.3e}");
     assert!(
         rel > 0.1,
@@ -238,7 +227,7 @@ fn conditioning_strength_changes_the_ti2v_render() {
 
     // …and the response is monotone in the knob rather than an on/off flip: a weaker pin departs
     // from the full pin by MORE than a stronger one does.
-    let weaker = rel_max_abs(&render(0.2), &full);
+    let weaker = peak_rel_slices(&render(0.2), &full, Some(1e-9));
     println!("[ti2v strength 0.2 vs 1.0] rel_max_abs={weaker:.3e}");
     assert!(
         weaker > rel,

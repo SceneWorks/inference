@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::testkit::{env_path, tensor_max_abs, tensor_peak_rel};
 use candle_gen::Weights;
 use candle_gen_mochi::{
     load_transformer_var_builder, MochiDitConfig, MochiTransformer3DModel, DIT_DTYPE,
@@ -22,19 +23,9 @@ const GOLDEN: &str = concat!(
 );
 
 fn snapshot_dir() -> PathBuf {
-    std::env::var("MOCHI_SNAPSHOT")
-        .expect("set MOCHI_SNAPSHOT to the mochi-1-preview snapshot dir")
-        .into()
+    env_path("MOCHI_SNAPSHOT")
 }
 
-fn max_abs(t: &Tensor) -> f32 {
-    t.abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-}
 fn mean_abs(t: &Tensor) -> f32 {
     t.abs()
         .unwrap()
@@ -42,13 +33,6 @@ fn mean_abs(t: &Tensor) -> f32 {
         .unwrap()
         .to_scalar::<f32>()
         .unwrap()
-}
-
-/// `max|got − want| / max|want|` — peak relative error.
-fn peak_rel(got: &Tensor, want: &Tensor) -> f32 {
-    let got = got.to_dtype(DType::F32).unwrap();
-    let want = want.to_dtype(DType::F32).unwrap();
-    max_abs(&(&got - &want).unwrap()) / max_abs(&want).max(1e-12)
 }
 
 /// `mean|got − want| / mean|want|` — mean relative error.
@@ -80,7 +64,7 @@ fn transformer_forward_matches_golden() {
     let want = g.require("noise_pred").unwrap();
     assert_eq!(got.dims(), want.dims(), "noise_pred shape");
 
-    let pr = peak_rel(&got, &want);
+    let pr = tensor_peak_rel(&got, &want, Some(1e-12));
     let mr = mean_rel(&got, &want);
     eprintln!("DIT noise_pred peak_rel: {pr:.3e}  mean_rel: {mr:.3e}");
 

@@ -7,23 +7,10 @@
 //!   SAM3_VIDEO_FIXTURE=$PWD/scripts/spikes/sam3_oracle/video_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test integration video_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::cosine;
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::Sam3VideoModel;
-use mlx_rs::ops::{multiply, sqrt, sum};
 use mlx_rs::{Array, Dtype};
-
-fn scalar(a: &Array) -> f32 {
-    a.as_dtype(Dtype::Float32).unwrap().item::<f32>()
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let aa = Array::from_slice(a, &[a.len() as i32]);
-    let bb = Array::from_slice(b, &[b.len() as i32]);
-    let dot = scalar(&sum(multiply(&aa, &bb).unwrap(), None).unwrap());
-    let na = scalar(&sqrt(sum(multiply(&aa, &aa).unwrap(), None).unwrap()).unwrap());
-    let nb = scalar(&sqrt(sum(multiply(&bb, &bb).unwrap(), None).unwrap()).unwrap());
-    dot / (na * nb)
-}
 
 fn ints(a: &Array) -> Vec<i32> {
     a.as_dtype(Dtype::Int32).unwrap().as_slice::<i32>().to_vec()
@@ -68,7 +55,10 @@ fn video_pcs_matches_oracle() {
         let mut frame_worst = 1.0f32;
         for (oi, mask) in out.masks.iter().enumerate() {
             let want = &want_flat[oi * per..(oi + 1) * per];
-            let c = cosine(mask, want);
+            let c = cosine(
+                &Array::from_slice(mask, &[mask.len() as i32]),
+                &Array::from_slice(want, &[want.len() as i32]),
+            );
             frame_worst = frame_worst.min(c);
             worst = worst.min(c);
         }

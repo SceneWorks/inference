@@ -915,6 +915,7 @@ mod tests {
     use crate::rope::WanRope;
     use candle_gen::candle_core::safetensors as cst;
     use candle_gen::candle_nn::{VarBuilder, VarMap};
+    use candle_gen::testkit::tensor_max_abs_diff;
 
     /// A tiny Wan-shaped config (z16, 2 layers, 1 head, head_dim 128) — the dit_train test shape,
     /// exercising every vendored DiT path cheaply on CPU.
@@ -973,17 +974,6 @@ mod tests {
         let (latent, umt5, cos, sin) = inp;
         let ctx = dit.embed_text(umt5).unwrap();
         dit.forward(latent, &ctx, 500.0, cos, sin).unwrap()
-    }
-
-    fn max_abs_dev(a: &Tensor, b: &Tensor) -> f32 {
-        a.sub(b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
     }
 
     /// Write a PEFT LoRA `.safetensors` targeting `paths` (each `[out,in]` = `[dim,dim]`), rank `r`,
@@ -1052,7 +1042,8 @@ mod tests {
         let dit_fold = dit_from_map(&cfg, merged, &dev);
 
         let inp = fixed_inputs(&cfg, &dev);
-        let dev_max = max_abs_dev(&dit_forward(&dit_add, &inp), &dit_forward(&dit_fold, &inp));
+        let dev_max =
+            tensor_max_abs_diff(&dit_forward(&dit_add, &inp), &dit_forward(&dit_fold, &inp));
         assert!(
             dev_max < 1e-3,
             "additive DiT forward vs folded deviates by {dev_max}"
@@ -1085,7 +1076,8 @@ mod tests {
         assert!(report.skipped_targets.is_empty());
 
         let inp = fixed_inputs(&cfg, &dev);
-        let shift = max_abs_dev(&dit_forward(&dit_base, &inp), &dit_forward(&dit_add, &inp));
+        let shift =
+            tensor_max_abs_diff(&dit_forward(&dit_base, &inp), &dit_forward(&dit_add, &inp));
         assert!(
             shift > 1e-4,
             "additive LoRA did not shift the DiT forward ({shift})"

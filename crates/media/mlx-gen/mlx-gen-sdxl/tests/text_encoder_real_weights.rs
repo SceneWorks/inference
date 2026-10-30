@@ -11,10 +11,10 @@
 
 use crate::common;
 
+use mlx_gen::testing::peak_rel_host;
 use mlx_gen::weights::Weights;
 use mlx_gen_sdxl::{load_text_encoder_1, load_text_encoder_2};
 use mlx_rs::ops::concatenate_axis;
-use mlx_rs::Array;
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -22,20 +22,6 @@ const GOLDEN: &str = concat!(
 );
 
 use common::snapshot;
-
-/// Peak-relative error `max|a-b| / max|b|`.
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap();
-    let b = b.reshape(&[n]).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
-    let max_diff = a
-        .iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
-    max_diff / peak
-}
 
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
@@ -63,8 +49,8 @@ fn dual_clip_conditioning_matches_vendored() {
     // hidden_states[-2] (penultimate encoder layer, before final LN).
     let h1 = &o1.hidden_states[o1.hidden_states.len() - 2];
     let h2 = &o2.hidden_states[o2.hidden_states.len() - 2];
-    let pr_h1 = peak_rel(h1, g.require("te1_hidden_m2").unwrap());
-    let pr_h2 = peak_rel(h2, g.require("te2_hidden_m2").unwrap());
+    let pr_h1 = peak_rel_host(h1, g.require("te1_hidden_m2").unwrap(), None);
+    let pr_h2 = peak_rel_host(h2, g.require("te2_hidden_m2").unwrap(), None);
     println!("te1 hidden[-2] peak_rel={pr_h1:.3e} (768-wide, 12L)");
     println!("te2 hidden[-2] peak_rel={pr_h2:.3e} (1280-wide, 32L)");
     assert!(pr_h1 < 5e-4, "te1 hidden[-2] diverged: {pr_h1:.3e}");
@@ -74,14 +60,14 @@ fn dual_clip_conditioning_matches_vendored() {
     let cond = concatenate_axis(&[h1, h2], 2).unwrap();
     let golden_cond = g.require("conditioning").unwrap();
     assert_eq!(cond.shape(), golden_cond.shape(), "conditioning shape");
-    let pr_cond = peak_rel(&cond, golden_cond);
+    let pr_cond = peak_rel_host(&cond, golden_cond, None);
     println!("conditioning {:?} peak_rel={pr_cond:.3e}", cond.shape());
     assert!(pr_cond < 5e-4, "conditioning diverged: {pr_cond:.3e}");
 
     // Pooled (te2.pooled_output, projected EOS) -> [1, 1280].
     let golden_pooled = g.require("pooled").unwrap();
     assert_eq!(o2.pooled.shape(), golden_pooled.shape(), "pooled shape");
-    let pr_pool = peak_rel(&o2.pooled, golden_pooled);
+    let pr_pool = peak_rel_host(&o2.pooled, golden_pooled, None);
     println!("pooled {:?} peak_rel={pr_pool:.3e}", o2.pooled.shape());
     assert!(pr_pool < 5e-4, "pooled diverged: {pr_pool:.3e}");
 

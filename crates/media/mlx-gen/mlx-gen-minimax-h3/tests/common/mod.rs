@@ -411,35 +411,6 @@ pub fn rel(a: &Array, b: &Array) -> (f32, f32) {
     (max_d / peak.max(1e-12), mean_d / mean.max(1e-12))
 }
 
-/// Cosine similarity between two tensors, flattened.
-///
-/// Reported alongside [`rel`] wherever a **layout** error is under test rather than a numeric one.
-/// sc-18740's gate/value half-swap leaves the output norm essentially unchanged (89 vs 85 on real
-/// weights) so magnitude, std and checksum assertions are all blind to it — but it also keeps
-/// cosine at 0.73-0.78 rather than ~0, because `silu(a)·b` and `silu(b)·a` share sign structure.
-/// **Neither metric alone is sufficient**: cosine is scale-invariant and the relative max-abs-diff
-/// is the one that actually exposes the swap, so the tests print both and gate on both.
-pub fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a
-        .as_dtype(mlx_rs::Dtype::Float32)
-        .unwrap()
-        .flatten(None, None)
-        .unwrap();
-    let b = b
-        .as_dtype(mlx_rs::Dtype::Float32)
-        .unwrap()
-        .flatten(None, None)
-        .unwrap();
-    let dot: f32 = mlx_rs::ops::multiply(&a, &b)
-        .unwrap()
-        .sum(None)
-        .unwrap()
-        .item();
-    let na: f32 = a.square().unwrap().sum(None).unwrap().item::<f32>().sqrt();
-    let nb: f32 = b.square().unwrap().sum(None).unwrap().item::<f32>().sqrt();
-    dot / (na * nb).max(1e-12)
-}
-
 /// L2 norm of a tensor — reported (never asserted on) in the half-swap tests, as the direct
 /// demonstration that magnitude cannot see a layout error.
 pub fn l2_norm(x: &Array) -> f32 {

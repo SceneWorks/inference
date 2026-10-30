@@ -66,6 +66,7 @@ use std::time::Instant;
 
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::{max_abs, max_abs_diff_f32};
 use mlx_gen::weights::Weights;
 use mlx_gen::CancelFlag;
 use mlx_gen_minimax_h3::dit::MiniMaxH3Dit;
@@ -84,19 +85,9 @@ fn peak_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
 }
 
 fn relative_max_abs(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let delta: f32 = a
-        .subtract(&b)
-        .unwrap()
-        .abs()
-        .unwrap()
-        .max(None)
-        .unwrap()
-        .item();
-    let scale: f32 = a.abs().unwrap().max(None).unwrap().item();
+    let scale = max_abs(a);
     assert!(scale > 1e-6, "the reference arm is degenerate ({scale})");
-    delta / scale
+    max_abs_diff_f32(a, b) / scale
 }
 
 /// One TE arm end to end: the resident baseline, then every window size in [`WINDOWS`], comparing

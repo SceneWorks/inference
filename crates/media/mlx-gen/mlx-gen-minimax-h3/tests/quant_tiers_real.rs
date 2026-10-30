@@ -41,6 +41,7 @@ use mlx_gen::gen_core::{
     CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource,
 };
 
+use mlx_gen::testing::peak_rel_u8_frames;
 use mlx_gen_minimax_h3::model::{load, DIT_COMPONENT};
 
 /// The geometry every tier is measured at — the epic's reference point (124 frames = 5.1667 s, the
@@ -98,23 +99,6 @@ fn frame_statistics(frames: &[mlx_gen::gen_core::Image]) -> Vec<FrameStats> {
         });
     }
     out
-}
-
-/// `max|a−b| / max|ref|` over the whole clip. Never a norm, never a cosine (see the module docs).
-fn relative_max_abs_diff(a: &[mlx_gen::gen_core::Image], b: &[mlx_gen::gen_core::Image]) -> f64 {
-    let mut worst = 0.0f64;
-    let mut denom = 0.0f64;
-    for (fa, fb) in a.iter().zip(b.iter()) {
-        for (&pa, &pb) in fa.pixels.iter().zip(fb.pixels.iter()) {
-            worst = worst.max((f64::from(pa) - f64::from(pb)).abs());
-            denom = denom.max(f64::from(pa));
-        }
-    }
-    if denom == 0.0 {
-        f64::INFINITY
-    } else {
-        worst / denom
-    }
 }
 
 /// One tier's render: the frames, the wall clock and the MLX peak.
@@ -237,7 +221,7 @@ fn tier_renders_coherently_and_is_close_to_bf16() {
 
     if let Some(bf16_dit) = env("MINIMAX_H3_BF16_DIT") {
         let reference = render_tier(Some(std::path::Path::new(&bf16_dit)), None, steps);
-        let rel = relative_max_abs_diff(&reference.frames, &r.frames);
+        let rel = peak_rel_u8_frames(&reference.frames, &r.frames);
         println!(
             "  vs bf16: relative max-abs-diff {rel:.4} (bf16 wall {:.1}s, peak {:.2} GB)",
             reference.wall_s,

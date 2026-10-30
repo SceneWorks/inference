@@ -34,6 +34,7 @@ use common::{flat, read_snapshot_file, rel, safetensors_keys, snapshot, std_dev}
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::loader::sorted_safetensors;
+use candle_gen::testkit::{tensor_cosine_f32_sums, Denom};
 use candle_gen_minimax_h3::{
     kaiser_sinc_filter1d, MiniMaxH3AudioVae, MiniMaxH3AudioVaeConfig, MiniMaxH3VaeConfig,
     MiniMaxH3VideoVae, TILE_SAMPLE_MIN_OVERLAP, TILE_SAMPLE_MIN_SIZE,
@@ -527,7 +528,7 @@ fn real_weight_decode_matches_the_official_diffusers_vae() {
 
     assert_eq!(got.dims(), want.dims(), "decoded shape");
     let (peak, mean) = rel(&got, &want);
-    let cos = common::cosine(&got, &want);
+    let cos = tensor_cosine_f32_sums(&got, &want, Denom::FloorAt(1e-12));
     println!(
         "real-weight decode vs diffusers AutoencoderKLMiniMaxH3: peak rel {peak:.3e}, mean rel \
          {mean:.3e}, cosine {cos:.6}"
@@ -667,7 +668,7 @@ fn real_weight_encode_matches_the_official_diffusers_vae() {
             ("std", &got_std, &want_std),
         ] {
             let (peak, mean) = rel(got, want);
-            let cos = common::cosine(got, want);
+            let cos = tensor_cosine_f32_sums(got, want, Denom::FloorAt(1e-12));
             println!(
                 "real-weight encode {name}.{label} vs diffusers AutoencoderKLMiniMaxH3: peak rel \
                  {peak:.3e}, mean rel {mean:.3e}, cosine {cos:.7}"

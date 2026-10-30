@@ -13,6 +13,7 @@
 //! only expected gap is the float-summation order between mlx `conv3d` and the reference's
 //! conv2d-per-temporal-slice decomposition of the same convolution (bounded, like the 2.1 gate).
 
+use mlx_gen::testing::{cosine_f64_sums, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, LatentDecoder};
 use mlx_gen_wan::{Wan22Vae, Wan22VideoDecoder};
@@ -44,17 +45,6 @@ fn diff(got: &[f32], exp: &[f32]) -> (f32, f64) {
 /// The tiny fixture uses `dec_dim = enc_dim = 8` with the real `z_dim = 48`.
 fn vae(w: &Weights) -> Wan22Vae {
     Wan22Vae::from_weights_dims(w, 8, 8, 48).expect("build Wan22Vae")
-}
-
-/// Cosine similarity of two equal-length f32 slices.
-fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += *x as f64 * *y as f64;
-        na += *x as f64 * *x as f64;
-        nb += *y as f64 * *y as f64;
-    }
-    dot / (na.sqrt() * nb.sqrt()).max(1e-12)
 }
 
 #[ignore = "model inference; explicit model-proof workflow"]
@@ -188,7 +178,7 @@ fn vae22_bf16_decode_is_finite_and_close_to_f32() {
         g.iter().all(|v| v.is_finite()),
         "bf16 decode produced non-finite values (NaN/Inf)"
     );
-    let cos = cosine(g, f);
+    let cos = cosine_f64_sums(g, f, Denom::FloorAt(1e-12));
     println!("[vae22 bf16 decode] cosine(bf16, f32) = {cos:.6}");
     assert!(cos > 0.99, "bf16 decode cosine {cos:.4} too low vs f32");
     crate::model_inference_device::record_model_inference_device();

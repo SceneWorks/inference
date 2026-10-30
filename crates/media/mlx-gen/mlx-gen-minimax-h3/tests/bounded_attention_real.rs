@@ -75,6 +75,7 @@ use std::time::Instant;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::attention::{AttentionBudget, AttentionChunkAxis};
+use mlx_gen::testing::{max_abs, max_abs_diff_f32};
 use mlx_gen_minimax_h3::denoise::{
     adaln_schedule, JointSchedule, JointStep, JointVelocity, PackedLayout,
 };
@@ -249,19 +250,9 @@ impl Rig {
 /// Deliberately **not** a norm, a cosine or a checksum: all three are dominated by the bulk of an
 /// already-agreeing tensor and would pass on a chunk boundary that dropped rows entirely.
 fn relative_max_abs(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let max_abs: f32 = a
-        .subtract(&b)
-        .unwrap()
-        .abs()
-        .unwrap()
-        .max(None)
-        .unwrap()
-        .item();
-    let scale: f32 = a.abs().unwrap().max(None).unwrap().item();
+    let scale = max_abs(a);
     assert!(scale > 1e-3, "the reference arm is degenerate ({scale})");
-    max_abs / scale
+    max_abs_diff_f32(a, b) / scale
 }
 
 /// **The in-forward measurement, and the verdict input for rung 3's declaration.**

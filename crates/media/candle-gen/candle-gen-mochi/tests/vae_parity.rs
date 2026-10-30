@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::testkit::{env_path, tensor_max_abs};
 use candle_gen::Weights;
 use candle_gen_mochi::MochiVaeDecoder;
 
@@ -19,18 +20,7 @@ const GOLDEN: &str = concat!(
 );
 
 fn snapshot_dir() -> PathBuf {
-    std::env::var("MOCHI_SNAPSHOT")
-        .expect("set MOCHI_SNAPSHOT to the mochi-1-preview snapshot dir")
-        .into()
-}
-
-fn max_abs(t: &Tensor) -> f32 {
-    t.abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
+    env_path("MOCHI_SNAPSHOT")
 }
 
 fn mean_abs(t: &Tensor) -> f32 {
@@ -60,7 +50,7 @@ fn vae_decode_matches_golden() {
     // A valid (f32) golden video is ~[-1, 1]; if the provisioned golden is out of range it was dumped
     // in bf16 (the Mochi AsymmVAE is numerically f32-only) and is NOT a valid parity target — surface
     // that rather than gate against it (the MLX vae_parity finding).
-    let want_range = max_abs(&want);
+    let want_range = tensor_max_abs(&want);
     assert!(
         want_range < 1.1,
         "golden `video` range is ±{want_range:.2} — this is a bf16 decode (the Mochi AsymmVAE is \
@@ -70,7 +60,7 @@ fn vae_decode_matches_golden() {
     let want_f = want.to_dtype(DType::F32).unwrap();
     let video_f = video.to_dtype(DType::F32).unwrap();
     let diff = (&video_f - &want_f).unwrap();
-    let max_px = max_abs(&diff);
+    let max_px = tensor_max_abs(&diff);
     let mean_px = mean_abs(&diff);
     eprintln!("VAE decode: max_px {max_px:.3e}  mean_px {mean_px:.3e}  (video ~[-1,1])");
 

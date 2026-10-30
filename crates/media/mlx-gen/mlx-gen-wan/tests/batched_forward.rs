@@ -6,8 +6,7 @@
 //! Runs in CI on the tiny seeded S5 weights (no real checkpoint). It also exercises the cached path
 //! (`prepare_cross_kv` / `prepare_rope` / `forward_cached`) against the legacy recompute `forward`.
 
-use crate::common;
-
+use mlx_gen::testing::max_abs_diff_slices;
 use mlx_gen::weights::Weights;
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::WanTransformer;
@@ -37,8 +36,6 @@ fn load(name: &str) -> Weights {
         .unwrap_or_else(|e| panic!("read {path}: {e} (run dump_s5_fixtures.py)"))
 }
 
-use common::max_abs;
-
 #[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn batched_b2_forward_bit_identical_to_two_b1_forwards() {
@@ -67,8 +64,8 @@ fn batched_b2_forward_bit_identical_to_two_b1_forwards() {
     assert_eq!(preds[0].shape(), cond_b1.shape());
     assert_eq!(preds[1].shape(), uncond_b1.shape());
 
-    let cond_d = max_abs(preds[0].as_slice::<f32>(), cond_b1.as_slice::<f32>());
-    let uncond_d = max_abs(preds[1].as_slice::<f32>(), uncond_b1.as_slice::<f32>());
+    let cond_d = max_abs_diff_slices(preds[0].as_slice::<f32>(), cond_b1.as_slice::<f32>());
+    let uncond_d = max_abs_diff_slices(preds[1].as_slice::<f32>(), uncond_b1.as_slice::<f32>());
     println!("[batched B=2 vs 2×B=1] cond max|Δ|={cond_d:.3e} uncond max|Δ|={uncond_d:.3e}");
 
     // Bit-exact: stacking the branches on the batch axis must not perturb either output.

@@ -30,6 +30,7 @@ use std::time::Instant;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::testkit::tensor_max_abs_host;
 use candle_gen_ltx::audio_vae::AudioDecoder;
 use candle_gen_ltx::config::{AudioVaeConfig, VocoderConfig, LATENT_CHANNELS};
 use candle_gen_ltx::vae::LtxVideoVae;
@@ -100,15 +101,6 @@ fn psnr_db(got: &Tensor, want: &Tensor) -> f64 {
     20.0 * 2.0f64.log10() - 10.0 * mse.max(1e-20).log10()
 }
 
-fn max_abs(t: &Tensor) -> f32 {
-    t.flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap()
-        .into_iter()
-        .fold(0.0f32, |acc, v| acc.max(v.abs()))
-}
-
 #[test]
 #[ignore = "sc-18765: needs the gated Lightricks/LTX-2.5 conv VAE (1.45 GB)"]
 fn conv_vae_round_trips_on_the_unconverted_2_5_component_file() {
@@ -167,7 +159,7 @@ fn conv_vae_round_trips_on_the_unconverted_2_5_component_file() {
         let decode_s = t.elapsed().as_secs_f64();
         assert_eq!(round.dims(), clip.dims());
 
-        let peak = max_abs(&round);
+        let peak = tensor_max_abs_host(&round);
         assert!(
             peak.is_finite() && peak < 5.0,
             "{w}x{h}x{frames}: decode returned out-of-range values (max|v| = {peak})"
@@ -260,7 +252,7 @@ fn audio_vae_and_vocoder_produce_stereo_audio_off_the_unconverted_2_5_component_
         voc_cfg.bwe_input_sample_rate,
         voc_cfg.bwe_output_sample_rate,
     );
-    let amplitude = max_abs(&wav);
+    let amplitude = tensor_max_abs_host(&wav);
     assert!(
         amplitude.is_finite() && amplitude > 1e-5 && amplitude <= 1.5,
         "the vocoder waveform is not a sane audio signal (max|v| = {amplitude})"

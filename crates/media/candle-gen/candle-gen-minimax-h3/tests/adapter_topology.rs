@@ -46,6 +46,7 @@ use candle_gen_minimax_h3::{
 };
 
 use crate::common::{dit_fixture_config, weights, Golden, DIT_FIXTURE};
+use candle_gen::testkit::tensor_max_abs;
 
 /// The module the numeric arms probe — `[96, 64]` at the fixture geometry.
 const PROBE: &str = "transformer_blocks.0.attn.to_q";
@@ -366,19 +367,6 @@ fn probe_residual(
     (y1 - y0).expect("residual")
 }
 
-fn max_abs(t: &Tensor) -> f32 {
-    t.to_dtype(DType::F32)
-        .expect("f32")
-        .abs()
-        .expect("abs")
-        .flatten_all()
-        .expect("flat")
-        .max(0)
-        .expect("max")
-        .to_scalar::<f32>()
-        .expect("scalar")
-}
-
 /// **AC1/AC2 (sc-26688):** the same body LoRA folds *bit-identically* on the full and the pruned
 /// topology, and each fold matches an independently computed `x·Aᵀ·(fold·Bᵀ)·scale` — the deltas
 /// and the alpha fold are preserved across topologies, never reweighted, never rederived.
@@ -400,12 +388,12 @@ fn body_deltas_are_identical_across_full_and_pruned_topologies() {
         let pruned_res = probe_residual(|| pruned_dit(&cfg), &lora, 1.0, target, &x);
 
         assert!(
-            max_abs(&full_res) > 0.0,
+            tensor_max_abs(&full_res) > 0.0,
             "{target}: the residual must be nonzero or the test proves nothing"
         );
         let diff = (&full_res - &pruned_res).expect("difference");
         assert_eq!(
-            max_abs(&diff),
+            tensor_max_abs(&diff),
             0.0,
             "{target}: the same factors must fold bit-identically on both topologies — the body \
              leaves are the same modules and the install must not reweight across topology"
@@ -796,12 +784,12 @@ fn a_genuine_lokr_installs_on_the_pruned_curve_with_the_same_delta() {
     let full_res = probe_residual(|| full_dit(&cfg), &path, 1.0, PROBE, &x);
     let pruned_res = probe_residual(|| pruned_dit(&cfg), &path, 1.0, PROBE, &x);
     assert!(
-        max_abs(&full_res) > 0.0,
+        tensor_max_abs(&full_res) > 0.0,
         "the LoKr residual must be nonzero or the test proves nothing"
     );
     let diff = (full_res - pruned_res).expect("difference");
     assert_eq!(
-        max_abs(&diff),
+        tensor_max_abs(&diff),
         0.0,
         "the LoKr delta must fold bit-identically across topologies"
     );
@@ -890,12 +878,12 @@ fn the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve(
     let full_res = probe_residual(|| full_dit(&cfg), &converted_path, 1.0, PROBE, &x);
     let pruned_res = probe_residual(|| pruned_dit(&cfg), &converted_path, 1.0, PROBE, &x);
     assert!(
-        max_abs(&pruned_res) > 0.0,
+        tensor_max_abs(&pruned_res) > 0.0,
         "the converted qkv residual must be nonzero"
     );
     let diff = (&full_res - &pruned_res).expect("difference");
     assert_eq!(
-        max_abs(&diff),
+        tensor_max_abs(&diff),
         0.0,
         "the converted namespace must fold bit-identically across topologies"
     );
@@ -951,12 +939,12 @@ fn the_delta_is_independent_of_the_body_weights_it_folds_onto() {
 
     let res_a = residual_on(pruned_weights(&cfg, &dev()), "pruned body");
     let res_b = residual_on(doubled_pruned_weights(&cfg, &dev()), "doubled body");
-    assert!(max_abs(&res_a) > 0.0, "the residual must be nonzero");
+    assert!(tensor_max_abs(&res_a) > 0.0, "the residual must be nonzero");
     // f32 addition rounds, so adapted−base reproduces the residual to f32 rounding, not bit-exact —
     // but any wrong fold, dropped target or base-weight coupling moves it by orders of magnitude.
     let diff = (&res_a - &res_b).expect("difference");
-    let worst = max_abs(&diff);
-    let peak = max_abs(&res_a) as f64;
+    let worst = tensor_max_abs(&diff);
+    let peak = tensor_max_abs(&res_a) as f64;
     assert!(
         worst as f64 <= 1.0e-4 * peak,
         "the delta must be independent of the body weights it folds onto (worst {worst}, peak {peak})"
@@ -1324,7 +1312,7 @@ fn exact_probe(
         .forward(x)
         .expect("base forward");
     assert_eq!(
-        max_abs(&y0),
+        tensor_max_abs(&y0),
         0.0,
         "{target}: the zero-base probe module must output exactly zero"
     );

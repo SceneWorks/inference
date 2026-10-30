@@ -440,6 +440,7 @@ impl Qwen25VlText {
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
+    use candle_gen::testkit::{tensor_cosine, tensor_max_abs_diff};
     use std::collections::HashMap;
 
     /// The default config matches Qwen2.5-VL-7B (head_dim derived = 128, GQA groups = 7).
@@ -568,19 +569,6 @@ mod tests {
         (Qwen25VlText::new(cfg.clone(), vb).unwrap(), cfg)
     }
 
-    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
-        (a - b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
-    }
-
     /// F-143: the memory-lean [`Qwen25VlText::penultimate`] must return **bit-identical** results to the
     /// full-Vec `forward(...)[len-2]` it replaces — the last decoder layer and the final norm only feed
     /// `[-1]`, so skipping them cannot perturb `[-2]`. Checked across a multi-layer stack and the
@@ -612,7 +600,7 @@ mod tests {
             let got = bb.penultimate(&embeds, &pos, &mask).unwrap();
             assert_eq!(got.dims(), want.dims());
             assert_eq!(
-                max_abs(&got, want),
+                tensor_max_abs_diff(&got, want),
                 0.0,
                 "penultimate (n={n}) must equal forward()[-2] bit-for-bit"
             );
@@ -622,7 +610,11 @@ mod tests {
         let (bb0, cfg0) = tiny_backbone(0, &dev);
         let (embeds, pos, mask) = mk_inputs(&cfg0);
         let got0 = bb0.penultimate(&embeds, &pos, &mask).unwrap();
-        assert_eq!(max_abs(&got0, &embeds), 0.0, "empty stack → embeds");
+        assert_eq!(
+            tensor_max_abs_diff(&got0, &embeds),
+            0.0,
+            "empty stack → embeds"
+        );
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED qwen2_5_vl::tests::penultimate_matches_forward");
@@ -652,18 +644,6 @@ mod tests {
         map.insert(format!("{name}.scales"), scales);
         map.insert(format!("{name}.biases"), biases);
         grid
-    }
-
-    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (x, y) in a.iter().zip(&b) {
-            dot += (*x as f64) * (*y as f64);
-            na += (*x as f64) * (*x as f64);
-            nb += (*y as f64) * (*y as f64);
-        }
-        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
     }
 
     /// sc-11062: when the tier ships the MLX-packed triple for the Qwen2.5-VL LLM linears, [`Attn`] and
@@ -762,7 +742,7 @@ mod tests {
             let dense = candle_gen::candle_nn::Linear::new(grid.clone(), None);
             let got = lin.forward(&x).unwrap();
             let want = dense.forward(&x).unwrap();
-            let cos = cosine(&got, &want);
+            let cos = tensor_cosine(&got, &want) as f32;
             assert!(
                 cos > 0.9999,
                 "{name} packed forward vs grid cosine {cos:.6}"

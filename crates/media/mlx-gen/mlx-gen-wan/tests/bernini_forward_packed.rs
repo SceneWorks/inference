@@ -7,8 +7,7 @@
 //!
 //! Runs in CI on the tiny seeded S5 fixture (no real checkpoint).
 
-use crate::common;
-
+use mlx_gen::testing::max_abs_diff_slices;
 use mlx_gen::weights::Weights;
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::patchify::unpatchify;
@@ -37,8 +36,6 @@ fn load(name: &str) -> Weights {
         .unwrap_or_else(|e| panic!("read {path}: {e} (run dump_s5_fixtures.py)"))
 }
 
-use common::max_abs;
-
 #[ignore = "model inference; explicit model-proof workflow"]
 #[test]
 fn forward_packed_matches_dense_forward_for_target_only() {
@@ -66,7 +63,7 @@ fn forward_packed_matches_dense_forward_for_target_only() {
     let packed_out = unpatchify(&packed, grid, cfg.out_dim, cfg.patch_size).unwrap();
 
     assert_eq!(packed_out.shape(), dense.shape());
-    let d = max_abs(packed_out.as_slice::<f32>(), dense.as_slice::<f32>());
+    let d = max_abs_diff_slices(packed_out.as_slice::<f32>(), dense.as_slice::<f32>());
     println!("[forward_packed vs forward] max|Δ| = {d:.3e}");
     assert_eq!(
         d, 0.0,

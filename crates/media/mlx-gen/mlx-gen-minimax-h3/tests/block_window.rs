@@ -26,13 +26,14 @@ use crate::common;
 
 use std::path::Path;
 
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Dtype;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::dit::{AdaLnCache, DitBlock, MiniMaxH3DitConfig, MmRope};
 use mlx_gen_minimax_h3::DitBlockStream;
 
 use common::{dit_fixture_config, DIT_FIXTURE};
+use mlx_gen::testing::max_abs_diff_f32;
 
 /// The fixture's model weights, written into `dir` as a component directory a stream can reopen.
 ///
@@ -76,18 +77,6 @@ fn stage_fixture(dir: &Path) -> MiniMaxH3DitConfig {
     )
     .unwrap();
     cfg
-}
-
-fn max_abs(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    a.subtract(&b)
-        .unwrap()
-        .abs()
-        .unwrap()
-        .max(None)
-        .unwrap()
-        .item()
 }
 
 /// **The residency claim, as a count rather than as a byte figure.**
@@ -241,7 +230,7 @@ fn windowed_and_resident_stacks_agree() {
         "every block must have been re-materialized"
     );
 
-    let delta = max_abs(&resident_out, &windowed_out);
+    let delta = max_abs_diff_f32(&resident_out, &windowed_out);
     eprintln!("[fixture rung 4, window 1] resident vs windowed max|Δ| {delta:.3e}");
     assert_eq!(
         delta, 0.0,
@@ -267,7 +256,7 @@ fn windowed_and_resident_stacks_agree() {
     one_short = block
         .forward(&one_short, &modulation, &adaln_indices, &rope, &tables)
         .unwrap();
-    let short_delta = max_abs(&resident_out, &one_short);
+    let short_delta = max_abs_diff_f32(&resident_out, &one_short);
     assert!(
         short_delta > 1e-4,
         "mutation check: running one fewer block moved the metric only {short_delta:e}"
@@ -359,7 +348,7 @@ fn the_windowed_adaln_precompute_matches_the_resident_one() {
                 windowed.modulation(layer).unwrap(),
             );
             for (i, (a, b)) in want.tables().zip(got.tables()).enumerate() {
-                let delta = max_abs(a, b);
+                let delta = max_abs_diff_f32(a, b);
                 assert_eq!(
                     delta, 0.0,
                     "layer {layer} table {i}: the windowed projection moved by {delta:e}"
@@ -453,7 +442,7 @@ fn the_windowed_te_matches_the_resident_one_on_the_fixture() {
             .unwrap();
         let out = te.forward(&ids, &mask).unwrap();
         assert_eq!(
-            max_abs(&reference, &out),
+            max_abs_diff_f32(&reference, &out),
             0.0,
             "window {window} changed the context — the windowed walk must be bit-identical"
         );

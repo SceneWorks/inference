@@ -16,6 +16,7 @@
 use std::path::Path;
 
 use mlx_gen::gen_core::FLUX1_LATENT_SPACE;
+use mlx_gen::testing::max_abs_diff_host;
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
 use mlx_gen::{ensure_decoder_compatible, CancelFlag, Error, LatentDecoder, Result};
@@ -98,16 +99,6 @@ fn whole_tail_tiled(vae: &Vae, latent: &Array, out_tile_px: i32) -> Array {
     .expect("pre-fix whole-tail tiled decode")
 }
 
-fn max_abs_delta(a: &Array, b: &Array) -> f32 {
-    a.eval().unwrap();
-    b.eval().unwrap();
-    a.as_slice::<f32>()
-        .iter()
-        .zip(b.as_slice::<f32>())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f32, f32::max)
-}
-
 /// The production seam body of `model::decode_latents_via_seam` reconstructed from public API:
 /// unpack the packed DiT latent, admit the decoder for the FLUX.1 latent space, then decode —
 /// bounded when a tiling config is supplied.
@@ -141,7 +132,7 @@ fn flux_bounded_decode_tracks_the_dense_decode() {
     .expect("bounded decode");
 
     assert_eq!(bounded.shape(), dense.shape());
-    let delta = max_abs_delta(&dense, &bounded);
+    let delta = max_abs_diff_host(&dense, &bounded);
     println!("[flux inheritance] bounded vs dense max|Δ|={delta:.3e}");
     assert!(
         delta < 1e-4,
@@ -166,7 +157,7 @@ fn the_pre_fix_whole_tail_route_is_observably_wrong_against_the_dense_decode() {
     let whole_tail = whole_tail_tiled(&vae, &latent, BOUNDED_TILE_PX);
 
     assert_eq!(whole_tail.shape(), dense.shape());
-    let delta = max_abs_delta(&dense, &whole_tail);
+    let delta = max_abs_diff_host(&dense, &whole_tail);
     println!("[flux inheritance] pre-fix whole-tail vs dense max|Δ|={delta:.3e}");
     assert!(
         delta > 1e-1,
@@ -207,7 +198,7 @@ fn the_bounded_request_actually_tiles_and_the_wide_request_does_not() {
     let dense = decode_via_seam(&vae, &packed, None).unwrap();
     let fallthrough = decode_via_seam(&vae, &packed, Some(&wide)).unwrap();
     assert_eq!(
-        max_abs_delta(&dense, &fallthrough),
+        max_abs_diff_host(&dense, &fallthrough),
         0.0,
         "a request too wide to tile must be the exact single-pass decode"
     );

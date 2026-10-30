@@ -8,9 +8,9 @@
 //!
 //! Run: `cargo test -p mlx-gen-lens --test integration dit_quant_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{abs, max, multiply, subtract, sum};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::{cosine_device_sums, peak_rel_native, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::Quant;
 use mlx_gen_lens::dit::{LensDitConfig, LensTransformer};
@@ -35,27 +35,6 @@ fn transformer_dir() -> std::path::PathBuf {
 
 fn meta_usize(g: &Weights, key: &str) -> usize {
     g.metadata(key).unwrap().parse().unwrap()
-}
-
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(got, want).unwrap()).unwrap();
-    let denom = max(abs(want).unwrap(), None).unwrap().item::<f32>();
-    max(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
-}
-
-fn cosine(got: &Array, want: &Array) -> f32 {
-    let dot = sum(multiply(got, want).unwrap(), None)
-        .unwrap()
-        .item::<f32>();
-    let na = sum(multiply(got, got).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    let nb = sum(multiply(want, want).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    dot / (na * nb).max(1e-12)
 }
 
 #[test]
@@ -89,20 +68,20 @@ fn lens_dit_quant_matches_dense() {
     let dense = run(&dit);
     dit.quantize(Quant::Q8.bits()).expect("quantize Q8");
     let q8 = run(&dit);
-    let q8_cos = cosine(&q8, &dense);
+    let q8_cos = cosine_device_sums(&q8, &dense, Denom::FloorAt(1e-12));
     eprintln!(
         "Q8 vs dense bf16: cosine {q8_cos:.6}  peak_rel {:.3e}",
-        peak_rel(&q8, &dense)
+        peak_rel_native(&q8, &dense, Some(1e-12))
     );
 
     // Fresh dense DiT → Q4.
     let mut dit = LensTransformer::from_weights(&weights, &cfg, Dtype::Bfloat16).expect("load DiT");
     dit.quantize(Quant::Q4.bits()).expect("quantize Q4");
     let q4 = run(&dit);
-    let q4_cos = cosine(&q4, &dense);
+    let q4_cos = cosine_device_sums(&q4, &dense, Denom::FloorAt(1e-12));
     eprintln!(
         "Q4 vs dense bf16: cosine {q4_cos:.6}  peak_rel {:.3e}",
-        peak_rel(&q4, &dense)
+        peak_rel_native(&q4, &dense, Some(1e-12))
     );
 
     // Q8 is near-lossless. Q4 is lossier — a single full DiT forward quantizes `img_in`/`txt_in`/

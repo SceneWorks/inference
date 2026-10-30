@@ -8,9 +8,9 @@
 
 use std::path::Path;
 
-use crate::support::cosine;
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::default_device;
+use candle_gen::testkit::{tensor_cosine_device_sums, Denom};
 use candle_gen_sam3::{Sam3Tracker, Weights};
 
 fn scalar(t: &Tensor) -> f32 {
@@ -58,9 +58,9 @@ fn tracked_frame_decode_matches_oracle() {
     let ptr_want = fx.require("object_pointer").unwrap(); // [1,1,256]
     let score_want = scalar(&fx.require("object_score_logits").unwrap());
 
-    let c_low = cosine(&out.low_res, &pred_want);
-    let c_high = cosine(&out.high_res, &high_want);
-    let c_ptr = cosine(&out.object_pointer, &ptr_want);
+    let c_low = tensor_cosine_device_sums(&out.low_res, &pred_want, Denom::Exact);
+    let c_high = tensor_cosine_device_sums(&out.high_res, &high_want, Denom::Exact);
+    let c_ptr = tensor_cosine_device_sums(&out.object_pointer, &ptr_want, Denom::Exact);
     println!(
         "low_res cosine={c_low:.7}  high_res cosine={c_high:.7}  object_pointer cosine={c_ptr:.7}  \
          object_score got={:.4} want={score_want:.4}",

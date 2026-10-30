@@ -18,21 +18,11 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::testing::require_env_path;
+use mlx_gen::testing::{cosine_f32_device, require_env_path};
 use mlx_gen::weights::Weights;
 use mlx_gen_boogu::load_vision_tower;
 use mlx_gen_boogu::vision::preprocess::preprocess_image;
-use mlx_rs::ops::{multiply, sqrt, sum};
-use mlx_rs::{Array, Dtype};
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let dot = sum(multiply(&a, &b).unwrap(), false).unwrap();
-    let na = sqrt(sum(multiply(&a, &a).unwrap(), false).unwrap()).unwrap();
-    let nb = sqrt(sum(multiply(&b, &b).unwrap(), false).unwrap()).unwrap();
-    (dot / (na * nb)).item::<f32>()
-}
+use mlx_rs::Dtype;
 
 fn golden_path() -> PathBuf {
     std::env::var("BOOGU_VISION_GOLDEN")
@@ -74,11 +64,11 @@ fn vision_tower_matches_reference() {
     let (embeds, deepstack, prenorm) = tower.forward_debug(&pv, &grid).expect("vision forward");
 
     // Compute all cosines first (so a failure reports where the drift starts), then assert.
-    let c_pre = cosine(&prenorm, g.require("vision_prenorm_f32").unwrap());
-    let c_emb = cosine(&embeds, g.require("image_embeds_f32").unwrap());
+    let c_pre = cosine_f32_device(&prenorm, g.require("vision_prenorm_f32").unwrap());
+    let c_emb = cosine_f32_device(&embeds, g.require("image_embeds_f32").unwrap());
     let c_ds: Vec<f32> = (0..deepstack.len())
         .map(|i| {
-            cosine(
+            cosine_f32_device(
                 &deepstack[i],
                 g.require(&format!("deepstack_f32_{i}")).unwrap(),
             )
@@ -134,7 +124,7 @@ fn preprocess_matches_reference() {
     assert_eq!(pv.shape(), want.shape(), "pixel_values shape");
 
     // 512 is a multiple of patch·merge (32) → smart_resize is identity, so this should be ~exact.
-    let c = cosine(&pv, want);
+    let c = cosine_f32_device(&pv, want);
     println!("preprocess pixel_values parity cosine = {c:.7}");
     assert!(c > 0.999, "preprocess parity cosine {c} too low");
 }

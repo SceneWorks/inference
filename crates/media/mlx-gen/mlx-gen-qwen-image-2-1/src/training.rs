@@ -5244,6 +5244,7 @@ mod tests {
 #[cfg(test)]
 mod adapter_noise_loop_tests {
     use super::*;
+    use mlx_gen::testing::max_abs_diff_slices;
     use mlx_gen::train::lora::apply_weight_noise;
     use mlx_gen::WeightsSource;
 
@@ -5310,14 +5311,6 @@ mod adapter_noise_loop_tests {
         a.as_slice::<f32>().to_vec()
     }
 
-    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-        assert_eq!(a.len(), b.len());
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f32::max)
-    }
-
     /// The compared runs are SEPARATE Metal executions of the training loop, which agree only to a
     /// few ulps (Metal reductions are not bit-deterministic across runs). Compare within
     /// `1e-6 + 1e-5·max|want|`; the guarded mutations (noise on a micro-step, a wrong update
@@ -5325,7 +5318,7 @@ mod adapter_noise_loop_tests {
     fn assert_close(got: &[f32], want: &[f32], what: &str) {
         let scale = want.iter().fold(0.0f32, |m, x| m.max(x.abs()));
         let tol = 1e-6 + 1e-5 * scale;
-        let diff = max_abs_diff(got, want);
+        let diff = max_abs_diff_slices(got, want);
         assert!(diff <= tol, "{what}: max |diff| {diff} > tolerance {tol}");
     }
 
@@ -5361,7 +5354,7 @@ mod adapter_noise_loop_tests {
         let mut effect = 0.0f32;
         for (k, v) in &a {
             assert_close(&host(&b[k]), &host(v), &format!("{k} reproducible"));
-            effect = effect.max(max_abs_diff(&host(v), &host(&clean[k])));
+            effect = effect.max(max_abs_diff_slices(&host(v), &host(&clean[k])));
         }
         assert!(
             effect > 1e-3,

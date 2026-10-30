@@ -14,6 +14,7 @@
 
 use std::time::Instant;
 
+use mlx_gen::testing::max_abs_diff;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::{multiply, sigmoid};
 use mlx_rs::transforms::compile::{compile, CallMut, Compile};
@@ -53,15 +54,6 @@ fn normal(shape: &[i32]) -> Array {
     x
 }
 
-fn max_abs_diff(a: &Array, b: &Array) -> f64 {
-    let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
-    mlx_rs::ops::max(&d, None)
-        .unwrap()
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .item::<f32>() as f64
-}
-
 #[test]
 #[ignore = "perf microbenchmark (no weights) — run with --ignored --nocapture"]
 fn compile_silu_micro() {
@@ -80,10 +72,10 @@ fn compile_silu_micro() {
         let oneshot = bench(warmup, iters, || compile(silu_body, true)(&x).unwrap());
         let mut held = silu_body.compile(true);
         let heldt = bench(warmup, iters, || held.call_mut(&x).unwrap());
-        let diff = max_abs_diff(
+        let diff = f64::from(max_abs_diff(
             &silu_body(&x).unwrap(),
             &compile(silu_body, true)(&x).unwrap(),
-        );
+        ));
         println!(
             "[silu fp16 {}x{}x{}x{}] eager={eager:.3} oneshot={oneshot:.3} held={heldt:.3} ms \
              | held speedup={:.2}× saved/call={:.3}ms ×50={:.1}ms | max|Δ|={diff:.2e}",

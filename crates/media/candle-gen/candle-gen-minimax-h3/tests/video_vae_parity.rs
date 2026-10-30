@@ -42,10 +42,11 @@ use crate::common;
 use std::collections::BTreeSet;
 
 use common::{
-    assert_parity, cosine, fixture_config, flat, l2_norm, rel, std_dev, weights, Golden, FIXTURE,
+    assert_parity, fixture_config, flat, l2_norm, rel, std_dev, weights, Golden, FIXTURE,
 };
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::testkit::{tensor_cosine_f32_sums, Denom};
 use candle_gen_minimax_h3::blocks::TransformerBlock;
 use candle_gen_minimax_h3::{
     split_fused_qkv, swap_gated_halves, GatedFfnLayout, MiniMaxH3VaeConfig, MiniMaxH3VideoVae,
@@ -454,7 +455,7 @@ fn reading_the_ffn_halves_gate_first_breaks_parity() {
     let mutated = vae_from(map, 3).decode(&latent).expect("mutated decode");
 
     let (peak, mean) = rel(&mutated, &baseline);
-    let cos = cosine(&mutated, &baseline);
+    let cos = tensor_cosine_f32_sums(&mutated, &baseline, Denom::FloorAt(1e-12));
     println!(
         "FFN half-swap: rel-max-abs={peak:.3e} rel-mean={mean:.3e} cosine={cos:.4} \
          ||correct||={:.4} ||swapped||={:.4}  (parity residual with the correct layout: \

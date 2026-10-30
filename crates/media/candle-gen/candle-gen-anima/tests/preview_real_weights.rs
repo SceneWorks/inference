@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{GenerationRequest, Image, LoadSpec, PreviewFrame, WeightsSource};
-use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::save_rgb8_png_in;
 use candle_gen::testkit::sha256_file;
 use candle_gen::testkit::{
     collecting_sink, correlation, downsample_box, downsample_box_raw, env_path_opt, env_u32,
@@ -225,25 +225,26 @@ fn anima_vae_matches_the_qwen_fit_vae_tensor_for_tensor() {
 
 // ── Runtime: the frames actually develop ──────────────────────────────────────────────────────────
 
-fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let path = artifact_dir().join(format!("{name}.png"));
-    save_rgb8_png(&path, pixels, width, height);
-    eprintln!("  saved {}", path.display());
-}
-
 /// Write the frames side by side as one strip, plus each frame individually — the artifact the epic
 /// asks to be reviewed directly.
 fn save_strip(frames: &[PreviewFrame], name: &str) {
     let (strip, width, height) = preview_strip_sheet(frames);
     for frame in frames {
-        save_png(
+        save_rgb8_png_in(
+            &artifact_dir(),
+            &format!("{}.png", &format!("{name}_frame{:02}", frame.current)),
             &frame.image.pixels,
             frame.image.width,
             frame.image.height,
-            &format!("{name}_frame{:02}", frame.current),
         );
     }
-    save_png(&strip, width, height, &format!("{name}_strip"));
+    save_rgb8_png_in(
+        &artifact_dir(),
+        &format!("{}.png", &format!("{name}_strip")),
+        &strip,
+        width,
+        height,
+    );
 }
 
 /// The shared strip analysis: numbering, latent resolution, per-frame movement, falling distance to
@@ -431,11 +432,12 @@ fn assert_variant_previews_converge(variant: Variant, steps: u32, size: u32) {
     let frames = candle_gen::lock_recover(&frames).clone();
     let name = format!("{id}_{size}_s{steps}");
     save_strip(&frames, &name);
-    save_png(
+    save_rgb8_png_in(
+        &artifact_dir(),
+        &format!("{}.png", &format!("{name}_final")),
         &active.pixels,
         active.width,
         active.height,
-        &format!("{name}_final"),
     );
     assert_the_strip_converges(id, &frames, &active, steps, size, size);
 }

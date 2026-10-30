@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::synth;
+use candle_gen::testkit::max_abs_diff_slices;
 
 fn dev() -> Device {
     Device::Cpu
@@ -55,14 +56,6 @@ fn read(t: &Tensor) -> Vec<f32> {
 
 fn scalar(t: &Tensor) -> f32 {
     t.to_scalar::<f32>().unwrap()
-}
-
-fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len());
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f32::max)
 }
 
 fn shapes(v: &Value) -> Vec<(String, Vec<usize>)> {
@@ -198,12 +191,12 @@ fn identity_path_matches_the_torch_reference() {
         f["arcface"]["noise_samples"].as_u64().unwrap() as usize,
         IDENTITY_NOISE_SAMPLES
     );
-    let d_mean = max_abs_diff(&read(s.noise_mean()), &floats(&f["arcface"]["noise_mean"]));
+    let d_mean = max_abs_diff_slices(&read(s.noise_mean()), &floats(&f["arcface"]["noise_mean"]));
     assert!(d_mean < 2e-5, "noise-mean drift {d_mean}");
     let e_live = read(&s.embed(&live, crop).unwrap());
     let e_ref = read(&s.embed(&reference, crop).unwrap());
-    let d_live = max_abs_diff(&e_live, &floats(&f["arcface"]["embedding"]));
-    let d_ref = max_abs_diff(&e_ref, &floats(&f["arcface"]["reference_embedding"]));
+    let d_live = max_abs_diff_slices(&e_live, &floats(&f["arcface"]["embedding"]));
+    let d_ref = max_abs_diff_slices(&e_ref, &floats(&f["arcface"]["reference_embedding"]));
     assert!(
         d_live < 2e-5 && d_ref < 2e-5,
         "embedding drift {d_live} / {d_ref}"
@@ -281,7 +274,7 @@ fn landmark_path_matches_the_torch_reference() {
     let l_ref = loss.landmarks(&reference, crop).unwrap();
     let want = floats(&f["facemesh"]["landmarks"]);
     let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
-    let d = max_abs_diff(&read(&l_live), &want);
+    let d = max_abs_diff_slices(&read(&l_live), &want);
     assert!(d < 1e-4 * scale, "landmark drift {d} (scale {scale})");
     let got = scalar(&landmark_distance(&l_live, &l_ref).unwrap());
     let want = expect(&f["facemesh"]["landmark_loss"]);
@@ -775,7 +768,7 @@ fn real_facemesh_program_matches_torch() {
     let got = read(&program.forward(&io["input"]).unwrap()[0]);
     let want = read(&io["output0"]);
     let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
-    let d = max_abs_diff(&got, &want);
+    let d = max_abs_diff_slices(&got, &want);
     println!("real FaceMesh max abs {d} (scale {scale})");
     assert!(d <= 1e-4 * scale, "real FaceMesh drift {d} (scale {scale})");
 

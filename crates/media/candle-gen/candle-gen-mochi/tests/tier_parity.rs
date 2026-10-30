@@ -19,6 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::testkit::{tensor_max_abs, tensor_peak_rel};
 use candle_gen::Weights;
 use candle_gen_mochi::tier::MochiTierPaths;
 use candle_gen_mochi::{
@@ -39,14 +40,6 @@ fn tier_root() -> PathBuf {
     PathBuf::from(std::env::var("HOME").expect("HOME")).join("mochi-tiers")
 }
 
-fn max_abs(t: &Tensor) -> f32 {
-    t.abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-}
 fn mean_abs(t: &Tensor) -> f32 {
     t.abs()
         .unwrap()
@@ -54,13 +47,6 @@ fn mean_abs(t: &Tensor) -> f32 {
         .unwrap()
         .to_scalar::<f32>()
         .unwrap()
-}
-
-/// `max|got − want| / max|want|` — peak relative error.
-fn peak_rel(got: &Tensor, want: &Tensor) -> f32 {
-    let got = got.to_dtype(DType::F32).unwrap();
-    let want = want.to_dtype(DType::F32).unwrap();
-    max_abs(&(&got - &want).unwrap()) / max_abs(&want).max(1e-12)
 }
 
 /// `mean|got − want| / mean|want|` — mean relative error.
@@ -120,7 +106,7 @@ fn tier_forward_parity(tier: &str, expect_bits: Option<i32>, peak_bar: f32, mean
         "{tier}: non-finite velocity (a structural break, not quant loss)"
     );
 
-    let pr = peak_rel(&got, &want);
+    let pr = tensor_peak_rel(&got, &want, Some(1e-12));
     let mr = mean_rel(&got, &want);
     eprintln!("[{tier} tier] noise_pred vs bf16 golden — peak_rel={pr:.3e} mean_rel={mr:.3e}");
     assert!(

@@ -1968,16 +1968,11 @@ mod tests {
 #[cfg(test)]
 mod guidance_ops_tests {
     use super::*;
+    use crate::testing::max_abs_diff;
     use gen_core::guidance::{cfg, cfg_rescale, normalized_guidance};
 
     fn t(data: &[f32], shape: &[i32]) -> Array {
         Array::from_slice(data, shape)
-    }
-
-    fn max_abs(a: &Array, b: &Array) -> f32 {
-        mlx_rs::ops::max(subtract(a, b).unwrap().abs().unwrap(), None)
-            .unwrap()
-            .item::<f32>()
     }
 
     /// A [B=1, seq=2, C=3] cond/uncond pair (per-token channel-axis geometry, the Lens case).
@@ -1997,7 +1992,10 @@ mod guidance_ops_tests {
             multiply(subtract(&cond, &uncond).unwrap(), scalar(4.0)).unwrap(),
         )
         .unwrap();
-        assert!(max_abs(&got, &want) < 1e-4, "cfg over MLX != hand combine");
+        assert!(
+            max_abs_diff(&got, &want) < 1e-4,
+            "cfg over MLX != hand combine"
+        );
     }
 
     /// sc-7443 enabler: with the dtype-preserving `MlxLatentOps::axpy`/`scale`, gen-core `cfg` over a
@@ -2029,7 +2027,7 @@ mod guidance_ops_tests {
                 "{dt:?}: cfg must preserve dtype (no f32 promotion)"
             );
             assert_eq!(
-                max_abs(&got, &want),
+                max_abs_diff(&got, &want),
                 0.0,
                 "{dt:?}: gen-core cfg != bespoke half-precision combine"
             );
@@ -2057,7 +2055,7 @@ mod guidance_ops_tests {
         // comb_norm > 0 for this pair, so the where-guard is a no-op → want = comb · ratio.
         let want = multiply(&comb, &ratio).unwrap();
         assert!(
-            max_abs(&got, &want) < 1e-4,
+            max_abs_diff(&got, &want) < 1e-4,
             "cfg_rescale over MLX != Lens formula"
         );
     }
@@ -2072,7 +2070,7 @@ mod guidance_ops_tests {
             normalized_guidance(&ops, &cond, &uncond, 4.0, None, 1.0, 0.0, &shape, &[-1]).unwrap();
         let want = cfg(&ops, &cond, &uncond, 4.0).unwrap();
         assert!(
-            max_abs(&got, &want) < 1e-4,
+            max_abs_diff(&got, &want) < 1e-4,
             "apg(eta=1,nt=0) over MLX != cfg"
         );
     }
@@ -2090,7 +2088,7 @@ mod guidance_ops_tests {
         let dot = sum_axes(multiply(&nd, &cond).unwrap(), &[-1], true).unwrap();
         let zeros = Array::zeros::<f32>(dot.shape()).unwrap();
         assert!(
-            max_abs(&dot, &zeros) < 1e-3,
+            max_abs_diff(&dot, &zeros) < 1e-3,
             "eta=0 not orthogonal to cond on MLX"
         );
     }

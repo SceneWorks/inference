@@ -39,6 +39,7 @@
 #![cfg(feature = "cuda")]
 
 use candle_gen::candle_core::{safetensors, DType, Device, Result as CoreResult, Tensor};
+use candle_gen::testkit::tensor_peak_rel_host;
 use candle_gen_ltx::config::ConnectorConfig;
 use candle_gen_ltx::connector::Connector;
 use candle_gen_ltx::tier::TierPaths;
@@ -48,23 +49,14 @@ const GOLDEN: &str = concat!(
     "/../../mlx-gen/mlx-gen-ltx/tests/fixtures/ltx_connector_golden.safetensors"
 );
 
-fn peak_rel(got: &Tensor, want: &Tensor) -> CoreResult<f32> {
-    let got = got.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let want = want.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    assert_eq!(got.len(), want.len());
-    let mut diff = 0f32;
-    let mut mag = 0f32;
-    for (g, w) in got.iter().zip(want.iter()) {
-        diff = diff.max((g - w).abs());
-        mag = mag.max(w.abs());
-    }
-    Ok(diff / mag.max(1e-12))
-}
-
 /// [`peak_rel`] over token rows `[lo, hi)` of a `[1, seq, dim]` pair, denominator over the same
 /// slice — the valid-row bar must not hide behind (or be drowned by) the register rows.
 fn peak_rel_rows(got: &Tensor, want: &Tensor, lo: usize, hi: usize) -> CoreResult<f32> {
-    peak_rel(&got.narrow(1, lo, hi - lo)?, &want.narrow(1, lo, hi - lo)?)
+    tensor_peak_rel_host(
+        &got.narrow(1, lo, hi - lo)?,
+        &want.narrow(1, lo, hi - lo)?,
+        Some(1e-12),
+    )
 }
 
 /// The golden's `mask01` (stored int) → the connector's `nv` (valid, non-padding token count).
@@ -114,7 +106,7 @@ fn video_connector_matches_reference() -> candle_gen::Result<()> {
     let got = conn.forward(&features, nv)?;
     assert_eq!(got.shape(), want.shape());
     // The connector reorders its input, so the valid rows are the PREFIX (`0..nv`).
-    let pr = peak_rel(&got, want)?;
+    let pr = tensor_peak_rel_host(&got, want, Some(1e-12));
     let pr_valid = peak_rel_rows(&got, want, 0, nv)?;
     eprintln!("candle video connector peak_rel = {pr:.3e} (valid rows {pr_valid:.3e})");
     // Provisional derived bars (sc-21663) — see the module docs; the first CUDA run records the
@@ -151,7 +143,7 @@ fn audio_connector_matches_reference() -> candle_gen::Result<()> {
 
     let got = conn.forward(&features, nv)?;
     assert_eq!(got.shape(), want.shape());
-    let pr = peak_rel(&got, want)?;
+    let pr = tensor_peak_rel_host(&got, want, Some(1e-12));
     let pr_valid = peak_rel_rows(&got, want, 0, nv)?;
     eprintln!("candle audio connector peak_rel = {pr:.3e} (valid rows {pr_valid:.3e})");
     // Provisional derived bars (sc-21663) — see the module docs; the first CUDA run records the

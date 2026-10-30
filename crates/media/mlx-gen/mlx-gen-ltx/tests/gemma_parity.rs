@@ -12,9 +12,7 @@
 //!
 //! Run: `cargo test -p mlx-gen-ltx --test integration gemma_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{abs, max, subtract};
-use mlx_rs::Array;
-
+use mlx_gen::testing::peak_rel_native;
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 
@@ -53,12 +51,6 @@ fn gemma_q8_dir() -> std::path::PathBuf {
     newest_snapshot("models--mlx-community--gemma-3-12b-it-8bit")
 }
 
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(got, want).unwrap()).unwrap();
-    let denom = max(abs(want).unwrap(), None).unwrap().item::<f32>();
-    max(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
-}
-
 /// Load `gemma_dir` (dense bf16 or, with `quant`, the quantized snapshot), run the 49-state forward on
 /// the golden's input, and assert the worst per-layer `peak_rel` is below `tol`.
 fn run_gemma_gate(gemma_dir: &std::path::Path, golden: &str, quant: Option<GemmaQuant>, tol: f32) {
@@ -81,7 +73,7 @@ fn run_gemma_gate(gemma_dir: &std::path::Path, golden: &str, quant: Option<Gemma
     let mut profile = Vec::new();
     for (i, h) in hiddens.iter().enumerate() {
         let want = g.require(&format!("h_{i:02}")).unwrap();
-        let pr = peak_rel(h, want);
+        let pr = peak_rel_native(h, want, Some(1e-12));
         profile.push(pr);
         if pr > worst {
             worst = pr;

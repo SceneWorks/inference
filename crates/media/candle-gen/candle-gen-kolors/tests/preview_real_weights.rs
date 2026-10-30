@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use candle_gen::gen_core::{
     GenerationRequest, Image, LoadSpec, PreviewFrame, Progress, WeightsSource,
 };
-use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::save_rgb8_png_in;
 use candle_gen::testkit::sha256_file;
 use candle_gen::testkit::{
     collecting_sink, correlation, downsample_nearest, downsample_nearest_raw, env_path_opt,
@@ -103,15 +103,9 @@ fn the_kolors_vae_is_the_sdxl_fit_vae() {
 
 // ── Frame analysis helpers (same measurements as the SDXL harness) ────────────────────────────────
 
-fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let path = artifact_dir().join(name);
-    save_rgb8_png(&path, pixels, width, height);
-    eprintln!("  wrote {}", path.display());
-}
-
 fn save_strip(frames: &[PreviewFrame], name: &str) {
     let (sheet, width, height) = preview_strip_sheet(frames);
-    save_png(&sheet, width, height, name);
+    save_rgb8_png_in(&artifact_dir(), name, &sheet, width, height);
 }
 
 fn assert_the_strip_converges(
@@ -307,11 +301,12 @@ fn assert_lane_previews_converge(
     let frames = candle_gen::lock_recover(&frames);
     assert_the_strip_converges(label, &frames, &live, steps, size, size);
     save_strip(&frames, &format!("{label}-strip.png"));
-    save_png(
+    save_rgb8_png_in(
+        &artifact_dir(),
+        &format!("{label}-final.png"),
         &live.pixels,
         live.width,
         live.height,
-        &format!("{label}-final.png"),
     );
     events
 }

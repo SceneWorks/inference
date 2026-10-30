@@ -29,6 +29,7 @@ use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::Linear;
 use candle_gen::gen_core::Quant;
 use candle_gen::quant::{dequant_mlx_q8_gs, DenseLinear, QLinear};
+use candle_gen::testkit::tensor_cosine;
 
 const COMFYUI_FILE_ENV: &str = "FLUX2_COMFYUI_FILE";
 const TIER_FILE_ENV: &str = "FLUX2_Q8_TIER_FILE";
@@ -37,26 +38,6 @@ const COMFYUI_FILE_DEFAULT: &str =
 const TIER_FILE_DEFAULT: &str = r"E:\huggingface\hub\models--SceneWorks--flux2-dev-mlx\snapshots\0c9b86f4d91eeaec3db11bcc9cc0e4c006faed74\q8\transformer\diffusion_pytorch_model.safetensors";
 /// The flux2-dev-mlx tiers pack at the MLX default group size.
 const GROUP_SIZE: usize = 64;
-
-fn cosine(a: &Tensor, b: &Tensor) -> Result<f64> {
-    let a = a
-        .to_device(&Device::Cpu)?
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?;
-    let b = b
-        .to_device(&Device::Cpu)?
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?;
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += (*x as f64) * (*y as f64);
-        na += (*x as f64) * (*x as f64);
-        nb += (*y as f64) * (*y as f64);
-    }
-    Ok(dot / (na.sqrt() * nb.sqrt() + 1e-12))
-}
 
 /// Deterministic pseudo-random f32 in [-1, 1) (splitmix64 of the index) — launch-portable, no RNG.
 fn pseudo_random(n: usize, salt: u64) -> Vec<f32> {
@@ -200,7 +181,7 @@ fn comfyui_fold_probe() -> Result<()> {
             .load(&format!("{}.biases", spec.tier_base), &cpu)?
             .to_dtype(DType::F32)?;
         let grid = dequant_mlx_q8_gs(&wq, &scales, &biases, GROUP_SIZE)?;
-        let w_cos = cosine(&w_c, &grid)?;
+        let w_cos = tensor_cosine(&w_c, &grid);
         eprintln!(
             "[probe] {:<55} [{out_dim}x{in_dim}] weight cos(comfyui, tier-grid) = {w_cos:.6}",
             spec.tier_base
@@ -235,7 +216,7 @@ fn comfyui_fold_probe() -> Result<()> {
 
             for (name, lin) in &arms {
                 let y = lin.forward(&x)?;
-                let cos = cosine(&y, &reference)?;
+                let cos = tensor_cosine(&y, &reference);
                 let flag = if cos < 0.98 { "  <-- DIVERGED" } else { "" };
                 eprintln!(
                     "[probe] {:<55} m={m:<5} {name:<14} cos={cos:.6}{flag}",

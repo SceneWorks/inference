@@ -12,6 +12,7 @@ use mlx_rs::Array;
 
 use mlx_gen::weights::Weights;
 
+use mlx_gen::testing::max_abs_diff_host;
 use mlx_gen_ltx::positions::create_position_grid;
 use mlx_gen_ltx::rope::{apply_split_rotary_emb, precompute_split_freqs_cis};
 use mlx_gen_ltx::{STAGE1_SIGMAS, STAGE2_SIGMAS};
@@ -23,11 +24,7 @@ const GOLDEN: &str = concat!(
 
 fn max_abs_diff(a: &Array, b: &Array) -> f32 {
     assert_eq!(a.shape(), b.shape(), "shape mismatch");
-    a.as_slice::<f32>()
-        .iter()
-        .zip(b.as_slice::<f32>())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0f32, f32::max)
+    max_abs_diff_host(a, b)
 }
 
 fn meta_usize(g: &Weights, key: &str) -> usize {

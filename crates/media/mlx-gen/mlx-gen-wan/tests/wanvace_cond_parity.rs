@@ -12,6 +12,7 @@
 //! normalization that turns these into the final 32/96-ch control is the already-validated
 //! [`WanVae::encode`] (sc-2678), exercised end-to-end (checkpoint-gated) at S3.
 
+use mlx_gen::testing::max_abs_diff_slices;
 use mlx_gen::weights::Weights;
 use mlx_gen_wan::vace::{binarize_mask, prepare_masks};
 use mlx_rs::ops::{multiply, subtract};
@@ -25,14 +26,6 @@ fn golden() -> Weights {
     .expect("run tools/dump_wanvace_cond_golden.py")
 }
 
-fn max_abs(got: &[f32], exp: &[f32]) -> f32 {
-    assert_eq!(got.len(), exp.len(), "length mismatch");
-    got.iter()
-        .zip(exp.iter())
-        .map(|(g, e)| (g - e).abs())
-        .fold(0f32, f32::max)
-}
-
 #[test]
 fn prepare_masks_matches_diffusers() {
     let g = golden();
@@ -41,7 +34,7 @@ fn prepare_masks_matches_diffusers() {
     let out = prepare_masks(mask, 4, 8, 2, 1).expect("prepare_masks");
     let exp = g.require("out.mask_latent").unwrap();
     assert_eq!(out.shape(), exp.shape(), "mask_latent shape");
-    let d = max_abs(out.as_slice::<f32>(), exp.as_slice::<f32>());
+    let d = max_abs_diff_slices(out.as_slice::<f32>(), exp.as_slice::<f32>());
     println!("[prepare_masks] shape={:?} max|Δ|={d:.3e}", out.shape());
     assert_eq!(d, 0.0, "prepare_masks not bit-exact: {d:.3e}");
 }
@@ -53,7 +46,7 @@ fn masking_matches_diffusers() {
     let mask = g.require("in.mask").unwrap();
 
     let m_bin = binarize_mask(mask).expect("binarize");
-    let db = max_abs(
+    let db = max_abs_diff_slices(
         m_bin.as_slice::<f32>(),
         g.require("out.m_bin").unwrap().as_slice::<f32>(),
     );
@@ -63,11 +56,11 @@ fn masking_matches_diffusers() {
     let one = Array::from_slice(&[1.0f32], &[1]);
     let inactive = multiply(video, subtract(&one, &m_bin).unwrap()).unwrap();
     let reactive = multiply(video, &m_bin).unwrap();
-    let di = max_abs(
+    let di = max_abs_diff_slices(
         inactive.as_slice::<f32>(),
         g.require("out.inactive").unwrap().as_slice::<f32>(),
     );
-    let dr = max_abs(
+    let dr = max_abs_diff_slices(
         reactive.as_slice::<f32>(),
         g.require("out.reactive").unwrap().as_slice::<f32>(),
     );

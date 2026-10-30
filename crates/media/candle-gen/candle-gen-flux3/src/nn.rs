@@ -921,20 +921,13 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
     use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
+    use candle_gen::testkit::tensor_peak_rel;
 
     fn seeded(n: usize, k: usize, salt: f32) -> Tensor {
         let data: Vec<f32> = (0..n * k)
             .map(|i| (i as f32 * 0.37 + salt).sin() * 0.8 + (i as f32 * 0.011).cos() * 0.2)
             .collect();
         Tensor::from_vec(data, (n, k), &Device::Cpu).unwrap()
-    }
-
-    fn peak_relative(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a.to_dtype(DType::F32).unwrap();
-        let b = b.to_dtype(DType::F32).unwrap();
-        let diff = (&a - &b).unwrap().abs().unwrap().max_all().unwrap();
-        let peak = b.abs().unwrap().max_all().unwrap();
-        diff.to_scalar::<f32>().unwrap() / peak.to_scalar::<f32>().unwrap()
     }
 
     fn packed(w: &Tensor, storage: NativeDitStorage, compute: DType) -> (Linear, Tensor) {
@@ -971,7 +964,7 @@ mod tests {
                     .unwrap()
                     .reshape((1, 7, n))
                     .unwrap();
-                let err = peak_relative(&y, &reference);
+                let err = tensor_peak_rel(&y, &reference, None);
                 assert!(err < 0.02, "{storage:?}/{compute:?}: {err}");
                 assert!(linear.is_quantized());
                 assert!(linear.weight().is_err(), "no dequantized dense weight");
@@ -1034,7 +1027,7 @@ mod tests {
                 assert_eq!(y.dtype(), compute);
                 let xr = to(&x, compute).unwrap().to_dtype(DType::F32).unwrap();
                 let reference = xr.matmul(&dequant.t().unwrap()).unwrap();
-                let err = peak_relative(&y, &reference);
+                let err = tensor_peak_rel(&y, &reference, None);
                 eprintln!("cuda {storage:?}/{compute:?}: peak-relative error {err:e}");
                 assert!(err < 0.02, "{storage:?}/{compute:?}: {err}");
             }
@@ -1112,7 +1105,7 @@ mod tests {
             * 0.75)
             .unwrap();
         let want = (&base + &residual).unwrap();
-        assert!(peak_relative(&adapted, &want) < 1e-5);
+        assert!(tensor_peak_rel(&adapted, &want, None) < 1e-5);
         assert!(linear.is_quantized(), "the base stays packed");
         assert!(matches!(
             linear.push_trainable_lora(down, up, 1.0),

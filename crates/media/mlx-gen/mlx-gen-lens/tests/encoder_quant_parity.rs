@@ -14,9 +14,9 @@
 //!
 //! Run: `cargo test -p mlx-gen-lens --test integration encoder_quant_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{multiply, sum};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Dtype;
 
+use mlx_gen::testing::{cosine_device_sums, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::Quant;
 use mlx_gen_lens::config::GptOssConfig;
@@ -42,22 +42,6 @@ fn text_encoder_dir() -> std::path::PathBuf {
         .max()
         .expect("a snapshot");
     snap.join("text_encoder")
-}
-
-/// Cosine similarity over the flattened tensors.
-fn cosine(got: &Array, want: &Array) -> f32 {
-    let dot = sum(multiply(got, want).unwrap(), None)
-        .unwrap()
-        .item::<f32>();
-    let na = sum(multiply(got, got).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    let nb = sum(multiply(want, want).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    dot / (na * nb).max(1e-12)
 }
 
 /// Run the quantized encoder over the golden prompts; return the worst (prompt, layer) cosine vs the
@@ -89,7 +73,7 @@ fn worst_cosine_for(quant: Quant) -> f32 {
         for (j, layer_idx) in selected.iter().enumerate() {
             let want = g.require(&format!("cap_{i}_{j}")).unwrap();
             let got = captured[j].as_dtype(Dtype::Float32).unwrap();
-            let cos = cosine(&got, want);
+            let cos = cosine_device_sums(&got, want, Denom::FloorAt(1e-12));
             eprintln!("  prompt {i} layer {layer_idx}: cosine {cos:.5}");
             worst = worst.min(cos);
         }

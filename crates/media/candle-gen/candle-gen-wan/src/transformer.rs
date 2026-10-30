@@ -1069,6 +1069,7 @@ impl WanTransformer {
 mod tests {
     use super::*;
     use crate::rope::{apply_source_id, WanRope};
+    use candle_gen::testkit::tensor_max_abs_diff;
     use std::collections::HashMap;
 
     #[test]
@@ -1226,19 +1227,6 @@ mod tests {
     /// executed. The invariant was never evaluated on the architecture that breaks it.
     const CHUNK_PARITY_MAX_ABS: f32 = 1e-5;
 
-    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
-        (a - b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
-    }
-
     /// The refactored [`WanTransformer::forward`] is byte-identical to the explicit
     /// `patch_embed_tokens → forward_packed → unpatchify_tokens` composition — pins the additive seams
     /// to the validated monolithic forward (the many-crates-depend-on-it invariant).
@@ -1263,7 +1251,7 @@ mod tests {
         assert_eq!(out.dims(), &[1, 8, cfg.out_channels * 4]);
         let got = dit.unpatchify_tokens(&out, grid).unwrap();
         assert_eq!(
-            max_abs(&got, &want),
+            tensor_max_abs_diff(&got, &want),
             0.0,
             "seam composition must equal forward"
         );
@@ -1304,7 +1292,7 @@ mod tests {
             .forward_prepared(&latents, timestep, &pos_kv, &cos, &sin)
             .unwrap();
         assert_eq!(
-            max_abs(&prior, &prepared),
+            tensor_max_abs_diff(&prior, &prepared),
             0.0,
             "prepared scalar forward must preserve the prior fixture"
         );
@@ -1313,7 +1301,7 @@ mod tests {
             .forward_tokens_prepared(&latents, &tokens, &pos_kv, &cos, &sin)
             .unwrap();
         assert!(
-            max_abs(&prepared, &tokenized) < 1e-5,
+            tensor_max_abs_diff(&prepared, &tokenized) < 1e-5,
             "prepared TI2V-token forward must retain scalar parity"
         );
         // Repeat both CFG branches across multiple denoise steps. Only Q changes; text K/V is untouched.
@@ -1351,7 +1339,7 @@ mod tests {
             .forward_tokens(&latents, &all_equal, &context, &cos, &sin)
             .unwrap();
         assert!(
-            max_abs(&scalar, &tokenized) < 1e-5,
+            tensor_max_abs_diff(&scalar, &tokenized) < 1e-5,
             "all-equal token timesteps must reduce to the scalar forward"
         );
 
@@ -1365,7 +1353,7 @@ mod tests {
             .forward_tokens(&latents, &mixed, &context, &cos, &sin)
             .unwrap();
         assert!(
-            max_abs(&tokenized, &pinned) > 1e-5,
+            tensor_max_abs_diff(&tokenized, &pinned) > 1e-5,
             "zero-timestep pinned tokens must change the modulation path"
         );
 
@@ -1418,7 +1406,7 @@ mod tests {
         // entered the target through self-attention).
         let solo = dit.forward(&target, &context, t, &cos_t, &sin_t).unwrap();
         assert!(
-            max_abs(&vel, &solo) > 1e-5,
+            tensor_max_abs_diff(&vel, &solo) > 1e-5,
             "a conditioning source must couple into the target velocity"
         );
 
@@ -1432,7 +1420,7 @@ mod tests {
             .unpatchify_tokens(&out0.narrow(1, total - l_t, l_t).unwrap(), grid_t)
             .unwrap();
         assert!(
-            max_abs(&vel, &vel0) > 1e-6,
+            tensor_max_abs_diff(&vel, &vel0) > 1e-6,
             "source-id RoPE (id 1 vs id 0) must change the coupled velocity"
         );
 
@@ -1497,14 +1485,14 @@ mod tests {
             3,
             "budget 42 must split S=7 into 3 query-row blocks (3,3,1)"
         );
-        let d_chunked = max_abs(&single, &chunked);
+        let d_chunked = tensor_max_abs_diff(&single, &chunked);
         assert!(
             d_chunked < CHUNK_PARITY_MAX_ABS,
             "chunked attention diverged from the single pass: max|Δ| {d_chunked:e} ≥ {CHUNK_PARITY_MAX_ABS:e}"
         );
         let block1 = sdpa_budgeted(&q, &k, &v, scale, 1, counting).unwrap();
         assert_eq!(calls.get(), 10, "budget 1 adds 7 single-row blocks (3 + 7)");
-        let d_block1 = max_abs(&single, &block1);
+        let d_block1 = tensor_max_abs_diff(&single, &block1);
         assert!(
             d_block1 < CHUNK_PARITY_MAX_ABS,
             "single-row chunks diverged from the single pass: max|Δ| {d_block1:e} ≥ {CHUNK_PARITY_MAX_ABS:e}"
@@ -1565,7 +1553,7 @@ mod tests {
         // and acceptable — an order of magnitude tighter would demand the f32 upcast we are dropping.
         let a = f32_path.to_dtype(DType::F32).unwrap();
         let bpath = bf16_path.to_dtype(DType::F32).unwrap();
-        let max_abs = max_abs(&a, &bpath);
+        let max_abs = tensor_max_abs_diff(&a, &bpath);
         eprintln!("[sc-12894] bf16-vs-f32 softmax attention max_abs = {max_abs:.5}");
         assert!(
             max_abs < 0.05,

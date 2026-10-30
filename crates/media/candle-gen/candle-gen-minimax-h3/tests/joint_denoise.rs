@@ -42,7 +42,8 @@ use candle_gen_minimax_h3::denoise::{
 use candle_gen_minimax_h3::dit::adaln::TimestepSchedule;
 use candle_gen_minimax_h3::dit::positions::KeyframeAnchor;
 
-use common::{assert_parity, cosine, flat, l2_norm, rel, std_dev, Golden, DENOISE_FIXTURE};
+use candle_gen::testkit::{tensor_cosine_f32_sums, Denom};
+use common::{assert_parity, flat, l2_norm, rel, std_dev, Golden, DENOISE_FIXTURE};
 
 /// **This lane's** bound. The loop is f32 arithmetic over the reference's own recorded velocities,
 /// so its residual is round-off; MLX's 1e-2 is a Metal-precision number and is not inherited.
@@ -333,7 +334,7 @@ fn swapped_or_shared_shifts_change_the_output() {
     // Norm and cosine are reported, never gated: they are the metrics that miss this class.
     println!(
         "  swap rel {sv:.3e}/{sa:.3e}  both-audio rel {ba:.3e}  cosine {:.4}  |L2| {:.3} vs {:.3}",
-        cosine(&both.1, &want_audio),
+        tensor_cosine_f32_sums(&both.1, &want_audio, Denom::FloorAt(1e-12)),
         l2_norm(&both.1),
         l2_norm(&want_audio)
     );

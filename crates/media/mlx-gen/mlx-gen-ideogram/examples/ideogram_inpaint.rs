@@ -9,10 +9,7 @@ use mlx_gen::gen_core::{
     Conditioning, GenerationOutput, GenerationRequest, LoadSpec, OffloadPolicy, WeightsSource,
 };
 use mlx_gen::media::Image;
-
-fn env_or(k: &str, d: &str) -> String {
-    std::env::var(k).unwrap_or_else(|_| d.to_string())
-}
+use mlx_gen::testing::env_or;
 
 fn load_img(path: &str) -> Image {
     let rgb = image::open(path)

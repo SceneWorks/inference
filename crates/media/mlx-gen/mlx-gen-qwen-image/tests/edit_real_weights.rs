@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::max_abs_diff_host;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     CancelFlag, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
@@ -80,13 +81,6 @@ fn rel_errors(a: &Array, b: &Array) -> (f32, f32) {
     (max_diff / peak, (sum_abs_diff / sum_abs_b) as f32)
 }
 
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    a.iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
-}
-
 // Must match tools/dump_qwen_edit_rope_golden.py.
 //
 // NOT `#[ignore]`d: weight-free on both sides. The golden is committed under `tests/fixtures/` and
@@ -105,7 +99,7 @@ fn edit_rope_multi_image_matches_fork() {
     ] {
         let want = g.require(key).unwrap();
         assert_eq!(got.shape(), want.shape(), "{name} shape");
-        let d = max_abs_diff(got, want);
+        let d = max_abs_diff_host(got, want);
         println!("edit rope {name} {:?}: max abs diff {d:.3e}", got.shape());
         assert!(d < 1e-5, "{name} max abs diff {d:.3e}");
     }

@@ -728,6 +728,7 @@ pub fn run_scm_sampler_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::max_abs_diff_slices;
     use candle_core::Device;
     use gen_core::sampling::{
         build_flow_sigmas, compute_mu, denoise, image_seq_len, sampler_by_name, Euler,
@@ -739,12 +740,6 @@ mod tests {
     }
     fn vec1(x: &Tensor) -> Vec<f32> {
         x.flatten_all().unwrap().to_vec1::<f32>().unwrap()
-    }
-    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
-        a.iter()
-            .zip(b)
-            .map(|(&x, &y)| (x - y).abs())
-            .fold(0.0_f32, f32::max)
     }
     /// A constant flow velocity (independent of x) for the exactness check.
     fn const_v() -> Tensor {
@@ -808,7 +803,7 @@ mod tests {
         let want = x_init
             .sub(&v.affine(sigmas[0] as f64, 0.0).unwrap())
             .unwrap();
-        assert!(max_abs(&vec1(&out), &vec1(&want)) < 1e-4);
+        assert!(max_abs_diff_slices(&vec1(&out), &vec1(&want)) < 1e-4);
     }
 
     #[test]
@@ -885,7 +880,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            max_abs(&vec1(&out), &vec1(&legacy)) < 1e-4,
+            max_abs_diff_slices(&vec1(&out), &vec1(&legacy)) < 1e-4,
             "driver euler diverged from inline flow loop"
         );
     }
@@ -1730,21 +1725,13 @@ mod tests {
 #[cfg(test)]
 mod guidance_ops_tests {
     use super::*;
+    use crate::testkit::tensor_max_abs_diff_host;
     use candle_core::Device;
     use gen_core::guidance::{cfg, cfg_rescale, normalized_guidance};
 
     /// A [B=1, seq=2, C=3] tensor (per-token channel-axis geometry, the Lens case).
     fn t(data: &[f32]) -> Tensor {
         Tensor::from_vec(data.to_vec(), (1usize, 2, 3), &Device::Cpu).unwrap()
-    }
-
-    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
-        let av = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let bv = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        av.iter()
-            .zip(&bv)
-            .map(|(&x, &y)| (x - y).abs())
-            .fold(0.0_f32, f32::max)
     }
 
     fn pair() -> (Tensor, Tensor) {
@@ -1762,7 +1749,7 @@ mod guidance_ops_tests {
             .add(&cond.sub(&uncond).unwrap().affine(4.0, 0.0).unwrap())
             .unwrap();
         assert!(
-            max_abs(&got, &want) < 1e-4,
+            tensor_max_abs_diff_host(&got, &want) < 1e-4,
             "cfg over candle != hand combine"
         );
     }
@@ -1785,7 +1772,7 @@ mod guidance_ops_tests {
         let ratio = cond_norm.broadcast_div(&denom).unwrap();
         let want = comb.broadcast_mul(&ratio).unwrap();
         assert!(
-            max_abs(&got, &want) < 1e-4,
+            tensor_max_abs_diff_host(&got, &want) < 1e-4,
             "cfg_rescale over candle != Lens formula"
         );
     }
@@ -1800,7 +1787,7 @@ mod guidance_ops_tests {
             normalized_guidance(&ops, &cond, &uncond, 4.0, None, 1.0, 0.0, &shape, &[-1]).unwrap();
         let want = cfg(&ops, &cond, &uncond, 4.0).unwrap();
         assert!(
-            max_abs(&got, &want) < 1e-4,
+            tensor_max_abs_diff_host(&got, &want) < 1e-4,
             "apg(eta=1,nt=0) over candle != cfg"
         );
     }
@@ -1817,7 +1804,7 @@ mod guidance_ops_tests {
         let dot = nd.mul(&cond).unwrap().sum_keepdim(2).unwrap();
         let zeros = dot.zeros_like().unwrap();
         assert!(
-            max_abs(&dot, &zeros) < 1e-3,
+            tensor_max_abs_diff_host(&dot, &zeros) < 1e-3,
             "eta=0 not orthogonal to cond on candle"
         );
     }

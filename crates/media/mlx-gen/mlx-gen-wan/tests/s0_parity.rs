@@ -9,6 +9,7 @@ use mlx_gen_wan::patchify::{patchify, unpatchify};
 use mlx_gen_wan::rope::RopeTable;
 use mlx_gen_wan::scheduler::{compute_sigmas, SolverKind};
 
+use mlx_gen::testing::max_abs_diff_slices;
 use mlx_rs::Array;
 use serde_json::Value;
 
@@ -25,20 +26,6 @@ fn as_f32_vec(v: &Value) -> Vec<f32> {
         .iter()
         .map(|x| x.as_f64().unwrap() as f32)
         .collect()
-}
-
-fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(
-        a.len(),
-        b.len(),
-        "length mismatch {} vs {}",
-        a.len(),
-        b.len()
-    );
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f32, f32::max)
 }
 
 #[test]
@@ -58,7 +45,7 @@ fn sigmas_and_timesteps_match_reference() {
             .map(|&s| (s * nt).trunc())
             .collect();
 
-        let sd = max_abs_diff(&sigmas, &ref_sigmas);
+        let sd = max_abs_diff_slices(&sigmas, &ref_sigmas);
         assert!(sd < 1e-6, "[{name}] sigma max|Δ| = {sd}");
         // Integer timesteps must match the reference exactly (model is trained on integer t).
         assert_eq!(ts, ref_ts, "[{name}] integer timesteps differ");
@@ -84,8 +71,8 @@ fn rope_cos_sin_matches_reference() {
     let cos = cos.as_slice::<f32>().to_vec();
     let sin = sin.as_slice::<f32>().to_vec();
 
-    let cd = max_abs_diff(&cos, &ref_cos);
-    let sd = max_abs_diff(&sin, &ref_sin);
+    let cd = max_abs_diff_slices(&cos, &ref_cos);
+    let sd = max_abs_diff_slices(&sin, &ref_sin);
     // cos/sin built in f64 then cast f32 in both impls → expect ≤ a couple f32 ULPs.
     assert!(cd < 1e-6, "rope cos max|Δ| = {cd}");
     assert!(sd < 1e-6, "rope sin max|Δ| = {sd}");

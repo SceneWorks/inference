@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::testkit::{env_path, tensor_max_abs, tensor_peak_rel};
 use candle_gen::Weights;
 use candle_gen_mochi::{encode_prompt, load_tokenizer, MochiT5};
 
@@ -25,25 +26,7 @@ const GOLDEN: &str = concat!(
 );
 
 fn snapshot_dir() -> PathBuf {
-    std::env::var("MOCHI_SNAPSHOT")
-        .expect("set MOCHI_SNAPSHOT to the mochi-1-preview snapshot dir")
-        .into()
-}
-
-fn max_abs(t: &Tensor) -> f32 {
-    t.abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-}
-
-/// `max|got − want| / max|want|` — peak relative error.
-fn peak_rel(got: &Tensor, want: &Tensor) -> f32 {
-    let got = got.to_dtype(DType::F32).unwrap();
-    let want = want.to_dtype(DType::F32).unwrap();
-    max_abs(&(&got - &want).unwrap()) / max_abs(&want).max(1e-12)
+    env_path("MOCHI_SNAPSHOT")
 }
 
 /// Peak relative error over the **real (unmasked) token rows only** — zero out padded positions in
@@ -51,7 +34,7 @@ fn peak_rel(got: &Tensor, want: &Tensor) -> f32 {
 /// so a full-tensor `peak_rel` is dominated by padding-noise (worst on the empty negative).
 fn masked_peak_rel(got: &Tensor, want: &Tensor, mask: &Tensor) -> f32 {
     let (got, want) = masked_pair(got, want, mask);
-    peak_rel(&got, &want)
+    tensor_peak_rel(&got, &want, Some(1e-12))
 }
 
 /// Zero out padded token rows in both tensors via `mask [1, L]`.
@@ -91,7 +74,7 @@ fn masked_mean_rel(got: &Tensor, want: &Tensor, mask: &Tensor) -> f32 {
         .unwrap()
         .to_scalar::<f32>()
         .unwrap();
-    (sum_abs / n_real.max(1.0)) / max_abs(&want).max(1e-12)
+    (sum_abs / n_real.max(1.0)) / tensor_max_abs(&want).max(1e-12)
 }
 
 #[test]
@@ -110,13 +93,15 @@ fn t5_encode_matches_golden() {
     let neg = encode_prompt(&tok, &t5, NEGATIVE, &device).expect("encode negative");
 
     // Masks are exact 0/1 — must match bit-for-bit.
-    let pos_mask_rel = peak_rel(
+    let pos_mask_rel = tensor_peak_rel(
         &pos.prompt_attention_mask,
         &g.require("prompt_attention_mask").unwrap(),
+        Some(1e-12),
     );
-    let neg_mask_rel = peak_rel(
+    let neg_mask_rel = tensor_peak_rel(
         &neg.prompt_attention_mask,
         &g.require("negative_prompt_attention_mask").unwrap(),
+        Some(1e-12),
     );
     eprintln!("TE masks: prompt {pos_mask_rel:.3e}  negative {neg_mask_rel:.3e}");
     assert_eq!(pos_mask_rel, 0.0, "prompt_attention_mask must be exact");

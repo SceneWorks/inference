@@ -18,6 +18,7 @@
 
 use std::time::Instant;
 
+use mlx_gen::testing::max_abs_diff;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::{add, multiply, power, subtract, tanh};
 use mlx_rs::transforms::compile::{compile, CallMut, Compile};
@@ -94,11 +95,6 @@ fn normal(shape: &[i32]) -> Array {
     x
 }
 
-fn max_abs_diff(a: &Array, b: &Array) -> f64 {
-    let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
-    mlx_rs::ops::max(&d, None).unwrap().item::<f32>() as f64
-}
-
 #[test]
 #[ignore = "perf microbenchmark (no weights) — run with --ignored --nocapture"]
 fn compile_glue_micro() {
@@ -119,10 +115,10 @@ fn compile_glue_micro() {
         let oneshot = bench(warmup, iters, || compile(gelu_body, true)(&x).unwrap());
         let mut held = gelu_body.compile(true);
         let heldt = bench(warmup, iters, || held.call_mut(&x).unwrap());
-        let diff = max_abs_diff(
+        let diff = f64::from(max_abs_diff(
             &gelu_body(&x).unwrap(),
             &compile(gelu_body, true)(&x).unwrap(),
-        );
+        ));
         println!(
             "[gelu_tanh f32 {b}x{s}x{ffn}] eager={eager:.3} oneshot={oneshot:.3} held={heldt:.3} ms \
              | held speedup={:.2}× saved/call={:.3}ms ×48={:.1}ms | max|Δ|={diff:.2e}",
@@ -143,10 +139,10 @@ fn compile_glue_micro() {
         });
         let mut held = modulate_body.compile(true);
         let heldt = bench(warmup, iters, || held.call_mut((&m, &sc, &sh)).unwrap());
-        let diff = max_abs_diff(
+        let diff = f64::from(max_abs_diff(
             &modulate_body((&m, &sc, &sh)).unwrap(),
             &compile(modulate_body, true)((&m, &sc, &sh)).unwrap(),
-        );
+        ));
         println!(
             "[modulate f32 {b}x{s}x{dim}] eager={eager:.3} oneshot={oneshot:.3} held={heldt:.3} ms \
              | held speedup={:.2}× saved/call={:.3}ms ×192={:.1}ms | max|Δ|={diff:.2e}",
@@ -167,10 +163,10 @@ fn compile_glue_micro() {
         });
         let mut held = gated_body.compile(true);
         let heldt = bench(warmup, iters, || held.call_mut((&x, &o, &g)).unwrap());
-        let diff = max_abs_diff(
+        let diff = f64::from(max_abs_diff(
             &gated_body((&x, &o, &g)).unwrap(),
             &compile(gated_body, true)((&x, &o, &g)).unwrap(),
-        );
+        ));
         println!(
             "[gated f32 {b}x{s}x{dim}] eager={eager:.3} oneshot={oneshot:.3} held={heldt:.3} ms \
              | held speedup={:.2}× saved/call={:.3}ms ×144={:.1}ms | max|Δ|={diff:.2e}",
@@ -195,10 +191,10 @@ fn compile_glue_micro() {
         let heldt = bench(warmup, iters, || {
             held.call_mut(&args).unwrap().pop().unwrap()
         });
-        let diff = max_abs_diff(
+        let diff = f64::from(max_abs_diff(
             &rope_body(&args).unwrap()[0],
             &compile(rope_body, true)(&args).unwrap()[0],
-        );
+        ));
         println!(
             "[rope_rotate f32 {b}x{heads}x{s}x{half}] eager={eager:.3} oneshot={oneshot:.3} held={heldt:.3} ms \
              | held speedup={:.2}× saved/call={:.3}ms ×96={:.1}ms | max|Δ|={diff:.2e}",

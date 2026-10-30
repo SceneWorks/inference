@@ -42,7 +42,7 @@ use candle_gen_minimax_h3::adapters::{
 };
 use candle_gen_minimax_h3::{MiniMaxH3Dit, MiniMaxH3DitConfig};
 
-use candle_gen::testkit::sha256_file;
+use candle_gen::testkit::{sha256_file, tensor_max_abs, tensor_peak_rel_or_abs};
 use common::{dit_fixture_config, weights, Golden, DIT_FIXTURE};
 
 /// The published rank — every one of the seven turbo files is rank 128. Used verbatim in the tiny
@@ -220,30 +220,6 @@ fn tiny_dit_on(cfg: &MiniMaxH3DitConfig, device: &Device) -> MiniMaxH3Dit {
         .collect();
     let w = weights(tensors);
     MiniMaxH3Dit::from_weights(&w, cfg, device, DType::F32).expect("the whole tiny DiT")
-}
-
-/// **Relative max-abs-diff**, the only honest gate for this defect class. `max|a-b| / max|b|`.
-fn rel_max_abs(a: &Tensor, b: &Tensor) -> f32 {
-    assert_eq!(a.dims(), b.dims(), "shape");
-    let d = max_abs(&(a - b).expect("difference"));
-    let scale = max_abs(b);
-    if scale == 0.0 {
-        return d;
-    }
-    d / scale
-}
-
-fn max_abs(t: &Tensor) -> f32 {
-    t.to_dtype(DType::F32)
-        .expect("f32")
-        .abs()
-        .expect("abs")
-        .flatten_all()
-        .expect("flat")
-        .max(0)
-        .expect("max")
-        .to_scalar::<f32>()
-        .expect("scalar")
 }
 
 /// Independent row-major Kronecker construction used only by the LoKr oracle. This deliberately
@@ -511,7 +487,7 @@ fn the_install_folds_at_the_published_strength() {
         .unwrap()
         .reshape((1, 5, out))
         .unwrap();
-    let drift = rel_max_abs(&got, &want);
+    let drift = tensor_peak_rel_or_abs(&got, &want);
     println!("[alpha=128] rel-max-abs vs an independent x·Aᵀ·Bᵀ = {drift:.3e}");
     assert!(
         drift < 1e-2,
@@ -521,9 +497,9 @@ fn the_install_folds_at_the_published_strength() {
     // ── ratio: alpha 8 is 1/16 of alpha 128, and an ABSENT alpha equals a declared 8.
     let a8 = write_lora(dir.path(), "a8.safetensors", &cfg, Some("8"));
     let none = write_lora(dir.path(), "none.safetensors", &cfg, None);
-    let r128 = max_abs(&got);
-    let r8 = max_abs(&probe_residual(&cfg, &a8, 1.0, &x));
-    let rnone = max_abs(&probe_residual(&cfg, &none, 1.0, &x));
+    let r128 = tensor_max_abs(&got);
+    let r8 = tensor_max_abs(&probe_residual(&cfg, &a8, 1.0, &x));
+    let rnone = tensor_max_abs(&probe_residual(&cfg, &none, 1.0, &x));
     assert!(
         ((r8 / r128) - 0.0625).abs() < 1e-3,
         "alpha=8 must fold at 1/16 of alpha=128; got {}",
@@ -536,14 +512,14 @@ fn the_install_folds_at_the_published_strength() {
     );
 
     // ── the user's strength multiplies the fold, and a zero strength is exactly inert.
-    let r_half = max_abs(&probe_residual(&cfg, &a128, 0.5, &x));
+    let r_half = tensor_max_abs(&probe_residual(&cfg, &a128, 0.5, &x));
     assert!(
         ((r_half / r128) - 0.5).abs() < 1e-3,
         "AdapterSpec::scale must multiply the fold; got {}",
         r_half / r128
     );
     assert_eq!(
-        max_abs(&probe_residual(&cfg, &a128, 0.0, &x)),
+        tensor_max_abs(&probe_residual(&cfg, &a128, 0.0, &x)),
         0.0,
         "a zero-strength adapter must be byte-identical to the bare base"
     );
@@ -735,7 +711,7 @@ fn lokr_matches_an_independent_dense_kron_and_rejects_mutant_results() {
     let actual = (y1 - y0).unwrap();
     let effective = 7.0 / 5.0 * strength;
     let expected = explicit_dense_residual(&x, &explicit_kron(&w1, &w2, effective));
-    let drift = rel_max_abs(&actual, &expected);
+    let drift = tensor_peak_rel_or_abs(&actual, &expected);
     assert!(
         drift < 2e-5,
         "structured vs explicit kron drift {drift:.3e}"
@@ -752,7 +728,7 @@ fn lokr_matches_an_independent_dense_kron_and_rejects_mutant_results() {
         ("swap-w1-w2", swapped),
         ("drop-alpha-rank-strength", dropped_scale),
     ] {
-        let separation = rel_max_abs(&actual, &mutant);
+        let separation = tensor_peak_rel_or_abs(&actual, &mutant);
         assert!(
             separation > 1e-2,
             "the oracle must fail the plausible {name} mutation, separation was only {separation:.3e}"
@@ -850,7 +826,7 @@ fn fused_qkv_and_mlp_lokr_cover_the_complete_block_surface_numerically() {
             .unwrap();
         }
         let expected = explicit_dense_residual(&x, &delta);
-        let drift = rel_max_abs(&actual, &expected);
+        let drift = tensor_peak_rel_or_abs(&actual, &expected);
         assert!(drift < 2e-5, "{target}: rel-max-abs {drift:.3e}");
     }
 
@@ -1014,7 +990,7 @@ fn manual_cuda_fabricated_lokr_install_receipt() {
         .expect("copy CUDA residual to host oracle");
     let effective = 7.0 / 5.0 * strength;
     let expected = explicit_dense_residual(&x_cpu, &explicit_kron(&w1, &w2, effective));
-    let drift = rel_max_abs(&actual, &expected);
+    let drift = tensor_peak_rel_or_abs(&actual, &expected);
     assert!(
         drift < 2e-5,
         "structured vs explicit CUDA kron drift {drift:.3e}"
@@ -1105,7 +1081,7 @@ fn a_peft_blob_supplies_the_alpha_and_its_rank_is_only_a_cross_check() {
     let top = write_lora(dir.path(), "top_alpha128.safetensors", &cfg, Some("128"));
     let r_blob = probe_residual(&cfg, &blob, 1.0, &x);
     let r_top = probe_residual(&cfg, &top, 1.0, &x);
-    let drift = rel_max_abs(&r_blob, &r_top);
+    let drift = tensor_peak_rel_or_abs(&r_blob, &r_top);
     println!("[peft blob] rel-max-abs vs top-level alpha=128 = {drift:.3e}");
     assert!(
         drift < 1e-6,
@@ -1113,7 +1089,7 @@ fn a_peft_blob_supplies_the_alpha_and_its_rank_is_only_a_cross_check() {
          {drift:.3e}"
     );
     let none = write_lora(dir.path(), "blob_none.safetensors", &cfg, None);
-    let ratio = max_abs(&probe_residual(&cfg, &none, 1.0, &x)) / max_abs(&r_blob);
+    let ratio = tensor_max_abs(&probe_residual(&cfg, &none, 1.0, &x)) / tensor_max_abs(&r_blob);
     assert!(
         (ratio - 0.0625).abs() < 1e-5,
         "…and the blob alpha must WIN over DEFAULT_LORA_ALPHA, which would have given 1.0; got \
@@ -1149,7 +1125,7 @@ fn a_peft_blob_supplies_the_alpha_and_its_rank_is_only_a_cross_check() {
             ("lora_adapter_metadata", r#"{"r": 128, "lora_alpha": 8}"#),
         ],
     );
-    let drift = rel_max_abs(&probe_residual(&cfg, &both, 1.0, &x), &r_top);
+    let drift = tensor_peak_rel_or_abs(&probe_residual(&cfg, &both, 1.0, &x), &r_top);
     assert!(
         drift < 1e-6,
         "an in-band .alpha of 128 must outrank BOTH a blob lora_alpha of 8 and a top-level alpha \
@@ -1473,7 +1449,7 @@ fn trainer_namespace_converts_to_independent_expected_factors_at_relative_max_ab
             ("lora_B.weight", &qkv[index].1),
         ] {
             let key = format!("transformer_blocks.0.attn.{name}.{suffix}");
-            let drift = rel_max_abs(got.get(&key).unwrap(), expected);
+            let drift = tensor_peak_rel_or_abs(got.get(&key).unwrap(), expected);
             assert!(
                 drift <= 1e-6,
                 "{key}: trainer conversion drifted at relative max-abs {drift:.3e}"
@@ -1481,7 +1457,7 @@ fn trainer_namespace_converts_to_independent_expected_factors_at_relative_max_ab
         }
         let key = format!("transformer_blocks.0.attn.{name}.alpha");
         let expected = Tensor::new(&[FUSED_ALPHA], &dev()).unwrap();
-        let drift = rel_max_abs(got.get(&key).unwrap(), &expected);
+        let drift = tensor_peak_rel_or_abs(got.get(&key).unwrap(), &expected);
         assert!(
             drift <= 1e-6,
             "{key}: trainer/raw conversion drifted at relative max-abs {drift:.3e}"
@@ -1489,11 +1465,11 @@ fn trainer_namespace_converts_to_independent_expected_factors_at_relative_max_ab
     }
     for (suffix, expected) in [("lora_A.weight", &fc1.0), ("lora_B.weight", &fc1.1)] {
         let key = format!("transformer_blocks.0.ff.net.0.proj.{suffix}");
-        let drift = rel_max_abs(got.get(&key).unwrap(), expected);
+        let drift = tensor_peak_rel_or_abs(got.get(&key).unwrap(), expected);
         assert!(drift <= 1e-6, "{key}: relative max-abs {drift:.3e}");
     }
     let expected = Tensor::new(&[FC1_ALPHA], &dev()).unwrap();
-    let drift = rel_max_abs(
+    let drift = tensor_peak_rel_or_abs(
         got.get("transformer_blocks.0.ff.net.0.proj.alpha").unwrap(),
         &expected,
     );
@@ -1608,16 +1584,16 @@ fn assert_twin_equivalence(spelling: AlphaSpelling) {
             let want = residual(&diffusers);
             let got = residual(&comfy);
             assert!(
-                max_abs(&want) > 1e-4,
+                tensor_max_abs(&want) > 1e-4,
                 "{probe}: the twin's own residual must be non-trivial, else the comparison is \
                  vacuous"
             );
-            let drift = rel_max_abs(&got, &want);
+            let drift = tensor_peak_rel_or_abs(&got, &want);
             // The **fold ratio** is the quantity the defect is stated in — an undivided alpha on a
             // block-diagonal split reads 3.007×, and the fix reads 1.000×. Printed alongside the
             // gated relative max-abs-diff (never cosine: a pure fold-ratio error is exactly a scale
             // error, and cosine is scale-invariant).
-            let ratio = max_abs(&got) / max_abs(&want);
+            let ratio = tensor_max_abs(&got) / tensor_max_abs(&want);
             println!(
                 "[{label}] {probe}: fold ratio {ratio:.4}x, converted-vs-twin rel-max-abs = \
                  {drift:.3e}"
@@ -1974,7 +1950,7 @@ fn block_diagonality_is_measured_on_the_bytes_not_inferred_from_the_shape() {
         assert_eq!(other.dims(), a.dims());
     }
     assert_ne!(
-        max_abs(
+        tensor_max_abs(
             &(converted
                 .get("transformer_blocks.0.attn.to_q.lora_B.weight")
                 .unwrap()
@@ -2084,7 +2060,7 @@ fn the_render_seam_folds_the_staged_adapter_onto_the_dit() {
     // Separate loads can own distinct CUDA contexts even on the same GPU.
     let y0 = y0.to_device(&Device::Cpu).unwrap();
     let y1 = y1.to_device(&Device::Cpu).unwrap();
-    let residual = max_abs(&(y1 - y0).unwrap());
+    let residual = tensor_max_abs(&(y1 - y0).unwrap());
     assert!(
         residual > 1e-4,
         "the staged adapter must CHANGE the render's DiT; got a residual of {residual:.3e}, which \
@@ -2298,7 +2274,7 @@ fn shared_a_fused_qkv_oracle_casts_raw_f32_factors_to_bf16_probe_dtype() {
         .contiguous()
         .unwrap();
     assert!(
-        rel_max_abs(&q_up, &k_up) > 1e-2,
+        tensor_peak_rel_or_abs(&q_up, &k_up) > 1e-2,
         "synthetic Q and K slices must be independently distinguishable"
     );
     let native_down = independent_factor_at_activation_dtype(&x, &down);
@@ -2310,7 +2286,7 @@ fn shared_a_fused_qkv_oracle_casts_raw_f32_factors_to_bf16_probe_dtype() {
         "the runtime receipt must retain its non-unit strength"
     );
     assert!(
-        rel_max_abs(&native_down.to_dtype(DType::F32).unwrap(), &down) > 1e-6,
+        tensor_peak_rel_or_abs(&native_down.to_dtype(DType::F32).unwrap(), &down) > 1e-6,
         "synthetic raw factors must not already be BF16-exact"
     );
 }
@@ -2542,7 +2518,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
         )
     };
     let base = base_native.to_dtype(DType::F32).unwrap();
-    let base_peak = max_abs(&base);
+    let base_peak = tensor_max_abs(&base);
     assert!(
         base_peak.is_finite() && base_peak > 1e-6,
         "real base projection is non-finite or vacuous: max|y|={base_peak:.3e}"
@@ -2587,14 +2563,14 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
         .unwrap()
         .to_dtype(DType::F32)
         .unwrap();
-    let expected_peak = max_abs(&expected_delta);
+    let expected_peak = tensor_max_abs(&expected_delta);
     let relative_max_abs_diff = expected_peak / base_peak;
     assert!(
         relative_max_abs_diff.is_finite() && relative_max_abs_diff > 1e-6,
         "the exact trainer LoRA did not measurably change the real {probe} forward: \
          relative-max-abs-diff={relative_max_abs_diff:.3e}"
     );
-    let residual_correctness_rel_max = rel_max_abs(&observed_delta, &expected_delta);
+    let residual_correctness_rel_max = tensor_peak_rel_or_abs(&observed_delta, &expected_delta);
     assert!(
         residual_correctness_rel_max.is_finite()
             && residual_correctness_rel_max <= SC21028_RUNTIME_RESIDUAL_REL_MAX,

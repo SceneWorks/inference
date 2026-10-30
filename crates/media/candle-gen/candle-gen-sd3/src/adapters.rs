@@ -844,18 +844,10 @@ pub fn install_additive(dit: &mut Sd3Transformer, specs: &[AdapterSpec]) -> Resu
 mod tests {
     use super::*;
     use candle_gen::candle_core::{safetensors as cst, DType, Device};
+    use candle_gen::testkit::tensor_max_abs;
 
     fn t2(data: &[f32], r: usize, c: usize) -> Tensor {
         Tensor::from_vec(data.to_vec(), (r, c), &Device::Cpu).unwrap()
-    }
-
-    fn max_abs(t: &Tensor) -> f32 {
-        t.abs()
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
     }
 
     /// A tiny stand-in for the base MMDiT tensor map at `inner = 4`: one full joint block's split
@@ -1109,7 +1101,7 @@ mod tests {
                 .unwrap();
             let expected = full.narrow(0, i * 4, 4).unwrap();
             assert!(
-                max_abs(&(merged - expected).unwrap()) < 1e-4,
+                tensor_max_abs(&(merged - expected).unwrap()) < 1e-4,
                 "{proj} slice mismatch"
             );
         }
@@ -1145,7 +1137,7 @@ mod tests {
             .to_dtype(DType::F32)
             .unwrap();
         let expected = reconstruct_lora_delta(&down, &up, 4.0, 2.0, 1.0).unwrap();
-        assert!(max_abs(&(merged - expected).unwrap()) < 1e-4);
+        assert!(tensor_max_abs(&(merged - expected).unwrap()) < 1e-4);
     }
 
     /// A 2-D LoRA targeting the conv `x_embedder` (`pos_embed.proj`, a 4-D base) is surfaced as skipped,
@@ -1249,7 +1241,7 @@ mod tests {
         for (key, original) in bases {
             let merged = map.get(&key).unwrap().to_dtype(DType::F32).unwrap();
             assert_eq!(
-                max_abs(&(merged - original).unwrap()),
+                tensor_max_abs(&(merged - original).unwrap()),
                 0.0,
                 "scale-0 merge must be byte-exact with the base at {key}"
             );
@@ -1297,7 +1289,7 @@ mod tests {
             (4, 4),
         )
         .unwrap();
-        assert!(max_abs(&(merged - expected).unwrap()) < 1e-2);
+        assert!(tensor_max_abs(&(merged - expected).unwrap()) < 1e-2);
     }
 
     /// The keystone train→infer round-trip: a PEFT `.safetensors` written by the **actual trainer** path
@@ -1354,9 +1346,9 @@ mod tests {
         )
         .unwrap();
         let merged = map[&format!("{path}.weight")].to_dtype(DType::F32).unwrap();
-        assert!(max_abs(&(&merged - &expected).unwrap()) < 1e-2);
+        assert!(tensor_max_abs(&(&merged - &expected).unwrap()) < 1e-2);
         assert!(
-            max_abs(&expected) > 0.0,
+            tensor_max_abs(&expected) > 0.0,
             "forced-nonzero B must be non-trivial"
         );
     }
@@ -1405,7 +1397,8 @@ mod tests {
         let folded =
             AdaptLinear::from_dense(Linear::new((w + delta).unwrap(), None), in_dim, out_dim);
         let x = Tensor::randn(0f32, 1f32, (2usize, in_dim), &dev).unwrap();
-        let d = max_abs(&(additive.forward(&x).unwrap() - folded.forward(&x).unwrap()).unwrap());
+        let d =
+            tensor_max_abs(&(additive.forward(&x).unwrap() - folded.forward(&x).unwrap()).unwrap());
         assert!(d < 1e-4, "resolved additive != folded ({d})");
 
         #[cfg(feature = "model-inference-proof")]
@@ -1444,7 +1437,7 @@ mod tests {
             // ratio = alpha/rank = 1 (no `.alpha`); b == up[i·inner..]ᵀ.
             let want_b = up.narrow(0, i * inner, inner).unwrap().t().unwrap();
             assert!(
-                max_abs(&(&p.b - &want_b).unwrap()) < 1e-6,
+                tensor_max_abs(&(&p.b - &want_b).unwrap()) < 1e-6,
                 "{proj} up-slice mismatch"
             );
         }

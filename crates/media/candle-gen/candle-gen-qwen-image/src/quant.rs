@@ -69,6 +69,7 @@ mod tests {
     use candle_gen::candle_core::safetensors::MmapedSafetensors;
     use candle_gen::candle_core::{DType, Device, Tensor};
     use candle_gen::candle_nn::Linear;
+    use candle_gen::testkit::tensor_cosine;
     use std::collections::HashMap;
 
     /// Test-side MLX Q4 packer: per-element 4-bit codes → MLX u32 words (LSB-first nibbles), group `G`.
@@ -102,18 +103,6 @@ mod tests {
         let s = Tensor::from_vec(scales, (out_dim, gpr), &dev).unwrap();
         let b = Tensor::from_vec(biases, (out_dim, gpr), &dev).unwrap();
         (wq, s, b, grid)
-    }
-
-    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (x, y) in a.iter().zip(&b) {
-            dot += (*x as f64) * (*y as f64);
-            na += (*x as f64) * (*x as f64);
-            nb += (*y as f64) * (*y as f64);
-        }
-        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
     }
 
     /// **Packed-detect fires on the real Qwen-Image DiT key layout (the `attn.to_out.0` nesting + a
@@ -168,7 +157,7 @@ mod tests {
             out_dim,
         );
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
+        let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?) as f32;
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
 
         #[cfg(feature = "model-inference-proof")]
@@ -205,7 +194,7 @@ mod tests {
             out_dim,
         );
         let x = Tensor::randn(0f32, 1f32, (3, in_dim), &dev)?;
-        let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
+        let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?) as f32;
         assert!(cos > 0.99999, "group-32 packed vs grid cosine {cos:.6}");
 
         #[cfg(feature = "model-inference-proof")]
@@ -243,7 +232,7 @@ mod tests {
             out_dim,
         );
         let x = Tensor::randn(0f32, 1f32, (2, in_dim), &dev)?;
-        let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
+        let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?) as f32;
         assert!(cos > 0.99999, "bias-less packed vs grid cosine {cos:.6}");
 
         #[cfg(feature = "model-inference-proof")]

@@ -46,7 +46,7 @@ use std::path::PathBuf;
 use candle_gen::gen_core::{
     GenerationRequest, Image, LoadSpec, PreviewFrame, Progress, WeightsSource,
 };
-use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::save_rgb8_png_in;
 use candle_gen::testkit::sha256_file;
 use candle_gen::testkit::{
     collecting_sink, correlation, downsample_nearest, downsample_nearest_raw, env_path_opt,
@@ -161,16 +161,10 @@ fn the_decode_vae_is_a_different_checkpoint_and_that_is_recorded() {
 
 // ── Frame analysis helpers ────────────────────────────────────────────────────────────────────────
 
-fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let path = artifact_dir().join(name);
-    save_rgb8_png(&path, pixels, width, height);
-    eprintln!("  wrote {}", path.display());
-}
-
 /// Lay the strip out as one horizontal contact sheet so a reviewer sees the progression at a glance.
 fn save_strip(frames: &[PreviewFrame], name: &str) {
     let (sheet, width, height) = preview_strip_sheet(frames);
-    save_png(&sheet, width, height, name);
+    save_rgb8_png_in(&artifact_dir(), name, &sheet, width, height);
 }
 
 /// The shared strip analysis: numbering, latent resolution, per-frame movement, falling distance to
@@ -423,11 +417,12 @@ fn assert_lane_previews_converge(
     let frames = candle_gen::lock_recover(&frames).clone();
     assert_the_strip_converges(label, &frames, &live, steps, size, size, min_r_last);
     save_strip(&frames, &format!("{label}-strip.png"));
-    save_png(
+    save_rgb8_png_in(
+        &artifact_dir(),
+        &format!("{label}-final.png"),
         &live.pixels,
         live.width,
         live.height,
-        &format!("{label}-final.png"),
     );
     (events, frames)
 }

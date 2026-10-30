@@ -41,6 +41,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::env_path_or_home;
 use mlx_gen::{
     AdapterKind, AdapterSpec, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec,
     WeightsSource,
@@ -91,11 +92,10 @@ fn install_count(lora: &std::path::Path) -> usize {
 }
 
 fn snapshot_dir() -> PathBuf {
-    std::env::var("KREA_REALTIME_SNAPSHOT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/krea-realtime-mlx-convert")
-        })
+    env_path_or_home(
+        "KREA_REALTIME_SNAPSHOT_DIR",
+        ".cache/krea-realtime-mlx-convert",
+    )
 }
 
 fn env_usize(key: &str, default: usize) -> usize {

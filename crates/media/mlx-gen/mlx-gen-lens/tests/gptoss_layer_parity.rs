@@ -11,10 +11,9 @@
 //!
 //! Run: `cargo test -p mlx-gen-lens --test integration gptoss_layer_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{multiply, sum};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::testing::peak_rel;
+use mlx_gen::testing::{cosine_device_sums, peak_rel, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_lens::config::GptOssConfig;
 use mlx_gen_lens::text_encoder::gpt_oss::{attention_mask, GptOssDecoderLayer};
@@ -23,22 +22,6 @@ const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/lens_gptoss_layer_golden.safetensors"
 );
-
-/// Cosine similarity over the flattened tensors — robust to the output's wide dynamic range.
-fn cosine(got: &Array, want: &Array) -> f32 {
-    let dot = sum(multiply(got, want).unwrap(), None)
-        .unwrap()
-        .item::<f32>();
-    let na = sum(multiply(got, got).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    let nb = sum(multiply(want, want).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    dot / (na * nb).max(1e-12)
-}
 
 #[test]
 #[ignore = "needs tools/golden/lens_gptoss_layer_golden.safetensors (dump_lens_gptoss_layer_golden.py)"]
@@ -59,7 +42,7 @@ fn gptoss_decoder_layer_matches_reference() {
     let moe_pr = peak_rel(&moe_out, want);
     eprintln!(
         "gpt-oss MoE: cosine {:.7} peak_rel {moe_pr:.3e}",
-        cosine(&moe_out, want)
+        cosine_device_sums(&moe_out, want, Denom::FloorAt(1e-12))
     );
     assert!(moe_pr < 2e-2, "MoE peak_rel {moe_pr:.3e} exceeds tol 2e-2");
 
@@ -74,7 +57,7 @@ fn gptoss_decoder_layer_matches_reference() {
     // not a structural bug — the MoE sub-block is cosine 1.0000000. cosine reported for whole-output.
     eprintln!(
         "gpt-oss decoder-layer: cosine {:.7} peak_rel {pr:.3e}",
-        cosine(&out, want)
+        cosine_device_sums(&out, want, Denom::FloorAt(1e-12))
     );
     assert!(
         pr < 2e-2,

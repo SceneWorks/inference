@@ -19,6 +19,7 @@
 //!   cargo test -p candle-gen-lens --features cuda --test integration e2e_parity:: -- --nocapture
 
 use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::testkit::{tensor_cosine, tensor_peak_rel_host_f64};
 use candle_gen_lens::text::LensTokenizer;
 use candle_gen_lens::LensGenerator;
 
@@ -30,31 +31,6 @@ const LATENT_H: usize = 32; // 512 / 16
 const LATENT_W: usize = 32;
 const NUM_STEPS: usize = 4;
 const GUIDANCE: f32 = 1.0;
-
-fn cosine(a: &Tensor, b: &Tensor) -> Result<f32, AnyErr> {
-    let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    assert_eq!(a.len(), b.len(), "shape mismatch in cosine");
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += (*x as f64) * (*y as f64);
-        na += (*x as f64) * (*x as f64);
-        nb += (*y as f64) * (*y as f64);
-    }
-    Ok((dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32)
-}
-
-fn peak_rel(a: &Tensor, b: &Tensor) -> Result<f32, AnyErr> {
-    let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let mut max_diff = 0f64;
-    let mut max_b = 0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        max_diff = max_diff.max((*x - *y).abs() as f64);
-        max_b = max_b.max((*y).abs() as f64);
-    }
-    Ok((max_diff / max_b.max(1e-12)) as f32)
-}
 
 fn std_of(t: &Tensor) -> Result<f32, AnyErr> {
     let v = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
@@ -121,13 +97,13 @@ fn lens_e2e_matches_reference() -> Result<(), AnyErr> {
     )?;
 
     // 3. Final latents (the tightest e2e signal: encoder + DiT + scheduler + CFG, pre-VAE).
-    let lat_cos = cosine(&latents, &g["final_latents"])?;
-    let lat_pr = peak_rel(&latents, &g["final_latents"])?;
+    let lat_cos = tensor_cosine(&latents, &g["final_latents"]) as f32;
+    let lat_pr = tensor_peak_rel_host_f64(&latents, &g["final_latents"], Some(1e-12)) as f32;
     eprintln!("final latents: cosine={lat_cos:.5}  peak_rel={lat_pr:.3e}");
 
     // 4. Decoded image (full e2e incl. the VAE shim); both in [-1, 1].
-    let img_cos = cosine(&decoded, &g["image"])?;
-    let img_pr = peak_rel(&decoded, &g["image"])?;
+    let img_cos = tensor_cosine(&decoded, &g["image"]) as f32;
+    let img_pr = tensor_peak_rel_host_f64(&decoded, &g["image"], Some(1e-12)) as f32;
     let (got_std, want_std) = (std_of(&decoded)?, std_of(&g["image"])?);
     eprintln!(
         "image: cosine={img_cos:.5}  peak_rel={img_pr:.3e}  std got={got_std:.4} / ref={want_std:.4}"

@@ -15,6 +15,7 @@
 
 use crate::common;
 
+use mlx_gen::testing::peak_rel_host;
 use mlx_gen::weights::Weights;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource};
 use mlx_gen_sdxl::config::DiffusionConfig;
@@ -40,19 +41,6 @@ const GOLDEN: &str = concat!(
 const DT: Dtype = Dtype::Float16;
 
 use common::snapshot;
-
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    // Cast to f32 before reading — the fp16 path's latents are f16, and the golden saves them as f32.
-    let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
-    a.iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
-        / peak
-}
 
 /// Pixels differing by > `thr` (0..255) between two RGB8 buffers, as a fraction.
 fn px_frac(a: &[u8], b: &[u8], thr: i32) -> f32 {
@@ -100,7 +88,7 @@ fn accumulate_from_own_prior() {
         .unwrap();
     println!(
         "own prior vs golden: peak_rel={:.3e}",
-        peak_rel(&lat, g.require("prior").unwrap())
+        peak_rel_host(&lat, g.require("prior").unwrap(), None)
     );
     for (i, (t, t_prev)) in sampler
         .timesteps(steps, sampler.max_time())
@@ -131,7 +119,7 @@ fn accumulate_from_own_prior() {
         lat.eval().unwrap();
         println!(
             "  acc step{i} peak_rel={:.3e}",
-            peak_rel(&lat, g.require(&format!("step{i}_latents")).unwrap())
+            peak_rel_host(&lat, g.require(&format!("step{i}_latents")).unwrap(), None)
         );
     }
 
@@ -156,7 +144,7 @@ fn rng_stream_matches() {
     mlx_rs::random::seed(42).unwrap();
     for i in 0..5 {
         let n = mlx_rs::random::normal::<f32>(&[1, 64, 64, 4], None, None, None).unwrap();
-        let pr = peak_rel(&n, g.require(&format!("draw{i}")).unwrap());
+        let pr = peak_rel_host(&n, g.require(&format!("draw{i}")).unwrap(), None);
         let s = n.reshape(&[-1]).unwrap();
         println!(
             "draw{i} peak_rel={pr:.3e}  rust[0..3]={:?}",
@@ -243,7 +231,7 @@ fn denoise_per_step_matches_golden() {
         .unwrap();
         let out = sampler.step(&ec, &input, t, t_prev).unwrap();
         out.eval().unwrap();
-        let pr = peak_rel(&out, g.require(&format!("step{i}_latents")).unwrap());
+        let pr = peak_rel_host(&out, g.require(&format!("step{i}_latents")).unwrap(), None);
         worst = worst.max(pr);
         println!("  step{i} (t={t}->{t_prev}) peak_rel={pr:.3e}");
     }

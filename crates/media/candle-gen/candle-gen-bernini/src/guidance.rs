@@ -101,6 +101,7 @@ pub fn normalized_guidance_chain(
 mod tests {
     use super::*;
     use candle_gen::candle_core::{Device, Tensor};
+    use candle_gen::testkit::tensor_max_abs_diff;
 
     fn deterministic(seed: f32) -> Tensor {
         // A varied, finite [B=1, C=4, T=2, H=2, W=2] tensor.
@@ -109,19 +110,6 @@ mod tests {
             .map(|i| ((i as f32 * 7.0 + seed * 13.0) % 11.0) - 5.0)
             .collect();
         Tensor::from_vec(v, (1, 4, 2, 2, 2), &Device::Cpu).unwrap()
-    }
-
-    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
-        (a - b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
     }
 
     /// eta=1, norm_threshold=0, no momentum ⇒ APG is EXACTLY plain CFG `uncond + scale·(cond−uncond)`.
@@ -134,7 +122,7 @@ mod tests {
         let got = normalized_guidance(&cond, &uncond, scale, None, 1.0, 0.0).unwrap();
         let want = (&uncond + ((&cond - &uncond).unwrap() * scale as f64).unwrap()).unwrap();
         assert!(
-            max_abs(&got, &want) < 1e-4,
+            tensor_max_abs_diff(&got, &want) < 1e-4,
             "eta=1/nt=0 must equal plain CFG"
         );
         assert_eq!(got.dims(), cond.dims(), "shape preserved");
@@ -153,7 +141,7 @@ mod tests {
         let with_hist = normalized_guidance(&c2, &uncond, 3.0, Some(&mut buf), 0.8, 0.0).unwrap();
         let fresh = normalized_guidance(&c2, &uncond, 3.0, None, 0.8, 0.0).unwrap();
         assert!(
-            max_abs(&with_hist, &fresh) > 1e-4,
+            tensor_max_abs_diff(&with_hist, &fresh) > 1e-4,
             "momentum history must change the second step"
         );
     }

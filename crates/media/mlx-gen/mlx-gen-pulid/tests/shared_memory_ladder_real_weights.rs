@@ -6,6 +6,7 @@ use mlx_gen::gen_core::{
     standard_memory_behavior_context, MemoryBehaviorRoute, MemoryMode, MemoryNumericTier,
     MemoryRunOutcome, MemoryStrategy, MemoryStrategySupport,
 };
+use mlx_gen::testing::{cosine_f32_sums, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Conditioning, GenerationOutput, GenerationRequest, IdentityWeights, LoadShape, LoadSpec,
@@ -36,13 +37,6 @@ fn mean_abs_delta(left: &[u8], right: &[u8]) -> f64 {
         .map(|(&a, &b)| a.abs_diff(b) as f64)
         .sum::<f64>()
         / left.len() as f64
-}
-
-fn cosine(left: &[f32], right: &[f32]) -> f32 {
-    let dot = left.iter().zip(right).map(|(a, b)| a * b).sum::<f32>();
-    let l = left.iter().map(|v| v * v).sum::<f32>().sqrt();
-    let r = right.iter().map(|v| v * v).sum::<f32>().sqrt();
-    dot / (l * r)
 }
 
 fn face_stack(root: &Path) -> FaceAnalysis {
@@ -238,7 +232,11 @@ origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
     let generated_face = generated
         .first()
         .expect("no face detected in the four-step streamed identity render");
-    let identity_cosine = cosine(&reference[0].embedding, &generated_face.embedding);
+    let identity_cosine = cosine_f32_sums(
+        &reference[0].embedding,
+        &generated_face.embedding,
+        Denom::Exact,
+    );
     assert!(
         identity_cosine > 0.30,
         "streamed identity quality collapsed: cosine {identity_cosine}"

@@ -2470,6 +2470,7 @@ dependencies = [
  "pmetal-mlx-sys",
  "safetensors 0.4.5",
  "sceneworks-gen-core",
+ "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
  "sha2",

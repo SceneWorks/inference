@@ -35,6 +35,7 @@
 //! environment so peak is bounded by the single largest model rather than by whatever the
 //! allocator declines to release between rebuilds.
 
+use mlx_gen::testing::{max_abs, max_abs_diff_f32};
 use mlx_gen::weights::Weights;
 use mlx_gen_qwen_image::loader::remap_transformer_keys;
 use mlx_gen_qwen_image::transformer::{set_compile_glue, QwenTransformer, QwenTransformerConfig};
@@ -50,19 +51,6 @@ fn snapshot(env: &str) -> PathBuf {
         std::env::var(env)
             .unwrap_or_else(|_| panic!("set {env} to the snapshot TIER dir (…/bf16, …/q8)")),
     )
-}
-
-fn max_abs(a: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    mlx_rs::ops::max(mlx_rs::ops::abs(&a).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    max_abs(&mlx_rs::ops::subtract(&a, &b).unwrap())
 }
 
 fn gib(b: usize) -> f64 {
@@ -135,15 +123,15 @@ fn row(
     set_compile_glue(false);
 
     let m = max_abs(&e1);
-    let d = max_abs_diff(&c1, &e1);
+    let d = max_abs_diff_f32(&c1, &e1);
     let rel = d / m;
     println!(
         "{label}  max|out|={m:.5}  max|D|={d:.4e}  rel={rel:.4e}  relULP={:.1}  \
          eager-repeat={:.3e}  compiled-repeat={:.3e}  c2-vs-e1={:.4e}",
         rel / ULP,
-        max_abs_diff(&e2, &e1),
-        max_abs_diff(&c2, &c1),
-        max_abs_diff(&c2, &e1),
+        max_abs_diff_f32(&e2, &e1),
+        max_abs_diff_f32(&c2, &c1),
+        max_abs_diff_f32(&c2, &e1),
     );
 }
 
@@ -243,12 +231,12 @@ fn sweep_conditioning(edit: bool) {
         println!("size={size} img_seq={img_seq} max|out|={m:.5}");
 
         let probe = |tag: &str, perturbed: Array| {
-            let in_rel = max_abs_diff(&perturbed, &hidden) / max_abs(&hidden);
+            let in_rel = max_abs_diff_f32(&perturbed, &hidden) / max_abs(&hidden);
             let out = t
                 .forward(&perturbed, &encoder, None, 1.0f32, lat, lat, grids)
                 .unwrap();
             mlx_rs::transforms::eval([&out]).unwrap();
-            let out_rel = max_abs_diff(&out, &base) / m;
+            let out_rel = max_abs_diff_f32(&out, &base) / m;
             println!(
                 "  {tag:<12}: in_rel={in_rel:.4e} ({:.1} inULP) out_rel={out_rel:.4e} \
                  ({:.0} outULP) amplification={:.3e}",

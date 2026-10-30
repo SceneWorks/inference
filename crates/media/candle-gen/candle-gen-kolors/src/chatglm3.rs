@@ -339,6 +339,7 @@ mod tests {
     use crate::tokenizer::KolorsTokens;
     use candle_gen::candle_core::safetensors::MmapedSafetensors;
     use candle_gen::candle_core::DType;
+    use candle_gen::testkit::tensor_cosine;
     use std::collections::HashMap;
 
     const GS: usize = 64;
@@ -529,30 +530,6 @@ mod tests {
         }
     }
 
-    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        let b = b
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (x, y) in a.iter().zip(b.iter()) {
-            dot += (*x as f64) * (*y as f64);
-            na += (*x as f64) * (*x as f64);
-            nb += (*y as f64) * (*y as f64);
-        }
-        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
-    }
-
     /// A `.scales`-sibling checkpoint routes every GLM projection to the packed path; a dense one falls
     /// back — the packed-detect superset (sc-10819).
     #[test]
@@ -629,8 +606,8 @@ mod tests {
         let (ctx_p, pooled_p) = packed.encode_prompt(&toks).unwrap();
         let (ctx_d, pooled_d) = dense.encode_prompt(&toks).unwrap();
         assert_eq!(ctx_p.dims(), ctx_d.dims());
-        let c_ctx = cosine(&ctx_p, &ctx_d);
-        let c_pooled = cosine(&pooled_p, &pooled_d);
+        let c_ctx = tensor_cosine(&ctx_p, &ctx_d) as f32;
+        let c_pooled = tensor_cosine(&pooled_p, &pooled_d) as f32;
         assert!(c_ctx > 0.99999, "packed vs dense context cosine {c_ctx:.6}");
         assert!(
             c_pooled > 0.99999,

@@ -18,10 +18,7 @@ use mlx_gen::gen_core::{
     WeightsSource,
 };
 use mlx_gen::media::Image;
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
+use mlx_gen::testing::{env_or, save_png};
 
 /// The env var if set, else a default resolved from the local HF cache (F-080: no hardcoded personal
 /// `/Users/...` paths). See [`hf_snapshot`].
@@ -63,14 +60,6 @@ fn load_rgb(path: &str) -> Image {
         height,
         pixels: img.into_raw(),
     }
-}
-
-fn save_png(img: &Image, path: &str) {
-    let buf: image::RgbImage =
-        image::ImageBuffer::from_raw(img.width, img.height, img.pixels.clone())
-            .expect("output image buffer");
-    buf.save(path)
-        .unwrap_or_else(|e| panic!("save {path}: {e}"));
 }
 
 fn main() {

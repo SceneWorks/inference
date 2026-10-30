@@ -13,22 +13,10 @@
 //!   SAM3_GEOMETRY_E2E_FIXTURE=scripts/spikes/sam3_oracle/geometry_e2e_fixture.safetensors \
 //!     cargo test -p mlx-gen-sam3 --release --test integration geometry_parity:: -- --ignored --nocapture
 
-use mlx_gen::testing::{iou, max_abs_diff};
+use mlx_gen::testing::{cosine_device_sums, iou, max_abs_diff, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_sam3::{Sam3GeometryConfig, Sam3GeometryEncoder, Sam3ImageSegmenter};
-use mlx_rs::ops::{multiply, sum};
 use mlx_rs::Array;
-
-fn f32_of(a: &Array) -> f32 {
-    a.as_dtype(mlx_rs::Dtype::Float32).unwrap().item::<f32>()
-}
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let dot = f32_of(&sum(multiply(a, b).unwrap(), None).unwrap());
-    let na = f32_of(&sum(multiply(a, a).unwrap(), None).unwrap()).sqrt();
-    let nb = f32_of(&sum(multiply(b, b).unwrap(), None).unwrap()).sqrt();
-    dot / (na * nb)
-}
 
 #[test]
 #[ignore = "needs SAM3_WEIGHTS + SAM3_GEOMETRY_FIXTURE"]
@@ -66,7 +54,7 @@ fn geometry_encoder_matches_oracle() {
         .expect("geometry forward");
 
     let want = fx.require("geo_output").unwrap().clone();
-    let cos = cosine(&out, &want);
+    let cos = cosine_device_sums(&out, &want, Denom::Exact);
     let maxabs = max_abs_diff(&out, &want);
     println!(
         "geometry prompt tokens: cosine={cos:.7} max_abs={maxabs:.5} shape={:?}",

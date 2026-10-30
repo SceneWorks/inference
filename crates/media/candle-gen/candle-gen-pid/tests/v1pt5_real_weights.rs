@@ -12,6 +12,7 @@
 //! ```
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::testkit::tensor_max_abs;
 use candle_gen::Weights;
 use candle_gen_pid::config::PidConfig;
 use candle_gen_pid::lq::PidNet;
@@ -36,17 +37,6 @@ fn v1pt5_cfg() -> PidConfig {
     cfg
 }
 
-fn max_abs(t: &Tensor) -> f32 {
-    t.abs()
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .max(0)
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-}
-
 #[test]
 #[ignore = "needs the converted PiD v1.5 flux safetensors (PID_V1PT5_CKPT)"]
 fn v1pt5_flux_loads_and_forwards() {
@@ -65,7 +55,7 @@ fn v1pt5_flux_loads_and_forwards() {
 
     let out = net.forward(&x, &t, &y, &lq, &sigma).unwrap();
     assert_eq!(out.dims(), &[1, 3, 64, 64], "v1.5 forward output shape");
-    let peak = max_abs(&out);
+    let peak = tensor_max_abs(&out);
     assert!(
         peak.is_finite() && peak > 1e-6,
         "v1.5 forward degenerate (peak={peak})"
@@ -91,8 +81,8 @@ fn v1pt5_flux_forward_matches_reference() {
     let out = net.forward(&x, &t, &y, &lq, &sigma).unwrap();
     assert_eq!(out.dims(), ref_out.dims(), "shape vs reference");
 
-    let max_abs_diff = max_abs(&(out - &ref_out).unwrap());
-    let ref_peak = max_abs(&ref_out);
+    let max_abs_diff = tensor_max_abs(&(out - &ref_out).unwrap());
+    let ref_peak = tensor_max_abs(&ref_out);
     let peak_rel = max_abs_diff / ref_peak;
     eprintln!(
         "candle v1.5 flux forward parity: max|Δ|={max_abs_diff:.4e}  ref-peak={ref_peak:.4}  peak-rel={peak_rel:.4e}"

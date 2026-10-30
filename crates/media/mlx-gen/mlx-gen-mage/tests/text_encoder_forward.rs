@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use mlx_rs::Array;
 
+use mlx_gen::testing::max_abs_diff_host;
 use mlx_gen::weights::Weights;
 use mlx_gen_mage::config::QwenVlTextConfig;
 use mlx_gen_mage::text_encoder::{MRopePositions, Qwen3VlTextEncoder};
@@ -126,11 +127,7 @@ fn encoder(cfg: &QwenVlTextConfig) -> Qwen3VlTextEncoder {
 
 fn max_abs(a: &Array, b: &Array) -> f32 {
     assert_eq!(a.shape(), b.shape(), "shape mismatch");
-    a.as_slice::<f32>()
-        .iter()
-        .zip(b.as_slice::<f32>())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0f32, f32::max)
+    max_abs_diff_host(a, b)
 }
 
 /// The forward produces the documented shape, and every layer plus the final norm participates.

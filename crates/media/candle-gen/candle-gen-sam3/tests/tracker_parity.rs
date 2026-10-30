@@ -8,9 +8,9 @@
 
 use std::path::Path;
 
-use crate::support::cosine;
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::default_device;
+use candle_gen::testkit::{tensor_cosine_device_sums, Denom};
 use candle_gen_sam3::{Sam3Tracker, Weights};
 
 fn scalar(t: &Tensor) -> f32 {
@@ -60,7 +60,7 @@ fn tracker_single_frame_matches_oracle() {
             .unwrap();
         let want = fx.require(key).unwrap();
         assert_eq!(got.dims(), want.dims(), "{key} shape");
-        let c = cosine(&got, &want);
+        let c = tensor_cosine_device_sums(&got, &want, Denom::Exact);
         println!("{key}: cosine={c:.7}");
         assert!(c > 0.9999, "{key} cosine {c}");
     }
@@ -69,7 +69,7 @@ fn tracker_single_frame_matches_oracle() {
     let out = tracker.segment(&pixel_values, box_xyxy).expect("segment");
     let want_mask = fx.require("best_low_res").unwrap(); // [288, 288]
     assert_eq!(out.low_res.dims(), want_mask.dims(), "mask shape");
-    let c = cosine(&out.low_res, &want_mask);
+    let c = tensor_cosine_device_sums(&out.low_res, &want_mask, Denom::Exact);
     let want_obj = scalar(&fx.require("object_score").unwrap());
     println!(
         "mask: cosine={c:.7}  iou ours={:.4}  obj ours={:.3} oracle={:.3}",

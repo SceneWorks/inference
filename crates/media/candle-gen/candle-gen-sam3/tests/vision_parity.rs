@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use crate::support::cosine;
+use candle_gen::testkit::{tensor_cosine_device_sums, Denom};
 use candle_gen_sam3::{Sam3VisionConfig, Sam3VisionEncoder, Weights};
 
 #[test]
@@ -54,7 +54,7 @@ fn vision_encoder_matches_oracle() {
             .unwrap();
         let want = fx.require(&format!("fpn_{i}")).expect("fixture fpn");
         assert_eq!(got.dims(), want.dims(), "fpn_{i} shape");
-        let cos = cosine(&got, &want);
+        let cos = tensor_cosine_device_sums(&got, &want, Denom::Exact);
         worst_cos = worst_cos.min(cos);
         println!("fpn_{i} {:?}: cosine={cos:.6}", want.dims());
     }

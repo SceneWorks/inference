@@ -11,10 +11,9 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::cosine_f32_device;
 use mlx_gen::weights::Weights;
 use mlx_gen_krea::{Krea2Config, Krea2Transformer};
-use mlx_rs::ops::{multiply, sqrt, sum};
-use mlx_rs::{Array, Dtype};
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -23,15 +22,6 @@ const GOLDEN: &str = concat!(
 
 fn snapshot() -> PathBuf {
     PathBuf::from(std::env::var("KREA_TURBO_DIR").expect("set KREA_TURBO_DIR to the snapshot root"))
-}
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let dot = sum(multiply(&a, &b).unwrap(), false).unwrap();
-    let na = sqrt(sum(multiply(&a, &a).unwrap(), false).unwrap()).unwrap();
-    let nb = sqrt(sum(multiply(&b, &b).unwrap(), false).unwrap()).unwrap();
-    (dot / (na * nb)).item::<f32>()
 }
 
 #[test]
@@ -61,7 +51,7 @@ fn dit_matches_real_reference() {
     let want = g.require("out.velocity").unwrap();
     assert_eq!(velocity.shape(), want.shape(), "velocity shape");
 
-    let c = cosine(&velocity, want);
+    let c = cosine_f32_device(&velocity, want);
     println!("Krea 2 real-weight DiT parity cosine = {c:.7}");
     assert!(c > 0.98, "real-weight DiT cosine {c:.7} <= 0.98");
     crate::model_inference_device::record_model_inference_device();

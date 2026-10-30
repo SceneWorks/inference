@@ -10,11 +10,8 @@ use mlx_gen::gen_core::{
     Conditioning, GenerationOutput, GenerationRequest, LoadSpec, OffloadPolicy, WeightsSource,
 };
 use mlx_gen::media::Image;
+use mlx_gen::testing::env_or;
 use mlx_gen_flux2::load_dev;
-
-fn env_or(k: &str, d: &str) -> String {
-    std::env::var(k).unwrap_or_else(|_| d.to_string())
-}
 
 /// Decode a PNG/JPEG file into a gen-core RGB `Image`.
 fn load_image(path: &str) -> Image {

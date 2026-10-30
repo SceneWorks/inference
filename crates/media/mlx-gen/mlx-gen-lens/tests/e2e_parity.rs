@@ -16,10 +16,10 @@
 //!
 //! Run: `cargo test -p mlx-gen-lens --test integration e2e_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{abs, max, multiply, subtract, sum};
+use mlx_rs::ops::{abs, max, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::testing::peak_rel;
+use mlx_gen::testing::{cosine_device_sums, peak_rel, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_lens::pipeline::LensPipeline;
 use mlx_gen_lens::text::LensTokenizer;
@@ -47,22 +47,6 @@ fn meta_usize(g: &Weights, key: &str) -> usize {
 }
 fn meta_f32(g: &Weights, key: &str) -> f32 {
     g.metadata(key).unwrap().parse().unwrap()
-}
-
-/// Cosine similarity over the flattened tensors.
-fn cosine(got: &Array, want: &Array) -> f32 {
-    let dot = sum(multiply(got, want).unwrap(), None)
-        .unwrap()
-        .item::<f32>();
-    let na = sum(multiply(got, got).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    let nb = sum(multiply(want, want).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    dot / (na * nb).max(1e-12)
 }
 
 #[test]
@@ -134,7 +118,7 @@ fn lens_e2e_matches_reference() {
         got_lat.shape(),
         want_lat.shape()
     );
-    let lat_cos = cosine(&got_lat, want_lat);
+    let lat_cos = cosine_device_sums(&got_lat, want_lat, Denom::FloorAt(1e-12));
     let lat_pr = peak_rel(&got_lat, want_lat);
     eprintln!("final latents: cosine {lat_cos:.5}  peak_rel {lat_pr:.3e}");
 
@@ -158,7 +142,7 @@ fn lens_e2e_matches_reference() {
         got_img.shape(),
         want_img.shape()
     );
-    let img_cos = cosine(&got_img, want_img);
+    let img_cos = cosine_device_sums(&got_img, want_img, Denom::FloorAt(1e-12));
     let img_pr = peak_rel(&got_img, want_img);
     // Coherence floor: a degenerate (flat) render would have ~0 variance. The reference image's own
     // std is the yardstick; ours must be in the same ballpark (not collapsed to a constant).
@@ -267,8 +251,8 @@ fn lens_curated_samplers_drive_the_real_dit() {
     eprintln!(
         "std  euler {se:.4}  heun {sh:.4}  karras {sk:.4}\n\
          cosine(heun,euler) {:.4}  cosine(karras,euler) {:.4}  peak_rel(heun,euler) {:.4}",
-        cosine(&heun, &euler),
-        cosine(&karras, &euler),
+        cosine_device_sums(&heun, &euler, Denom::FloorAt(1e-12)),
+        cosine_device_sums(&karras, &euler, Denom::FloorAt(1e-12)),
         peak_rel(&heun, &euler)
     );
     // The sampler knob is live — heun's extra eval changes the trajectory vs euler.

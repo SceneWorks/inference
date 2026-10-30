@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+use candle_gen::testkit::tensor_max_abs_diff;
 use candle_gen_anima::adapt::AdaptLinear;
 use candle_gen_anima::adapters::install_anima_residuals;
 use candle_gen_anima::conditioner::AnimaTextConditioner;
@@ -237,17 +238,6 @@ fn cond_forward(cond: &AnimaTextConditioner) -> Tensor {
         .expect("conditioner forward")
 }
 
-fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-    (a - b)
-        .unwrap()
-        .abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-}
-
 /// The DiT and conditioner targets a real Anima LoRA hits, at this tiny config's dims: a DiT
 /// self-attn q (in/out = hidden = 12) and a conditioner self-attn q (in/out = model_dim = 8).
 const DIT_TARGET: (&str, usize, usize) = ("blocks.0.self_attn.q_proj", 12, 12);
@@ -275,7 +265,7 @@ fn install_routes_dit_and_conditioner_and_residual_shifts_forward() {
     );
     let shifted = dit_forward(&dit);
     assert!(
-        max_abs_diff(&shifted, &baseline) > 1e-4,
+        tensor_max_abs_diff(&shifted, &baseline) > 1e-4,
         "the installed residual must move the DiT forward"
     );
     // The conditioner residual is live in the (AdaptLinear-swapped) conditioner forward too — its output
@@ -283,7 +273,7 @@ fn install_routes_dit_and_conditioner_and_residual_shifts_forward() {
     // LoRA has non-zero conditioner deltas), which a DiT-only install would silently miss.
     let cond_baseline = cond_forward(&build_cond());
     assert!(
-        max_abs_diff(&cond_forward(&cond), &cond_baseline) > 1e-4,
+        tensor_max_abs_diff(&cond_forward(&cond), &cond_baseline) > 1e-4,
         "the installed conditioner residual must move the conditioner forward"
     );
 
@@ -295,7 +285,7 @@ fn install_routes_dit_and_conditioner_and_residual_shifts_forward() {
     let r0 = install_anima_residuals(&mut dit0, &mut cond0, std::slice::from_ref(&spec0)).unwrap();
     assert_eq!(r0.merged, 2);
     assert_eq!(
-        max_abs_diff(&dit_forward(&dit0), &baseline),
+        tensor_max_abs_diff(&dit_forward(&dit0), &baseline),
         0.0,
         "a scale-0 residual must be an exact no-op"
     );
@@ -341,7 +331,7 @@ fn lokr_installs_as_structured_residual_and_shifts_forward() {
         "the LoKr target must route as a structured residual"
     );
     assert!(
-        max_abs_diff(&dit_forward(&dit), &baseline) > 1e-4,
+        tensor_max_abs_diff(&dit_forward(&dit), &baseline) > 1e-4,
         "the structured LoKr residual must move the DiT forward"
     );
 

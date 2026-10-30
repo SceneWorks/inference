@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::CancelFlag;
+use candle_gen::testkit::{env_path, tensor_max_abs, tensor_peak_rel};
 use candle_gen::Weights;
 use candle_gen_mochi::{
     denoise, load_transformer_var_builder, MochiDitConfig, MochiScheduler, MochiTransformer3DModel,
@@ -40,19 +41,9 @@ const E2E_GOLDEN: &str = concat!(
 );
 
 fn snapshot_dir() -> PathBuf {
-    std::env::var("MOCHI_SNAPSHOT")
-        .expect("set MOCHI_SNAPSHOT to the mochi-1-preview snapshot dir")
-        .into()
+    env_path("MOCHI_SNAPSHOT")
 }
 
-fn max_abs(t: &Tensor) -> f32 {
-    t.abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-}
 fn mean_abs(t: &Tensor) -> f32 {
     t.abs()
         .unwrap()
@@ -60,11 +51,6 @@ fn mean_abs(t: &Tensor) -> f32 {
         .unwrap()
         .to_scalar::<f32>()
         .unwrap()
-}
-fn peak_rel(got: &Tensor, want: &Tensor) -> f32 {
-    let got = got.to_dtype(DType::F32).unwrap();
-    let want = want.to_dtype(DType::F32).unwrap();
-    max_abs(&(&got - &want).unwrap()) / max_abs(&want).max(1e-12)
 }
 fn mean_rel(got: &Tensor, want: &Tensor) -> f32 {
     let got = got.to_dtype(DType::F32).unwrap();
@@ -104,7 +90,7 @@ fn e2e_final_latents_match_golden() {
     assert_eq!(hidden.dims(), &[2, 12, 2, 8, 8], "dit hidden_states shape");
     let h0 = hidden.narrow(0, 0, 1).unwrap();
     let h1 = hidden.narrow(0, 1, 1).unwrap();
-    let branch_delta = max_abs(&(&h0 - &h1).unwrap());
+    let branch_delta = tensor_max_abs(&(&h0 - &h1).unwrap());
     eprintln!("init-latent assumption: max|branch0 - branch1| = {branch_delta:.3e} (must be 0)");
     assert!(
         branch_delta == 0.0,
@@ -154,7 +140,7 @@ fn e2e_final_latents_match_golden() {
             &enc_mask,
         )
         .unwrap();
-    let np0_pr = peak_rel(&np0, &dit_g.require("noise_pred").unwrap());
+    let np0_pr = tensor_peak_rel(&np0, &dit_g.require("noise_pred").unwrap(), Some(1e-12));
     eprintln!("step-0 per-forward noise_pred peak_rel = {np0_pr:.3e} (dit_parity floor)");
     assert!(
         np0_pr < 1.0e-1,
@@ -188,7 +174,7 @@ fn e2e_final_latents_match_golden() {
 
     let want = e2e_g.require("final_latents").unwrap(); // [1, 12, 2, 8, 8]
     assert_eq!(latents.dims(), want.dims(), "final_latents shape");
-    let pr = peak_rel(&latents, &want);
+    let pr = tensor_peak_rel(&latents, &want, Some(1e-12));
     let mr = mean_rel(&latents, &want);
     eprintln!("E2E final_latents peak_rel = {pr:.3e}  mean_rel = {mr:.3e}");
 

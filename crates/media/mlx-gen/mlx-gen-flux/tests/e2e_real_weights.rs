@@ -14,6 +14,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::image::decoded_to_image;
+use mlx_gen::testing::peak_rel_host;
 use mlx_gen::weights::Weights;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource};
 use mlx_gen_flux::{
@@ -70,7 +71,7 @@ fn verify_quant(quant: Quant, bits: i32) {
             println!(
                 "  Q{bits} substage {name}: mean_rel={:.3e} peak_rel={:.3e}",
                 mean_abs_rel(&f32a(&arr), gold),
-                peak_rel(&f32a(&arr), gold)
+                peak_rel_host(&f32a(&arr), gold, None)
             );
         }
     }
@@ -86,7 +87,7 @@ fn verify_quant(quant: Quant, bits: i32) {
             .unwrap();
         if i == 0 {
             v0_mr = mean_abs_rel(&f32a(&v), g.require("v0").unwrap());
-            let v0_pr = peak_rel(&f32a(&v), g.require("v0").unwrap());
+            let v0_pr = peak_rel_host(&f32a(&v), g.require("v0").unwrap(), None);
             println!("Q{bits} v0 vs fork-Q v0: mean_rel={v0_mr:.3e} peak_rel={v0_pr:.3e}");
         }
         let dt = sigmas[i + 1] - sigmas[i];
@@ -241,20 +242,6 @@ fn snapshot() -> PathBuf {
     )
 }
 
-/// Peak-relative error `max|a-b| / max|b|` — the meaningful metric vs a bf16 golden.
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap();
-    let b = b.reshape(&[n]).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
-    let max_diff = a
-        .iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
-    max_diff / peak
-}
-
 fn mean_abs_rel(a: &Array, b: &Array) -> f32 {
     let n = b.shape().iter().product::<i32>();
     let a = a.reshape(&[n]).unwrap();
@@ -325,7 +312,7 @@ fn e2e_t5_prompt_embeds_match_golden() {
     let out = t5.forward(g.require("t5_input_ids").unwrap()).unwrap();
     let golden = g.require("prompt_embeds").unwrap();
     assert_eq!(out.shape(), golden.shape(), "prompt_embeds shape");
-    let pr = peak_rel(&f32a(&out), golden);
+    let pr = peak_rel_host(&f32a(&out), golden, None);
     let mr = mean_abs_rel(&f32a(&out), golden);
     println!(
         "T5 prompt_embeds: peak_rel={pr:.3e} mean_rel={mr:.3e} shape={:?}",
@@ -346,7 +333,7 @@ fn e2e_clip_pooled_matches_golden() {
     let out = clip.forward(g.require("clip_input_ids").unwrap()).unwrap();
     let golden = g.require("pooled_prompt_embeds").unwrap();
     assert_eq!(out.shape(), golden.shape(), "pooled shape");
-    let pr = peak_rel(&f32a(&out), golden);
+    let pr = peak_rel_host(&f32a(&out), golden, None);
     let mr = mean_abs_rel(&f32a(&out), golden);
     println!(
         "CLIP pooled: peak_rel={pr:.3e} mean_rel={mr:.3e} shape={:?}",
@@ -382,7 +369,7 @@ fn e2e_transformer_v0_matches_golden() {
         .unwrap();
     let golden = g.require("v0").unwrap();
     assert_eq!(v.shape(), golden.shape(), "v0 shape");
-    let pr = peak_rel(&f32a(&v), golden);
+    let pr = peak_rel_host(&f32a(&v), golden, None);
     let mr = mean_abs_rel(&f32a(&v), golden);
     println!(
         "transformer v0: peak_rel={pr:.3e} mean_rel={mr:.3e} shape={:?}",
@@ -410,7 +397,7 @@ fn e2e_vae_decode_matches_golden() {
     let decoded = f32a(&vae.decode(&unpacked).unwrap());
     let golden = g.require("decoded").unwrap();
     assert_eq!(decoded.shape(), golden.shape(), "decoded shape");
-    let pr = peak_rel(&decoded, golden);
+    let pr = peak_rel_host(&decoded, golden, None);
     println!("VAE decoded: peak_rel={pr:.3e} shape={:?}", decoded.shape());
     let img = decoded_to_image(&decoded).unwrap();
     let gimg = decoded_to_image(golden).unwrap();
@@ -451,7 +438,7 @@ fn e2e_transformer_substages_match_golden() {
         .unwrap();
     for (name, arr) in &caps {
         if let Ok(golden) = g.require(name) {
-            let pr = peak_rel(&f32a(arr), golden);
+            let pr = peak_rel_host(&f32a(arr), golden, None);
             let mr = mean_abs_rel(&f32a(arr), golden);
             println!(
                 "substage {name}: peak_rel={pr:.3e} mean_rel={mr:.3e} shape={:?}",
@@ -496,9 +483,9 @@ fn e2e_rope_table_matches_golden() {
     let sin_f = pick(2); // col2=sin
     println!(
         "rope cos: peak_rel={:.3e} mean_rel={:.3e} | sin: peak_rel={:.3e} mean_rel={:.3e}",
-        peak_rel(&cos, &cos_f),
+        peak_rel_host(&cos, &cos_f, None),
         mean_abs_rel(&cos, &cos_f),
-        peak_rel(&sin, &sin_f),
+        peak_rel_host(&sin, &sin_f, None),
         mean_abs_rel(&sin, &sin_f)
     );
 }
@@ -540,7 +527,7 @@ fn e2e_init_noise_matches_golden() {
     let init = mlx_gen_flux::create_noise(seed, w, h).unwrap();
     let golden = g.require("init").unwrap();
     assert_eq!(init.shape(), golden.shape(), "init shape");
-    let pr = peak_rel(&f32a(&init), golden);
+    let pr = peak_rel_host(&f32a(&init), golden, None);
     println!("init noise: peak_rel={pr:.3e} shape={:?}", init.shape());
     assert!(
         pr < 1e-5,
@@ -574,7 +561,7 @@ fn e2e_denoise_loop_matches_golden() {
         .unwrap();
     }
     let golden = g.require("final_latents").unwrap();
-    let pr = peak_rel(&f32a(&latents), golden);
+    let pr = peak_rel_host(&f32a(&latents), golden, None);
     let mr = mean_abs_rel(&f32a(&latents), golden);
     println!(
         "denoise final_latents: peak_rel={pr:.3e} mean_rel={mr:.3e} shape={:?}",
@@ -631,7 +618,7 @@ fn e2e_single_stack_injected_matches_golden() {
         let golden = g.require(&name).unwrap();
         println!(
             "  {name}: peak_rel={:.3e} mean_rel={:.3e}",
-            peak_rel(&f32a(&arr), golden),
+            peak_rel_host(&f32a(&arr), golden, None),
             mean_abs_rel(&f32a(&arr), golden)
         );
     }
@@ -641,14 +628,14 @@ fn e2e_single_stack_injected_matches_golden() {
     let gb0 = g.require("single_b0_img").unwrap();
     println!(
         "single block[0] (injected): peak_rel={:.3e} mean_rel={:.3e}",
-        peak_rel(&f32a(&b0), gb0),
+        peak_rel_host(&f32a(&b0), gb0, None),
         mean_abs_rel(&f32a(&b0), gb0)
     );
     let out = t
         .debug_single_stack(&encoder, &hidden, &text_emb, lh, lw, 0)
         .unwrap();
     let golden = g.require("single_img").unwrap();
-    let pr = peak_rel(&f32a(&out), golden);
+    let pr = peak_rel_host(&f32a(&out), golden, None);
     let mr = mean_abs_rel(&f32a(&out), golden);
     println!(
         "single stack (injected): peak_rel={pr:.3e} mean_rel={mr:.3e} shape={:?}",

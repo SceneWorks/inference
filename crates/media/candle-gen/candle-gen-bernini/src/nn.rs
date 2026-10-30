@@ -52,19 +52,7 @@ pub fn layer_norm(x: &Tensor, w: Option<&Tensor>, b: Option<&Tensor>, eps: f64) 
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
-
-    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
-        (a.to_dtype(DType::F32).unwrap() - b.to_dtype(DType::F32).unwrap())
-            .unwrap()
-            .abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
-    }
+    use candle_gen::testkit::tensor_max_abs_diff_f32;
 
     #[test]
     fn rms_norm_bf16_reduces_in_f32_and_casts_back() {
@@ -103,8 +91,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual.dtype(), DType::BF16);
-        assert_eq!(max_abs(&actual, &expected), 0.0);
-        assert!(max_abs(&actual, &legacy) > 0.0);
+        assert_eq!(tensor_max_abs_diff_f32(&actual, &expected), 0.0);
+        assert!(tensor_max_abs_diff_f32(&actual, &legacy) > 0.0);
     }
 
     #[test]
@@ -142,6 +130,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual.dtype(), DType::BF16);
-        assert_eq!(max_abs(&actual, &expected), 0.0);
+        assert_eq!(tensor_max_abs_diff_f32(&actual, &expected), 0.0);
     }
 }

@@ -1872,6 +1872,7 @@ mod tests {
     use candle_gen::candle_nn::Module;
     use candle_gen::gen_core::checkpoint_codec::TensorCodecSpec;
     use candle_gen::gen_core::checkpoint_facts::ExecutionRepresentation;
+    use candle_gen::testkit::tensor_cosine;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
@@ -2142,18 +2143,6 @@ mod tests {
         Ok(())
     }
 
-    fn cosine(a: &Tensor, b: &Tensor) -> f64 {
-        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (x, y) in a.iter().zip(&b) {
-            dot += (*x as f64) * (*y as f64);
-            na += (*x as f64) * (*x as f64);
-            nb += (*y as f64) * (*y as f64);
-        }
-        dot / (na.sqrt() * nb.sqrt() + 1e-12)
-    }
-
     /// **Packed-detect fires on the Krea key layout, incl. the `attn.to_out.0` nesting (sc-9411).** A
     /// packed q4 component (`quantization` block present) whose `attn.to_out.0` is a group-64 packed
     /// triple must `linear_detect` to a `Packed` projection — the `.scales`/`.biases` siblings surviving
@@ -2191,7 +2180,7 @@ mod tests {
         // The packed forward reproduces the affine grid (group-64 repack + dequant-on-forward).
         let grid_lin = QLinear::dense(Linear::new(grid, None));
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
+        let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-64 packed vs grid cosine {cos:.6}");
 
         #[cfg(feature = "model-inference-proof")]
@@ -2245,7 +2234,7 @@ mod tests {
         );
         let dense = QLinear::dense(Linear::new(grid, None));
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        assert!(cosine(&packed.forward(&x)?, &dense.forward(&x)?) > 0.99999);
+        assert!(tensor_cosine(&packed.forward(&x)?, &dense.forward(&x)?) > 0.99999);
 
         drop(weights);
         #[cfg(feature = "model-inference-proof")]
@@ -2383,7 +2372,7 @@ mod tests {
         let base = w.get_cpu_merge_base("attn.to_q.weight")?;
         assert_eq!(base.dims(), &[out_dim, in_dim], "reconstructed dense shape");
         assert!(
-            cosine(&base, &grid) > 0.99999,
+            tensor_cosine(&base, &grid) > 0.99999,
             "reconstructed base must equal the affine grid"
         );
 
@@ -2433,7 +2422,7 @@ mod tests {
             "reconstructed dense shape"
         );
         assert!(
-            cosine(lin.weight(), &grid) > 0.99999,
+            tensor_cosine(lin.weight(), &grid) > 0.99999,
             "linear() on a packed tier must reconstruct the affine grid, not cast the u32 codes"
         );
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
@@ -2652,7 +2641,7 @@ mod tests {
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let got = lin.forward(&x)?.to_dtype(DType::F32)?;
         let want = __model_proof_output!(Linear::new(ref_w, None).forward(&x))?;
-        let cos = cosine(&got, &want);
+        let cos = tensor_cosine(&got, &want);
         assert!(
             cos > 0.99,
             "convrot online-rotation vs canonical cosine {cos:.5}"
@@ -2669,7 +2658,7 @@ mod tests {
             "the control-inference projection loader must preserve ConvRot identity"
         );
         let control_got = control.forward(&x)?.to_dtype(DType::F32)?;
-        let control_cos = cosine(&control_got, &want);
+        let control_cos = tensor_cosine(&control_got, &want);
         assert!(
             control_cos > 0.99,
             "control ConvRot online-rotation vs canonical cosine {control_cos:.5}"

@@ -33,6 +33,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::adapters::AdaptableHost;
+use mlx_gen::testing::env_path_or_home;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterKind, AdapterSpec, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec,
@@ -42,11 +43,7 @@ use mlx_gen_scail2::pipeline::MODEL_ID;
 use mlx_gen_scail2::{Scail2Config, Scail2Dit};
 
 fn snapshot_dir() -> PathBuf {
-    std::env::var("SCAIL2_SNAPSHOT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/scail2-mlx-convert")
-        })
+    env_path_or_home("SCAIL2_SNAPSHOT_DIR", ".cache/scail2-mlx-convert")
 }
 
 fn env_usize(key: &str, default: usize) -> usize {

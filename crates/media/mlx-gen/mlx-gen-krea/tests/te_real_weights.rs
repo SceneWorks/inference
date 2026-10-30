@@ -9,10 +9,11 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::cosine_f32_device;
 use mlx_gen::weights::Weights;
 use mlx_gen_krea::{KreaTeConfig, KreaTextEncoder, KreaTokenizer};
-use mlx_rs::ops::{array_eq, multiply, sqrt, sum};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::ops::array_eq;
+use mlx_rs::Array;
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -23,15 +24,6 @@ const PROMPT: &str =
 
 fn snapshot() -> PathBuf {
     PathBuf::from(std::env::var("KREA_TURBO_DIR").expect("set KREA_TURBO_DIR to the snapshot root"))
-}
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let dot = sum(multiply(&a, &b).unwrap(), false).unwrap();
-    let na = sqrt(sum(multiply(&a, &a).unwrap(), false).unwrap()).unwrap();
-    let nb = sqrt(sum(multiply(&b, &b).unwrap(), false).unwrap()).unwrap();
-    (dot / (na * nb)).item::<f32>()
 }
 
 #[test]
@@ -56,7 +48,7 @@ fn te_matches_real_reference() {
     let want = g.require("out.hiddens").unwrap();
     assert_eq!(hiddens.shape(), want.shape(), "stacked-context shape");
 
-    let c = cosine(&hiddens, want);
+    let c = cosine_f32_device(&hiddens, want);
     println!("Krea 2 real-weight TE parity cosine = {c:.7}");
     assert!(c > 0.98, "real-weight TE cosine {c:.7} <= 0.98");
     crate::model_inference_device::record_model_inference_device();

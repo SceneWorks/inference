@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use candle_gen::gen_core::{
     GenerationRequest, Image, LoadSpec, PreviewFrame, Progress, WeightsSource,
 };
-use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::save_rgb8_png_in;
 use candle_gen::testkit::sha256_file;
 use candle_gen::testkit::{
     collecting_sink, correlation, downsample_nearest, downsample_nearest_raw, env_path_opt,
@@ -97,15 +97,9 @@ fn crate_preview_channels() -> usize {
 
 // ── Frame analysis ────────────────────────────────────────────────────────────────────────────────
 
-fn save_png(dir: &Path, pixels: &[u8], width: u32, height: u32, name: &str) {
-    let path = dir.join(name);
-    save_rgb8_png(&path, pixels, width, height);
-    eprintln!("  wrote {}", path.display());
-}
-
 fn save_strip(dir: &Path, frames: &[PreviewFrame], name: &str) {
     let (sheet, width, height) = preview_strip_sheet(frames);
-    save_png(dir, &sheet, width, height, name);
+    save_rgb8_png_in(dir, name, &sheet, width, height);
 }
 
 /// Consecutive frames must not be the same picture — a low floor, because the first pair of a flow
@@ -354,12 +348,12 @@ fn assert_chroma_previews_converge(
         min_acceleration,
     );
     save_strip(&dir, &frames, &format!("{label}-strip.png"));
-    save_png(
+    save_rgb8_png_in(
         &dir,
+        &format!("{label}-final.png"),
         &live.pixels,
         live.width,
         live.height,
-        &format!("{label}-final.png"),
     );
     (events, frames)
 }

@@ -719,6 +719,7 @@ impl RmsNorm {
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
+    use candle_gen::testkit::tensor_peak_rel_or_abs;
 
     /// Deterministic spread values — a fixed pseudo-random fixture, so the equivalence measurement
     /// is reproducible run to run.
@@ -747,31 +748,6 @@ mod tests {
     /// Token spans the last [`DitFeedForward::forward_budgeted`] ran — `1` is the un-chunked path.
     fn spans_run() -> usize {
         LAST_SPAN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// **Relative max-abs-diff** — `max|a-b| / max|b|`, the crate's established measure (the same
-    /// one `tests/turbo_lora.rs` and `tests/dit_parity.rs` gate on). Deliberately not cosine:
-    /// cosine is blind to a uniform scale error, which is precisely what a truncated chunk tail
-    /// would look like.
-    fn rel_max_abs(a: &Tensor, b: &Tensor) -> f32 {
-        assert_eq!(a.dims(), b.dims(), "shape");
-        let max_abs = |t: &Tensor| -> f32 {
-            t.abs()
-                .expect("abs")
-                .flatten_all()
-                .expect("flat")
-                .max(0)
-                .expect("max")
-                .to_vec0::<f32>()
-                .expect("scalar")
-        };
-        let d = max_abs(&(a - b).expect("difference"));
-        let scale = max_abs(b);
-        if scale == 0.0 {
-            d
-        } else {
-            d / scale
-        }
     }
 
     /// Chunking the token axis is *mathematically* exact — no reduction crosses tokens — but not
@@ -809,7 +785,7 @@ mod tests {
             "the chunked forward must recompose"
         );
 
-        let drift = rel_max_abs(&got, &want);
+        let drift = tensor_peak_rel_or_abs(&got, &want);
         println!("[swiglu] chunked vs unchunked rel-max-abs = {drift:.3e}");
         assert!(
             drift < 1e-5,
@@ -826,7 +802,7 @@ mod tests {
             8,
             "37 = 5·7 + 2 — eight spans, the last ragged"
         );
-        assert!(rel_max_abs(&uneven, &want) < 1e-5, "ragged tail");
+        assert!(tensor_peak_rel_or_abs(&uneven, &want) < 1e-5, "ragged tail");
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::layers::tests::chunked_swiglu_matches_the_unchunked_projection");
@@ -852,7 +828,11 @@ mod tests {
         let x = spread(&[1, seq, hidden], 0.7);
         let a = ff.forward(&x).expect("forward");
         let b = ff.forward_span(&x).expect("span");
-        assert_eq!(rel_max_abs(&a, &b), 0.0, "byte-identical to the bare span");
+        assert_eq!(
+            tensor_peak_rel_or_abs(&a, &b),
+            0.0,
+            "byte-identical to the bare span"
+        );
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::layers::tests::a_geometry_that_fits_stays_on_the_unchunked_path");
@@ -988,7 +968,7 @@ mod tests {
         let got = packed.forward(&x).expect("packed forward");
         let want = dense.forward(&x).expect("dense forward");
         assert_eq!(got.dims(), want.dims());
-        let drift = rel_max_abs(&got, &want);
+        let drift = tensor_peak_rel_or_abs(&got, &want);
         println!("[linear] packed vs dense-reference rel-max-abs = {drift:.3e}");
         assert!(
             drift < 5e-3,
@@ -1034,7 +1014,7 @@ mod tests {
 
         let packed_residual = (packed.forward(&x).unwrap() - packed_base.clone()).unwrap();
         let dense_residual = (dense.forward(&x).unwrap() - dense_base).unwrap();
-        let drift = rel_max_abs(&packed_residual, &dense_residual);
+        let drift = tensor_peak_rel_or_abs(&packed_residual, &dense_residual);
         println!("[linear] packed-vs-dense LoRA residual rel-max-abs = {drift:.3e}");
         assert!(
             drift < 1e-5,
@@ -1046,7 +1026,7 @@ mod tests {
         packed.clear_adapters();
         assert!(!packed.is_adapted());
         assert_eq!(
-            rel_max_abs(&packed.forward(&x).unwrap(), &packed_base),
+            tensor_peak_rel_or_abs(&packed.forward(&x).unwrap(), &packed_base),
             0.0,
             "clear_adapters must restore the bare base bit-for-bit"
         );
@@ -1092,7 +1072,7 @@ mod tests {
         assert!(packed.is_packed(), "LoKr must not dequantize the base");
         let packed_residual = (packed.forward(&x).unwrap() - packed_base).unwrap();
         let dense_residual = (dense.forward(&x).unwrap() - dense_base).unwrap();
-        let drift = rel_max_abs(&packed_residual, &dense_residual);
+        let drift = tensor_peak_rel_or_abs(&packed_residual, &dense_residual);
         assert!(drift < 1e-5, "packed-vs-dense LoKr residual {drift:.3e}");
 
         #[cfg(feature = "model-inference-proof")]

@@ -1101,6 +1101,7 @@ mod tests {
     use crate::train_dit::KREA_ATTN_TARGETS;
     use candle_gen::candle_core::safetensors::save as save_tensors;
     use candle_gen::candle_core::{DType, Device};
+    use candle_gen::testkit::tensor_max_abs;
 
     /// A tiny stand-in for the base DiT tensor map: two attention Linears + one conv (4-D) weight.
     fn base_map() -> HashMap<String, Tensor> {
@@ -1159,15 +1160,6 @@ mod tests {
         )
         .expect_err("a valid first file must not hide a later dense zero-match");
         assert!(error.to_string().contains(&missing.display().to_string()));
-    }
-
-    fn max_abs(t: &Tensor) -> f32 {
-        t.abs()
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
     }
 
     /// Bare dotted (the trainer's format), prefixed PEFT, and kohya flattened all resolve to the same
@@ -1345,7 +1337,7 @@ mod tests {
             .to_dtype(DType::F32)
             .unwrap();
         let expected = reconstruct_lora_delta(&down, &up, 4.0, 2.0, 1.0).unwrap(); // base is zero
-        assert!(max_abs(&(merged - expected).unwrap()) < 1e-2); // bf16 base round-trip tolerance
+        assert!(tensor_max_abs(&(merged - expected).unwrap()) < 1e-2); // bf16 base round-trip tolerance
     }
 
     /// sc-5374: a diffusers-format LoRA with NO per-target `.alpha` tensor but a `lora_adapter_metadata`
@@ -1378,11 +1370,11 @@ mod tests {
             .to_dtype(DType::F32)
             .unwrap();
         let expected = reconstruct_lora_delta(&down, &up, 16.0, 8.0, 1.0).unwrap();
-        assert!(max_abs(&(&merged - &expected).unwrap()) < 1e-4);
+        assert!(tensor_max_abs(&(&merged - &expected).unwrap()) < 1e-4);
         // The pre-sc-5374 default (alpha = rank ⇒ scale 1.0) would diverge by a factor of 2.
         let buggy = reconstruct_lora_delta(&down, &up, 8.0, 8.0, 1.0).unwrap();
         assert!(
-            max_abs(&(&merged - &buggy).unwrap()) > 1e-3,
+            tensor_max_abs(&(&merged - &buggy).unwrap()) > 1e-3,
             "metadata alpha must differ from alpha=rank"
         );
     }
@@ -1457,7 +1449,7 @@ mod tests {
             (4, 4),
         )
         .unwrap();
-        assert!(max_abs(&(merged - expected).unwrap()) < 1e-2);
+        assert!(tensor_max_abs(&(merged - expected).unwrap()) < 1e-2);
     }
 
     /// The keystone sc-8776 round-trip: an **ostris ai-toolkit** LoKr — **no** `networkType` metadata,
@@ -1552,10 +1544,13 @@ mod tests {
         )
         .unwrap();
         assert!(
-            max_abs(&(&merged - &expected).unwrap()) < 1e-4,
+            tensor_max_abs(&(&merged - &expected).unwrap()) < 1e-4,
             "both-full LoKr must fold at scale 1 (sentinel alpha ignored)"
         );
-        assert!(max_abs(&merged) > 0.0, "the delta must be non-trivial");
+        assert!(
+            tensor_max_abs(&merged) > 0.0,
+            "the delta must be non-trivial"
+        );
     }
 
     /// sc-8776: with **no** file-level `rank`/`alpha` metadata, a **decomposed** LoKr leg
@@ -1607,7 +1602,7 @@ mod tests {
             (4, 4),
         )
         .unwrap();
-        assert!(max_abs(&(&merged - &expected).unwrap()) < 1e-4);
+        assert!(tensor_max_abs(&(&merged - &expected).unwrap()) < 1e-4);
         // The old alpha=rank default (scale 1) would diverge by a factor of 4.
         let buggy = reconstruct_lokr_delta(
             Some(&w1),
@@ -1623,7 +1618,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            max_abs(&(&merged - &buggy).unwrap()) > 1e-3,
+            tensor_max_abs(&(&merged - &buggy).unwrap()) > 1e-3,
             "per-target alpha must differ from the alpha=rank default"
         );
     }
@@ -1708,9 +1703,9 @@ mod tests {
         )
         .unwrap();
         let merged = map[&format!("{path}.weight")].to_dtype(DType::F32).unwrap();
-        assert!(max_abs(&(&merged - &expected).unwrap()) < 1e-2);
+        assert!(tensor_max_abs(&(&merged - &expected).unwrap()) < 1e-2);
         assert!(
-            max_abs(&expected) > 0.0,
+            tensor_max_abs(&expected) > 0.0,
             "forced-nonzero B must yield a non-trivial delta"
         );
     }
@@ -1775,13 +1770,17 @@ mod tests {
         // to_q now serves the trained delta (base was zero) ...
         let merged = w.get_f32("transformer_blocks.0.attn.to_q.weight").unwrap();
         let expected = reconstruct_lora_delta(&down, &up, 4.0, 2.0, 1.0).unwrap();
-        assert!(max_abs(&(merged - expected).unwrap()) < 1e-4);
+        assert!(tensor_max_abs(&(merged - expected).unwrap()) < 1e-4);
         // ... while the untargeted projections stay at their (zero) base.
         for target in ["to_k", "to_v", "to_out.0"] {
             let untouched = w
                 .get_f32(&format!("transformer_blocks.0.attn.{target}.weight"))
                 .unwrap();
-            assert_eq!(max_abs(&untouched), 0.0, "{target} must be untouched");
+            assert_eq!(
+                tensor_max_abs(&untouched),
+                0.0,
+                "{target} must be untouched"
+            );
         }
 
         std::fs::remove_file(&base_file).ok();
@@ -1849,12 +1848,12 @@ mod tests {
                 .unwrap())
         .unwrap();
         assert!(
-            max_abs(&(merged - expected).unwrap()) < 1e-4,
+            tensor_max_abs(&(merged - expected).unwrap()) < 1e-4,
             "projector = base + 0.5·δ"
         );
         // The untargeted attention projection stays at its (zero) base.
         assert_eq!(
-            max_abs(&w.get_f32("transformer_blocks.0.attn.to_q.weight").unwrap()),
+            tensor_max_abs(&w.get_f32("transformer_blocks.0.attn.to_q.weight").unwrap()),
             0.0
         );
 
@@ -1907,8 +1906,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.merged, 2, "weight + bias delta both fold");
-        assert!(max_abs(&(w.get_f32("mod0.weight").unwrap() - dw).unwrap()) < 1e-5);
-        assert!(max_abs(&(w.get_f32("mod0.bias").unwrap() - db).unwrap()) < 1e-5);
+        assert!(tensor_max_abs(&(w.get_f32("mod0.weight").unwrap() - dw).unwrap()) < 1e-5);
+        assert!(tensor_max_abs(&(w.get_f32("mod0.bias").unwrap() - db).unwrap()) < 1e-5);
 
         std::fs::remove_file(&base_file).ok();
         std::fs::remove_file(&adapter_file).ok();
@@ -1968,12 +1967,12 @@ mod tests {
             "weight + coupled bias both surfaced as skipped"
         );
         assert_eq!(
-            max_abs(&w.get_f32("mod0.weight").unwrap()),
+            tensor_max_abs(&w.get_f32("mod0.weight").unwrap()),
             0.0,
             "base untouched"
         );
         assert_eq!(
-            max_abs(&w.get_f32("mod0.bias").unwrap()),
+            tensor_max_abs(&w.get_f32("mod0.bias").unwrap()),
             0.0,
             "bias untouched"
         );
@@ -2142,7 +2141,7 @@ mod tests {
             .to_dtype(DType::F32)
             .unwrap();
         assert_eq!(
-            max_abs(&(merged - original).unwrap()),
+            tensor_max_abs(&(merged - original).unwrap()),
             0.0,
             "scale-0 merge must be byte-exact with the base"
         );
@@ -2257,7 +2256,7 @@ mod tests {
         let delta = reconstruct_lora_delta(&down, &up, 2.0, 2.0, 1.0).unwrap();
         let expected = (grids["to_q"].clone() + delta).unwrap();
         assert!(
-            max_abs(&(merged - expected).unwrap()) < 1e-2,
+            tensor_max_abs(&(merged - expected).unwrap()) < 1e-2,
             "packed to_q must merge into dequant(grid)+δ"
         );
 
@@ -2330,7 +2329,8 @@ mod tests {
         let folded =
             AdaptLinear::from_dense(Linear::new((w + delta).unwrap(), None), in_dim, out_dim);
         let x = Tensor::randn(0f32, 1f32, (2usize, in_dim), &dev).unwrap();
-        let d = max_abs(&(additive.forward(&x).unwrap() - folded.forward(&x).unwrap()).unwrap());
+        let d =
+            tensor_max_abs(&(additive.forward(&x).unwrap() - folded.forward(&x).unwrap()).unwrap());
         assert!(d < 1e-4, "resolved additive != folded ({d})");
 
         #[cfg(feature = "model-inference-proof")]
@@ -2402,7 +2402,8 @@ mod tests {
         let folded =
             AdaptLinear::from_dense(Linear::new((base_w + delta).unwrap(), None), inp, out);
         let x = Tensor::randn(0f32, 1f32, (2usize, inp), &dev).unwrap();
-        let dd = max_abs(&(additive.forward(&x).unwrap() - folded.forward(&x).unwrap()).unwrap());
+        let dd =
+            tensor_max_abs(&(additive.forward(&x).unwrap() - folded.forward(&x).unwrap()).unwrap());
         assert!(dd < 1e-4, "resolved additive LoKr != folded ({dd})");
         assert_eq!(skipped, 0);
 
@@ -2606,8 +2607,9 @@ mod tests {
         let q_delta = reconstruct_lora_delta(&dq, &uq, rank as f32, rank as f32, 1.0).unwrap();
         let q_folded =
             AdaptLinear::from_dense(Linear::new((wq + q_delta).unwrap(), None), in_dim, out_dim);
-        let q_diff =
-            max_abs(&(dit.to_q.forward(&x).unwrap() - q_folded.forward(&x).unwrap()).unwrap());
+        let q_diff = tensor_max_abs(
+            &(dit.to_q.forward(&x).unwrap() - q_folded.forward(&x).unwrap()).unwrap(),
+        );
         assert!(
             q_diff < 1e-4,
             "LoraLinear attention leaf additive != fold ({q_diff})"
@@ -2616,8 +2618,9 @@ mod tests {
         let i_delta = reconstruct_lora_delta(&di, &ui, rank as f32, rank as f32, 1.0).unwrap();
         let i_folded =
             AdaptLinear::from_dense(Linear::new((wi + i_delta).unwrap(), None), in_dim, out_dim);
-        let i_diff =
-            max_abs(&(dit.img_in.forward(&x).unwrap() - i_folded.forward(&x).unwrap()).unwrap());
+        let i_diff = tensor_max_abs(
+            &(dit.img_in.forward(&x).unwrap() - i_folded.forward(&x).unwrap()).unwrap(),
+        );
         assert!(
             i_diff < 1e-4,
             "AdaptLinear front-end leaf additive != fold ({i_diff})"

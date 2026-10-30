@@ -1097,6 +1097,7 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
     use candle_gen::candle_nn::{Linear, VarBuilder, VarMap};
+    use candle_gen::testkit::tensor_cosine;
 
     /// A tiny SD3.5-shaped config: 1 head at head_dim 8 (inner 8), a couple of joint blocks, small
     /// CLIP/T5 dims — enough to exercise every vendored path cheaply on CPU.
@@ -1511,19 +1512,6 @@ mod tests {
 
     // ---- Q4/Q8 quantization (sc-7879) -----------------------------------------------------------
 
-    /// Cosine similarity over all elements (f64).
-    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (x, y) in a.iter().zip(b.iter()) {
-            dot += (*x as f64) * (*y as f64);
-            na += (*x as f64) * (*x as f64);
-            nb += (*y as f64) * (*y as f64);
-        }
-        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
-    }
-
     /// Build a tiny MMDiT and its full forward inputs (shared by the quant tests). The inner dim is
     /// bumped to 32 so every quantized contraction is at least one Q4_0/Q8_0 block wide.
     fn quant_harness(cfg: &Sd3Config) -> (VarMap, Tensor, Tensor, Tensor, Tensor) {
@@ -1648,7 +1636,7 @@ mod tests {
                 "{quant:?} MMDiT produced a non-finite velocity"
             );
         }
-        let cos = cosine(&v_dense, &v_q);
+        let cos = tensor_cosine(&v_dense, &v_q) as f32;
         assert!(
             cos > min_cos,
             "{quant:?} MMDiT forward cosine {cos:.5} ≤ {min_cos} vs dense"

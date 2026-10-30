@@ -13,36 +13,10 @@
 //! Run with the `cuda` feature (absolute goldens path — cargo test cwd is the crate dir):
 //!   cargo test -p candle-gen-lens --features cuda --test integration vae_parity:: -- --nocapture
 
-use candle_gen::candle_core::{DType, Result, Tensor};
+use candle_gen::candle_core::{DType, Result};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::testkit::{tensor_cosine, tensor_peak_rel_host_f64};
 use candle_gen_lens::vae::{decode, Flux2Vae};
-
-/// Cosine similarity over all elements (flattened), computed in f64 on CPU.
-fn cosine(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    assert_eq!(a.len(), b.len(), "shape mismatch in cosine");
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += (*x as f64) * (*y as f64);
-        na += (*x as f64) * (*x as f64);
-        nb += (*y as f64) * (*y as f64);
-    }
-    Ok((dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32)
-}
-
-/// Peak relative error `max|a-b| / max|b|`, in f64 on CPU.
-fn peak_rel(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let mut max_diff = 0f64;
-    let mut max_b = 0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        max_diff = max_diff.max((*x - *y).abs() as f64);
-        max_b = max_b.max((*y).abs() as f64);
-    }
-    Ok((max_diff / max_b.max(1e-12)) as f32)
-}
 
 #[test]
 #[ignore = "needs the Lens-Turbo vae snapshot (LENS_VAE_DIR) + goldens (LENS_VAE_GOLDENS)"]
@@ -91,8 +65,8 @@ fn lens_vae_matches_reference() -> Result<()> {
     let out = decode(&vae, &latents, lh, lw)?;
     let golden = g["out"].to_dtype(DType::F32)?;
     assert_eq!(out.dims(), golden.dims(), "decoded shape mismatch");
-    let pr = peak_rel(&out, &golden)?;
-    let cos = cosine(&out, &golden)?;
+    let pr = tensor_peak_rel_host_f64(&out, &golden, Some(1e-12)) as f32;
+    let cos = tensor_cosine(&out, &golden) as f32;
     eprintln!(
         "vae decode: peak_rel={pr:.3e} cosine={cos:.7} out={:?}",
         out.dims()

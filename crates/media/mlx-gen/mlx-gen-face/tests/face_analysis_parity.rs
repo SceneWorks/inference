@@ -15,6 +15,7 @@
 //!   ~/.bisenet-spike/venv/bin/python tools/convert_bisenet.py
 //!   cargo test -p mlx-gen-face --release --test integration face_analysis_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::{box_iou_xyxy, cosine_f32_sums, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_face::{detector_blob, FaceAnalysis};
 use std::time::Instant;
@@ -50,21 +51,6 @@ fn kps5(g: &Weights, key: &str) -> [[f32; 2]; 5] {
         p[1] = v[i * 2 + 1];
     }
     k
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    dot / (na * nb)
-}
-
-fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
-    let (x1, y1) = (a[0].max(b[0]), a[1].max(b[1]));
-    let (x2, y2) = (a[2].min(b[2]), a[3].min(b[3]));
-    let inter = (x2 - x1).max(0.0) * (y2 - y1).max(0.0);
-    let area = |r: &[f32; 4]| (r[2] - r[0]) * (r[3] - r[1]);
-    inter / (area(a) + area(b) - inter)
 }
 
 fn kps_l2(a: &[[f32; 2]; 5], b: &[[f32; 2]; 5]) -> f32 {
@@ -142,10 +128,10 @@ fn face_analysis_end_to_end() {
             .unwrap()
             .try_as_slice::<f32>()
             .unwrap();
-        let bi = iou(&f.bbox, &want_bbox);
+        let bi = box_iou_xyxy(&f.bbox, &want_bbox);
         let kl = kps_l2(&f.kps, &want_kps);
-        let rc = cosine(&f.embedding, want_emb_ref);
-        let oc = cosine(&f.embedding, want_emb_ort);
+        let rc = cosine_f32_sums(&f.embedding, want_emb_ref, Denom::Exact);
+        let oc = cosine_f32_sums(&f.embedding, want_emb_ort, Denom::Exact);
         min_iou = min_iou.min(bi);
         max_kl2 = max_kl2.max(kl);
         min_ref = min_ref.min(rc);

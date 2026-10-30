@@ -1126,6 +1126,7 @@ mod tests {
 #[cfg(test)]
 mod adapter_noise_tests {
     use super::*;
+    use crate::testing::max_abs_diff_slices;
     use crate::train::optim::TrainOptimizer;
     use gen_core::TrainingConfig;
 
@@ -1147,14 +1148,6 @@ mod adapter_noise_tests {
         (v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
     }
 
-    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-        assert_eq!(a.len(), b.len());
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f32::max)
-    }
-
     /// Two SEPARATE Metal executions of the same seeded graph (optimizer steps, norm/rms
     /// reductions) agree only to the last few ulps — Metal reductions are not bit-deterministic
     /// across runs (run 37255363552 differed by 1 ulp). Compare such results within
@@ -1163,7 +1156,7 @@ mod adapter_noise_tests {
     fn assert_close(got: &[f32], want: &[f32], what: &str) {
         let scale = want.iter().fold(0.0f32, |m, x| m.max(x.abs()));
         let tol = 1e-6 + 1e-5 * scale;
-        let diff = max_abs_diff(got, want);
+        let diff = max_abs_diff_slices(got, want);
         assert!(diff <= tol, "{what}: max |diff| {diff} > tolerance {tol}");
     }
 
@@ -1412,7 +1405,7 @@ mod adapter_noise_tests {
             host(&p["blk.to_q.lora_a"])
         };
         let (clean, a, b) = (run(0.0), run(0.05), run(0.05));
-        let effect = max_abs_diff(&a, &clean);
+        let effect = max_abs_diff_slices(&a, &clean);
         assert!(
             effect > 1e-3,
             "gradient noise must reach the step (max |diff| {effect})"

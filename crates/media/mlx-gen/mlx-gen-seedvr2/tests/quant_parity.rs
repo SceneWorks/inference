@@ -5,10 +5,11 @@
 //! Also proves the in-features-divisibility predicate (so `vid_in.proj`, in=132, stays dense — else
 //! `quantize` would error). Skips when the goldens are absent.
 
+use mlx_gen::testing::{cosine_host_f64, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_seedvr2::config::DitConfig;
 use mlx_gen_seedvr2::dit::Seedvr2Transformer;
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Dtype;
 
 fn golden_dir() -> std::path::PathBuf {
     std::env::var("SEEDVR2_GOLDEN_DIR")
@@ -17,27 +18,6 @@ fn golden_dir() -> std::path::PathBuf {
             std::path::Path::new(&std::env::var("HOME").unwrap())
                 .join(".cache/mlx-gen-seedvr2-golden")
         })
-}
-
-fn cosine(got: &Array, exp: &Array) -> f32 {
-    let g = got
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .reshape(&[-1])
-        .unwrap();
-    let e = exp
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .reshape(&[-1])
-        .unwrap();
-    let (gs, es) = (g.as_slice::<f32>(), e.as_slice::<f32>());
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (a, b) in gs.iter().zip(es.iter()) {
-        dot += (*a as f64) * (*b as f64);
-        na += (*a as f64).powi(2);
-        nb += (*b as f64).powi(2);
-    }
-    (dot / (na.sqrt() * nb.sqrt()).max(1e-12)) as f32
 }
 
 /// Cast a Weights map to bf16 (the dtype the quantizer + reference compute in).
@@ -82,12 +62,12 @@ fn run(weights_file: &str, io_file: &str, cfg: DitConfig, label: &str) {
     let mut q8 = Seedvr2Transformer::from_weights(&w, &cfg).expect("q8");
     q8.quantize(8).expect("quantize 8"); // would error on vid_in (in=132) if the predicate were wrong
     let out_q8 = q8.forward(&vid, &txt, ts).expect("q8 fwd");
-    let cos8 = cosine(&out_q8, &out_dense);
+    let cos8 = cosine_host_f64(&out_q8, &out_dense, Denom::FloorAt(1e-12)) as f32;
 
     let mut q4 = Seedvr2Transformer::from_weights(&w, &cfg).expect("q4");
     q4.quantize(4).expect("quantize 4");
     let out_q4 = q4.forward(&vid, &txt, ts).expect("q4 fwd");
-    let cos4 = cosine(&out_q4, &out_dense);
+    let cos4 = cosine_host_f64(&out_q4, &out_dense, Denom::FloorAt(1e-12)) as f32;
 
     eprintln!("[{label}] Q8 cosine={cos8:.6}  Q4 cosine={cos4:.6} (vs bf16 dense)");
     // Q8 is near-lossless; Q4 is coherent (not bit-exact). Thresholds carry CI margin — this tiny

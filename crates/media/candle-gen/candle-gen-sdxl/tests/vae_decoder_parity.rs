@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{VarBuilder, VarMap};
 use candle_gen::gen_core::CancelFlag;
+use candle_gen::testkit::tensor_max_abs_diff_f32;
 use candle_gen::CandleError;
 use candle_gen_sdxl::SdxlVaeDecoder;
 use candle_transformers::models::stable_diffusion::vae::{AutoEncoderKL, AutoEncoderKLConfig};
@@ -86,19 +87,6 @@ fn latent(h: usize, w: usize, dtype: DType, device: &Device) -> Tensor {
         .unwrap()
 }
 
-fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
-    (a.to_dtype(DType::F32).unwrap() - b.to_dtype(DType::F32).unwrap())
-        .unwrap()
-        .abs()
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .max(0)
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-}
-
 /// The port must reproduce the stock decoder. Run at f32 *and* f16 because candle's `GroupNorm`
 /// computes its statistics in f32 for half-precision inputs and casts back **before** the affine —
 /// a port that normalized entirely in the input dtype would pass at f32 and drift at f16, which is
@@ -127,7 +115,7 @@ fn native_dense_decode_matches_the_stock_autoencoder_kl() {
         let want = __model_proof_output!(stock.decode(&z)).unwrap();
         let got = native.decode(&z).unwrap();
         assert_eq!(got.dims(), want.dims(), "{dtype:?} geometry");
-        let delta = max_abs(&got, &want);
+        let delta = tensor_max_abs_diff_f32(&got, &want);
         assert!(
             delta < bound,
             "{dtype:?}: the ported decoder diverged from candle's AutoEncoderKL by max|delta|={delta:.3e}"
@@ -173,7 +161,7 @@ fn bounded_decode_tracks_the_dense_decode() {
 
         let bounded = native.decode_tiled(&z, edge, None).unwrap();
         assert_eq!(bounded.dims(), dense.dims(), "{dtype:?} geometry");
-        let delta = max_abs(&bounded, &dense);
+        let delta = tensor_max_abs_diff_f32(&bounded, &dense);
         assert!(
             delta < bound,
             "{dtype:?}: layer-wise bounded SDXL decode diverged from dense: max|delta|={delta:.3e}"
@@ -216,7 +204,7 @@ fn per_tile_normalization_is_observably_wrong() {
         let per_tile = candle_gen::candle_core::Tensor::cat(&[left, right], 3).unwrap();
         assert_eq!(per_tile.dims(), dense.dims());
 
-        let delta = max_abs(&per_tile, &dense);
+        let delta = tensor_max_abs_diff_f32(&per_tile, &dense);
         assert!(
             delta > 1e-2,
             "{dtype:?}: per-crop normalization must be observably different from the dense decode, \
@@ -260,7 +248,7 @@ fn a_wide_edge_falls_through_to_the_dense_computation() {
     let z = latent(6, 7, dtype, &device);
     let dense = native.decode(&z).unwrap();
     let bounded = native.decode_tiled(&z, 4096, None).unwrap();
-    let delta = max_abs(&bounded, &dense);
+    let delta = tensor_max_abs_diff_f32(&bounded, &dense);
     assert!(
         delta == 0.0,
         "the single-tile fall-through must BE the dense computation, not merely approximate it: \

@@ -16,20 +16,8 @@ use std::time::Instant;
 use mlx_gen::gen_core::{
     CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, OffloadPolicy, Quant, WeightsSource,
 };
-use mlx_gen::media::Image;
+use mlx_gen::testing::{env_or, save_png};
 use mlx_gen_flux2::load_dev;
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-fn save_png(img: &Image, path: &str) {
-    let buf: image::RgbImage =
-        image::ImageBuffer::from_raw(img.width, img.height, img.pixels.clone())
-            .expect("output image buffer");
-    buf.save(path)
-        .unwrap_or_else(|e| panic!("save {path}: {e}"));
-}
 
 fn main() {
     let snapshot = env_or("FLUX2_DEV_SNAPSHOT", "");

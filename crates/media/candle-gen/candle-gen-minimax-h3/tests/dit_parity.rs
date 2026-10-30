@@ -39,13 +39,14 @@ use crate::common;
 use std::collections::{BTreeSet, HashMap};
 
 use common::{
-    assert_parity, cosine, dit_fixture_config, l2_norm, rel, std_dev, weights, Golden, DIT_FIXTURE,
+    assert_parity, dit_fixture_config, l2_norm, rel, std_dev, weights, Golden, DIT_FIXTURE,
     DIT_LAYOUT,
 };
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::Weights;
 
+use candle_gen::testkit::{tensor_cosine_f32_sums, Denom};
 use candle_gen_minimax_h3::dit::layers::DitAttention;
 use candle_gen_minimax_h3::dit::positions::{self, KeyframeAnchor};
 use candle_gen_minimax_h3::dit::qkv;
@@ -625,7 +626,7 @@ fn qk_norm_runs_per_head_before_the_rotary() {
         let (peak, _) = rel(variant, &want);
         println!(
             "  {label}: peak rel {peak:.3e} cosine {:.4} ||variant||={:.4} ||golden||={:.4}",
-            cosine(variant, &want),
+            tensor_cosine_f32_sums(variant, &want, Denom::FloorAt(1e-12)),
             l2_norm(variant),
             l2_norm(&want)
         );
@@ -821,7 +822,7 @@ fn reading_the_ffn_halves_gate_first_breaks_parity() {
         "FFN half-swap: rel-max-abs={peak:.3e} rel-mean={mean:.3e} cosine={:.4} \
          ||correct||={:.4} ||swapped||={:.4}  (parity residual with the correct layout: \
          {base_peak:.3e})",
-        cosine(&mutated, &baseline),
+        tensor_cosine_f32_sums(&mutated, &baseline, Denom::FloorAt(1e-12)),
         l2_norm(&baseline),
         l2_norm(&mutated),
     );
@@ -1011,7 +1012,7 @@ fn the_wrong_qkv_transform_breaks_parity() {
     let (peak, _) = rel(&mutated, &baseline);
     println!(
         "  wrong qkv transform: peak rel {peak:.3e} cosine {:.4}",
-        cosine(&mutated, &baseline)
+        tensor_cosine_f32_sums(&mutated, &baseline, Denom::FloorAt(1e-12))
     );
     assert!(
         peak > MUTATION_FLOOR,

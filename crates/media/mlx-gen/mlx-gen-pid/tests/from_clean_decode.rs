@@ -11,12 +11,13 @@
 //! ```
 
 use mlx_gen::decoder::LatentDecoder;
+use mlx_gen::testing::{env_or, save_nchw_signed_unit_png};
 use mlx_gen::weights::Weights;
 use mlx_gen_pid::{
     CaptionEncoder, Gemma2, Gemma2Config, PidConfig, PidDecoder, PidNet, Sampler, SamplerConfig,
 };
 use mlx_rs::ops::{max, mean, min};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Dtype;
 
 /// Each runA `from_clean` sample: name (→ `clean_latent_<name>.safetensors` + `mlx_<name>_*.png`) and
 /// the **PiD decode caption** (the short text condition fed to PiD, NOT the longer Qwen-Image
@@ -36,12 +37,8 @@ const SAMPLES: &[(&str, &str)] = &[
     ),
 ];
 
-fn env_or(name: &str, default: String) -> String {
-    std::env::var(name).unwrap_or(default)
-}
-
 fn gemma_snapshot() -> String {
-    env_or("PID_GEMMA_DIR", {
+    env_or("PID_GEMMA_DIR", &{
         let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
         let base = format!("{home}/models--Efficient-Large-Model--gemma-2-2b-it/snapshots");
         std::fs::read_dir(&base)
@@ -55,32 +52,6 @@ fn gemma_snapshot() -> String {
     })
 }
 
-/// `[1,3,H,W]` in [-1,1] → RGB8 PNG.
-fn save_png(out: &Array, path: &str) {
-    let sh = out.shape();
-    let (h, w) = (sh[2], sh[3]);
-    let chw = out
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .reshape(&[3, h, w])
-        .unwrap();
-    // NB: `as_slice` returns *physical* storage order. A bare `transpose` is a strided view whose
-    // buffer is still the original `[3,H,W]` (channel-planar) layout — reading that as interleaved
-    // `[H,W,3]` shuffles every pixel into a 3×3-tiled, channel-averaged (grayscale) mess. Reshape
-    // after the transpose to force a logical-order contiguous copy before slicing.
-    let hwc = chw
-        .transpose_axes(&[1, 2, 0])
-        .unwrap()
-        .reshape(&[h * w * 3])
-        .unwrap(); // [H·W·3] interleaved RGB
-    let v: Vec<f32> = hwc.as_slice::<f32>().to_vec();
-    let buf: Vec<u8> = v
-        .iter()
-        .map(|x| (((x + 1.0) * 127.5).clamp(0.0, 255.0)) as u8)
-        .collect();
-    image::save_buffer(path, &buf, w as u32, h as u32, image::ColorType::Rgb8).unwrap();
-}
-
 #[test]
 #[ignore = "needs qwenimage ckpt + gemma + clean_latent dumps"]
 fn from_clean_runa() {
@@ -91,8 +62,7 @@ fn from_clean_runa() {
         concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../tools/golden/pid/qwenimage_2kto4k.safetensors"
-        )
-        .to_string(),
+        ),
     );
     let w = Weights::from_file(&ckpt).unwrap();
 
@@ -169,7 +139,7 @@ fn from_clean_runa() {
             ),
             name, th
         );
-        save_png(&out, &png);
+        save_nchw_signed_unit_png(&out, &png);
         eprintln!("[{name}] wrote {png}");
     }
     crate::model_inference_device::record_model_inference_device();

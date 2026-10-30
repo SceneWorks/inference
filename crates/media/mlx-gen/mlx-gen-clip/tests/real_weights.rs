@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use mlx_gen::gen_core::runtime::{LoadSpec, WeightsSource};
 use mlx_gen::media::Image;
+use mlx_gen::testing::{cosine_f32_sums, Denom};
 use mlx_gen_clip::{load, load_text};
 
 fn snapshot() -> PathBuf {
@@ -34,13 +35,6 @@ fn solid(w: u32, h: u32, rgb: [u8; 3]) -> Image {
     }
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    dot / (na * nb)
-}
-
 #[test]
 #[ignore = "loads openai/clip-vit-large-patch14 (~1.7GB); set CLIP_VIT_L_SNAPSHOT"]
 fn embeds_real_images_with_sane_cosine_geometry() {
@@ -57,14 +51,14 @@ fn embeds_real_images_with_sane_cosine_geometry() {
     assert!(red.iter().any(|&x| x != 0.0), "embedding is not all-zero");
 
     // Determinism / size-invariance: the same colour at two sizes → identical embedding.
-    let self_cos = cosine(&red, &red_big);
+    let self_cos = cosine_f32_sums(&red, &red_big, Denom::Exact);
     assert!(
         self_cos > 0.999,
         "same colour at two sizes should match (cos={self_cos})"
     );
 
     // Colour sensitivity: a different colour is measurably less similar than an identical image.
-    let cross_cos = cosine(&red, &blue);
+    let cross_cos = cosine_f32_sums(&red, &blue, Denom::Exact);
     assert!(
         cross_cos < self_cos,
         "red·blue ({cross_cos}) should be < red·red ({self_cos})"
@@ -96,10 +90,10 @@ fn text_and_image_embeds_rank_matching_colours_higher() {
     assert!(red_text.iter().all(|v| v.is_finite()) && red_text.iter().any(|&v| v != 0.0));
     assert!(blue_text.iter().all(|v| v.is_finite()) && blue_text.iter().any(|&v| v != 0.0));
 
-    let red_text_red = cosine(&red_text, &red);
-    let red_text_blue = cosine(&red_text, &blue);
-    let blue_text_blue = cosine(&blue_text, &blue);
-    let blue_text_red = cosine(&blue_text, &red);
+    let red_text_red = cosine_f32_sums(&red_text, &red, Denom::Exact);
+    let red_text_blue = cosine_f32_sums(&red_text, &blue, Denom::Exact);
+    let blue_text_blue = cosine_f32_sums(&blue_text, &blue, Denom::Exact);
+    let blue_text_red = cosine_f32_sums(&blue_text, &red, Denom::Exact);
 
     assert!(
         red_text_red > red_text_blue,

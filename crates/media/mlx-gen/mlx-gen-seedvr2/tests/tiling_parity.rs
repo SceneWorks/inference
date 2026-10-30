@@ -4,10 +4,11 @@
 //! one closely. We force a small tile on a small frame (where both fit) and assert the tiled decode
 //! matches the untiled `run_model_5d` decode. Weight-gated; skips without the raw checkpoint.
 
+use mlx_gen::testing::{cosine_f64_sums, cosine_host_f64, Denom};
 use mlx_gen::Image;
 use mlx_gen_seedvr2::config::DitConfig;
 use mlx_gen_seedvr2::pipeline::Seedvr2Pipeline;
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Dtype;
 
 fn raw_dir() -> Option<std::path::PathBuf> {
     let base = std::path::Path::new(&std::env::var("MLX_GEN_MODELS_ROOT").ok()?)
@@ -16,27 +17,6 @@ fn raw_dir() -> Option<std::path::PathBuf> {
     snap.join("seedvr2_ema_3b_fp16.safetensors")
         .exists()
         .then_some(snap)
-}
-
-fn cosine(got: &Array, exp: &Array) -> f32 {
-    let g = got
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .reshape(&[-1])
-        .unwrap();
-    let e = exp
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .reshape(&[-1])
-        .unwrap();
-    let (gs, es) = (g.as_slice::<f32>(), e.as_slice::<f32>());
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (a, b) in gs.iter().zip(es.iter()) {
-        dot += (*a as f64) * (*b as f64);
-        na += (*a as f64).powi(2);
-        nb += (*b as f64).powi(2);
-    }
-    (dot / (na.sqrt() * nb.sqrt()).max(1e-12)) as f32
 }
 
 #[test]
@@ -89,24 +69,13 @@ fn seedvr2_spatial_tiling_tracks_untiled() {
         .run_frame_tiled(&processed, 7, 160, 64, &neg, &mlx_gen::CancelFlag::new())
         .expect("tiled path");
     assert_eq!(tiled.shape(), untiled.shape(), "decoded shape");
-    let cos = cosine(&tiled, &untiled);
+    let cos = cosine_host_f64(&tiled, &untiled, Denom::FloorAt(1e-12)) as f32;
     eprintln!(
         "spatial tiling vs untiled: cosine={cos:.6} (shape {:?})",
         tiled.shape()
     );
     // Not bit-exact (VAE border padding differs per tile); overlap-feather keeps it close.
     assert!(cos > 0.95, "tiled decode diverged from untiled: {cos}");
-}
-
-/// Cosine similarity over two equal-length RGB8 pixel buffers.
-fn pixel_cosine(a: &[u8], b: &[u8]) -> f32 {
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += (*x as f64) * (*y as f64);
-        na += (*x as f64).powi(2);
-        nb += (*y as f64).powi(2);
-    }
-    (dot / (na.sqrt() * nb.sqrt()).max(1e-12)) as f32
 }
 
 /// sc-6067: the **image** path (`Seedvr2Pipeline::generate`) must spatially tile when a single
@@ -176,7 +145,7 @@ fn seedvr2_image_path_tiles_when_over_budget() {
 
     // The tiled result tracks the one-pass result closely (feather-blend; not bit-exact — the causal
     // VAE sees different border padding per tile).
-    let cos = pixel_cosine(&tiled.pixels, &single.pixels);
+    let cos = cosine_f64_sums(&tiled.pixels, &single.pixels, Denom::FloorAt(1e-12)) as f32;
     eprintln!("image-path tiled vs single-pass: cosine={cos:.6}");
     assert!(cos > 0.95, "tiled image diverged from single-pass: {cos}");
 }

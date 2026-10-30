@@ -865,6 +865,7 @@ impl DcAeEncoder {
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
+    use candle_gen::testkit::tensor_max_abs_diff;
     use std::collections::HashMap;
 
     /// A deterministic pseudo-random tensor (linear-congruential fill) — reproducible on any backend,
@@ -1302,7 +1303,7 @@ mod tests {
         let tail_crop = dec
             .decode_tail(&head.narrow(3, 0, CROP).unwrap().contiguous().unwrap())
             .unwrap();
-        let tail_residual = max_abs(
+        let tail_residual = tensor_max_abs_diff(
             &tail_full.narrow(3, 0, INTERIOR * scale).unwrap(),
             &tail_crop.narrow(3, 0, INTERIOR * scale).unwrap(),
         );
@@ -1317,7 +1318,7 @@ mod tests {
         let head_crop = dec
             .decode_head(&latent.narrow(3, 0, CROP).unwrap().contiguous().unwrap())
             .unwrap();
-        let head_residual = max_abs(
+        let head_residual = tensor_max_abs_diff(
             &head.narrow(3, 0, INTERIOR).unwrap(),
             &head_crop.narrow(3, 0, INTERIOR).unwrap(),
         );
@@ -1327,7 +1328,7 @@ mod tests {
              deepest interior — a head that survived cropping would mean this fixture never \
              exercised the global op; max|Δ|={head_residual:.3e}"
         );
-        let head_edge_column = max_abs(
+        let head_edge_column = tensor_max_abs_diff(
             &head.narrow(3, 0, 1).unwrap(),
             &head_crop.narrow(3, 0, 1).unwrap(),
         );
@@ -1478,7 +1479,7 @@ mod tests {
         let x = signed(&[1, c, 12, 12], 91, &dev);
         let whole = norm.forward(&x).unwrap();
         let cropped = norm.forward(&x.narrow(3, 0, 6).unwrap()).unwrap();
-        let norm_residual = max_abs(&whole.narrow(3, 0, 6).unwrap(), &cropped);
+        let norm_residual = tensor_max_abs_diff(&whole.narrow(3, 0, 6).unwrap(), &cropped);
         assert_eq!(
             norm_residual, 0.0,
             "a channel-axis reduction must commute with a spatial crop bit-exactly, else the tail is \
@@ -1496,7 +1497,7 @@ mod tests {
         let crop = |t: &Tensor| t.narrow(3, 0, half).unwrap().contiguous().unwrap();
         let attn_cropped =
             relu_linear_attention(&crop(&q), &crop(&k), &crop(&v), cfg.attn_eps as f64).unwrap();
-        let attn_residual = max_abs(&crop(&attn_whole), &attn_cropped);
+        let attn_residual = tensor_max_abs_diff(&crop(&attn_whole), &attn_cropped);
         assert!(
             attn_residual > 1e-2,
             "the head's token-axis reduction must NOT commute with a crop — that is why it may never \
@@ -1530,20 +1531,6 @@ mod tests {
             })
             .collect::<Vec<f32>>();
         Tensor::from_vec(v, shape, dev).unwrap()
-    }
-
-    /// max|a − b| as f32, for the crop-commutation residuals above.
-    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
-        (a.contiguous().unwrap() - b.contiguous().unwrap())
-            .unwrap()
-            .abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
     }
 
     #[test]

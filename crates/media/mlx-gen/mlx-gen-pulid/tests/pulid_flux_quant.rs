@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use mlx_gen::media::Image;
+use mlx_gen::testing::{cosine_f32_sums, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Conditioning, GenerationOutput, GenerationRequest, Generator, LoadSpec, Quant, WeightsSource,
@@ -84,13 +85,6 @@ fn build_eva() -> EvaVisionTransformer {
     .unwrap()
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    dot / (na * nb)
-}
-
 #[test]
 #[ignore = "real-weights quant e2e: needs FLUX.1-dev + PuLID + EVA/face goldens"]
 fn pulid_flux_quant_holds_identity() {
@@ -140,7 +134,7 @@ fn pulid_flux_quant_holds_identity() {
             .unwrap();
         let cos = gen
             .first()
-            .map(|g| cosine(&g.embedding, &ref_emb))
+            .map(|g| cosine_f32_sums(&g.embedding, &ref_emb, Denom::Exact))
             .unwrap_or(f32::NAN);
         println!(
             "{quant:?}: render {dt:.1}s, identity ArcFace cosine = {cos:.4} (bf16 baseline ≈0.68)"

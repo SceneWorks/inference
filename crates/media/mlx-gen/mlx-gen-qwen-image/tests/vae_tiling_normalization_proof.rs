@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+use mlx_gen::testing::max_abs_diff_host;
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::vae_tiling::tiled_decode;
 use mlx_gen::weights::Weights;
@@ -191,14 +192,6 @@ fn latents(hw: i32) -> Array {
     Array::from_slice(&data, &shape)
 }
 
-fn max_abs_delta(left: &Array, right: &Array) -> f32 {
-    left.as_slice::<f32>()
-        .iter()
-        .zip(right.as_slice::<f32>())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0_f32, f32::max)
-}
-
 /// `x[..., ..width]` on the last (W) axis, made contiguous so `as_slice` reads it correctly.
 fn front_cols(x: &Array, width: i32) -> Array {
     let idx = (0..width).collect::<Vec<_>>();
@@ -241,7 +234,7 @@ fn head_tail_decomposition_is_the_exact_single_pass_decode() {
     split.eval().unwrap();
     assert_eq!(split.shape(), dense.shape());
     assert_eq!(
-        max_abs_delta(&dense, &split),
+        max_abs_diff_host(&dense, &split),
         0.0,
         "the head/tail split must reproduce the single-pass decode exactly"
     );
@@ -288,7 +281,7 @@ fn the_upsample_tail_is_spatially_local_but_the_head_is_not() {
     dense_window.eval().unwrap();
     crop_window.eval().unwrap();
     assert_eq!(crop_window.shape(), dense_window.shape());
-    let local = max_abs_delta(&dense_window, &crop_window);
+    let local = max_abs_diff_host(&dense_window, &crop_window);
 
     // Global claim (the executed mutation control): re-running the head on the crop moves the SAME
     // window by orders of magnitude, because the attention softmax spans the whole latent.
@@ -298,7 +291,7 @@ fn the_upsample_tail_is_spatially_local_but_the_head_is_not() {
     let crop_decode_window = front_cols(&crop_decode, CROP_EXACT_OUT_W);
     dense_decode_window.eval().unwrap();
     crop_decode_window.eval().unwrap();
-    let global = max_abs_delta(&dense_decode_window, &crop_decode_window);
+    let global = max_abs_diff_host(&dense_decode_window, &crop_decode_window);
 
     assert!(
         local < 1e-4,
@@ -376,18 +369,18 @@ fn tiled_decode_runs_the_global_head_once_and_tiles_only_the_local_tail() {
     assert_eq!(route_b.shape(), shipped.shape());
 
     assert_eq!(
-        max_abs_delta(&shipped, &route_a),
+        max_abs_diff_host(&shipped, &route_a),
         0.0,
         "decode_tiled must be exactly `dense head + tiled local tail`"
     );
-    let b = max_abs_delta(&shipped, &route_b);
+    let b = max_abs_diff_host(&shipped, &route_b);
     assert!(
         b > 1e-1,
         "tiling the global attention head must be observably wrong, but it moved the output by only \
          max|Δ|={b:.3e} — either the head stopped being global or the fixture stopped discriminating"
     );
     // Informational: the blend's own halo residual against the dense single-pass decode.
-    let halo = max_abs_delta(&dense, &shipped);
+    let halo = max_abs_diff_host(&dense, &shipped);
     println!("route_b vs shipped = {b:.3e}; dense vs shipped (halo residual) = {halo:.3e}");
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED vae_tiling_normalization_proof::tiled_decode_runs_the_global_head_once_and_tiles_only_the_local_tail");
@@ -414,7 +407,7 @@ fn a_request_too_wide_to_tile_is_the_exact_single_pass_decode() {
     dense.eval().unwrap();
     untiled.eval().unwrap();
     assert_eq!(
-        max_abs_delta(&dense, &untiled),
+        max_abs_diff_host(&dense, &untiled),
         0.0,
         "a request too wide to tile must be the exact single-pass decode"
     );
@@ -469,7 +462,7 @@ fn the_tail_normalization_commutes_with_cropping_but_a_spatial_reduction_does_no
     cropped_dense.eval().unwrap();
     norm_of_crop.eval().unwrap();
     assert_eq!(
-        max_abs_delta(&cropped_dense, &norm_of_crop),
+        max_abs_diff_host(&cropped_dense, &norm_of_crop),
         0.0,
         "a channel-axis-only normalization must commute with spatial cropping"
     );
@@ -487,7 +480,7 @@ fn the_tail_normalization_commutes_with_cropping_but_a_spatial_reduction_does_no
     let group_of_crop = group_norm_shaped(&crop(&x));
     cropped_group.eval().unwrap();
     group_of_crop.eval().unwrap();
-    let broken = max_abs_delta(&cropped_group, &group_of_crop);
+    let broken = max_abs_diff_host(&cropped_group, &group_of_crop);
     assert!(
         broken > 1e-1,
         "the GroupNorm-shaped control must break commutation, got max|Δ|={broken:.3e} — the \

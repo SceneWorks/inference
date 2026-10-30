@@ -46,6 +46,7 @@ use mlx_gen::gen_core::{
     WeightsSource,
 };
 use mlx_gen::media::Image;
+use mlx_gen::testing::env_or_nonempty;
 use mlx_gen_boogu::VisionTower;
 use mlx_gen_minimax_h3::model::{load, DIT_COMPONENT, TEXT_ENCODER_COMPONENT};
 use mlx_gen_minimax_h3::pipeline::{resolve_geometry, PATCH_SIZE, SPATIAL_STRIDE};
@@ -74,13 +75,6 @@ fn env(key: &str) -> Option<PathBuf> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)
-}
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| default.to_owned())
 }
 
 /// A deterministic 576x320 plate in the shape of the film-harness fixture plates: one flat colour
@@ -144,7 +138,7 @@ fn gb(bytes: usize) -> f64 {
 fn cold_second_load_token_embedding_incidence_probe() {
     let root = env("MINIMAX_H3_SNAPSHOT").expect("MINIMAX_H3_SNAPSHOT=<snapshot root>");
     let component = env("MINIMAX_H3_TE").expect("MINIMAX_H3_TE=<text_encoder component dir>");
-    let mode = env_or("MINIMAX_H3_COLD_MODE", "screened");
+    let mode = env_or_nonempty("MINIMAX_H3_COLD_MODE", "screened");
     assert!(
         mode == "raw" || mode == "screened",
         "MINIMAX_H3_COLD_MODE must be raw|screened, got {mode}"
@@ -299,12 +293,14 @@ fn reference_partition_step_cost_against_base() {
     let root = env("MINIMAX_H3_SNAPSHOT").expect("MINIMAX_H3_SNAPSHOT=<snapshot root>");
     let dit = env("MINIMAX_H3_DIT").expect("MINIMAX_H3_DIT=<tier>/transformer");
     let text_encoder = env("MINIMAX_H3_TE").expect("MINIMAX_H3_TE=<tier>/text_encoder");
-    let route = env_or("MINIMAX_H3_COST_ROUTE", "ref2va");
+    let route = env_or_nonempty("MINIMAX_H3_COST_ROUTE", "ref2va");
     assert!(
         route == "ref2va" || route == "t2va",
         "MINIMAX_H3_COST_ROUTE must be ref2va|t2va, got {route}"
     );
-    let steps: u32 = env_or("MINIMAX_H3_COST_STEPS", "5").parse().expect("steps");
+    let steps: u32 = env_or_nonempty("MINIMAX_H3_COST_STEPS", "5")
+        .parse()
+        .expect("steps");
     let keep_decode = std::env::var_os("MINIMAX_H3_COST_DECODE").is_some();
 
     let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))

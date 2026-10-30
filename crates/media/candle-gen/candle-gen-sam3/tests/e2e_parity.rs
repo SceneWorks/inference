@@ -12,8 +12,8 @@
 
 use std::path::Path;
 
-use crate::support::iou;
 use candle_gen::default_device;
+use candle_gen::testkit::tensor_iou;
 use candle_gen_sam3::{Sam3ImageSegmenter, Weights};
 
 #[test]
@@ -68,7 +68,7 @@ fn full_segmenter_matches_oracle() {
             .unwrap()
             .reshape((288, 288))
             .unwrap();
-        let m = iou(&inst.mask, &want);
+        let m = tensor_iou(&inst.mask, &want);
         worst_iou = worst_iou.min(m);
         println!("  instance {i}: score={:.3} mask IoU={:.4}", inst.score, m);
     }

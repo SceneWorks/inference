@@ -9,6 +9,7 @@
 //!   ~/.dwpose-spike/venv/bin/python tools/convert_scrfd.py
 //!   cargo test -p mlx-gen-face --release --test integration scrfd_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::box_iou_xyxy;
 use mlx_gen::weights::Weights;
 use mlx_gen_face::{Detection, Scrfd};
 
@@ -16,17 +17,6 @@ fn golden(name: &str) -> Weights {
     let path = format!("{}/../tools/golden/{name}", env!("CARGO_MANIFEST_DIR"));
     Weights::from_file(&path)
         .unwrap_or_else(|e| panic!("missing golden {path}: {e}\nRun tools/convert_scrfd.py first."))
-}
-
-fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
-    let x1 = a[0].max(b[0]);
-    let y1 = a[1].max(b[1]);
-    let x2 = a[2].min(b[2]);
-    let y2 = a[3].min(b[3]);
-    let inter = (x2 - x1).max(0.0) * (y2 - y1).max(0.0);
-    let area_a = (a[2] - a[0]) * (a[3] - a[1]);
-    let area_b = (b[2] - b[0]) * (b[3] - b[1]);
-    inter / (area_a + area_b - inter)
 }
 
 #[test]
@@ -75,13 +65,13 @@ fn scrfd_network_and_detect_parity() {
     let mut max_kps_l2 = 0.0f32;
     for i in 0..m {
         let want_box = [gbv[i * 5], gbv[i * 5 + 1], gbv[i * 5 + 2], gbv[i * 5 + 3]];
-        let (best, biou) =
-            got.iter()
-                .map(|d| (d, iou(&d.bbox, &want_box)))
-                .fold(
-                    (&got[0], 0.0f32),
-                    |acc, x| if x.1 > acc.1 { x } else { acc },
-                );
+        let (best, biou) = got
+            .iter()
+            .map(|d| (d, box_iou_xyxy(&d.bbox, &want_box)))
+            .fold(
+                (&got[0], 0.0f32),
+                |acc, x| if x.1 > acc.1 { x } else { acc },
+            );
         let mut kl2 = 0.0f32;
         for p in 0..5 {
             let wx = gkv[(i * 5 + p) * 2];

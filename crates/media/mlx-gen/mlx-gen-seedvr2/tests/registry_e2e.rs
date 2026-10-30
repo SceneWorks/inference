@@ -4,6 +4,7 @@
 //! the golden `decoded`; (c) `generate` runs end-to-end on an image and returns the right size.
 //! Needs the models root (`MLX_GEN_MODELS_ROOT`) + e2e golden; skips otherwise.
 
+use mlx_gen::testing::{cosine_host_f64, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::Image;
 use mlx_gen_seedvr2::config::DitConfig;
@@ -26,27 +27,6 @@ fn raw_dir() -> Option<std::path::PathBuf> {
     snap.join("seedvr2_ema_3b_fp16.safetensors")
         .exists()
         .then_some(snap)
-}
-
-fn cosine(got: &Array, exp: &Array) -> f32 {
-    let g = got
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .reshape(&[-1])
-        .unwrap();
-    let e = exp
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .reshape(&[-1])
-        .unwrap();
-    let (gs, es) = (g.as_slice::<f32>(), e.as_slice::<f32>());
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (a, b) in gs.iter().zip(es.iter()) {
-        dot += (*a as f64) * (*b as f64);
-        na += (*a as f64).powi(2);
-        nb += (*b as f64).powi(2);
-    }
-    (dot / (na.sqrt() * nb.sqrt()).max(1e-12)) as f32
 }
 
 #[ignore = "model inference; explicit model-proof workflow"]
@@ -73,10 +53,11 @@ fn seedvr2_loads_and_runs_from_real_checkpoint() {
     let io = Weights::from_file(gdir.join("e2e_io_f32.safetensors")).expect("e2e io");
 
     // (a) bundled neg-embed matches the reference
-    let neg_cos = cosine(
+    let neg_cos = cosine_host_f64(
         pipe.neg_embed().expect("neg-embed"),
         io.require("neg_embed").unwrap(),
-    );
+        Denom::FloorAt(1e-12),
+    ) as f32;
     eprintln!("neg_embed cosine = {neg_cos:.6}");
     assert!(neg_cos > 0.9999, "bundled neg-embed mismatch: {neg_cos}");
 
@@ -91,7 +72,11 @@ fn seedvr2_loads_and_runs_from_real_checkpoint() {
             256,
         )
         .expect("run_model");
-    let cos = cosine(&decoded, io.require("decoded").unwrap());
+    let cos = cosine_host_f64(
+        &decoded,
+        io.require("decoded").unwrap(),
+        Denom::FloorAt(1e-12),
+    ) as f32;
     eprintln!("real-weight decoded cosine = {cos:.6}");
     assert!(cos > 0.999, "real-weight model path diverged: {cos}");
 
@@ -273,7 +258,7 @@ fn seedvr2_generate_tiles_above_vae_cap() {
         &tiled.pixels.iter().map(|&v| v as f32).collect::<Vec<_>>(),
         &[tiled.pixels.len() as i32],
     );
-    let cos = cosine(&auto_f, &tiled_f);
+    let cos = cosine_host_f64(&auto_f, &tiled_f, Denom::FloorAt(1e-12)) as f32;
     eprintln!("auto-vs-forced-tiled cosine @ {target}² = {cos:.4}");
 
     // Non-degenerate: a collapsed/uniform decode would have near-zero variance.

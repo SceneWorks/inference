@@ -13,6 +13,7 @@
 
 use std::time::Instant;
 
+use mlx_gen::testing::iou_bool;
 use mlx_gen::weights::Weights;
 use mlx_gen_sam2::{Sam2ImageEncoderConfig, Sam2Segmenter};
 use mlx_rs::Array;
@@ -27,25 +28,6 @@ fn u8s(a: &Array) -> Vec<u8> {
         .unwrap()
         .as_slice::<u8>()
         .to_vec()
-}
-
-/// IoU of two binary masks (`got` is 0/255, `base` is 0/1).
-fn iou(got: &[u8], base: &[u8]) -> f32 {
-    let (mut inter, mut union) = (0usize, 0usize);
-    for (&g, &b) in got.iter().zip(base) {
-        let (gg, bb) = (g > 127, b > 0);
-        if gg && bb {
-            inter += 1;
-        }
-        if gg || bb {
-            union += 1;
-        }
-    }
-    if union == 0 {
-        1.0
-    } else {
-        inter as f32 / union as f32
-    }
 }
 
 #[test]
@@ -84,8 +66,8 @@ fn box_prompt_go_vs_spike_baseline() {
 
         let pt = u8s(g.require(&format!("pt_{name}")).unwrap());
         let ort = u8s(g.require(&format!("ort_{name}")).unwrap());
-        let iou_pt = iou(&got, &pt);
-        let iou_ort = iou(&got, &ort);
+        let iou_pt = iou_bool(got.iter().map(|&g| g > 127), pt.iter().map(|&b| b > 0));
+        let iou_ort = iou_bool(got.iter().map(|&g| g > 127), ort.iter().map(|&b| b > 0));
         let fg = got.iter().filter(|&&v| v > 127).count();
         println!(
             "{name} ({h}x{wd}): IoU vs PyTorch {iou_pt:.4}, vs ONNX {iou_ort:.4} | mask fg {fg} | {ms:.0} ms/frame"

@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use mlx_gen::testing::max_abs;
+use mlx_gen::testing::{max_abs, max_abs_diff_f32};
 use mlx_gen_qwen_image::loader::{load_transformer, load_transformer_edit};
 use mlx_gen_qwen_image::transformer::{set_compile_glue, QwenTransformer};
 use mlx_rs::{random, Array, Dtype};
@@ -62,13 +62,6 @@ fn timed(eval: &[&Array], start: Instant) -> f64 {
 fn median(mut xs: Vec<f64>) -> f64 {
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     xs[xs.len() / 2]
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(&a, &b).unwrap()).unwrap();
-    mlx_rs::ops::max(&d, None).unwrap().item::<f32>()
 }
 
 /// Peak-**relative** bound on the compiled-glue-vs-eager divergence of the **whole 60-layer T2I
@@ -244,7 +237,7 @@ fn ab<F: Fn() -> Array>(label: &str, tol: f32, run: F) {
     let comp0 = run();
     set_compile_glue(false);
     assert_eq!(comp0.shape(), eager0.shape(), "{label} v shape");
-    let max_diff = max_abs_diff(&comp0, &eager0);
+    let max_diff = max_abs_diff_f32(&comp0, &eager0);
     let max_out = max_abs(&eager0);
     let rel = mlx_gen::nn::max_rel_diff(&comp0, &eager0);
 

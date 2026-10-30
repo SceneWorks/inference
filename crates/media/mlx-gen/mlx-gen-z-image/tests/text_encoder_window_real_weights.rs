@@ -24,6 +24,7 @@ use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
 use mlx_rs::Array;
 
 use common::tier_snapshot as snapshot;
+use mlx_gen::testing::max_abs_diff_host;
 
 const PROMPT: &str = "A photorealistic portrait of an elderly lighthouse keeper on a weathered \
      stone pier at dawn, heavy wool coat soaked with sea spray, low coastal fog behind him";
@@ -55,21 +56,7 @@ fn streamable(weights: &Weights, dir: &std::path::Path, cfg: &ZTextEncoderConfig
 /// Max absolute difference over the two conditioning tensors, cast to f32.
 fn max_abs_delta(a: &Array, b: &Array) -> f32 {
     assert_eq!(a.shape(), b.shape(), "conditioning shape changed");
-    let n: i32 = a.shape().iter().product();
-    let a = a
-        .as_dtype(mlx_rs::Dtype::Float32)
-        .unwrap()
-        .reshape(&[n])
-        .unwrap();
-    let b = b
-        .as_dtype(mlx_rs::Dtype::Float32)
-        .unwrap()
-        .reshape(&[n])
-        .unwrap();
-    a.as_slice::<f32>()
-        .iter()
-        .zip(b.as_slice::<f32>())
-        .fold(0f32, |m, (x, y)| m.max((x - y).abs()))
+    max_abs_diff_host(a, b)
 }
 
 /// **Identity.** The streamed encoder must produce the same `cap_feats` as the resident one.

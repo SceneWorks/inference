@@ -9,28 +9,15 @@
 //! IP-Adapter (sc-3059); this only validates it under `ResamplerConfig::instantid_face()`
 //! (embedding_dim=512) on a fixed 512-d ArcFace embedding → 16 face tokens × 2048.
 
+use mlx_gen::testing::peak_rel_host;
 use mlx_gen::weights::Weights;
 use mlx_gen_sdxl::ip_adapter::{Resampler, ResamplerConfig};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Dtype;
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/instantid_resampler_golden.safetensors"
 );
-
-/// Peak-relative error `max|a-b| / max|b|`.
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap().as_dtype(Dtype::Float32).unwrap();
-    let b = b.reshape(&[n]).unwrap().as_dtype(Dtype::Float32).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
-    let max_diff = a
-        .iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
-    max_diff / peak
-}
 
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
@@ -56,7 +43,7 @@ fn instantid_face_resampler_matches_torch() {
         .unwrap();
     assert_eq!(tokens.shape(), [1, 16, 2048], "output token shape");
 
-    let rel = peak_rel(&tokens, tok_golden);
+    let rel = peak_rel_host(&tokens, tok_golden, None);
     println!("[instantid resampler] face tokens peak_rel = {rel:.3e}");
 
     // f32 vs f32 cross-backend (torch CPU vs MLX Metal). `norm_out` renormalizes the output, so this

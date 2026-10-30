@@ -284,11 +284,7 @@ pub(crate) fn upsample_nearest2d_nhwc(x: &Tensor, factor: usize) -> Result<Tenso
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Cosine similarity over all elements (f64), the quant-parity metric.
-    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        candle_gen::testkit::tensor_cosine(a, b) as f32
-    }
+    use candle_gen::testkit::tensor_cosine;
 
     fn dense(w: &Tensor, b: Option<&Tensor>) -> Linear {
         Linear(QLinear::from_dense(DenseLinear::Transposed {
@@ -315,7 +311,7 @@ mod tests {
             "SAM3 uses candle's int8 QMatMul forward"
         );
         let q_out = lin.forward(&x).unwrap();
-        let cos = cosine(&dense_out, &q_out);
+        let cos = tensor_cosine(&dense_out, &q_out) as f32;
         assert!(cos > min_cos, "{quant:?} cosine {cos:.5} ≤ {min_cos}");
     }
 

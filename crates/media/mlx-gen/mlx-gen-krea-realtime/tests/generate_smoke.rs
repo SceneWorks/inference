@@ -40,6 +40,7 @@ use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
+use mlx_gen::testing::env_path_or_home;
 use mlx_gen::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
 };
@@ -86,11 +87,10 @@ use support::*;
 /// Kept in this file (not `generate_smoke/support.rs`): the workspace gate's `$HOME`-derivation
 /// lint scopes its env-override search to a plain or `pub` `fn`.
 fn snapshot_dir() -> PathBuf {
-    std::env::var("KREA_REALTIME_SNAPSHOT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/krea-realtime-mlx-convert")
-        })
+    env_path_or_home(
+        "KREA_REALTIME_SNAPSHOT_DIR",
+        ".cache/krea-realtime-mlx-convert",
+    )
 }
 
 /// This suite's own source — this file and every `generate_smoke/` submodule — for the prose gates

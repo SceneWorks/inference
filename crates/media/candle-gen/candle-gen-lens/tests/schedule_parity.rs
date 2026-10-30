@@ -10,24 +10,10 @@
 //! Run:  cargo test -p candle-gen-lens --test integration schedule_parity:: -- --nocapture
 
 use candle_gen::candle_core::{Device, Result, Tensor};
+use candle_gen::testkit::{tensor_max_abs_diff_host, tensor_peak_rel_host};
 use candle_gen_lens::schedule::{cfg_rescale, lens_sigmas};
 
 const LATENT: usize = 64; // 64×64 = 4096 seq_len (matches the dump's SEQ_LEN)
-
-fn max_abs(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let a = a.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.flatten_all()?.to_vec1::<f32>()?;
-    assert_eq!(a.len(), b.len(), "shape mismatch");
-    Ok(a.iter()
-        .zip(&b)
-        .fold(0f32, |m, (x, y)| m.max((x - y).abs())))
-}
-
-fn peak_rel(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let bv = b.flatten_all()?.to_vec1::<f32>()?;
-    let denom = bv.iter().fold(0f32, |m, &y| m.max(y.abs())).max(1e-12);
-    Ok(max_abs(a, b)? / denom)
-}
 
 #[test]
 #[ignore = "needs the schedule goldens (LENS_SCHEDULE_GOLDENS; run scripts/dump_lens_schedule_golden.py)"]
@@ -49,7 +35,7 @@ fn lens_schedule_matches_reference() -> Result<()> {
 
         // (a) shifted sigmas (n+1, trailing 0).
         let got_sigmas = Tensor::from_slice(&sigmas, sigmas.len(), &dev)?;
-        let d_sig = max_abs(&got_sigmas, &g[&format!("sigmas_{n}")])?;
+        let d_sig = tensor_max_abs_diff_host(&got_sigmas, &g[&format!("sigmas_{n}")]);
 
         eprintln!("n={n}: sigmas Δ={d_sig:.3e}");
         assert!(d_sig < 1e-5, "n={n} sigmas Δ {d_sig:.3e}");
@@ -57,7 +43,7 @@ fn lens_schedule_matches_reference() -> Result<()> {
 
     // (b) norm-rescaled CFG (guidance 5.0).
     let got_cfg = cfg_rescale(&g["cfg_cond"], &g["cfg_uncond"], 5.0)?;
-    let d_cfg = peak_rel(&got_cfg, &g["cfg_out"])?;
+    let d_cfg = tensor_peak_rel_host(&got_cfg, &g["cfg_out"], Some(1e-12));
     eprintln!("cfg: peak_rel={d_cfg:.3e}");
     assert!(d_cfg < 1e-4, "cfg peak_rel {d_cfg:.3e}");
     eprintln!("ALL PASS");

@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::testing::{cosine_host_f64, Denom};
 use mlx_gen::WeightsSource;
 use mlx_gen_anima::pipeline::AnimaPipeline;
 use mlx_gen_anima::Variant;
@@ -72,21 +73,6 @@ origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
     Array::from_slice(&chw, &[1, 3, h as i32, w as i32])
 }
 
-/// Cosine similarity over the full flattened tensors. Both inputs must be contiguous f32 (they are —
-/// each is the fresh result of an elementwise op / dtype cast, not a strided view).
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a.as_slice::<f32>();
-    let b = b.as_slice::<f32>();
-    assert_eq!(a.len(), b.len());
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for i in 0..a.len() {
-        dot += a[i] as f64 * b[i] as f64;
-        na += (a[i] as f64).powi(2);
-        nb += (b[i] as f64).powi(2);
-    }
-    (dot / (na.sqrt() * nb.sqrt())) as f32
-}
-
 #[test]
 #[ignore = "model inference; explicit model-proof workflow; needs the circlestone-labs/Anima snapshot; real weights + Metal"]
 fn dit_predicts_flow_velocity_eps_minus_x0() {
@@ -125,7 +111,7 @@ fn dit_predicts_flow_velocity_eps_minus_x0() {
     // Flow-match target: v = ε − x0.
     let target = subtract(&eps, &x0).unwrap();
 
-    let cos = cosine(&v_pred, &target);
+    let cos = cosine_host_f64(&v_pred, &target, Denom::Exact) as f32;
     println!("[velocity_convention] cos(v_pred, eps - x0) = {cos:.4} (sigma = {sigma})");
     // A correct port aligns strongly with ε − x0 (≈0.9+). A negated velocity gives ≈ −0.9; a σ·1000
     // timestep collapses toward 0. 0.5 is a wide, unambiguous floor that only a correct sign/timestep

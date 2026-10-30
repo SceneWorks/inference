@@ -35,6 +35,7 @@ use mlx_gen_minimax_h3::dit::layers::{attention_probe, planned_attention_chunks,
 use mlx_gen_minimax_h3::dit::{MiniMaxH3DitConfig, MmRope};
 
 use common::{dit_fixture_config, DIT_FIXTURE};
+use mlx_gen::testing::{max_abs, max_abs_diff_f32};
 
 fn model_weights() -> Weights {
     let mut w = Weights::from_file(DIT_FIXTURE).unwrap();
@@ -53,19 +54,9 @@ fn rope_of(cfg: &MiniMaxH3DitConfig) -> MmRope {
 /// Relative, and specifically **not** a norm, a cosine or a checksum: all three are dominated by the
 /// bulk of an already-agreeing tensor and would pass on a chunk boundary that dropped rows entirely.
 fn relative_max_abs(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let delta: f32 = a
-        .subtract(&b)
-        .unwrap()
-        .abs()
-        .unwrap()
-        .max(None)
-        .unwrap()
-        .item();
-    let scale: f32 = a.abs().unwrap().max(None).unwrap().item();
+    let scale = max_abs(a);
     assert!(scale > 1e-6, "the reference arm is degenerate ({scale})");
-    delta / scale
+    max_abs_diff_f32(a, b) / scale
 }
 
 /// The **query-row** axis's agreement bound at the fixture geometry.

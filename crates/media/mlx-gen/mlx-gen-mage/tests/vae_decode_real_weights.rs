@@ -42,6 +42,7 @@ use mlx_rs::ops::{abs, max, mean, subtract};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::image::decoded_to_image;
+use mlx_gen::testing::max_abs_diff_f32;
 use mlx_gen::weights::Weights;
 use mlx_gen_mage::vae::{
     self, MageVae, VaePart, DECODER_PREFIX, ENCODER_PREFIX, SKIPPED_DECODER_SUBTREES,
@@ -221,14 +222,6 @@ fn pick_vae_dir(dir: &Path) -> PathBuf {
     }
 }
 
-fn max_abs(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    max(abs(subtract(&a, &b).unwrap()).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-}
-
 fn mean_abs(a: &Array, b: &Array) -> f32 {
     let a = a.as_dtype(Dtype::Float32).unwrap();
     let b = b.as_dtype(Dtype::Float32).unwrap();
@@ -291,7 +284,7 @@ fn check_decode(
     assert_eq!(got.shape(), want.shape(), "{size} {key_expected} geometry");
     maybe_dump_ppm(&format!("{key_expected}_{size}_{}", dt.label()), &got);
 
-    let (mx, mn) = (max_abs(&got, want), mean_abs(&got, want));
+    let (mx, mn) = (max_abs_diff_f32(&got, want), mean_abs(&got, want));
     let (tol_mx, tol_mn) = dt.tolerance();
     println!(
         "  {size} [{}] {key_expected}: max_abs {mx:.6} (< {tol_mx})  mean_abs {mn:.6} (< {tol_mn})  \
@@ -755,7 +748,7 @@ fn decode_folding_matches_unfolded_real_weights() {
 
     let a = folded.decode(&latent).unwrap();
     let b = unfolded.decode(&latent).unwrap();
-    let (mx, mn) = (max_abs(&a, &b), mean_abs(&a, &b));
+    let (mx, mn) = (max_abs_diff_f32(&a, &b), mean_abs(&a, &b));
     println!("folded vs unfolded max_abs {mx} mean_abs {mn}");
     assert!(mx < 3e-4, "decode folding changed max_abs by {mx}");
     assert!(mn < 2e-5, "decode folding changed mean_abs by {mn}");
@@ -834,13 +827,17 @@ fn decode_is_deterministic_and_batch_invariant() {
 
     let once = v.decode(&latent).unwrap();
     let twice = v.decode(&latent).unwrap();
-    assert_eq!(max_abs(&once, &twice), 0.0, "decode is not deterministic");
+    assert_eq!(
+        max_abs_diff_f32(&once, &twice),
+        0.0,
+        "decode is not deterministic"
+    );
 
     let batched = v
         .decode(&mlx_rs::ops::concatenate_axis(&[latent.clone(), latent], 0).unwrap())
         .unwrap();
     let first = batched.take_axis(Array::from_int(0), 0).unwrap();
-    let err = max_abs(&first.reshape(once.shape()).unwrap(), &once);
+    let err = max_abs_diff_f32(&first.reshape(once.shape()).unwrap(), &once);
     println!("batch-of-2 vs batch-of-1 max_abs {err}");
     assert!(err < 1e-5, "batching changed the decode by {err}");
     crate::model_inference_device::record_model_inference_device();

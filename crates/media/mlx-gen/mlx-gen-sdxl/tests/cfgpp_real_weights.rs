@@ -110,14 +110,7 @@ fn save_png(name: &str, img: &Image) -> PathBuf {
     let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/golden");
     std::fs::create_dir_all(&out).unwrap();
     let p = out.join(name);
-    image::save_buffer(
-        &p,
-        &img.pixels,
-        img.width,
-        img.height,
-        image::ExtendedColorType::Rgb8,
-    )
-    .unwrap();
+    mlx_gen::testing::save_png(img, &p);
     p
 }
 

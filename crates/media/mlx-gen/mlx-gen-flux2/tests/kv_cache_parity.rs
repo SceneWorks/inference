@@ -281,11 +281,7 @@ fn cached_without_populated_cache_errors() {
 
 fn max_abs_diff(a: &Array, b: &Array) -> f32 {
     assert_eq!(a.shape(), b.shape());
-    mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap())
-        .unwrap()
-        .max(None)
-        .unwrap()
-        .item::<f32>()
+    mlx_gen::testing::max_abs_diff(a, b)
 }
 
 /// The negative prompt: a deterministic transform of the positive text so the two branches'

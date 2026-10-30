@@ -20,6 +20,7 @@
 //! reduced-precision matmul across the block forwards (matching the Qwen sibling `fun_control_parity.rs`
 //! and the base FLUX.2 transformer parity). The context byte-confirm is a pure gather → **exact**.
 
+use mlx_gen::testing::{max_abs_diff_host, max_abs_host};
 use mlx_gen::weights::Weights;
 use mlx_gen_flux2::{pipeline, Flux2Config, Flux2ControlBranch};
 use mlx_rs::ops::all_close;
@@ -60,25 +61,6 @@ fn small_cfg() -> Flux2Config {
         num_latent_channels: 4,
         vae_scale_factor: 8,
     }
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap();
-    let b = b.reshape(&[n]).unwrap();
-    a.as_slice::<f32>()
-        .iter()
-        .zip(b.as_slice::<f32>())
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
-}
-
-fn max_abs(a: &Array) -> f32 {
-    let n = a.shape().iter().product::<i32>();
-    a.reshape(&[n])
-        .unwrap()
-        .as_slice::<f32>()
-        .iter()
-        .fold(0f32, |m, &x| m.max(x.abs()))
 }
 
 fn owned(w: &Weights, key: &str) -> Array {
@@ -145,11 +127,11 @@ fn forward_control_hints_match_videox_reference() {
         // Non-degeneracy guard: a zero-init (bugged) branch would emit ~0 hints and pass a loose
         // tolerance vacuously — the reference hints are O(1), so require the MLX hint be too.
         assert!(
-            max_abs(hint) > 1e-2,
+            max_abs_host(hint) > 1e-2,
             "hint {i} is ~zero (max|hint| {:.3e}); the control branch looks inert",
-            max_abs(hint)
+            max_abs_host(hint)
         );
-        let d = max_abs_diff(hint, want);
+        let d = max_abs_diff_host(hint, want);
         worst = worst.max(d);
         assert!(
             all_close(hint, want, 1e-2, 1e-2, false)
@@ -177,7 +159,7 @@ fn control_context_fill_byte_matches_reference_prepare() {
 
     let want = w.require("ctx.pack_ref").unwrap(); // [1, LH·LW, CONTROL_IN]
     assert_eq!(packed.shape(), want.shape(), "packed context shape");
-    let d = max_abs_diff(&packed, want);
+    let d = max_abs_diff_host(&packed, want);
     assert_eq!(
         d, 0.0,
         "packed control-context fill diverged from upstream pipeline_flux2_control (max|Δ| {d:.3e})"

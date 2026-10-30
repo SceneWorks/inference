@@ -10,8 +10,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen_krea::transformer::block::{SingleStreamBlock, TextFusionTransformer};
 use mlx_gen_krea::transformer::rope::RopeTables;
 use mlx_gen_krea::Krea2Transformer;
-use mlx_rs::ops::{all_close, multiply, sqrt, subtract, sum};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::ops::all_close;
 
 use crate::common;
 
@@ -23,6 +22,7 @@ use common::{
     SHARED_FIXTURE_DIT_TXT_HEADS, SHARED_FIXTURE_ROPE_CAP_LEN, SHARED_FIXTURE_ROPE_GRID_H,
     SHARED_FIXTURE_ROPE_GRID_W,
 };
+use mlx_gen::testing::{cosine_f32_device, max_abs_diff_f32};
 
 const FIX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
 
@@ -30,23 +30,6 @@ fn load(name: &str) -> Weights {
     Weights::from_file(format!("{FIX}{name}")).unwrap_or_else(|e| {
         panic!("load fixture {name} (run tools/dump_krea_dit_golden.py): {e}");
     })
-}
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let dot = sum(multiply(&a, &b).unwrap(), false).unwrap();
-    let na = sqrt(sum(multiply(&a, &a).unwrap(), false).unwrap()).unwrap();
-    let nb = sqrt(sum(multiply(&b, &b).unwrap(), false).unwrap()).unwrap();
-    (dot / (na * nb)).item::<f32>()
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    mlx_rs::ops::max(mlx_rs::ops::abs(subtract(&a, &b).unwrap()).unwrap(), false)
-        .unwrap()
-        .item::<f32>()
 }
 
 /// The #1 parity risk localized: the 3-axis interleaved RoPE table for the DiT's joint positions
@@ -77,14 +60,14 @@ fn rope_matches_reference() {
             .unwrap()
             .item::<bool>(),
         "rope cos diverged (max abs {:e})",
-        max_abs_diff(&cos, want_cos)
+        max_abs_diff_f32(&cos, want_cos)
     );
     assert!(
         all_close(&sin, want_sin, 1e-5, 1e-5, false)
             .unwrap()
             .item::<bool>(),
         "rope sin diverged (max abs {:e})",
-        max_abs_diff(&sin, want_sin)
+        max_abs_diff_f32(&sin, want_sin)
     );
 }
 
@@ -114,10 +97,10 @@ fn single_block_matches_reference() {
         .unwrap();
     let want = w.require("out.y").unwrap();
     assert_eq!(y.shape(), want.shape());
-    let c = cosine(&y, want);
+    let c = cosine_f32_device(&y, want);
     println!(
         "single_block parity: cosine={c:.7} max_abs={:e}",
-        max_abs_diff(&y, want)
+        max_abs_diff_f32(&y, want)
     );
     assert!(
         all_close(&y, want, 1e-2, 1e-2, false)
@@ -148,10 +131,10 @@ fn text_fusion_matches_reference() {
     let y = tf.forward(w.require("in.x").unwrap()).unwrap();
     let want = w.require("out.y").unwrap();
     assert_eq!(y.shape(), want.shape());
-    let c = cosine(&y, want);
+    let c = cosine_f32_device(&y, want);
     println!(
         "text_fusion parity: cosine={c:.7} max_abs={:e}",
-        max_abs_diff(&y, want)
+        max_abs_diff_f32(&y, want)
     );
     assert!(
         all_close(&y, want, 1e-2, 1e-2, false)
@@ -228,10 +211,10 @@ fn dit_matches_reference() {
         .unwrap();
     let want = w.require("out.velocity").unwrap();
     assert_eq!(velocity.shape(), want.shape(), "velocity shape");
-    let c = cosine(&velocity, want);
+    let c = cosine_f32_device(&velocity, want);
     println!(
         "full-DiT parity: cosine={c:.7} max_abs={:e}",
-        max_abs_diff(&velocity, want)
+        max_abs_diff_f32(&velocity, want)
     );
     assert!(c > 0.999, "full-DiT cosine {c:.7} <= 0.999");
     assert!(

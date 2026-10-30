@@ -16,6 +16,7 @@
 
 use crate::common;
 
+use mlx_gen::testing::peak_rel_host;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_sdxl::config::DiffusionConfig;
@@ -40,17 +41,6 @@ const GOLDEN: &str = concat!(
 );
 
 use common::snapshot;
-
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let (a, b) = (a.reshape(&[n]).unwrap(), b.reshape(&[n]).unwrap());
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
-    a.iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
-        / peak
-}
 
 fn init_image(g: &Weights, w: u32, h: u32) -> Image {
     let pixels: Vec<u8> = g
@@ -90,14 +80,14 @@ fn img2img_components_match_reference() {
     )
         .1
         .unwrap();
-    let pr_x0 = peak_rel(&x0, g.require("x0_mean").unwrap());
+    let pr_x0 = peak_rel_host(&x0, g.require("x0_mean").unwrap(), None);
 
     // x_t = add_noise(x_0, max_time·strength) — the first RNG draw (#0).
     mlx_rs::random::seed(seed).unwrap();
     let xt = sampler
         .add_noise(&x0, sampler.max_time() * strength)
         .unwrap();
-    let pr_xt = peak_rel(&xt, g.require("x_t").unwrap());
+    let pr_xt = peak_rel_host(&xt, g.require("x_t").unwrap(), None);
 
     // step-1 U-Net eps (CFG) for the golden step-0 input at t = timesteps[1].
     let ts = g.require("timesteps").unwrap().as_slice::<f32>().to_vec();
@@ -136,7 +126,7 @@ fn img2img_components_match_reference() {
         mlx_rs::ops::multiply(mlx_rs::ops::subtract(&et, &en).unwrap(), cfg_s).unwrap(),
     )
     .unwrap();
-    let pr_eps = peak_rel(&eps1, g.require("eps1_cfg").unwrap());
+    let pr_eps = peak_rel_host(&eps1, g.require("eps1_cfg").unwrap(), None);
 
     println!("x_0 {pr_x0:.3e}  x_t {pr_xt:.3e}  eps1 {pr_eps:.3e}");
     // sc-12896 (MLX 0.32.0, golden re-dumped on the matched non-NAX env): the near-bit-exact 0.31.2

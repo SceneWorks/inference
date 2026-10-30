@@ -28,6 +28,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
 
+use mlx_gen::testing::max_abs_diff_host;
 use mlx_gen_minimax_h3::convert::{is_te_pack_target, GROUP_SIZE};
 use mlx_gen_minimax_h3::text_encoder::{MiniMaxH3TeConfig, MiniMaxH3TextEncoder};
 
@@ -119,26 +120,6 @@ fn weights_from(map: &HashMap<String, Array>) -> Weights {
     w
 }
 
-/// `max|a−b|` over two same-shaped arrays. Never a norm and never a cosine: a cosine is
-/// scale-invariant and a norm averages a local catastrophe away over the channel axis.
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let a: Vec<f32> = a
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .as_slice::<f32>()
-        .to_vec();
-    let b: Vec<f32> = b
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .as_slice::<f32>()
-        .to_vec();
-    assert_eq!(a.len(), b.len());
-    a.iter()
-        .zip(&b)
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0f32, f32::max)
-}
-
 fn probe_ids(cfg: &MiniMaxH3TeConfig) -> (Array, Array) {
     let ids: Vec<i32> = (0..6).map(|i| (i * 7) % cfg.vocab_size).collect();
     (
@@ -180,7 +161,7 @@ fn converter_pack_matches_the_encoders_own_quantize() {
         let b = from_tier.forward(&ids, &mask).unwrap();
 
         assert_eq!(
-            max_abs_diff(&a, &b),
+            max_abs_diff_host(&a, &b),
             0.0,
             "q{bits}: the converter's pack set differs from the encoder's own `quantize`"
         );
@@ -224,7 +205,7 @@ fn packing_moves_the_context_and_q8_moves_it_less_than_q4() {
             mlx_gen::quant::quantize_map(source.clone(), bits, GROUP_SIZE, is_te_pack_target)
                 .unwrap();
         let te = MiniMaxH3TextEncoder::from_weights(&weights_from(&packed), PREFIX, &cfg).unwrap();
-        max_abs_diff(&reference, &te.forward(&ids, &mask).unwrap()) / scale
+        max_abs_diff_host(&reference, &te.forward(&ids, &mask).unwrap()) / scale
     };
     let (q4, q8) = (relative(4), relative(8));
     assert!(q4 > 0.0, "q4 left the context untouched — nothing packed");
@@ -260,7 +241,7 @@ fn a_packed_tier_still_loads_only_the_selected_layers() {
 
     let (ids, mask) = probe_ids(&cfg);
     assert_eq!(
-        max_abs_diff(
+        max_abs_diff_host(
             &full.forward(&ids, &mask).unwrap(),
             &te.forward(&ids, &mask).unwrap()
         ),

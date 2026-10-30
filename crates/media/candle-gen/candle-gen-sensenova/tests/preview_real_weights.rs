@@ -52,7 +52,7 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{
     GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink, Progress, WeightsSource,
 };
-use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::save_rgb8_png_in;
 use candle_gen::testkit::{
     correlation, downsample_box, downsample_box_raw, env_u32, mean_abs_delta, one_image,
     preview_strip_sheet,
@@ -95,25 +95,26 @@ enum Event {
     Step(u32, u32),
 }
 
-fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let path = artifact_dir().join(format!("{name}.png"));
-    save_rgb8_png(&path, pixels, width, height);
-    eprintln!("  saved {}", path.display());
-}
-
 /// Write the frames side by side as one strip, plus each frame individually — the artifact the epic
 /// asks to be reviewed directly. One strip **per route**.
 fn save_strip(frames: &[PreviewFrame], name: &str) {
     let (strip, width, height) = preview_strip_sheet(frames);
     for frame in frames {
-        save_png(
+        save_rgb8_png_in(
+            &artifact_dir(),
+            &format!("{}.png", &format!("{name}_frame{:02}", frame.current)),
             &frame.image.pixels,
             frame.image.width,
             frame.image.height,
-            &format!("{name}_frame{:02}", frame.current),
         );
     }
-    save_png(&strip, width, height, &format!("{name}_strip"));
+    save_rgb8_png_in(
+        &artifact_dir(),
+        &format!("{}.png", &format!("{name}_strip")),
+        &strip,
+        width,
+        height,
+    );
 }
 
 /// The fraction of an RGB8 frame sitting on a rail (0 or 255).
@@ -505,11 +506,12 @@ fn render_and_assert(
     let frames = candle_gen::lock_recover(&frames).clone();
     let name = format!("{label}_{size}_s{steps}");
     save_strip(&frames, &name);
-    save_png(
+    save_rgb8_png_in(
+        &artifact_dir(),
+        &format!("{}.png", &format!("{name}_final")),
         &active.pixels,
         active.width,
         active.height,
-        &format!("{name}_final"),
     );
     assert_the_strip_converges(label, &events, &frames, &active, steps, size, develops);
 }

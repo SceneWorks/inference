@@ -9,6 +9,7 @@
 //!
 //! Run: `cargo test -p mlx-gen-sensenova --test integration quant_smoke:: -- --nocapture`
 
+use mlx_gen::testing::{cosine_host_f64, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, Path, Qwen3Backbone};
 use mlx_rs::Array;
@@ -53,14 +54,6 @@ fn flat(a: &Array) -> Vec<f32> {
     a.reshape(&[n]).unwrap().as_slice::<f32>().to_vec()
 }
 
-fn cosine(a: &Array, b: &Array) -> f64 {
-    let (g, w) = (flat(a), flat(b));
-    let dot: f64 = g.iter().zip(&w).map(|(&x, &y)| x as f64 * y as f64).sum();
-    let na: f64 = g.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-    let nb: f64 = w.iter().map(|&y| (y as f64).powi(2)).sum::<f64>().sqrt();
-    dot / (na * nb + 1e-12)
-}
-
 fn forward(w: &Weights, cfg: &NeoChatConfig, bits: Option<i32>) -> Array {
     let mut model = Qwen3Backbone::from_weights(w, cfg, "language_model").expect("build");
     if let Some(b) = bits {
@@ -92,8 +85,8 @@ fn quantized_forward_stays_close_to_dense() {
         "Q4 forward has non-finite values"
     );
 
-    let c8 = cosine(&q8, &dense);
-    let c4 = cosine(&q4, &dense);
+    let c8 = cosine_host_f64(&q8, &dense, Denom::PlusEps(1e-12));
+    let c4 = cosine_host_f64(&q4, &dense, Denom::PlusEps(1e-12));
     println!("quant vs dense: Q8 cosine={c8:.5}  Q4 cosine={c4:.5}");
     // Q8 is near-lossless; Q4 is coarser but still directionally faithful. (Tiny random weights +
     // group 64 → looser than a real model, hence conservative bounds.)

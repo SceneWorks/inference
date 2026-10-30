@@ -9,9 +9,9 @@
 
 use std::path::Path;
 
-use crate::support::cosine;
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::default_device;
+use candle_gen::testkit::{tensor_cosine_device_sums, Denom};
 use candle_gen_sam3::{Sam3Tracker, Weights};
 
 fn fx_i32(fx: &Weights, key: &str) -> Vec<i32> {
@@ -56,7 +56,7 @@ fn memory_conditioning_matches_oracle() {
     // computation matches the captured fixture, so the pipeline can recompute it instead of caching it.
     let g = (cvf.dim(0).unwrap() as f64).sqrt() as usize;
     let pos_computed = tracker.frame_position_encoding(g).unwrap();
-    let c_pos = cosine(&pos_computed, &cvp);
+    let c_pos = tensor_cosine_device_sums(&pos_computed, &cvp, Denom::Exact);
     println!("frame_position_encoding: cosine={c_pos:.7}");
     assert!(c_pos > 0.999999, "current_vision_pos cosine {c_pos}");
 
@@ -110,7 +110,7 @@ fn memory_conditioning_matches_oracle() {
         .contiguous()
         .unwrap(); // [1,72,72,256]
     assert_eq!(got.dims(), want.dims(), "conditioned feature map shape");
-    let c = cosine(&got, &want);
+    let c = tensor_cosine_device_sums(&got, &want, Denom::Exact);
     println!("conditioned feature map: cosine={c:.7}");
     assert!(c > 0.999, "memory-conditioned feature map cosine {c}");
 

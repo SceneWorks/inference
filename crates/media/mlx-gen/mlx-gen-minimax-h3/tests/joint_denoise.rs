@@ -33,7 +33,8 @@ use mlx_gen_minimax_h3::denoise::{
 };
 use mlx_gen_minimax_h3::dit::positions::KeyframeAnchor;
 
-use common::{assert_parity, cosine, is_materialized, l2_norm, rel, std_dev};
+use common::{assert_parity, is_materialized, l2_norm, rel, std_dev};
+use mlx_gen::testing::{cosine_device_sums_f32, Denom};
 
 /// The committed joint-denoise fixture.
 const FIXTURE: &str = concat!(
@@ -323,7 +324,7 @@ fn swapped_or_shared_shifts_change_the_output() {
         "  swap rel {:.3e}/{:.3e}  both-audio rel {ba:.3e}  cosine {:.4}  |L2| {:.3} vs {:.3}",
         sv,
         sa,
-        cosine(&both.1, &want_audio),
+        cosine_device_sums_f32(&both.1, &want_audio, Denom::FloorAt(1e-12)),
         l2_norm(&both.1),
         l2_norm(&want_audio)
     );

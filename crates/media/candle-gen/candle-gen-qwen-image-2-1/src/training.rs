@@ -2634,6 +2634,7 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::train::TrainingItem;
     use candle_gen::gen_core::{AdapterKind, AdapterSpec, Quant, WeightsSource};
+    use candle_gen::testkit::tensor_max_abs;
 
     fn tiny_snapshot() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4390,15 +4391,6 @@ mod tests {
         }
     }
 
-    fn max_abs(t: &Tensor) -> f32 {
-        t.abs()
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
-    }
-
     /// Review (PR #1146): a saved adapter reloaded through the inference host computes **the
     /// trainer-side function** — not merely "a different velocity". The trainer's own (frozen)
     /// adapted DiT and a fresh DiT with the saved file installed by `crate::adapters::install` agree
@@ -4474,9 +4466,9 @@ mod tests {
             };
             let (want, got, bare) = (forwards(&trained), forwards(&reloaded), forwards(&base));
             for (i, ((want, got), bare)) in want.iter().zip(&got).zip(&bare).enumerate() {
-                let moved = max_abs(&(want - bare).unwrap());
-                let diff = max_abs(&(want - got).unwrap());
-                let peak = max_abs(want).max(1.0);
+                let moved = tensor_max_abs(&(want - bare).unwrap());
+                let diff = tensor_max_abs(&(want - got).unwrap());
+                let peak = tensor_max_abs(want).max(1.0);
                 eprintln!(
                     "[sc-24162] {network:?} r{rank} a8 layout {i}: adapter moves {moved:.3e}, \
                      reload vs trainer {diff:.3e}"
@@ -5051,7 +5043,7 @@ mod tests {
         let f32 = |t: &Tensor| t.to_dtype(DType::F32).unwrap();
         let differs = bucketed
             .iter()
-            .any(|(k, t)| max_abs(&(f32(t) - f32(&single[k])).unwrap()) > 0.0);
+            .any(|(k, t)| tensor_max_abs(&(f32(t) - f32(&single[k])).unwrap()) > 0.0);
         assert!(differs, "the 64 px bucket must change the trained factors");
 
         #[cfg(feature = "model-inference-proof")]
@@ -5271,7 +5263,7 @@ mod tests {
             );
             assert_eq!(a.len(), b.len());
             for (key, ta) in &a {
-                let diff = max_abs(&(ta - &b[key]).unwrap());
+                let diff = tensor_max_abs(&(ta - &b[key]).unwrap());
                 assert!(diff <= 1e-6, "accum {accum}: {key} differs by {diff}");
             }
         }

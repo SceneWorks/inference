@@ -26,6 +26,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use mlx_gen::testing::max_abs_diff_f32;
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::config::{LtxConfig, SplitModel};
 use mlx_gen_ltx::positions::create_position_grid;
@@ -69,13 +70,6 @@ fn timed(eval: &[&Array], start: Instant) -> f64 {
 fn median(mut xs: Vec<f64>) -> f64 {
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     xs[xs.len() / 2]
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(&a, &b).unwrap()).unwrap();
-    mlx_rs::ops::max(&d, None).unwrap().item::<f32>()
 }
 
 fn bf16(a: Array) -> Array {
@@ -130,7 +124,7 @@ fn ltx_video_per_step_compiled_vs_eager() {
             let comp0 = run();
             set_compile_glue(false);
             assert_eq!(comp0.shape(), eager0.shape(), "velocity shape");
-            let max_diff = max_abs_diff(&comp0, &eager0);
+            let max_diff = max_abs_diff_f32(&comp0, &eager0);
 
             set_compile_glue(false);
             let mut eager = Vec::new();
@@ -219,8 +213,8 @@ fn ltx_av_compiled_vs_eager() {
     let (cv, ca) = run();
     set_compile_glue(false);
 
-    let dv = max_abs_diff(&cv, &ev);
-    let da = max_abs_diff(&ca, &ea);
+    let dv = max_abs_diff_f32(&cv, &ev);
+    let da = max_abs_diff_f32(&ca, &ea);
     println!("[LTX AvDiT compiled-vs-eager] video max|Δ|={dv:.3e}  audio max|Δ|={da:.3e}");
     assert_eq!(
         dv, 0.0,

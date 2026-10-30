@@ -1234,6 +1234,7 @@ pub(crate) fn denoise_vace_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::testing::max_abs_diff_f32;
 
     fn tiny_vace_fixture() -> (Weights, WanVaceConfig) {
         let mut weights = Weights::from_file(concat!(
@@ -1289,14 +1290,6 @@ mod tests {
             .reshape(&[-1, 32])
             .unwrap();
         (latent, control, raw)
-    }
-
-    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-        mlx_rs::ops::abs(mlx_rs::ops::subtract(f32c(a).unwrap(), f32c(b).unwrap()).unwrap())
-            .unwrap()
-            .max(None)
-            .unwrap()
-            .item::<f32>()
     }
 
     const QUANT_CHILD: &str = "WAN_VACE_QUANT_MATERIALIZE_CHILD";
@@ -1368,12 +1361,12 @@ mod tests {
         };
         let expected = forward(&reference);
         assert_eq!(
-            max_abs_diff(&forward(&ours.reshape(&[1, 512, 32]).unwrap()), &expected),
+            max_abs_diff_f32(&forward(&ours.reshape(&[1, 512, 32]).unwrap()), &expected),
             0.0
         );
         let unpadded = forward(&prompt.reshape(&[1, 5, 32]).unwrap());
         assert!(
-            max_abs_diff(&unpadded, &expected) > 1e-4,
+            max_abs_diff_f32(&unpadded, &expected) > 1e-4,
             "zero padding must reach the cross-attention (projected pads are not zeros)"
         );
         crate::model_inference_device::record_model_inference_device();
@@ -1434,7 +1427,7 @@ mod tests {
             .max(None)
             .unwrap()
             .item::<f32>();
-        let error = max_abs_diff(&ours, &expected);
+        let error = max_abs_diff_f32(&ours, &expected);
         assert!(
             error <= 0.05 * scale.max(1.0),
             "bf16 forward drifted: {error} (scale {scale})"

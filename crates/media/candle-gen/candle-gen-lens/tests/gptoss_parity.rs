@@ -14,23 +14,8 @@
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::testkit::tensor_cosine;
 use candle_gen_lens::text_encoder::{Config, GptOssTextEncoder, DEFAULT_SELECTED_LAYERS};
-
-/// Cosine similarity over all elements (flattened), computed in f32 on CPU.
-fn cosine(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    assert_eq!(a.len(), b.len(), "shape mismatch in cosine");
-    let mut dot = 0f64;
-    let mut na = 0f64;
-    let mut nb = 0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += (*x as f64) * (*y as f64);
-        na += (*x as f64) * (*x as f64);
-        nb += (*y as f64) * (*y as f64);
-    }
-    Ok((dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32)
-}
 
 /// Relative L2 error ||a-b|| / ||b||, in f32 on CPU.
 fn rel_l2(a: &Tensor, b: &Tensor) -> Result<f32> {
@@ -101,7 +86,7 @@ fn gptoss_encoder_matches_torch_reference() -> Result<()> {
             continue;
         };
         let mine = out.hidden_states[i].squeeze(0)?; // [seq, hidden]
-        let c = cosine(&mine, golden)?;
+        let c = tensor_cosine(&mine, golden) as f32;
         let r = rel_l2(&mine, golden)?;
         eprintln!("hidden[{i:>2}]: cosine={c:.6}  rel_l2={r:.4}");
         worst_cos = worst_cos.min(c);
@@ -111,7 +96,7 @@ fn gptoss_encoder_matches_torch_reference() -> Result<()> {
 
     let last = out.last_hidden_state.squeeze(0)?;
     let golden_last = &goldens["last_hidden_state"];
-    let c = cosine(&last, golden_last)?;
+    let c = tensor_cosine(&last, golden_last) as f32;
     let r = rel_l2(&last, golden_last)?;
     eprintln!("last_hidden_state: cosine={c:.6}  rel_l2={r:.4}");
     assert!(c > 0.99, "last_hidden_state cosine {c:.6} too low");
@@ -131,7 +116,7 @@ fn gptoss_encoder_matches_torch_reference() -> Result<()> {
             continue;
         };
         let mine = cap.squeeze(0)?; // [seq, hidden]
-        let c = cosine(&mine, golden)?;
+        let c = tensor_cosine(&mine, golden) as f32;
         let r = rel_l2(&mine, golden)?;
         eprintln!("capture[L{layer:>2}]: cosine={c:.6}  rel_l2={r:.4}");
         assert!(

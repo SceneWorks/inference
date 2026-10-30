@@ -82,12 +82,13 @@
 use crate::common;
 
 use common::{
-    audio_fixture_config, cosine, dit_fixture_config, encode_fixture_config, encode_fixture_tiles,
+    audio_fixture_config, dit_fixture_config, encode_fixture_config, encode_fixture_tiles,
     fixture_config, l2_norm, rel, weights, Golden, AUDIO_FIXTURE, DENOISE_FIXTURE, DIT_FIXTURE,
     ENCODE_FIXTURE, FIXTURE, MLX_FIXTURE_DIR, MLX_RECORD,
 };
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::testkit::{tensor_cosine_f32_sums, Denom};
 use candle_gen_minimax_h3::audio_vae::{AmpBlock1, BigVgan};
 use candle_gen_minimax_h3::blocks::TransformerBlock;
 use candle_gen_minimax_h3::{
@@ -242,7 +243,7 @@ fn video_decode_agrees_with_the_mlx_lane() {
         let (peak, mean) = rel(got, &want);
         println!(
             "  {name}: candle-vs-mlx peak rel {peak:.3e} (mean {mean:.3e}, cosine {:.7})",
-            cosine(got, &want)
+            tensor_cosine_f32_sums(got, &want, Denom::FloorAt(1e-12))
         );
         assert!(
             peak < CROSS_TOL,
@@ -337,7 +338,7 @@ fn video_encode_agrees_with_the_mlx_lane() {
         let (peak, mean) = rel(got, &want);
         println!(
             "  {name}: candle-vs-mlx peak rel {peak:.3e} (mean {mean:.3e}, cosine {:.7})",
-            cosine(got, &want)
+            tensor_cosine_f32_sums(got, &want, Denom::FloorAt(1e-12))
         );
         assert!(
             peak < CROSS_TOL,
@@ -415,7 +416,7 @@ fn audio_decode_agrees_with_the_mlx_lane() {
         let (peak, mean) = rel(got, &want);
         println!(
             "  {name}: candle-vs-mlx peak rel {peak:.3e} (mean {mean:.3e}, cosine {:.7})",
-            cosine(got, &want)
+            tensor_cosine_f32_sums(got, &want, Denom::FloorAt(1e-12))
         );
         assert!(
             peak < CROSS_TOL,
@@ -634,7 +635,7 @@ fn a_gated_ffn_half_swap_is_loud_against_the_mlx_record() {
     println!(
         "sc-18740 half-swap vs the MLX record: peak rel {peak:.3e} (mean {mean:.3e}), cosine \
          {:.6}, ||mlx||={:.4} ||swapped||={:.4}; bound {CROSS_TOL:.0e}",
-        cosine(&mutated, &want),
+        tensor_cosine_f32_sums(&mutated, &want, Denom::FloorAt(1e-12)),
         l2_norm(&want),
         l2_norm(&mutated),
     );
@@ -685,7 +686,7 @@ fn dit_agrees_with_the_mlx_lane() {
         let (peak, mean) = rel(got, &want);
         println!(
             "  {name}: candle-vs-mlx peak rel {peak:.3e} (mean {mean:.3e}, cosine {:.7})",
-            cosine(got, &want)
+            tensor_cosine_f32_sums(got, &want, Denom::FloorAt(1e-12))
         );
         assert!(
             peak < CROSS_TOL,
@@ -855,7 +856,7 @@ fn joint_denoise_agrees_with_the_mlx_lane() {
         let (peak, mean) = rel(got, &want);
         println!(
             "  {name}: candle-vs-mlx peak rel {peak:.3e} (mean {mean:.3e}, cosine {:.7})",
-            cosine(got, &want)
+            tensor_cosine_f32_sums(got, &want, Denom::FloorAt(1e-12))
         );
         assert!(
             peak < CROSS_TOL,
@@ -981,7 +982,7 @@ fn a_dit_gated_ffn_half_swap_is_loud_against_the_mlx_record() {
     println!(
         "sc-18740 half-swap vs the MLX DiT record: peak rel {peak:.3e} (mean {mean:.3e}), cosine \
          {:.6}, ||mlx||={:.4} ||swapped||={:.4}; bound {CROSS_TOL:.0e}",
-        cosine(&mutated, &want),
+        tensor_cosine_f32_sums(&mutated, &want, Denom::FloorAt(1e-12)),
         l2_norm(&want),
         l2_norm(&mutated),
     );

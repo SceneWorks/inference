@@ -8,12 +8,8 @@
 use std::path::PathBuf;
 
 use mlx_gen::gen_core::{CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
-use mlx_gen::media::Image;
+use mlx_gen::testing::{env_or, save_png};
 use mlx_gen_krea::model::load_raw;
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
 
 /// The env var if set, else a default resolved from the local HF cache (F-080: no hardcoded personal
 /// `/Users/...` paths). See [`hf_snapshot`].
@@ -45,22 +41,11 @@ fn hf_snapshot(repo: &str, rel: &str) -> String {
     }
 }
 
-fn save_png(img: &Image, path: &str) {
-    let buf: image::RgbImage =
-        image::ImageBuffer::from_raw(img.width, img.height, img.pixels.clone())
-            .expect("output image buffer");
-    buf.save(path)
-        .unwrap_or_else(|e| panic!("save {path}: {e}"));
-}
-
 fn main() {
     let snapshot = env_or_hf("KREA_SNAPSHOT", "models--krea--Krea-2-Raw", "");
-    let prompt = env_or(
-        "KREA_T2I_PROMPT",
-        "a photorealistic head-and-shoulders studio portrait of a woman with wavy auburn hair, green \
+    let prompt = env_or("KREA_T2I_PROMPT", "a photorealistic head-and-shoulders studio portrait of a woman with wavy auburn hair, green \
          eyes, light freckles, calm neutral expression, looking directly at the camera, soft even \
-         lighting, plain light-grey seamless background, sharp focus, 85mm",
-    );
+         lighting, plain light-grey seamless background, sharp focus, 85mm");
     let out_path = env_or("KREA_T2I_OUT", "/tmp/krea_person_ref.png");
     let steps: u32 = env_or("KREA_T2I_STEPS", "30").parse().expect("steps");
     let guidance: f32 = env_or("KREA_T2I_GUIDANCE", "4.0")

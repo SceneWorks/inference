@@ -36,6 +36,7 @@ use std::time::Instant;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::testkit::tensor_max_abs_host;
 #[cfg(feature = "cuda")]
 use candle_gen::testkit::PeakSampler;
 use candle_gen_ltx::config::LATENT_CHANNELS;
@@ -156,10 +157,6 @@ fn mean_abs_err(got: &Tensor, want: &Tensor) -> f32 {
     let a = values(got);
     let b = values(want);
     a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len() as f32
-}
-
-fn max_abs(t: &Tensor) -> f32 {
-    values(t).iter().map(|v| v.abs()).fold(0.0f32, f32::max)
 }
 
 fn mean(t: &Tensor) -> f32 {
@@ -357,7 +354,7 @@ fn the_timestep_embedder_and_shared_adaln_match_the_reference() {
     let err = abs_err(&t_emb, require(&g, "t_emb"));
     eprintln!(
         "[t_emb] max|delta| = {err:.3e} over |v| <= {:.3}",
-        max_abs(&t_emb)
+        tensor_max_abs_host(&t_emb)
     );
     assert!(err < BLOCK_TOL, "timestep embedding max|delta| = {err:.3e}");
 
@@ -365,11 +362,11 @@ fn the_timestep_embedder_and_shared_adaln_match_the_reference() {
     let err = abs_err(&adaln, require(&g, "adaln"));
     eprintln!(
         "[adaln] max|delta| = {err:.3e} over |v| <= {:.3}",
-        max_abs(&adaln)
+        tensor_max_abs_host(&adaln)
     );
     // The AdaLN projection amplifies (its outputs reach |52|), so scale the bar with the signal.
     assert!(
-        err < BLOCK_TOL * max_abs(&adaln).max(1.0),
+        err < BLOCK_TOL * tensor_max_abs_host(&adaln).max(1.0),
         "shared AdaLN max|delta| = {err:.3e}"
     );
 
@@ -391,7 +388,7 @@ fn one_deterministic_na_block_matches_the_reference() {
     eprintln!(
         "[na block] max|delta| = {err:.3e}, mean|delta| = {:.3e}, |ref| <= {:.3}",
         mean_abs_err(&got, want),
-        max_abs(want)
+        tensor_max_abs_host(want)
     );
     assert!(
         err < BLOCK_TOL,
@@ -418,7 +415,7 @@ fn one_diffusion_block_matches_the_reference() {
     eprintln!(
         "[diff block] max|delta| = {err:.3e}, mean|delta| = {:.3e}, |ref| <= {:.3}",
         mean_abs_err(&got, want),
-        max_abs(want)
+        tensor_max_abs_host(want)
     );
     assert!(err < BLOCK_TOL, "diffusion block max|delta| = {err:.3e}");
 
@@ -500,7 +497,7 @@ fn the_full_decode_matches_the_reference() {
         latent.dims(),
         got.dims(),
         mean_abs_err(&got, want),
-        max_abs(want)
+        tensor_max_abs_host(want)
     );
     assert!(err < DECODE_TOL, "full decode max|delta| = {err:.3e}");
 
@@ -555,7 +552,7 @@ fn the_conv_vae_decode_still_matches_the_v1_2_0_reference() {
         latent.dims(),
         got.dims(),
         mean_abs_err(&got, want),
-        max_abs(want)
+        tensor_max_abs_host(want)
     );
     assert!(err < BLOCK_TOL, "conv VAE decode max|delta| = {err:.3e}");
 

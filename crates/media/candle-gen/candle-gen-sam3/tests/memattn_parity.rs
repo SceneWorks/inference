@@ -8,9 +8,9 @@
 
 use std::path::Path;
 
-use crate::support::cosine;
 use candle_gen::candle_core::Device;
 use candle_gen::default_device;
+use candle_gen::testkit::{tensor_cosine_device_sums, Denom};
 use candle_gen_sam3::{Sam3Tracker, Weights};
 
 fn fx_i32(fx: &Weights, key: &str) -> Vec<i32> {
@@ -53,7 +53,7 @@ fn memory_attention_matches_oracle() {
     for (key, got) in [("rope_cos", &cos), ("rope_sin", &sin)] {
         let want = fx.require(key).unwrap();
         assert_eq!(got.dims(), want.dims(), "{key} shape");
-        let c = cosine(got, &want);
+        let c = tensor_cosine_device_sums(got, &want, Denom::Exact);
         println!("{key}: cosine={c:.7}");
         assert!(c > 0.999999, "{key} cosine {c}");
     }
@@ -74,7 +74,7 @@ fn memory_attention_matches_oracle() {
         want.flatten_all().unwrap().dims(),
         "output numel"
     );
-    let c = cosine(&got, &want);
+    let c = tensor_cosine_device_sums(&got, &want, Denom::Exact);
     println!("memory_attention output (num_obj_ptr={n_optr}): cosine={c:.7}");
     assert!(c > 0.999, "memory_attention cosine {c}");
 

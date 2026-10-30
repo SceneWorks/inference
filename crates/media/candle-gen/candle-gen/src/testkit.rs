@@ -705,6 +705,7 @@ pub fn tensor_cosine(a: &Tensor, b: &Tensor) -> f64 {
             .expect("tensor reads back as f32")
     };
     let (a, b) = (flat(a), flat(b));
+    assert_eq!(a.len(), b.len(), "cosine over tensors of different sizes");
     let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
     for (x, y) in a.iter().zip(&b) {
         dot += (*x as f64) * (*y as f64);
