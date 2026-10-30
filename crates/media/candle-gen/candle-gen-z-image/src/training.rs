@@ -179,7 +179,7 @@ fn compute_loss_grads(
     let device = x0.device();
     let (x_t_f32, target, timestep) = build_batch(x0, noise, sigma)?;
     let x_t = x_t_f32.to_dtype(compute_dtype)?;
-    let prepared = prepare_inputs(&x_t, std::slice::from_ref(cap), device)?;
+    let prepared = dit.training_inputs(&x_t, cap)?;
     let cap_feats = prepared.cap_feats.to_dtype(compute_dtype)?;
     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
 
@@ -690,6 +690,32 @@ impl FlowMatchTrainer for ZImageTrainer {
         Ok((cache, (), sample_plan))
     }
 
+    fn prepare_training(
+        &self,
+        dit: &mut Self::Dit,
+        cache: &mut [Self::Cached],
+        _aux: &mut Self::Aux,
+        req: &TrainingRequest,
+        _device: &Device,
+    ) -> Result<()> {
+        dit.prepare_training_projections()?;
+        let dtype = flow_match::parse_compute_dtype(&req.config.train_dtype);
+        let mut captions = std::collections::HashMap::<_, Tensor>::new();
+        for (x0, caption, _) in cache {
+            let id = caption.id();
+            *caption = match captions.get(&id) {
+                Some(projected) => projected.clone(),
+                None => {
+                    let projected = dit.prepare_training_caption(x0, caption, dtype)?;
+                    captions.insert(id, projected.clone());
+                    projected
+                }
+            };
+            dit.prepare_training_bucket(x0, caption)?;
+        }
+        Ok(())
+    }
+
     fn build_dit(
         &self,
         req: &TrainingRequest,
@@ -995,7 +1021,15 @@ mod tests {
         let dev = Device::Cpu;
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-        let (mut dit, cfg) = tiny_dit(vb);
+        let (_fixture, cfg) = tiny_dit(vb);
+        let weights = vm
+            .data()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_tensor().detach()))
+            .collect();
+        let (mut dit, _) = tiny_dit(VarBuilder::from_tensors(weights, DType::F32, &dev));
         let suffixes: Vec<String> = Z_IMAGE_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
         // Move B off zero so both A and B grads are nonzero (a no-op-init adapter zeros A's grad).
@@ -1016,6 +1050,28 @@ mod tests {
         let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
         let noise = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
 
+        let (loss_ref, g_ref) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &cap,
+            0.5,
+            &noise,
+            false,
+            None,
+            DType::F32,
+            false,
+        )
+        .unwrap();
+        dit.prepare_training_projections().unwrap();
+        let cap = dit.prepare_training_caption(&x0, &cap, DType::F32).unwrap();
+        dit.prepare_training_bucket(&x0, &cap).unwrap();
+        let inputs = dit.training_inputs(&x0, &cap).unwrap();
+        assert_eq!(
+            inputs.cap_feats.id(),
+            cap.id(),
+            "reuse only the frozen pre-refiner caption"
+        );
         let (loss_d, g_d) = compute_loss_grads(
             &dit,
             &set.vars,
@@ -1044,6 +1100,10 @@ mod tests {
         .unwrap();
 
         assert!(
+            (loss_ref - loss_d).abs() < 1e-4,
+            "prepared/fused loss {loss_ref} vs {loss_d}"
+        );
+        assert!(
             (loss_d - loss_c).abs() < 1e-4,
             "loss: dense {loss_d} vs checkpoint {loss_c}"
         );
@@ -1061,9 +1121,16 @@ mod tests {
                 g_d.get(v.as_tensor()).is_some() && g_c.get(v.as_tensor()).is_some(),
                 "var {idx} missing a gradient (dense or checkpoint)"
             );
+            let reference = grad_vec(&g_ref, v);
             let a = grad_vec(&g_d, v);
             let b = grad_vec(&g_c, v);
             assert_eq!(a.len(), b.len());
+            for (reference, packed) in reference.iter().zip(&a) {
+                assert!(
+                    (reference - packed).abs() < 1e-4,
+                    "prepared/fused adapter grad {idx}: {reference} vs {packed}"
+                );
+            }
             for (x, y) in a.iter().zip(b.iter()) {
                 assert!(
                     (x - y).abs() < 1e-4,

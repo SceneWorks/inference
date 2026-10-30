@@ -39,9 +39,16 @@
 use candle_core::{DType, Result, Tensor, D};
 use candle_nn::{RmsNorm, VarBuilder};
 
+use candle_core::{Module, TensorId};
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::train::gradient_checkpoint::Segment;
 use candle_gen::train::lora::{lora_linear, lora_linear_no_bias, LoraHost, LoraLinear};
+use candle_gen::train::projection::FrozenProjectionPack;
+use candle_transformers::models::z_image::preprocess::{prepare_inputs, PreparedInputs};
+
+fn rms_diff(norm: &RmsNorm, x: &Tensor) -> Result<Tensor> {
+    candle_gen::train::norm::rms_norm_cast_before_weight(x, norm.weight(), norm.eps())
+}
 
 fn default_attention_plan() -> AttentionPlan<'static> {
     AttentionPlan::budgeted(AttentionBudget::from_score_elements(
@@ -116,7 +123,7 @@ impl QkNorm {
     }
 
     fn forward(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
-        Ok((self.norm_q.forward_diff(q)?, self.norm_k.forward_diff(k)?))
+        Ok((rms_diff(&self.norm_q, q)?, rms_diff(&self.norm_k, k)?))
     }
 }
 
@@ -135,6 +142,7 @@ pub const Z_IMAGE_ATTN_TARGETS: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"]
 /// backward).
 #[derive(Debug, Clone)]
 pub struct ZImageAttention {
+    qkv_pack: Option<FrozenProjectionPack>,
     to_q: LoraLinear,
     to_k: LoraLinear,
     to_v: LoraLinear,
@@ -170,6 +178,7 @@ impl ZImageAttention {
         };
 
         Ok(Self {
+            qkv_pack: None,
             to_q,
             to_k,
             to_v,
@@ -203,9 +212,17 @@ impl ZImageAttention {
         let (b, seq_len, _) = hidden_states.dims3()?;
 
         // Project to Q, K, V (through the LoRA-adapted projections).
-        let q = hidden_states.apply(&self.to_q)?;
-        let k = hidden_states.apply(&self.to_k)?;
-        let v = hidden_states.apply(&self.to_v)?;
+        let projected = match &self.qkv_pack {
+            Some(pack) => {
+                pack.forward_lora(hidden_states, &[&self.to_q, &self.to_k, &self.to_v])?
+            }
+            None => vec![
+                self.to_q.forward(hidden_states)?,
+                self.to_k.forward(hidden_states)?,
+                self.to_v.forward(hidden_states)?,
+            ],
+        };
+        let (q, k, v) = (&projected[0], &projected[1], &projected[2]);
 
         // (B, seq, n*hd) -> (B, seq, n, hd). K/V use `n_heads` (not `n_kv_heads`); valid only under the
         // MHA invariant asserted in `new` (n_kv_heads == n_heads).
@@ -387,7 +404,7 @@ impl ZImageTransformerBlock {
             let scale_mlp = (scale_mlp + 1.0)?;
 
             // Attention block
-            let normed = self.attention_norm1.forward_diff(x)?;
+            let normed = rms_diff(&self.attention_norm1, x)?;
             let scaled = normed.broadcast_mul(&scale_msa)?;
             let attn_out = self.attention.forward_with_attention_plan(
                 &scaled,
@@ -396,17 +413,17 @@ impl ZImageTransformerBlock {
                 sin,
                 attention_plan,
             )?;
-            let attn_out = self.attention_norm2.forward_diff(&attn_out)?;
+            let attn_out = rms_diff(&self.attention_norm2, &attn_out)?;
             let x = (x + gate_msa.broadcast_mul(&attn_out)?)?;
 
             // FFN block
-            let normed = self.ffn_norm1.forward_diff(&x)?;
+            let normed = rms_diff(&self.ffn_norm1, &x)?;
             let scaled = normed.broadcast_mul(&scale_mlp)?;
             let ffn_out = self.feed_forward.forward(&scaled)?;
-            let ffn_out = self.ffn_norm2.forward_diff(&ffn_out)?;
+            let ffn_out = rms_diff(&self.ffn_norm2, &ffn_out)?;
             Ok((x + gate_mlp.broadcast_mul(&ffn_out)?)?)
         } else {
-            let normed = self.attention_norm1.forward_diff(x)?;
+            let normed = rms_diff(&self.attention_norm1, x)?;
             let attn_out = self.attention.forward_with_attention_plan(
                 &normed,
                 attn_mask,
@@ -414,12 +431,12 @@ impl ZImageTransformerBlock {
                 sin,
                 attention_plan,
             )?;
-            let attn_out = self.attention_norm2.forward_diff(&attn_out)?;
+            let attn_out = rms_diff(&self.attention_norm2, &attn_out)?;
             let x = (x + attn_out)?;
 
-            let normed = self.ffn_norm1.forward_diff(&x)?;
+            let normed = rms_diff(&self.ffn_norm1, &x)?;
             let ffn_out = self.feed_forward.forward(&normed)?;
-            let ffn_out = self.ffn_norm2.forward_diff(&ffn_out)?;
+            let ffn_out = rms_diff(&self.ffn_norm2, &ffn_out)?;
             Ok((x + ffn_out)?)
         }
     }
@@ -448,6 +465,11 @@ pub struct ZImageTransformer2DModel {
     pub(crate) layers: Vec<ZImageTransformerBlock>,
     pub(crate) rope_embedder: RopeEmbedder,
     pub(crate) cfg: Config,
+    training_captions: Vec<(TensorId, Tensor, usize)>,
+    training_geometry: std::collections::HashMap<
+        (usize, usize, usize, usize, TensorId, TensorId),
+        TrainingGeometry,
+    >,
     #[cfg(test)]
     prepare_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -467,6 +489,19 @@ pub struct MainContext {
     unified_attn_mask: Tensor,
     img_seq_len: usize,
     orig_size: (usize, usize, usize),
+}
+
+#[derive(Debug, Clone)]
+struct TrainingGeometry {
+    x_cos: Tensor,
+    x_sin: Tensor,
+    cap_cos: Tensor,
+    cap_sin: Tensor,
+    x_attn_mask: Tensor,
+    cap_attn_mask: Tensor,
+    unified_cos: Tensor,
+    unified_sin: Tensor,
+    unified_attn_mask: Tensor,
 }
 
 /// Request-owned geometry and caption conditioning for dense/vendored Z-Image inference.
@@ -565,8 +600,107 @@ impl ZImageTransformer2DModel {
             layers,
             rope_embedder,
             cfg: cfg.clone(),
+            training_captions: Vec::new(),
+            training_geometry: std::collections::HashMap::new(),
             #[cfg(test)]
             prepare_calls: Default::default(),
+        })
+    }
+
+    pub(crate) fn prepare_training_projections(&mut self) -> Result<()> {
+        for block in self
+            .noise_refiner
+            .iter_mut()
+            .chain(self.context_refiner.iter_mut())
+            .chain(self.layers.iter_mut())
+        {
+            let attention = &mut block.attention;
+            attention.qkv_pack = FrozenProjectionPack::prepare_lora(&mut [
+                &mut attention.to_q,
+                &mut attention.to_k,
+                &mut attention.to_v,
+            ])?;
+        }
+        Ok(())
+    }
+
+    /// Cache only the immutable caption embedder, before the adaptable context refiner.
+    /// The caller replaces the original caption; no second activation copy is retained here.
+    pub(crate) fn prepare_training_caption(
+        &mut self,
+        x: &Tensor,
+        caption: &Tensor,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let inputs = prepare_inputs(x, std::slice::from_ref(caption), x.device())?;
+        let features = inputs.cap_feats.to_dtype(dtype)?;
+        let projected = __model_proof_output!(self
+            .cap_embedder_linear
+            .forward(&rms_diff(&self.cap_embedder_norm, &features)?))?;
+        self.training_captions.push((
+            projected.id(),
+            inputs.cap_mask.clone(),
+            inputs.text_lengths[0],
+        ));
+        Ok(projected)
+    }
+
+    pub(crate) fn prepare_training_bucket(&mut self, x: &Tensor, caption: &Tensor) -> Result<()> {
+        let inputs = self.training_inputs(x, caption)?;
+        let geometry =
+            self.build_training_geometry(&inputs.latents, &inputs.cap_feats, &inputs.cap_mask)?;
+        let (b, _, f, h, w) = inputs.latents.dims5()?;
+        self.training_geometry
+            .insert((b, f, h, w, caption.id(), inputs.cap_mask.id()), geometry);
+        Ok(())
+    }
+
+    pub(crate) fn training_inputs(&self, x: &Tensor, caption: &Tensor) -> Result<PreparedInputs> {
+        match self
+            .training_captions
+            .iter()
+            .find(|(id, _, _)| *id == caption.id())
+        {
+            Some((_, mask, length)) => Ok(PreparedInputs {
+                latents: x.unsqueeze(2)?,
+                cap_feats: caption.clone(),
+                cap_mask: mask.clone(),
+                text_lengths: vec![*length],
+            }),
+            None => prepare_inputs(x, std::slice::from_ref(caption), x.device()),
+        }
+    }
+
+    fn build_training_geometry(
+        &self,
+        x: &Tensor,
+        caption: &Tensor,
+        mask: &Tensor,
+    ) -> Result<TrainingGeometry> {
+        let (b, _, f, h, w) = x.dims5()?;
+        let (p, fp) = (self.cfg.all_patch_size[0], self.cfg.all_f_patch_size[0]);
+        let text_len = caption.dim(1)?;
+        let x_pos =
+            create_coordinate_grid((f / fp, h / p, w / p), (text_len + 1, 0, 0), x.device())?;
+        let cap_pos = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), x.device())?;
+        let (x_cos, x_sin) = self.rope_embedder.forward(&x_pos)?;
+        let (cap_cos, cap_sin) = self.rope_embedder.forward(&cap_pos)?;
+        let (unified_cos, unified_sin) = self
+            .rope_embedder
+            .forward(&Tensor::cat(&[&x_pos, &cap_pos], 0)?)?;
+        let x_attn_mask = Tensor::ones((b, (f / fp) * (h / p) * (w / p)), DType::U8, x.device())?;
+        let cap_attn_mask = mask.to_dtype(DType::U8)?;
+        let unified_attn_mask = Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1)?;
+        Ok(TrainingGeometry {
+            x_cos,
+            x_sin,
+            cap_cos,
+            cap_sin,
+            x_attn_mask,
+            cap_attn_mask,
+            unified_cos,
+            unified_sin,
+            unified_attn_mask,
         })
     }
 
@@ -596,7 +730,7 @@ impl ZImageTransformer2DModel {
         let (cap_cos, cap_sin) = self.rope_embedder.forward(&cap_pos_ids)?;
         let x_attn_mask = Tensor::ones((b, img_seq_len), DType::U8, device)?;
         let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
-        let cap_normed = self.cap_embedder_norm.forward_diff(cap_feats)?;
+        let cap_normed = rms_diff(&self.cap_embedder_norm, cap_feats)?;
         let mut cap = __model_proof_output!(cap_normed.apply(&self.cap_embedder_linear))?;
         for layer in &self.context_refiner {
             cap = layer.forward(&cap, Some(&cap_attn_mask), &cap_cos, &cap_sin, None)?;
@@ -722,8 +856,26 @@ impl ZImageTransformer2DModel {
         cap_feats: &Tensor,
         cap_mask: &Tensor,
     ) -> Result<(Tensor, MainContext)> {
-        let device = x.device();
         let (b, _c, f, h, w) = x.dims5()?;
+        let geometry =
+            match self
+                .training_geometry
+                .get(&(b, f, h, w, cap_feats.id(), cap_mask.id()))
+            {
+                Some(geometry) => geometry.clone(),
+                None => self.build_training_geometry(x, cap_feats, cap_mask)?,
+            };
+        let TrainingGeometry {
+            x_cos,
+            x_sin,
+            cap_cos,
+            cap_sin,
+            x_attn_mask,
+            cap_attn_mask,
+            unified_cos,
+            unified_sin,
+            unified_attn_mask,
+        } = geometry;
         let patch_size = self.cfg.all_patch_size[0];
         let f_patch_size = self.cfg.all_f_patch_size[0];
 
@@ -736,26 +888,19 @@ impl ZImageTransformer2DModel {
         let mut x = __model_proof_output!(x_patches.apply(&self.x_embedder))?;
         let img_seq_len = x.dim(1)?;
 
-        // 3. Image position IDs (offset past the text block)
-        let f_tokens = f / f_patch_size;
-        let h_tokens = h / patch_size;
-        let w_tokens = w / patch_size;
-        let text_len = cap_feats.dim(1)?;
-        let x_pos_ids =
-            create_coordinate_grid((f_tokens, h_tokens, w_tokens), (text_len + 1, 0, 0), device)?;
-        let (x_cos, x_sin) = self.rope_embedder.forward(&x_pos_ids)?;
-
-        // 4. Caption embedding (composable norm — see the module header on fused RMSNorm).
-        let cap_normed = self.cap_embedder_norm.forward_diff(cap_feats)?;
-        let mut cap = __model_proof_output!(cap_normed.apply(&self.cap_embedder_linear))?;
-
-        // 5. Caption position IDs
-        let cap_pos_ids = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), device)?;
-        let (cap_cos, cap_sin) = self.rope_embedder.forward(&cap_pos_ids)?;
-
-        // 6. Attention masks
-        let x_attn_mask = Tensor::ones((b, img_seq_len), DType::U8, device)?;
-        let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
+        // Only the frozen caption embedder can be reused. Every adaptable refiner
+        // below is evaluated on each update and remains in the prelude autograd graph.
+        let mut cap = if self
+            .training_captions
+            .iter()
+            .any(|(id, _, _)| *id == cap_feats.id())
+        {
+            cap_feats.clone()
+        } else {
+            __model_proof_output!(
+                rms_diff(&self.cap_embedder_norm, cap_feats)?.apply(&self.cap_embedder_linear)
+            )?
+        };
 
         // 7. Noise refiner (image, with modulation)
         for layer in &self.noise_refiner {
@@ -769,11 +914,6 @@ impl ZImageTransformer2DModel {
 
         // 9. Concatenate [image, text]
         let unified = Tensor::cat(&[&x, &cap], 1)?;
-
-        // 10. Unified position IDs + mask
-        let unified_pos_ids = Tensor::cat(&[&x_pos_ids, &cap_pos_ids], 0)?;
-        let (unified_cos, unified_sin) = self.rope_embedder.forward(&unified_pos_ids)?;
-        let unified_attn_mask = Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1)?;
 
         Ok((
             unified,
