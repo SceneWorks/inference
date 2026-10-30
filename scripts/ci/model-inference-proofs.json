@@ -60315,7 +60315,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
-            "case_source_sha256": "f5674cb7ebf529cb0a7658fea89f39a2b3d8821655a6ad571fd0aa76598c4ef0",
+            "case_source_sha256": "d1f346791904fa2ff509b9dbe0923b9459d47d8480db0ba19a1911214a380121",
             "writer": "trainer_cuda_smoke::run(kind,full): trainer.train(output_dir,file_name=adapter.safetensors) writes output.adapter_path -> candle_core::safetensors::load(&output.adapter_path,Device::Cpu)"
           }
         },
@@ -60377,7 +60377,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
-            "case_source_sha256": "f5674cb7ebf529cb0a7658fea89f39a2b3d8821655a6ad571fd0aa76598c4ef0",
+            "case_source_sha256": "d1f346791904fa2ff509b9dbe0923b9459d47d8480db0ba19a1911214a380121",
             "writer": "trainer_cuda_smoke::run(kind,full): RgbImage::from_pixel(64,64,Rgb([210,160,30])).save(&input) -> TrainingItem::captioned(input) -> trainer.train -> cache_samples -> decode_square(item.image_path) -> observed image::open(path)"
           }
         }
@@ -60459,7 +60459,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
-            "case_source_sha256": "f5674cb7ebf529cb0a7658fea89f39a2b3d8821655a6ad571fd0aa76598c4ef0",
+            "case_source_sha256": "d1f346791904fa2ff509b9dbe0923b9459d47d8480db0ba19a1911214a380121",
             "writer": "trainer_cuda_smoke::run(kind,full): trainer.train(output_dir,file_name=adapter.safetensors) writes output.adapter_path -> candle_core::safetensors::load(&output.adapter_path,Device::Cpu)"
           }
         },
@@ -60521,7 +60521,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
-            "case_source_sha256": "f5674cb7ebf529cb0a7658fea89f39a2b3d8821655a6ad571fd0aa76598c4ef0",
+            "case_source_sha256": "d1f346791904fa2ff509b9dbe0923b9459d47d8480db0ba19a1911214a380121",
             "writer": "trainer_cuda_smoke::run(kind,full): RgbImage::from_pixel(64,64,Rgb([210,160,30])).save(&input) -> TrainingItem::captioned(input) -> trainer.train -> cache_samples -> decode_square(item.image_path) -> observed image::open(path)"
           }
         },
@@ -60537,7 +60537,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
-            "case_source_sha256": "f5674cb7ebf529cb0a7658fea89f39a2b3d8821655a6ad571fd0aa76598c4ef0",
+            "case_source_sha256": "d1f346791904fa2ff509b9dbe0923b9459d47d8480db0ba19a1911214a380121",
             "writer": "trainer_cuda_smoke::run(NetworkType::Lora/Lokr,false): trainer.train writes output.adapter_path -> adapted LoadSpec.with_adapters(AdapterSpec(output.adapter_path,1.0,...)) -> actual generate -> install_dotted_adapters -> read_adapter_capped reads produced file"
           }
         }
@@ -60619,7 +60619,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
-            "case_source_sha256": "f5674cb7ebf529cb0a7658fea89f39a2b3d8821655a6ad571fd0aa76598c4ef0",
+            "case_source_sha256": "d1f346791904fa2ff509b9dbe0923b9459d47d8480db0ba19a1911214a380121",
             "writer": "trainer_cuda_smoke::run(kind,full): trainer.train(output_dir,file_name=adapter.safetensors) writes output.adapter_path -> candle_core::safetensors::load(&output.adapter_path,Device::Cpu)"
           }
         },
@@ -60681,7 +60681,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
-            "case_source_sha256": "f5674cb7ebf529cb0a7658fea89f39a2b3d8821655a6ad571fd0aa76598c4ef0",
+            "case_source_sha256": "d1f346791904fa2ff509b9dbe0923b9459d47d8480db0ba19a1911214a380121",
             "writer": "trainer_cuda_smoke::run(kind,full): RgbImage::from_pixel(64,64,Rgb([210,160,30])).save(&input) -> TrainingItem::captioned(input) -> trainer.train -> cache_samples -> decode_square(item.image_path) -> observed image::open(path)"
           }
         },
@@ -60697,7 +60697,7 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
-            "case_source_sha256": "f5674cb7ebf529cb0a7658fea89f39a2b3d8821655a6ad571fd0aa76598c4ef0",
+            "case_source_sha256": "d1f346791904fa2ff509b9dbe0923b9459d47d8480db0ba19a1911214a380121",
             "writer": "trainer_cuda_smoke::run(NetworkType::Lora/Lokr,false): trainer.train writes output.adapter_path -> adapted LoadSpec.with_adapters(AdapterSpec(output.adapter_path,1.0,...)) -> actual generate -> install_dotted_adapters -> read_adapter_capped reads produced file"
           }
         }
@@ -304354,8 +304354,8 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
-            "case_source_sha256": "f5674cb7ebf529cb0a7658fea89f39a2b3d8821655a6ad571fd0aa76598c4ef0",
-            "writer": "trainer_cuda_smoke::run(kind,full): trainer.train(output_dir,file_name=adapter.safetensors) writes output.adapter_path -> candle_core::safetensors::load(&output.adapter_path,Device::Cpu)"
+            "case_source_sha256": "d1f346791904fa2ff509b9dbe0923b9459d47d8480db0ba19a1911214a380121",
+            "writer": "trainer_cuda_smoke::mage_bounded_acceleration_acceptance: trainer.train writes output.adapter_path -> safetensors::load(&output.adapter_path,Device::Cpu)"
           }
         },
         {
@@ -304416,8 +304416,8 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
-            "case_source_sha256": "f5674cb7ebf529cb0a7658fea89f39a2b3d8821655a6ad571fd0aa76598c4ef0",
-            "writer": "trainer_cuda_smoke::run(kind,full): RgbImage::from_pixel(64,64,Rgb([210,160,30])).save(&input) -> TrainingItem::captioned(input) -> trainer.train -> cache_samples -> decode_square(item.image_path) -> observed image::open(path)"
+            "case_source_sha256": "d1f346791904fa2ff509b9dbe0923b9459d47d8480db0ba19a1911214a380121",
+            "writer": "trainer_cuda_smoke::mage_bounded_acceleration_acceptance: RgbImage::from_pixel(...).save(&input) -> TrainingItem::captioned(input) -> production trainer cache_samples -> observed decode_square/item image reader"
           }
         },
         {
@@ -304432,11 +304432,12 @@
           "scope": "case",
           "case_generated_write_read": {
             "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
-            "case_source_sha256": "f5674cb7ebf529cb0a7658fea89f39a2b3d8821655a6ad571fd0aa76598c4ef0",
-            "writer": "trainer_cuda_smoke::run(NetworkType::Lora/Lokr,false): trainer.train writes output.adapter_path -> adapted LoadSpec.with_adapters(AdapterSpec(output.adapter_path,1.0,...)) -> actual generate -> install_dotted_adapters -> read_adapter_capped reads produced file"
+            "case_source_sha256": "d1f346791904fa2ff509b9dbe0923b9459d47d8480db0ba19a1911214a380121",
+            "writer": "trainer_cuda_smoke::mage_bounded_acceleration_acceptance: trainer.train writes output.adapter_path -> LoadSpec.with_adapters(AdapterSpec(output.adapter_path,1.0,Lora)) -> production generate/install_dotted_adapters/read_adapter_capped"
           }
         }
-      ]
+      ],
+      "case_generated_inputs": true
     },
     "output_artifacts": [
       "bespoke_acceptance/metrics.json",
@@ -306897,7 +306898,9 @@
             3072,
             3072
           ]
-        }
+        },
+        "metadata_format": "flux3",
+        "alpha": 2.0
       }
     }
   },

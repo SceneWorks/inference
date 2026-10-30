@@ -325,13 +325,12 @@ fn moss_bounded_acceleration_acceptance() {
     let root = bounded_root();
     let base = required("MOSS_BASE_SNAPSHOT");
     let shared = required("MOSS_SHARED_SNAPSHOT");
-    let spec = prepared(MossImageVariant::Base, &base, &shared, &shared);
     let input = root.join("input.png");
     image::RgbImage::from_pixel(64, 64, image::Rgb([80, 140, 210]))
         .save(&input)
         .unwrap();
     let sampler = candle_gen::testkit::PeakSampler::start_rendered();
-    let output = candle_gen::train::profile::with_bounded_cohort_for(
+    let (output, spec) = candle_gen::train::profile::with_bounded_cohort_for(
         &root.join("metrics.json"),
         &[
             "moss:geometry-storage-hit",
@@ -339,6 +338,7 @@ fn moss_bounded_acceleration_acceptance() {
             "moss:frozen-projection-pack",
         ],
         || {
+            let spec = prepared(MossImageVariant::Base, &base, &shared, &shared);
             let mut trainer = candle_gen_moss_image::register_providers(
                 candle_gen::gen_core::ProviderRegistryBuilder::new(),
             )
@@ -375,7 +375,7 @@ fn moss_bounded_acceleration_acceptance() {
                 .unwrap();
             assert_eq!(output.steps, 4);
             assert!(output.final_loss.is_finite());
-            output
+            (output, spec)
         },
     );
     bounded_peak(sampler, &root);

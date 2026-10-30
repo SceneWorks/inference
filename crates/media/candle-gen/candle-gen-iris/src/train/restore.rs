@@ -814,6 +814,22 @@ impl Run {
         let mut finished = self.step >= plan.max_steps as u64;
         let mut epoch = self.epoch;
         let mut start_pos = self.pos;
+        if candle_gen::train::profile::cohort_active() {
+            // Both owners are captured before timing: the first critic update
+            // must not allocate its initial diagnostics in a steady interval.
+            let vars = self
+                .params
+                .iter()
+                .filter(|(name, _)| self.opt.is_trained(name))
+                .chain(
+                    self.head
+                        .iter()
+                        .filter(|(name, _)| self.critic_opt.is_trained(name)),
+                )
+                .map(|(_, var)| var.clone())
+                .collect::<Vec<_>>();
+            candle_gen::train::profile::cohort_capture_initial(&vars)?;
+        }
         while !finished && !cancelled && epoch <= max_epoch {
             for pos in start_pos..bpe {
                 if req.cancel.is_cancelled() && batch_count.is_multiple_of(per_step) {
