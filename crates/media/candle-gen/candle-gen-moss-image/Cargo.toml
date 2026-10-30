@@ -30,6 +30,8 @@ cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-llm/cuda"]
 metal = ["candle-gen/metal", "candle-gen-flux2/metal", "candle-llm/metal"]
 
 [dev-dependencies]
+# Bounded integration proofs use the shared sampler/output helpers independently of sibling crates.
+candle-gen = { path = "../candle-gen", features = ["testkit"] }
 tempfile = { workspace = true }
 
 [[test]]
