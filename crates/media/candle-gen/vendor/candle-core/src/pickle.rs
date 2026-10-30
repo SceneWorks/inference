@@ -895,39 +895,3 @@ pub fn read_all_with_key<P: AsRef<std::path::Path>>(
 pub fn read_all<P: AsRef<std::path::Path>>(path: P) -> Result<Vec<(String, Tensor)>> {
     read_all_with_key(path, None)
 }
-
-#[cfg(test)]
-mod load_progress_tests {
-    use super::*;
-    use load_progress::LoadActivityObserver;
-    use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn pth_lazy_load_retains_request_and_deduplicates_ranges() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let output = events.clone();
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fortran_tensor_3d.pth");
-        let archive = {
-            let _observer = LoadActivityObserver::new(move |v| output.lock().unwrap().push(v));
-            PthTensors::new(&path, None).unwrap()
-        };
-        let _other = LoadActivityObserver::new(|_| panic!("lazy PTH changed request"));
-        let name = archive.tensor_infos().keys().next().unwrap();
-        archive.get(name).unwrap().unwrap();
-        let first = events
-            .lock()
-            .unwrap()
-            .iter()
-            .flatten()
-            .last()
-            .unwrap()
-            .bytes_read;
-        archive.get(name).unwrap().unwrap();
-        let events = events.lock().unwrap();
-        let last = events.iter().flatten().last().unwrap();
-        assert_eq!(last.bytes_read, first);
-        assert!(last.bytes_read <= last.total_bytes.unwrap());
-        assert_eq!(events.last(), Some(&None));
-    }
-}

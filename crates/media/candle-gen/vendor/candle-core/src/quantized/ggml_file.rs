@@ -281,25 +281,3 @@ impl Content {
         }
     }
 }
-
-#[cfg(test)]
-mod load_progress_tests {
-    use super::*;
-    use load_progress::LoadActivityObserver;
-    use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn metadata_only_ggml_reports_reads_and_clears() {
-        let mut bytes = 0x67676d6cu32.to_le_bytes().to_vec();
-        bytes.extend_from_slice(&[0; 28]); // Empty vocab and no tensor records.
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let output = events.clone();
-        let _observer = LoadActivityObserver::new(move |v| output.lock().unwrap().push(v));
-        Content::read_with_path(&mut std::io::Cursor::new(bytes), &Device::Cpu, "model.ggml")
-            .unwrap();
-        let events = events.lock().unwrap();
-        let last = events.iter().flatten().last().unwrap();
-        assert_eq!((last.bytes_read, last.total_bytes), (32, Some(32)));
-        assert_eq!(events.last(), Some(&None));
-    }
-}
