@@ -34,7 +34,7 @@ simulator-functional = ["media", "runtime-ios/simulator-functional"]
 zimage = ["media"]
 
 [dependencies]
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "4f194724477e7a47e06ca7a2129e118138bd7526" }
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "11d0ff7c81e628beaa548e1872db974c10529efe" }
 # Deliberately the BUNDLE, not mlx-llm directly: the point of an on-device test is to exercise the
 # composition a product actually consumes (registry, capability descriptor, provider selection),
 # not just the engine underneath it.

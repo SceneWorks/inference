@@ -51,8 +51,8 @@ INTERNAL_PACKAGES = {
     "runtime-cuda",
 }
 PINNED_WORKSPACE_DEPENDENCIES = {
-    "mlx-rs": ("pmetal-mlx-rs", "4f194724477e7a47e06ca7a2129e118138bd7526"),
-    "mlx-sys": ("pmetal-mlx-sys", "4f194724477e7a47e06ca7a2129e118138bd7526"),
+    "mlx-rs": ("pmetal-mlx-rs", "11d0ff7c81e628beaa548e1872db974c10529efe"),
+    "mlx-sys": ("pmetal-mlx-sys", "11d0ff7c81e628beaa548e1872db974c10529efe"),
     "candle-core": ("candle-core", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-nn": ("candle-nn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-transformers": ("candle-transformers", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
