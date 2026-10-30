@@ -139,6 +139,40 @@ class MultiCudaSupervisorTests(unittest.TestCase):
                 clock=timeline.clock, additional_cuda_policies=tuple(policies[1:]),
                 additional_cuda_probes=tuple(probes[1:]), **kwargs)
 
+    def test_single_device_failure_retains_sample_and_usage_basis(self):
+        for basis in ('owned-process-attributed', 'global-used-upper-bound'):
+            for breach in ('cap', 'reserve'):
+                with self.subTest(basis=basis, breach=breach):
+                    policy = dataclasses.replace(self.policies[0], backend='windows-cuda')
+                    timeline = Timeline()
+                    probe = DeviceProbe(policy, timeline, 0, breach=('during', breach), use=64)
+                    probe.gpu_usage_basis = basis
+                    with self.assertRaises(safety.SupervisionError) as caught:
+                        self.run_fake(timeline, [probe], [policy], require_gpu_sample=False)
+                    error = caught.exception
+                    self.assertEqual(error.reason, 'device-memory')
+                    sample = error.watchdog_device_memory
+                    self.assertEqual(sample['cudaDeviceUuid'], policy.cuda_device_uuid)
+                    self.assertEqual(sample['gpuUsageBasis'], basis)
+                    self.assertEqual(sample['capExceeded'], breach == 'cap')
+                    self.assertEqual(sample['reserveBreached'], breach == 'reserve')
+                    self.assertEqual(sample['childGpuCapBytes'], policy.child_gpu_cap_bytes)
+                    self.assertEqual(sample['gpuFreeReserveBytes'], policy.gpu_free_reserve_bytes)
+                    self.assertEqual(sample['atNs'], 12345)
+                    self.assertGreaterEqual(sample['elapsedSeconds'], 0)
+                    key = 'ownedGpuBytes' if basis == 'owned-process-attributed' else 'globalUsedUpperBoundBytes'
+                    peak = 'sampledOwnedPeakBytes' if basis == 'owned-process-attributed' else 'sampledGlobalUpperBoundPeakBytes'
+                    self.assertEqual(sample[key], policy.child_gpu_cap_bytes + 1 if breach == 'cap' else 64)
+                    self.assertEqual(sample[peak], sample[key])
+                    other = 'globalUsedUpperBoundBytes' if key == 'ownedGpuBytes' else 'ownedGpuBytes'
+                    self.assertIsNone(sample[other])
+                    self.assertEqual(len(timeline.stopped), 1)
+                    path = self.root / f'failure-{basis}-{breach}.json'
+                    safety.write_unaccepted_record(path, kind='test', coordinate='single', error=error)
+                    saved = json.loads(path.read_text())
+                    self.assertFalse(saved['accepted'])
+                    self.assertEqual(saved['watchdogDeviceMemory'], sample)
+
     def test_role_order_independent_caps_and_estimates_are_preserved(self):
         timeline = Timeline()
         probes = [DeviceProbe(p, timeline, role, use=500 + role * 750) for role, p in enumerate(self.policies)]

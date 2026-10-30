@@ -67,6 +67,20 @@ pub(crate) fn begin_step(segment: usize, logical_step: u32) {
     let _ = (segment, logical_step);
 }
 
+/// Durable failure/budget boundary, called outside the measured step interval.
+/// A start without a commit conservatively consumes one attempted update.
+pub(crate) fn boundary(detail: &str) -> candle_core::Result<()> {
+    #[cfg(feature = "model-inference-proof")]
+    if active() {
+        use std::io::Write;
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "KREA_PROFILE_BOUNDARY {detail}").map_err(candle_core::Error::wrap)?;
+        stderr.flush().map_err(candle_core::Error::wrap)?;
+    }
+    let _ = detail;
+    Ok(())
+}
+
 /// Synchronized wall span, enabled ONLY on the first (excluded warmup) update
 /// of each segment. These are inclusive operation spans, not hardware counters
 /// or independent kernel time. Steady timings have no per-operation barriers.

@@ -418,6 +418,8 @@ class Collector(unittest.TestCase):
                 kwargs['event_path'].symlink_to(root / 'missing-observer-events')
             elif observer_events:
                 kwargs['event_path'].write_text('{"mock":true}\n', encoding="utf-8")
+            if isinstance(fail, safety.SupervisionError) and not discovery:
+                raise fail
             return safety.RunResult(42, 1 if fail and not discovery else 0, 1024, None,
                                     1000000000, None, 0.01, (), {'mode': 'mock'})
         @contextlib.contextmanager
@@ -535,6 +537,27 @@ class Collector(unittest.TestCase):
                 Path(temporary).resolve(), row_override=row)
             self.assertEqual(status, 0)
             self.assertEqual(calls, 2)
+
+    def test_device_memory_failure_sample_survives_collector(self):
+        error = safety.SupervisionError('device-memory', 'MOCK device predicate')
+        error.pid = 42
+        error.watchdog_device_memory = {
+            'cudaDeviceUuid': 'GPU-12345678-1234-1234-1234-123456789abc',
+            'gpuUsageBasis': 'global-used-upper-bound', 'globalUsedUpperBoundBytes': 1001,
+            'ownedGpuBytes': None, 'gpuFreeBytes': 4000, 'childGpuCapBytes': 1000,
+            'gpuFreeReserveBytes': 100, 'capExceeded': True, 'reserveBreached': False,
+            'sampledGlobalUpperBoundPeakBytes': 1001,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            status, receipt, verified, calls, output = self._mock_run(Path(temporary).resolve(), fail=error)
+            self.assertEqual(status, 1)
+            self.assertEqual(calls, 2)
+            self.assertEqual(receipt['completed'], 0)
+            self.assertFalse(receipt['accepted'])
+            self.assertFalse(verified['accepted_model_run'])
+            result = json.loads((output / '00000/result.json').read_text())
+            self.assertEqual(result['supervision_failure']['watchdog_device_memory'], error.watchdog_device_memory)
+            self.assertEqual(receipt['cases'][0]['supervision_failure'], result['supervision_failure'])
 
     def test_failed_child_keeps_failure_receipt_and_known_logs_not_acceptance(self):
         with tempfile.TemporaryDirectory() as temporary:

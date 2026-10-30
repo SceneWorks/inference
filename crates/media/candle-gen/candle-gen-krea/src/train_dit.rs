@@ -41,8 +41,9 @@
 //! the final segment via [`velocity_out`](KreaTrainDit::velocity_out).
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::candle_nn::ops::{sigmoid, softmax};
+use candle_gen::candle_nn::ops::sigmoid;
 use candle_gen::candle_nn::Module;
+use candle_gen::gen_core;
 use candle_gen::train::gradient_checkpoint::Segment;
 use candle_gen::train::lora::{LoraHost, LoraLinear};
 use candle_gen::train::projection::FrozenProjectionPack;
@@ -88,11 +89,10 @@ pub(crate) use candle_gen::attention::repeat_kv_bshd as repeat_kv;
 /// consumed by `sdpa_diff_budgeted`.
 pub const KREA_ATTN_CHUNK_BUDGET: usize = 128 * 1024 * 1024;
 
-/// Bidirectional, unmasked scaled-dot-product attention with a **composable** softmax (the inference
-/// `sdpa` uses the no-backward fused `softmax_last_dim`), with **query-row chunking bounded by
-/// `budget`** — the Krea control activation-peak lever (sc-11745). Delegates to the shared
-/// i32-overflow-safe [`candle_gen::sdpa_budgeted_bhsd`] with the grad-carrying composable
-/// `softmax(_, D::Minus1)`, so:
+/// Bidirectional, unmasked scaled-dot-product attention with differentiable standard softmax.
+/// The explicit Reference path owns its backward without retaining quadratic score tapes;
+/// the streaming candidate remains separately selected. Query-row chunking retains the
+/// existing `budget` (the Krea control activation-peak lever, sc-11745), so:
 /// - below `budget` it is a **single un-chunked pass** — the plain `q·kᵀ·scale → softmax → ·v` (the
 ///   ≤1024² default, [`candle_gen::ATTN_SCORES_BUDGET`] — that guard only ever engages past the i32
 ///   element limit);
@@ -110,15 +110,17 @@ pub(crate) fn sdpa_diff_budgeted(
     budget: usize,
 ) -> Result<Tensor> {
     candle_gen::train::profile::span("attention_forward", q.device(), || {
-        candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
+        candle_gen::fused_attention::training_sdpa_standard_bhsd(
             q,
             k,
             v,
             scale,
             None,
-            |s| softmax(s, D::Minus1),
-            budget,
+            gen_core::attention_budget::AttentionPlan::budgeted(
+                candle_gen::attention::attention_budget_from_usize(budget),
+            ),
         )
+        .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))
     })
 }
 

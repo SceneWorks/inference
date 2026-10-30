@@ -1568,6 +1568,15 @@ jobs:
           type "%RUNNER_TEMP%\training-attention-proof.log"
           findstr /c:"test result: ok. 1 passed; 0 failed; 0 ignored;" "%RUNNER_TEMP%\training-attention-proof.log" >nul
           if errorlevel 1 exit /b 1
+      - name: Prove dense Reference attention ownership and gradients
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked -p candle-gen --lib --features cuda reference_training_attention::tests::dense_reference_forward_backward_matches_composable -- --exact --ignored --nocapture > "%RUNNER_TEMP%\reference-attention-proof.log" 2>&1
+          if errorlevel 1 (type "%RUNNER_TEMP%\reference-attention-proof.log" & exit /b 1)
+          type "%RUNNER_TEMP%\reference-attention-proof.log"
+          findstr /c:"test result: ok. 1 passed; 0 failed; 0 ignored;" "%RUNNER_TEMP%\reference-attention-proof.log" >nul
+          if errorlevel 1 exit /b 1
       - name: Prove half precision adapter rounding raw CUDA arithmetic
         shell: cmd
         run: |

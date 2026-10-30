@@ -1,6 +1,8 @@
 //! Experimental, first-order differentiable streaming CUDA SDPA (sc-26856).
 //!
-//! The composable caller remains the default. This SIMT candidate avoids the
+//! Reference remains the default. Known standard-softmax callers can use the
+//! dense single-owner reference; arbitrary closures retain composable fallback.
+//! This SIMT candidate avoids the
 //! quadratic scores/backward buffers, but is not a tensor-core FlashAttention
 //! port and makes no speed claim. Select it only within a measured proof scope.
 //! Q/K/V and accumulations are f32 internally; the public output/gradients keep
@@ -13,7 +15,8 @@ use std::cell::Cell;
 /// Explicit candidate selection, scoped to the synchronous training thread.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TrainingAttentionMode {
-    /// Unchanged composable reference, including the caller's softmax semantics.
+    /// Dense reference, preserving the caller's softmax semantics (a single
+    /// autograd owner for the explicit standard-softmax API; composable otherwise).
     #[default]
     Reference,
     /// Native linear-memory forward/backward; requires numerical and timing proof.
