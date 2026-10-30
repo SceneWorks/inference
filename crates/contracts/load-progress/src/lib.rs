@@ -35,6 +35,7 @@ struct Request {
     observer: Option<Observer>,
     next: u64,
     active: u64,
+    activities: HashMap<u64, (u64, LoadActivity)>,
     files: HashMap<PathBuf, (String, u64)>,
     consumed: HashMap<(LoadActivityPhase, PathBuf), u64>,
 }
@@ -42,6 +43,7 @@ struct Request {
 #[derive(Clone, Default)]
 pub struct LoadActivityContext {
     request: Arc<Mutex<Request>>,
+    emission: Arc<Mutex<()>>,
     components: Arc<Vec<(PathBuf, String)>>,
 }
 thread_local! { static CONTEXT: RefCell<LoadActivityContext> = RefCell::default(); }
@@ -70,8 +72,26 @@ impl LoadActivityContext {
         roots.extend(components.into_iter().map(|(p, c)| (absolute(&p), c)));
         Self {
             request: self.request.clone(),
+            emission: self.emission.clone(),
             components: Arc::new(roots),
         }
+    }
+    /// Use a retained reader's source attribution and selected files with this request's callback.
+    /// Cached mappings can therefore serve a new request without routing events to an old job.
+    pub fn with_sources_from(&self, source: &Self) -> Self {
+        let context = self.with_components(source.components.iter().cloned());
+        if !Arc::ptr_eq(&self.request, &source.request) {
+            let files = source
+                .request
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .files
+                .iter()
+                .map(|(path, (_, bytes))| (path.clone(), *bytes))
+                .collect::<Vec<_>>();
+            context.register_files(files);
+        }
+        context
     }
     pub fn component(&self, path: &Path) -> String {
         let path = absolute(path);
@@ -138,6 +158,7 @@ impl LoadActivityContext {
             .retain(|(_, p), _| p != &path);
     }
     pub fn report(&self, activity: Option<LoadActivity>) {
+        let _emission = self.emission.lock().unwrap_or_else(|e| e.into_inner());
         let observer = self
             .request
             .lock()
@@ -199,6 +220,7 @@ impl LoadActivityObserver {
                 observer: Some(Arc::new(observe)),
                 ..Request::default()
             })),
+            emission: Arc::default(),
             components: Arc::default(),
         }
         .install()
@@ -219,6 +241,11 @@ struct FileState {
 }
 impl FileState {
     fn finish(&self) {
+        let _emission = self
+            .context
+            .emission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if self
             .state
             .lock()
@@ -228,20 +255,26 @@ impl FileState {
         {
             return;
         }
-        let observer = {
+        let (observer, activity) = {
             let mut r = self
                 .context
                 .request
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            r.activities.remove(&self.id);
             if r.active != self.id {
                 return;
             }
-            r.active = 0;
-            r.observer.clone()
+            let next = r
+                .activities
+                .iter()
+                .max_by_key(|(_, (order, _))| order)
+                .map(|(id, (_, activity))| (*id, activity.clone()));
+            r.active = next.as_ref().map(|(id, _)| *id).unwrap_or(0);
+            (r.observer.clone(), next.map(|(_, activity)| activity))
         };
         if let Some(observe) = observer {
-            observe(None);
+            observe(activity);
         }
     }
 }
@@ -269,6 +302,12 @@ impl LoadActivityFile {
         });
     }
     fn change(&self, change: impl FnOnce(&mut LoadActivity)) {
+        let _emission = self
+            .inner
+            .context
+            .emission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let activity = {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             let Some(activity) = state.as_mut() else {
@@ -309,6 +348,10 @@ impl LoadActivityFile {
                 activity.component_bytes_read = bytes;
                 activity.component_total_bytes = Some(total);
             }
+            r.next += 1;
+            let order = r.next;
+            r.activities
+                .insert(self.inner.id, (order, activity.clone()));
             r.observer.clone()
         };
         if let Some(observe) = observer {
@@ -359,6 +402,30 @@ mod tests {
         assert_eq!(events[1].as_ref().unwrap().bytes_read, 100);
         assert_eq!(events.last(), Some(&None));
     }
+    #[test]
+    fn ending_latest_parallel_read_restores_still_running_source() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let out = events.clone();
+        let _observer = LoadActivityObserver::new(move |v| out.lock().unwrap().push(v));
+        let a = LoadActivityScope::file(LoadActivityPhase::Loading, "a", Some(100));
+        a.update(27);
+        let b = LoadActivityScope::file(LoadActivityPhase::Loading, "b", Some(100));
+        b.finish();
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .bytes_read,
+            27
+        );
+        a.finish();
+        assert_eq!(events.lock().unwrap().last(), Some(&None));
+    }
+
     #[test]
     fn completed_older_read_cannot_clear_newer_activity() {
         let events = Arc::new(Mutex::new(Vec::new()));
