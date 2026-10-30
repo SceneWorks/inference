@@ -1227,6 +1227,33 @@ pub(crate) mod tests {
         model
             .prepare_training_positions(Some(&video_positions), Some(&audio_positions))
             .unwrap();
+        let geometry_entries = model.training_rope_entries();
+        assert!(geometry_entries > 0);
+        model
+            .prepare_training_positions(Some(&video_positions), Some(&audio_positions))
+            .unwrap();
+        assert_eq!(
+            model.training_rope_entries(),
+            geometry_entries,
+            "idempotent bucket preparation"
+        );
+        let preview_positions = video_positions.affine(1.0, 0.01).unwrap();
+        model
+            .forward(
+                &video,
+                &audio,
+                0.37,
+                &video_context,
+                &video_context,
+                &preview_positions,
+                &audio_positions,
+            )
+            .unwrap();
+        assert_eq!(
+            model.training_rope_entries(),
+            geometry_entries,
+            "preview grids must not accumulate in the dataset cache"
+        );
         let (video_velocity, audio_velocity) = model
             .forward(
                 &video,

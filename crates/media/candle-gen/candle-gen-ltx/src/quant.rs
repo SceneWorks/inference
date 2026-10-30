@@ -834,10 +834,17 @@ impl TrainingProjectionPacks {
     ) -> Result<Self> {
         use candle_gen::train::projection::FrozenProjectionPack as Pack;
         if self_attention {
-            let input = match gate {
-                Some(gate) => Pack::prepare_lora(&mut [q, k, v, gate])?,
-                None => Pack::prepare_lora(&mut [q, k, v])?,
-            };
+            if let Some(gate) = gate {
+                let input = Pack::prepare_lora(&mut [&mut *q, &mut *k, &mut *v, gate])?;
+                if input.is_some() {
+                    return Ok(Self {
+                        input,
+                        context: None,
+                    });
+                }
+            }
+            // A packed/incompatible gate does not disable an otherwise valid dense QKV pack.
+            let input = Pack::prepare_lora(&mut [q, k, v])?;
             Ok(Self {
                 input,
                 context: None,

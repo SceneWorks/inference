@@ -1252,7 +1252,7 @@ impl AvDiT {
             ),
         ] {
             if let Some(positions) = positions {
-                self.training_freqs(
+                let (cos, sin) = self.training_freqs(
                     positions,
                     dim,
                     self.cfg.video.rope_theta,
@@ -1260,9 +1260,34 @@ impl AvDiT {
                     heads,
                     &self.device,
                 )?;
+                if let Some(cache) = &self.training_rope {
+                    let mut cache = candle_gen::lock_recover(cache);
+                    if !cache.iter().any(|entry| {
+                        entry.positions.matches(positions)
+                            && entry.dim == dim
+                            && entry.heads == heads
+                            && entry.max_pos == max_pos
+                    }) {
+                        cache.push(TrainingRopeTable {
+                            positions: TensorIdentity::new(positions),
+                            dim,
+                            heads,
+                            max_pos,
+                            cos,
+                            sin,
+                        });
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn training_rope_entries(&self) -> usize {
+        self.training_rope
+            .as_ref()
+            .map_or(0, |cache| candle_gen::lock_recover(cache).len())
     }
 
     fn training_freqs(
@@ -1274,7 +1299,7 @@ impl AvDiT {
         heads: usize,
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
-        let mut cache = self.training_rope.as_ref().map(candle_gen::lock_recover);
+        let cache = self.training_rope.as_ref().map(candle_gen::lock_recover);
         if let Some(cache) = &cache {
             if let Some(entry) = cache.iter().find(|entry| {
                 entry.positions.matches(positions)
@@ -1291,16 +1316,8 @@ impl AvDiT {
             positions.clone()
         };
         let (cos, sin) = precompute_split_freqs_nd(&effective, dim, theta, max_pos, heads, device)?;
-        if let Some(cache) = &mut cache {
-            cache.push(TrainingRopeTable {
-                positions: TensorIdentity::new(positions),
-                dim,
-                heads,
-                max_pos: max_pos.to_vec(),
-                cos: cos.clone(),
-                sin: sin.clone(),
-            });
-        }
+        // Runtime misses (including periodic preview grids) are temporary. Only the
+        // explicit dataset preparation above may extend the run-owned cache.
         Ok((cos, sin))
     }
 
