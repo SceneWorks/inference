@@ -306,7 +306,8 @@ pub fn restore(
     {
         return Err(invalid("snapshot exceeds declared factor/state bound"));
     }
-    let bytes = std::fs::read(path).map_err(|e| invalid(format!("read snapshot: {e}")))?;
+    let bytes = mlx_gen::gen_core::load_activity::reader::read(path)
+        .map_err(|e| invalid(format!("read snapshot: {e}")))?;
     let (_, header) = safetensors::SafeTensors::read_metadata(&bytes)
         .map_err(|e| invalid(format!("snapshot header: {e}")))?;
     let metadata = header

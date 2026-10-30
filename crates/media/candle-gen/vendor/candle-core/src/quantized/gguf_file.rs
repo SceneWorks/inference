@@ -5,7 +5,9 @@
 use super::{GgmlDType, QTensor};
 use crate::{Context, Device, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use load_progress::reader::SourceProgress;
 use std::collections::HashMap;
+use std::io::Seek;
 
 pub const DEFAULT_ALIGNMENT: u64 = 32;
 
@@ -87,6 +89,7 @@ pub struct Content {
     pub metadata: HashMap<String, Value>,
     pub tensor_infos: HashMap<String, TensorInfo>,
     pub tensor_data_offset: u64,
+    progress: SourceProgress,
 }
 
 fn read_string<R: std::io::Read>(reader: &mut R, magic: &VersionedMagic) -> Result<String> {
@@ -394,6 +397,21 @@ impl ValueType {
 
 impl Content {
     pub fn read<R: std::io::Seek + std::io::Read>(reader: &mut R) -> Result<Self> {
+        Self::read_with_path(reader, "<unknown GGUF source>")
+    }
+
+    /// Parse a source with its file identity, retaining the originating request for lazy tensors.
+    pub fn read_with_path<R: std::io::Seek + std::io::Read>(
+        reader: &mut R,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
+        let position = reader.stream_position()?;
+        let total = reader.seek(std::io::SeekFrom::End(0))?;
+        reader.seek(std::io::SeekFrom::Start(position))?;
+        let progress = SourceProgress::new(path, Some(total));
+        let _operation = progress.operation();
+        let mut tracked = progress.reader(reader)?;
+        let reader = &mut tracked;
         let magic = VersionedMagic::read(reader)?;
 
         let tensor_count = match magic {
@@ -464,6 +482,7 @@ impl Content {
             metadata,
             tensor_infos,
             tensor_data_offset,
+            progress,
         })
     }
 
@@ -477,7 +496,9 @@ impl Content {
             Some(tensor_info) => tensor_info,
             None => crate::bail!("cannot find tensor info for {name}"),
         };
-        tensor_info.read(reader, self.tensor_data_offset, device)
+        let _operation = self.progress.operation();
+        let mut tracked = self.progress.reader(reader)?;
+        tensor_info.read(&mut tracked, self.tensor_data_offset, device)
     }
 }
 

@@ -95,14 +95,14 @@ impl MiniMaxH3 {
         // was read as the DiT's.
         on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::TextEncoder));
         let (context, text_tags) = if anchors.is_empty() {
-            let context = self.encode_prompt(&req.prompt, window, &req.cancel)?;
+            let context = self.encode_prompt(&req.prompt, window, &req.cancel, on_progress)?;
             let tags = vec![crate::denoise::TEXT_TAG; context.shape()[1] as usize];
             (context, tags)
         } else {
             let refs: Vec<&mlx_gen::media::Image> = fitted.iter().collect();
             in_fl2va_phase(
                 FL2VA_GROUNDED_QWEN3_VL_PHASE,
-                self.encode_prompt_grounded(&req.prompt, &refs, window, &req.cancel),
+                self.encode_prompt_grounded(&req.prompt, &refs, window, &req.cancel, on_progress),
             )?
         };
         if req.cancel.is_cancelled() {

@@ -338,13 +338,19 @@ impl Supra2Image {
         let per_image = cfg.latent_numel();
         check(&request.cancel)?;
 
-        let (cond, tokens) = self.encode_prompt(&request.prompt)?;
-        let (uncond, used_stored) = if r.use_cfg {
-            let (u, stored) = self.unconditional()?;
-            (Some(u), stored)
-        } else {
-            (None, false)
-        };
+        let (cond, tokens, uncond, used_stored) = candle_gen::gen_core::with_prompt_encoding(
+            progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let (cond, tokens) = self.encode_prompt(&request.prompt)?;
+                let (uncond, used_stored) = if r.use_cfg {
+                    let (u, stored) = self.unconditional()?;
+                    (Some(u), stored)
+                } else {
+                    (None, false)
+                };
+                Ok((cond, tokens, uncond, used_stored))
+            },
+        )?;
         check(&request.cancel)?;
 
         let z0: Vec<f32> = match noise {

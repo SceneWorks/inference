@@ -1,4 +1,41 @@
 use super::*;
+
+#[test]
+fn prompt_encoding_is_required_only_for_missing_active_embeddings() {
+    let values = vec![0.0; 4096];
+    let supplied = MossImageEmbeddings {
+        values: &values,
+        batch: 1,
+        sequence: 1,
+        mask: None,
+    };
+    for positive in [None, Some(supplied)] {
+        for negative in [None, Some(supplied)] {
+            let inputs = MossImageAdvancedInputs {
+                positive,
+                negative,
+                ..Default::default()
+            };
+            assert_eq!(
+                needs_prompt_encoding(inputs, MossImageAcceleration::Off, 1.0),
+                positive.is_none()
+            );
+            assert_eq!(
+                needs_prompt_encoding(inputs, MossImageAcceleration::Off, 2.0),
+                positive.is_none() || negative.is_none()
+            );
+            assert_eq!(
+                needs_prompt_encoding(
+                    inputs,
+                    MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16),
+                    2.0
+                ),
+                positive.is_none()
+            );
+        }
+    }
+}
+
 use crate::transformer::{Geometry, Transformer};
 use candle_gen::{
     candle_core::{DType, Tensor},

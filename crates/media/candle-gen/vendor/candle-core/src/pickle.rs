@@ -672,7 +672,20 @@ pub fn read_pth_tensor_info<P: AsRef<std::path::Path>>(
     verbose: bool,
     key: Option<&str>,
 ) -> Result<Vec<TensorInfo>> {
-    let file = std::fs::File::open(file)?;
+    let path = file.as_ref();
+    let total = std::fs::metadata(path)?.len();
+    let progress = load_progress::reader::SourceProgress::new(path, Some(total));
+    read_pth_tensor_info_with_progress(path, verbose, key, &progress)
+}
+
+fn read_pth_tensor_info_with_progress(
+    path: &std::path::Path,
+    verbose: bool,
+    key: Option<&str>,
+    progress: &load_progress::reader::SourceProgress,
+) -> Result<Vec<TensorInfo>> {
+    let _operation = progress.operation();
+    let file = progress.reader(std::fs::File::open(path)?)?;
     let zip_reader = std::io::BufReader::new(file);
     let mut zip = zip::ZipArchive::new(zip_reader)?;
     let zip_file_names = zip
@@ -743,19 +756,27 @@ pub fn read_pth_tensor_info<P: AsRef<std::path::Path>>(
 pub struct PthTensors {
     tensor_infos: HashMap<String, TensorInfo>,
     path: std::path::PathBuf,
+    progress: load_progress::reader::SourceProgress,
     // We do not store a zip reader as it needs mutable access to extract data. Instead we
     // re-create a zip reader for each tensor.
 }
 
 impl PthTensors {
     pub fn new<P: AsRef<std::path::Path>>(path: P, key: Option<&str>) -> Result<Self> {
-        let tensor_infos = read_pth_tensor_info(path.as_ref(), false, key)?;
+        let total = std::fs::metadata(path.as_ref())?.len();
+        let progress = load_progress::reader::SourceProgress::new(path.as_ref(), Some(total));
+        let tensor_infos =
+            read_pth_tensor_info_with_progress(path.as_ref(), false, key, &progress)?;
         let tensor_infos = tensor_infos
             .into_iter()
             .map(|ti| (ti.name.to_string(), ti))
             .collect();
         let path = path.as_ref().to_owned();
-        Ok(Self { tensor_infos, path })
+        Ok(Self {
+            tensor_infos,
+            path,
+            progress,
+        })
     }
 
     pub fn tensor_infos(&self) -> &HashMap<String, TensorInfo> {
@@ -769,7 +790,9 @@ impl PthTensors {
             Some(tensor_info) => tensor_info,
         };
         // We hope that the file has not changed since first reading it.
-        let zip_reader = std::io::BufReader::new(std::fs::File::open(&self.path)?);
+        let _operation = self.progress.operation();
+        let zip_reader =
+            std::io::BufReader::new(self.progress.reader(std::fs::File::open(&self.path)?)?);
         let mut zip = zip::ZipArchive::new(zip_reader)?;
         let mut reader = zip.by_name(&tensor_info.path)?;
         let is_fortran_contiguous = tensor_info.layout.is_fortran_contiguous();

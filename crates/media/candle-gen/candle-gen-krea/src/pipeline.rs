@@ -573,7 +573,6 @@ pub(crate) fn load_text_quantized_for_request(
     quant: gen_core::Quant,
 ) -> Result<KreaText> {
     candle_gen::check_cancel(cancel)?;
-    let _activity = gen_core::LoadActivityScope::enter(gen_core::LoadActivity::TextEncoder);
     let vision_encoder_source = resolve_vision_encoder_source(root)?;
     let tok = crate::tokenizer::KreaTokenizer::from_validated_source(source, device)?;
     let te_cfg = KreaTeConfig::qwen3_vl_4b();
@@ -608,7 +607,6 @@ fn load_text_cancelable(
     if let Some(cancel) = cancel {
         candle_gen::check_cancel(cancel)?;
     }
-    let _activity = gen_core::LoadActivityScope::enter(gen_core::LoadActivity::TextEncoder);
     let vision_encoder_source = resolve_vision_encoder_source(root)?;
     let tok = crate::tokenizer::KreaTokenizer::from_validated_source(source, device)?;
 
@@ -656,7 +654,6 @@ fn load_heavy_cancelable(
     use_pid: bool,
     cancel: Option<&gen_core::CancelFlag>,
 ) -> Result<KreaHeavy> {
-    let _activity = gen_core::LoadActivityScope::enter(gen_core::LoadActivity::Renderer);
     let dit = load_dit_cancelable(root, device, adapters, false, cancel)?;
     check_optional_cancel(cancel)?;
     let vae = load_vae(root, device)?;
@@ -785,7 +782,6 @@ pub(crate) fn load_heavy_convrot(
     device: &Device,
     adapters: &[AdapterSpec],
 ) -> Result<KreaHeavy> {
-    let _activity = gen_core::LoadActivityScope::enter(gen_core::LoadActivity::Renderer);
     // The floor probe needs a cuBLASLt handle to read the device's compute capability — so it KEEPS it
     // and hands it to the DiT weight set as the trunk's one shared handle (sc-12301 scope 5), instead of
     // building 32 MiB of workspace, reading two integers off it, and dropping it.
@@ -918,7 +914,6 @@ pub(crate) fn load_heavy_native_with(
     stream_blocks: bool,
     facts: &gen_core::CheckpointFactsSink,
 ) -> Result<KreaHeavy> {
-    let _activity = gen_core::LoadActivityScope::enter(gen_core::LoadActivity::Renderer);
     let dit = load_native_dit(
         root,
         native_dit,
@@ -1198,7 +1193,9 @@ pub fn render(
 ) -> Result<Vec<Image>> {
     // Condition encoding (seed-independent): the 12 selected Qwen3-VL hidden layers, stacked +
     // prefix-dropped → the DiT's text_fusion context [1, n_tok, 12, 2560]. CFG-free, B=1.
-    let context = encode_prompt_context(&comps.text, req)?;
+    let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+        encode_prompt_context(&comps.text, req)
+    })?;
     render_from_context(&comps.heavy, req, device, &context, on_progress)
 }
 
@@ -1248,7 +1245,9 @@ pub(crate) fn render_three_stage_with_native(
     } else {
         load_text_cancelable(root, text_encoder_source, device, Some(&req.cancel))?
     };
-    let context = encode_prompt_context(&text, req)?;
+    let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+        encode_prompt_context(&text, req)
+    })?;
     device.synchronize()?;
     drop(text);
 
@@ -1432,8 +1431,14 @@ pub fn render_tap_reweight(
     weights: &[f32],
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
-    let context = encode_prompt_context(&comps.text, req)?;
-    let context = apply_tap_weights(&context, weights)?;
+    let (_base_context, context) = candle_gen::gen_core::with_prompt_encoding(
+        on_progress,
+        || -> std::result::Result<_, candle_gen::CandleError> {
+            let base_context = encode_prompt_context(&comps.text, req)?;
+            let context = apply_tap_weights(&base_context, weights)?;
+            Ok((base_context, context))
+        },
+    )?;
     render_from_context(&comps.heavy, req, device, &context, on_progress)
 }
 
@@ -1493,7 +1498,6 @@ pub(crate) fn maybe_apply_style_gain(context: Tensor, gain: Option<f32>) -> Resu
 /// seam every txt2img / img2img entry point shares (sc-11878). The negative (CFG-uncond) context is
 /// encoded without the gain, so the knob steers only the conditional prediction (matching the spike).
 fn encode_prompt_context(text: &KreaText, req: &GenerationRequest) -> Result<Tensor> {
-    let _activity = gen_core::LoadActivityScope::enter(gen_core::LoadActivity::EncodingPrompt);
     let context = text
         .te
         .forward(&text.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
@@ -1620,7 +1624,9 @@ pub fn render_img2img(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     // Condition encoding (seed-independent), identical to `render`: img2img changes only the init latent.
-    let context = encode_prompt_context(&comps.text, req)?;
+    let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+        encode_prompt_context(&comps.text, req)
+    })?;
     render_img2img_from_context(
         &comps.heavy,
         vae_encoder,
@@ -1744,7 +1750,13 @@ pub fn render_base(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
-    let (context, neg_context) = encode_base_contexts(&comps.text, req, guidance)?;
+    let (context, neg_context) = candle_gen::gen_core::with_prompt_encoding(
+        on_progress,
+        || -> std::result::Result<_, candle_gen::CandleError> {
+            let (context, neg_context) = encode_base_contexts(&comps.text, req, guidance)?;
+            Ok((context, neg_context))
+        },
+    )?;
     render_base_from_contexts(
         &comps.heavy,
         req,
@@ -2245,7 +2257,13 @@ pub fn render_base_img2img(
     // The conditional + unconditional condition encoding (seed-independent), identical to `render_base`
     // (the shared `encode_base_contexts` seam): img2img changes only the init latent + schedule start,
     // not the conditioning.
-    let (context, neg_context) = encode_base_contexts(&comps.text, req, guidance)?;
+    let (context, neg_context) = candle_gen::gen_core::with_prompt_encoding(
+        on_progress,
+        || -> std::result::Result<_, candle_gen::CandleError> {
+            let (context, neg_context) = encode_base_contexts(&comps.text, req, guidance)?;
+            Ok((context, neg_context))
+        },
+    )?;
     render_base_img2img_from_contexts(
         &comps.heavy,
         vae_encoder,
@@ -2418,7 +2436,9 @@ pub fn render_edit(
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
-    let encoded = encode_edit_context(&comps.text, req, references, distilled, device)?;
+    let encoded = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+        encode_edit_context(&comps.text, req, references, distilled, device)
+    })?;
     render_edit_from_context(
         &comps.heavy,
         &edit.vae_encoder,
@@ -2985,15 +3005,18 @@ mod tests {
             &gen_core::CheckpointFactsSink::new(),
         )
         .is_err());
+        let activities = candle_gen::lock_recover(&activities);
+        assert!(
+            activities
+                .iter()
+                .flatten()
+                .all(|event| event.phase != gen_core::LoadActivityPhase::Verifying),
+            "cached metadata checks and malformed component loads must not claim hashing"
+        );
         assert_eq!(
-            *candle_gen::lock_recover(&activities),
-            [
-                Some(gen_core::LoadActivity::TextEncoder),
-                None,
-                Some(gen_core::LoadActivity::Renderer),
-                None,
-            ],
-            "metadata checks and component errors must not claim to hash model files"
+            activities.last(),
+            Some(&None),
+            "failed read ends its shared I/O phase"
         );
     }
 

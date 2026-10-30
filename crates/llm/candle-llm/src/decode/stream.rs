@@ -144,6 +144,7 @@ pub fn generate_with(
 
     // Prefill the whole prompt at offset 0; logits are for the last prompt position.
     let prompt = input_ids(prompt_ids, device)?;
+    core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
     let logits = decoder.step(&prompt, cache.as_mut(), 0)?;
 
     decode_loop(
@@ -192,6 +193,7 @@ pub fn generate_with_cache(
     let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
     let device = decoder.device();
     let suffix = input_ids(&prompt_ids[offset..], device)?;
+    core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
     let logits = decoder.step(&suffix, cache, offset as i32)?;
 
     decode_loop(
@@ -333,6 +335,8 @@ fn decode_loop_with_stop(
         if let Some(c) = &mut constraint {
             c.accept(next);
         }
+
+        core_llm::report_generation_phase(core_llm::GenerationPhase::Generating);
 
         on_event(StreamEvent::Token { id: next, step });
         generated.push(next);

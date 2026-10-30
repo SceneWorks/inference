@@ -10,6 +10,7 @@ keywords = ["candle", "cuda", "llm", "inference", "serving"]
 categories = ["science"]
 
 [dependencies]
+sceneworks-load-progress = { workspace = true }
 # The Candle tensor backend. Pinned to the SAME git rev the `candle-gen` sibling family pins
 # (huggingface/candle post-0.10.2) so the whole on-device stack resolves ONE candle build — and
 # because that rev clears `CUDA_ERROR_INVALID_PTX` on Blackwell (sm_120). CPU by default; the

@@ -234,6 +234,25 @@ graph-captured models many times accumulates up to that allowance per load; rest
 worker process is what reclaims it. Upstream eviction (or a clear API) would let the provider free
 a load's entries at unload — revisit when the candle pin is next bumped.
 
+## Shared model-file progress (sc-27980)
+
+`sceneworks-load-progress` is a tensor-neutral path dependency shared with gen-core. The
+safetensors buffered reader reports actual read bytes; mmap creation reports no payload bytes.
+Header parsing and shared tensor materialization report the unique logical source ranges they
+consume, including views returned through `MmapedFile`. Raw byte decoders and descriptor parsers
+use the shared `read_tensor_bytes` / `read_source_byte_sets` adapters; `QStorage::from_data`
+observes borrowed mapped packed operands before device upload or host copying. These are source-byte observations,
+not measurements of OS disk traffic or page faults. Shared checksums use `with_source_bytes` so
+only the synchronous hashing interval reports verification. Repeated views cannot inflate a
+file's consumed extent. Explicit selected shard lists supply component totals; readers do not
+scan unselected sibling checkpoints.
+
+Retained mmap sources preserve slot attribution and file inventories, while evaluation uses
+the current request's observer and a process-unique request ID. A worker thread without an
+installed observer retains the source's original captured context. No process-global latest-job
+callback is used. Shared GGUF/GGML, pickle/PTH and NumPy readers use the same neutral read/seek
+instrumentation; retain these patches and the dependency when re-vendoring.
+
 ## Consumers
 
 **A `[patch]` only takes effect in the top-level workspace.** Any consumer that builds these
@@ -258,7 +277,9 @@ candle-core = { git = "https://github.com/SceneWorks/inference", rev = "<the pin
    the new revision skips untracked operands itself, and the pickle storage-size check
    (`src/pickle.rs`, sc-27456) unless the new revision bounds the read itself — only then can this
    vendor and its `[patch]` be dropped.
-3. Re-derive `Cargo.toml` from the new upstream workspace manifest as described above.
-4. Move every pin (`Cargo.toml`, `scripts/check-workspace.py` `PINNED_WORKSPACE_DEPENDENCIES` and
+3. Re-apply the shared model-file progress patch above (including request capture and exact
+   source-byte tests). Do not replace mmap range consumption with mapped address-space size.
+4. Re-derive `Cargo.toml` from the new upstream workspace manifest as described above.
+5. Move every pin (`Cargo.toml`, `scripts/check-workspace.py` `PINNED_WORKSPACE_DEPENDENCIES` and
    `VENDORED_PACKAGES`), re-vendor `candle-kernels` and `candle-metal-kernels` (their own
    `VENDORED.md`), regenerate the lock, and run the CUDA lane (`gh workflow run ci.yml -f lanes=windows-cuda`).

@@ -258,9 +258,11 @@ impl IpAdapterFlux {
         // Conditioning: text (T5 seq + CLIP pooled) and the reference image tokens (computed once).
         self.backbone
             .validate_native_vae_request(false, &req.cancel)?;
-        let (t5_emb, clip_emb) = self
-            .backbone
-            .encode_text_with_memory(&req.prompt, &req.cancel)?;
+        let (t5_emb, clip_emb) = self.backbone.encode_text_with_memory_and_progress(
+            &req.prompt,
+            &req.cancel,
+            on_progress,
+        )?;
         candle_gen::check_cancel(&req.cancel)?;
         let embeds = self
             .ip_encoder

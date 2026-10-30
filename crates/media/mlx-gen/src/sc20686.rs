@@ -722,11 +722,14 @@ pub fn observe_progress(progress: &Progress) {
         // and mapping it to `load` left the generation-start `encode` window empty -- an allocator
         // sample with a zero peak, which the adapter (rightly) refuses as missing evidence -- while
         // the text encode was misattributed to `load`. The render bundle's load stays `load`.
-        Progress::Loading(LoadPhase::TextEncoder) => enter_phase(state, "encode"),
+        Progress::Loading(LoadPhase::TextEncoder | LoadPhase::EncodingPrompt) => {
+            enter_phase(state, "encode")
+        }
         Progress::Loading(LoadPhase::Renderer) => enter_phase(state, "load"),
         // The optional prompt-upsampling stage (sc-26238) precedes the encode and rewrites the
         // prompt; it is part of the conditioning window, not a phase of its own here.
         Progress::PromptUpsamplingComplete
+        | Progress::PromptEncodingComplete
         | Progress::ConditioningComplete
         | Progress::Upsampling { .. } => {}
     });

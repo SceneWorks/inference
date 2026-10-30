@@ -463,7 +463,7 @@ impl Ltx {
         }
         let conditioning =
             finish_calibration_phase(req, mlx_gen::gen_core::MemoryPhase::Conditioning, || {
-                self.stage_text_phase(req)
+                self.stage_text_phase(req, on_progress)
             })?;
         // The TE is dropped; free the allocator cache so the DiT loads into the low-water footprint.
         mlx_rs::memory::clear_cache();

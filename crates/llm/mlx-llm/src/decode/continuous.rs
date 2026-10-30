@@ -546,6 +546,10 @@ pub fn generate_continuous_kv(
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(usize, StreamEvent),
 ) -> Result<Vec<ContinuousOutput>> {
+    // Every terminal path (including cancellation outside record_token) retires its observer
+    // before forwarding Done. The batch guard still clears all lanes on an engine error.
+    let mut emit = |index, event| emit_lane_event(index, event, on_event);
+    let on_event: &mut dyn FnMut(usize, StreamEvent) = &mut emit;
     if requests.is_empty() {
         return Err(Error::Msg("generate_continuous: no requests".into()));
     }
@@ -808,6 +812,7 @@ fn admit_lane(
     let reused = run.reuse_prefix(&mut selection, &r.prompt_ids)?;
     run.reused[ri] = reused;
     run.reserve_prefill(&selection, r.prompt_ids.len())?;
+    core_llm::report_generation_phase_for(ri, Some(core_llm::GenerationPhase::Prefilling));
     // batch-1 prefill of the positions no stored prefix covers
     let logits = model.decode_logits(
         &input_ids(&r.prompt_ids[reused..]),
@@ -844,6 +849,15 @@ fn retire_lane(run: &mut KvRun<'_>, mut lane: Lane) -> Result<()> {
     run.reports[lane.req_index] = Some(lane.selection.report()?);
     drop(lane);
     run.trim()
+}
+
+/// The shared terminal boundary for active, queued, and cancelled lanes. Clear before the
+/// callback or fallible cache retirement, while other requests keep their current phase.
+fn emit_lane_event(index: usize, event: StreamEvent, on_event: &mut dyn FnMut(usize, StreamEvent)) {
+    if matches!(event, StreamEvent::Done { .. }) {
+        core_llm::report_generation_phase_for(index, None);
+    }
+    on_event(index, event);
 }
 
 /// One decode step's logits, one `[1, vocab]` per live lane (in lane order). `Exact` builds each
@@ -895,6 +909,10 @@ fn record_token(
     tok: i32,
     on_event: &mut dyn FnMut(usize, StreamEvent),
 ) -> LaneStep {
+    core_llm::report_generation_phase_for(
+        lane.req_index,
+        Some(core_llm::GenerationPhase::Generating),
+    );
     record_lane_token(
         sched,
         lane.seq,
@@ -904,6 +922,89 @@ fn record_token(
         &mut lane.next_token,
         on_event,
     )
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::{emit_lane_event, FinishReason, StreamEvent};
+    use core_llm::{
+        install_generation_batch_progress, report_generation_phase_for, GenerationPhase,
+        GenerationProgressObserver,
+    };
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn terminal_lane_clears_before_done_while_other_lane_keeps_generating() {
+        for reason in [
+            FinishReason::Cancelled,
+            FinishReason::StopToken,
+            FinishReason::MaxTokens,
+        ] {
+            let phases = Arc::new(Mutex::new([Vec::new(), Vec::new()]));
+            let observers = (0..2).map(|index| {
+                let phases = phases.clone();
+                Some(GenerationProgressObserver::new(move |phase| {
+                    phases.lock().unwrap()[index].push(phase);
+                }))
+            });
+            let mut wire = Vec::new();
+            let failed = || -> Result<(), ()> {
+                let _batch = install_generation_batch_progress(observers);
+                for index in 0..2 {
+                    report_generation_phase_for(index, Some(GenerationPhase::Generating));
+                }
+                let mut sink = |index, event| {
+                    if matches!(event, StreamEvent::Done { .. }) {
+                        let phases = phases.lock().unwrap().clone();
+                        assert_eq!(phases[0].last(), Some(&None));
+                        assert_eq!(phases[1], [Some(GenerationPhase::Generating)]);
+                    }
+                    wire.push((index, event));
+                };
+                emit_lane_event(0, StreamEvent::Token { id: 7, step: 0 }, &mut sink);
+                let observed = phases.lock().unwrap().clone();
+                assert_eq!(
+                    observed[0],
+                    [Some(GenerationPhase::Generating)],
+                    "a token does not retire its lane"
+                );
+                emit_lane_event(
+                    0,
+                    StreamEvent::Done {
+                        reason,
+                        generated: 1,
+                    },
+                    &mut sink,
+                );
+                emit_lane_event(1, StreamEvent::Token { id: 8, step: 1 }, &mut sink);
+                let observed = phases.lock().unwrap().clone();
+                assert_eq!(
+                    observed[0],
+                    [Some(GenerationPhase::Generating), None],
+                    "the first lane clears while the second still runs"
+                );
+                // A subsequent cache/engine error must still clear the remaining lane.
+                Err(())
+            };
+            assert!(failed().is_err());
+            assert_eq!(
+                wire,
+                [
+                    (0, StreamEvent::Token { id: 7, step: 0 }),
+                    (
+                        0,
+                        StreamEvent::Done {
+                            reason,
+                            generated: 1
+                        }
+                    ),
+                    (1, StreamEvent::Token { id: 8, step: 1 }),
+                ],
+                "terminal cleanup preserves the token/done wire events"
+            );
+            assert_eq!(phases.lock().unwrap()[1].last(), Some(&None));
+        }
+    }
 }
 
 /// sc-20681 on a synthetic two-layer GQA model (hidden 128, 4 query / 2 KV heads, head dim 64).

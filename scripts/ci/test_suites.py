@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile the selected Cargo test targets, then run a bounded libtest suite.
 
-Routine CI executes every default test except exact, reviewed exhaustive cases in
+Separately dispatched routine validation executes every default test except exact, reviewed exhaustive cases in
 test_suites.json. Explicit exhaustive validation executes every registered case,
 using `--ignored --exact` only for registered bodies already ignored by the ordinary CI policy.
 Suite partitioning preserves Rust test bodies, ignore attributes, compilation
@@ -20,9 +20,11 @@ import signal
 import subprocess
 import sys
 import time
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = Path(__file__).with_suffix(".json")
+SAFE_MANIFEST = Path(__file__).with_name("safe_controls.json")
 LISTING = re.compile(r"^(.+): test$", re.MULTILINE)
 SUMMARY = re.compile(
     r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;.*? (\d+) filtered out;"
@@ -182,6 +184,118 @@ def require_windows_gpu1_before_model_case() -> None:
         raise ValueError("physical GPU1 identity/free memory changed before exhaustive model execution")
 
 
+def safe_controls(path: Path = SAFE_MANIFEST) -> list[dict]:
+    """A small closed execution set, not a classification of every backend test."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("version") != 1 or not data.get("controls"):
+        raise ValueError("empty or unsupported safe-control table")
+    seen = set()
+    for control in data["controls"]:
+        key = tuple(control.get(field) for field in ("package", "kind", "target", "test"))
+        source = ROOT / control["source"]
+        if (key in seen or control["kind"] not in ("lib", "test")
+                or control.get("protocol") != "libtest" or not control["test"]
+                or not control.get("platforms") or set(control["platforms"]) - {"darwin", "linux", "win32"}
+                or not isinstance(control.get("features", []), list)
+                or any(not isinstance(feature, str) or not feature for feature in control.get("features", []))
+                or len(control.get("reason", "")) < 30 or not source.is_file()
+                or not re.search(r"\bfn\s+" + re.escape(control["test"].split("::")[-1]) + r"\s*\(", source.read_text(encoding="utf-8"))):
+            raise ValueError(f"invalid/stale safe control: {key}")
+        seen.add(key)
+    return data["controls"]
+
+
+def libtest_target(package: dict, artifact: dict) -> dict:
+    """Check Cargo metadata and manifest before listing an approved executable.
+
+    Cargo's JSON does not expose `harness = false`. Never probe an unknown
+    executable with --list: custom harnesses may do real work for that argument.
+    """
+    target = artifact["target"]
+    matches = [entry for entry in package["targets"]
+               if entry["name"] == target["name"] and entry["kind"] == target["kind"]
+               and entry["src_path"] == target["src_path"] and entry.get("test", True)]
+    if len(matches) != 1:
+        raise ValueError("approved target is not bound to exact Cargo metadata")
+    manifest = tomllib.loads(Path(package["manifest_path"]).read_text(encoding="utf-8"))
+    library = "lib" in target["kind"] or "rlib" in target["kind"]
+    declarations = [manifest.get("lib", {})] if library else [
+        entry for entry in manifest.get("test", []) if entry.get("name") == target["name"]]
+    if any(entry.get("harness", True) is not True for entry in declarations):
+        raise ValueError("approved target does not use the libtest protocol")
+    return matches[0]
+
+
+def execute_safe(command: list[str], controls: list[dict], deadline_seconds: int) -> None:
+    if command[:1] != ["cargo"] or "test" not in command or "--" in command or "--no-run" in command:
+        raise ValueError("expected unfiltered cargo test build arguments")
+    boundary = command.index("test")
+    if command[:boundary] != ["cargo"] and not (boundary == 3 and command[1] == "--config"):
+        raise ValueError("unsupported Cargo prefix before test compilation")
+    metadata_command = command[:boundary] + ["metadata", "--locked", "--no-deps", "--format-version=1"]
+    if "--manifest-path" in command:
+        at = command.index("--manifest-path")
+        metadata_command += command[at:at + 2]
+    deadline = time.monotonic() + deadline_seconds
+    remaining = lambda limit: min(limit, deadline - time.monotonic())
+    metadata = json.loads(run(metadata_command, remaining(120)))
+    by_id = {package["id"]: package for package in metadata["packages"]}
+    packages = {identity: package["name"] for identity, package in by_id.items()}
+    output = run(command + ["--no-run", "--message-format=json"], remaining(2400))
+    built = artifacts(output)
+    built_keys = {target_key(artifact, packages) for artifact in built}
+    built_packages = {key[0] for key in built_keys}
+    package_features = {}
+    for artifact in built:
+        package_features.setdefault(packages[artifact["package_id"]], set()).update(artifact.get("features", []))
+    named = {command[i + 1] for i, arg in enumerate(command[:-1]) if arg == "--test"}
+    expected = {}
+    for control in controls:
+        if sys.platform not in control["platforms"]:
+            continue
+        if not set(control.get("features", [])) <= package_features.get(control["package"], set()):
+            continue
+        if control["kind"] == "test" and ("--lib" in command and "--tests" not in command or named and control["target"] not in named):
+            continue
+        if control["kind"] == "lib" and named and "--lib" not in command:
+            continue
+        key = tuple(control[field] for field in ("package", "kind", "target"))
+        if control["package"] in built_packages:
+            expected.setdefault(key, []).append(control)
+    if set(expected) - built_keys:
+        raise ValueError(f"safe-control targets absent from selected Cargo graph: {set(expected) - built_keys}")
+    rust_lib = run(["rustc", "--print", "target-libdir"], remaining(60))
+    executed = compiled_only = 0
+    for artifact in built:
+        key = target_key(artifact, packages)
+        entries = expected.get(key, [])
+        if not entries:
+            compiled_only += 1
+            print(f"COMPILE ONLY (no approved execution protocol/controls): {key}", flush=True)
+            continue
+        package = by_id[artifact["package_id"]]
+        libtest_target(package, artifact)
+        for entry in entries:
+            if not (ROOT / entry["source"]).resolve().is_relative_to(Path(package["manifest_path"]).resolve().parent):
+                raise ValueError(f"safe-control source belongs to another package: {entry}")
+        context = {"cwd": str(Path(package["manifest_path"]).parent),
+                   "env": test_environment(metadata, package, artifact, output, rust_lib)}
+        binary = artifact["executable"]
+        names = listed(run([binary, "--list", "--format=terse"], remaining(60), **context))
+        ignored = listed(run([binary, "--ignored", "--list", "--format=terse"], remaining(60), **context))
+        selected = {entry["test"] for entry in entries}
+        if not selected or selected - names or selected & ignored or not ignored <= names:
+            raise ValueError(f"safe controls missing, ignored, or empty: {key}: {selected - names}, {selected & ignored}")
+        for name in sorted(selected):
+            result = run([binary, "--exact", name, "--test-threads=1"], remaining(120), **context)
+            print(result, flush=True)
+            verify_result(result, 1, 0)
+            if int(SUMMARY.findall(result)[-1][3]) != len(names) - 1:
+                raise ValueError("safe-control libtest filtered count differs from exact listing")
+            executed += 1
+    print(f"audited-safe: {executed} exact controls passed; {compiled_only} targets compiled only (not passes)", flush=True)
+
+
 def execute(mode: str, command: list[str], cases: list[dict], deadline_seconds: int) -> None:
     if command[:2] != ["cargo", "test"] or "--" in command or "--no-run" in command:
         raise ValueError("expected cargo test build arguments without libtest filters")
@@ -284,16 +398,19 @@ def execute(mode: str, command: list[str], cases: list[dict], deadline_seconds: 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("routine", "exhaustive", "check"))
+    parser.add_argument("mode", choices=("audited-safe", "routine", "exhaustive", "check"))
     parser.add_argument("--deadline-seconds", type=int)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     cases = registry()
     if args.mode == "check":
-        print(f"{len(cases)} reviewed exhaustive test identities")
+        print(f"{len(cases)} reviewed exhaustive identities; {len(safe_controls())} exact safe controls")
         return 0
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    execute(args.mode, command, cases, args.deadline_seconds or (7200 if args.mode == "exhaustive" else 2700))
+    if args.mode == "audited-safe":
+        execute_safe(command, safe_controls(), args.deadline_seconds or 2700)
+    else:
+        execute(args.mode, command, cases, args.deadline_seconds or (7200 if args.mode == "exhaustive" else 2700))
     return 0
 
 

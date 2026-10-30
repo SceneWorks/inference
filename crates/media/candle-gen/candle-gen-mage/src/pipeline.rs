@@ -166,7 +166,9 @@ impl MagePipeline {
         cancel: &candle_gen::gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> Result<candle_gen::gen_core::Image> {
-        let encoded = Self::encode_prompt(&self.text, prompt, negative_prompt, guidance)?;
+        let encoded = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+            Self::encode_prompt(&self.text, prompt, negative_prompt, guidance)
+        })?;
         Self::sample(
             &self.transformer,
             &self.vae,

@@ -350,42 +350,78 @@ impl T3 {
         progress: &mut dyn FnMut(usize),
         cancel: &dyn Fn() -> bool,
     ) -> CandleResult<Option<Vec<u32>>> {
+        self.inference_with_prompt_progress(
+            cond,
+            text_tokens,
+            cfg_weight,
+            temperature,
+            top_p,
+            min_p,
+            repetition_penalty,
+            max_new_tokens,
+            rng,
+            progress,
+            cancel,
+            &mut |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn inference_with_prompt_progress(
+        &mut self,
+        cond: &T3Cond,
+        text_tokens: &[u32],
+        cfg_weight: f32,
+        temperature: f32,
+        top_p: f32,
+        min_p: f32,
+        repetition_penalty: f32,
+        max_new_tokens: usize,
+        rng: &mut StdRng,
+        progress: &mut dyn FnMut(usize),
+        cancel: &dyn Fn() -> bool,
+        on_prompt_progress: &mut dyn FnMut(candle_audio::gen_core::Progress),
+    ) -> CandleResult<Option<Vec<u32>>> {
         self.reset_cache();
         let use_cfg = cfg_weight > 0.0;
         let batch = if use_cfg { 2 } else { 1 };
 
-        // Conditioning prefix (shared across the CFG batch).
-        let cond_emb = self.prepare_conditioning(cond)?; // [1, len_cond, dim]
+        let mut inputs = candle_audio::gen_core::with_prompt_encoding(on_prompt_progress, || {
+            // Conditioning prefix (shared across the CFG batch).
+            let cond_emb = self.prepare_conditioning(cond)?; // [1, len_cond, dim]
 
-        // Text embeddings + learned positions. For CFG the uncond row zeroes the text embeddings.
-        let text_ids =
-            Tensor::from_vec(text_tokens.to_vec(), (1, text_tokens.len()), &self.device)?;
-        let mut text_emb = __model_proof_output!(self.text_emb.forward(&text_ids))?; // [1, T, dim]
-        let text_pos = self
-            .text_pos_emb
-            .narrow(0, 0, text_tokens.len())?
-            .unsqueeze(0)?;
-        text_emb = text_emb.broadcast_add(&text_pos)?;
+            // Text embeddings + learned positions. For CFG the uncond row zeroes the text embeddings.
+            let text_ids =
+                Tensor::from_vec(text_tokens.to_vec(), (1, text_tokens.len()), &self.device)?;
+            let mut text_emb = __model_proof_output!(self.text_emb.forward(&text_ids))?; // [1, T, dim]
+            let text_pos = self
+                .text_pos_emb
+                .narrow(0, 0, text_tokens.len())?
+                .unsqueeze(0)?;
+            text_emb = text_emb.broadcast_add(&text_pos)?;
 
-        // Initial speech token: a single start-of-speech, position 0.
-        let start = self.cfg.start_speech_token;
-        let bos_ids = Tensor::from_vec(vec![start], (1, 1), &self.device)?;
-        let bos_emb = __model_proof_output!(self.speech_emb.forward(&bos_ids))?
-            .broadcast_add(&self.speech_pos_emb.narrow(0, 0, 1)?.unsqueeze(0)?)?;
+            // Initial speech token: a single start-of-speech, position 0.
+            let start = self.cfg.start_speech_token;
+            let bos_ids = Tensor::from_vec(vec![start], (1, 1), &self.device)?;
+            let bos_emb = __model_proof_output!(self.speech_emb.forward(&bos_ids))?
+                .broadcast_add(&self.speech_pos_emb.narrow(0, 0, 1)?.unsqueeze(0)?)?;
 
-        // Assemble the per-row prefix and stack into the CFG batch.
-        let rows: Vec<Tensor> = (0..batch)
-            .map(|r| {
-                let te = if use_cfg && r == 1 {
-                    text_emb.zeros_like()?
-                } else {
-                    text_emb.clone()
-                };
-                Tensor::cat(&[&cond_emb, &te, &bos_emb], 1)
-            })
-            .collect::<CandleResult<_>>()?;
-        let refs: Vec<&Tensor> = rows.iter().collect();
-        let mut inputs = Tensor::cat(&refs, 0)?; // [batch, len_cond+T+1, dim]
+            // Assemble the per-row prefix and stack into the CFG batch.
+            let rows: Vec<Tensor> = (0..batch)
+                .map(|r| {
+                    let te = if use_cfg && r == 1 {
+                        text_emb.zeros_like()?
+                    } else {
+                        text_emb.clone()
+                    };
+                    Tensor::cat(&[&cond_emb, &te, &bos_emb], 1)
+                })
+                .collect::<CandleResult<_>>()?;
+            let refs: Vec<&Tensor> = rows.iter().collect();
+            let inputs = Tensor::cat(&refs, 0)?; // [batch, len_cond+T+1, dim]
+
+            Ok::<_, candle_audio::candle_core::Error>(inputs)
+        })?;
 
         let mut offset = 0usize;
         let mut generated: Vec<u32> = Vec::new();
@@ -395,7 +431,13 @@ impl T3 {
             if cancel() {
                 return Ok(None);
             }
-            let hidden = self.backbone(&inputs, offset)?;
+            let hidden = if step == 0 {
+                candle_audio::gen_core::with_prompt_encoding(on_prompt_progress, || {
+                    self.backbone(&inputs, offset)
+                })?
+            } else {
+                self.backbone(&inputs, offset)?
+            };
             offset += inputs.dim(1)?;
             // Logits of the last position for each CFG row.
             let last = hidden.narrow(1, hidden.dim(1)? - 1, 1)?; // [batch, 1, dim]

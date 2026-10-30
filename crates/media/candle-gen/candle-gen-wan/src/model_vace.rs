@@ -216,15 +216,20 @@ impl Pipeline {
         let num_ref = references.len();
 
         // Stage 1: UMT5 text encode + project to the DiT context.
-        let pos = self.encode(comps, &req.prompt)?;
-        let ctx_pos = comps.dit.embed_text(&pos)?;
-        let ctx_neg = if cfg_disabled {
-            None
-        } else {
-            let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
-            Some(comps.dit.embed_text(&self.encode(comps, neg)?)?)
-        };
-
+        let (ctx_pos, ctx_neg) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let pos = self.encode(comps, &req.prompt)?;
+                let ctx_pos = comps.dit.embed_text(&pos)?;
+                let ctx_neg = if cfg_disabled {
+                    None
+                } else {
+                    let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
+                    Some(comps.dit.embed_text(&self.encode(comps, neg)?)?)
+                };
+                Ok((ctx_pos, ctx_neg))
+            },
+        )?;
         // Stage 2: z16 VAE-encode the control + mask → the 96-ch control latent.
         let patch_h = self.vace_cfg.base.patch.1;
         let video_latents = prepare_video_latents(&comps.vae, &control_video, &mask, &references)?;

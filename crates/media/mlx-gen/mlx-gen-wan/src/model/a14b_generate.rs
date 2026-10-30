@@ -243,13 +243,14 @@ impl Wan14b {
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
         // A14B always encodes both prompts (the dual-expert default), so `skip_neg = false`; unwrap
         // the always-present negative context back to the `Array` the MoE denoise expects.
-        let (context, context_null) = encode_text_staged_for_tier(
+        let (context, context_null) = encode_text_staged_for_tier_with_progress(
             &self.root,
             cfg,
             &req.prompt,
             &neg_prompt,
             false,
             self.quant,
+            on_progress,
         )?;
         let context_null = context_null.expect("a14b always encodes the negative context");
         // sc-12736: `encode_text_staged` already drops the UMT5 encoder before returning (only the

@@ -78,6 +78,8 @@ fn progress_is_steps_then_one_decoding_and_output_is_rgb8() {
     assert_eq!(
         events,
         [
+            "Loading(EncodingPrompt)",
+            "PromptEncodingComplete",
             "Step { current: 1, total: 3 }",
             "Step { current: 2, total: 3 }",
             "Step { current: 3, total: 3 }",
@@ -110,7 +112,13 @@ fn sequential_policy_reports_loading_phases_and_matches_resident_pixels() {
     let mut loading = 0;
     let b = sequential
         .generate(&request(), &mut |p| {
-            if matches!(p, Progress::Loading(_)) {
+            if matches!(
+                p,
+                Progress::Loading(
+                    candle_gen::gen_core::LoadPhase::TextEncoder
+                        | candle_gen::gen_core::LoadPhase::Renderer
+                )
+            ) {
                 loading += 1;
             }
         })

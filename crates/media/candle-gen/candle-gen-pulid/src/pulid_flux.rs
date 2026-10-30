@@ -467,9 +467,11 @@ impl PulidFlux {
 
         // Text conditioning (T5 seq + CLIP pooled) — tier-agnostic via the backbone (dense or packed
         // encoders, same token ids either way).
-        let (t5_emb, clip_emb) = self
-            .backbone
-            .encode_text_with_memory(&req.prompt, &req.cancel)?;
+        let (t5_emb, clip_emb) = self.backbone.encode_text_with_memory_and_progress(
+            &req.prompt,
+            &req.cancel,
+            on_progress,
+        )?;
         let heavy = self.backbone.load_heavy(&req.cancel)?;
 
         // candle's get_noise geometry: latent is /8 of a multiple-of-16 request.

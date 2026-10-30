@@ -49,9 +49,25 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 fn authenticated_bytes(pin: &PinnedWeightsFile, digest: &str) -> Result<Vec<u8>> {
+    authenticated_source_bytes(pin, digest, false)
+}
+fn authenticated_weight_bytes(pin: &PinnedWeightsFile, digest: &str) -> Result<Vec<u8>> {
+    authenticated_source_bytes(pin, digest, true)
+}
+fn authenticated_source_bytes(
+    pin: &PinnedWeightsFile,
+    digest: &str,
+    weights: bool,
+) -> Result<Vec<u8>> {
     pin.read_unchanged(|path| {
-        let bytes = std::fs::read(path)?;
-        if hex(&Sha256::digest(&bytes)) != digest {
+        let (bytes, actual): (Vec<u8>, [u8; 32]) = if weights {
+            mlx_gen::gen_core::weightsmeta::read_hashed_file(path)?
+        } else {
+            let bytes = std::fs::read(path)?;
+            let digest = Sha256::digest(&bytes).into();
+            (bytes, digest)
+        };
+        if hex(&actual) != digest {
             return Err(mlx_gen::gen_core::Error::Unsupported(
                 "consumed MOSS edit bytes changed".into(),
             ));
@@ -93,8 +109,10 @@ impl EditAssets {
     }
     pub(crate) fn install(&self, transformer: &mut Transformer, cancel: &CancelFlag) -> Result<()> {
         check(cancel)?;
-        let meta =
-            CheckpointMeta::from_bytes(authenticated_bytes(&self.weights, EDIT_WEIGHTS_SHA256)?)?;
+        let meta = CheckpointMeta::from_bytes(authenticated_weight_bytes(
+            &self.weights,
+            EDIT_WEIGHTS_SHA256,
+        )?)?;
         let headers = meta
             .keys()
             .map(|name| {
@@ -443,6 +461,66 @@ impl EditSampling<'_> {
 mod tests {
     use super::*;
     use serde_json::Value;
+    /// Actual owned weight I/O/authentication only; no edit model is constructed.
+    #[test]
+    fn authenticated_edit_weight_bytes_report_reads_hashes_and_clear_errors() {
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("renamed-edit-weights");
+        let bytes = vec![29; 131_079];
+        std::fs::write(&path, &bytes).unwrap();
+        let pin = PinnedWeightsFile::pin(&path).unwrap();
+        let expected = hex(&Sha256::digest(&bytes));
+        let config_path = dir.path().join("adapter_config.json");
+        std::fs::write(&config_path, b"{}").unwrap();
+        let config_pin = PinnedWeightsFile::pin(&config_path).unwrap();
+        let config_digest = hex(&Sha256::digest(b"{}"));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let _observer = mlx_gen::gen_core::LoadActivityObserver::new(move |event| {
+            output.lock().unwrap().push(event)
+        });
+        assert_eq!(authenticated_weight_bytes(&pin, &expected).unwrap(), bytes);
+        {
+            let events = events.lock().unwrap();
+            for phase in [
+                mlx_gen::gen_core::LoadActivityPhase::Loading,
+                mlx_gen::gen_core::LoadActivityPhase::Verifying,
+            ] {
+                assert_eq!(
+                    events
+                        .iter()
+                        .flatten()
+                        .filter(|event| event.phase == phase)
+                        .map(|event| event.bytes_read)
+                        .max(),
+                    Some(bytes.len() as u64)
+                );
+            }
+            assert_eq!(events.last(), Some(&None));
+        }
+        assert!(authenticated_weight_bytes(&pin, "incorrect").is_err());
+        assert_eq!(events.lock().unwrap().last(), Some(&None));
+        events.lock().unwrap().clear();
+        assert_eq!(
+            authenticated_bytes(&config_pin, &config_digest).unwrap(),
+            b"{}"
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .any(|event| matches!(
+                    event.phase,
+                    mlx_gen::gen_core::LoadActivityPhase::Loading
+                        | mlx_gen::gen_core::LoadActivityPhase::Verifying
+                )),
+            "JSON config must not receive weight-read credit"
+        );
+    }
+
     #[test]
     fn frozen_cfg_euler_steps_are_fp32_cpu() {
         const CHILD: &str = "MOSS_EDIT_SAMPLING_CPU_CHILD";

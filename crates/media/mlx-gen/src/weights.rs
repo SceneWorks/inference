@@ -16,10 +16,7 @@ use crate::{Error, Result};
 pub fn load_safetensors_on_cpu(
     path: impl AsRef<Path>,
 ) -> Result<(HashMap<String, Array>, HashMap<String, String>)> {
-    Ok(Array::load_safetensors_with_metadata_device(
-        path,
-        mlx_rs::Stream::cpu(),
-    )?)
+    Ok(mlx_llm::load_progress::load_with_metadata(path)?)
 }
 
 /// A loaded set of named tensors (dotted keys, e.g. `"layers.0.attention.to_q.weight"`)
@@ -215,9 +212,20 @@ path.as_ref(),
         // SAFETY: the mapping is read-only and remains alive until every borrowed
         // TensorView has been copied into MLX-owned array storage below.
         let bytes = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let context = gen_core::LoadActivityContext::capture();
+        context.reset_file(path.as_ref());
+        let progress = context.file(
+            gen_core::LoadActivityPhase::Loading,
+            path.as_ref(),
+            Some(bytes.len() as u64),
+        );
         let safe = safetensors_fp8::SafeTensors::deserialize(&bytes).map_err(|error| {
             Error::from(format!("loading {}: {error}", path.as_ref().display()))
         })?;
+        // deserialize has read the length prefix and JSON header, without touching tensor payloads.
+        let header_len =
+            u64::from_le_bytes(bytes[..8].try_into().expect("validated length prefix"));
+        progress.add_bytes(8 + header_len);
         let mut tensors = HashMap::new();
         for (name, view) in safe.tensors() {
             if !include(&name) {
@@ -285,6 +293,7 @@ path.as_ref(),
                     )
                 }
             };
+            progress.add_bytes(view.data().len() as u64);
             tensors.insert(name.to_owned(), value);
         }
         #[cfg(feature = "model-inference-proof")]
@@ -328,6 +337,7 @@ path.as_ref(),
         if files.is_empty() {
             return Err(format!("no .safetensors files in {}", source_dir.display()).into());
         }
+        mlx_llm::load_progress::register_files(files);
         let mut tensors = HashMap::new();
         let mut metadata = HashMap::new();
         for f in files {
@@ -563,6 +573,88 @@ pub fn join(prefix: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CPU reader only: no model, learned operation, coherence probe, or GPU evaluation.
+    #[test]
+    fn lazy_weight_reads_keep_request_component_and_selected_shard_totals() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let component_dir = dir.path().join("unfamiliar_component");
+        std::fs::create_dir(&component_dir).unwrap();
+        let files: Vec<_> = (0..2)
+            .map(|index| {
+                let path = component_dir.join(format!("model-{index}.safetensors"));
+                let header = format!(
+                    r#"{{"w{index}":{{"dtype":"U8","shape":[65536],"data_offsets":[0,65536]}}}}"#
+                );
+                let mut file = std::fs::File::create(&path).unwrap();
+                file.write_all(&(header.len() as u64).to_le_bytes())
+                    .unwrap();
+                file.write_all(header.as_bytes()).unwrap();
+                file.write_all(&vec![3; 65536]).unwrap();
+                path
+            })
+            .collect();
+        let total: u64 = files
+            .iter()
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .sum();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let observer =
+            gen_core::LoadActivityObserver::new(move |event| output.lock().unwrap().push(event));
+        let source_context = gen_core::LoadActivityContext::capture()
+            .with_components([(component_dir.clone(), "transformer".to_owned())]);
+        let source_scope = source_context.install();
+        let weights = Weights::from_paths(&files, &component_dir).unwrap();
+        drop(source_scope);
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .all(|event| event.bytes_read < event.total_bytes.unwrap()));
+        drop(observer);
+        let initial_events = events.lock().unwrap().len();
+        let unrelated_events = Arc::new(Mutex::new(Vec::new()));
+        let output = unrelated_events.clone();
+        let _unrelated =
+            gen_core::LoadActivityObserver::new(move |event| output.lock().unwrap().push(event));
+        mlx_rs::transforms::eval_pending_loads(weights.tensors.values()).unwrap();
+        assert_eq!(
+            events.lock().unwrap().len(),
+            initial_events,
+            "the creating job receives no later payload reports"
+        );
+        let events = unrelated_events.lock().unwrap();
+        let reports: Vec<_> = events.iter().flatten().collect();
+        assert!(!reports.is_empty());
+        assert!(reports.iter().all(|event| event.component == "transformer"));
+        assert!(reports
+            .iter()
+            .all(|event| event.component_total_bytes == Some(total)));
+        assert_eq!(
+            reports.iter().map(|event| event.component_bytes_read).max(),
+            Some(2 * 65536),
+            "only payload bytes were read by the evaluating job"
+        );
+        for file in &files {
+            assert_eq!(
+                reports
+                    .iter()
+                    .filter(|event| &event.file == file)
+                    .map(|event| event.bytes_read)
+                    .max(),
+                Some(65536)
+            );
+        }
+        assert_eq!(
+            events.last(),
+            Some(&None),
+            "completed reads clear the loading phase"
+        );
+    }
 
     #[test]
     fn peek_borrows_without_consuming_or_changing_array_identity() {

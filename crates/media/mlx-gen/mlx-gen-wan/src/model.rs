@@ -44,7 +44,7 @@ use crate::pipeline::{
     seq_len, staged_expert_swap, ti2v_blend_init, Expert,
 };
 use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
-use crate::text_encoder::encode_text_staged_for_tier;
+use crate::text_encoder::encode_text_staged_for_tier_with_progress;
 use crate::token_pruning::TokenPruner;
 use crate::transformer::WanTransformer;
 

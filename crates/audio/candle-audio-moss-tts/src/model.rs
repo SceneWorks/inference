@@ -311,15 +311,18 @@ impl MossTtsdGenerator {
         let seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
+        let progress = std::cell::RefCell::new(on_progress);
         let mut on_position = |step: usize| {
-            on_progress(Progress::Step {
+            (progress.borrow_mut())(Progress::Step {
                 current: (step as u32) + 1,
                 total,
             });
         };
         let result = pipeline
             .decoder
-            .run(grid, budget, seed, &probe, &mut on_position)
+            .run_with_prompt_progress(grid, budget, seed, &probe, &mut on_position, &mut |event| {
+                (progress.borrow_mut())(event)
+            })
             .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: AR decode: {e}")))?;
         match result {
             Some(r) => Ok(r),

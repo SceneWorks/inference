@@ -577,6 +577,7 @@ fn encode_text_staged(
     neg_prompt: &str,
     skip_neg: bool,
     te_quant: Option<WanQuant>,
+    on_progress: &mut dyn FnMut(mlx_gen::Progress),
 ) -> Result<(Array, Option<Array>)> {
     let tokenizer = load_tokenizer(root.join("tokenizer.json"), cfg.text_len)?;
     let mut w = Weights::from_file(root.join("t5_encoder.safetensors"))?;
@@ -588,16 +589,22 @@ fn encode_text_staged(
         Some(q) => Umt5Encoder::from_weights_quantized(&mut w, cfg, q)?,
         None => Umt5Encoder::from_weights(&w, cfg)?,
     };
-    let context = enc.encode(&tokenizer, prompt)?;
-    let context_null = if skip_neg {
-        None
-    } else {
-        Some(enc.encode(&tokenizer, neg_prompt)?)
-    };
-    match &context_null {
-        Some(cn) => mlx_rs::transforms::eval([&context, cn])?,
-        None => mlx_rs::transforms::eval([&context])?,
-    }
+    let (context, context_null) = mlx_gen::gen_core::with_prompt_encoding(
+        on_progress,
+        || -> std::result::Result<_, mlx_gen::Error> {
+            let context = enc.encode(&tokenizer, prompt)?;
+            let context_null = if skip_neg {
+                None
+            } else {
+                Some(enc.encode(&tokenizer, neg_prompt)?)
+            };
+            match &context_null {
+                Some(cn) => mlx_rs::transforms::eval([&context, cn])?,
+                None => mlx_rs::transforms::eval([&context])?,
+            }
+            Ok((context, context_null))
+        },
+    )?;
     Ok((context, context_null))
 }
 
@@ -614,6 +621,29 @@ pub fn encode_text_staged_for_tier(
     skip_neg: bool,
     load_quant: Option<mlx_gen::Quant>,
 ) -> Result<(Array, Option<Array>)> {
+    encode_text_staged_for_tier_with_progress(
+        root,
+        cfg,
+        prompt,
+        neg_prompt,
+        skip_neg,
+        load_quant,
+        &mut |_| {},
+    )
+}
+
+/// The provider progress bridge opens prompt encoding after the staged encoder is built.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_text_staged_for_tier_with_progress(
+    root: &std::path::Path,
+    cfg: &WanModelConfig,
+    prompt: &str,
+    neg_prompt: &str,
+    skip_neg: bool,
+    load_quant: Option<mlx_gen::Quant>,
+    on_progress: &mut dyn FnMut(mlx_gen::Progress),
+) -> Result<(Array, Option<Array>)> {
     encode_text_staged(
         root,
         cfg,
@@ -621,6 +651,7 @@ pub fn encode_text_staged_for_tier(
         neg_prompt,
         skip_neg,
         crate::model::effective_te_quant(cfg, load_quant),
+        on_progress,
     )
 }
 

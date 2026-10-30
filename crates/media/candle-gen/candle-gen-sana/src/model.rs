@@ -385,24 +385,26 @@ fn generate_base_images(
     let steps = req.steps.map(|s| s as usize);
     let guidance_scale = req.true_cfg.or(req.guidance);
     let guidance = guidance_scale.unwrap_or(crate::pipeline::DEFAULT_GUIDANCE);
-    let conditioning = pipeline
-        .encode_batch(
-            &SanaGenerateRequest {
-                prompt: &req.prompt,
-                negative_prompt: req.negative_prompt.as_deref(),
-                height: req.height,
-                width: req.width,
-                steps,
-                guidance_scale,
-                seed: None,
-                sampler: req.sampler.as_deref(),
-                scheduler: req.scheduler.as_deref(),
-                init_image,
-                strength,
-            },
-            guidance,
-        )
-        .map_err(gen_core::Error::from)?;
+    let conditioning = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+        pipeline
+            .encode_batch(
+                &SanaGenerateRequest {
+                    prompt: &req.prompt,
+                    negative_prompt: req.negative_prompt.as_deref(),
+                    height: req.height,
+                    width: req.width,
+                    steps,
+                    guidance_scale,
+                    seed: None,
+                    sampler: req.sampler.as_deref(),
+                    scheduler: req.scheduler.as_deref(),
+                    init_image,
+                    strength,
+                },
+                guidance,
+            )
+            .map_err(gen_core::Error::from)
+    })?;
     let prepared_reference = pipeline
         .prepare_reference(
             &SanaGenerateRequest {
@@ -656,9 +658,11 @@ fn generate_sprint_images(
         .unwrap_or((None, None));
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let steps = req.steps.map(|s| s as usize);
-    let conditioning = pipeline
-        .encode_batch(&req.prompt)
-        .map_err(gen_core::Error::from)?;
+    let conditioning = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+        pipeline
+            .encode_batch(&req.prompt)
+            .map_err(gen_core::Error::from)
+    })?;
     let prepared_reference = pipeline
         .prepare_reference(
             &SanaGenerateRequest {
@@ -1185,15 +1189,37 @@ mod tests {
             .to_vec();
 
         let inert = PreviewSink::default();
+        let mut phases = Vec::new();
         let actual = generate_base_images(
             &pipeline,
             &request,
             &Device::Cpu,
-            &mut |_| {},
+            &mut |phase| {
+                match phase {
+                    Progress::Loading(gen_core::LoadPhase::EncodingPrompt) => assert_eq!(
+                        pipeline.encoder_calls.get(),
+                        0,
+                        "start must precede encoding"
+                    ),
+                    Progress::PromptEncodingComplete => {
+                        assert_eq!(pipeline.encoder_calls.get(), 2, "end must follow encoding")
+                    }
+                    other => panic!("unexpected encoding event: {other:?}"),
+                }
+                assert!(pipeline.rendered_seeds.borrow().is_empty());
+                phases.push(phase);
+            },
             &inert_hook(&inert),
         )
         .unwrap();
 
+        assert!(matches!(
+            phases.as_slice(),
+            [
+                Progress::Loading(gen_core::LoadPhase::EncodingPrompt),
+                Progress::PromptEncodingComplete
+            ]
+        ));
         assert_eq!(pipeline.encoder_calls.get(), 2);
         assert_eq!(pipeline.reference_encoder_calls.get(), 1);
         assert_eq!(
@@ -1283,15 +1309,37 @@ mod tests {
             .to_vec();
 
         let inert = PreviewSink::default();
+        let mut phases = Vec::new();
         let actual = generate_sprint_images(
             &pipeline,
             &request,
             &Device::Cpu,
-            &mut |_| {},
+            &mut |phase| {
+                match phase {
+                    Progress::Loading(gen_core::LoadPhase::EncodingPrompt) => assert_eq!(
+                        pipeline.encoder_calls.get(),
+                        0,
+                        "start must precede encoding"
+                    ),
+                    Progress::PromptEncodingComplete => {
+                        assert_eq!(pipeline.encoder_calls.get(), 1, "end must follow encoding")
+                    }
+                    other => panic!("unexpected encoding event: {other:?}"),
+                }
+                assert!(pipeline.rendered_seeds.borrow().is_empty());
+                phases.push(phase);
+            },
             &inert_hook(&inert),
         )
         .unwrap();
 
+        assert!(matches!(
+            phases.as_slice(),
+            [
+                Progress::Loading(gen_core::LoadPhase::EncodingPrompt),
+                Progress::PromptEncodingComplete
+            ]
+        ));
         assert_eq!(pipeline.encoder_calls.get(), 1);
         assert_eq!(pipeline.reference_encoder_calls.get(), 1);
         assert_eq!(*pipeline.rendered_seeds.borrow(), vec![11, 12, 13]);

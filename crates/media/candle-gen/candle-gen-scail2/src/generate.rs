@@ -425,12 +425,18 @@ pub fn generate(
     // The tokenizer is loaded+parsed once at component load (sc-8991 / F-011) — reuse the cached one.
     let tok = &comps.tok;
     let pad_id = te_cfg.pad_token_id.max(0) as u32;
-    let context = encode_text(&comps.te, tok, job.prompt, pad_id, dev)?;
-    let context_null = if cfg_disabled {
-        context.clone()
-    } else {
-        encode_text(&comps.te, tok, job.negative_prompt, pad_id, dev)?
-    };
+    let (context, context_null) = candle_gen::gen_core::with_prompt_encoding(
+        on_progress,
+        || -> std::result::Result<_, candle_gen::CandleError> {
+            let context = encode_text(&comps.te, tok, job.prompt, pad_id, dev)?;
+            let context_null = if cfg_disabled {
+                context.clone()
+            } else {
+                encode_text(&comps.te, tok, job.negative_prompt, pad_id, dev)?
+            };
+            Ok((context, context_null))
+        },
+    )?;
     let clip_fea = {
         let pixel = clip_preprocess(&ref_chw.reshape((1, 3, th, tw))?, 224)?;
         comps.clip.encode(&pixel)?

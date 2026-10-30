@@ -87,7 +87,7 @@ impl MiniMaxH3 {
         // --- 1. the conditioner: vision tower over the visual references, then the 66.7 GB LM ---
         on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::TextEncoder));
         let (context, text_tags) =
-            self.encode_prompt_ref2va(&req.prompt, &normalized, window, &req.cancel)?;
+            self.encode_prompt_ref2va(&req.prompt, &normalized, window, &req.cancel, on_progress)?;
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }

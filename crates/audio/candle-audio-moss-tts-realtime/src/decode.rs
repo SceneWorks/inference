@@ -258,10 +258,32 @@ impl Decoder {
         cancel: &dyn Fn() -> bool,
         on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
     ) -> CandleResult<Option<DecodeResult>> {
+        self.run_with_prompt_progress(
+            prompt_frames,
+            streamed_text,
+            max_frames,
+            seed,
+            cancel,
+            on_frame,
+            &mut |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_prompt_progress(
+        &self,
+        prompt_frames: Vec<Frame>,
+        streamed_text: &[u32],
+        max_frames: usize,
+        seed: u64,
+        cancel: &dyn Fn() -> bool,
+        on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
+        on_prompt_progress: &mut dyn FnMut(candle_audio::gen_core::Progress),
+    ) -> CandleResult<Option<DecodeResult>> {
         // Single-turn: a fresh cache, one prefill, then AR generation. Delegates to the shared
         // per-turn core so single-turn and multi-turn generation are the identical computation.
         let mut cache = self.backbone.new_cache();
-        self.generate_turn(
+        self.generate_turn_with_prompt_progress(
             &mut cache,
             &prompt_frames,
             streamed_text,
@@ -269,6 +291,7 @@ impl Decoder {
             seed,
             cancel,
             on_frame,
+            on_prompt_progress,
         )
     }
 
@@ -295,7 +318,7 @@ impl Decoder {
         cancel: &dyn Fn() -> bool,
         on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
     ) -> CandleResult<Option<DecodeResult>> {
-        self.generate_turn_observed(
+        self.generate_turn_with_prompt_progress(
             cache,
             prefill_block,
             streamed_text,
@@ -307,10 +330,36 @@ impl Decoder {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_turn_with_prompt_progress(
+        &self,
+        cache: &mut BackboneCache,
+        prefill_block: &[Frame],
+        streamed_text: &[u32],
+        max_frames: usize,
+        seed: u64,
+        cancel: &dyn Fn() -> bool,
+        on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
+        on_prompt_progress: &mut dyn FnMut(candle_audio::gen_core::Progress),
+    ) -> CandleResult<Option<DecodeResult>> {
+        self.generate_turn_observed_with_prompt_progress(
+            cache,
+            prefill_block,
+            streamed_text,
+            max_frames,
+            seed,
+            cancel,
+            on_frame,
+            &mut |_| {},
+            on_prompt_progress,
+        )
+    }
+
     /// Shared AR implementation with an internal observer for the exact frame fed back to the
     /// backbone. Production callers use [`generate_turn`](Self::generate_turn), whose observer is a
     /// no-op; focused tests use this seam to prove streamed text reaches `Backbone::step` without
     /// relying on platform-sensitive equality of sampled audio tokens.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn generate_turn_observed<F>(
         &self,
@@ -322,6 +371,35 @@ impl Decoder {
         cancel: &dyn Fn() -> bool,
         on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
         on_feedback: &mut F,
+    ) -> CandleResult<Option<DecodeResult>>
+    where
+        F: FnMut(&Frame),
+    {
+        self.generate_turn_observed_with_prompt_progress(
+            cache,
+            prefill_block,
+            streamed_text,
+            max_frames,
+            seed,
+            cancel,
+            on_frame,
+            on_feedback,
+            &mut |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_turn_observed_with_prompt_progress<F>(
+        &self,
+        cache: &mut BackboneCache,
+        prefill_block: &[Frame],
+        streamed_text: &[u32],
+        max_frames: usize,
+        seed: u64,
+        cancel: &dyn Fn() -> bool,
+        on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
+        on_feedback: &mut F,
+        on_prompt_progress: &mut dyn FnMut(candle_audio::gen_core::Progress),
     ) -> CandleResult<Option<DecodeResult>>
     where
         F: FnMut(&Frame),
@@ -352,7 +430,9 @@ impl Decoder {
             // prefill block on the first iteration, then one fed-back frame per iteration thereafter.
             let hidden = if !prefilled {
                 prefilled = true;
-                self.backbone.prefill(prefill_block, cache)?
+                candle_audio::gen_core::with_prompt_encoding(on_prompt_progress, || {
+                    self.backbone.prefill(prefill_block, cache)
+                })?
             } else {
                 // The previous iteration's emitted frame, fed back with the text channel carrying the
                 // next streamed text token (delay-pattern), or text_pad once the text is exhausted.
@@ -410,12 +490,34 @@ impl Decoder {
         known_frames: &[RvqFrame],
         cancel: &dyn Fn() -> bool,
     ) -> CandleResult<Option<()>> {
+        self.replay_turn_with_prompt_progress(
+            cache,
+            prefill_block,
+            streamed_text,
+            known_frames,
+            cancel,
+            &mut |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn replay_turn_with_prompt_progress(
+        &self,
+        cache: &mut BackboneCache,
+        prefill_block: &[Frame],
+        streamed_text: &[u32],
+        known_frames: &[RvqFrame],
+        cancel: &dyn Fn() -> bool,
+        on_prompt_progress: &mut dyn FnMut(candle_audio::gen_core::Progress),
+    ) -> CandleResult<Option<()>> {
         if cancel() {
             return Ok(None);
         }
         // Prefill the turn's conditioning block (its hidden state is discarded — we are not sampling,
         // only warming the cache), then step through the known frames just as generation would.
-        self.backbone.prefill(prefill_block, cache)?;
+        candle_audio::gen_core::with_prompt_encoding(on_prompt_progress, || {
+            self.backbone.prefill(prefill_block, cache)
+        })?;
         for (i, frame) in known_frames.iter().enumerate() {
             if cancel() {
                 return Ok(None);

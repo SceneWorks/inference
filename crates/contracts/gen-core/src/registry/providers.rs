@@ -49,6 +49,7 @@ macro_rules! explicit_registry_kind {
                     ))
                 })?;
             self.ensure_quant_supported(id, spec, $kind)?;
+            let _activity = spec.load_activity_context().install();
             spec.read_prepared_files_unchanged(|| (registration.load)(spec))
         }
     };

@@ -305,13 +305,18 @@ impl Pipeline {
 
         // Encode the prompt(s) once for the whole batch (seed- and image-independent). The negative
         // branch is skipped entirely when guidance ≤ 1 (Flash single-forward) — bit-exact `pred = pos`.
-        let pos_embeds = self.encode(components, &req.prompt)?;
-        let neg = if guidance > 1.0 {
-            Some(self.encode(components, negative)?)
-        } else {
-            None
-        };
-
+        let (pos_embeds, neg) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let pos_embeds = self.encode(components, &req.prompt)?;
+                let neg = if guidance > 1.0 {
+                    Some(self.encode(components, negative)?)
+                } else {
+                    None
+                };
+                Ok((pos_embeds, neg))
+            },
+        )?;
         let h2 = (req.height as usize).div_ceil(16);
         let w2 = (req.width as usize).div_ceil(16);
         let rope_pos = rope::build_for(&components.cfg, pos_embeds.dim(1)?, h2, w2, &self.device)?;
@@ -403,12 +408,18 @@ impl Pipeline {
             self.device.clone(),
             "conditioning components",
         );
-        let pos_embeds = self.encode_parts(&text.tokenizer, &text.t5, &req.prompt)?;
-        let neg = if guidance > 1.0 {
-            Some(self.encode_parts(&text.tokenizer, &text.t5, negative)?)
-        } else {
-            None
-        };
+        let (pos_embeds, neg) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let pos_embeds = self.encode_parts(&text.tokenizer, &text.t5, &req.prompt)?;
+                let neg = if guidance > 1.0 {
+                    Some(self.encode_parts(&text.tokenizer, &text.t5, negative)?)
+                } else {
+                    None
+                };
+                Ok((pos_embeds, neg))
+            },
+        )?;
         let h2 = (req.height as usize).div_ceil(16);
         let w2 = (req.width as usize).div_ceil(16);
         let rope_pos = rope::build_for(&text.cfg, pos_embeds.dim(1)?, h2, w2, &self.device)?;

@@ -220,6 +220,7 @@ impl CandleStarVector8bProvider {
         request: &StarVectorRequest,
         on_event: &mut dyn FnMut(StarVectorStreamEvent),
     ) -> CoreResult<(StarVectorOutput, Option<DecodeRecord>)> {
+        let _progress = request.text_request.install_progress();
         self.validate_svg(request)?;
         if request.text_request.cancel.is_cancelled() {
             return Err(CoreError::Canceled);
@@ -245,6 +246,7 @@ impl CandleStarVector8bProvider {
         // The whole request from the conditioning prefill on (the engine's own span starts after
         // it).
         let span = RequestSpan::begin();
+        core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
         let (first, mut cache) = self.model.prefill(image, &prompt).map_err(to_core)?;
         let config = GenerationConfig {
             max_new_tokens: request.text_request.max_new_tokens as usize,
@@ -363,6 +365,7 @@ impl TextLlm for CandleStarVector8bProvider {
         request: &TextLlmRequest,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> CoreResult<TextLlmOutput> {
+        let _progress = request.install_progress();
         let prompt_tokens = self.tokenizer.encode(SVG_PROMPT, false)?.len() as u32;
         svg_text_output(
             request,

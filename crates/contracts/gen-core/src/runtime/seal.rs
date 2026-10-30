@@ -566,6 +566,9 @@ impl ArtifactSeal {
         mut observe: impl FnMut(&ArtifactSealProgress),
     ) -> crate::Result<Self> {
         let path = path.as_ref();
+        let checking =
+            crate::LoadActivityScope::file(crate::LoadActivityPhase::Checking, path, None);
+        checking.checked(0, Some(1));
         let loader_path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         let mut last = seal_progress(
             &loader_path,
@@ -596,6 +599,9 @@ impl ArtifactSeal {
                 last.state = state;
                 observe(&last);
             }
+        }
+        if result.is_ok() {
+            checking.checked(1, Some(1));
         }
         result
     }
@@ -1249,7 +1255,8 @@ fn hash_file_sha256_with_progress(
     let mut reader = File::open(path)?;
     let source_bytes = Some(reader.metadata()?.len());
     checked(0, source_bytes)?;
-    let _activity = crate::LoadActivityScope::enter(crate::LoadActivity::VerifyingFiles);
+    let activity =
+        crate::LoadActivityScope::file(crate::LoadActivityPhase::Verifying, path, source_bytes);
     // Release the callback borrow so progress is reported BEFORE the post-read cancellation check.
     let mut hash = Sha256::new();
     let mut buffer = vec![0_u8; HASH_READ_BYTES];
@@ -1286,6 +1293,7 @@ fn hash_file_sha256_with_progress(
         };
         hash.update(&buffer[..read]);
         hashed_bytes += read as u64;
+        activity.update(hashed_bytes);
         #[cfg(test)]
         THREAD_HASH_BYTES_READ.with(|bytes| bytes.set(bytes.get() + read));
         if read == 0 || reported == 0 || hashed_bytes - reported >= 256 * 1024 * 1024 {

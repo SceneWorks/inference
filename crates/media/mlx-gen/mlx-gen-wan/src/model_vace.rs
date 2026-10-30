@@ -46,7 +46,7 @@ use crate::pipeline::{
     reject_over_area, resolve_sampler_knobs, seq_len, staged_expert_swap,
 };
 use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
-use crate::text_encoder::encode_text_staged_for_tier;
+use crate::text_encoder::encode_text_staged_for_tier_with_progress;
 use crate::vace::{
     build_vace_control, denoise_vace, denoise_vace_moe, denoise_vace_range, prepare_masks,
     prepare_video_latents, vace_control_scales, WanVaceTransformer,
@@ -143,6 +143,7 @@ fn vace_prep(
     req: &GenerationRequest,
     cfg_disabled: bool,
     load_quant: Option<Quant>,
+    on_progress: &mut dyn FnMut(Progress),
 ) -> Result<VacePrep> {
     let base = &config.base;
     let clip = req.control_clip().expect("validated present");
@@ -179,13 +180,14 @@ fn vace_prep(
     let num_ref = references.len();
 
     // --- Stage 1: UMT5 text encode ---
-    let (context, context_null) = encode_text_staged_for_tier(
+    let (context, context_null) = encode_text_staged_for_tier_with_progress(
         root,
         base,
         &req.prompt,
         &neg_prompt,
         cfg_disabled,
         load_quant,
+        on_progress,
     )?;
     // Each CFG branch's context is zero-padded to `text_len` (512) exactly as the reference
     // (diffusers `WanVACEPipeline` / original Wan) and base Wan build it; the transformer then
@@ -567,7 +569,14 @@ impl WanVace {
         let cfg_disabled = guidance <= 1.0;
 
         // Stages 1–2 + noise seeding (shared with the dual-expert path, F-072).
-        let prep = vace_prep(&self.root, &self.config, req, cfg_disabled, self.quantize)?;
+        let prep = vace_prep(
+            &self.root,
+            &self.config,
+            req,
+            cfg_disabled,
+            self.quantize,
+            on_progress,
+        )?;
 
         // --- Stage 3: load the VACE DiT, embed contexts, CFG denoise ---
         let latents = {
@@ -1027,7 +1036,14 @@ impl WanVaceFun {
         let cfg_disabled = low_gs <= 1.0 && high_gs <= 1.0;
 
         // Stages 1–2 + noise seeding (shared with the single-expert path, F-072).
-        let prep = vace_prep(&self.root, &self.config, req, cfg_disabled, self.quantize)?;
+        let prep = vace_prep(
+            &self.root,
+            &self.config,
+            req,
+            cfg_disabled,
+            self.quantize,
+            on_progress,
+        )?;
 
         if sequential {
             // `vace_prep` materializes the raw text contexts and control latent before returning;

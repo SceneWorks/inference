@@ -459,6 +459,7 @@ impl TextLlm for JoyCaptionProvider {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
     ) -> CoreResult<TextLlmOutput> {
+        let _progress = req.install_progress();
         self.validate(req)?;
         if req.cancel.is_cancelled() {
             return Err(CoreError::Canceled);
@@ -474,6 +475,7 @@ impl TextLlm for JoyCaptionProvider {
         // Prompt length the engine sees = expanded (image token → IMAGE_SEQ_LENGTH rows).
         let prompt_len = expand_image_tokens(&prompt_ids).len() as u32;
 
+        core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
         let features = self
             .model
             .image_features(&image.pixels, image.width as usize, image.height as usize)

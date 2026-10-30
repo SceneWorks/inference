@@ -539,6 +539,7 @@ impl CandleStarVectorProvider {
         req: &core_llm::StarVectorRequest,
         events: &mut dyn FnMut(core_llm::StarVectorStreamEvent),
     ) -> core_llm::Result<(core_llm::StarVectorOutput, Option<DecodeRecord>)> {
+        let _progress = req.text_request.install_progress();
         core_llm::StarVectorProvider::validate_svg(self, req)?;
         if req.text_request.cancel.is_cancelled() {
             return Err(core_llm::Error::Canceled);
@@ -557,6 +558,7 @@ impl CandleStarVectorProvider {
             })
             .ok_or_else(|| core_llm::Error::InvalidRequest("starvector requires image".into()))?;
         let started = std::time::Instant::now();
+        core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
         let pixels = self
             .processor
             .preprocess(

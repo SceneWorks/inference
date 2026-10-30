@@ -273,6 +273,12 @@ pub enum StageEvent {
 
 /// Observes an engine run. Every method has a no-op default.
 pub trait EngineObserver {
+    /// An autoregressive prefix is about to be encoded after its model is available.
+    fn on_prompt_encoding(&mut self) {}
+
+    /// The actual prefix prefill yielded before token sampling or acoustic solving.
+    fn on_prompt_encoding_complete(&mut self) {}
+
     /// A stage started, finished or was reused.
     fn on_stage(&mut self, stage: Stage, event: StageEvent) {
         let _ = (stage, event);
@@ -600,6 +606,18 @@ struct TokenForward<'a> {
 }
 
 impl DecodeObserver for TokenForward<'_> {
+    fn on_prompt_progress(&mut self, event: gen_core::Progress) {
+        match event {
+            gen_core::Progress::Loading(gen_core::LoadPhase::EncodingPrompt) => {
+                self.observer.on_prompt_encoding()
+            }
+            gen_core::Progress::PromptEncodingComplete => {
+                self.observer.on_prompt_encoding_complete()
+            }
+            _ => unreachable!("prompt helper emits only prompt boundaries"),
+        }
+    }
+
     fn on_token(&mut self, _phase: Phase, token: u32) {
         self.observer.on_token(self.stage, token);
     }
@@ -611,6 +629,18 @@ struct ProgressForward<'a> {
 }
 
 impl SynthesisObserver for ProgressForward<'_> {
+    fn on_prompt_progress(&mut self, event: gen_core::Progress) {
+        match event {
+            gen_core::Progress::Loading(gen_core::LoadPhase::EncodingPrompt) => {
+                self.observer.on_prompt_encoding()
+            }
+            gen_core::Progress::PromptEncodingComplete => {
+                self.observer.on_prompt_encoding_complete()
+            }
+            _ => unreachable!("prompt helper emits only prompt boundaries"),
+        }
+    }
+
     fn on_progress(&mut self, completed: usize, total: usize) {
         self.observer.on_synthesis_progress(completed, total);
     }

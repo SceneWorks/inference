@@ -365,7 +365,7 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
                     gib(dh),
                 );
             }
-            Progress::Loading(_) | Progress::PromptUpsamplingComplete | Progress::ConditioningComplete | Progress::Upsampling { .. } => {}
+            Progress::Loading(_) | Progress::PromptUpsamplingComplete | Progress::PromptEncodingComplete | Progress::ConditioningComplete | Progress::Upsampling { .. } => {}
         })
         .unwrap_or_else(|e| panic!("{engine_id} ({tier}) generate: {e}"));
     probe.end_gen(generate_phase);

@@ -86,7 +86,9 @@ fn render(generator: &dyn Generator, request: &GenerationRequest) -> (Vec<u8>, V
     let mut loads = Vec::new();
     let output = generator
         .generate(request, &mut |progress| {
-            if let Progress::Loading(phase) = progress {
+            if let Progress::Loading(phase @ (LoadPhase::TextEncoder | LoadPhase::Renderer)) =
+                progress
+            {
                 loads.push(phase);
             }
         })

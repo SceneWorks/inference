@@ -925,7 +925,11 @@ impl MiniMaxH3 {
     /// The prefix trim is what keeps this to the 50 layers the tap runs: `lm_prefixes` names
     /// `embed_tokens` and layers `0..50`, so the header-only mmap never materializes layers 50-63,
     /// the final norm or `lm_head`.
-    fn encode_prompt(&self, prompt: &str) -> Result<candle_gen::candle_core::Tensor> {
+    fn encode_prompt(
+        &self,
+        prompt: &str,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<candle_gen::candle_core::Tensor> {
         let phase = PhaseLog::start("text_encoder");
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let (ids, mask) = tok.encode_prompt(prompt, &self.device)?;
@@ -942,7 +946,8 @@ impl MiniMaxH3 {
         )?;
         let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
         drop(w);
-        let context = te.forward(&ids, &mask)?;
+        let context =
+            candle_gen::gen_core::with_prompt_encoding(on_progress, || te.forward(&ids, &mask))?;
         // candle is eager, so `context` is already materialized here and dropping the encoder
         // genuinely frees its weights — there is no lazy graph holding them alive.
         drop(te);
@@ -966,6 +971,7 @@ impl MiniMaxH3 {
         &self,
         prompt: &str,
         keyframes: &[&Image],
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(candle_gen::candle_core::Tensor, Vec<u32>)> {
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let cfg = MiniMaxH3TeConfig::from_component_dir(&self.tiers.text_encoder_dir)?;
@@ -991,13 +997,15 @@ impl MiniMaxH3 {
         )?;
         let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
         drop(w);
-        let context = te.forward_with_images(
-            &ids,
-            &mask,
-            &grounded.embeds,
-            &grounded.deepstack,
-            &grounded.grids,
-        )?;
+        let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+            te.forward_with_images(
+                &ids,
+                &mask,
+                &grounded.embeds,
+                &grounded.deepstack,
+                &grounded.grids,
+            )
+        })?;
         drop(te);
         drop(grounded);
         crate::dit::release_device_memory(&self.device)?;
@@ -1072,12 +1080,12 @@ impl MiniMaxH3 {
         };
 
         let (context, text_tags) = if anchors.is_empty() {
-            let context = self.encode_prompt(&req.prompt)?;
+            let context = self.encode_prompt(&req.prompt, on_progress)?;
             let tags = vec![crate::denoise::TEXT_TAG; context.dims()[1]];
             (context, tags)
         } else {
             let refs: Vec<&Image> = fitted.iter().collect();
-            self.encode_prompt_grounded(&req.prompt, &refs)?
+            self.encode_prompt_grounded(&req.prompt, &refs, on_progress)?
         };
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
@@ -1355,7 +1363,8 @@ impl MiniMaxH3 {
         }
 
         // --- 1. the conditioner: vision tower over the visual references, then the 66.7 GB LM ---
-        let (context, text_tags) = self.encode_prompt_ref2va(&req.prompt, &normalized)?;
+        let (context, text_tags) =
+            self.encode_prompt_ref2va(&req.prompt, &normalized, on_progress)?;
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -1623,6 +1632,7 @@ impl MiniMaxH3 {
         &self,
         prompt: &str,
         references: &[Ref2VaReference],
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(candle_gen::candle_core::Tensor, Vec<u32>)> {
         use crate::reference::{
             sample_video_condition_frames, ReferencePresentation, VIDEO_SAMPLE_FPS,
@@ -1727,18 +1737,19 @@ impl MiniMaxH3 {
         )?;
         let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
         drop(w);
-        let context = te.forward_with_references(
-            &ids,
-            &mask,
-            &grounded.embeds,
-            &grounded.deepstack,
-            &grounded.grids,
-        )?;
+        let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+            te.forward_with_references(
+                &ids,
+                &mask,
+                &grounded.embeds,
+                &grounded.deepstack,
+                &grounded.grids,
+            )
+        })?;
         drop(te);
         drop(grounded);
         crate::dit::release_device_memory(&self.device)?;
         phase.done();
-
         if context.dims()[1] != tags.len() {
             return Err(CandleError::Msg(format!(
                 "{MODEL_ID}: the ref2va context has {} rows but {} modality tags",

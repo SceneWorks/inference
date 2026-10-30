@@ -90,6 +90,8 @@ pub struct DecodeRequest<'a> {
 
 /// Observes a decode as it runs. Every method has a no-op default.
 pub trait DecodeObserver {
+    /// Universal logical prefix-encoding boundaries; no synchronization is implied.
+    fn on_prompt_progress(&mut self, _event: gen_core::Progress) {}
     /// The logits row step `step` samples from — the CFG-mixed row under guidance, the
     /// conditional row otherwise — before any mask or penalty.
     fn on_logits(&mut self, step: usize, logits: &[f32]) {
@@ -215,14 +217,18 @@ pub fn decode_tokens(
         let logits = lm.prefill(ids, &mut cache, || check_cancel(cancelled))?;
         Ok((host_row(&logits)?, cache))
     };
-    let (mut conditional, mut positive) = prefill(request.prefix)?;
-    let mut negative = match guidance {
-        Some(g) => {
-            check_cancel(cancelled)?;
-            Some(prefill(g.negative)?)
-        }
-        None => None,
-    };
+    let (mut conditional, mut positive, mut negative) =
+        gen_core::with_prompt_encoding(&mut |event| observer.on_prompt_progress(event), || {
+            let (conditional, positive) = prefill(request.prefix)?;
+            let negative = match guidance {
+                Some(g) => {
+                    check_cancel(cancelled)?;
+                    Some(prefill(g.negative)?)
+                }
+                None => None,
+            };
+            Ok::<_, gen_core::Error>((conditional, positive, negative))
+        })?;
     let prefill_seconds = start.elapsed().as_secs_f64();
     let end = request.phase.end_token();
     let mut history = Vec::new();
