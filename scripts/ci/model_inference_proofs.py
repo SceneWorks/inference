@@ -26,6 +26,7 @@ from scripts.ci.model_proof_parent_helpers import validate_parent_helpers
 from scripts.ci.model_proof_resources import validate_child_visibility
 from scripts.ci.model_proof_inputs import assess_inputs, receipt_claims, validate_contract
 from scripts.ci import model_proof_multi_cuda as multi_cuda
+from scripts.ci import krea_recovery
 from scripts.ci.native_darwin_sdk import select_sdk as select_native_darwin_sdk
 from scripts.ci.prepare_iris_quant_proof_assets import validate_receipt as validate_iris_asset_receipt
 from scripts.ci.prepare_bespoke_training_proof_assets import exact_bindings as bespoke_training_bindings
@@ -341,6 +342,7 @@ def configured_case(row: dict, name: str | None = None) -> dict:
         result.pop('required_cuda_physical_index', None)
     if 'execution_lane' in recipe:
         result['execution_lane'] = recipe['execution_lane']
+    krea_recovery.validate_binding(result)
     return result
 
 
@@ -651,7 +653,8 @@ def verify_execution(row: dict, text: str) -> dict:
             or (not expected and not all(value.startswith('mlx-') for value in observed))):
         raise ValueError('actual in-scope device SET differs from the case contract: ' + repr(sorted(observed)))
     return {'successful_libtest_summaries': len(results), 'body_completed': 1,
-            'parent_completed': 1 if parent is not None else None, 'actual_devices': sorted(observed)}
+            'parent_completed': 1 if parent is not None else None, 'actual_devices': sorted(observed),
+            **krea_recovery.verify_execution(row, text)}
 
 
 def repository_identity(expected: str) -> dict:
@@ -1214,6 +1217,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                     published = publish_file(generated / relative, destination, generated, cap, destination_root=artifact, adapter=adapter)
                     published['path'] = destination.relative_to(artifact).as_posix()
                     result['outputs'].append(published)
+                if krea_recovery.applies(row) and krea_recovery.validate_binding(row):
+                    krea_recovery.verify_metrics(row, json.loads((generated / 'krea_bounded_acceleration/metrics.json').read_text(encoding='utf-8')), result, expected)
                 repository_identity(expected)
                 if result['input_grade'] == 'no-input-executed':
                     raise ValueError('external-absent: no input executed; not successful case execution')
@@ -1480,6 +1485,9 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
             raise ValueError('accepted input claims require their exact bounded body logs')
         body = '\n'.join((root / name).read_text(encoding='utf-8', errors='replace') for name in logs)
         execution = verify_execution(approved_rows[index], body)
+        if krea_recovery.applies(approved_rows[index]) and krea_recovery.validate_binding(approved_rows[index]):
+            metrics = root / f'{index:05d}/generated/krea_bounded_acceleration/metrics.json'
+            krea_recovery.verify_metrics(approved_rows[index], json.loads(metrics.read_text(encoding='utf-8')), execution, expected)
         if any(case.get(key) != value for key, value in execution.items()):
             raise ValueError('accepted execution differs from its actual body logs')
         if approved_uuids:

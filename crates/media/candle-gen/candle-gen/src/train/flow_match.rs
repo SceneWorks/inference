@@ -990,9 +990,11 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     let cfg = &req.config;
     let device = model.device();
     let bounded_profile = super::profile::active();
+    let recovery_profile = super::profile::recovery_active();
+    let profile_update_limit = if recovery_profile { 6 } else { 18 };
     if bounded_profile
         && (T::LABEL != "krea trainer"
-            || cfg.steps != 18
+            || cfg.steps != profile_update_limit
             || cfg.gradient_accumulation != 1
             || cfg.resume
             || cfg.gradient_checkpointing
@@ -1002,7 +1004,16 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             || cfg.sample_every < cfg.steps
             || cfg.save_every != 0)
     {
-        return Err(CandleError::Msg("bounded Krea profile requires CUDA,18 total updates,rank16,1024px,accum1,checkpoint OFF,no resume/intermediate save,and existing preview cadence beyond the bounded run".into()));
+        return Err(CandleError::Msg("bounded Krea profile requires its exact source-owned update limit (18 default or 6 explicit recovery), CUDA,rank16,1024px,accum1,checkpoint OFF,no resume/intermediate save,and existing preview cadence beyond the bounded run".into()));
+    }
+    if recovery_profile
+        && (cfg.alpha != 16.
+            || cfg.seed != 7
+            || cfg.train_dtype != "bf16"
+            || cfg.sample_every != 500
+            || cfg.network_type != NetworkType::Lora)
+    {
+        return Err(CandleError::Msg("six-update Krea recovery requires the unchanged rank16/alpha16 BF16 seed7 LoRA recipe and preview cadence500".into()));
     }
     on_progress(TrainingProgress::Preparing);
     model.preflight(req)?;
@@ -1129,7 +1140,11 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         }
         super::profile::cohort_begin_step(device)?;
         let segment = if bounded_profile {
-            ((step - 1) / 6) as usize
+            if recovery_profile {
+                2
+            } else {
+                ((step - 1) / 6) as usize
+            }
         } else {
             0
         };
@@ -1153,7 +1168,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
                     effective_weight_decay(cfg),
                 )?;
                 update_idx = 0;
-                if segment == 1 {
+                if segment == 1 || recovery_profile {
                     device.synchronize()?;
                     let prepare_start = std::time::Instant::now();
                     model.prepare_training(&mut dit, &mut cache, &mut aux, req, device)?;
@@ -1262,7 +1277,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             if logical_step > 2 {
                 profile_times[segment].push(elapsed);
             }
-            eprintln!("KREA_PROFILE_STEP physical_update={step}/18 segment={segment} logical_step={logical_step} warmup={} seconds={elapsed:.6} loss={loss} attention_candidate={candidate} attention_reference={reference}",logical_step<=2);
+            eprintln!("KREA_PROFILE_STEP physical_update={step}/{profile_update_limit} segment={segment} logical_step={logical_step} warmup={} seconds={elapsed:.6} loss={loss} attention_candidate={candidate} attention_reference={reference}",logical_step<=2);
             super::profile::finish_attribution(segment);
             for grad in &gradient_witnesses {
                 let maximum = grad
@@ -1277,7 +1292,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
                 }
             }
             eprintln!(
-                "KREA_PROFILE_GRADIENTS physical_update={step}/18 finite={} total={}",
+                "KREA_PROFILE_GRADIENTS physical_update={step}/{profile_update_limit} finite={} total={}",
                 gradient_witnesses.len(),
                 set.vars.len()
             );
@@ -1300,6 +1315,9 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
                     return Err(CandleError::Msg(
                         "bounded profile produced no adapter update".into(),
                     ));
+                }
+                if recovery_profile {
+                    eprintln!("KREA_PROFILE_RECOVERY_ADAPTER changed=true");
                 }
                 if segment == 1 {
                     optimized_final = set
@@ -1436,7 +1454,22 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         }
     }
 
-    if bounded_profile {
+    if recovery_profile {
+        if steps_run != 6
+            || profile_losses[2].len() != 6
+            || profile_losses[..2].iter().any(|steps| !steps.is_empty())
+        {
+            return Err(CandleError::Msg(
+                "six-update Krea recovery exceeded or failed its candidate-only budget".into(),
+            ));
+        }
+        #[cfg(feature = "model-inference-proof")]
+        super::profile::finish_krea_recovery(
+            &profile_times[2],
+            &profile_losses[2],
+            profile_candidates[2],
+        )?;
+    } else if bounded_profile {
         if steps_run != 18 || profile_times.iter().any(|t| t.len() != 4) {
             return Err(CandleError::Msg(
                 "bounded profile incomplete; no timing/adoption proof".into(),

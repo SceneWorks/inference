@@ -8,6 +8,8 @@ use std::cell::{Cell, RefCell};
 #[cfg(feature = "model-inference-proof")]
 thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static RECOVERY: Cell<bool> = const { Cell::new(false) };
+    static RECOVERY_REPORT: RefCell<Option<serde_json::Value>> = const { RefCell::new(None) };
     static SEGMENT: Cell<usize> = const { Cell::new(0) };
     static ATTRIBUTION: Cell<bool> = const { Cell::new(false) };
     static TIMES: RefCell<Vec<(String,f64)>> = const { RefCell::new(Vec::new()) };
@@ -47,6 +49,8 @@ pub fn with_bounded_krea_profile<T>(f: impl FnOnce() -> T) -> T {
     impl Drop for Reset {
         fn drop(&mut self) {
             ACTIVE.set(false);
+            RECOVERY.set(false);
+            RECOVERY_REPORT.with(|report| *report.borrow_mut() = None);
             SEGMENT.set(0);
             ATTRIBUTION.set(false);
             TIMES.with(|t| t.borrow_mut().clear());
@@ -55,6 +59,106 @@ pub fn with_bounded_krea_profile<T>(f: impl FnOnce() -> T) -> T {
     let _reset = Reset;
     SEGMENT.set(0);
     f()
+}
+
+/// Explicit continuation of the failed M3 experiment. The eighteen-update default
+/// remains separate; only six fresh candidate updates can enter this scope.
+pub fn recovery_active() -> bool {
+    #[cfg(feature = "model-inference-proof")]
+    {
+        RECOVERY.get()
+    }
+    #[cfg(not(feature = "model-inference-proof"))]
+    {
+        false
+    }
+}
+
+/// Immutable audited scalar observations, never executable artifact content.
+#[cfg(feature = "model-inference-proof")]
+pub fn krea_recovery_baseline() -> serde_json::Value {
+    serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../../scripts/ci/krea-recovery-baseline.json"
+    )))
+    .expect("source-owned baseline JSON")
+}
+
+#[cfg(feature = "model-inference-proof")]
+pub fn with_bounded_krea_recovery<T>(f: impl FnOnce() -> T) -> (T, Option<serde_json::Value>) {
+    with_bounded_krea_profile(|| {
+        RECOVERY.set(true);
+        let result = f();
+        let report = RECOVERY_REPORT.with(|report| report.borrow_mut().take());
+        (result, report)
+    })
+}
+
+/// Recovery has no saved shared adapter to restore on NO-GO. Preserve the actual
+/// trained candidate for save/reload/apply, and expose adoption separately.
+#[cfg(feature = "model-inference-proof")]
+pub(crate) fn finish_krea_recovery(
+    times: &[f64],
+    losses: &[f32],
+    candidate_dispatches: u64,
+) -> candle_core::Result<()> {
+    if !recovery_active()
+        || times.len() != 4
+        || losses.len() != 6
+        || times.iter().any(|t| !t.is_finite() || *t <= 0.)
+        || losses.iter().any(|l| !l.is_finite())
+    {
+        candle_core::bail!("incomplete six-update Krea recovery");
+    }
+    let baseline = krea_recovery_baseline();
+    let shared = &baseline["reference_segments"][1]["steps"];
+    let loss_parity = shared
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(losses)
+        .all(|(old, new)| {
+            let old: f64 = old["loss"].as_str().unwrap().parse().unwrap();
+            (old - f64::from(*new)).abs() <= 0.01 * old.abs().max(1.)
+        });
+    let mean = |segment: usize| {
+        baseline["reference_segments"][segment]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(2)
+            .map(|step| step["seconds"].as_str().unwrap().parse::<f64>().unwrap())
+            .sum::<f64>()
+            / 4.
+    };
+    let reference = mean(0);
+    let shared = mean(1);
+    let candidate = times.iter().sum::<f64>() / 4.;
+    let uncertainty = baseline["timing_mean_rounding_uncertainty_seconds"]
+        .as_f64()
+        .unwrap();
+    let go_ambiguous = (candidate - shared).abs() <= uncertainty;
+    let go = candidate_dispatches > 0 && loss_parity && candidate < shared - uncertainty;
+    let target_ambiguous = (candidate - 0.75 * reference).abs() <= 0.75 * uncertainty;
+    let target_met = go && !target_ambiguous && candidate <= 0.75 * (reference - uncertainty);
+    let report = serde_json::json!({
+        "schema_version": 1, "new_optimizer_updates": 6, "new_segment": 2,
+        "steady_updates": 4, "prior_conservative_update_charge": 14,
+        "hard_update_cap": 20, "remaining_updates_after_success": 0,
+        "baseline": baseline, "reference_logged_mean_seconds": reference,
+        "shared_logged_mean_seconds": shared, "candidate_mean_seconds": candidate,
+        "candidate_steady_seconds": times, "candidate_losses": losses,
+        "candidate_dispatches": candidate_dispatches, "loss_parity": loss_parity,
+        "candidate_go": go, "go_rounding_boundary_ambiguous": go_ambiguous,
+        "target_met": target_met, "target_rounding_boundary_ambiguous": target_ambiguous,
+        "candidate_reduction_vs_original_logged_mean": 1. - candidate / reference,
+        "saved_adapter_role": "actual-six-update-candidate-even-on-no-go",
+        "shared_adapter_available": false,
+        "claim_limit": "Cross-run recovery, not a new matched 18-update invocation. Original reference source/run/log identity retained; unchanged source/input closure qualification is mandatory. NO-GO never means a default Reference or saved shared-adapter success. Smoke completion does not imply attention adoption, the 25 percent target or convergence."
+    });
+    eprintln!("KREA_PROFILE_RECOVERY_RESULT {report}");
+    RECOVERY_REPORT.with(|state| *state.borrow_mut() = Some(report));
+    Ok(())
 }
 
 pub(crate) fn begin_step(segment: usize, logical_step: u32) {

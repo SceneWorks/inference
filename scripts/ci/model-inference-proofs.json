@@ -49845,20 +49845,24 @@
       "cuda",
       "model-inference-proof"
     ],
-    "fixture_identity": "Krea 2 Raw BF16 with actual external model/tokenizer/configuration readers and two source-generated swatches; matched reference/shared/candidate segments totaling 18 optimizer updates, selected adapter reload/apply and one generated sample. Provisioned path/layout is not content-integrity or named-revision attestation.",
+    "fixture_identity": "Krea 2 Raw BF16 with actual external model/tokenizer/configuration readers and two source-generated swatches; matched reference/shared/candidate segments totaling 18 optimizer updates, selected adapter reload/apply and one generated sample. Provisioned path/layout is not content-integrity or named-revision attestation. Explicit fixed_cuda_candidate_recovery instead executes six NEW candidate updates with separately identified audited original reference scalar evidence; no baseline replay.",
     "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs::trainer_e2e::krea_bounded_acceleration_profile",
     "required_environment": [
       "KREA_RAW_DIR",
       "MODEL_PROOF_OUTPUT_DIR"
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
-    "output_contract": "Exactly one successful libtest summary, one late actual-FQN BODY and actual learned candle-cuda DEVICE witnesses; required input receipts retain their declared grades. Retain the three declared generated files plus body stdout/stderr. metrics.json records completed updates, fixed configuration, losses, selected adapter final loss and training/preparation device peak; body.stderr.log carries synchronized attribution, warmup/steady timings, dispatch counts, candidate go/no-go and the unchanged >=25% target result. A successful smoke body is not a speed-target PASS or convergence evidence.",
-    "configuration_controls": [],
+    "output_contract": "Exactly one successful libtest summary, one late actual-FQN BODY and actual learned candle-cuda DEVICE witnesses; required input receipts retain their declared grades. Retain the three declared generated files plus body stdout/stderr. metrics.json records completed updates, fixed configuration, losses, selected adapter final loss and training/preparation device peak; body.stderr.log carries synchronized attribution, warmup/steady timings, dispatch counts, candidate go/no-go and the unchanged >=25% target result. A successful smoke body is not a speed-target PASS or convergence evidence. Recovery configuration additionally requires exact six candidate starts/commits/step/224gradient records and a validated source-bound KREA_PROFILE_RECOVERY_RESULT; always actual candidate adapter onNO-GO, adoption and25percent remain separate decisions.",
+    "configuration_controls": [
+      "KREA_PROFILE_CANDIDATE_RECOVERY"
+    ],
     "default_configuration": "fixed_cuda",
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs::trainer_e2e::krea_bounded_acceleration_profile/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "KREA_PROFILE_CANDIDATE_RECOVERY": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -49877,9 +49881,34 @@
         ],
         "required_cuda_physical_index": 1,
         "cuda_activity_profile": "non-isolated-correctness-headroom"
+      },
+      "fixed_cuda_candidate_recovery": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs::trainer_e2e::krea_bounded_acceleration_profile/fixed_cuda_candidate_recovery",
+        "environment": {
+          "KREA_PROFILE_CANDIDATE_RECOVERY": "1"
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Exactly SIX NEW candidate optimizer updates only (2warmup+4timed), fresh original seed7/rank16/alpha16/BF16/1024/batch1/accum1/checkpointOFF/cadence500; original M3 segments retain original source/run identity. Current conservative prior charge14+new6=hard20. Save/reload/apply actual candidate even onNO-GO and one1024RGB/28step/seed7 sample.",
+        "required_work": [
+          "Hard source/binding/workloop limit SIX NEW updates, only segment2 with logical1..6, fresh initial factors/optimizer/RNG/input schedule. Never rerun segments0/1 or claim18 new updates; no reference adapter is recovered.",
+          "First two updates warmup excluded; four synchronized measured timings, first-update attribution, every224 finite adapter gradient and actual nonzero factor updates, real dispatches and sampled selected-device peak.",
+          "Compare ALL SIX candidate losses against source-bound original M3 shared losses with absdiff<=0.01*max(abs(shared),1); GO only if actual candidate dispatches and strictly faster four-update mean, respecting original logged timing rounding uncertainty0.5microsecond. Preserve original source69c25a1d87f761464cb200802dfbb04125e9f54c/run41127490702/attempt1/artifact13013732335/stderrhash.",
+          "Original failed artifact remains immutable and UNACCEPTED; cross-run timing requires separately proved unchanged source/input closure before dispatch. No same-run matched18 claim, no named weight byte attestation.",
+          "Always save/reopen/apply the ACTUAL six-update trained candidate even onNO-GO and generate exactly ONE1024RGB,28denoise,seed7sample. NO-GO has no shared/defaultReference adapter success or25percent acceptance. Report original rounded reference mean/uncertainty, candidateGO and unchanged25percent target separately from smoke."
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "source_guard": "candidate-only-six-new-updates;prior-conservative-charge14;hard-cap20;no-reference-replay"
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "mixed",
       "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs::trainer_e2e::krea_bounded_acceleration_profile",

@@ -104,6 +104,7 @@ pub(crate) fn try_streaming(
     masked: bool,
 ) -> candle_core::Result<Option<Tensor>> {
     let eligible = MODE.get() == TrainingAttentionMode::StreamingCandidate
+        && !candle_core::backprop::grad_do_not_detach()
         && streaming_eligible(
             cfg!(feature = "cuda") && q.device().is_cuda(),
             q.device().same_device(k.device()) && q.device().same_device(v.device()),
@@ -183,19 +184,32 @@ mod cuda {
             let func = module
                 .function("attention_forward")
                 .map_err(candle_core::Error::wrap)?;
-            let q = q.as_cuda_slice::<f32>()?.slice(ql.start_offset()..);
-            let k = k.as_cuda_slice::<f32>()?.slice(kl.start_offset()..);
-            let v = v.as_cuda_slice::<f32>()?.slice(vl.start_offset()..);
+
             let mut dst = unsafe { dev.alloc::<f32>(b * h * sq * (d + 1))? };
             let dims = [b * h * sq, h, hk, sq, sk, d].map(|n| n as i32);
             let stream = dev.cuda_stream();
             let mut launch = stream.launch_builder(&func);
-            launch.arg(&q).arg(&k).arg(&v).arg(&mut dst);
-            for dim in &dims {
-                launch.arg(dim);
+            macro_rules! launch_inputs {
+                ($ty:ty, $dtype:expr) => {{
+                    let q = q.as_cuda_slice::<$ty>()?.slice(ql.start_offset()..);
+                    let k = k.as_cuda_slice::<$ty>()?.slice(kl.start_offset()..);
+                    let v = v.as_cuda_slice::<$ty>()?.slice(vl.start_offset()..);
+                    let dtype: i32 = $dtype;
+                    launch.arg(&q).arg(&k).arg(&v).arg(&mut dst);
+                    for dim in &dims {
+                        launch.arg(dim);
+                    }
+                    launch.arg(&dtype).arg(&self.0);
+                    unsafe { launch.launch(config(b * h * sq)) }
+                        .map_err(candle_core::Error::wrap)?;
+                }};
             }
-            launch.arg(&self.0);
-            unsafe { launch.launch(config(b * h * sq)) }.map_err(candle_core::Error::wrap)?;
+            match q.dtype() {
+                DType::F32 => launch_inputs!(f32, 0),
+                DType::BF16 => launch_inputs!(half::bf16, 1),
+                DType::F16 => launch_inputs!(half::f16, 2),
+                _ => candle_core::bail!("unsupported streaming attention dtype"),
+            }
             Ok((
                 CudaStorage::wrap_cuda_slice(dst, dev.clone()),
                 Shape::from((b, h, sq, d + 1)),
@@ -223,9 +237,24 @@ mod cuda {
             let nq = q.elem_count();
             let nk = k.elem_count();
             Ok((
-                Some(packed.narrow(0, 0, nq)?.reshape(q.shape())?),
-                Some(packed.narrow(0, nq, nk)?.reshape(k.shape())?),
-                Some(packed.narrow(0, nq + nk, nk)?.reshape(v.shape())?),
+                Some(
+                    packed
+                        .narrow(0, 0, nq)?
+                        .reshape(q.shape())?
+                        .to_dtype(q.dtype())?,
+                ),
+                Some(
+                    packed
+                        .narrow(0, nq, nk)?
+                        .reshape(k.shape())?
+                        .to_dtype(k.dtype())?,
+                ),
+                Some(
+                    packed
+                        .narrow(0, nq + nk, nk)?
+                        .reshape(v.shape())?
+                        .to_dtype(v.dtype())?,
+                ),
             ))
         }
     }
@@ -262,9 +291,7 @@ mod cuda {
             let (_, hk, sk, _) = kl.shape().dims4()?;
             let dev = q.device();
             let module = SOURCE.compiled(dev).map_err(candle_core::Error::wrap)?;
-            let q = q.as_cuda_slice::<f32>()?.slice(ql.start_offset()..);
-            let k = k.as_cuda_slice::<f32>()?.slice(kl.start_offset()..);
-            let v = v.as_cuda_slice::<f32>()?.slice(vl.start_offset()..);
+
             let (out, ol) = self.out.storage_and_layout();
             let (grad, gl) = self.grad.storage_and_layout();
             let (Storage::Cuda(out), Storage::Cuda(grad)) = (&*out, &*grad) else {
@@ -279,18 +306,32 @@ mod cuda {
                 let func = module.function(name).map_err(candle_core::Error::wrap)?;
                 let dims = [rows, h, hk, sq, sk, d].map(|n| n as i32);
                 let mut launch = stream.launch_builder(&func);
-                launch
-                    .arg(&q)
-                    .arg(&k)
-                    .arg(&v)
-                    .arg(&out)
-                    .arg(&grad)
-                    .arg(&mut dst);
-                for dim in &dims {
-                    launch.arg(dim);
+                macro_rules! launch_inputs {
+                    ($ty:ty, $dtype:expr) => {{
+                        let q = q.as_cuda_slice::<$ty>()?.slice(ql.start_offset()..);
+                        let k = k.as_cuda_slice::<$ty>()?.slice(kl.start_offset()..);
+                        let v = v.as_cuda_slice::<$ty>()?.slice(vl.start_offset()..);
+                        let dtype: i32 = $dtype;
+                        launch
+                            .arg(&q)
+                            .arg(&k)
+                            .arg(&v)
+                            .arg(&out)
+                            .arg(&grad)
+                            .arg(&mut dst);
+                        for dim in &dims {
+                            launch.arg(dim);
+                        }
+                        launch.arg(&dtype).arg(&self.scale);
+                        unsafe { launch.launch(config(rows)) }.map_err(candle_core::Error::wrap)?;
+                    }};
                 }
-                launch.arg(&self.scale);
-                unsafe { launch.launch(config(rows)) }.map_err(candle_core::Error::wrap)?;
+                match q.dtype() {
+                    DType::F32 => launch_inputs!(f32, 0),
+                    DType::BF16 => launch_inputs!(half::bf16, 1),
+                    DType::F16 => launch_inputs!(half::f16, 2),
+                    _ => candle_core::bail!("unsupported streaming attention dtype"),
+                }
             }
             Ok((
                 CudaStorage::wrap_cuda_slice(dst, dev.clone()),
@@ -311,9 +352,9 @@ mod cuda {
         v: &Tensor,
         scale: f32,
     ) -> candle_core::Result<Tensor> {
-        let qf = q.to_dtype(DType::F32)?.contiguous()?;
-        let kf = k.to_dtype(DType::F32)?.contiguous()?;
-        let vf = v.to_dtype(DType::F32)?.contiguous()?;
+        let qf = q.contiguous()?;
+        let kf = k.contiguous()?;
+        let vf = v.contiguous()?;
         qf.apply_op3(&kf, &vf, Forward(scale))?
             .narrow(3, 0, q.dim(3)?)?
             .contiguous()?

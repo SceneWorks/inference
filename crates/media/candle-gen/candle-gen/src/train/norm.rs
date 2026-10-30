@@ -526,6 +526,44 @@ mod ownership_tests {
         let dx = g.get(&x).unwrap();
         assert!(dx.track_op());
         assert!(dx.sorted_nodes().iter().any(|n| n.id() == x.id()));
+        // Head width 32 would dispatch the CUDA candidate in first-order mode.
+        // The cached graph-retaining opt-in must keep the composable graph even
+        // when the caller explicitly selects the candidate.
+        let q32 = Var::from_tensor(&Tensor::from_vec(values(64, 1), (1, 1, 2, 32), &device)?)?;
+        let k32 = Var::from_tensor(&Tensor::from_vec(values(64, 2), (1, 1, 2, 32), &device)?)?;
+        let v32 = Var::from_tensor(&Tensor::from_vec(values(64, 3), (1, 1, 2, 32), &device)?)?;
+        let c32 = Tensor::from_vec(values(64, 4), (1, 1, 2, 32), &device)?;
+        crate::training_attention::take_training_attention_counts();
+        let selected =
+            with_training_attention_mode(TrainingAttentionMode::StreamingCandidate, || {
+                crate::fused_attention::training_sdpa_standard_bhsd(
+                    &q32, &k32, &v32, 0.4, None, plan,
+                )
+            })
+            .map_err(candle_core::Error::wrap)?;
+        assert_eq!(
+            crate::training_attention::take_training_attention_counts(),
+            (0, 1)
+        );
+        let composable = crate::attention::sdpa_planned_bhsd(
+            &q32,
+            &k32,
+            &v32,
+            0.4,
+            None,
+            |s| candle_nn::ops::softmax(s, D::Minus1),
+            plan,
+        )
+        .map_err(candle_core::Error::wrap)?;
+        gradients(&selected, &composable, &c32, &[&q32, &k32, &v32], 2e-5)?;
+        let grad = selected.mul(&c32)?.sum_all()?.backward()?;
+        assert!(grad.get(&q32).unwrap().track_op());
+        assert!(grad
+            .get(&q32)
+            .unwrap()
+            .sorted_nodes()
+            .iter()
+            .any(|n| n.id() == k32.id()));
         Ok(())
     }
 }
