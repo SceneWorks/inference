@@ -10,7 +10,7 @@ pub(super) struct MappedRead {
     start: usize,
     len: usize,
     context: LoadActivityContext,
-    ranges: Mutex<HashMap<LoadActivityPhase, (BTreeMap<usize, usize>, u64)>>,
+    ranges: Mutex<HashMap<(u64, LoadActivityPhase), (BTreeMap<usize, usize>, u64)>>,
 }
 fn mappings() -> &'static Mutex<Vec<Weak<MappedRead>>> {
     static MAPPINGS: OnceLock<Mutex<Vec<Weak<MappedRead>>>> = OnceLock::new();
@@ -32,17 +32,17 @@ impl MappedRead {
         mappings.push(Arc::downgrade(&read));
         read
     }
-    fn consumed(&self, phase: LoadActivityPhase) -> u64 {
+    fn consumed(&self, request: u64, phase: LoadActivityPhase) -> u64 {
         self.ranges
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&phase)
+            .get(&(request, phase))
             .map(|v| v.1)
             .unwrap_or(0)
     }
-    fn add(&self, phase: LoadActivityPhase, mut start: usize, mut end: usize) -> u64 {
+    fn add(&self, request: u64, phase: LoadActivityPhase, mut start: usize, mut end: usize) -> u64 {
         let mut phases = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
-        let state = phases.entry(phase).or_default();
+        let state = phases.entry((request, phase)).or_default();
         if let Some((&a, &b)) = state.0.range(..=start).next_back() {
             if b >= start {
                 start = a;
@@ -73,8 +73,10 @@ impl MappedRead {
             self.context.clone()
         };
         let activity = context.file(phase, &self.path, Some(self.len as u64));
-        activity.update(self.consumed(phase));
+        let request = context.request_id();
+        activity.update(self.consumed(request, phase));
         Consumption {
+            request,
             phase,
             read: self.clone(),
             start,
@@ -95,6 +97,7 @@ impl MappedRead {
     }
 }
 pub(super) struct Consumption {
+    request: u64,
     phase: LoadActivityPhase,
     read: Arc<MappedRead>,
     start: usize,
@@ -103,8 +106,10 @@ pub(super) struct Consumption {
 }
 impl Consumption {
     pub(super) fn complete(&self) {
-        self.activity
-            .update(self.read.add(self.phase, self.start, self.end));
+        self.activity.update(
+            self.read
+                .add(self.request, self.phase, self.start, self.end),
+        );
     }
 }
 impl Drop for Consumption {

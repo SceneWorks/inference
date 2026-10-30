@@ -33,6 +33,7 @@ type Observer = Arc<dyn Fn(Option<LoadActivity>) + Send + Sync>;
 #[derive(Default)]
 struct Request {
     observer: Option<Observer>,
+    id: u64,
     next: u64,
     active: u64,
     activities: HashMap<u64, (u64, LoadActivity)>,
@@ -49,6 +50,16 @@ pub struct LoadActivityContext {
 thread_local! { static CONTEXT: RefCell<LoadActivityContext> = RefCell::default(); }
 
 impl LoadActivityContext {
+    /// Stable, process-unique request identity without retaining its observer in reader counters.
+    pub fn request_id(&self) -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+        let mut request = self.request.lock().unwrap_or_else(|e| e.into_inner());
+        if request.id == 0 {
+            request.id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+        }
+        request.id
+    }
     pub fn capture() -> Self {
         CONTEXT.with(|v| v.borrow().clone())
     }
