@@ -2185,8 +2185,7 @@ impl Generator for StableAudio3Generator {
                 total: total as u32,
             });
         };
-        let mut encoding =
-            || (progress.borrow_mut())(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
+        let mut encoding = |event| (progress.borrow_mut())(event);
         let mut decoding = || (progress.borrow_mut())(Progress::Decoding);
         // Both conditioning paths resolve through a function that is reachable — and gated —
         // without weights, because `generate` is not: `reference_audio_for` carries the one

@@ -302,13 +302,13 @@ impl Generator for KokoroGenerator {
         let pack = self.voice_pack(voice)?;
         let ref_s = pack.ref_s(tokens.len()).to_vec();
 
-        on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
-
         // target_duration → speed factor from the duration head's natural estimate, clamped
         // to the model's usable range.
         let speed = match audio.target_duration {
             Some(target) if target > 0.0 => {
-                let raw = pipeline.raw_durations(&tokens, &ref_s)?;
+                let raw = gen_core::with_prompt_encoding(on_progress, || {
+                    pipeline.raw_durations(&tokens, &ref_s)
+                })?;
                 let natural = pipeline.natural_duration_secs(&raw);
                 (natural / target).clamp(0.5, 2.0)
             }
@@ -317,13 +317,14 @@ impl Generator for KokoroGenerator {
 
         let seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let cancel = req.cancel.clone();
+        let progress = std::cell::RefCell::new(on_progress);
         let mut stage = |current: u32| -> AudioResult<()> {
             // The vocoder is the terminal decode phase (Progress contract: Decoding exactly
             // once) — announce it before the last stage runs.
             if current == STAGES - 1 {
-                on_progress(Progress::Decoding);
+                (progress.borrow_mut())(Progress::Decoding);
             }
-            on_progress(Progress::Step {
+            (progress.borrow_mut())(Progress::Step {
                 current,
                 total: STAGES,
             });
@@ -335,10 +336,15 @@ impl Generator for KokoroGenerator {
         // The probe reaches inside the dominant stage-5 decoder/vocoder so a cancel lands
         // promptly mid-synthesis, not only at stage boundaries.
         let probe = req.cancel.clone();
-        let samples =
-            pipeline.synthesize(&tokens, &ref_s, speed, seed, &mut stage, &move || {
-                probe.is_cancelled()
-            })?;
+        let samples = pipeline.synthesize_with_prompt_progress(
+            &tokens,
+            &ref_s,
+            speed,
+            seed,
+            &mut stage,
+            &move || probe.is_cancelled(),
+            &mut |event| (progress.borrow_mut())(event),
+        )?;
 
         // Guard the advertised duration cap at the output too (the floor already bounds
         // target_duration; a runaway duration head must not exceed the advertisement wildly).

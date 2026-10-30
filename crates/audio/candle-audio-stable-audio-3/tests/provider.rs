@@ -543,6 +543,7 @@ fn run_case(case: &Case) {
                 Progress::Decoding => decoding += 1,
                 Progress::Loading(_)
                 | Progress::PromptUpsamplingComplete
+                | Progress::PromptEncodingComplete
                 | Progress::ConditioningComplete
                 | Progress::Upsampling { .. } => {}
             },
@@ -608,6 +609,7 @@ fn run_default_case(case: &Case) {
                 Progress::Decoding => decoding += 1,
                 Progress::Loading(_)
                 | Progress::PromptUpsamplingComplete
+                | Progress::PromptEncodingComplete
                 | Progress::ConditioningComplete
                 | Progress::Upsampling { .. } => {}
             },

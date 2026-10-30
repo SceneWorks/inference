@@ -309,10 +309,31 @@ pub struct MmAudioPipeline {
 pub enum PipelineProgress {
     /// CLIP text conditioning is about to be encoded.
     EncodingPrompt,
+    /// The logical text-encoding call returned without forcing lazy device work.
+    PromptEncodingComplete,
     /// Euler step `k` of `total` completed.
     Step(usize),
     /// The DiT finished; the 16k decoder (VAE + BigVGAN) is running.
     Decoding,
+}
+
+/// Adapt the universal prompt lifecycle to this pipeline's existing progress callback.
+pub(crate) fn with_prompt_encoding<T>(
+    progress: &mut dyn FnMut(PipelineProgress),
+    encode: impl FnOnce() -> candle_audio::Result<T>,
+) -> candle_audio::Result<T> {
+    candle_audio::gen_core::with_prompt_encoding(
+        &mut |event| match event {
+            candle_audio::gen_core::Progress::Loading(
+                candle_audio::gen_core::LoadPhase::EncodingPrompt,
+            ) => progress(PipelineProgress::EncodingPrompt),
+            candle_audio::gen_core::Progress::PromptEncodingComplete => {
+                progress(PipelineProgress::PromptEncodingComplete)
+            }
+            _ => unreachable!("prompt lifecycle helper emits only prompt boundaries"),
+        },
+        encode,
+    )
 }
 
 impl MmAudioPipeline {
@@ -373,9 +394,11 @@ impl MmAudioPipeline {
         let sync_rgb = resample_frames(frames, src_fps, SYNC_FPS, sync_rgb_count)?;
 
         let clip_feat = self.encode_clip_visual(&clip_rgb)?; // (1, clip_seq_len, 1024)
-        progress(PipelineProgress::EncodingPrompt);
-        let text_feat = self.encode_text(prompt)?; // (1, 77, 1024)
-        let neg_text_feat = self.encode_text(negative_prompt)?; // (1, 77, 1024)
+        let (text_feat, neg_text_feat) = with_prompt_encoding(progress, || {
+            let text_feat = self.encode_text(prompt)?; // (1, 77, 1024)
+            let neg_text_feat = self.encode_text(negative_prompt)?; // (1, 77, 1024)
+            Ok((text_feat, neg_text_feat))
+        })?;
         if probe() {
             return Err(AudioError::Canceled);
         }
@@ -654,6 +677,9 @@ impl Generator for MmAudioGenerator {
         let mut progress = |p: PipelineProgress| match p {
             PipelineProgress::EncodingPrompt => {
                 on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt))
+            }
+            PipelineProgress::PromptEncodingComplete => {
+                on_progress(Progress::PromptEncodingComplete)
             }
             PipelineProgress::Step(k) => on_progress(Progress::Step {
                 current: k as u32,
@@ -947,5 +973,39 @@ mod tests {
         let req = foley_req(foley_frames(8, 16, 16, 0), 8);
         let err = g.generate(&req, &mut |_| {}).unwrap_err();
         assert!(!matches!(err, gen_core::Error::Canceled));
+    }
+}
+
+#[cfg(test)]
+mod prompt_progress_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_stage_yields_before_following_conditioning_on_success_and_cancel() {
+        use std::cell::RefCell;
+        for canceled in [false, true] {
+            let trace = RefCell::new(Vec::new());
+            let mut progress = |event| {
+                trace.borrow_mut().push(match event {
+                    PipelineProgress::EncodingPrompt => "encoding",
+                    PipelineProgress::PromptEncodingComplete => "yielded",
+                    _ => panic!("prompt stage must not emit generation steps"),
+                })
+            };
+            let result = with_prompt_encoding(&mut progress, || {
+                trace.borrow_mut().push("encoder-call");
+                if canceled {
+                    Err(candle_audio::AudioError::Canceled)
+                } else {
+                    Ok(())
+                }
+            });
+            trace.borrow_mut().push("next-conditioner");
+            assert_eq!(result.is_err(), canceled);
+            assert_eq!(
+                *trace.borrow(),
+                ["encoding", "encoder-call", "yielded", "next-conditioner"]
+            );
+        }
     }
 }

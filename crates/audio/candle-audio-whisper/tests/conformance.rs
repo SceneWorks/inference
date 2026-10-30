@@ -151,6 +151,7 @@ fn whisper_transcribes_kokoro_roundtrip_within_cer() {
             Progress::Decoding => decoding += 1,
             Progress::Loading(_)
             | Progress::PromptUpsamplingComplete
+            | Progress::PromptEncodingComplete
             | Progress::ConditioningComplete
             | Progress::Upsampling { .. } => {}
         })

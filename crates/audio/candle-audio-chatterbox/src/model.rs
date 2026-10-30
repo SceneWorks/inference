@@ -492,15 +492,15 @@ impl ChatterboxGenerator {
 
         let mut guard = lock_recover(&self.t3);
         let t3 = guard.as_mut().unwrap();
-        on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
+        let progress = std::cell::RefCell::new(on_progress);
         let mut on_step = |step: usize| {
-            on_progress(Progress::Step {
+            (progress.borrow_mut())(Progress::Step {
                 current: step as u32,
                 total: max_new as u32,
             });
         };
         let out = t3
-            .inference(
+            .inference_with_prompt_progress(
                 &cond,
                 &text_tokens,
                 defaults.cfg_weight,
@@ -512,6 +512,7 @@ impl ChatterboxGenerator {
                 &mut rng,
                 &mut on_step,
                 &cancel_fn,
+                &mut |event| (progress.borrow_mut())(event),
             )
             .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: T3 decode: {e}")))?;
         match out {

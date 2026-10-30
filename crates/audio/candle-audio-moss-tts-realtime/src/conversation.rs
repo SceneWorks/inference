@@ -215,6 +215,35 @@ pub fn advance_turn(
     cancel: &dyn Fn() -> bool,
     on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
 ) -> Result<Option<Vec<RvqFrame>>, String> {
+    advance_turn_with_prompt_progress(
+        decoder,
+        tokenizer,
+        cfg,
+        voice_clone,
+        state,
+        turn,
+        base_seed,
+        budget,
+        cancel,
+        on_frame,
+        &mut |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn advance_turn_with_prompt_progress(
+    decoder: &Decoder,
+    tokenizer: &Tokenizer,
+    cfg: &MossTtsRealtimeConfig,
+    voice_clone: Option<&[RvqFrame]>,
+    state: &mut ConvState,
+    turn: &PreparedTurn,
+    base_seed: u64,
+    budget: usize,
+    cancel: &dyn Fn() -> bool,
+    on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
+    on_prompt_progress: &mut dyn FnMut(candle_audio::gen_core::Progress),
+) -> Result<Option<Vec<RvqFrame>>, String> {
     if cancel() {
         return Ok(None);
     }
@@ -232,10 +261,10 @@ pub fn advance_turn(
             })?;
             block.extend(user_body_frames(tokenizer, cfg, &turn.text, codes)?);
             // A user turn is context only: prefill it to warm the cache (no generation).
-            decoder
-                .backbone
-                .prefill(&block, &mut state.cache)
-                .map_err(|e| format!("multi-turn: prefill user turn: {e}"))?;
+            candle_audio::gen_core::with_prompt_encoding(on_prompt_progress, || {
+                decoder.backbone.prefill(&block, &mut state.cache)
+            })
+            .map_err(|e| format!("multi-turn: prefill user turn: {e}"))?;
             state.preceding = Preceding::Turn;
             Ok(Some(codes.clone()))
         }
@@ -261,7 +290,14 @@ pub fn advance_turn(
                         }
                     }
                     match decoder
-                        .replay_turn(&mut state.cache, &block, &streamed, codes, cancel)
+                        .replay_turn_with_prompt_progress(
+                            &mut state.cache,
+                            &block,
+                            &streamed,
+                            codes,
+                            cancel,
+                            on_prompt_progress,
+                        )
                         .map_err(|e| format!("multi-turn: replay assistant turn: {e}"))?
                     {
                         Some(()) => Ok(Some(codes.clone())),
@@ -273,7 +309,7 @@ pub fn advance_turn(
                     let seed = turn_seed(base_seed, state.synth_ordinal);
                     state.synth_ordinal += 1;
                     let result = decoder
-                        .generate_turn(
+                        .generate_turn_with_prompt_progress(
                             &mut state.cache,
                             &block,
                             &streamed,
@@ -281,6 +317,7 @@ pub fn advance_turn(
                             seed,
                             cancel,
                             on_frame,
+                            on_prompt_progress,
                         )
                         .map_err(|e| format!("multi-turn: generate assistant turn: {e}"))?;
                     Ok(result.map(|r| r.frames))
@@ -312,10 +349,37 @@ pub fn render_conversation(
     cancel: &dyn Fn() -> bool,
     on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
 ) -> Result<Option<ConversationFrames>, String> {
+    render_conversation_with_prompt_progress(
+        decoder,
+        tokenizer,
+        cfg,
+        voice_clone,
+        turns,
+        base_seed,
+        budget,
+        cancel,
+        on_frame,
+        &mut |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_conversation_with_prompt_progress(
+    decoder: &Decoder,
+    tokenizer: &Tokenizer,
+    cfg: &MossTtsRealtimeConfig,
+    voice_clone: Option<&[RvqFrame]>,
+    turns: &[PreparedTurn],
+    base_seed: u64,
+    budget: usize,
+    cancel: &dyn Fn() -> bool,
+    on_frame: &mut dyn FnMut(usize, &[u32]) -> CandleResult<()>,
+    on_prompt_progress: &mut dyn FnMut(candle_audio::gen_core::Progress),
+) -> Result<Option<ConversationFrames>, String> {
     let mut state = ConvState::new(decoder);
     let mut out: Vec<Vec<RvqFrame>> = Vec::new();
     for turn in turns {
-        let frames = advance_turn(
+        let frames = advance_turn_with_prompt_progress(
             decoder,
             tokenizer,
             cfg,
@@ -326,6 +390,7 @@ pub fn render_conversation(
             budget,
             cancel,
             on_frame,
+            on_prompt_progress,
         )?;
         match frames {
             None => return Ok(None),

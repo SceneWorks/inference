@@ -285,6 +285,9 @@ impl Generator for MossSfxGenerator {
             crate::pipeline::PipelineProgress::EncodingPrompt => {
                 on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt))
             }
+            crate::pipeline::PipelineProgress::PromptEncodingComplete => {
+                on_progress(Progress::PromptEncodingComplete)
+            }
             crate::pipeline::PipelineProgress::Step(k) => on_progress(Progress::Step {
                 current: k as u32,
                 total,

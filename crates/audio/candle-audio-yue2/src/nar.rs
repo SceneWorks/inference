@@ -571,6 +571,8 @@ pub struct Evaluation<'a> {
 /// Observes a synthesis. Every method has a no-op default; nothing is copied off the device unless
 /// an implementation does it.
 pub trait SynthesisObserver {
+    /// Universal logical prefix-encoding boundaries; no synchronization is implied.
+    fn on_prompt_progress(&mut self, _event: gen_core::Progress) {}
     /// After each midpoint step: `completed` of `total` steps over all chunks.
     fn on_progress(&mut self, completed: usize, total: usize) {
         let _ = (completed, total);
@@ -936,7 +938,10 @@ pub fn solve_chunk(
         ));
     }
     check_cancel(hooks.cancelled)?;
-    let mut solver = ChunkSolver::prefill(nar, input, options.query_tile, hooks.cancelled)?;
+    let mut solver = gen_core::with_prompt_encoding(
+        &mut |event| hooks.observer.on_prompt_progress(event),
+        || ChunkSolver::prefill(nar, input, options.query_tile, hooks.cancelled),
+    )?;
     let offloaded = if options.offload_ar {
         match nar.lm.offload_ar() {
             Ok(bytes) => bytes,

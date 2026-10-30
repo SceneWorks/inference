@@ -1543,12 +1543,14 @@ fn reused_engine_stages_do_not_claim_prompt_encoding() {
             tokens: 0,
         };
         bridge.on_prompt_encoding();
+        bridge.on_prompt_encoding_complete();
         bridge.on_token(Stage::Plan, 1);
     }
     assert!(matches!(
         events.as_slice(),
         [
             Progress::Loading(gen_core::LoadPhase::EncodingPrompt),
+            Progress::PromptEncodingComplete,
             Progress::Step {
                 current: 1,
                 total: 8

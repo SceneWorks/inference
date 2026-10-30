@@ -501,6 +501,9 @@ impl Generator for AceStepGenerator {
             PipelineProgress::EncodingPrompt => {
                 on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt))
             }
+            PipelineProgress::PromptEncodingComplete => {
+                on_progress(Progress::PromptEncodingComplete)
+            }
             PipelineProgress::Step(k) => on_progress(Progress::Step {
                 current: k as u32,
                 total,

@@ -324,6 +324,28 @@ fn engine_events_report_every_segment_with_its_label() {
         })
         .count();
     assert_eq!(finished, 3);
+    let mut encoding = false;
+    let mut completed = 0;
+    for event in &events {
+        match event {
+            crate::YueEvent::PromptEncodingStarted => {
+                assert!(!encoding, "segment prompt stages cannot overlap");
+                encoding = true;
+            }
+            crate::YueEvent::PromptEncodingComplete => {
+                assert!(encoding, "completion requires a real prefix stage");
+                encoding = false;
+                completed += 1;
+            }
+            crate::YueEvent::SegmentFinished { .. } => assert!(
+                !encoding,
+                "prefix stage must yield before the segment's sampled output"
+            ),
+            _ => {}
+        }
+    }
+    assert_eq!(completed, 3);
+    assert!(!encoding);
 }
 
 #[test]

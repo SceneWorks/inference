@@ -276,6 +276,9 @@ pub trait EngineObserver {
     /// An autoregressive prefix is about to be encoded after its model is available.
     fn on_prompt_encoding(&mut self) {}
 
+    /// The actual prefix prefill yielded before token sampling or acoustic solving.
+    fn on_prompt_encoding_complete(&mut self) {}
+
     /// A stage started, finished or was reused.
     fn on_stage(&mut self, stage: Stage, event: StageEvent) {
         let _ = (stage, event);
@@ -603,6 +606,18 @@ struct TokenForward<'a> {
 }
 
 impl DecodeObserver for TokenForward<'_> {
+    fn on_prompt_progress(&mut self, event: gen_core::Progress) {
+        match event {
+            gen_core::Progress::Loading(gen_core::LoadPhase::EncodingPrompt) => {
+                self.observer.on_prompt_encoding()
+            }
+            gen_core::Progress::PromptEncodingComplete => {
+                self.observer.on_prompt_encoding_complete()
+            }
+            _ => unreachable!("prompt helper emits only prompt boundaries"),
+        }
+    }
+
     fn on_token(&mut self, _phase: Phase, token: u32) {
         self.observer.on_token(self.stage, token);
     }
@@ -614,6 +629,18 @@ struct ProgressForward<'a> {
 }
 
 impl SynthesisObserver for ProgressForward<'_> {
+    fn on_prompt_progress(&mut self, event: gen_core::Progress) {
+        match event {
+            gen_core::Progress::Loading(gen_core::LoadPhase::EncodingPrompt) => {
+                self.observer.on_prompt_encoding()
+            }
+            gen_core::Progress::PromptEncodingComplete => {
+                self.observer.on_prompt_encoding_complete()
+            }
+            _ => unreachable!("prompt helper emits only prompt boundaries"),
+        }
+    }
+
     fn on_progress(&mut self, completed: usize, total: usize) {
         self.observer.on_synthesis_progress(completed, total);
     }
@@ -1254,7 +1281,6 @@ impl Yue2Engine {
                 check_generation_budget(planning.prefix().len(), None, generation.abc(), 1.0)
                     .map_err(msg)?;
                 let nar = self.lock_nar_for_ar()?;
-                hooks.observer.on_prompt_encoding();
                 let mut rng = stage_rng(request.seed());
                 let mut forward = TokenForward {
                     stage: Stage::Plan,
@@ -1296,7 +1322,6 @@ impl Yue2Engine {
             .semantic_conditioning(&self.tokenizer, generation.semantic())
             .map_err(msg)?;
         let nar = self.lock_nar_for_ar()?;
-        hooks.observer.on_prompt_encoding();
         let mut rng = stage_rng(plan.request().seed());
         let mut forward = TokenForward {
             stage: Stage::Semantic,
@@ -1372,7 +1397,6 @@ impl Yue2Engine {
         // The acoustic stage prefills the song prefix with the AR path: always the exact BF16
         // originals, never the FP8 mode (upstream `synthesize` → `restore_ar`).
         fp8::restore_ar_bf16(nar.lm_mut())?;
-        hooks.observer.on_prompt_encoding();
         let mut forward = ProgressForward {
             observer: &mut *hooks.observer,
         };
