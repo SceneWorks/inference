@@ -252,9 +252,11 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/ordinary-tooling"
           "$RUNNER_TEMP/ordinary-tooling/bin/python3" -m pip install --disable-pip-version-check numpy==2.4.3 safetensors==0.8.0 PyYAML==6.0.3
           echo "$RUNNER_TEMP/ordinary-tooling/bin" >> "$GITHUB_PATH"
-          echo 'PYTHONPATH=' >> "$GITHUB_ENV"
-          echo 'PYTHONHOME=' >> "$GITHUB_ENV"
-          echo 'PYTHONNOUSERSITE=1' >> "$GITHUB_ENV"
+          {
+            echo 'PYTHONPATH='
+            echo 'PYTHONHOME='
+            echo 'PYTHONNOUSERSITE=1'
+          } >> "$GITHUB_ENV"
       - name: Verify isolated model-free tooling environment
         run: |
           unset PYTHONPATH PYTHONHOME
