@@ -1244,31 +1244,79 @@ mod gpu_peak {
     /// captured) while keeping the subprocess-spawn overhead negligible.
     const POLL: Duration = Duration::from_millis(40);
 
-    fn parse_probe_gpu(raw: Option<&str>) -> Result<usize, String> {
+    fn is_gpu_uuid(value: &str) -> bool {
+        let Some(uuid) = value.strip_prefix("GPU-") else {
+            return false;
+        };
+        uuid.len() == 36
+            && uuid.bytes().enumerate().all(|(index, byte)| {
+                if [8, 13, 18, 23].contains(&index) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+    }
+
+    fn parse_probe_gpu(
+        raw: Option<&str>,
+        metadata: impl FnOnce() -> Option<String>,
+    ) -> Result<usize, String> {
         let Some(raw) = raw else {
             return Ok(0);
         };
-        let first = raw.split(',').next().unwrap_or_default().trim();
-        if first.is_empty() {
-            return Err("CUDA_VISIBLE_DEVICES is set but its first entry is empty".into());
+        let entries: Vec<_> = raw.split(',').map(str::trim).collect();
+        if entries.iter().any(|entry| {
+            entry.is_empty()
+                || !(entry.bytes().all(|byte| byte.is_ascii_digit())
+                    && entry.parse::<usize>().is_ok()
+                    || is_gpu_uuid(entry))
+        }) {
+            return Err(format!(
+                "CUDA_VISIBLE_DEVICES={raw:?} contains an invalid GPU selector"
+            ));
         }
-        first.parse::<usize>().map_err(|_| {
-            format!(
-                "CUDA_VISIBLE_DEVICES={raw:?} does not start with a physical GPU ordinal; \
-                 nvidia-smi cannot safely map UUID/MIG handles here"
-            )
-        })
+        let first = entries[0];
+        if let Ok(ordinal) = first.parse::<usize>() {
+            return Ok(ordinal);
+        }
+        // nvidia-smi ignores CUDA visibility. The reported physical index, never row position,
+        // establishes identity. Missing/ambiguous metadata must not fall back to GPU zero.
+        let rows = metadata().ok_or("cannot query physical GPU UUID/index metadata")?;
+        let mut found = None;
+        let mut indices = std::collections::HashSet::new();
+        let mut uuids = std::collections::HashSet::new();
+        for row in rows.lines().filter(|row| !row.trim().is_empty()) {
+            let fields: Vec<_> = row.split(',').map(str::trim).collect();
+            if fields.len() != 2 || !is_gpu_uuid(fields[1]) {
+                return Err("malformed physical GPU UUID/index metadata".into());
+            }
+            let index = fields[0]
+                .parse::<usize>()
+                .map_err(|_| "invalid physical GPU ordinal in UUID metadata")?;
+            if !indices.insert(index) || !uuids.insert(fields[1]) {
+                return Err("ambiguous physical GPU UUID/index metadata".into());
+            }
+            if fields[1] == first {
+                found = Some(index);
+            }
+        }
+        found
+            .ok_or_else(|| format!("visible GPU UUID {first} is absent from physical GPU metadata"))
     }
 
     /// Physical GPU ordinal sampled by `nvidia-smi` for Candle's rendered `cuda:0`.
     ///
     /// `CUDA_VISIBLE_DEVICES` remaps Candle's logical device indices but is ignored by `nvidia-smi`.
-    /// Deriving the first visible physical ordinal here keeps render and probe on the same card by
-    /// construction. Unset defaults to physical GPU 0. An empty, UUID, MIG handle, or otherwise
-    /// non-numeric first entry panics instead of silently sampling the wrong card.
+    /// Numeric visibility retains its physical mapping; full UUID visibility is verified against
+    /// trusted nvidia-smi physical metadata. Unset defaults to GPU 0. Empty, malformed, MIG,
+    /// missing or ambiguous UUID selectors panic instead of silently sampling the wrong card.
     pub fn probe_gpu() -> usize {
         let raw = std::env::var("CUDA_VISIBLE_DEVICES").ok();
-        parse_probe_gpu(raw.as_deref()).unwrap_or_else(|message| panic!("{message}"))
+        parse_probe_gpu(raw.as_deref(), || {
+            crate::gpu::query_gpu_field("index,uuid", None)
+        })
+        .unwrap_or_else(|message| panic!("{message}"))
     }
 
     /// Device-level used VRAM (MiB) for GPU ordinal `gpu` via `nvidia-smi`, or `None` if the query
@@ -1337,20 +1385,55 @@ mod gpu_peak {
 
         #[test]
         fn probe_gpu_defaults_to_zero_when_visibility_is_unset() {
-            assert_eq!(parse_probe_gpu(None), Ok(0));
+            assert_eq!(
+                parse_probe_gpu(None, || panic!("must not query metadata")),
+                Ok(0)
+            );
         }
 
         #[test]
         fn probe_gpu_uses_the_first_visible_physical_ordinal() {
-            assert_eq!(parse_probe_gpu(Some(" 1,0 ")), Ok(1));
-            assert_eq!(parse_probe_gpu(Some("7")), Ok(7));
+            assert_eq!(parse_probe_gpu(Some(" 1,0 "), || None), Ok(1));
+            assert_eq!(parse_probe_gpu(Some("7"), || None), Ok(7));
         }
 
         #[test]
-        fn probe_gpu_rejects_empty_uuid_mig_and_junk_without_guessing() {
-            for raw in ["", " ,1", "GPU-a1b2", "MIG-GPU-a/b/c", "wat"] {
-                assert!(parse_probe_gpu(Some(raw)).is_err(), "{raw:?} must fail");
+        fn probe_gpu_rejects_empty_short_uuid_mig_and_junk_without_guessing() {
+            for raw in [
+                "",
+                " ,1",
+                "GPU-a1b2",
+                "MIG-GPU-a/b/c",
+                "wat",
+                "1,",
+                "1,wat",
+                "-1",
+            ] {
+                assert!(
+                    parse_probe_gpu(Some(raw), || None).is_err(),
+                    "{raw:?} must fail"
+                );
             }
+        }
+
+        #[test]
+        fn uuid_visibility_resolves_exact_physical_gpu_one_without_compute() {
+            let uuid = "GPU-e4b79931-7be6-f216-460a-f5405cfafffe";
+            // Reverse rows deliberately: row position is not a physical ordinal.
+            let rows = format!("1, {uuid}\n0, GPU-00000000-0000-0000-0000-000000000000\n");
+            assert_eq!(parse_probe_gpu(Some(uuid), || Some(rows.clone())), Ok(1));
+            assert_eq!(
+                parse_probe_gpu(Some(&format!("{uuid},0")), || Some(rows.clone())),
+                Ok(1)
+            );
+            assert!(parse_probe_gpu(Some(uuid), || None).is_err());
+            assert!(parse_probe_gpu(Some(uuid), || Some(
+                "0, GPU-00000000-0000-0000-0000-000000000000".into()
+            ))
+            .is_err());
+            assert!(parse_probe_gpu(Some(uuid), || Some(format!("{rows}1, {uuid}\n"))).is_err());
+            assert!(parse_probe_gpu(Some(uuid), || Some(format!("wat, {uuid}"))).is_err());
+            assert!(parse_probe_gpu(Some(&format!("{uuid},wat")), || Some(rows)).is_err());
         }
 
         #[test]
