@@ -239,7 +239,9 @@ a load's entries at unload — revisit when the candle pin is next bumped.
 `sceneworks-load-progress` is a tensor-neutral path dependency shared with gen-core. The
 safetensors buffered reader reports actual read bytes; mmap creation reports no payload bytes.
 Header parsing and shared tensor materialization report the unique logical source ranges they
-consume, including views returned through `MmapedFile`. These are source-byte observations,
+consume, including views returned through `MmapedFile`. Raw byte decoders and descriptor parsers
+use the shared `read_tensor_bytes` / `read_source_byte_sets` adapters; `QStorage::from_data`
+observes borrowed mapped packed operands before device upload or host copying. These are source-byte observations,
 not measurements of OS disk traffic or page faults. Shared checksums use `with_source_bytes` so
 only the synchronous hashing interval reports verification. Repeated views cannot inflate a
 file's consumed extent. Explicit selected shard lists supply component totals; readers do not

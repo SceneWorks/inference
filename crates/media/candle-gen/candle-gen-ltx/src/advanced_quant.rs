@@ -54,7 +54,9 @@ fn sha256(parts: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
     for part in parts {
         let bytes = part.as_ref();
         digest.update((bytes.len() as u64).to_le_bytes());
-        digest.update(bytes);
+        candle_gen::candle_core::safetensors::verify_source_bytes(bytes, |bytes| {
+            digest.update(bytes)
+        });
     }
     format!("{:x}", digest.finalize())
 }
@@ -208,11 +210,15 @@ fn inspect_convrot(st: &MmapedSafetensors) -> Result<BTreeSet<String>> {
                 "ConvRot descriptor `{descriptor_name}` must be a rank-1 U8 JSON tensor"
             )));
         }
-        let json: Value = serde_json::from_slice(descriptor.data()).map_err(|error| {
-            invalid(format!(
-                "ConvRot descriptor `{descriptor_name}` is invalid JSON: {error}"
-            ))
-        })?;
+        let json: Value =
+            candle_gen::candle_core::safetensors::read_tensor_bytes(&descriptor, |bytes| {
+                serde_json::from_slice(bytes)
+            })
+            .map_err(|error| {
+                invalid(format!(
+                    "ConvRot descriptor `{descriptor_name}` is invalid JSON: {error}"
+                ))
+            })?;
         if json.get("format").and_then(Value::as_str) != Some("int8_tensorwise")
             || json.get("convrot").and_then(Value::as_bool) != Some(true)
         {
@@ -390,7 +396,10 @@ impl AdvancedQuantSource {
             AdvancedBackend::ConvRot { st, context } => {
                 let descriptor_name = format!("{base}.comfy_quant");
                 let descriptor = st.get(&descriptor_name)?;
-                let json: Value = serde_json::from_slice(descriptor.data())
+                let json: Value =
+                    candle_gen::candle_core::safetensors::read_tensor_bytes(&descriptor, |bytes| {
+                        serde_json::from_slice(bytes)
+                    })
                     .map_err(|error| invalid(error.to_string()))?;
                 let group_size = json["convrot_groupsize"]
                     .as_u64()
@@ -404,11 +413,12 @@ impl AdvancedQuantSource {
                     )));
                 }
                 let codes = Tensor::from_vec(
-                    weight
-                        .data()
-                        .iter()
-                        .map(|byte| *byte as i8 as i64)
-                        .collect::<Vec<_>>(),
+                    candle_gen::candle_core::safetensors::read_tensor_bytes(&weight, |bytes| {
+                        bytes
+                            .iter()
+                            .map(|byte| *byte as i8 as i64)
+                            .collect::<Vec<_>>()
+                    }),
                     weight.shape().to_vec(),
                     &Device::Cpu,
                 )?;

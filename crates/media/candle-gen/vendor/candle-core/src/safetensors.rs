@@ -450,6 +450,44 @@ pub fn with_source_bytes<T>(
     result
 }
 
+/// Read a model source into an owned buffer while reporting its actual chunked file reads.
+/// Callers retain their own source validation and cancellation contracts around this operation.
+pub fn read_file_bytes(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
+    crate::safetensors_progress::read_file(path.as_ref())
+}
+
+/// Consume mapped tensor bytes without introducing an eager copy or provider-owned progress.
+pub fn read_tensor_bytes<T>(view: &st::TensorView<'_>, consume: impl FnOnce(&[u8]) -> T) -> T {
+    read_source_bytes(view.data(), consume)
+}
+
+/// Consume a borrowed source range; owned buffers have already been observed at file read time.
+pub fn read_source_bytes<T>(data: &[u8], consume: impl FnOnce(&[u8]) -> T) -> T {
+    with_source_bytes(data, load_progress::LoadActivityPhase::Loading, || {
+        consume(data)
+    })
+}
+
+/// Consume several source ranges together (for example packed codes and companion scales).
+pub fn read_source_byte_sets<T>(data: &[&[u8]], consume: impl FnOnce() -> T) -> T {
+    let reads = data
+        .iter()
+        .filter_map(|bytes| crate::safetensors_progress::consuming(bytes))
+        .collect::<Vec<_>>();
+    let result = consume();
+    for read in reads {
+        read.complete();
+    }
+    result
+}
+
+/// Hash an actual mapped source range. Unmapped in-memory metadata produces no file event.
+pub fn verify_source_bytes<T>(data: &[u8], consume: impl FnOnce(&[u8]) -> T) -> T {
+    with_source_bytes(data, load_progress::LoadActivityPhase::Verifying, || {
+        consume(data)
+    })
+}
+
 pub fn load_buffer(data: &[u8], device: &Device) -> Result<HashMap<String, Tensor>> {
     let st = safetensors::SafeTensors::deserialize(data)?;
     st.tensors()

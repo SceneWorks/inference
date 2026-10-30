@@ -88,7 +88,8 @@ pub enum QStorage {
 
 impl QStorage {
     pub fn from_data(data: Cow<'_, [u8]>, device: &Device, dtype: GgmlDType) -> Result<Self> {
-        match device {
+        let consumption = crate::safetensors_progress::consuming(data.as_ref());
+        let result = match device {
             Device::Cpu => Ok(Self::Cpu(dtype.from_data(data))),
             Device::Metal(d) => match dtype {
                 GgmlDType::F32 => metal::load_quantized(d, as_t_slice::<f32>(data)),
@@ -124,7 +125,13 @@ impl QStorage {
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
             },
+        };
+        if result.is_ok() {
+            if let Some(read) = consumption {
+                read.complete();
+            }
         }
+        result
     }
 
     fn block_size(&self) -> usize {

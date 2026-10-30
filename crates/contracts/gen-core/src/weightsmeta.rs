@@ -284,8 +284,11 @@ pub fn read_safetensors_header(
 /// safetensors file is allowed to carry none.
 pub fn safetensors_file_metadata(path: impl AsRef<Path>) -> Result<BTreeMap<String, String>> {
     let path = path.as_ref();
-    let mut file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
+    let source = load_progress::reader::SourceProgress::new(path, Some(file_len));
+    let mut file = source.reader(file)?;
+    file.begin();
     let (header, _data_start) = read_safetensors_header(&mut file, file_len, path)?;
     crate::__model_input_result!(
         safetensors_metadata_from_json(path, &header),
@@ -429,7 +432,17 @@ impl CheckpointMeta {
         // for lazy random-access tensor reads. This is intended for adapter-sized checkpoints; calling
         // `from_dir` on a multi-GB *base-model* dir would hold every file resident (host RAM). An mmap
         // backing (page on demand) is the efficiency follow-up if base-model use is ever needed (F-038).
-        self.add_buffer(std::fs::read(path)?, path)
+        let file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        let source = load_progress::reader::SourceProgress::new(path, Some(size));
+        let mut reader = source.reader(file)?;
+        reader.begin();
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(size)
+                .map_err(|_| Error::Msg("checkpoint exceeds address space".into()))?,
+        );
+        reader.read_to_end(&mut bytes)?;
+        self.add_buffer(bytes, path)
     }
 
     fn add_buffer(&mut self, buf: Vec<u8>, path: &Path) -> Result<()> {
@@ -668,8 +681,11 @@ fn file_tensor_locations_impl(
     path: &Path,
     observer: Option<&mut SourceMetadataObserver<'_>>,
 ) -> Result<SafetensorsFileLayout> {
-    let mut file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
+    let source = load_progress::reader::SourceProgress::new(path, Some(file_len));
+    let mut file = source.reader(file)?;
+    file.begin();
     reader_tensor_locations_impl(&mut file, file_len, path, observer)
 }
 
@@ -883,7 +899,10 @@ pub fn read_safetensors_tensor_payloads(
 
     let path = path.as_ref();
     let layout = safetensors_file_tensor_locations(path)?;
-    let mut file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
+    let source = load_progress::reader::SourceProgress::new(path, Some(file.metadata()?.len()));
+    let mut file = source.reader(file)?;
+    file.begin();
     let mut payloads = BTreeMap::new();
     for location in layout.tensors {
         if !select(&location.header) {

@@ -1666,7 +1666,10 @@ fn validate_sidecar_counted(
     *payload_bytes_hashed = payload_bytes_hashed.saturating_add(payload.data().len() as u64);
     let actual_hash = validation_payload_digest(payload.data(), cancel)?;
     check_cancel(cancel)?;
-    Ok(stored_hash.data() == actual_hash)
+    Ok(candle_core::safetensors::read_tensor_bytes(
+        &stored_hash,
+        |bytes| bytes == actual_hash,
+    ))
 }
 
 fn validation_payload_digest(bytes: &[u8], cancel: Option<&CancelFlag>) -> Result<[u8; 32]> {

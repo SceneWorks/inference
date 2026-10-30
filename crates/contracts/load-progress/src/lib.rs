@@ -43,6 +43,12 @@ struct Request {
 
 impl Request {
     fn aggregate(&self, activity: &mut LoadActivity) {
+        activity.bytes_read = activity.bytes_read.max(
+            self.consumed
+                .get(&(activity.phase, activity.file.clone()))
+                .copied()
+                .unwrap_or(0),
+        );
         if self.files.contains_key(&activity.file) {
             let (bytes, total) = self
                 .files

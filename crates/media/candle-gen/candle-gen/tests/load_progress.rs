@@ -161,3 +161,45 @@ fn cached_mapped_reader_routes_consumption_to_the_evaluating_request_and_retains
         .all(|v| v.component == "auxiliary tower"));
     assert_eq!(reports.last(), Some(&None));
 }
+
+#[test]
+fn raw_mapped_bytes_and_borrowed_quant_storage_are_observed_before_owned_aliases() {
+    use candle_core::quantized::{GgmlDType, QStorage};
+    use std::borrow::Cow;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw.safetensors");
+    let tensors: HashMap<_, _> = [
+        (
+            "packed",
+            Tensor::from_vec(vec![1f32; 8], 8, &Device::Cpu).unwrap(),
+        ),
+        (
+            "descriptor",
+            Tensor::from_vec(br#"{"x":1}"#.to_vec(), 7, &Device::Cpu).unwrap(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    safetensors::save(&tensors, &path).unwrap();
+    let size = std::fs::metadata(&path).unwrap().len();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let out = events.clone();
+    let _observer = LoadActivityObserver::new(move |v| out.lock().unwrap().push(v));
+    // SAFETY: fixture remains immutable while mapped.
+    let mapped = unsafe { MmapedSafetensors::new(&path) }.unwrap();
+    let header = max_bytes(&events.lock().unwrap());
+    let packed = mapped.get("packed").unwrap();
+    QStorage::from_data(Cow::Borrowed(packed.data()), &Device::Cpu, GgmlDType::F32).unwrap();
+    assert_eq!(max_bytes(&events.lock().unwrap()), header + 32);
+    let descriptor = mapped.get("descriptor").unwrap();
+    let alias = safetensors::read_tensor_bytes(&descriptor, |bytes| bytes.to_vec());
+    assert_eq!(max_bytes(&events.lock().unwrap()), size);
+    let value: serde_json::Value = serde_json::from_slice(&alias).unwrap();
+    assert_eq!(value["x"], 1);
+    // A joint decode may borrow repeated/aliased ranges without inflating the file extent.
+    safetensors::read_source_byte_sets(&[packed.data(), descriptor.data()], || {
+        assert_eq!(packed.data().len(), 32);
+    });
+    assert_eq!(max_bytes(&events.lock().unwrap()), size);
+    assert_eq!(events.lock().unwrap().last(), Some(&None));
+}
