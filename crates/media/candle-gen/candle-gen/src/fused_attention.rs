@@ -58,6 +58,22 @@ use candle_core::{DType, Tensor};
 
 use crate::attention::{sdpa_planned_bhsd, AttentionPlan};
 
+/// Candidate-only seam for callers owning a separate replay/tape fallback.
+/// Select outside the tape fold: `Some` carries the native custom backward;
+/// `None` means reference mode, unsupported input, or cached compile refusal.
+/// Allocation and execution errors propagate. The caller retains its existing
+/// cancellation checks and must not wrap a successful candidate in another
+/// autograd owner. Standard unmasked SDPA only, with no dropout or softcap.
+pub fn try_training_sdpa_bhsd(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+) -> candle_core::Result<Option<Tensor>> {
+    crate::training_attention::try_streaming(q, k, v, scale, mask.is_some())
+}
+
 /// First-order training SDPA. The experimental streaming candidate is explicitly
 /// scoped by [`crate::training_attention::with_training_attention_mode`]. Callers
 /// must supply ordinary last-axis softmax (possibly upcast to f32), with no
