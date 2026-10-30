@@ -15,14 +15,9 @@
 
 use std::path::{Path, PathBuf};
 
+use mlx_gen::testing::env_or_env;
 use mlx_gen_krea::convert::assemble_quantized_snapshot;
 use mlx_gen_krea::{KreaPipeline, TurboOptions};
-
-fn env_or(key: &str, fallback: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| {
-        std::env::var(fallback).unwrap_or_else(|_| panic!("set {key} or {fallback}"))
-    })
-}
 
 /// Total bytes of a directory tree (for the manifest `estimatedSizeBytes`).
 fn dir_size(dir: &Path) -> u64 {
@@ -43,7 +38,7 @@ fn dir_size(dir: &Path) -> u64 {
 #[test]
 #[ignore = "needs real weights (~32 GB dense snapshot): set KREA_ASM_SRC/KREA_TURBO_DIR"]
 fn assemble_turnkey_loads() {
-    let src = PathBuf::from(env_or("KREA_ASM_SRC", "KREA_TURBO_DIR"));
+    let src = PathBuf::from(env_or_env("KREA_ASM_SRC", "KREA_TURBO_DIR"));
     let root = std::env::var("KREA_ASM_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("krea-2-turbo-mlx"));

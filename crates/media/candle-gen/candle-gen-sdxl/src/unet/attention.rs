@@ -969,6 +969,7 @@ mod vae_attention_budget_tests {
     use candle_core::Device;
     use candle_gen::attention::{attention_budget_from_usize, chunk_probe, ATTN_SCORES_BUDGET};
     use candle_gen::gen_core::{GenerationMemory, GenerationRequest};
+    use candle_gen::testkit::tensor_max_abs_diff;
     use candle_nn::{VarBuilder, VarMap};
 
     /// The prior, unguarded VAE attention arithmetic. This is deliberately kept only in the test
@@ -1012,17 +1013,6 @@ mod vae_attention_budget_tests {
             },
         )
         .unwrap()
-    }
-
-    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
-        (a - b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
     }
 
     #[test]
@@ -1102,7 +1092,7 @@ mod vae_attention_budget_tests {
             "the VAE seam must actually chunk"
         );
         assert!(
-            max_abs(&chunked, &oracle) < 1e-5,
+            tensor_max_abs_diff(&chunked, &oracle) < 1e-5,
             "small VAE attention must remain numerically pinned to the pre-budget implementation"
         );
 

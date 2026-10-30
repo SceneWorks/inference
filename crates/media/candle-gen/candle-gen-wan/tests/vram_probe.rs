@@ -73,7 +73,9 @@ use candle_gen::gen_core::{
     AdapterKind, AdapterSpec, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec,
     MoeExpert, Progress, WeightsSource,
 };
-use candle_gen::testkit::{cuda_mempool_used_high_bytes, reset_cuda_mempool_high_water, VramProbe};
+use candle_gen::testkit::{
+    cuda_mempool_used_high_bytes, env_parse_or, reset_cuda_mempool_high_water, VramProbe,
+};
 
 /// Max idle-baseline VRAM (GB) tolerated before the sampled peak is considered contaminated by
 /// another process. Matches the flux2 harness's `assert_trustworthy(1.0)`.
@@ -99,10 +101,6 @@ fn env(key: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty())
-}
-
-fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-    env(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 /// Per-pixel standard deviation of an RGB frame — the non-degenerate gate.
@@ -201,7 +199,7 @@ fn recipe(engine_id: &str) -> Recipe {
 /// `candle_resolve_wan_adapters`: strength 1.0, tagged per MoE expert.
 fn lightning_adapters() -> Vec<AdapterSpec> {
     // WAN_VRAM_LIGHTNING=0 ⇒ deliberate no-distill A/B.
-    if env_or::<u32>("WAN_VRAM_LIGHTNING", 1) == 0 {
+    if env_parse_or::<u32>("WAN_VRAM_LIGHTNING", 1) == 0 {
         return Vec::new();
     }
     let high = env("WAN_VRAM_LORA_HIGH").unwrap_or_else(|| {
@@ -233,11 +231,11 @@ fn measure(engine_id: &str) {
     let tier = env("WAN_VRAM_TIER").unwrap_or_else(|| "unknown".to_owned());
     let r = recipe(engine_id);
     let (width, height) = (
-        env_or("WAN_VRAM_W", r.width),
-        env_or("WAN_VRAM_H", r.height),
+        env_parse_or("WAN_VRAM_W", r.width),
+        env_parse_or("WAN_VRAM_H", r.height),
     );
-    let frames = env_or("WAN_VRAM_FRAMES", r.frames);
-    let steps = env_or("WAN_VRAM_STEPS", r.steps);
+    let frames = env_parse_or("WAN_VRAM_FRAMES", r.frames);
+    let steps = env_parse_or("WAN_VRAM_STEPS", r.steps);
 
     let adapters = if r.moe {
         lightning_adapters()

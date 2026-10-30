@@ -11,11 +11,12 @@
 //!
 //! Both need the models root (`MLX_GEN_MODELS_ROOT`) (and (a) the video golden); they skip otherwise.
 
+use mlx_gen::testing::{cosine_host_f64, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::Image;
 use mlx_gen_seedvr2::config::DitConfig;
 use mlx_gen_seedvr2::pipeline::Seedvr2Pipeline;
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Dtype;
 
 fn golden_dir() -> std::path::PathBuf {
     std::env::var("SEEDVR2_GOLDEN_DIR")
@@ -33,27 +34,6 @@ fn raw_dir() -> Option<std::path::PathBuf> {
     snap.join("seedvr2_ema_3b_fp16.safetensors")
         .exists()
         .then_some(snap)
-}
-
-fn cosine(got: &Array, exp: &Array) -> f32 {
-    let g = got
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .reshape(&[-1])
-        .unwrap();
-    let e = exp
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .reshape(&[-1])
-        .unwrap();
-    let (gs, es) = (g.as_slice::<f32>(), e.as_slice::<f32>());
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (a, b) in gs.iter().zip(es.iter()) {
-        dot += (*a as f64) * (*b as f64);
-        na += (*a as f64).powi(2);
-        nb += (*b as f64).powi(2);
-    }
-    (dot / (na.sqrt() * nb.sqrt()).max(1e-12)) as f32
 }
 
 /// A synthetic LR frame whose content varies with the frame index (so a real clip's per-frame work
@@ -103,7 +83,7 @@ fn seedvr2_video_model_path_matches_golden() {
         .expect("run_model_5d");
     let exp = io.require("decoded").unwrap();
     assert_eq!(decoded.shape(), exp.shape(), "decoded 5-D shape");
-    let cos = cosine(&decoded, exp);
+    let cos = cosine_host_f64(&decoded, exp, Denom::FloorAt(1e-12)) as f32;
     eprintln!(
         "video model-path decoded cosine = {cos:.6} (shape {:?})",
         decoded.shape()

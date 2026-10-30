@@ -1196,6 +1196,7 @@ pub fn expect_shape(name: &str, a: &Tensor, want: &[usize]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::testkit::tensor_max_abs_diff;
 
     #[test]
     fn promotion_follows_torch() {
@@ -1251,19 +1252,6 @@ mod tests {
             .unwrap()
     }
 
-    fn max_diff(a: &Tensor, b: &Tensor) -> f32 {
-        (a - b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
-    }
-
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
     fn lokr_runs_the_structured_kronecker_product() {
@@ -1301,7 +1289,7 @@ mod tests {
         let r = lokr((8, 15));
         assert!(matches!(r, Residual::Kron(_)), "{r:?}");
         assert_eq!(r.shape().unwrap(), ((8, 15), true));
-        let merged = max_diff(&r.delta().unwrap(), &delta);
+        let merged = tensor_max_abs_diff(&r.delta().unwrap(), &delta);
         assert!(
             merged < 1e-6,
             "merged view off the Kronecker delta by {merged}"
@@ -1333,7 +1321,7 @@ mod tests {
         assert!(matches!(r, Residual::LowRank { .. }), "{r:?}");
         assert_eq!(r.shape().unwrap(), ((24, 16), true));
         let delta = g.delta((24, 16), 0.75).unwrap();
-        let merged = max_diff(&r.delta().unwrap(), &delta);
+        let merged = tensor_max_abs_diff(&r.delta().unwrap(), &delta);
         assert!(
             merged < 1e-5,
             "merged view off the Hadamard delta by {merged}"

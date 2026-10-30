@@ -16,6 +16,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::media::Image;
+use mlx_gen::testing::{cosine_f32_sums, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Conditioning, GenerationOutput, GenerationRequest, Generator, LoadSpec, WeightsSource,
@@ -77,13 +78,6 @@ fn load_face() -> FaceAnalysis {
     .unwrap()
     .with_parser(&golden("bisenet_parsing.safetensors"))
     .unwrap()
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    dot / (na * nb)
 }
 
 fn req_with(
@@ -189,7 +183,7 @@ fn pulid_flux_end_to_end() {
         .analyze(&id1.pixels, id1.height as usize, id1.width as usize)
         .unwrap();
     if let Some(gf) = gen_faces.first() {
-        let cos = cosine(&gf.embedding, &ref_emb);
+        let cos = cosine_f32_sums(&gf.embedding, &ref_emb, Denom::Exact);
         println!(
             "IDENTITY ArcFace cosine(generated, reference) = {cos:.4}  (sc-2012 baseline ≈0.80)"
         );
@@ -232,7 +226,7 @@ fn pulid_flux_end_to_end() {
     {
         println!(
             "true_cfg=2.0 IDENTITY ArcFace cosine = {:.4}",
-            cosine(&gf.embedding, &ref_emb)
+            cosine_f32_sums(&gf.embedding, &ref_emb, Denom::Exact)
         );
     }
     crate::model_inference_device::record_model_inference_device();

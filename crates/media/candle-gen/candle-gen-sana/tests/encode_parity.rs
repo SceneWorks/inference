@@ -17,6 +17,7 @@
 //!   cargo test -p candle-gen-sana --test integration encode_parity:: --features cuda --release -- --ignored --nocapture
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::testkit::tensor_peak_rel;
 use candle_gen::Weights;
 use candle_gen_sana::{DcAeConfig, DcAeEncoder};
 
@@ -33,26 +34,6 @@ fn device() -> Device {
     {
         Device::Cpu
     }
-}
-
-/// `max|Δ| / max|ref|`.
-fn peak_rel(got: &Tensor, want: &Tensor) -> f32 {
-    let diff = (got - want)
-        .unwrap()
-        .abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap();
-    let denom = want
-        .abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap();
-    diff / denom.max(1e-12)
 }
 
 /// `Σ|Δ| / Σ|ref|`.
@@ -99,7 +80,7 @@ fn encode_matches_reference() {
     let got = encoder.encode(&image).expect("encode"); // [1,32,8,8] NCHW
 
     assert_eq!(got.dims(), want.dims(), "shape");
-    let peak = peak_rel(&got, &want);
+    let peak = tensor_peak_rel(&got, &want, Some(1e-12));
     let mean = mean_rel(&got, &want);
     println!(
         "DC-AE candle encode parity vs diffusers reference: peak_rel={peak:.5}  mean_rel={mean:.5}"

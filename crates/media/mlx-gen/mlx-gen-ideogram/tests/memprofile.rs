@@ -14,16 +14,13 @@ use crate::common;
 use std::path::PathBuf;
 
 use common::CAPTION_JSON;
+use mlx_gen::testing::env_path_or_home;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Quant, WeightsSource};
 use mlx_gen_ideogram::MODEL_ID;
 use mlx_rs::memory::{clear_cache, get_active_memory, get_peak_memory, reset_peak_memory};
 
 fn snapshot_dir() -> PathBuf {
-    std::env::var("IDEOGRAM4_MLX")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").expect("HOME")).join(".cache/ideogram4-mlx-convert")
-        })
+    env_path_or_home("IDEOGRAM4_MLX", ".cache/ideogram4-mlx-convert")
 }
 
 fn gb(bytes: usize) -> f64 {

@@ -26,10 +26,11 @@
 
 use crate::common;
 
-use common::{assert_parity, cosine, fixture_config, l2_norm, rel, std_dev, FIXTURE};
+use common::{assert_parity, fixture_config, l2_norm, rel, std_dev, FIXTURE};
 
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::{cosine_device_sums_f32, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::blocks::TransformerBlock;
 use mlx_gen_minimax_h3::{
@@ -415,7 +416,7 @@ fn reading_the_ffn_halves_gate_first_breaks_parity() {
         .unwrap();
 
     let (peak, mean) = rel(&mutated, &baseline);
-    let cos = cosine(&mutated, &baseline);
+    let cos = cosine_device_sums_f32(&mutated, &baseline, Denom::FloorAt(1e-12));
     println!(
         "FFN half-swap: rel-max-abs={peak:.3e} rel-mean={mean:.3e} cosine={cos:.4} \
          ||correct||={:.4} ||swapped||={:.4}  (parity residual with the correct layout: {base_peak:.3e})",

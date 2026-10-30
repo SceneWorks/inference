@@ -16,6 +16,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::media::Image;
+use mlx_gen::testing::{cosine_f64_sums, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterKind, AdapterSpec, WeightsSource};
 use mlx_gen_instantid::{letterbox, InstantId, InstantIdPaths, InstantIdRequest};
@@ -93,18 +94,9 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Cosine similarity of two (un-normalized) embeddings.
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f64 = a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum();
-    let na: f64 = a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-    let nb: f64 = b.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-    (dot / (na * nb + 1e-12)) as f32
-}
-
 fn save_png(name: &str, img: &Image) {
     let path = golden_path(name);
-    let buf = image::RgbImage::from_raw(img.width, img.height, img.pixels.clone()).unwrap();
-    buf.save(&path).unwrap();
+    mlx_gen::testing::save_png(img, &path);
     println!("  wrote {path:?}");
 }
 
@@ -191,7 +183,11 @@ fn run_identity(quant_bits: Option<i32>, size_override: Option<u32>, out_png: &s
     let out_face = model
         .largest_face(&out.pixels, size as usize, size as usize)
         .expect("detect generated face");
-    let cos = cosine(&ref_face.embedding, &out_face.embedding);
+    let cos = cosine_f64_sums(
+        &ref_face.embedding,
+        &out_face.embedding,
+        Denom::PlusEps(1e-12),
+    ) as f32;
     println!(
         "[instantid {label}] {size}x{size} steps={steps} sampler={} | generated face \
          det_score={:.3} | ArcFace-cosine(ref, generated) = {cos:.4}",
@@ -309,7 +305,11 @@ fn instantid_pose_mode_preserves_identity() {
     let out_face = model
         .largest_face(&out.pixels, size as usize, size as usize)
         .expect("detect generated face");
-    let cos = cosine(&ref_face.embedding, &out_face.embedding);
+    let cos = cosine_f64_sums(
+        &ref_face.embedding,
+        &out_face.embedding,
+        Denom::PlusEps(1e-12),
+    ) as f32;
     println!("[instantid pose] {size}x{size} | ArcFace-cosine(ref, generated) = {cos:.4}");
     assert!(
         cos > 0.3,
@@ -375,7 +375,11 @@ fn instantid_face_restore_improves_identity() {
     let base_face = model
         .largest_face(&base.pixels, size as usize, size as usize)
         .expect("detect base face");
-    let base_cos = cosine(&ref_face.embedding, &base_face.embedding);
+    let base_cos = cosine_f64_sums(
+        &ref_face.embedding,
+        &base_face.embedding,
+        Denom::PlusEps(1e-12),
+    ) as f32;
 
     // Restore with the gender-neutral default prompt (sc-3380 bug fix).
     let restore_req = InstantIdRequest {
@@ -395,7 +399,11 @@ fn instantid_face_restore_improves_identity() {
     let out_face = model
         .largest_face(&restored.pixels, size as usize, size as usize)
         .expect("detect restored face");
-    let restored_cos = cosine(&ref_face.embedding, &out_face.embedding);
+    let restored_cos = cosine_f64_sums(
+        &ref_face.embedding,
+        &out_face.embedding,
+        Denom::PlusEps(1e-12),
+    ) as f32;
     println!(
         "[instantid restore] {size}x{size} | ArcFace-cosine base={base_cos:.4} restored={restored_cos:.4}"
     );
@@ -464,7 +472,11 @@ fn instantid_view_angle_preserves_identity() {
     let out_face = model
         .largest_face(&out.pixels, size as usize, size as usize)
         .expect("detect generated face");
-    let cos = cosine(&ref_face.embedding, &out_face.embedding);
+    let cos = cosine_f64_sums(
+        &ref_face.embedding,
+        &out_face.embedding,
+        Denom::PlusEps(1e-12),
+    ) as f32;
     println!("[instantid view={view}] {size}x{size} | ArcFace-cosine(ref, generated) = {cos:.4}");
     assert!(
         cos > 0.4,

@@ -14,6 +14,7 @@ use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Linear, Module, VarBuilder};
 use candle_gen::quant::{pack_mlx_affine, DenseLinear, QLinear, MLX_GROUP_SIZE};
+use candle_gen::testkit::{tensor_cosine, tensor_max_abs_diff_f32};
 
 /// Deterministic well-conditioned `[out, in]` weight (seeded, not `randn` — portable FP so the cosine
 /// parity doesn't flap around the Q4 loss floor on CI, per candle-wan's note).
@@ -30,33 +31,6 @@ fn acts(b: usize, s: usize, in_dim: usize, seed: f32) -> Tensor {
         .map(|i| ((i as f32 + seed) * 0.017).cos() * 0.9)
         .collect();
     Tensor::from_vec(data, (b, s, in_dim), &Device::Cpu).unwrap()
-}
-
-fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-    let a = a.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
-    let b = b.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
-    let a = a.to_vec1::<f32>().unwrap();
-    let b = b.to_vec1::<f32>().unwrap();
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(&b) {
-        dot += (*x as f64) * (*y as f64);
-        na += (*x as f64) * (*x as f64);
-        nb += (*y as f64) * (*y as f64);
-    }
-    (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
-}
-
-fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-    a.to_dtype(DType::F32)
-        .unwrap()
-        .sub(&b.to_dtype(DType::F32).unwrap())
-        .unwrap()
-        .abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
 }
 
 /// Pack a synthetic dense weight on the real Mochi DiT key, load it back through the seam, and check the
@@ -98,10 +72,10 @@ fn packed_linear_round_trips(bits: usize) -> Result<()> {
     // (2) the dequant-on-forward is a bounded perturbation of the dense weight.
     let dense_lin = Linear::new(w, None);
     let x = acts(2, 5, in_dim, 11.0);
-    let cos = cosine(
+    let cos = tensor_cosine(
         &packed.forward(&x)?,
         &__model_proof_output!(dense_lin.forward(&x))?,
-    );
+    ) as f32;
     assert!(
         cos > 0.997,
         "Q{bits}: packed-load forward cosine {cos:.6} vs dense too low"
@@ -176,7 +150,7 @@ fn dense_forward_upcast_is_byte_identical_to_linear_nb() -> Result<()> {
     let got = lin.forward_upcast(&x)?;
 
     assert_eq!(got.dims(), want.dims());
-    let d = max_abs_diff(&got, &want);
+    let d = tensor_max_abs_diff_f32(&got, &want);
     assert_eq!(
         d, 0.0,
         "dense forward_upcast must be byte-identical to linear_nb (max|Δ|={d:.3e})"

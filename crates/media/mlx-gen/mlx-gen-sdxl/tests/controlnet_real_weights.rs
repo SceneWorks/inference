@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::peak_rel_host;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
@@ -47,18 +48,6 @@ fn nchw_to_nhwc(a: &Array) -> Array {
         .unwrap()
         .transpose_axes(&[0, 2, 3, 1])
         .unwrap()
-}
-
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap().as_dtype(Dtype::Float32).unwrap();
-    let b = b.reshape(&[n]).unwrap().as_dtype(Dtype::Float32).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-6);
-    a.iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
-        / peak
 }
 
 #[test]
@@ -98,11 +87,11 @@ fn controlnet_residuals_match_diffusers() {
     assert_eq!(res.down.len(), 9, "expected 9 down residuals");
     let mut worst_down = 0f32;
     for (i, d) in res.down.iter().enumerate() {
-        let rel = peak_rel(d, g.require(&format!("down_{i}")).unwrap());
+        let rel = peak_rel_host(d, g.require(&format!("down_{i}")).unwrap(), Some(1e-6));
         println!("[controlnet] down_{i} peak_rel = {rel:.3e}");
         worst_down = worst_down.max(rel);
     }
-    let mid_rel = peak_rel(&res.mid, g.require("mid").unwrap());
+    let mid_rel = peak_rel_host(&res.mid, g.require("mid").unwrap(), Some(1e-6));
     println!("[controlnet] mid peak_rel = {mid_rel:.3e}");
 
     // f32 vs f32, cross-backend (torch CPU vs MLX Metal) over a UNet-encoder copy. The residual

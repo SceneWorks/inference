@@ -533,6 +533,7 @@ pub fn text_projection(
 mod tests {
     use super::*;
     use candle_core::safetensors::MmapedSafetensors;
+    use candle_gen::testkit::tensor_cosine;
     use candle_nn::{VarBuilder, VarMap};
     use candle_transformers::models::stable_diffusion::clip as stock;
     use std::collections::HashMap;
@@ -568,25 +569,6 @@ mod tests {
     /// still runs cheaply enough on CPU for a `--lib` test.
     fn stock_cfg_g() -> stock::Config {
         stock::Config::sdxl2()
-    }
-
-    /// Cosine similarity over all elements (f64) — the canonical `candle_gen::quant` packed-vs-dense
-    /// parity metric (`packed_qlinear_forward_matches_dense_grid` asserts `> 0.99999`). The MLX Q4→Q4_1
-    /// repack rounds group scales to f16, so an f32-grid reference deviates by a small per-group
-    /// quantization of the *scale* — cosine (direction, not absolute scale) is the metric the shared
-    /// seam uses for exactly this reason, matching the sc-9416 UNet packed surface convention.
-    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
-        let b = b.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
-        let a = a.to_vec1::<f32>().unwrap();
-        let b = b.to_vec1::<f32>().unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (x, y) in a.iter().zip(b.iter()) {
-            dot += (*x as f64) * (*y as f64);
-            na += (*x as f64) * (*x as f64);
-            nb += (*y as f64) * (*y as f64);
-        }
-        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
     }
 
     /// Pack an `[out, in]` weight as an MLX Q4 triple (LSB-first nibbles, per-group affine
@@ -813,13 +795,13 @@ mod tests {
         // Last hidden state.
         let y_p = packed.forward_with_mask(&ids, usize::MAX)?;
         let y_d = dense.forward_with_mask(&ids, usize::MAX)?;
-        let cos = cosine(&y_p, &y_d);
+        let cos = tensor_cosine(&y_p, &y_d) as f32;
         assert!(cos > 0.99999, "packed vs dense last-hidden cosine {cos:.6}");
 
         // Penultimate hidden state (the conditioning path).
         let (_, penult_p) = packed.forward_until_encoder_layer(&ids, usize::MAX, -2)?;
         let (_, penult_d) = dense.forward_until_encoder_layer(&ids, usize::MAX, -2)?;
-        let cos2 = cosine(&penult_p, &penult_d);
+        let cos2 = tensor_cosine(&penult_p, &penult_d) as f32;
         assert!(
             cos2 > 0.99999,
             "packed vs dense penultimate cosine {cos2:.6}"
@@ -855,7 +837,7 @@ mod tests {
         assert!(!tp_d.is_quantized(), "dense text_projection falls back");
 
         let x = Tensor::randn(0f32, 1f32, (2, dim), &Device::Cpu)?;
-        let cos = cosine(&tp_p.forward(&x)?, &tp_d.forward(&x)?);
+        let cos = tensor_cosine(&tp_p.forward(&x)?, &tp_d.forward(&x)?) as f32;
         assert!(
             cos > 0.99999,
             "packed vs dense text_projection cosine {cos:.6}"

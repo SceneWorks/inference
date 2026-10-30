@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use candle_gen::gen_core::{
     GenerationRequest, Image, LoadSpec, PreviewFrame, Progress, WeightsSource,
 };
-use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::save_rgb8_png_in;
 use candle_gen::testkit::sha256_file;
 use candle_gen::testkit::{
     collecting_sink, correlation, downsample_nearest, downsample_nearest_raw, env_path_opt,
@@ -264,16 +264,10 @@ fn the_boogu_vae_is_not_the_flux2_one_and_that_is_why_boogu_is_unwired() {
 
 // ── Frame analysis helpers ────────────────────────────────────────────────────────────────────────
 
-pub fn save_png(dir: &Path, pixels: &[u8], width: u32, height: u32, name: &str) {
-    let path = dir.join(name);
-    save_rgb8_png(&path, pixels, width, height);
-    eprintln!("  wrote {}", path.display());
-}
-
 /// Lay the strip out as one horizontal contact sheet so a reviewer sees the progression at a glance.
 pub fn save_strip(dir: &Path, frames: &[PreviewFrame], name: &str) {
     let (sheet, width, height) = preview_strip_sheet(frames);
-    save_png(dir, &sheet, width, height, name);
+    save_rgb8_png_in(dir, name, &sheet, width, height);
 }
 
 /// Consecutive frames must not be the same picture. A floor rather than a ratio, and a low one: on an
@@ -585,12 +579,12 @@ fn assert_klein_previews_converge(
         min_acceleration,
     );
     save_strip(&dir, &frames, &format!("{label}-strip.png"));
-    save_png(
+    save_rgb8_png_in(
         &dir,
+        &format!("{label}-final.png"),
         &live.pixels,
         live.width,
         live.height,
-        &format!("{label}-final.png"),
     );
     (events, frames)
 }

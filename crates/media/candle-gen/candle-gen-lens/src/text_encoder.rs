@@ -1429,6 +1429,7 @@ fn check_reasoner_cancel(cancel: &CancelFlag) -> candle_gen::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::testkit::tensor_cosine;
 
     fn streamable_encoder_without_layer_files() -> GptOssTextEncoder {
         let device = Device::Cpu;
@@ -1786,30 +1787,6 @@ mod tests {
             .collect()
     }
 
-    fn cosine_cpu(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        let b = b
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (x, y) in a.iter().zip(b.iter()) {
-            dot += (*x as f64) * (*y as f64);
-            na += (*x as f64) * (*x as f64);
-            nb += (*y as f64) * (*y as f64);
-        }
-        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
-    }
-
     // The Q4_0/Q8_0 quantized projection (sc-5111) must track its dense `Linear` counterpart on the
     // same weight + bias: Q8 near-lossless, Q4 coherent. Validates the QMatMul wiring + the f16
     // activation path + the separate dense-bias add. Runs on the default device, so `--features cuda`
@@ -1835,7 +1812,7 @@ mod tests {
             };
             let got = quant.forward(&xs).unwrap();
             assert_eq!(got.dims(), want.dims());
-            let cos = cosine_cpu(&got, &want);
+            let cos = tensor_cosine(&got, &want) as f32;
             assert!(
                 cos > thr,
                 "{ggml:?} expert proj cosine {cos:.5} ≤ {thr} on {dev:?}"
@@ -1972,7 +1949,7 @@ mod tests {
             g.iter().filter(|x| !x.is_finite()).count(),
             g.len()
         );
-        let cos = cosine_cpu(&got, &want);
+        let cos = tensor_cosine(&got, &want) as f32;
         assert!(cos > 0.99, "Q8 MoE cosine {cos:.5} ≤ 0.99 vs dense");
 
         #[cfg(feature = "model-inference-proof")]
@@ -2122,7 +2099,7 @@ mod tests {
             g.iter().all(|v| v.is_finite()),
             "packed MoE produced non-finite output"
         );
-        let cos = cosine_cpu(&got, &want);
+        let cos = tensor_cosine(&got, &want) as f32;
         assert!(
             cos > 0.999,
             "packed-expert MoE cosine {cos:.5} ≤ 0.999 vs the dense affine grid"

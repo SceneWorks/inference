@@ -27,6 +27,7 @@ use mlx_gen_sdxl::{load_unet_dtype, set_compile_glue};
 use mlx_rs::{random, Array, Dtype};
 
 use common::snapshot_opt as snapshot;
+use mlx_gen::testing::max_abs_diff_f32;
 
 fn env_i32(var: &str, default: i32) -> i32 {
     std::env::var(var)
@@ -43,13 +44,6 @@ fn timed(eval: &[&Array], start: Instant) -> f64 {
 fn median(mut xs: Vec<f64>) -> f64 {
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     xs[xs.len() / 2]
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(&a, &b).unwrap()).unwrap();
-    mlx_rs::ops::max(&d, None).unwrap().item::<f32>()
 }
 
 #[test]
@@ -100,7 +94,7 @@ fn sdxl_per_step_compiled_vs_eager() {
     set_compile_glue(false);
     assert_eq!(comp0.shape(), eager0.shape(), "eps shape");
     assert_eq!(comp0.dtype(), Dtype::Float16, "fp16 forward must stay f16");
-    let max_diff = max_abs_diff(&comp0, &eager0);
+    let max_diff = max_abs_diff_f32(&comp0, &eager0);
 
     let warmup = 2usize;
     let iters = 8usize;

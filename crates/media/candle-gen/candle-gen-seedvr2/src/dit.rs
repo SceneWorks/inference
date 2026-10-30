@@ -1022,11 +1022,7 @@ impl Seedvr2Transformer {
 #[cfg(test)]
 mod quant_tests {
     use super::*;
-
-    /// Cosine similarity over all elements (f64), the quant-parity metric.
-    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        candle_gen::testkit::tensor_cosine(a, b) as f32
-    }
+    use candle_gen::testkit::tensor_cosine;
 
     /// A `[out,in]` `Linear` with `in_dim` a multiple of the 32-wide block quantizes and forwards
     /// near-losslessly at Q8 / coherently at Q4 vs the dense f32 result — the per-Linear analog of the
@@ -1058,7 +1054,7 @@ mod quant_tests {
             "shape preserved through quant forward"
         );
 
-        let cos = cosine(&dense, &q);
+        let cos = tensor_cosine(&dense, &q) as f32;
         assert!(cos > min_cos, "{quant:?} cosine {cos:.5} ≤ {min_cos}");
     }
 

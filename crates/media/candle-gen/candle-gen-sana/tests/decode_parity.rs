@@ -13,6 +13,7 @@
 //!   cargo test -p candle-gen-sana --test integration decode_parity:: --features cuda --release -- --ignored --nocapture
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::testkit::tensor_peak_rel;
 use candle_gen::Weights;
 use candle_gen_sana::{DcAeConfig, DcAeDecoder};
 
@@ -29,26 +30,6 @@ fn device() -> Device {
     {
         Device::Cpu
     }
-}
-
-/// `max|Δ| / max|ref|`.
-fn peak_rel(got: &Tensor, want: &Tensor) -> f32 {
-    let diff = (got - want)
-        .unwrap()
-        .abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap();
-    let denom = want
-        .abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap();
-    diff / denom.max(1e-12)
 }
 
 /// `Σ|Δ| / Σ|ref|`.
@@ -89,7 +70,7 @@ fn decode_matches_reference() {
     let got = decoder.decode(&latent).expect("decode"); // [1,3,1024,1024] NCHW
 
     assert_eq!(got.dims(), want.dims(), "shape");
-    let peak = peak_rel(&got, &want);
+    let peak = tensor_peak_rel(&got, &want, Some(1e-12));
     let mean = mean_rel(&got, &want);
     println!("DC-AE candle decode parity vs mlx-gen #612 reference: peak_rel={peak:.5}  mean_rel={mean:.5}");
 

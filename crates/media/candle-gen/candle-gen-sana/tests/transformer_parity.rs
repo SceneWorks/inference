@@ -33,6 +33,7 @@ use candle_gen_sana::{SanaTransformer, SanaTransformerConfig};
 
 use crate::common;
 
+use candle_gen::testkit::tensor_peak_rel;
 use common::{tiny_config, tiny_sprint_config};
 
 fn mean_rel(got: &Tensor, want: &Tensor) -> f32 {
@@ -52,25 +53,6 @@ fn mean_rel(got: &Tensor, want: &Tensor) -> f32 {
         .to_scalar::<f32>()
         .unwrap();
     num / den.max(1e-12)
-}
-
-fn peak_rel(got: &Tensor, want: &Tensor) -> f32 {
-    let peak = (got - want)
-        .unwrap()
-        .abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap();
-    let denom = want
-        .abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap();
-    peak / denom.max(1e-12)
 }
 
 /// Split the dump tool's `w.`-prefixed weights into a [`Weights`] with the bare diffusers key names,
@@ -107,7 +89,7 @@ fn trunk_matches_diffusers_tiny() {
 
     assert_eq!(got.dims(), want.dims(), "shape");
     let mean = mean_rel(&got, &want);
-    let peak = peak_rel(&got, &want);
+    let peak = tensor_peak_rel(&got, &want, Some(1e-12));
     println!("SANA trunk parity (tiny f32): mean_rel={mean:.6}  peak_rel={peak:.6}");
 
     // f32 path, 2-block tiny model: a port bug (wrong transpose / op order / modulation chunk order /
@@ -142,7 +124,7 @@ fn sprint_trunk_matches_diffusers_tiny() {
 
     assert_eq!(got.dims(), want.dims(), "shape");
     let mean = mean_rel(&got, &want);
-    let peak = peak_rel(&got, &want);
+    let peak = tensor_peak_rel(&got, &want, Some(1e-12));
     println!("SANA-Sprint trunk parity (tiny f32): mean_rel={mean:.6}  peak_rel={peak:.6}");
     assert!(
         mean < 5e-3,
@@ -197,7 +179,7 @@ fn trunk_matches_diffusers_real() {
 
     assert_eq!(got.dims(), want.dims(), "shape");
     let mean = mean_rel(&got, &want);
-    let peak = peak_rel(&got, &want);
+    let peak = tensor_peak_rel(&got, &want, Some(1e-12));
     println!("SANA trunk parity (real f32): mean_rel={mean:.6}  peak_rel={peak:.6}");
     // Real single step; the per-step drift band the MLX port observed across a 20-step gen is ~3.4%.
     assert!(

@@ -15,7 +15,7 @@
 //! Run each under an external memory guard:
 //! `cargo test -p mlx-gen-iris --release --test integration -- --ignored restoration_real_weights:: --test-threads 1`
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use gen_core_iris::restoration::{plan_request, restore_detailed, TileGeometry};
@@ -26,6 +26,7 @@ use mlx_gen::{
 use mlx_gen_iris::IrisRestorer;
 
 use crate::common::{fixtures, host_f32};
+use mlx_gen::testing::env_path_opt;
 
 fn env_dir(name: &str) -> PathBuf {
     PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name} is required")))
@@ -82,12 +83,9 @@ fn rgb8_distance(a: &[u8], b: &[u8]) -> (u8, f64, f64) {
 }
 
 fn save_png(image: &Image, name: &str) {
-    if let Ok(dir) = std::env::var("IRIS_OUT") {
-        let path = Path::new(&dir).join(name);
-        image::RgbImage::from_raw(image.width, image.height, image.pixels.clone())
-            .unwrap()
-            .save(&path)
-            .unwrap();
+    if let Some(dir) = env_path_opt("IRIS_OUT") {
+        let path = dir.join(name);
+        mlx_gen::testing::save_png(image, &path);
         eprintln!("wrote {}", path.display());
     }
 }

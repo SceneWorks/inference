@@ -9,6 +9,7 @@
 //!   PYTHONPATH=/tmp/sam2-mlx/src ~/mlx-flux-venv/bin/python tools/dump_sam2_encoder_golden.py --size large
 //!   cargo test -p mlx-gen-sam2 --release --test integration encoder_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::{cosine_host_f64, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_sam2::{Sam2ImageEncoder, Sam2ImageEncoderConfig};
 use mlx_rs::Array;
@@ -55,18 +56,6 @@ fn rel_errors(got: &Array, want: &Array) -> (f32, f32) {
     (max_diff / peak_ref, (sum_diff / sum_ref) as f32)
 }
 
-fn cosine(got: &Array, want: &Array) -> f32 {
-    let a = flat(got);
-    let b = flat(want);
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (&x, &y) in a.iter().zip(&b) {
-        dot += x as f64 * y as f64;
-        na += (x as f64).powi(2);
-        nb += (y as f64).powi(2);
-    }
-    (dot / (na.sqrt() * nb.sqrt())) as f32
-}
-
 fn assert_parity(got: &Array, want: &Array, label: &str) {
     assert_eq!(
         got.shape(),
@@ -76,7 +65,7 @@ fn assert_parity(got: &Array, want: &Array, label: &str) {
         want.shape()
     );
     let (peak, mean) = rel_errors(got, want);
-    let cos = cosine(got, want);
+    let cos = cosine_host_f64(got, want, Denom::Exact) as f32;
     println!(
         "{label}: shape {:?} cos {cos:.7} peak-rel {peak:.3e} mean-rel {mean:.3e}",
         got.shape()

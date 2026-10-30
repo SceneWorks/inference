@@ -23,13 +23,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use mlx_gen::testing::env_or;
 use mlx_gen::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, Precision, Progress, WeightsSource,
 };
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
 
 /// Whether `dir` is a Mochi turnkey root — at least one tier's `transformer/` is present.
 fn is_root(dir: &Path) -> bool {

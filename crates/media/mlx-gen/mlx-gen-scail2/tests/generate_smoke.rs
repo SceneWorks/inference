@@ -14,6 +14,7 @@
 //! (env: `SCAIL2_SNAPSHOT_DIR`, `SCAIL2_SMOKE_SIZE`=256, `SCAIL2_SMOKE_FRAMES`=13,
 //! `SCAIL2_SMOKE_STEPS`=8).
 
+use mlx_gen::testing::env_path_or_home;
 use mlx_gen::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, ReplacementMode,
     WeightsSource,
@@ -22,11 +23,7 @@ use mlx_gen_scail2::pipeline::MODEL_ID;
 use std::path::PathBuf;
 
 fn snapshot_dir() -> PathBuf {
-    std::env::var("SCAIL2_SNAPSHOT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/scail2-mlx-convert")
-        })
+    env_path_or_home("SCAIL2_SNAPSHOT_DIR", ".cache/scail2-mlx-convert")
 }
 
 fn env_usize(key: &str, default: usize) -> usize {

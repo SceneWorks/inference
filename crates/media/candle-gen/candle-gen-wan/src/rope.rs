@@ -159,22 +159,10 @@ pub fn assign_source_ids(n: usize, max_trained: f64, interpolate: bool) -> Vec<f
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
+    use candle_gen::testkit::tensor_max_abs_diff;
 
     fn tiny_rope() -> WanRope {
         WanRope::new(&TransformerConfig::t2v_14b()) // head_dim 128, θ 10000
-    }
-
-    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
-        (a - b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
     }
 
     /// `source_id = 0` is the identity phase (the noisy target keeps the plain spatial RoPE).
@@ -183,8 +171,8 @@ mod tests {
         let dev = Device::Cpu;
         let (cos, sin) = tiny_rope().cos_sin(2, 3, 4, &dev).unwrap();
         let (cos0, sin0) = apply_source_id(&cos, &sin, 0.0, 128).unwrap();
-        assert_eq!(max_abs(&cos, &cos0), 0.0);
-        assert_eq!(max_abs(&sin, &sin0), 0.0);
+        assert_eq!(tensor_max_abs_diff(&cos, &cos0), 0.0);
+        assert_eq!(tensor_max_abs_diff(&sin, &sin0), 0.0);
     }
 
     /// Composing a unit-modulus phase keeps `cos²+sin² = 1` per lane, so RoPE stays an orthogonal
@@ -196,7 +184,7 @@ mod tests {
         let (cos3, sin3) = apply_source_id(&cos, &sin, 3.0, 128).unwrap();
         let unit = (cos3.sqr().unwrap() + sin3.sqr().unwrap()).unwrap();
         let ones = Tensor::ones(unit.dims(), unit.dtype(), &dev).unwrap();
-        assert!(max_abs(&unit, &ones) < 1e-5, "cos²+sin² ≠ 1");
+        assert!(tensor_max_abs_diff(&unit, &ones) < 1e-5, "cos²+sin² ≠ 1");
     }
 
     /// Lane 0 has `ω_0 = θ^0 = 1`, so the phase for `source_id s` is exactly `(cos s, sin s)`; at
@@ -222,7 +210,10 @@ mod tests {
         let rope = tiny_rope();
         let (cos, sin) = rope.cos_sin(2, 2, 2, &dev).unwrap();
         let (cos1, _sin1) = apply_source_id(&cos, &sin, 1.0, 128).unwrap();
-        assert!(max_abs(&cos, &cos1) > 1e-4, "source_id 1 must shift cos");
+        assert!(
+            tensor_max_abs_diff(&cos, &cos1) > 1e-4,
+            "source_id 1 must shift cos"
+        );
         // Reconstruct lane `k` at token `row` from the documented angle add and check it matches.
         let (row, k, half) = (5usize, 7usize, 64usize);
         let cs = cos.flatten_all().unwrap().to_vec1::<f32>().unwrap();

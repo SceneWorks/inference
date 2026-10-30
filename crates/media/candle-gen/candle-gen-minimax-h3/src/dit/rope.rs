@@ -261,6 +261,7 @@ impl MmRope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::testkit::tensor_peak_rel_or_abs;
 
     fn dev() -> Device {
         Device::Cpu
@@ -415,29 +416,6 @@ mod tests {
         assert!(rope.apply(&spread(&[4, 1, 12]), &tables).is_err());
     }
 
-    /// **Relative max-abs-diff** — `max|a-b| / max|b|`, the crate's established measure.
-    fn rel_max_abs(a: &Tensor, b: &Tensor) -> f32 {
-        let m = |t: &Tensor| -> f32 {
-            t.to_dtype(DType::F32)
-                .unwrap()
-                .abs()
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .max(0)
-                .unwrap()
-                .to_vec0::<f32>()
-                .unwrap()
-        };
-        let d = m(&(a.to_dtype(DType::F32).unwrap() - b.to_dtype(DType::F32).unwrap()).unwrap());
-        let s = m(b);
-        if s == 0.0 {
-            d
-        } else {
-            d / s
-        }
-    }
-
     /// The tables carry a `[4, 3]` grid of raw `(t, h, w)` coordinates in the range the shipped
     /// packing actually produces, so the angles are large enough for the mantissa to matter.
     fn grid(seq: usize) -> Tensor {
@@ -487,7 +465,7 @@ mod tests {
             .unwrap()
             .to_dtype(DType::BF16)
             .unwrap();
-        let drift = rel_max_abs(&shipped, &at_f32);
+        let drift = tensor_peak_rel_or_abs(&shipped, &at_f32);
         println!("[mm-rope] narrow-before vs narrow-after rel-max-abs = {drift:.3e}");
         assert!(
             drift > 1e-4,
@@ -522,7 +500,7 @@ mod tests {
         let x = spread(&[1, 9, 2, 128]);
         let good = rope.apply(&x, &tables).unwrap();
         let bad = rope.apply(&x, &narrowed).unwrap();
-        let drift = rel_max_abs(&bad, &good);
+        let drift = tensor_peak_rel_or_abs(&bad, &good);
         println!("[rope] bf16 TABLES vs f32 tables rel-max-abs = {drift:.3e}");
         assert!(
             drift > 1e-3,

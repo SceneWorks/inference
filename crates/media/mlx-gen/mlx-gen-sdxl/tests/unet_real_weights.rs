@@ -11,9 +11,9 @@
 
 use crate::common;
 
+use mlx_gen::testing::peak_rel_host;
 use mlx_gen::weights::Weights;
 use mlx_gen_sdxl::load_unet;
-use mlx_rs::Array;
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -21,19 +21,6 @@ const GOLDEN: &str = concat!(
 );
 
 use common::snapshot;
-
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap();
-    let b = b.reshape(&[n]).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
-    let max_diff = a
-        .iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
-    max_diff / peak
-}
 
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
@@ -58,7 +45,7 @@ fn unet_single_forward_matches_vendored() {
 
     let golden = g.require("eps").unwrap();
     assert_eq!(eps.shape(), golden.shape(), "eps shape");
-    let pr = peak_rel(&eps, golden);
+    let pr = peak_rel_host(&eps, golden, None);
     let mean_rel = {
         let n = golden.shape().iter().product::<i32>();
         let (a, b) = (eps.reshape(&[n]).unwrap(), golden.reshape(&[n]).unwrap());

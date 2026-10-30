@@ -18,35 +18,9 @@
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::testkit::{tensor_cosine, tensor_peak_rel_host_f64};
 use candle_gen_lens::rope::LensRope;
 use candle_gen_lens::transformer::{LensDitConfig, LensTransformer, LensTransformerBlock};
-
-/// Cosine similarity over all elements (flattened), computed in f64 on CPU.
-fn cosine(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    assert_eq!(a.len(), b.len(), "shape mismatch in cosine");
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += (*x as f64) * (*y as f64);
-        na += (*x as f64) * (*x as f64);
-        nb += (*y as f64) * (*y as f64);
-    }
-    Ok((dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32)
-}
-
-/// Peak relative error `max|a-b| / max|b|`, in f64 on CPU.
-fn peak_rel(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let mut max_diff = 0f64;
-    let mut max_b = 0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        max_diff = max_diff.max((*x - *y).abs() as f64);
-        max_b = max_b.max((*y).abs() as f64);
-    }
-    Ok((max_diff / max_b.max(1e-12)) as f32)
-}
 
 #[test]
 #[ignore = "needs the Lens-Turbo transformer snapshot (LENS_DIT_DIR) + goldens (LENS_DIT_GOLDENS)"]
@@ -111,10 +85,10 @@ fn lens_dit_matches_reference() -> Result<()> {
         &txt_sin,
         None,
     )?;
-    let blk_enc_pr = peak_rel(&enc0, &f32g("block0_enc")?)?;
-    let blk_hid_pr = peak_rel(&hid0, &f32g("block0_hidden")?)?;
-    let blk_enc_cos = cosine(&enc0, &f32g("block0_enc")?)?;
-    let blk_hid_cos = cosine(&hid0, &f32g("block0_hidden")?)?;
+    let blk_enc_pr = tensor_peak_rel_host_f64(&enc0, &f32g("block0_enc")?, Some(1e-12)) as f32;
+    let blk_hid_pr = tensor_peak_rel_host_f64(&hid0, &f32g("block0_hidden")?, Some(1e-12)) as f32;
+    let blk_enc_cos = tensor_cosine(&enc0, &f32g("block0_enc")?) as f32;
+    let blk_hid_cos = tensor_cosine(&hid0, &f32g("block0_hidden")?) as f32;
     eprintln!(
         "block0: enc peak_rel={blk_enc_pr:.3e} cosine={blk_enc_cos:.7} | hidden peak_rel={blk_hid_pr:.3e} cosine={blk_hid_cos:.7}"
     );
@@ -125,8 +99,8 @@ fn lens_dit_matches_reference() -> Result<()> {
         .map(|i| f32g(&format!("feat_{i}")))
         .collect::<Result<_>>()?;
     let out = transformer.forward(&f32g("hidden_states")?, &feats, None, timestep, frame, h, w)?;
-    let out_pr = peak_rel(&out, &f32g("out")?)?;
-    let out_cos = cosine(&out, &f32g("out")?)?;
+    let out_pr = tensor_peak_rel_host_f64(&out, &f32g("out")?, Some(1e-12)) as f32;
+    let out_cos = tensor_cosine(&out, &f32g("out")?) as f32;
     eprintln!("full forward: peak_rel={out_pr:.3e} cosine={out_cos:.7}");
 
     // Per-block, fed the exact reference block-0 inputs, isolates every sub-op (fused QKV, QK-norm,

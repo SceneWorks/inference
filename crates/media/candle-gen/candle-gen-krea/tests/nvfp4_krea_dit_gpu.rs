@@ -59,6 +59,7 @@ use std::time::Instant;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::quant::{ActPrecision, CublasLt, Nvfp4Context, OutlierClass};
+use candle_gen::testkit::{cosine_f64_sums, Denom};
 use candle_gen_krea::loader::Weights;
 use candle_gen_krea::nvfp4_dit::{LayerRole, Nvfp4Capability};
 use candle_gen_krea::pipeline::MAX_TEXT_TOKENS;
@@ -217,16 +218,6 @@ fn rel_rms(got: &[f32], reference: &[f32]) -> f64 {
         den += (*r as f64).powi(2);
     }
     (num / den.max(1e-30)).sqrt()
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(b) {
-        dot += (*x as f64) * (*y as f64);
-        na += (*x as f64) * (*x as f64);
-        nb += (*y as f64) * (*y as f64);
-    }
-    dot / (na.sqrt() * nb.sqrt() + 1e-30)
 }
 
 /// PSNR (dB) between two latents, normalized by the reference's dynamic range — the "no visible
@@ -834,7 +825,7 @@ fn nvfp4_krea_dit_sc2_parity_vs_q4_tier() {
     let score = |lat: &[f32]| {
         (
             rel_rms(lat, &lat_bf16),
-            cosine(lat, &lat_bf16),
+            cosine_f64_sums(lat, &lat_bf16, Denom::PlusEps(1e-30)),
             psnr_latent(lat, &lat_bf16),
         )
     };
@@ -863,7 +854,7 @@ fn nvfp4_krea_dit_sc2_parity_vs_q4_tier() {
         "[sc-12110] {:<40} {:>10.5} {:>10.5} {:>10.2}",
         "NVFP4 W4A16 vs Q4 (head to head)",
         rel_rms(&lat_w4a16, &lat_q4),
-        cosine(&lat_w4a16, &lat_q4),
+        cosine_f64_sums(&lat_w4a16, &lat_q4, Denom::PlusEps(1e-30)),
         psnr_latent(&lat_w4a16, &lat_q4)
     );
 

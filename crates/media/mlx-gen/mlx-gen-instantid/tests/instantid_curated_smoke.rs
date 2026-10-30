@@ -19,6 +19,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::media::Image;
+use mlx_gen::testing::{cosine_f64_sums, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::WeightsSource;
 use mlx_gen_instantid::{letterbox, InstantId, InstantIdPaths, InstantIdRequest};
@@ -32,14 +33,6 @@ fn env_usize(key: &str, default: usize) -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
-}
-
-/// Cosine similarity of two (un-normalized) ArcFace embeddings.
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f64 = a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum();
-    let na: f64 = a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-    let nb: f64 = b.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-    (dot / (na * nb + 1e-12)) as f32
 }
 
 fn load_rgb(path: &PathBuf) -> Image {
@@ -117,7 +110,9 @@ fn curated_samplers_preserve_identity() {
         // A destabilizing sampler can yield an image with no detectable face — treat that as
         // identity-lost (cosine 0) rather than a hard panic, so the gate reports it cleanly.
         let cos = match model.largest_face(&out.pixels, size as usize, size as usize) {
-            Ok(f) => cosine(&ref_face.embedding, &f.embedding),
+            Ok(f) => {
+                cosine_f64_sums(&ref_face.embedding, &f.embedding, Denom::PlusEps(1e-12)) as f32
+            }
             Err(e) => {
                 println!("[smoke]   (no face detected in output: {e})");
                 0.0

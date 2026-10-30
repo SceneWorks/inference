@@ -15,6 +15,7 @@ use candle_gen_krea::Krea2Transformer;
 
 use crate::common;
 
+use candle_gen::testkit::{tensor_cosine_f32_sums, tensor_max_abs_diff_host, Denom};
 use common::{
     tiny_dit_config, SHARED_FIXTURE_DIT_AXES_DIMS_ROPE, SHARED_FIXTURE_DIT_EPS,
     SHARED_FIXTURE_DIT_HEADS, SHARED_FIXTURE_DIT_HEAD_DIM, SHARED_FIXTURE_DIT_HIDDEN,
@@ -45,23 +46,6 @@ fn vec_f32(x: &Tensor) -> Vec<f32> {
         .unwrap()
 }
 
-fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-    let a = vec_f32(a);
-    let b = vec_f32(b);
-    let dot: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    dot / (na * nb)
-}
-
-fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-    vec_f32(a)
-        .iter()
-        .zip(&vec_f32(b))
-        .map(|(x, y)| (x - y).abs())
-        .fold(0f32, f32::max)
-}
-
 /// The #1 parity risk localized: the 3-axis interleaved RoPE table for the DiT's joint positions
 /// (`cap_len` text `(0,0,0)` + an `ht×wt` grid `(0,row,col)`) must match the reference cos/sin exactly.
 #[test]
@@ -86,8 +70,8 @@ fn rope_matches_reference() -> Result<()> {
     let want_cos = g.get("cos")?;
     let want_sin = g.get("sin")?;
     assert_eq!(cos.dims(), want_cos.dims(), "cos shape");
-    let dc = max_abs_diff(&cos, &want_cos);
-    let ds = max_abs_diff(&sin, &want_sin);
+    let dc = tensor_max_abs_diff_host(&cos, &want_cos);
+    let ds = tensor_max_abs_diff_host(&sin, &want_sin);
     assert!(dc < 1e-5, "rope cos diverged (max abs {dc:e})");
     assert!(ds < 1e-5, "rope sin diverged (max abs {ds:e})");
     Ok(())
@@ -116,14 +100,14 @@ fn single_block_matches_reference() -> Result<()> {
     )?;
     let want = w.get("out.y")?;
     assert_eq!(y.dims(), want.dims());
-    let c = cosine(&y, &want);
+    let c = tensor_cosine_f32_sums(&y, &want, Denom::Exact);
     println!(
         "single_block parity: cosine={c:.7} max_abs={:e}",
-        max_abs_diff(&y, &want)
+        tensor_max_abs_diff_host(&y, &want)
     );
     assert!(c > 0.999, "single block cosine {c:.7} <= 0.999");
     assert!(
-        max_abs_diff(&y, &want) < 2e-2,
+        tensor_max_abs_diff_host(&y, &want) < 2e-2,
         "single block diverged beyond 2e-2 (cosine {c:.7})"
     );
     #[cfg(feature = "model-inference-proof")]
@@ -149,14 +133,14 @@ fn text_fusion_matches_reference() -> Result<()> {
     let y = tf.forward(&w.get("in.x")?)?;
     let want = w.get("out.y")?;
     assert_eq!(y.dims(), want.dims());
-    let c = cosine(&y, &want);
+    let c = tensor_cosine_f32_sums(&y, &want, Denom::Exact);
     println!(
         "text_fusion parity: cosine={c:.7} max_abs={:e}",
-        max_abs_diff(&y, &want)
+        tensor_max_abs_diff_host(&y, &want)
     );
     assert!(c > 0.999, "text_fusion cosine {c:.7} <= 0.999");
     assert!(
-        max_abs_diff(&y, &want) < 2e-2,
+        tensor_max_abs_diff_host(&y, &want) < 2e-2,
         "text_fusion diverged beyond 2e-2 (cosine {c:.7})"
     );
     #[cfg(feature = "model-inference-proof")]
@@ -188,7 +172,7 @@ fn edit_forward_reduces_to_base_and_refs_influence() -> Result<()> {
     // 1. Zero references ≡ the base forward (byte-close: same ops, same RoPE table).
     let edit0 = dit.forward_edit(&latent, &timestep, &context, &[])?;
     assert_eq!(edit0.dims(), base.dims(), "zero-ref edit shape");
-    let d0 = max_abs_diff(&edit0, &base);
+    let d0 = tensor_max_abs_diff_host(&edit0, &base);
     assert!(
         d0 < 1e-5,
         "forward_edit(&[]) must equal forward() (max abs {d0:e})"
@@ -205,7 +189,7 @@ fn edit_forward_reduces_to_base_and_refs_influence() -> Result<()> {
         vec_f32(&edit1).iter().all(|v| v.is_finite()),
         "one-ref edit finite"
     );
-    let d1 = max_abs_diff(&edit1, &base);
+    let d1 = tensor_max_abs_diff_host(&edit1, &base);
     println!("edit-forward smoke: zero-ref Δ={d0:e} · one-ref Δ={d1:e}");
     assert!(
         d1 > 1e-4,
@@ -242,14 +226,14 @@ fn dit_matches_reference() -> Result<()> {
     )?;
     let want = w.get("out.velocity")?;
     assert_eq!(velocity.dims(), want.dims(), "velocity shape");
-    let c = cosine(&velocity, &want);
+    let c = tensor_cosine_f32_sums(&velocity, &want, Denom::Exact);
     println!(
         "full-DiT parity: cosine={c:.7} max_abs={:e}",
-        max_abs_diff(&velocity, &want)
+        tensor_max_abs_diff_host(&velocity, &want)
     );
     assert!(c > 0.999, "full-DiT cosine {c:.7} <= 0.999");
     assert!(
-        max_abs_diff(&velocity, &want) < 2e-2,
+        tensor_max_abs_diff_host(&velocity, &want) < 2e-2,
         "full-DiT velocity diverged beyond 2e-2 (cosine {c:.7})"
     );
     #[cfg(feature = "model-inference-proof")]

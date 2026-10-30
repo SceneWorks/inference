@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::media::Image;
+use mlx_gen::testing::{cosine_f64_sums, Denom};
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource};
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
 
@@ -64,29 +65,6 @@ fn render(spec: &LoadSpec) -> (Image, f64) {
     (img, peak)
 }
 
-fn cosine(a: &Image, b: &Image) -> f64 {
-    assert_eq!(a.pixels.len(), b.pixels.len());
-    let dot: f64 = a
-        .pixels
-        .iter()
-        .zip(&b.pixels)
-        .map(|(&x, &y)| x as f64 * y as f64)
-        .sum();
-    let na: f64 = a
-        .pixels
-        .iter()
-        .map(|&x| (x as f64).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    let nb: f64 = b
-        .pixels
-        .iter()
-        .map(|&y| (y as f64).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    dot / (na * nb + 1e-12)
-}
-
 fn coherent(img: &Image) -> bool {
     img.pixels.iter().any(|&p| p != 0) && img.pixels.iter().any(|&p| p != 255)
 }
@@ -107,8 +85,8 @@ fn quant_vs_bf16_t2i() {
     let (q8, p_q8) = render(&LoadSpec::new(src.clone()).with_quant(Quant::Q8));
     let (q4, p_q4) = render(&LoadSpec::new(src).with_quant(Quant::Q4));
 
-    let c8 = cosine(&bf16, &q8);
-    let c4 = cosine(&bf16, &q4);
+    let c8 = cosine_f64_sums(&bf16.pixels, &q8.pixels, Denom::PlusEps(1e-12));
+    let c4 = cosine_f64_sums(&bf16.pixels, &q4.pixels, Denom::PlusEps(1e-12));
     // The peak is the process-global peak (`get_peak_memory`); the three tiers run in one process (so
     // later tiers can carry some cache residual). With the sc-5360 streaming load (load+quantize each
     // expert before the next, `WanTransformer::quantize` eval-freeing the bf16 dequant) only one bf16

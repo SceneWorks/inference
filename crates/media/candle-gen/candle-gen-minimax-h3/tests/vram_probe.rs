@@ -85,7 +85,8 @@ use candle_gen::gen_core::{
     WeightsSource,
 };
 use candle_gen::testkit::{
-    cuda_mempool_used_high_bytes, probe_gpu, reset_cuda_mempool_high_water, used_mib, VramProbe,
+    cuda_mempool_used_high_bytes, env_parse_or, probe_gpu, reset_cuda_mempool_high_water, used_mib,
+    VramProbe,
 };
 
 use candle_gen_minimax_h3::model::DEFAULT_STEPS;
@@ -129,10 +130,6 @@ fn env(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-    env(key).and_then(|v| v.parse().ok()).unwrap_or(default)
-}
-
 /// Per-pixel standard deviation of an RGB frame — the non-degenerate gate.
 fn frame_std(img: &Image) -> f64 {
     let n = img.pixels.len() as f64;
@@ -161,10 +158,10 @@ fn measure(tier: &str, quant: Option<Quant>) {
         dir.display()
     );
 
-    let width: u32 = env_or("MINIMAX_H3_VRAM_W", CANVAS_LONG_EDGE);
-    let height: u32 = env_or("MINIMAX_H3_VRAM_H", CANVAS_SHORT_EDGE);
-    let frames: u32 = env_or("MINIMAX_H3_VRAM_FRAMES", SMALLEST_LEGAL_FRAMES as u32);
-    let steps: u32 = env_or("MINIMAX_H3_VRAM_STEPS", DEFAULT_STEPS);
+    let width: u32 = env_parse_or("MINIMAX_H3_VRAM_W", CANVAS_LONG_EDGE);
+    let height: u32 = env_parse_or("MINIMAX_H3_VRAM_H", CANVAS_SHORT_EDGE);
+    let frames: u32 = env_parse_or("MINIMAX_H3_VRAM_FRAMES", SMALLEST_LEGAL_FRAMES as u32);
+    let steps: u32 = env_parse_or("MINIMAX_H3_VRAM_STEPS", DEFAULT_STEPS);
     let prompt = env("MINIMAX_H3_VRAM_PROMPT").unwrap_or_else(|| {
         "a cellist playing on a rooftop at golden hour, the city humming below".to_owned()
     });

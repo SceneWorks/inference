@@ -1108,6 +1108,7 @@ pub(crate) mod quantum_proofs {
     use super::*;
     use crate::quantum::MAX_RATIO;
     use mlx_gen::ios_quantum::{assert_tracks_measured, measured_peak_bytes};
+    use mlx_gen::testing::max_abs_diff_host;
     use std::collections::HashMap;
 
     pub(crate) fn config() -> DcAeConfig {
@@ -1370,14 +1371,6 @@ pub(crate) mod quantum_proofs {
         }
     }
 
-    fn max_abs(a: &Array, b: &Array) -> f32 {
-        a.as_slice::<f32>()
-            .iter()
-            .zip(b.as_slice::<f32>())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f32::max)
-    }
-
     /// The bounded encode tracks the whole-image encode within the tiled-decode parity standard —
     /// in fact to float reassociation: each tile carries the attention-free prefix's full receptive
     /// halo, so every core cell sees exactly the whole image's pixels. It must genuinely tile (both
@@ -1420,7 +1413,7 @@ pub(crate) mod quantum_proofs {
             .as_slice::<f32>()
             .iter()
             .fold(0.0f32, |m, v| m.max(v.abs()));
-        let delta = max_abs(&tiled, &whole);
+        let delta = max_abs_diff_host(&tiled, &whole);
         println!("[tiled encode] max|delta| {delta:.3e} (scale {scale:.3e})");
         assert!(
             delta <= 1e-5 * scale.max(1.0),
@@ -1457,7 +1450,7 @@ pub(crate) mod quantum_proofs {
             .encode_rest(&stitch(&no_halo_rows).unwrap(), &cancel)
             .unwrap();
         no_halo.eval().unwrap();
-        let seam = max_abs(&no_halo, &whole);
+        let seam = max_abs_diff_host(&no_halo, &whole);
         println!("[tiled encode without halo] max|delta| {seam:.3e}");
         assert!(
             seam > 1e-3 * scale,

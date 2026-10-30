@@ -1011,7 +1011,7 @@ mod tests {
         let mask = ones_mask(5);
         let got = packed.forward(&tokens, &mask).unwrap();
         let want = dense.forward(&tokens, &mask).unwrap();
-        let drift = crate::quant::testkit::rel_max_abs(&got, &want);
+        let drift = candle_gen::testkit::tensor_peak_rel_or_abs(&got, &want);
         println!("[te] packed vs dense-grid rel-max-abs = {drift:.3e}");
         assert!(
             drift < 5e-3,

@@ -12,15 +12,12 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::env_path_or_home;
 use mlx_gen::{Conditioning, GenerationRequest, Image, LoadSpec, ReplacementMode, WeightsSource};
 use mlx_gen_scail2::pipeline::MODEL_ID;
 
 fn snapshot_dir() -> PathBuf {
-    std::env::var("SCAIL2_SNAPSHOT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/scail2-mlx-convert")
-        })
+    env_path_or_home("SCAIL2_SNAPSHOT_DIR", ".cache/scail2-mlx-convert")
 }
 
 /// A deterministic gradient image (reference / driving frame stand-in; `generate_smoke.rs`).

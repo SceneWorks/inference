@@ -11,6 +11,7 @@
 //!
 //! Run: `cargo test -p mlx-gen-sensenova --test integration it2i_parity:: -- --nocapture`
 
+use mlx_gen::testing::peak_rel_host;
 use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, T2iModel, T2iOptions};
 use mlx_rs::Array;
@@ -55,18 +56,6 @@ fn config_from_meta(w: &Weights) -> NeoChatConfig {
         "llm_config": llm, "vision_config": vision,
     });
     NeoChatConfig::from_config_json(&v).expect("synthetic parity config is valid")
-}
-
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap();
-    let b = b.reshape(&[n]).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
-    a.iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
-        / peak
 }
 
 #[ignore = "model inference; explicit model-proof workflow"]
@@ -126,7 +115,7 @@ fn it2i_denoise_matches_reference() {
         .unwrap()
         .reshape(&[1, 3, height, width])
         .unwrap();
-    let rel = peak_rel(got, &want);
+    let rel = peak_rel_host(got, &want, Some(1e-12));
     println!("final step ({}): peak-rel={rel:.3e}", num_steps - 1);
     assert!(
         rel < 2e-2,

@@ -17,12 +17,13 @@
 //! ```
 
 use mlx_gen::decoder::LatentDecoder;
+use mlx_gen::testing::{env_or, save_nchw_signed_unit_png};
 use mlx_gen::weights::Weights;
 use mlx_gen_pid::{
     CaptionEncoder, Gemma2, Gemma2Config, PidConfig, PidDecoder, PidNet, Sampler, SamplerConfig,
 };
 use mlx_rs::ops::{max, mean, min};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Dtype;
 
 /// Run B drives the LDM generation AND the PiD caption from the same single prompt.
 const CAPTION: &str = "a highly detailed photograph of a bustling night market food stall, glowing paper lanterns, a neon sign reading OPEN, steam rising from a wok, fresh vegetables, reflections on wet cobblestones, shallow depth of field, 35mm";
@@ -30,12 +31,8 @@ const CAPTION: &str = "a highly detailed photograph of a bustling night market f
 /// Captured trajectory steps (+ final x0), matching `--save_xt_steps 44 46 48` over 50 LDM steps.
 const LABELS: &[&str] = &["44xt", "46xt", "48xt", "x0"];
 
-fn env_or(name: &str, default: String) -> String {
-    std::env::var(name).unwrap_or(default)
-}
-
 fn gemma_snapshot() -> String {
-    env_or("PID_GEMMA_DIR", {
+    env_or("PID_GEMMA_DIR", &{
         let home = std::env::var("MLX_GEN_MODELS_ROOT").expect("set MLX_GEN_MODELS_ROOT to the explicit models root (holds models--*/snapshots); inference never self-fetches or derives a cache location (epic 13657)");
         let base = format!("{home}/models--Efficient-Large-Model--gemma-2-2b-it/snapshots");
         std::fs::read_dir(&base)
@@ -49,28 +46,6 @@ fn gemma_snapshot() -> String {
     })
 }
 
-/// `[1,3,H,W]` in [-1,1] → RGB8 PNG. (`as_slice` is physical-order, so reshape after the transpose
-/// to force a logical-order copy — see `from_clean_decode::save_png`.)
-fn save_png(out: &Array, path: &str) {
-    let sh = out.shape();
-    let (h, w) = (sh[2], sh[3]);
-    let hwc = out
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .reshape(&[3, h, w])
-        .unwrap()
-        .transpose_axes(&[1, 2, 0])
-        .unwrap()
-        .reshape(&[h * w * 3])
-        .unwrap();
-    let buf: Vec<u8> = hwc
-        .as_slice::<f32>()
-        .iter()
-        .map(|x| (((x + 1.0) * 127.5).clamp(0.0, 255.0)) as u8)
-        .collect();
-    image::save_buffer(path, &buf, w as u32, h as u32, image::ColorType::Rgb8).unwrap();
-}
-
 #[test]
 #[ignore = "needs qwenimage ckpt + gemma + dump_runb_latents outputs"]
 fn from_ldm_runb() {
@@ -79,8 +54,7 @@ fn from_ldm_runb() {
         concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../tools/golden/pid/qwenimage_2kto4k.safetensors"
-        )
-        .to_string(),
+        ),
     );
     let w = Weights::from_file(&ckpt).unwrap();
 
@@ -150,7 +124,7 @@ fn from_ldm_runb() {
         assert!(lo.is_finite() && hi.is_finite(), "non-finite output");
         assert!(hi - lo > 0.2, "degenerate (flat) output");
 
-        save_png(&out, &format!("{dir}/mlx_runb_{label}_4096.png"));
+        save_nchw_signed_unit_png(&out, format!("{dir}/mlx_runb_{label}_4096.png"));
         eprintln!("[{label}] wrote mlx_runb_{label}_4096.png + qwenvae_runb_{label}.png");
     }
     crate::model_inference_device::record_model_inference_device();

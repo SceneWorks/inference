@@ -12,14 +12,9 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::env_or_env;
 use mlx_gen_boogu::convert::assemble_quantized_snapshot;
 use mlx_gen_boogu::{BooguPipeline, GenerateOptions, TurboOptions};
-
-fn env_or(key: &str, fallback: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| {
-        std::env::var(fallback).unwrap_or_else(|_| panic!("set {key} or {fallback}"))
-    })
-}
 
 /// Total bytes of a directory tree (for the manifest `estimatedSizeBytes`).
 fn dir_size(dir: &std::path::Path) -> u64 {
@@ -40,7 +35,7 @@ fn dir_size(dir: &std::path::Path) -> u64 {
 #[test]
 #[ignore = "needs real weights (128 GB Mac): set BOOGU_ASM_SRC/BOOGU_BASE_DIR"]
 fn assemble_turnkey_loads() {
-    let src = PathBuf::from(env_or("BOOGU_ASM_SRC", "BOOGU_BASE_DIR"));
+    let src = PathBuf::from(env_or_env("BOOGU_ASM_SRC", "BOOGU_BASE_DIR"));
     let dst = std::env::var("BOOGU_ASM_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("boogu_turnkey"));

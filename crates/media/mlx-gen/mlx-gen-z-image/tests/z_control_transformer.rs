@@ -4,10 +4,10 @@
 //! control projections perturbed off zero-init so the control branch is actually active).
 //! Tol 1e-2 — Metal fp32 across a 40+-matmul control forward.
 
+use mlx_gen::testing::max_abs_diff_host;
 use mlx_gen::weights::Weights;
 use mlx_gen_z_image::{ZImageControlTransformer, ZImageTransformer, ZImageTransformerConfig};
 use mlx_rs::ops::all_close;
-use mlx_rs::Array;
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -33,16 +33,6 @@ fn small_cfg() -> ZImageTransformerConfig {
     }
 }
 
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap();
-    let b = b.reshape(&[n]).unwrap();
-    a.as_slice::<f32>()
-        .iter()
-        .zip(b.as_slice::<f32>())
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
-}
-
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn control_forward_matches_fork() {
@@ -63,7 +53,7 @@ fn control_forward_matches_fork() {
             .unwrap()
             .item::<bool>(),
         "control-on forward diverged from the fork (max|Δ| {:.3e})",
-        max_abs_diff(&y_ctrl, want_ctrl)
+        max_abs_diff_host(&y_ctrl, want_ctrl)
     );
 
     // 2) control_context = None delegates to the base path and matches the fork's base output.
@@ -74,7 +64,7 @@ fn control_forward_matches_fork() {
             .unwrap()
             .item::<bool>(),
         "control-off (None) forward diverged from the fork's base output (max|Δ| {:.3e})",
-        max_abs_diff(&y_none, want_none)
+        max_abs_diff_host(&y_none, want_none)
     );
 
     // 3) Self-consistency: control_context_scale = 0 contributes zero, so it equals the None path
@@ -85,11 +75,11 @@ fn control_forward_matches_fork() {
             .unwrap()
             .item::<bool>(),
         "control scale=0 is not inert: it differs from the base path (max|Δ| {:.3e})",
-        max_abs_diff(&y_scale0, &y_none)
+        max_abs_diff_host(&y_scale0, &y_none)
     );
 
     // 4) Guard against a no-op control bug: control-on must meaningfully differ from control-off.
-    let delta = max_abs_diff(&y_ctrl, &y_none);
+    let delta = max_abs_diff_host(&y_ctrl, &y_none);
     assert!(
         delta > 1e-2,
         "control branch appears inert (max|Δ| {delta:.3e}); a no-op would pass gates 1-3 vacuously"

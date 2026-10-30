@@ -415,30 +415,6 @@ pub(crate) mod testkit {
         )
     }
 
-    /// **Relative max-abs-diff** — `max|a-b| / max|b|`, the crate's established measure. Never
-    /// cosine: cosine is scale-invariant, so it is structurally blind to a mis-decoded group scale,
-    /// which is the defect class the packed path can produce.
-    pub fn rel_max_abs(a: &Tensor, b: &Tensor) -> f32 {
-        assert_eq!(a.dims(), b.dims(), "shape");
-        let max_abs = |t: &Tensor| -> f32 {
-            t.abs()
-                .expect("abs")
-                .flatten_all()
-                .expect("flat")
-                .max(0)
-                .expect("max")
-                .to_vec0::<f32>()
-                .expect("scalar")
-        };
-        let d = max_abs(&(a - b).expect("difference"));
-        let scale = max_abs(b);
-        if scale == 0.0 {
-            d
-        } else {
-            d / scale
-        }
-    }
-
     /// Insert the packed triple for `{base}` into a `Weights`-bound key map, returning the affine
     /// grid the packed weight decodes to.
     pub fn insert_packed(
@@ -461,6 +437,7 @@ mod tests {
     use super::testkit::*;
     use super::*;
     use candle_gen::candle_core::Device;
+    use candle_gen::testkit::tensor_peak_rel_or_abs;
     use std::collections::HashMap;
 
     /// The detect fires on the `.scales` sibling, keeps the base quantized, and never materializes
@@ -515,7 +492,7 @@ mod tests {
         .unwrap();
         let got = packed.linear.forward_upcast(&x).expect("packed forward");
         let want = dense.linear.forward_upcast(&x).expect("dense forward");
-        let drift = rel_max_abs(&got, &want);
+        let drift = tensor_peak_rel_or_abs(&got, &want);
         println!("[quant] packed vs dense-grid rel-max-abs = {drift:.3e}");
         assert!(
             drift < 5e-3,

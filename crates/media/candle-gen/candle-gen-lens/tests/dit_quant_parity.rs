@@ -19,34 +19,8 @@
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::Quant;
+use candle_gen::testkit::{tensor_cosine, tensor_peak_rel_host_f64};
 use candle_gen_lens::transformer::{LensDitConfig, LensTransformer};
-
-/// Cosine similarity over all elements (flattened), computed in f64 on CPU.
-fn cosine(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    assert_eq!(a.len(), b.len(), "shape mismatch in cosine");
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += (*x as f64) * (*y as f64);
-        na += (*x as f64) * (*x as f64);
-        nb += (*y as f64) * (*y as f64);
-    }
-    Ok((dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32)
-}
-
-/// Peak relative error `max|a-b| / max|b|`, in f64 on CPU.
-fn peak_rel(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let mut max_diff = 0f64;
-    let mut max_b = 0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        max_diff = max_diff.max((*x - *y).abs() as f64);
-        max_b = max_b.max((*y).abs() as f64);
-    }
-    Ok((max_diff / max_b.max(1e-12)) as f32)
-}
 
 #[test]
 #[ignore = "needs the Lens-Turbo transformer snapshot (LENS_DIT_DIR) + goldens (LENS_DIT_GOLDENS)"]
@@ -111,20 +85,20 @@ fn lens_dit_quant_matches_dense() -> Result<()> {
     let dense = run(&dit)?;
     dit.quantize(Quant::Q8)?;
     let q8 = run(&dit)?;
-    let q8_cos = cosine(&q8, &dense)?;
+    let q8_cos = tensor_cosine(&q8, &dense) as f32;
     eprintln!(
         "Q8 vs dense bf16: cosine {q8_cos:.6}  peak_rel {:.3e}",
-        peak_rel(&q8, &dense)?
+        tensor_peak_rel_host_f64(&q8, &dense, Some(1e-12)) as f32
     );
 
     // Fresh dense DiT → Q4.
     let mut dit = LensTransformer::new(&cfg, vb)?;
     dit.quantize(Quant::Q4)?;
     let q4 = run(&dit)?;
-    let q4_cos = cosine(&q4, &dense)?;
+    let q4_cos = tensor_cosine(&q4, &dense) as f32;
     eprintln!(
         "Q4 vs dense bf16: cosine {q4_cos:.6}  peak_rel {:.3e}",
-        peak_rel(&q4, &dense)?
+        tensor_peak_rel_host_f64(&q4, &dense, Some(1e-12)) as f32
     );
 
     // Q8 is near-lossless. Q4 is lossier — a single full DiT forward quantizes `img_in`/`txt_in`/

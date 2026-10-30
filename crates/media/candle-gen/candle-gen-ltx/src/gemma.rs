@@ -272,6 +272,7 @@ impl GemmaEncoder {
 #[cfg(all(test, any(feature = "cuda", feature = "metal")))]
 mod hidden_state_pinning_tests {
     use super::*;
+    use candle_gen::testkit::tensor_max_abs_diff_f32;
     use std::collections::HashMap;
 
     fn device() -> Device {
@@ -438,19 +439,6 @@ mod hidden_state_pinning_tests {
         VarBuilder::from_tensors(m, DType::BF16, dev)
     }
 
-    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a.to_dtype(DType::F32).unwrap();
-        let b = b.to_dtype(DType::F32).unwrap();
-        (a - b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
-    }
-
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
     fn forward_returns_exactly_num_layers_plus_one_hidden_states() {
@@ -493,7 +481,7 @@ mod hidden_state_pinning_tests {
             .reshape((1, 2, cfg.hidden_size))
             .unwrap();
         assert!(
-            max_abs_diff(&hiddens[0], &want) < 5e-3,
+            tensor_max_abs_diff_f32(&hiddens[0], &want) < 5e-3,
             "hidden_states[0] must be exactly the scaled embedding lookup (index 0 pinning)"
         );
 
@@ -529,12 +517,12 @@ mod hidden_state_pinning_tests {
         let last = hiddens_a.len() - 1;
         for i in 0..last {
             assert!(
-                max_abs_diff(&hiddens_a[i], &hiddens_b[i]) < 1e-6,
+                tensor_max_abs_diff_f32(&hiddens_a[i], &hiddens_b[i]) < 1e-6,
                 "perturbing the FINAL norm changed hidden_states[{i}], which is not the final index"
             );
         }
         assert!(
-            max_abs_diff(&hiddens_a[last], &hiddens_b[last]) > 1e-3,
+            tensor_max_abs_diff_f32(&hiddens_a[last], &hiddens_b[last]) > 1e-3,
             "perturbing the FINAL norm must change the LAST hidden state (the final-norm slot)"
         );
 

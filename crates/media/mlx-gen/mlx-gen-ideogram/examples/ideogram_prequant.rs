@@ -1,12 +1,9 @@
 //! One-call Q8 pre-quant of the ideogram-4-mlx snapshot so it fits 64GB (bf16 is ~53GB — the DiT is
 //! doubled for asymmetric CFG). Run from the workspace root:
 //!   cargo run --release --example ideogram_prequant -p mlx-gen-ideogram
+use mlx_gen::testing::env_or;
 use std::path::PathBuf;
 use std::time::Instant;
-
-fn env_or(k: &str, d: &str) -> String {
-    std::env::var(k).unwrap_or_else(|_| d.to_string())
-}
 
 fn main() {
     let src = PathBuf::from(env_or(

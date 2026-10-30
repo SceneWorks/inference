@@ -15,6 +15,7 @@ use crate::common;
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::{peak_rel_host, peak_rel_slices};
 use mlx_gen::weights::Weights;
 use mlx_gen_sdxl::ip_adapter::{Resampler, ResamplerConfig};
 use mlx_gen_sdxl::vision_encoder::{ClipVisionEncoder, VisionConfig};
@@ -32,20 +33,6 @@ fn f32_weights(path: PathBuf) -> Weights {
     let mut w = Weights::from_file(&path).unwrap_or_else(|e| panic!("load {path:?}: {e}"));
     w.cast_all(Dtype::Float32).unwrap();
     w
-}
-
-/// Peak-relative error `max|a-b| / max|b|`.
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap().as_dtype(Dtype::Float32).unwrap();
-    let b = b.reshape(&[n]).unwrap().as_dtype(Dtype::Float32).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
-    let max_diff = a
-        .iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
-    max_diff / peak
 }
 
 /// Diagnose where the error lives: peak_rel, mean-relative error, and the magnitude of the golden
@@ -73,22 +60,13 @@ fn diagnose(tag: &str, a: &Array, b: &Array) {
     println!(
         "[{tag}] peak_rel={:.3e} mean_rel={:.3e} | worst@(tok={tok},ch={ch}): \
          golden={:.4} mine={:.4} |Δ|={:.4} (golden_peak={:.2})",
-        peak_rel_slices(a, b),
+        peak_rel_slices(a, b, None),
         (sum_abs_d / sum_abs_b) as f32,
         b[wi],
         a[wi],
         wd,
         peak,
     );
-}
-
-fn peak_rel_slices(a: &[f32], b: &[f32]) -> f32 {
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
-    let max_diff = a
-        .iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
-    max_diff / peak
 }
 
 #[test]
@@ -123,11 +101,11 @@ fn ip_adapter_image_path_matches_torch() {
         // a primitive port bug; it's cross-backend f32 GEMM/SDPA accumulating in CLIP's pre-LN
         // residual stream (sc-3056 finding).
         assert!(
-            peak_rel(&gout, g.require("gelu_out").unwrap()) < 1e-5,
+            peak_rel_host(&gout, g.require("gelu_out").unwrap(), None) < 1e-5,
             "gelu_exact != torch"
         );
         assert!(
-            peak_rel(&lout, g.require("ln_out").unwrap()) < 1e-5,
+            peak_rel_host(&lout, g.require("ln_out").unwrap(), None) < 1e-5,
             "layer_norm != torch"
         );
     }
@@ -165,7 +143,7 @@ fn ip_adapter_image_path_matches_torch() {
         g.require("vit_h16").unwrap(),
     );
     let vit = states[states.len() - 2].clone();
-    let vit_rel = peak_rel(&vit, vit_golden);
+    let vit_rel = peak_rel_host(&vit, vit_golden, None);
     diagnose("ViT-H penultimate       ", &vit, vit_golden);
 
     // 2a. Resampler from the GOLDEN penultimate (isolates the Resampler).
@@ -175,7 +153,7 @@ fn ip_adapter_image_path_matches_torch() {
     )
         .1
         .unwrap();
-    let tok_iso_rel = peak_rel(&tok_iso, tok_golden);
+    let tok_iso_rel = peak_rel_host(&tok_iso, tok_golden, None);
     println!("[ip-adapter spike] Resampler tokens (golden in) peak_rel = {tok_iso_rel:.3e}");
 
     // 2b. Resampler from the Rust encoder's own penultimate (full image -> tokens chain).
@@ -185,7 +163,7 @@ fn ip_adapter_image_path_matches_torch() {
     )
         .1
         .unwrap();
-    let tok_e2e_rel = peak_rel(&tok_e2e, tok_golden);
+    let tok_e2e_rel = peak_rel_host(&tok_e2e, tok_golden, None);
     println!("[ip-adapter spike] Resampler tokens (e2e) peak_rel = {tok_e2e_rel:.3e}");
 
     // f32 vs f32, cross-backend (torch CPU vs MLX Metal). The Resampler is the strict gate: its

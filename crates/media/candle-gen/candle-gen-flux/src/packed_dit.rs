@@ -1798,7 +1798,7 @@ mod tests {
             Some(&guidance),
         )?;
         assert!(
-            max_abs_diff(&baseline, &expected) > 1e-6,
+            tensor_max_abs_diff_f32(&baseline, &expected) > 1e-6,
             "nonzero XLabs residual must affect the packed DiT output"
         );
         #[cfg(feature = "model-inference-proof")]
@@ -1869,7 +1869,7 @@ mod tests {
             &pooled,
             Some(&guidance),
         )?;
-        assert!(max_abs_diff(&baseline, &expected) > 1e-6);
+        assert!(tensor_max_abs_diff_f32(&baseline, &expected) > 1e-6);
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_dit::tests::streamed_control_window_one_matches_resident_with_absolute_residual_indices");
         Ok(())
@@ -1961,7 +1961,7 @@ mod tests {
         let injected =
             dit.forward_injected(&img, &img_ids, &txt, &txt_ids, &ts, &pooled, Some(&g), None)?;
         assert_eq!(
-            max_abs_diff(&base, &injected),
+            tensor_max_abs_diff_f32(&base, &injected),
             0.0,
             "None injector must be a no-op"
         );
@@ -2003,7 +2003,7 @@ mod tests {
             Some(&g),
             Some(&inj),
         )?;
-        let d = max_abs_diff(&base, &out);
+        let d = tensor_max_abs_diff_f32(&base, &out);
         assert!(
             d > 1e-4,
             "a nonzero injected residual must change the output: max|Δ| = {d}"
@@ -2028,20 +2028,8 @@ mod tests {
     // ========================================================================================
 
     use candle_gen::candle_core::Var;
+    use candle_gen::testkit::tensor_max_abs_diff_f32;
     use std::collections::HashMap;
-
-    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-        a.to_dtype(DType::F32)
-            .unwrap()
-            .sub(&b.to_dtype(DType::F32).unwrap())
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
-    }
 
     /// A tiny parity [`Config`]: heads 2 · head_dim 8 = hidden 16, `axes_dim` summing to 8.
     /// `context_in_dim`/`vec_in_dim` MUST be the real FLUX widths (4096 T5 / 768 pooled) because the
@@ -2449,7 +2437,7 @@ mod tests {
             guid.as_ref()
         ))?;
         assert_eq!(v.dims(), s.dims());
-        let d = max_abs_diff(&v, &s);
+        let d = tensor_max_abs_diff_f32(&v, &s);
         assert!(
             d < tol,
             "vendored diffusers DiT vs stock BFL Flux (double={num_double} single={num_single} \

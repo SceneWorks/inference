@@ -1824,6 +1824,7 @@ mod ltx25_real_bundle {
 /// (sc-18778), so there is no 2.5 pipeline to render through. This exercises the seam that exists.
 mod ltx25_real_packed_forward {
     use candle_gen::candle_core::{DType, Device, Tensor};
+    use candle_gen::testkit::tensor_max_abs_host;
     use candle_gen_ltx::diff_vae::{NaDiffusionDecoder, NaDiffusionDecoderConfig};
     use candle_gen_ltx::tier::{Ltx25Component, Ltx25Tier};
 
@@ -1835,16 +1836,6 @@ mod ltx25_real_packed_forward {
                  q4/ q8/ bf16/)"
             ),
         }
-    }
-
-    /// `max |x|` over a tensor, on the host.
-    fn max_abs(t: &Tensor) -> f32 {
-        t.to_dtype(DType::F32)
-            .and_then(|t| t.flatten_all())
-            .and_then(|t| t.to_vec1::<f32>())
-            .expect("host copy")
-            .into_iter()
-            .fold(0f32, |a, v| a.max(v.abs()))
     }
 
     /// Standard deviation over a tensor, on the host.
@@ -1902,7 +1893,7 @@ mod ltx25_real_packed_forward {
             .stage_features(&latent)
             .expect("forward the packed decoder");
 
-        let hi = max_abs(&features);
+        let hi = tensor_max_abs_host(&features);
         let sd = std_dev(&features);
         eprintln!(
             "[q4-diffvae] stage-4 features {:?} max|x|={hi:.4} std={sd:.4}",
@@ -1981,7 +1972,7 @@ mod ltx25_real_packed_forward {
         let latent =
             Tensor::randn(0f32, 1f32, (1, cfg.in_channels, t, h, w), &device).expect("latent");
         let (features, _) = decoder.stage_features(&latent).expect("dense forward");
-        assert!(max_abs(&features).is_finite());
+        assert!(tensor_max_abs_host(&features).is_finite());
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_tier_validate::ltx25_real_packed_forward::the_real_bf16_diff_vae_decoder_still_loads_dense");

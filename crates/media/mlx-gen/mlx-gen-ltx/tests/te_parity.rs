@@ -7,9 +7,7 @@
 //!
 //! Run: `cargo test -p mlx-gen-ltx --test integration te_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{abs, max, subtract};
-use mlx_rs::Array;
-
+use mlx_gen::testing::peak_rel_native;
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::config::{LtxConfig, SplitModel};
 use mlx_gen_ltx::gemma::GemmaConfig;
@@ -32,12 +30,6 @@ fn base_dir() -> std::path::PathBuf {
     }
     std::path::PathBuf::from(std::env::var("HOME").unwrap())
         .join("Library/Application Support/SceneWorks/data/models/mlx/ltx_2_3_base_q8")
-}
-
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(got, want).unwrap()).unwrap();
-    let denom = max(abs(want).unwrap(), None).unwrap().item::<f32>();
-    max(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
 }
 
 #[test]
@@ -69,8 +61,8 @@ fn full_text_encoder_matches_reference() {
         .encode_with_features(input_ids, attention_mask)
         .expect("encode");
 
-    let pr_feats = peak_rel(&feats, g.require("video_features").unwrap());
-    let pr_emb = peak_rel(&emb, g.require("video_embeddings").unwrap());
+    let pr_feats = peak_rel_native(&feats, g.require("video_features").unwrap(), Some(1e-12));
+    let pr_emb = peak_rel_native(&emb, g.require("video_embeddings").unwrap(), Some(1e-12));
     eprintln!("TE: video_features peak_rel {pr_feats:.3e}  video_embeddings peak_rel {pr_emb:.3e}");
     // `video_features` (after the per-token-RMS feature extractor) gates feat-extract + Gemma
     // tightly — the RMS-norm contracts the Gemma bf16 cross-build delta (~9e-3) rather than
@@ -121,11 +113,11 @@ fn full_text_encoder_av_matches_reference() {
         .expect("encode_av");
 
     // Video half identical to the video-only gate (shared normed_hidden).
-    let pr_vf = peak_rel(&vf, g.require("video_features").unwrap());
-    let pr_ve = peak_rel(&ve, g.require("video_embeddings").unwrap());
+    let pr_vf = peak_rel_native(&vf, g.require("video_features").unwrap(), Some(1e-12));
+    let pr_ve = peak_rel_native(&ve, g.require("video_embeddings").unwrap(), Some(1e-12));
     // Audio half: same per-token-RMS feature path → tight on features, looser through the connector.
-    let pr_af = peak_rel(&af, g.require("audio_features").unwrap());
-    let pr_ae = peak_rel(&ae, g.require("audio_embeddings").unwrap());
+    let pr_af = peak_rel_native(&af, g.require("audio_features").unwrap(), Some(1e-12));
+    let pr_ae = peak_rel_native(&ae, g.require("audio_embeddings").unwrap(), Some(1e-12));
     eprintln!(
         "TE/AV: video_features {pr_vf:.3e} video_emb {pr_ve:.3e} | audio_features {pr_af:.3e} audio_emb {pr_ae:.3e}"
     );

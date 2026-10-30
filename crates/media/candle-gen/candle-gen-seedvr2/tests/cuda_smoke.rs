@@ -17,6 +17,7 @@
 use crate::support::pearson;
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{imageops, Image};
+use candle_gen::testkit::{cosine_f64_sums, Denom};
 use candle_gen_seedvr2::config::DitConfig;
 use candle_gen_seedvr2::pipeline::Seedvr2Pipeline;
 
@@ -42,17 +43,6 @@ fn synth_lr(side: usize) -> Image {
         height: side as u32,
         pixels,
     }
-}
-
-/// Cosine similarity over two equal-length RGB8 pixel buffers.
-fn pixel_cosine(a: &[u8], b: &[u8]) -> f32 {
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += (*x as f64) * (*y as f64);
-        na += (*x as f64).powi(2);
-        nb += (*y as f64).powi(2);
-    }
-    (dot / (na.sqrt() * nb.sqrt()).max(1e-12)) as f32
 }
 
 /// Mean |gradient| (a crude sharpness proxy) of an interleaved RGB8 buffer.
@@ -219,7 +209,7 @@ fn seedvr2_image_path_tiles_when_over_budget() {
 
     // The tiled result tracks the one-pass result closely (feather-blend; not bit-exact — the causal
     // VAE sees different border padding per tile).
-    let cos = pixel_cosine(&tiled.pixels, &single.pixels);
+    let cos = cosine_f64_sums(&tiled.pixels, &single.pixels, Denom::FloorAt(1e-12)) as f32;
     eprintln!("[seedvr2-smoke] image-path tiled vs single-pass: cosine={cos:.6}");
     assert!(cos > 0.95, "tiled image diverged from single-pass: {cos}");
 

@@ -1808,6 +1808,7 @@ pub(crate) mod synthetic {
 mod bounded_attention_tests {
     use super::*;
     use mlx_gen::attention::{AttentionBudget, AttentionPlan};
+    use mlx_gen::testing::peak_rel_host;
     use mlx_gen::{CancelFlag, Error};
     use mlx_rs::random;
 
@@ -1864,18 +1865,6 @@ mod bounded_attention_tests {
     }
     fn single_call_at(sk: i32) -> u64 {
         HEADS * sk as u64 * IMAGE_TOKENS as u64
-    }
-
-    fn peak_relative_delta(a: &Array, b: &Array) -> f32 {
-        let n: i32 = b.shape().iter().product();
-        let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
-        let b = b.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
-        let (xs, ys) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-        let peak = ys.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
-        xs.iter()
-            .zip(ys)
-            .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
-            / peak
     }
 
     /// Chunking changes the query GEMM's `M` dimension, so the two forwards are tolerance-equivalent
@@ -1961,7 +1950,7 @@ mod bounded_attention_tests {
             .forward_bounded(&latents, &sigma, &encoder, Dtype::Float32, plan, None)
             .unwrap();
         assert_eq!(chunked.shape(), unbounded.shape(), "output shape");
-        let delta = peak_relative_delta(&chunked, &unbounded);
+        let delta = peak_rel_host(&chunked, &unbounded, Some(1e-12));
         assert!(
             delta < TOLERANCE,
             "bounded attention changed the DiT velocity: peak-relative delta {delta:e}"
@@ -1979,7 +1968,7 @@ mod bounded_attention_tests {
                 None,
             )
             .unwrap();
-        assert_eq!(peak_relative_delta(&unbounded, &explicit), 0.0);
+        assert_eq!(peak_rel_host(&unbounded, &explicit, Some(1e-12)), 0.0);
         #[cfg(target_os = "macos")]
         crate::test_metal_guard::record_model_inference_device();
         eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED transformer::bounded_attention_tests::the_chunked_forward_matches_the_unbounded_forward");

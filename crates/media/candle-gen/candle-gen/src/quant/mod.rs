@@ -1490,12 +1490,8 @@ pub fn embedding_dtype_gs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::tensor_cosine;
     use candle_core::safetensors::MmapedSafetensors;
-
-    /// Cosine similarity over all elements (f64), the quant-parity metric.
-    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        crate::testkit::tensor_cosine(a, b) as f32
-    }
 
     // ---- helpers -----------------------------------------------------------------------------
 
@@ -1555,7 +1551,7 @@ mod tests {
         )));
 
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        let cos = cosine(&packed.forward(&x)?, &dense.forward(&x)?);
+        let cos = tensor_cosine(&packed.forward(&x)?, &dense.forward(&x)?) as f32;
         assert!(cos > 0.99999, "packed vs dense-grid cosine {cos:.6}");
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::packed_qlinear_forward_matches_dense_grid");
@@ -1596,7 +1592,8 @@ mod tests {
         // The dequant-on-forward output approximates the dense weight it was quantized from + bias.
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let dense = Linear::new(w, Some(bias));
-        let cos = cosine(&ql.forward(&x)?, &__model_proof_output!(dense.forward(&x))?);
+        let cos =
+            tensor_cosine(&ql.forward(&x)?, &__model_proof_output!(dense.forward(&x))?) as f32;
         assert!(cos > 0.99, "Q4_K dequant-forward vs dense cosine {cos:.5}");
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::from_qtensor_dequant_keeps_kquant_resident_and_forwards");
@@ -1879,7 +1876,7 @@ mod tests {
                 } else {
                     lin.quantize(Quant::Q8)?;
                 }
-                let cos = cosine(&lin.forward(&x)?, &dense_ref);
+                let cos = tensor_cosine(&lin.forward(&x)?, &dense_ref) as f32;
                 assert!(
                     cos > 0.999,
                     "chunk {name} via {label}: cos {cos:.6} — an offset view quantized the wrong \
@@ -2160,8 +2157,8 @@ mod tests {
         // Raw int8 `QMatMul` over the same Q4 weight — the path the black-render bug took.
         let int8 = QMatMul::from_qtensor(qt)?.forward(&x)?;
 
-        let dq = cosine(&dequant, &reference);
-        let q8 = cosine(&int8, &reference);
+        let dq = tensor_cosine(&dequant, &reference) as f32;
+        let q8 = tensor_cosine(&int8, &reference) as f32;
         eprintln!("sc-7702 packed outlier cosine: dequant(QLinear)={dq:.4}  int8(QMatMul)={q8:.4}");
         assert!(
             dq > 0.99,
@@ -2311,7 +2308,7 @@ mod tests {
         let got = transposed.forward(&x)?;
         let want = __model_proof_output!(plain.forward(&x))?;
         assert_eq!(got.dims(), want.dims());
-        let cos = cosine(&got, &want);
+        let cos = tensor_cosine(&got, &want) as f32;
         assert!(cos > 0.99999, "transposed vs linear cosine {cos:.6}");
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::dense_transposed_layout_matches_linear_on_nd");
@@ -2343,7 +2340,7 @@ mod tests {
         ));
         let q = lin.forward(&x)?;
         assert_eq!(q.dims(), dense.dims());
-        let cos = cosine(&dense, &q);
+        let cos = tensor_cosine(&dense, &q) as f32;
         assert!(cos > 0.999, "int8-fast Q8 cosine {cos:.5}");
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED quant::tests::int8_fast_fold_quantizes_and_reports_strategy");

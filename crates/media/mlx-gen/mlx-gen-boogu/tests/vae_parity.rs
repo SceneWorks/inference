@@ -9,20 +9,9 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::testing::require_env_path;
+use mlx_gen::testing::{cosine_f32_device, require_env_path};
 use mlx_gen::weights::Weights;
 use mlx_gen_boogu::load_vae;
-use mlx_rs::ops::{multiply, sqrt, sum};
-use mlx_rs::{Array, Dtype};
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let dot = sum(multiply(&a, &b).unwrap(), false).unwrap();
-    let na = sqrt(sum(multiply(&a, &a).unwrap(), false).unwrap()).unwrap();
-    let nb = sqrt(sum(multiply(&b, &b).unwrap(), false).unwrap()).unwrap();
-    (dot / (na * nb)).item::<f32>()
-}
 
 fn golden_path() -> PathBuf {
     std::env::var("BOOGU_VAE_GOLDEN")
@@ -52,7 +41,7 @@ fn vae_decode_matches_reference() {
         "decoded image shape (NCHW [1,3,1,H,W])"
     );
 
-    let c = cosine(&out, want);
+    let c = cosine_f32_device(&out, want);
     println!("Boogu VAE decode parity cosine = {c:.7}");
     assert!(
         c > 0.999,
@@ -81,7 +70,7 @@ fn vae_encode_matches_reference() {
         "encoded latent shape [1,16,H/8,W/8]"
     );
 
-    let c = cosine(&out, want);
+    let c = cosine_f32_device(&out, want);
     println!("Boogu VAE encode parity cosine = {c:.7}");
     assert!(
         c > 0.999,

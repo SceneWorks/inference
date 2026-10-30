@@ -18,10 +18,10 @@
 //! call chain, or the budget did not chunk. Either is the regression this file exists to catch.
 
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
+use mlx_gen::testing::peak_rel_host;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error};
 use mlx_gen_z_image::{ZImageControlTransformer, ZImageTransformer, ZImageTransformerConfig};
-use mlx_rs::{Array, Dtype};
 
 const BASE_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -78,18 +78,6 @@ fn chunking_budget() -> AttentionBudget {
     AttentionBudget::from_score_elements(2048, true)
 }
 
-fn peak_relative_delta(a: &Array, b: &Array) -> f32 {
-    let n: i32 = b.shape().iter().product();
-    let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
-    let (xs, ys) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = ys.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
-    xs.iter()
-        .zip(ys)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
-        / peak
-}
-
 /// MLX's Metal matmul is reduced-precision (the sc-2338 class this crate already tolerates at 1e-2
 /// across a whole forward), and chunking changes which kernel specialization runs per block, so this
 /// is the numerical-equivalence bound over a whole DiT forward.
@@ -108,7 +96,7 @@ fn base_dit_chunked_forward_matches_the_unbounded_forward() {
         .forward_budgeted(x, 0.7, cap, AttentionPlan::budgeted(chunking_budget()))
         .unwrap();
     assert_eq!(chunked.shape(), unbounded.shape(), "output shape");
-    let delta = peak_relative_delta(&chunked, &unbounded);
+    let delta = peak_rel_host(&chunked, &unbounded, Some(1e-12));
     assert!(
         delta < TOLERANCE,
         "bounded attention changed the DiT velocity: peak-relative delta {delta:e}"
@@ -162,7 +150,7 @@ fn control_dit_chunked_forward_matches_the_unbounded_forward() {
         )
         .unwrap();
     assert_eq!(chunked.shape(), unbounded.shape(), "output shape");
-    let delta = peak_relative_delta(&chunked, &unbounded);
+    let delta = peak_rel_host(&chunked, &unbounded, Some(1e-12));
     assert!(
         delta < TOLERANCE,
         "bounded attention changed the control DiT velocity: peak-relative delta {delta:e}"
@@ -210,7 +198,7 @@ fn the_default_forward_is_exactly_the_unbounded_forward() {
     let explicit = model
         .forward_budgeted(x, 0.7, cap, AttentionPlan::UNBOUNDED)
         .unwrap();
-    assert_eq!(peak_relative_delta(&implicit, &explicit), 0.0);
+    assert_eq!(peak_rel_host(&implicit, &explicit, Some(1e-12)), 0.0);
     #[cfg(target_os = "macos")]
     crate::common::metal_guard::record_model_inference_device();
     eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED attention_budget_dit::the_default_forward_is_exactly_the_unbounded_forward");

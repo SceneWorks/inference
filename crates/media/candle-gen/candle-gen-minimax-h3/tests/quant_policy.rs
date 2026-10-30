@@ -55,6 +55,7 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::quant::MLX_GROUP_SIZE;
 use candle_gen::Weights;
 
+use candle_gen::testkit::tensor_peak_rel_or_abs;
 use candle_gen_minimax_h3::quant::{embed, guard_dense, lin, DIT, TEXT_ENCODER};
 
 /// A deterministic MLX **Q4** affine pack at [`MLX_GROUP_SIZE`] of an `[out, in]` weight.
@@ -120,31 +121,6 @@ fn insert_dense(map: &mut HashMap<String, Tensor>, base: &str, out_dim: usize, i
         format!("{base}.weight"),
         Tensor::zeros((out_dim, in_dim), DType::F32, &Device::Cpu).unwrap(),
     );
-}
-
-/// **Relative max-abs-diff** — `max|a-b| / max|b|`, this crate's established measure.
-///
-/// Never cosine: cosine is scale-invariant and therefore structurally blind to a mis-decoded group
-/// scale, which is precisely the defect class the packed path can produce.
-fn rel_max_abs(a: &Tensor, b: &Tensor) -> f32 {
-    assert_eq!(a.dims(), b.dims(), "shape");
-    let max_abs = |t: &Tensor| -> f32 {
-        t.abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_vec0::<f32>()
-            .unwrap()
-    };
-    let d = max_abs(&(a - b).unwrap());
-    let scale = max_abs(b);
-    if scale == 0.0 {
-        d
-    } else {
-        d / scale
-    }
 }
 
 /// Every base the converter's `TE_PACK_SUFFIXES` names, as a representative full dotted key on this
@@ -401,7 +377,7 @@ fn the_packed_forward_matches_its_dense_grid_at_every_target() {
 
             let got = packed.linear.forward_upcast(&x).expect("packed forward");
             let want = dense.linear.forward_upcast(&x).expect("dense forward");
-            let drift = rel_max_abs(&got, &want);
+            let drift = tensor_peak_rel_or_abs(&got, &want);
             assert!(
                 drift < 5e-3,
                 "{component} {base}: the Q4_1 repack is lossless up to the f16 scale/bias cast; got \

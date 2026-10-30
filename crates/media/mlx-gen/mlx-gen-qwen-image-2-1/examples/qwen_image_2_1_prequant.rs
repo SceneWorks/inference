@@ -27,15 +27,12 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use mlx_gen::testing::env_or;
 use mlx_gen_qwen_image_2_1::convert::{
     prequantize_turnkey, source_variant, CHANGES_FILE, SHA256SUMS_FILE,
 };
 use mlx_gen_qwen_image_2_1::quant::Tier;
 use mlx_gen_qwen_image_2_1::Variant;
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_owned())
-}
 
 fn tier_from_env() -> Tier {
     let name = env_or("QWEN21_TIER", "q8");

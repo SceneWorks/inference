@@ -1690,6 +1690,7 @@ mod tests {
     use candle_gen::candle_core::safetensors as ct_safetensors;
     use candle_gen::candle_nn::Module; // brings `LoraLinear::forward` into scope for the tests
     use candle_gen::quant::{dequant_mlx_q4_reference_gs, QLinear, MLX_GROUP_SIZE};
+    use candle_gen::testkit::tensor_max_abs_diff_f32;
     use candle_gen::train::lora::{
         build_lora_targets, save_lora_peft, LoraLinear, SDXL_PEFT_PREFIX,
     };
@@ -1771,17 +1772,6 @@ mod tests {
         (file, delta)
     }
 
-    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-        (a.to_dtype(DType::F32).unwrap() - b.to_dtype(DType::F32).unwrap())
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
-    }
-
     /// **Core packed parity (sc-11103).** Installing the SAME trained LoRA on (i) a **packed** `to_q` leaf
     /// (forward-time additive residual, base kept packed) and (ii) the equivalent **dense** grid folded
     /// (`W += δ`) produce the same forward within tolerance — proving the packed additive path equals the
@@ -1826,7 +1816,7 @@ mod tests {
         let packed_y = host.0.forward(&x).unwrap();
         let dense_y = dense.forward(&x).unwrap();
         assert!(
-            max_abs_diff(&packed_y, &dense_y) < 1e-3,
+            tensor_max_abs_diff_f32(&packed_y, &dense_y) < 1e-3,
             "packed additive forward diverged from the dense fold"
         );
         // The residual actually moves the output (a scale-0 / no-op install would fail this).
@@ -1841,7 +1831,7 @@ mod tests {
             qp.into(),
         );
         assert!(
-            max_abs_diff(&packed_y, &bare.forward(&x).unwrap()) > 1e-3,
+            tensor_max_abs_diff_f32(&packed_y, &bare.forward(&x).unwrap()) > 1e-3,
             "the additive residual must shift the packed forward"
         );
 
@@ -2073,7 +2063,7 @@ mod tests {
             "only the conv target folds (the Linear is additive)"
         );
         assert!(
-            max_abs_diff(map.get("conv_in.weight").unwrap(), &conv0) > 1e-4,
+            tensor_max_abs_diff_f32(map.get("conv_in.weight").unwrap(), &conv0) > 1e-4,
             "the conv weight must change"
         );
         // The packed to_q triple is byte-untouched: still u32-packed with its `.scales`/`.biases`.
@@ -2173,7 +2163,8 @@ mod tests {
         );
         let x = Tensor::randn(0f32, 1f32, (2usize, in_dim), &dev).unwrap();
         assert!(
-            max_abs_diff(&additive.forward(&x).unwrap(), &folded.forward(&x).unwrap()) < 1e-4,
+            tensor_max_abs_diff_f32(&additive.forward(&x).unwrap(), &folded.forward(&x).unwrap())
+                < 1e-4,
             "resolved additive != folded"
         );
 

@@ -37,7 +37,7 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{
     GenerationRequest, Image, LoadSpec, PreviewFrame, PreviewSink, Progress, WeightsSource,
 };
-use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::save_rgb8_png_in;
 use candle_gen::testkit::sha256_file;
 use candle_gen::testkit::{
     collecting_sink, correlation, downsample_nearest, downsample_nearest_raw, env_path_opt,
@@ -170,15 +170,9 @@ fn the_lens_vae_rounds_onto_the_flux2_fit_donor() {
 
 // ── Frame analysis helpers ────────────────────────────────────────────────────────────────────────
 
-fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let path = artifact_dir().join(name);
-    save_rgb8_png(&path, pixels, width, height);
-    eprintln!("  wrote {}", path.display());
-}
-
 fn save_strip(frames: &[PreviewFrame], name: &str) {
     let (sheet, width, height) = preview_strip_sheet(frames);
-    save_png(&sheet, width, height, name);
+    save_rgb8_png_in(&artifact_dir(), name, &sheet, width, height);
 }
 
 /// Consecutive frames must not be the same picture. A floor rather than a ratio, and a low one: on an
@@ -446,11 +440,12 @@ fn lens_preview_frames_evolve_toward_the_final_image() {
     // empirical-μ schedule, so both numbers track the FLUX.2 klein lane's.
     assert_the_strip_converges(label, &frames, &live, steps, 0.55, 5.0);
     save_strip(&frames, &format!("{label}-strip.png"));
-    save_png(
+    save_rgb8_png_in(
+        &artifact_dir(),
+        &format!("{label}-final.png"),
         &live.pixels,
         live.width,
         live.height,
-        &format!("{label}-final.png"),
     );
 
     #[cfg(feature = "model-inference-proof")]

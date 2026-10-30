@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::testkit::tensor_max_abs_diff;
 use candle_gen_qwen_image::vae::QwenVae;
 
 // ---------------------------------------------------------------------------------------------------
@@ -162,19 +163,6 @@ fn latent(h: usize, w: usize, dev: &Device) -> Tensor {
     Tensor::from_vec(v, (1, 16, h, w), dev).expect("latent")
 }
 
-fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
-    (a.contiguous().unwrap() - b.contiguous().unwrap())
-        .unwrap()
-        .abs()
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .max(0)
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-}
-
 /// PSNR (dB) of `b` against reference `a`, peak = `a`'s dynamic range — the codebase's seam metric
 /// (PiD sc-10087 called ≥~34.75 dB "no measurable seam"). `INFINITY` when equal.
 fn psnr_db(a: &Tensor, b: &Tensor) -> f64 {
@@ -230,7 +218,7 @@ fn head_tail_decomposition_is_the_single_pass_decode() {
     assert_eq!(single.dims(), &[1, 3, 64, 64], "×8 spatial upsample");
     assert_eq!(composed.dims(), single.dims());
 
-    let delta = max_abs(&single, &composed);
+    let delta = tensor_max_abs_diff(&single, &composed);
     assert_eq!(
         delta, 0.0,
         "the default decode must be exactly `decode_tail ∘ decode_mid`; a divergence means \
@@ -289,7 +277,7 @@ fn decode_tail_is_crop_decomposable_but_decode_mid_is_not() {
     let tail_crop = vae
         .decode_tail(&mid.narrow(3, 0, CROP).unwrap().contiguous().unwrap())
         .unwrap();
-    let tail_residual = max_abs(
+    let tail_residual = tensor_max_abs_diff(
         &tail_full.narrow(3, 0, INTERIOR * 8).unwrap(),
         &tail_crop.narrow(3, 0, INTERIOR * 8).unwrap(),
     );
@@ -304,7 +292,7 @@ fn decode_tail_is_crop_decomposable_but_decode_mid_is_not() {
     let mid_crop = vae
         .decode_mid(&z.narrow(3, 0, CROP).unwrap().contiguous().unwrap())
         .unwrap();
-    let head_col0 = max_abs(
+    let head_col0 = tensor_max_abs_diff(
         &mid.narrow(3, 0, 1).unwrap(),
         &mid_crop.narrow(3, 0, 1).unwrap(),
     );
@@ -363,7 +351,7 @@ fn tail_only_tiling_tracks_the_single_pass_decode_but_whole_decoder_tiling_does_
         .unwrap();
     assert_eq!(shipped.dims(), single.dims());
     assert!(
-        max_abs(&shipped, &single) != 0.0,
+        tensor_max_abs_diff(&shipped, &single) != 0.0,
         "the tile plan must actually split, else this arm is the single-pass decode in disguise"
     );
     let shipped_psnr = psnr_db(&single, &shipped);

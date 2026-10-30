@@ -8,8 +8,8 @@
 //!   * cached decode — `q_len < k_len`, where MLX aligns the queries to the *last* `q_len` key
 //!     positions (bottom-right), exactly reproducing the old `decode_mask(q_len, k_len, offset)`.
 
+use mlx_gen::testing::max_abs_diff;
 use mlx_rs::fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask};
-use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::random::{normal, seed};
 use mlx_rs::Array;
 
@@ -28,12 +28,6 @@ fn explicit_causal_mask(q_len: i32, k_len: i32) -> Array {
         }
     }
     Array::from_slice(&data, &[1, 1, q_len, k_len])
-}
-
-fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-    max(abs(subtract(a, b).unwrap()).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
 }
 
 fn assert_causal_matches_explicit(q_len: i32, k_len: i32) {

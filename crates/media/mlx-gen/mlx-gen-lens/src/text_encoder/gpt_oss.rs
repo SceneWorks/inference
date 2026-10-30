@@ -998,7 +998,8 @@ mod prequant_tests {
 #[cfg(test)]
 mod moe_grouped_tests {
     use super::*;
-    use mlx_rs::ops::{abs, max, quantized_matmul};
+    use mlx_gen::testing::peak_rel_f32;
+    use mlx_rs::ops::quantized_matmul;
 
     fn rn(shape: &[i32], scale: f32, dtype: Dtype) -> Array {
         let a = mlx_rs::random::normal::<f32>(shape, None, None, None).unwrap();
@@ -1165,14 +1166,6 @@ mod moe_grouped_tests {
         }
     }
 
-    fn peak_rel(got: &Array, want: &Array) -> f32 {
-        let g = got.as_dtype(Dtype::Float32).unwrap();
-        let w = want.as_dtype(Dtype::Float32).unwrap();
-        let diff = abs(subtract(&g, &w).unwrap()).unwrap();
-        let denom = max(abs(&w).unwrap(), None).unwrap().item::<f32>().max(1e-6);
-        max(&diff, None).unwrap().item::<f32>() / denom
-    }
-
     /// The two forward shapes to exercise per equivalence test: `(2,5)` = n·k 20 → broadcast gather;
     /// `(8,16)` = n·k 256 ≥ [`GATHER_SORT_THRESHOLD`] → the expert-sorted gather path. Both must match
     /// the dense reference (the sort is numerically equivalent — same per-pair math, reordered).
@@ -1190,7 +1183,11 @@ mod moe_grouped_tests {
         let moe = build_dense(e, k, hidden, inter, Dtype::Float32);
         for (bb, ll) in EQUIV_SHAPES {
             let x = rn(&[bb, ll, hidden], 1.0, Dtype::Float32);
-            let pr = peak_rel(&moe.forward(&x).unwrap(), &dense_reference(&moe, &x));
+            let pr = peak_rel_f32(
+                &moe.forward(&x).unwrap(),
+                &dense_reference(&moe, &x),
+                Some(1e-6),
+            );
             eprintln!(
                 "dense f32 n={} grouped-vs-loop peak_rel = {pr:.3e}",
                 bb * ll
@@ -1215,7 +1212,11 @@ mod moe_grouped_tests {
         let moe = build_dense(e, k, hidden, inter, Dtype::Bfloat16);
         for (bb, ll) in EQUIV_SHAPES {
             let x = rn(&[bb, ll, hidden], 1.0, Dtype::Bfloat16);
-            let pr = peak_rel(&moe.forward(&x).unwrap(), &dense_reference(&moe, &x));
+            let pr = peak_rel_f32(
+                &moe.forward(&x).unwrap(),
+                &dense_reference(&moe, &x),
+                Some(1e-6),
+            );
             eprintln!(
                 "dense bf16 n={} grouped-vs-loop peak_rel = {pr:.3e}",
                 bb * ll
@@ -1250,7 +1251,11 @@ mod moe_grouped_tests {
             };
             for (bb, ll) in EQUIV_SHAPES {
                 let x = rn(&[bb, ll, hidden], 1.0, Dtype::Float32);
-                let pr = peak_rel(&moe.forward(&x).unwrap(), &dense_reference(&moe, &x));
+                let pr = peak_rel_f32(
+                    &moe.forward(&x).unwrap(),
+                    &dense_reference(&moe, &x),
+                    Some(1e-6),
+                );
                 eprintln!("Q{bits} n={} grouped-vs-loop peak_rel = {pr:.3e}", bb * ll);
                 assert!(
                     pr < tol,
@@ -1295,7 +1300,7 @@ mod moe_grouped_tests {
         // Weights vs host oracle (dense [n,E]), gathered at the selected ascending indices.
         let oracle = host_routing(&logits, k);
         let want = oracle.take_along_axis(&idx, -1).unwrap();
-        let pr = peak_rel(&weights, &want);
+        let pr = peak_rel_f32(&weights, &want, Some(1e-6));
         eprintln!("tie weights peak_rel = {pr:.3e}");
         assert!(pr < 1e-2, "tie weights peak_rel {pr:.3e}");
     }
@@ -1369,7 +1374,7 @@ mod moe_grouped_tests {
                     );
                     let got = moe.forward(&x).unwrap();
                     let want = dense_reference(&moe, &x);
-                    let pr = peak_rel(&got, &want);
+                    let pr = peak_rel_f32(&got, &want, Some(1e-6));
                     worst = worst.max(pr);
                     eprintln!("{dtype:?} seq={seq} layer {layer}: peak_rel = {pr:.3e}");
                 }

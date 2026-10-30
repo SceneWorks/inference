@@ -27,12 +27,16 @@ use std::sync::{Mutex, MutexGuard};
 
 use sha2::{Digest, Sha256};
 
-use crate::candle_core::{Device, Tensor};
+use crate::candle_core::{DType, Device, Tensor};
 use crate::gen_core::{
     Image, LoadShape, MemoryBackend, MemoryCalibrationIdentity, MemoryEvidenceKey,
     MemoryEvidenceLogRecord, MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryParityContract,
     MemoryParityResult, MemoryReferenceShape, MemoryStrategy, MemoryStrategyParameters,
 };
+
+// The backend-neutral slice metrics (`cosine_f64_sums`, `max_abs_diff_slices`, `peak_rel_slices`, …),
+// IoU helpers and env resolvers (sc-27323), so a Candle test has one import path for both.
+pub use gen_core_testkit::host::*;
 
 /// Typed inputs for one real-weight calibration observation.
 pub struct MemoryEvidenceProbe<'a> {
@@ -221,11 +225,6 @@ pub fn env_path(key: &str) -> PathBuf {
     }))
 }
 
-/// An optional env-var path — `None` when unset (for tests that skip gracefully rather than panic).
-pub fn env_path_opt(key: &str) -> Option<PathBuf> {
-    std::env::var(key).ok().map(PathBuf::from)
-}
-
 static PROCESS_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 /// Serialize and restore one process-global environment variable for deterministic tests.
@@ -365,6 +364,21 @@ pub fn save_rgb8_png(path: &Path, pixels: &[u8], width: u32, height: u32) {
 /// [`save_rgb8_png`] for an RGB8 [`Image`].
 pub fn save_image_png(path: &Path, img: &Image) {
     save_rgb8_png(path, &img.pixels, img.width, img.height);
+}
+
+/// [`save_rgb8_png`] to `dir/file_name`, logging `  wrote <path>` to stderr — the preview
+/// harnesses' review-artifact writer. Returns the written path.
+pub fn save_rgb8_png_in(
+    dir: &Path,
+    file_name: &str,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> PathBuf {
+    let path = dir.join(file_name);
+    save_rgb8_png(&path, pixels, width, height);
+    eprintln!("  wrote {}", path.display());
+    path
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -575,6 +589,104 @@ pub fn tensor_max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
         .expect("f32 tensors")
 }
 
+/// The tensor cast to f32, flattened and read back to the host.
+pub fn tensor_f32_vec(t: &Tensor) -> Vec<f32> {
+    t.to_dtype(DType::F32)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+        .expect("tensor reads back as f32")
+}
+
+fn scalar_f32(t: crate::candle_core::Result<Tensor>) -> f32 {
+    t.and_then(|t| t.to_scalar::<f32>()).expect("f32 scalar")
+}
+
+/// `max|a − b|` with both inputs cast to f32 **before** the device subtraction (a bf16 difference
+/// would otherwise round in bf16), then a device max.
+pub fn tensor_max_abs_diff_f32(a: &Tensor, b: &Tensor) -> f32 {
+    let a = a.to_dtype(DType::F32).expect("cast a to f32");
+    let b = b.to_dtype(DType::F32).expect("cast b to f32");
+    tensor_max_abs_diff(&a, &b)
+}
+
+/// `max|a − b|` as a host fold over the f32 read-backs ([`max_abs_diff_slices`], NaN-skipping).
+pub fn tensor_max_abs_diff_host(a: &Tensor, b: &Tensor) -> f32 {
+    max_abs_diff_slices(&tensor_f32_vec(a), &tensor_f32_vec(b))
+}
+
+/// `max|t|` as a device reduction (cast to f32 first; `abs`/`max` are exact in any dtype).
+pub fn tensor_max_abs(t: &Tensor) -> f32 {
+    scalar_f32(
+        t.to_dtype(DType::F32)
+            .and_then(|t| t.abs())
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.max(0)),
+    )
+}
+
+/// `max|t|` as a host fold over the f32 read-back ([`max_abs_slice`], NaN-skipping).
+pub fn tensor_max_abs_host(t: &Tensor) -> f32 {
+    max_abs_slice(&tensor_f32_vec(t))
+}
+
+/// Peak relative error on the device: both inputs cast to f32, `max|got − want|` over `max|want|`
+/// (raised to `floor` when given).
+pub fn tensor_peak_rel(got: &Tensor, want: &Tensor, floor: Option<f32>) -> f32 {
+    let peak = tensor_max_abs(want);
+    tensor_max_abs_diff_f32(got, want) / floor.map_or(peak, |f| peak.max(f))
+}
+
+/// Peak relative error as an f32 **host** fold over the read-backs ([`peak_rel_slices`]).
+pub fn tensor_peak_rel_host(got: &Tensor, want: &Tensor, floor: Option<f32>) -> f32 {
+    peak_rel_slices(&tensor_f32_vec(got), &tensor_f32_vec(want), floor)
+}
+
+/// [`tensor_peak_rel_host`] with the floor and the division in f64 ([`peak_rel_slices_f64`]).
+pub fn tensor_peak_rel_host_f64(got: &Tensor, want: &Tensor, floor: Option<f64>) -> f64 {
+    peak_rel_slices_f64(&tensor_f32_vec(got), &tensor_f32_vec(want), floor)
+}
+
+/// `max|a − b| / max|b|` (both cast to f32, device reductions), except that an all-zero `b`
+/// returns the raw `max|a − b|` instead of dividing by zero.
+pub fn tensor_peak_rel_or_abs(a: &Tensor, b: &Tensor) -> f32 {
+    let (diff, scale) = (tensor_max_abs_diff_f32(a, b), tensor_max_abs(b));
+    if scale == 0.0 {
+        diff
+    } else {
+        diff / scale
+    }
+}
+
+/// Cosine from three device `sum_all`s of the flattened inputs in their own dtype (read back as
+/// f32); the square roots, the guard and the division run on the host.
+pub fn tensor_cosine_device_sums(a: &Tensor, b: &Tensor, denom: Denom) -> f32 {
+    let a = a.flatten_all().expect("flatten a");
+    let b = b.flatten_all().expect("flatten b");
+    let dot = scalar_f32((&a * &b).and_then(|t| t.sum_all()));
+    let na = scalar_f32((&a * &a).and_then(|t| t.sum_all())).sqrt();
+    let nb = scalar_f32((&b * &b).and_then(|t| t.sum_all())).sqrt();
+    dot / denom.apply_f32(na * nb)
+}
+
+/// Cosine accumulated in f32 on the host over the f32 read-backs ([`cosine_f32_sums`]).
+pub fn tensor_cosine_f32_sums(a: &Tensor, b: &Tensor, denom: Denom) -> f32 {
+    cosine_f32_sums(&tensor_f32_vec(a), &tensor_f32_vec(b), denom)
+}
+
+/// Intersection-over-union of two binary (0/1) mask tensors, from device f32 sums; two empty masks
+/// are a perfect match (`1.0`).
+pub fn tensor_iou(a: &Tensor, b: &Tensor) -> f32 {
+    let af = a.to_dtype(DType::F32).expect("cast a to f32");
+    let bf = b.to_dtype(DType::F32).expect("cast b to f32");
+    let inter = scalar_f32((&af * &bf).and_then(|t| t.sum_all()));
+    let union = scalar_f32(af.sum_all()) + scalar_f32(bf.sum_all()) - inter;
+    if union <= 0.0 {
+        1.0
+    } else {
+        inter / union
+    }
+}
+
 /// Bare dot product of two equal-length vectors — the cosine metric when both inputs are already
 /// L2-normalized (the SDXL / Kolors / FLUX IP-adapter feature extractors normalize before comparing).
 pub fn cosine_dot(a: &[f32], b: &[f32]) -> f32 {
@@ -593,6 +705,7 @@ pub fn tensor_cosine(a: &Tensor, b: &Tensor) -> f64 {
             .expect("tensor reads back as f32")
     };
     let (a, b) = (flat(a), flat(b));
+    assert_eq!(a.len(), b.len(), "cosine over tensors of different sizes");
     let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
     for (x, y) in a.iter().zip(&b) {
         dot += (*x as f64) * (*y as f64);
@@ -1442,5 +1555,66 @@ mod gpu_peak {
             let bare_spawn = ["Command", "::new(\"", "nvidia-smi", "\")"].concat();
             assert!(!source.contains(&bare_spawn));
         }
+    }
+}
+
+#[cfg(test)]
+mod semantic_variant_tests {
+    use super::*;
+
+    fn t(v: &[f32]) -> Tensor {
+        Tensor::new(v, &Device::Cpu).unwrap()
+    }
+
+    /// The named variants differ exactly where their names say: cast placement, device vs host
+    /// reduction, and the denominator guard (sc-27323). Pure arithmetic on tiny CPU tensors.
+    #[test]
+    fn tensor_variants_pin_cast_reduction_and_guard() {
+        let a = t(&[1.0, 0.0, 0.0, 1.0]).reshape((2, 2)).unwrap();
+        let c = t(&[0.0, 1.0, 1.0, 0.0]).reshape((2, 2)).unwrap();
+        assert_eq!(tensor_f32_vec(&a), vec![1.0, 0.0, 0.0, 1.0]);
+        // |v|·|v| = 25 exactly, so each guard's effect is exact.
+        let v = t(&[3.0, 4.0]);
+        assert_eq!(tensor_cosine_device_sums(&v, &v, Denom::Exact), 1.0);
+        assert_eq!(tensor_cosine_device_sums(&a, &c, Denom::Exact), 0.0);
+        assert_eq!(tensor_cosine_device_sums(&v, &v, Denom::FloorAt(50.0)), 0.5);
+        assert_eq!(tensor_cosine_f32_sums(&v, &v, Denom::PlusEps(25.0)), 0.5);
+
+        // bf16 cast placement: 256 − 1.5 = 254.5 needs 9 significant bits, so a bf16 difference
+        // rounds it (ties-to-even) to 254 while the f32-first difference keeps 254.5.
+        let x = t(&[256.0]).to_dtype(DType::BF16).unwrap();
+        let y = t(&[1.5]).to_dtype(DType::BF16).unwrap();
+        let native = (&x - &y).unwrap().to_dtype(DType::F32).unwrap();
+        assert_eq!(tensor_max_abs(&native), 254.0);
+        assert_eq!(tensor_max_abs_diff_f32(&x, &y), 254.5);
+        assert_eq!(tensor_max_abs_diff_host(&x, &y), 254.5);
+
+        assert_eq!(tensor_max_abs(&t(&[-3.0, 2.0])), 3.0);
+        assert_eq!(tensor_max_abs_host(&t(&[f32::NAN, -3.0])), 3.0);
+
+        let want = t(&[2.0, -4.0]);
+        let got = t(&[2.5, -4.0]);
+        assert_eq!(tensor_peak_rel(&got, &want, None), 0.125);
+        assert_eq!(tensor_peak_rel(&got, &want, Some(8.0)), 0.0625);
+        assert_eq!(tensor_peak_rel_host(&got, &want, Some(1e-12)), 0.125);
+        assert_eq!(tensor_peak_rel_host_f64(&got, &want, Some(1e-12)), 0.125);
+        let zero = t(&[0.0, 0.0]);
+        assert_eq!(tensor_peak_rel_or_abs(&got, &zero), 4.0);
+        assert_eq!(tensor_peak_rel_or_abs(&got, &want), 0.125);
+
+        assert_eq!(tensor_iou(&a, &a), 1.0);
+        assert_eq!(tensor_iou(&a, &c), 0.0);
+        assert_eq!(tensor_iou(&zero, &zero), 1.0);
+    }
+
+    #[test]
+    fn save_rgb8_png_in_writes_under_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = save_rgb8_png_in(dir.path(), "x.png", &[1, 2, 3], 1, 1);
+        assert_eq!(path, dir.path().join("x.png"));
+        assert_eq!(
+            image::open(&path).unwrap().to_rgb8().get_pixel(0, 0).0,
+            [1, 2, 3]
+        );
     }
 }

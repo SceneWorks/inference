@@ -46,6 +46,7 @@ pub mod audio_generator;
 pub mod audio_transform;
 pub mod captioner;
 pub mod h3_memory;
+pub mod host;
 pub mod memory_strategy;
 pub mod moss_training_fixture;
 pub mod moss_training_probe;

@@ -9,6 +9,7 @@
 //! RoPE/theta, wrong patch order, wrong unfold layout, missing/extra norm) diverges by orders of
 //! magnitude; f32 Metal matmul agrees to ~1e-2.
 
+use mlx_gen::testing::{cosine_host_f32, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_flux2::{Mistral3Projector, PixtralVisionConfig, PixtralVisionTower};
 use mlx_rs::ops::all_close;
@@ -21,18 +22,6 @@ const FIXTURE: &str = concat!(
 
 fn close(a: &Array, b: &Array, rtol: f64, atol: f64) -> bool {
     all_close(a, b, rtol, atol, false).unwrap().item::<bool>()
-}
-
-/// Cosine similarity over the flattened tensors — a scale-free structural check alongside `all_close`.
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap();
-    let b = b.reshape(&[n]).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let dot: f32 = a.iter().zip(b).map(|(&x, &y)| x * y).sum();
-    let na: f32 = a.iter().map(|&x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|&y| y * y).sum::<f32>().sqrt();
-    dot / (na * nb).max(1e-12)
 }
 
 /// The tiny Pixtral vision config the dump script used (head_dim = 32/4 = 8, patch 2, θ=10000).
@@ -66,7 +55,7 @@ fn pixtral_vision_tower_and_projector_match_reference() {
     println!(
         "image_features: shape={:?} cosine={:.6}",
         feats.shape(),
-        cosine(&feats, want_feats)
+        cosine_host_f32(&feats, want_feats, Denom::FloorAt(1e-12))
     );
     assert_eq!(feats.shape(), want_feats.shape(), "image_features shape");
     assert!(
@@ -81,7 +70,7 @@ fn pixtral_vision_tower_and_projector_match_reference() {
     println!(
         "projected: shape={:?} cosine={:.6}",
         got.shape(),
-        cosine(&got, want_proj)
+        cosine_host_f32(&got, want_proj, Denom::FloorAt(1e-12))
     );
     assert_eq!(got.shape(), want_proj.shape(), "projected shape");
     assert!(

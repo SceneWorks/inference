@@ -12,23 +12,13 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::testing::require_env_path;
+use mlx_gen::testing::{cosine_f32_device, require_env_path};
 use mlx_gen::weights::Weights;
 use mlx_gen_boogu::load_text_encoder;
-use mlx_rs::ops::{multiply, sqrt, sum};
 use mlx_rs::{Array, Dtype};
 
 /// Qwen3-VL image placeholder token (`mllm/config.json::image_token_id`).
 const IMAGE_TOKEN_ID: i32 = 151655;
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let dot = sum(multiply(&a, &b).unwrap(), false).unwrap();
-    let na = sqrt(sum(multiply(&a, &a).unwrap(), false).unwrap()).unwrap();
-    let nb = sqrt(sum(multiply(&b, &b).unwrap(), false).unwrap()).unwrap();
-    (dot / (na * nb)).item::<f32>()
-}
 
 fn golden_path() -> PathBuf {
     std::env::var("BOOGU_VISION_GOLDEN")
@@ -87,7 +77,7 @@ fn mllm_image_matches_reference() {
 
     let want = g.require("mllm_last_hidden").unwrap();
     assert_eq!(out.shape(), want.shape(), "last_hidden_state shape");
-    let c = cosine(&out, want);
+    let c = cosine_f32_device(&out, want);
     println!("MLLM image-conditioned last_hidden parity cosine = {c:.7}");
     assert!(
         c > 0.999,

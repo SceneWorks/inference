@@ -26,35 +26,9 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{safetensors, DType, Device, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+use candle_gen::testkit::{tensor_cosine, tensor_peak_rel_host_f64};
 use candle_gen_lens::merge_adapters;
 use candle_gen_lens::transformer::{LensDitConfig, LensTransformer};
-
-/// Cosine similarity over all elements (flattened), computed in f64 on CPU.
-fn cosine(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    assert_eq!(a.len(), b.len(), "shape mismatch in cosine");
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += (*x as f64) * (*y as f64);
-        na += (*x as f64) * (*x as f64);
-        nb += (*y as f64) * (*y as f64);
-    }
-    Ok((dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32)
-}
-
-/// Peak relative error `max|a-b| / max|b|`, in f64 on CPU.
-fn peak_rel(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let mut max_diff = 0f64;
-    let mut max_b = 0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        max_diff = max_diff.max((*x - *y).abs() as f64);
-        max_b = max_b.max((*y).abs() as f64);
-    }
-    Ok((max_diff / max_b.max(1e-12)) as f32)
-}
 
 /// Whether two tensors are bit-for-bit equal (the scale-0 no-op check).
 fn bit_exact(a: &Tensor, b: &Tensor) -> Result<bool> {
@@ -146,8 +120,8 @@ fn lens_adapters_match_reference() -> Result<()> {
 
     // --- 1. base (sanity) ---
     let base = run(&build_dit(map.clone(), &device)?)?;
-    let base_pr = peak_rel(&base, &f32g("base_out")?)?;
-    let base_cos = cosine(&base, &f32g("base_out")?)?;
+    let base_pr = tensor_peak_rel_host_f64(&base, &f32g("base_out")?, Some(1e-12)) as f32;
+    let base_cos = tensor_cosine(&base, &f32g("base_out")?) as f32;
     eprintln!("base:  peak_rel={base_pr:.3e} cosine={base_cos:.7}");
     assert!(
         base_pr < 2e-2,
@@ -181,8 +155,8 @@ fn lens_adapters_match_reference() -> Result<()> {
     );
     assert!(rep.merged > 0, "no LoRA targets matched");
     let lora_out = run(&build_dit(m1, &device)?)?;
-    let lora_pr = peak_rel(&lora_out, &f32g("lora_out")?)?;
-    let lora_cos = cosine(&lora_out, &f32g("lora_out")?)?;
+    let lora_pr = tensor_peak_rel_host_f64(&lora_out, &f32g("lora_out")?, Some(1e-12)) as f32;
+    let lora_cos = tensor_cosine(&lora_out, &f32g("lora_out")?) as f32;
     eprintln!("lora:  peak_rel={lora_pr:.3e} cosine={lora_cos:.7}");
     assert!(
         lora_pr < 2e-2 && lora_cos > 0.9999,
@@ -207,8 +181,8 @@ fn lens_adapters_match_reference() -> Result<()> {
     );
     assert!(rep.merged > 0, "no LoKr targets matched");
     let lokr_out = run(&build_dit(m2, &device)?)?;
-    let lokr_pr = peak_rel(&lokr_out, &f32g("lokr_out")?)?;
-    let lokr_cos = cosine(&lokr_out, &f32g("lokr_out")?)?;
+    let lokr_pr = tensor_peak_rel_host_f64(&lokr_out, &f32g("lokr_out")?, Some(1e-12)) as f32;
+    let lokr_cos = tensor_cosine(&lokr_out, &f32g("lokr_out")?) as f32;
     eprintln!("lokr:  peak_rel={lokr_pr:.3e} cosine={lokr_cos:.7}");
     assert!(
         lokr_pr < 2e-2 && lokr_cos > 0.9999,

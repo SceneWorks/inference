@@ -13,8 +13,8 @@
 
 use std::path::Path;
 
-use crate::support::cosine;
 use candle_gen::default_device;
+use candle_gen::testkit::{tensor_cosine_device_sums, Denom};
 use candle_gen_sam3::{Sam3TextConfig, Sam3TextEncoder, Sam3Tokenizer, Weights};
 
 #[test]
@@ -79,8 +79,8 @@ fn text_encoder_matches_oracle() {
         let got_v = got.narrow(1, 0, n_valid).unwrap();
         let want_v = want.narrow(1, 0, n_valid).unwrap();
 
-        let cos_full = cosine(&got, &want);
-        let cos_valid = cosine(&got_v, &want_v);
+        let cos_full = tensor_cosine_device_sums(&got, &want, Denom::Exact);
+        let cos_valid = tensor_cosine_device_sums(&got_v, &want_v, Denom::Exact);
         worst = worst.min(cos_valid);
         println!(
             "{concept}: cosine_valid({n_valid} tok)={cos_valid:.6}  cosine_full={cos_full:.6}"

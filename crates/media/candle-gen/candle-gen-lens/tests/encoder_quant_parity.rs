@@ -19,23 +19,10 @@
 //!   LENS_GOLDENS          — gptoss_goldens.safetensors (default: .scratch/gptoss-goldens/…)
 
 use candle_gen::candle_core::quantized::GgmlDType;
-use candle_gen::candle_core::{DType, Result, Tensor};
+use candle_gen::candle_core::{DType, Result};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::testkit::tensor_cosine;
 use candle_gen_lens::text_encoder::{Config, GptOssTextEncoder, DEFAULT_SELECTED_LAYERS};
-
-/// Cosine similarity over all elements (flattened), computed in f32 on CPU.
-fn cosine(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    assert_eq!(a.len(), b.len(), "shape mismatch in cosine");
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += (*x as f64) * (*y as f64);
-        na += (*x as f64) * (*x as f64);
-        nb += (*y as f64) * (*y as f64);
-    }
-    Ok((dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32)
-}
 
 /// Build the encoder at `quant`, run it over the golden ids, and return the worst capture cosine vs
 /// the bf16 reference (`cap_{layer}`). `None` skips cleanly (missing env / goldens).
@@ -107,7 +94,7 @@ fn worst_capture_cosine(quant: GgmlDType) -> Result<Option<f32>> {
             crate::model_proof::missing_required_work("required work omitted at crates/media/candle-gen/candle-gen-lens/tests/encoder_quant_parity.rs:98 (worst_capture_cosine): Required selected model/reference/capture/device/matrix branch is absent, so a return/continue/implicit helper None leaves requested work incomplete even if other neural work already ran.");
             continue;
         };
-        let c = cosine(&cap.squeeze(0)?, golden)?;
+        let c = tensor_cosine(&cap.squeeze(0)?, golden) as f32;
         eprintln!("  {quant:?} capture[L{layer:>2}]: cosine={c:.6}");
         // Guard the `min` against NaN (a broken quant path makes the captures NaN, and `f32::min`
         // silently *ignores* NaN — which would let the assertions below pass on garbage).

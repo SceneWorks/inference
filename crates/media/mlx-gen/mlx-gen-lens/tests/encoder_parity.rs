@@ -13,10 +13,9 @@
 //!
 //! Run: `cargo test -p mlx-gen-lens --test integration encoder_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{multiply, sum};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Dtype;
 
-use mlx_gen::testing::peak_rel;
+use mlx_gen::testing::{cosine_device_sums, peak_rel, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_lens::config::GptOssConfig;
 use mlx_gen_lens::text_encoder::encoder::{LensTextEncoder, DEFAULT_SELECTED_LAYERS};
@@ -37,22 +36,6 @@ fn text_encoder_dir() -> std::path::PathBuf {
         .max()
         .expect("a snapshot");
     snap.join("text_encoder")
-}
-
-/// Cosine similarity over the flattened tensors — robust to the output's wide dynamic range.
-fn cosine(got: &Array, want: &Array) -> f32 {
-    let dot = sum(multiply(got, want).unwrap(), None)
-        .unwrap()
-        .item::<f32>();
-    let na = sum(multiply(got, got).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    let nb = sum(multiply(want, want).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    dot / (na * nb).max(1e-12)
 }
 
 #[test]
@@ -111,7 +94,7 @@ fn lens_encoder_matches_reference() {
                 want.shape()
             );
             let pr = peak_rel(&got, want);
-            let cos = cosine(&got, want);
+            let cos = cosine_device_sums(&got, want, Denom::FloorAt(1e-12));
             worst_peak = worst_peak.max(pr);
             worst_cos = worst_cos.min(cos);
             eprintln!("prompt {i} layer {layer_idx:>2}: peak_rel {pr:.3e}  cosine {cos:.7}");

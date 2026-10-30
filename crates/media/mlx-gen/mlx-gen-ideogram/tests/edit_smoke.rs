@@ -13,16 +13,13 @@ use std::path::PathBuf;
 use common::CAPTION_JSON;
 use mlx_gen::array::host_i32;
 use mlx_gen::media::Image;
+use mlx_gen::testing::env_path_or_home;
 use mlx_gen::CancelFlag;
 use mlx_gen_ideogram::Ideogram4Pipeline;
 use mlx_rs::{Array, Dtype};
 
 fn snapshot_dir() -> PathBuf {
-    std::env::var("IDEOGRAM4_MLX")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").expect("HOME")).join(".cache/ideogram4-mlx-convert")
-        })
+    env_path_or_home("IDEOGRAM4_MLX", ".cache/ideogram4-mlx-convert")
 }
 
 fn envn(k: &str, d: u32) -> u32 {

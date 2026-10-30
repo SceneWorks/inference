@@ -739,6 +739,7 @@ impl LtxVideoVae {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::testing::max_abs_diff_host;
 
     fn synthetic_spatial_decode(tile: &Array) -> Result<Array> {
         let up_h = Array::repeat_axis::<f32>(tile.clone(), 32, 3)?;
@@ -953,14 +954,6 @@ mod tests {
         contiguous(&slice_range(a, 4, 0, width).unwrap()).unwrap()
     }
 
-    fn max_abs_delta(left: &Array, right: &Array) -> f32 {
-        left.as_slice::<f32>()
-            .iter()
-            .zip(right.as_slice::<f32>())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f32, f32::max)
-    }
-
     /// A position-dependent NCTHW tensor whose *amplitude* grows across W, so a spatial reduction
     /// taken over a left-hand crop is visibly different from one taken over the whole tensor (a
     /// merely additive ramp barely moves a mean-square, and would make the controls below toothless).
@@ -1003,7 +996,7 @@ mod tests {
         norm_of_crop.eval().unwrap();
         assert_eq!(cropped_dense.shape(), norm_of_crop.shape());
         assert_eq!(
-            max_abs_delta(&cropped_dense, &norm_of_crop),
+            max_abs_diff_host(&cropped_dense, &norm_of_crop),
             0.0,
             "pixel_norm reduces the channel axis only, so it must commute with spatial cropping"
         );
@@ -1012,7 +1005,7 @@ mod tests {
         let mutant_of_crop = spatially_normalized(&crop_w(&x, 5), DEC_NORM_EPS).unwrap();
         cropped_mutant.eval().unwrap();
         mutant_of_crop.eval().unwrap();
-        let broken = max_abs_delta(&cropped_mutant, &mutant_of_crop);
+        let broken = max_abs_diff_host(&cropped_mutant, &mutant_of_crop);
         println!("pixel_norm commutation = 0.0; spatial-reduction control = {broken:.3e}");
         assert!(
             broken > 1e-1,
@@ -1070,7 +1063,7 @@ mod tests {
         dense_window.eval().unwrap();
         crop_window.eval().unwrap();
         assert_eq!(crop_window.shape(), dense_window.shape());
-        let local = max_abs_delta(&dense_window, &crop_window);
+        let local = max_abs_diff_host(&dense_window, &crop_window);
 
         // The control: the identical block with a spatial reduction is no longer crop-local.
         let mutated = |input: &Array| -> Result<Array> {
@@ -1084,7 +1077,7 @@ mod tests {
         let mutant_crop = crop_w(&mutated(&crop_w(&x, CROP)).unwrap(), CROP - HALO);
         mutant_dense.eval().unwrap();
         mutant_crop.eval().unwrap();
-        let mutated_delta = max_abs_delta(&mutant_dense, &mutant_crop);
+        let mutated_delta = max_abs_diff_host(&mutant_dense, &mutant_crop);
 
         println!(
             "DecResBlock crop-locality = {local:.3e}; spatial-norm control = {mutated_delta:.3e}"
@@ -1150,10 +1143,10 @@ mod tests {
 
         let (dense, tiled) = run(&|x| pixel_norm(x, DEC_NORM_EPS));
         assert_eq!(tiled.shape(), dense.shape());
-        let exact = max_abs_delta(&dense, &tiled);
+        let exact = max_abs_diff_host(&dense, &tiled);
 
         let (mutant_dense, mutant_tiled) = run(&|x| spatially_normalized(x, DEC_NORM_EPS));
-        let broken = max_abs_delta(&mutant_dense, &mutant_tiled);
+        let broken = max_abs_diff_host(&mutant_dense, &mutant_tiled);
 
         println!("tiled pixel_norm assembly = {exact:.3e}; spatial-norm control = {broken:.3e}");
         assert!(

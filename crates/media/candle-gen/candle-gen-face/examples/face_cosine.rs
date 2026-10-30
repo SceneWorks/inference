@@ -14,11 +14,8 @@
 
 use std::path::PathBuf;
 
+use candle_gen::testkit::env_or;
 use candle_gen_face::load;
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
 
 /// Load an image as interleaved RGB8, returning `(pixels, height, width)` — the shape
 /// `FaceAnalysis::analyze` consumes.

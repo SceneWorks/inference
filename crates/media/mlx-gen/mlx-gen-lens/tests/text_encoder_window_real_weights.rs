@@ -8,13 +8,13 @@
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 
+use mlx_gen::testing::{cosine_device_sums, max_abs_diff_host, peak_rel_native, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Quant, WeightsSource};
 use mlx_gen_lens::config::GptOssConfig;
 use mlx_gen_lens::text::LensTokenizer;
 use mlx_gen_lens::text_encoder::encoder::{LensTextEncoder, DEFAULT_SELECTED_LAYERS};
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
-use mlx_rs::ops::{abs, max, multiply, subtract, sum};
 use mlx_rs::{Array, Dtype};
 
 const DATE: &str = "2026-07-31";
@@ -80,37 +80,8 @@ fn max_abs_delta(a: &[Array], b: &[Array]) -> f32 {
     assert_eq!(a.len(), b.len(), "captured layer count changed");
     a.iter().zip(b).fold(0.0_f32, |worst, (a, b)| {
         assert_eq!(a.shape(), b.shape(), "captured layer shape changed");
-        let a = a.as_dtype(Dtype::Float32).unwrap();
-        let b = b.as_dtype(Dtype::Float32).unwrap();
-        a.as_slice::<f32>()
-            .iter()
-            .zip(b.as_slice::<f32>())
-            .fold(worst, |m, (x, y)| m.max((x - y).abs()))
+        worst.max(max_abs_diff_host(a, b))
     })
-}
-
-/// The established Lens BF16 encoder metrics. Dense resident and streamed execution schedule the
-/// same operations differently on Metal, so absolute equality is not a valid cross-schedule gate
-/// for the model's very wide activation range (see `encoder_parity.rs`).
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(got, want).unwrap()).unwrap();
-    let denom = max(abs(want).unwrap(), None).unwrap().item::<f32>();
-    max(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
-}
-
-fn cosine(got: &Array, want: &Array) -> f32 {
-    let dot = sum(multiply(got, want).unwrap(), None)
-        .unwrap()
-        .item::<f32>();
-    let na = sum(multiply(got, got).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    let nb = sum(multiply(want, want).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    dot / (na * nb).max(1e-12)
 }
 
 fn assert_resident_parity(
@@ -131,8 +102,8 @@ fn assert_resident_parity(
     let mut worst_peak = 0.0_f32;
     let mut worst_cos = 1.0_f32;
     for (capture, (want, actual)) in expected.iter().zip(got).enumerate() {
-        let pr = peak_rel(actual, want);
-        let cos = cosine(actual, want);
+        let pr = peak_rel_native(actual, want, Some(1e-12));
+        let cos = cosine_device_sums(actual, want, Denom::FloorAt(1e-12));
         worst_peak = worst_peak.max(pr);
         worst_cos = worst_cos.min(cos);
         println!(

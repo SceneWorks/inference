@@ -20,16 +20,16 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::env_path_or_home;
 use mlx_gen::weights::Weights;
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::WanTransformer;
 
 fn snapshot_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("WAN_5B_DIR") {
-        return PathBuf::from(d);
-    }
-    PathBuf::from(std::env::var("HOME").unwrap())
-        .join("Library/Application Support/SceneWorks/data/models/mlx/wan_2_2_ti2v_5b")
+    env_path_or_home(
+        "WAN_5B_DIR",
+        "Library/Application Support/SceneWorks/data/models/mlx/wan_2_2_ti2v_5b",
+    )
 }
 
 /// The pre-quantized 5B snapshot dir (`WAN_5B_Q{bits}_DIR`, default `~/.cache/mlx-gen-models/...`).

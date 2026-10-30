@@ -13,6 +13,7 @@
 //! a separate, qualitative gate.
 
 use mlx_gen::sampler::{AlphaSchedule, DiffusionSampler, LcmSampler, LightningSampler, TcdSampler};
+use mlx_gen::testing::peak_rel_host;
 use mlx_gen::weights::Weights;
 use mlx_rs::{Array, Dtype};
 
@@ -27,18 +28,6 @@ const BETA_START: f32 = 0.00085;
 const BETA_END: f32 = 0.012;
 const ORIGINAL_STEPS: usize = 50;
 
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-6);
-    a.iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
-        / peak
-}
-
 fn sched() -> AlphaSchedule {
     AlphaSchedule::scaled_linear(N_TRAIN, BETA_START, BETA_END)
 }
@@ -49,7 +38,7 @@ fn alphas_cumprod_matches_diffusers() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let s = sched();
     let ours = Array::from_slice(&s.alphas_cumprod, &[N_TRAIN as i32]);
-    let pr = peak_rel(&ours, g.require("alphas_cumprod").unwrap());
+    let pr = peak_rel_host(&ours, g.require("alphas_cumprod").unwrap(), Some(1e-6));
     println!("alphas_cumprod peak_rel = {pr:.3e}");
     assert!(
         pr < 1e-5,
@@ -143,7 +132,7 @@ fn accel_schedulers_match_diffusers() {
                 S::Light(light) => {
                     let scaled_want = g.require(&format!("{cfg}.scaled{i}")).unwrap();
                     let scaled_got = light.scale_model_input(&x, i).unwrap();
-                    let spr = peak_rel(&scaled_got, scaled_want);
+                    let spr = peak_rel_host(&scaled_got, scaled_want, Some(1e-6));
                     assert!(
                         spr < 1e-4,
                         "{cfg}: scale_model_input[{i}] peak_rel {spr:.3e}"
@@ -153,7 +142,7 @@ fn accel_schedulers_match_diffusers() {
                 }
                 S::Tcd(tcd) => tcd.pred_noised(&eps, &x, i).unwrap(),
             };
-            let pr = peak_rel(&got, want);
+            let pr = peak_rel_host(&got, want, Some(1e-6));
             worst = worst.max(pr);
             assert!(
                 pr < 1e-4,

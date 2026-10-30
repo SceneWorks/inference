@@ -8,9 +8,9 @@
 
 use std::path::Path;
 
-use crate::support::cosine;
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::default_device;
+use candle_gen::testkit::{tensor_cosine_device_sums, Denom};
 use candle_gen_sam3::{Sam3Tracker, Weights};
 
 fn scalar(t: &Tensor) -> f32 {
@@ -58,7 +58,7 @@ fn dynamic_multimask_matches_oracle() {
     let want_mask = fx.require("dyn_mask").unwrap(); // [mg, mg]
     let want_iou = scalar(&fx.require("dyn_iou").unwrap());
     assert_eq!(out.low_res.dims(), want_mask.dims(), "dyn mask shape");
-    let c = cosine(&out.low_res, &want_mask);
+    let c = tensor_cosine_device_sums(&out.low_res, &want_mask, Denom::Exact);
     println!(
         "dyn_mask: cosine={c:.7}  iou ours={:.4} oracle={want_iou:.4}",
         out.iou

@@ -5,8 +5,7 @@
 //! and this gates the whole-forward composition on the tiny seeded S5 weights, in CI, no real
 //! checkpoint).
 
-use crate::common;
-
+use mlx_gen::testing::max_abs_diff_slices;
 use mlx_gen::weights::Weights;
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::transformer::set_compile_glue;
@@ -35,8 +34,6 @@ fn load(name: &str) -> Weights {
     Weights::from_file(&path)
         .unwrap_or_else(|e| panic!("read {path}: {e} (run dump_s5_fixtures.py)"))
 }
-
-use common::max_abs;
 
 #[ignore = "model inference; explicit model-proof workflow"]
 #[test]
@@ -67,7 +64,7 @@ fn compiled_glue_bit_identical_to_eager() {
     assert_eq!(compiled.len(), eager.len());
     for (i, (c, e)) in compiled.iter().zip(eager.iter()).enumerate() {
         assert_eq!(c.shape(), e.shape());
-        let d = max_abs(c.as_slice::<f32>(), e.as_slice::<f32>());
+        let d = max_abs_diff_slices(c.as_slice::<f32>(), e.as_slice::<f32>());
         println!("[compiled vs eager] batch[{i}] max|Δ|={d:.3e}");
         assert_eq!(
             d, 0.0,

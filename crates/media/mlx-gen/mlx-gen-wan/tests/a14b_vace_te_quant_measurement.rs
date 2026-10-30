@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
+use mlx_gen::testing::{cosine_f64_sums, Denom};
 use mlx_gen::{weights::Weights, Quant};
 use mlx_gen_wan::{
     encode_text_staged_for_tier, load_tokenizer, Umt5Encoder, WanModelConfig, WanVaceConfig,
@@ -39,17 +40,6 @@ fn required_dir(var: &str) -> PathBuf {
 
 fn gib(bytes: usize) -> f64 {
     bytes as f64 / 2_f64.powi(30)
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    assert_eq!(a.len(), b.len(), "embedding length mismatch");
-    let (mut dot, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
-    for (&x, &y) in a.iter().zip(b) {
-        dot += x as f64 * y as f64;
-        aa += x as f64 * x as f64;
-        bb += y as f64 * y as f64;
-    }
-    dot / (aa.sqrt() * bb.sqrt())
 }
 
 fn encode(root: &Path, cfg: &WanModelConfig, quantized: bool) -> (Vec<f32>, usize) {
@@ -82,7 +72,7 @@ fn encode(root: &Path, cfg: &WanModelConfig, quantized: bool) -> (Vec<f32>, usiz
 fn measure(label: &str, root: &Path, cfg: &WanModelConfig) {
     let (bf16, bf16_peak) = encode(root, cfg, false);
     let (q8, q8_peak) = encode(root, cfg, true);
-    let cos = cosine(&bf16, &q8);
+    let cos = cosine_f64_sums(&bf16, &q8, Denom::Exact);
     eprintln!(
         "[{label}] bf16 {:.2} GiB, Q8 {:.2} GiB, cosine {cos:.6}",
         gib(bf16_peak),

@@ -28,6 +28,7 @@
 //!   ~/.dwpose-spike/venv/bin/python tools/dump_face_align_golden.py
 //!   cargo test -p mlx-gen-face --release --test integration align_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::{cosine_f32_sums, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_face::{align, norm_crop, to_arcface_input, ArcFace, Scrfd};
 
@@ -69,13 +70,6 @@ fn vec_f32(g: &Weights, key: &str) -> Vec<f32> {
         .try_as_slice::<f32>()
         .unwrap()
         .to_vec()
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    dot / (na * nb)
 }
 
 fn diff(a: &[u8], b: &[u8]) -> (usize, i32) {
@@ -139,12 +133,12 @@ fn align_norm_crop_parity() {
         // (3) alignment fidelity: ArcFace(our crop) vs ArcFace(cv2 crop) — isolates alignment.
         let emb = embed(&arc, &crop);
         let emb_cv2 = embed(&arc, &want_crop);
-        let align_cos = cosine(&emb, &emb_cv2);
+        let align_cos = cosine_f32_sums(&emb, &emb_cv2, Denom::Exact);
         min_align_cos = min_align_cos.min(align_cos);
 
         // (informational) native ArcFace vs canonical math (RefEval) and vs insightface ORT.
-        let ref_cos = cosine(&emb, &vec_f32(&g, &format!("emb_ref.{i}")));
-        let ort_cos = cosine(&emb, &vec_f32(&g, &format!("emb_onnx.{i}")));
+        let ref_cos = cosine_f32_sums(&emb, &vec_f32(&g, &format!("emb_ref.{i}")), Denom::Exact);
+        let ort_cos = cosine_f32_sums(&emb, &vec_f32(&g, &format!("emb_onnx.{i}")), Denom::Exact);
         min_ref_cos = min_ref_cos.min(ref_cos);
         min_ort_cos = min_ort_cos.min(ort_cos);
         println!(
@@ -215,8 +209,8 @@ fn end_to_end_detect_align_embed() {
             .min_by(|a, b| kps_l2(&a.kps, &want_kps).total_cmp(&kps_l2(&b.kps, &want_kps)))
             .unwrap();
         let emb = embed(&arc, &norm_crop(&img, ih, iw, &det.kps).unwrap());
-        let ref_cos = cosine(&emb, &vec_f32(&g, &format!("emb_ref.{i}")));
-        let ort_cos = cosine(&emb, &vec_f32(&g, &format!("emb_onnx.{i}")));
+        let ref_cos = cosine_f32_sums(&emb, &vec_f32(&g, &format!("emb_ref.{i}")), Denom::Exact);
+        let ort_cos = cosine_f32_sums(&emb, &vec_f32(&g, &format!("emb_onnx.{i}")), Denom::Exact);
         min_ref_cos = min_ref_cos.min(ref_cos);
         min_ort_cos = min_ort_cos.min(ort_cos);
         println!(

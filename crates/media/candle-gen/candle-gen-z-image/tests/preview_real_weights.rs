@@ -58,7 +58,7 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{
     GenerationMemory, GenerationRequest, Image, LoadSpec, PreviewFrame, Progress, WeightsSource,
 };
-use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::save_rgb8_png_in;
 use candle_gen::testkit::sha256_file;
 use candle_gen::testkit::{
     collecting_sink, correlation, downsample_nearest, downsample_nearest_raw, env_path_opt,
@@ -279,16 +279,10 @@ fn the_z_image_vae_is_the_flux1_one() {
 
 // ── Frame analysis helpers ────────────────────────────────────────────────────────────────────────
 
-fn save_png(dir: &Path, pixels: &[u8], width: u32, height: u32, name: &str) {
-    let path = dir.join(name);
-    save_rgb8_png(&path, pixels, width, height);
-    eprintln!("  wrote {}", path.display());
-}
-
 /// Lay the strip out as one horizontal contact sheet so a reviewer sees the progression at a glance.
 fn save_strip(dir: &Path, frames: &[PreviewFrame], name: &str) {
     let (sheet, width, height) = preview_strip_sheet(frames);
-    save_png(dir, &sheet, width, height, name);
+    save_rgb8_png_in(dir, name, &sheet, width, height);
 }
 
 /// Consecutive frames must not be the same picture. A floor rather than a ratio, and a low one: on an
@@ -624,12 +618,12 @@ fn assert_registered_route_previews_converge(
         FROM_NOISE,
     );
     save_strip(&dir, &frames, &format!("{label}-strip.png"));
-    save_png(
+    save_rgb8_png_in(
         &dir,
+        &format!("{label}-final.png"),
         &live.pixels,
         live.width,
         live.height,
-        &format!("{label}-final.png"),
     );
     events
 }
@@ -840,12 +834,12 @@ fn the_control_routes_preview_their_target_latent() {
                 FROM_NOISE,
             );
             save_strip(&dir, &frames, &format!("{label}-strip.png"));
-            save_png(
+            save_rgb8_png_in(
                 &dir,
+                &format!("{label}-final.png"),
                 &live.pixels,
                 live.width,
                 live.height,
-                &format!("{label}-final.png"),
             );
         }
     }
@@ -937,12 +931,12 @@ fn the_edit_route_previews_its_reduced_schedule() {
     );
     let dir = artifact_dir();
     save_strip(&dir, &frames, "z_image_edit-strip.png");
-    save_png(
+    save_rgb8_png_in(
         &dir,
+        "z_image_edit-final.png",
         &live.pixels,
         live.width,
         live.height,
-        "z_image_edit-final.png",
     );
 
     #[cfg(feature = "model-inference-proof")]

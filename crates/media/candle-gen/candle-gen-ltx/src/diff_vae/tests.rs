@@ -14,6 +14,7 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 
 use super::*;
+use candle_gen::testkit::tensor_max_abs_diff_host;
 
 /// The released LTX-2.5 `vae` config block, verbatim from
 /// `docs/reference/sc-18765-vae-keysets/ltx-vae-keysets.json` (`ltx_2_5_video_vae_diffusion`).
@@ -260,12 +261,7 @@ fn probe(shape: &[usize], seed: usize) -> Tensor {
 
 fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
     assert_eq!(a.dims(), b.dims(), "shape mismatch before comparison");
-    let a: Vec<f32> = a.flatten_all().unwrap().to_vec1().unwrap();
-    let b: Vec<f32> = b.flatten_all().unwrap().to_vec1().unwrap();
-    a.iter()
-        .zip(&b)
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0f32, f32::max)
+    tensor_max_abs_diff_host(a, b)
 }
 
 #[test]

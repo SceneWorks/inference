@@ -14,10 +14,9 @@
 //!
 //! Run: `cargo test -p mlx-gen-lens --test integration dit_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{multiply, sum};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::testing::peak_rel;
+use mlx_gen::testing::{cosine_device_sums_f32, peak_rel, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_lens::dit::rope::LensRope3d;
 use mlx_gen_lens::dit::{LensDitConfig, LensTransformer, LensTransformerBlock};
@@ -38,23 +37,6 @@ fn transformer_dir() -> std::path::PathBuf {
         .max()
         .expect("a snapshot");
     snap.join("transformer")
-}
-
-fn cosine(got: &Array, want: &Array) -> f32 {
-    let got = got.as_dtype(Dtype::Float32).unwrap();
-    let want = want.as_dtype(Dtype::Float32).unwrap();
-    let dot = sum(multiply(&got, &want).unwrap(), None)
-        .unwrap()
-        .item::<f32>();
-    let na = sum(multiply(&got, &got).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    let nb = sum(multiply(&want, &want).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    dot / (na * nb).max(1e-12)
 }
 
 fn meta_usize(g: &Weights, key: &str) -> usize {
@@ -106,8 +88,8 @@ fn lens_dit_matches_reference() {
     let blk_hid_pr = peak_rel(&hid0, &f32("block0_hidden"));
     eprintln!(
         "block0: enc peak_rel {blk_enc_pr:.3e} cosine {:.7} | hidden peak_rel {blk_hid_pr:.3e} cosine {:.7}",
-        cosine(&enc0, &f32("block0_enc")),
-        cosine(&hid0, &f32("block0_hidden")),
+        cosine_device_sums_f32(&enc0, &f32("block0_enc"), Denom::FloorAt(1e-12)),
+        cosine_device_sums_f32(&hid0, &f32("block0_hidden"), Denom::FloorAt(1e-12)),
     );
 
     // --- 2. full forward ---
@@ -126,7 +108,7 @@ fn lens_dit_matches_reference() {
         )
         .expect("full forward");
     let out_pr = peak_rel(&out, &f32("out"));
-    let out_cos = cosine(&out, &f32("out"));
+    let out_cos = cosine_device_sums_f32(&out, &f32("out"), Denom::FloorAt(1e-12));
     eprintln!("full forward: peak_rel {out_pr:.3e} cosine {out_cos:.7}");
 
     // Per-block is the tight correctness gate: fed the exact reference block-0 inputs, the Rust block

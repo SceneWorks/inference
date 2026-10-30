@@ -66,14 +66,7 @@ fn report(tag: &str, img: &Image) -> (f64, f64) {
 }
 
 fn save_png(img: &Image, path: &str) {
-    image::save_buffer(
-        path,
-        &img.pixels,
-        img.width,
-        img.height,
-        image::ColorType::Rgb8,
-    )
-    .unwrap();
+    mlx_gen::testing::save_png(img, path);
     eprintln!("wrote {path}");
 }
 

@@ -8,11 +8,3 @@
 //! common;`; a binary may use only a subset, so `#![allow(dead_code)]` suppresses the otherwise
 //! unavoidable dead-code warnings under `-D warnings`.
 #![allow(dead_code)]
-
-/// Max absolute elementwise difference between two equal-length host slices.
-pub fn max_abs(got: &[f32], exp: &[f32]) -> f32 {
-    got.iter()
-        .zip(exp.iter())
-        .map(|(g, e)| (g - e).abs())
-        .fold(0f32, f32::max)
-}

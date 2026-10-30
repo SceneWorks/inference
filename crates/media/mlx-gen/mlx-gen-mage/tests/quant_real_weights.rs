@@ -11,6 +11,7 @@
 //! tower still take Q4's own width.
 
 use mlx_gen::quant::{load_dir_map, quantize_map};
+use mlx_gen::testing::{cosine_f64_sums, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Quant, WeightsSource};
 use mlx_gen_mage::config::{TE_RMS_NORM_EPS, TE_ROPE_THETA};
@@ -74,22 +75,15 @@ fn image_structure(pixels: &[u8]) -> (u8, u8, f64, usize) {
     (min, max, variance.sqrt(), repeated_rows)
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    let dot = a
-        .iter()
-        .zip(b)
-        .map(|(&x, &y)| x as f64 * y as f64)
-        .sum::<f64>();
-    let an = a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-    let bn = b.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-    dot / (an * bn).max(1e-12)
-}
-
 fn pairwise_similarities(vectors: &[Vec<f32>]) -> Vec<f64> {
     let mut out = Vec::new();
     for i in 0..vectors.len() {
         for j in i + 1..vectors.len() {
-            out.push(cosine(&vectors[i], &vectors[j]));
+            out.push(cosine_f64_sums(
+                &vectors[i],
+                &vectors[j],
+                Denom::FloorAt(1e-12),
+            ));
         }
     }
     out
@@ -420,19 +414,21 @@ fn qwen_q8_beats_q4_and_both_preserve_prompt_fidelity() {
     let q8_cos = q8
         .iter()
         .zip(&dense)
-        .map(|(a, b)| cosine(a, b))
+        .map(|(a, b)| cosine_f64_sums(a, b, Denom::FloorAt(1e-12)))
         .sum::<f64>()
         / prompts.len() as f64;
     let q4_cos = q4
         .iter()
         .zip(&dense)
-        .map(|(a, b)| cosine(a, b))
+        .map(|(a, b)| cosine_f64_sums(a, b, Denom::FloorAt(1e-12)))
         .sum::<f64>()
         / prompts.len() as f64;
     let wrong_cos = q4
         .iter()
         .enumerate()
-        .map(|(i, vector)| cosine(vector, &dense[(i + 1) % dense.len()]))
+        .map(|(i, vector)| {
+            cosine_f64_sums(vector, &dense[(i + 1) % dense.len()], Denom::FloorAt(1e-12))
+        })
         .sum::<f64>()
         / prompts.len() as f64;
     let dense_ranks = pairwise_similarities(&dense);

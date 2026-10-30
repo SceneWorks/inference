@@ -697,6 +697,7 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod hidden_state_pinning_tests {
     use super::*;
+    use mlx_gen::testing::max_abs_diff_host;
     use std::collections::HashMap;
 
     pub(crate) fn tiny_cfg(num_layers: usize) -> GemmaConfig {
@@ -830,16 +831,6 @@ pub(crate) mod hidden_state_pinning_tests {
         Weights::from_map(m)
     }
 
-    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-        let a = a.as_dtype(Dtype::Float32).unwrap();
-        let b = b.as_dtype(Dtype::Float32).unwrap();
-        a.as_slice::<f32>()
-            .iter()
-            .zip(b.as_slice::<f32>())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0f32, f32::max)
-    }
-
     #[test]
     #[ignore = "model inference; explicit model-proof workflow"]
     fn forward_returns_exactly_num_layers_plus_one_hidden_states() {
@@ -890,7 +881,7 @@ pub(crate) mod hidden_state_pinning_tests {
         let want: Vec<f32> = [row(3), row(1)].concat();
         let want = Array::from_slice(&want, &[1, 2, cfg.hidden_size]);
         assert!(
-            max_abs_diff(&hiddens[0], &want) < 5e-3,
+            max_abs_diff_host(&hiddens[0], &want) < 5e-3,
             "hidden_states[0] must be exactly the scaled embedding lookup (index 0 pinning)"
         );
         crate::model_inference_device::record_model_inference_device();
@@ -931,12 +922,12 @@ pub(crate) mod hidden_state_pinning_tests {
         let last = hiddens_a.len() - 1;
         for i in 0..last {
             assert!(
-                max_abs_diff(&hiddens_a[i], &hiddens_b[i]) < 1e-6,
+                max_abs_diff_host(&hiddens_a[i], &hiddens_b[i]) < 1e-6,
                 "perturbing the FINAL norm changed hidden_states[{i}], which is not the final index"
             );
         }
         assert!(
-            max_abs_diff(&hiddens_a[last], &hiddens_b[last]) > 1e-3,
+            max_abs_diff_host(&hiddens_a[last], &hiddens_b[last]) > 1e-3,
             "perturbing the FINAL norm must change the LAST hidden state (the final-norm slot)"
         );
         crate::model_inference_device::record_model_inference_device();

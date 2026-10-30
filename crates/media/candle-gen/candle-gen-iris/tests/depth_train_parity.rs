@@ -20,6 +20,7 @@ use gen_core_iris::train::{full_param_route, MuonAdjustLr, OptimizerKind, Optimi
 use gen_core_iris::IrisTask;
 
 use crate::common::{cpu, fixture, fixtures, host_f32, Fixture};
+use candle_gen::testkit::peak_rel_slices;
 
 fn golden_batch(g: &Fixture) -> DepthBatch {
     let depth = host_f32(g.require("depth"));
@@ -57,15 +58,6 @@ fn golden_batch(g: &Fixture) -> DepthBatch {
     }
 }
 
-fn peak_rel(got: &[f32], want: &[f32]) -> f32 {
-    let peak = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-12);
-    got.iter()
-        .zip(want)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0f32, f32::max)
-        / peak
-}
-
 #[test]
 #[ignore = "model inference; explicit model workflow only"]
 fn one_step_matches_the_torch_oracle() {
@@ -92,7 +84,7 @@ fn one_step_matches_the_torch_oracle() {
 
     let snap = candle_gen_iris::train::optim::snapshot(&params);
     let pred = model.predict(&snap, &step.rgb).unwrap();
-    let rel = peak_rel(&host_f32(&pred), &host_f32(g.require("pred0")));
+    let rel = peak_rel_slices(&host_f32(&pred), &host_f32(g.require("pred0")), Some(1e-12));
     eprintln!("pred0: {rel:.3e} of peak");
     assert!(rel <= 1e-4);
 
@@ -118,7 +110,7 @@ fn one_step_matches_the_torch_oracle() {
     let mut want_grads: HashMap<String, Vec<f32>> = HashMap::new();
     for k in &selected {
         let want = host_f32(g.require(&format!("grad/{k}")));
-        let rel = peak_rel(&host_f32(&grads[k]), &want);
+        let rel = peak_rel_slices(&host_f32(&grads[k]), &want, Some(1e-12));
         eprintln!("grad {k}: {rel:.3e} of peak");
         assert!(rel <= 1e-3, "{k}");
         want_grads.insert(k.clone(), want);

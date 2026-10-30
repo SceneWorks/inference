@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{VarBuilder, VarMap};
+use candle_gen::testkit::tensor_max_abs_diff_host;
 use candle_gen_flux::control::{FluxControlNet, FluxControlNetConfig, FluxControlTransformer};
 use candle_gen_flux::{FluxConfig, IpFlux};
 
@@ -164,15 +165,6 @@ impl Fixture {
     }
 }
 
-fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-    let av = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-    let bv = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-    av.iter()
-        .zip(&bv)
-        .map(|(x, y)| (x - y).abs())
-        .fold(0f32, f32::max)
-}
-
 #[test]
 fn residual_count_and_interval() {
     let f = Fixture::build();
@@ -188,7 +180,7 @@ fn scale_zero_equals_base_forward() {
     let base = f.base_forward();
     let control0 = f.control_forward(0.0);
     assert_eq!(control0.dims(), base.dims());
-    let d = max_abs_diff(&base, &control0);
+    let d = tensor_max_abs_diff_host(&base, &control0);
     assert!(
         d == 0.0,
         "control_scale = 0 must be byte-identical to the base forward (residuals ×0); max|Δ| = {d}"
@@ -205,7 +197,7 @@ fn scale_nonzero_injects_and_stays_finite() {
     let base = f.base_forward();
     let controlled = f.control_forward(0.8);
     assert_eq!(controlled.dims(), base.dims());
-    let d = max_abs_diff(&base, &controlled);
+    let d = tensor_max_abs_diff_host(&base, &controlled);
     assert!(
         d > 1e-6,
         "scale = 0.8 must change the output (residuals injected); max|Δ| = {d}"

@@ -15,6 +15,7 @@ use candle_gen_krea::KreaTextEncoder;
 
 use crate::common;
 
+use candle_gen::testkit::{tensor_cosine_f32_sums, tensor_max_abs_diff_host, Denom};
 use common::{tiny_te_config, SHARED_FIXTURE_TE_HIDDEN_SIZE};
 
 const FIXTURE: &str = concat!(
@@ -29,23 +30,6 @@ fn vec_f32(x: &Tensor) -> Vec<f32> {
         .unwrap()
         .to_vec1::<f32>()
         .unwrap()
-}
-
-fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-    let a = vec_f32(a);
-    let b = vec_f32(b);
-    let dot: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    dot / (na * nb)
-}
-
-fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-    vec_f32(a)
-        .iter()
-        .zip(&vec_f32(b))
-        .map(|(x, y)| (x - y).abs())
-        .fold(0f32, f32::max)
 }
 
 #[test]
@@ -63,14 +47,14 @@ fn te_matches_reference() -> Result<()> {
     let want = w.get("out.hiddens")?;
     assert_eq!(hiddens.dims(), want.dims(), "stacked-context shape");
 
-    let c = cosine(&hiddens, &want);
+    let c = tensor_cosine_f32_sums(&hiddens, &want, Denom::Exact);
     println!(
         "Krea TE parity: cosine={c:.7} max_abs={:e}",
-        max_abs_diff(&hiddens, &want)
+        tensor_max_abs_diff_host(&hiddens, &want)
     );
     assert!(c > 0.999, "TE cosine {c:.7} <= 0.999");
     assert!(
-        max_abs_diff(&hiddens, &want) < 2e-2,
+        tensor_max_abs_diff_host(&hiddens, &want) < 2e-2,
         "TE stacked context diverged beyond 2e-2 (cosine {c:.7})"
     );
     #[cfg(feature = "model-inference-proof")]
@@ -133,7 +117,7 @@ fn grounded_forward_splices_vision_through() -> Result<()> {
     // Different vision embeds → different grounded context (the splice feeds through the decoder).
     let (e_b, ds_b) = mk(-0.7)?;
     let out_b = te.forward_with_images(&input_ids, &e_b, &ds_b, &[grid])?;
-    let d = max_abs_diff(&out_a, &out_b);
+    let d = tensor_max_abs_diff_host(&out_a, &out_b);
     println!("grounded smoke: vision-embed-change Δ={d:e}");
     assert!(
         d > 1e-4,
@@ -184,12 +168,12 @@ fn bf16_store_te_stays_within_parity() -> Result<()> {
     );
     assert_eq!(ctx_bf16.dims(), ctx_f32.dims());
 
-    let c_store = cosine(&ctx_bf16, &ctx_f32);
+    let c_store = tensor_cosine_f32_sums(&ctx_bf16, &ctx_f32, Denom::Exact);
     let want = w_f32.get("out.hiddens")?;
-    let c_ref = cosine(&ctx_bf16, &want);
+    let c_ref = tensor_cosine_f32_sums(&ctx_bf16, &want, Denom::Exact);
     println!(
         "bf16-store TE: cosine(vs f32 store)={c_store:.7} max_abs(vs f32 store)={:e}; cosine(vs golden)={c_ref:.7}",
-        max_abs_diff(&ctx_bf16, &ctx_f32)
+        tensor_max_abs_diff_host(&ctx_bf16, &ctx_f32)
     );
     // Storing the f32 fixture weights as bf16 rounds them, but the context stays within the golden's own
     // 0.999 parity band against BOTH the f32 store and the transformers reference.

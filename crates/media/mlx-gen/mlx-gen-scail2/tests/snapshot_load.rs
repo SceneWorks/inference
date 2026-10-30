@@ -28,18 +28,13 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::env_path_or_home;
 use mlx_gen::weights::Weights;
 use mlx_gen_scail2::{ClipVisionConfig, Scail2Config, Scail2Dit, ScailClip};
 use mlx_gen_wan::{load_tokenizer, Umt5Encoder, WanVae};
 
-fn home_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap())
-}
-
 fn snapshot_dir() -> PathBuf {
-    std::env::var("SCAIL2_SNAPSHOT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home_dir().join(".cache/scail2-mlx-convert"))
+    env_path_or_home("SCAIL2_SNAPSHOT_DIR", ".cache/scail2-mlx-convert")
 }
 
 #[test]

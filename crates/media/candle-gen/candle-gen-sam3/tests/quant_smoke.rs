@@ -18,10 +18,10 @@
 
 use std::path::Path;
 
-use crate::support::{cosine, iou};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::default_device;
 use candle_gen::gen_core::Quant;
+use candle_gen::testkit::{tensor_cosine_device_sums, tensor_iou, Denom};
 use candle_gen_sam3::{Instance, Sam3ImageSegmenter, Sam3Tracker, Weights};
 
 /// Sign-threshold mask logits at 0 → {0,1} f32 (the binary mask depends only on the logit sign).
@@ -33,7 +33,7 @@ fn binarize(logits: &Tensor) -> Tensor {
 fn worst_iou(a: &[Instance], b: &[Instance]) -> f32 {
     a.iter()
         .zip(b)
-        .map(|(x, y)| iou(&x.mask, &y.mask))
+        .map(|(x, y)| tensor_iou(&x.mask, &y.mask))
         .fold(1.0f32, f32::min)
 }
 
@@ -154,8 +154,8 @@ fn quantized_tracker_stays_close_to_dense() {
     q8.quantize(Quant::Q8).expect("quantize tracker q8");
     let q8 = q8.segment(&pixel_values, box_xyxy).expect("q8 segment");
 
-    let cos = cosine(&dense.low_res, &q8.low_res);
-    let mask_iou = iou(&binarize(&dense.low_res), &binarize(&q8.low_res));
+    let cos = tensor_cosine_device_sums(&dense.low_res, &q8.low_res, Denom::Exact);
+    let mask_iou = tensor_iou(&binarize(&dense.low_res), &binarize(&q8.low_res));
     println!(
         "tracker Q8 vs dense: mask logit cosine={cos:.5} binary IoU={mask_iou:.4} (iou dense={:.3} q8={:.3})",
         dense.iou, q8.iou

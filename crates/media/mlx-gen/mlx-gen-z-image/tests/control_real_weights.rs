@@ -14,6 +14,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::peak_rel_host;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Conditioning, ControlKind, FlowMatchEuler, GenerationOutput, GenerationRequest, Image,
@@ -70,20 +71,6 @@ fn control_source(g: &Weights) -> WeightsSource {
     WeightsSource::File(file)
 }
 
-/// Peak-relative error `max|a-b| / max|b|`.
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap();
-    let b = b.reshape(&[n]).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
-    let max_diff = a
-        .iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
-    max_diff / peak
-}
-
 fn bf16(a: &Array) -> Array {
     a.as_dtype(Dtype::Bfloat16).unwrap()
 }
@@ -135,8 +122,8 @@ fn control_scale0_is_inert() {
         .forward(&init, t0, &cap, Some(&cc), scale)
         .unwrap();
 
-    let inert = peak_rel(&v_s0, &v_none);
-    let active = peak_rel(&v_ctrl, &v_none);
+    let inert = peak_rel_host(&v_s0, &v_none, Some(1e-12));
+    let active = peak_rel_host(&v_ctrl, &v_none, Some(1e-12));
     println!(
         "control scale=0 vs None peak_rel={inert:.2e}; scale={scale} vs None peak_rel={active:.3e}"
     );
@@ -176,7 +163,7 @@ fn control_single_forward_matches_golden() {
         .unwrap();
     let golden = g.require("v0").unwrap();
     assert_eq!(v.shape(), golden.shape(), "v0 shape");
-    let pr = peak_rel(&v, golden);
+    let pr = peak_rel_host(&v, golden, Some(1e-12));
     println!(
         "control single forward (mixed bf16/f32): v0 peak_rel={pr:.2e} shape={:?}",
         v.shape()
@@ -231,7 +218,7 @@ fn control_denoise_loop_matches_golden() {
 
     let golden = g.require("final_latents").unwrap();
     assert_eq!(out.shape(), golden.shape(), "final latents shape");
-    let pr = peak_rel(&out, golden);
+    let pr = peak_rel_host(&out, golden, Some(1e-12));
     println!(
         "control denoise (mixed): final_latents peak_rel={pr:.2e} shape={:?}",
         out.shape()
@@ -294,7 +281,7 @@ fn control_dtype_compare() {
         .unwrap()
         .as_dtype(Dtype::Float32)
         .unwrap();
-        let pr = peak_rel(&out, golden_lat);
+        let pr = peak_rel_host(&out, golden_lat, Some(1e-12));
         let unpacked = unpack_latents(&out).unwrap();
         let sh = unpacked.shape();
         let latent5 = unpacked.reshape(&[sh[0], sh[1], 1, sh[2], sh[3]]).unwrap();
@@ -396,7 +383,7 @@ fn control_q8_transformer_matches_golden() {
     let v0 = transformer
         .forward(&init, t0, &cap, Some(&cc), scale)
         .unwrap();
-    let v0_pr = peak_rel(&v0, g.require("v0").unwrap());
+    let v0_pr = peak_rel_host(&v0, g.require("v0").unwrap(), Some(1e-12));
     println!("control Q8 single forward: v0 peak_rel={v0_pr:.3e}");
     assert!(
         v0_pr < 3e-2,
@@ -425,7 +412,7 @@ fn control_q8_transformer_matches_golden() {
     let golden = g.require("final_latents").unwrap();
     println!(
         "control Q8 transformer: final_latents peak_rel={:.3e}",
-        peak_rel(&latents, golden)
+        peak_rel_host(&latents, golden, Some(1e-12))
     );
 
     let unpacked = unpack_latents(&latents).unwrap();
@@ -516,14 +503,14 @@ fn control_q8_bisect() {
         println!(
             "  {name:>14}: mean_rel={:.3e}  peak_rel={:.3e}",
             mean_rel(arr, golden),
-            peak_rel(arr, golden)
+            peak_rel_host(arr, golden, Some(1e-12))
         );
     }
     println!(
         "  {:>14}: mean_rel={:.3e}  peak_rel={:.3e}",
         "v0",
         mean_rel(&v0, bisect.require("v0_scale1").unwrap()),
-        peak_rel(&v0, bisect.require("v0_scale1").unwrap())
+        peak_rel_host(&v0, bisect.require("v0_scale1").unwrap(), Some(1e-12))
     );
 
     // STAGE-INJECTION (resolves the qmm_smallk=0.0 vs bisection x_emb=0.3% contradiction): is Rust's
@@ -541,7 +528,7 @@ fn control_q8_bisect() {
         Some((_, x_tokens)) if x_tokens.shape() == fork_x.shape() => println!(
             "  patchify x_tokens: Rust vs fork(qmm-probe x) mean_rel={:.3e}  peak_rel={:.3e}",
             mean_rel(x_tokens, fork_x),
-            peak_rel(x_tokens, fork_x)
+            peak_rel_host(x_tokens, fork_x, Some(1e-12))
         ),
         Some((_, x_tokens)) => println!(
             "  patchify x_tokens: SHAPE {:?} vs fork {:?}",
@@ -559,7 +546,7 @@ fn control_q8_bisect() {
     println!(
         "  base path (scale=0) vs fork v0_scale0: mean_rel={:.3e}  peak_rel={:.3e}",
         mean_rel(&v0_s0, bisect.require("v0_scale0").unwrap()),
-        peak_rel(&v0_s0, bisect.require("v0_scale0").unwrap())
+        peak_rel_host(&v0_s0, bisect.require("v0_scale0").unwrap(), Some(1e-12))
     );
 
     // COMPOSITION CHECK (pure Rust): does the control model's base path equal (1) its own None path
@@ -575,7 +562,7 @@ fn control_q8_bisect() {
         "  COMPOSITION: scale0-vs-None mean_rel={:.3e} | None-vs-standalone-base-Q8 mean_rel={:.3e} peak_rel={:.3e}",
         mean_rel(&v0_s0, &v_none),
         mean_rel(&v_none, &v_base),
-        peak_rel(&v_none, &v_base),
+        peak_rel_host(&v_none, &v_base, Some(1e-12)),
     );
     #[cfg(target_os = "macos")]
     crate::common::metal_guard::record_model_inference_device();

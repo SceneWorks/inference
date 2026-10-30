@@ -10,6 +10,7 @@
 //! Run:
 //!   cargo test -p mlx-gen-pulid --release --test integration eva_clip_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::{cosine_host_f64, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_pulid::eva_clip::{transform, EvaConfig, EvaVisionTransformer};
 use mlx_rs::Array;
@@ -56,18 +57,6 @@ fn rel_errors(got: &Array, want: &Array) -> (f32, f32) {
     (max_diff / peak_ref, (sum_diff / sum_ref) as f32)
 }
 
-fn cosine(got: &Array, want: &Array) -> f32 {
-    let a = slice(got);
-    let b = slice(want);
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (&x, &y) in a.iter().zip(&b) {
-        dot += x as f64 * y as f64;
-        na += (x as f64).powi(2);
-        nb += (y as f64).powi(2);
-    }
-    (dot / (na.sqrt() * nb.sqrt())) as f32
-}
-
 #[test]
 #[ignore = "needs local golden from tools/dump_eva_clip_golden.py"]
 fn rope_construction_matches_checkpoint() {
@@ -109,7 +98,7 @@ fn eva_encoder_matches_torch_f32() {
     for i in 0..5 {
         let want = g.require(&format!("hidden_{i}")).unwrap();
         let (peak, mean) = rel_errors(&out.hidden[i], want);
-        let cos = cosine(&out.hidden[i], want);
+        let cos = cosine_host_f64(&out.hidden[i], want, Denom::Exact) as f32;
         println!("hidden_{i}: peak-rel {peak:.3e} mean-rel {mean:.3e} cos {cos:.6}");
         assert!(cos > 0.9995, "hidden_{i} cosine {cos:.6}");
         assert!(mean < 1.2e-2, "hidden_{i} mean-rel {mean:.3e}");
@@ -117,7 +106,7 @@ fn eva_encoder_matches_torch_f32() {
 
     let want = g.require("id_cond_vit").unwrap();
     let (peak, mean) = rel_errors(&out.id_cond_vit, want);
-    let cos = cosine(&out.id_cond_vit, want);
+    let cos = cosine_host_f64(&out.id_cond_vit, want, Denom::Exact) as f32;
     println!("id_cond_vit: peak-rel {peak:.3e} mean-rel {mean:.3e} cos {cos:.6}");
     assert!(cos > 0.9995, "id_cond_vit cosine {cos:.6}");
     assert!(mean < 1.2e-2, "id_cond_vit mean-rel {mean:.3e}");
@@ -135,7 +124,11 @@ fn eva_encoder_bf16_floor() {
     gw.cast_all(mlx_rs::Dtype::Bfloat16).unwrap();
     let vt = EvaVisionTransformer::from_weights(&gw, "w", EvaConfig::default()).unwrap();
     let out = vt.forward(gw.require("enc_in_nhwc").unwrap()).unwrap();
-    let cos = cosine(&out.id_cond_vit, g.require("id_cond_vit").unwrap());
+    let cos = cosine_host_f64(
+        &out.id_cond_vit,
+        g.require("id_cond_vit").unwrap(),
+        Denom::Exact,
+    ) as f32;
     let (peak, mean) = rel_errors(&out.id_cond_vit, g.require("id_cond_vit").unwrap());
     println!("bf16 id_cond_vit: cos {cos:.6} peak-rel {peak:.3e} mean-rel {mean:.3e}");
     assert!(cos > 0.99, "bf16 id_cond_vit cosine {cos:.6}");

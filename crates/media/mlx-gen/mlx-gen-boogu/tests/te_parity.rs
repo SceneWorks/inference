@@ -8,21 +8,9 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::testing::require_env_path;
+use mlx_gen::testing::{cosine_f32_device, require_env_path};
 use mlx_gen::weights::Weights;
 use mlx_gen_boogu::{load_text_encoder, load_transformer};
-use mlx_rs::ops::{multiply, sqrt, sum};
-use mlx_rs::{Array, Dtype};
-
-/// Cosine similarity over all elements (robust to bf16 precision): `⟨a,b⟩ / (‖a‖·‖b‖)`.
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let dot = sum(multiply(&a, &b).unwrap(), false).unwrap();
-    let na = sqrt(sum(multiply(&a, &a).unwrap(), false).unwrap()).unwrap();
-    let nb = sqrt(sum(multiply(&b, &b).unwrap(), false).unwrap()).unwrap();
-    (dot / (na * nb)).item::<f32>()
-}
 
 fn golden_path() -> PathBuf {
     std::env::var("BOOGU_GOLDEN")
@@ -51,7 +39,7 @@ fn te_matches_reference_last_hidden() {
     let want = g.require("instruction_hidden_states").unwrap();
     assert_eq!(out.shape(), want.shape(), "last_hidden_state shape");
 
-    let c = cosine(&out, want);
+    let c = cosine_f32_device(&out, want);
     println!("Boogu Qwen3-VL TE parity cosine = {c:.7}");
     assert!(
         c > 0.999,
@@ -90,7 +78,7 @@ fn dit_matches_reference_velocity() {
     let want = g.require("dit_out_velocity_chw").unwrap();
     assert_eq!(out.shape(), want.shape(), "velocity shape");
 
-    let c = cosine(&out, want);
+    let c = cosine_f32_device(&out, want);
     println!("Boogu DiT velocity parity cosine = {c:.7}");
     assert!(
         c > 0.999,

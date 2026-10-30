@@ -14,6 +14,7 @@
 
 use std::path::Path;
 
+use mlx_gen::testing::max_abs_diff_f32;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterKind, AdapterSpec, CancelFlag, LoadSpec, NetworkType, TrainingConfig, TrainingItem,
@@ -60,27 +61,6 @@ fn probe_forward(
     let txt = random::normal::<f32>(&[1, txt_len, 2560], None, None, Some(&random::key(2)?))?;
     let sigma = mlx_rs::Array::from_slice(&[0.5f32], &[1]);
     Ok(t.forward(&img, &txt, &sigma, &ctx).unwrap())
-}
-
-fn max_abs_diff(a: &mlx_rs::Array, b: &mlx_rs::Array) -> f32 {
-    let n = a.shape().iter().product::<i32>();
-    let a = a
-        .as_dtype(mlx_rs::Dtype::Float32)
-        .unwrap()
-        .reshape(&[n])
-        .unwrap();
-    let b = b
-        .as_dtype(mlx_rs::Dtype::Float32)
-        .unwrap()
-        .reshape(&[n])
-        .unwrap();
-    a.subtract(&b)
-        .unwrap()
-        .abs()
-        .unwrap()
-        .max(None)
-        .unwrap()
-        .item::<f32>()
 }
 
 fn train_and_check(network_type: NetworkType, kind: AdapterKind, tag: &str) {
@@ -211,7 +191,7 @@ fn train_and_check(network_type: NetworkType, kind: AdapterKind, tag: &str) {
         v_adapted.sum(None).unwrap().item::<f32>().is_finite(),
         "[{tag}] reloaded forward finite"
     );
-    let delta = max_abs_diff(&v_base, &v_adapted);
+    let delta = max_abs_diff_f32(&v_base, &v_adapted);
     println!("[trainer-{tag}] reloaded adapter shifts the DiT velocity by max_abs {delta:.5}");
     assert!(
         delta > 1e-4,
@@ -395,7 +375,7 @@ fn mage_lora_reload_changes_generated_image() {
         .unwrap()
         .swap_remove(0);
 
-    let delta = max_abs_diff(&base_img, &adapted_img);
+    let delta = max_abs_diff_f32(&base_img, &adapted_img);
     let mean = {
         let n = base_img.shape().iter().product::<i32>();
         let a = base_img

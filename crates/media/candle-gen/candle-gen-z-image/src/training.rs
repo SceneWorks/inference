@@ -1756,6 +1756,7 @@ mod training_adapter_tests {
         install_training_adapter, set_training_adapter_pass, training_adapter_bytes, PREVIEW_PASS,
         TRAIN_PASS,
     };
+    use candle_gen::testkit::tensor_max_abs;
     use candle_gen::train::lora::build_lora_targets;
     use candle_nn::{VarBuilder, VarMap};
     use candle_transformers::models::z_image::transformer::Config;
@@ -1851,17 +1852,6 @@ mod training_adapter_tests {
             .collect()
     }
 
-    fn max_abs(t: &Tensor) -> f32 {
-        t.abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar()
-            .unwrap()
-    }
-
     /// (a) The effective weight of each targeted projection is base + `B·A` exactly (its output moves
     /// by `x·(B·A)ᵀ`), every other projection is bit-identical; the preview pass is bit-identical to
     /// the bare base on EVERY projection and the training pass comes back bit-for-bit.
@@ -1882,12 +1872,15 @@ mod training_adapter_tests {
             match deltas.get(path) {
                 Some(delta) => {
                     let want = (y0 + x.matmul(&delta.t().unwrap()).unwrap()).unwrap();
-                    let off = max_abs(&(y - &want).unwrap());
+                    let off = tensor_max_abs(&(y - &want).unwrap());
                     assert!(
                         off < 1e-5,
                         "{path}: effective weight is not base + B·A ({off})"
                     );
-                    assert!(max_abs(&(y - y0).unwrap()) > 1e-3, "{path}: adapter inert");
+                    assert!(
+                        tensor_max_abs(&(y - y0).unwrap()) > 1e-3,
+                        "{path}: adapter inert"
+                    );
                 }
                 None => assert_eq!(bits(y), bits(y0), "{path}: untargeted projection changed"),
             }

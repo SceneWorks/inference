@@ -29,7 +29,8 @@ use candle_gen_minimax_h3::{
     MiniMaxH3Dit, MiniMaxH3DitConfig, MmRope, TimestepSchedule, MODALITY_NUM, PUBLISHED_DIT_TENSORS,
 };
 
-use common::{assert_parity, cosine, dit_fixture_config, flat, rel, weights, Golden, DIT_FIXTURE};
+use candle_gen::testkit::{tensor_cosine_f32_sums, Denom};
+use common::{assert_parity, dit_fixture_config, flat, rel, weights, Golden, DIT_FIXTURE};
 
 /// **This lane's** bound, as in `dit_parity.rs` — set from the residual this suite measures rather
 /// than inherited from the MLX lane's Metal-limited 1e-2.
@@ -72,7 +73,7 @@ fn the_timestep_mlp_reproduces_the_reference_embedding() {
     println!(
         "  time_proj + time_embedder over {timesteps:?}: rel-max-abs {peak:.3e} (mean {mean:.3e}, \
          cosine {:.6})",
-        cosine(&got, &want)
+        tensor_cosine_f32_sums(&got, &want, Denom::FloorAt(1e-12))
     );
     assert_parity(&got, &want, TOL, "time_embedder(time_proj(t))");
 
@@ -370,9 +371,9 @@ fn the_whole_model_reproduces_the_reference_velocity() {
         video_rows.dims(),
         audio_rows.dims(),
         rel(&video, &want_video).0,
-        cosine(&video, &want_video),
+        tensor_cosine_f32_sums(&video, &want_video, Denom::FloorAt(1e-12)),
         rel(&audio, &want_audio).0,
-        cosine(&audio, &want_audio),
+        tensor_cosine_f32_sums(&audio, &want_audio, Denom::FloorAt(1e-12)),
     );
     assert_parity(&video, &want_video, TOL, "whole-model video velocity");
     assert_parity(&audio, &want_audio, TOL, "whole-model audio velocity");

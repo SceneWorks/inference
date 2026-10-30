@@ -73,6 +73,7 @@
 use candle_gen::candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_gen::candle_core::{Device, Module, Tensor};
 use candle_gen::default_device;
+use candle_gen::testkit::{tensor_cosine_device_sums, tensor_max_abs_host, Denom};
 
 /// Deterministic, launch-portable pseudo-random f32 in roughly [-1, 1] (splitmix64-style hash of the
 /// index). Avoids a device RNG so the CPU reference and the CUDA result quantize byte-identical data.
@@ -89,33 +90,6 @@ fn pseudo_random(n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Cosine similarity of two tensors over all elements (flattened, on the CPU).
-fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-    let a = a.flatten_all().unwrap();
-    let b = b.flatten_all().unwrap();
-    let dot = (&a * &b)
-        .unwrap()
-        .sum_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap();
-    let na = (&a * &a)
-        .unwrap()
-        .sum_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-        .sqrt();
-    let nb = (&b * &b)
-        .unwrap()
-        .sum_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-        .sqrt();
-    dot / (na * nb).max(1e-12)
-}
-
 fn all_finite(t: &Tensor) -> bool {
     t.flatten_all()
         .unwrap()
@@ -123,16 +97,6 @@ fn all_finite(t: &Tensor) -> bool {
         .unwrap()
         .iter()
         .all(|v| v.is_finite())
-}
-
-/// `max|a|` over all elements — the scale the relative error is measured against.
-fn max_abs(t: &Tensor) -> f32 {
-    t.flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap()
-        .iter()
-        .fold(0.0f32, |acc, v| acc.max(v.abs()))
 }
 
 /// Relative max-absolute-difference, `max|a - b| / max|b|`, with `b` the reference (sc-19545).
@@ -143,12 +107,12 @@ fn max_abs(t: &Tensor) -> f32 {
 /// the assertions below bound the worst single element and cosine survives only as a diagnostic
 /// print.
 fn relative_max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-    let scale = max_abs(b);
+    let scale = tensor_max_abs_host(b);
     assert!(
         scale > 0.0,
         "the CPU reference is itself all-zeros — the fixture is broken, not the CUDA kernel"
     );
-    max_abs(&(a - b).expect("elementwise difference")) / scale
+    tensor_max_abs_host(&(a - b).expect("elementwise difference")) / scale
 }
 
 /// The GGUF Q4_0/Q8_0 `QMatMul` on the CUDA device matches the CPU reference, all-finite.
@@ -207,14 +171,14 @@ fn cuda_qmatmul_matches_cpu() {
             .expect("y->cpu");
 
         let rel = relative_max_abs_diff(&y_cuda, &y_cpu);
-        let cuda_scale = max_abs(&y_cuda);
-        let cpu_scale = max_abs(&y_cpu);
+        let cuda_scale = tensor_max_abs_host(&y_cuda);
+        let cpu_scale = tensor_max_abs_host(&y_cpu);
         let finite = all_finite(&y_cuda);
         // Cosine is printed, never asserted on — see `relative_max_abs_diff`.
         eprintln!(
             "[quant-smoke] {label}: rel_max_abs_diff={rel:.6} max|cuda|={cuda_scale:.6} \
              max|cpu|={cpu_scale:.6} all_finite={finite} (diagnostic cos={:.5})",
-            cosine(&y_cpu, &y_cuda)
+            tensor_cosine_device_sums(&y_cpu, &y_cuda, Denom::FloorAt(1e-12))
         );
 
         assert!(

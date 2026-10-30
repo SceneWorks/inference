@@ -33,6 +33,7 @@
 
 use mlx_gen::adapters::{AdaptableHost, Adapter};
 use mlx_gen::attention::AttentionPlan;
+use mlx_gen::testing::peak_rel_host;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, WeightsSource};
 use mlx_gen_z_image::{ZImageControlTransformer, ZImageTransformer, ZImageTransformerConfig};
@@ -143,18 +144,6 @@ impl Drop for Scratch {
     }
 }
 
-fn peak_relative_delta(a: &Array, b: &Array) -> f32 {
-    let n: i32 = b.shape().iter().product();
-    let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
-    let (xs, ys) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = ys.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
-    xs.iter()
-        .zip(ys)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
-        / peak
-}
-
 /// A streamed block runs the *same* ops on the *same* weights as its resident twin, so the two agree
 /// far below the reduced-precision Metal matmul floor this crate already tolerates. Kept as a bound
 /// rather than an exact compare because the windowed path forces an `eval` at each window boundary,
@@ -186,7 +175,7 @@ fn windowed_base_dit_matches_the_resident_forward_and_really_streams() {
             .forward_windowed(&x, 0.7, &cap, AttentionPlan::UNBOUNDED, window, &cancel)
             .unwrap();
         assert_eq!(windowed.shape(), resident.shape(), "window {window} shape");
-        let delta = peak_relative_delta(&windowed, &resident);
+        let delta = peak_rel_host(&windowed, &resident, Some(1e-12));
         assert!(
             delta < TOLERANCE,
             "window {window} changed the DiT velocity: peak-relative delta {delta:e}"
@@ -199,7 +188,7 @@ fn windowed_base_dit_matches_the_resident_forward_and_really_streams() {
     // The resident forward still holds the originals, so it is unchanged...
     let resident_again = model.forward(&x, 0.7, &cap).unwrap();
     assert_eq!(
-        peak_relative_delta(&resident_again, &resident),
+        peak_rel_host(&resident_again, &resident, Some(1e-12)),
         0.0,
         "the resident forward must not re-read the file"
     );
@@ -209,7 +198,7 @@ fn windowed_base_dit_matches_the_resident_forward_and_really_streams() {
     let windowed = model
         .forward_windowed(&x, 0.7, &cap, AttentionPlan::UNBOUNDED, 1, &cancel)
         .unwrap();
-    let delta = peak_relative_delta(&windowed, &resident);
+    let delta = peak_rel_host(&windowed, &resident, Some(1e-12));
     assert!(
         delta > 1e-3,
         "the windowed forward did not re-materialize its blocks from the source (delta {delta:e}) — \
@@ -326,7 +315,7 @@ fn a_lora_on_the_trunk_survives_the_window_and_the_capture_is_load_bearing() {
     let windowed = adapted
         .forward_windowed(&x, 0.7, &cap, AttentionPlan::UNBOUNDED, 1, &cancel)
         .unwrap();
-    let delta = peak_relative_delta(&windowed, &resident);
+    let delta = peak_rel_host(&windowed, &resident, Some(1e-12));
     assert!(
         delta < TOLERANCE,
         "the streamed blocks lost the LoRA residual: peak-relative delta {delta:e}"
@@ -336,7 +325,7 @@ fn a_lora_on_the_trunk_survives_the_window_and_the_capture_is_load_bearing() {
     let (plain, _, _) = base_model(&scratch);
     let unadapted = plain.forward(&x, 0.7, &cap).unwrap();
     assert!(
-        peak_relative_delta(&resident, &unadapted) > 1e-3,
+        peak_rel_host(&resident, &unadapted, Some(1e-12)) > 1e-3,
         "the test LoRA must actually move the output"
     );
 
@@ -354,7 +343,7 @@ fn a_lora_on_the_trunk_survives_the_window_and_the_capture_is_load_bearing() {
         .forward_windowed(&x, 0.7, &cap, AttentionPlan::UNBOUNDED, 1, &cancel)
         .unwrap();
     assert!(
-        peak_relative_delta(&windowed_uncaptured, &resident) > 1e-3,
+        peak_rel_host(&windowed_uncaptured, &resident, Some(1e-12)) > 1e-3,
         "without `capture_block_adapters` the streamed blocks must be unadapted — if they match \
          anyway, the capture is not what is carrying the LoRA and the identity test is vacuous"
     );
@@ -380,7 +369,7 @@ fn the_window_composes_with_the_attention_budget() {
     let windowed_bounded = model
         .forward_windowed(&x, 0.7, &cap, AttentionPlan::budgeted(budget), 1, &cancel)
         .unwrap();
-    let delta = peak_relative_delta(&windowed_bounded, &resident_bounded);
+    let delta = peak_rel_host(&windowed_bounded, &resident_bounded, Some(1e-12));
     assert!(
         delta < TOLERANCE,
         "windowing changed a bounded-attention forward: peak-relative delta {delta:e}"
@@ -440,7 +429,7 @@ fn windowed_control_dit_preserves_the_hint_injection() {
                 &cancel,
             )
             .unwrap();
-        let delta = peak_relative_delta(&windowed, &resident);
+        let delta = peak_rel_host(&windowed, &resident, Some(1e-12));
         assert!(
             delta < TOLERANCE,
             "control window {window} changed the velocity: peak-relative delta {delta:e}"
@@ -461,7 +450,7 @@ fn windowed_control_dit_preserves_the_hint_injection() {
             &cancel,
         )
         .unwrap();
-    assert!(peak_relative_delta(&base_windowed, &base_resident) < TOLERANCE);
+    assert!(peak_rel_host(&base_windowed, &base_resident, Some(1e-12)) < TOLERANCE);
 
     // Anti-false-green: perturbing the CONTROL stack on disk must move the windowed control forward.
     // Only `w.control_layers.*` is rewritten, so this discriminates the CONTROL stream specifically —
@@ -480,12 +469,12 @@ fn windowed_control_dit_preserves_the_hint_injection() {
         )
         .unwrap();
     assert!(
-        peak_relative_delta(&windowed, &resident) > 1e-3,
+        peak_rel_host(&windowed, &resident, Some(1e-12)) > 1e-3,
         "the windowed control forward did not re-materialize its control blocks from the source"
     );
     // The resident control forward is untouched by the on-disk change.
     let resident_again = model.forward(&x, 0.7, &cap, Some(&cc), scale).unwrap();
-    assert_eq!(peak_relative_delta(&resident_again, &resident), 0.0);
+    assert_eq!(peak_rel_host(&resident_again, &resident, Some(1e-12)), 0.0);
     #[cfg(target_os = "macos")]
     crate::common::metal_guard::record_model_inference_device();
     eprintln!("\nMODEL_INFERENCE_BODY_COMPLETED block_window_dit::windowed_control_dit_preserves_the_hint_injection");
@@ -614,7 +603,7 @@ fn the_denoise_loop_threads_the_window_through_to_the_blocks() {
     let resident = run(None, &mut noop).expect("resident denoise");
     let windowed = run(Some(1), &mut noop).expect("windowed denoise");
     assert!(
-        peak_relative_delta(&windowed, &resident) < TOLERANCE,
+        peak_rel_host(&windowed, &resident, Some(1e-12)) < TOLERANCE,
         "the windowed denoise loop must match the resident one"
     );
 
@@ -622,13 +611,13 @@ fn the_denoise_loop_threads_the_window_through_to_the_blocks() {
     scratch.perturb_blocks(".layers.");
     let windowed_after = run(Some(1), &mut noop).expect("windowed denoise after perturb");
     assert!(
-        peak_relative_delta(&windowed_after, &resident) > 1e-3,
+        peak_rel_host(&windowed_after, &resident, Some(1e-12)) > 1e-3,
         "`denoise_with_progress` did not thread its `block_window` down to the blocks — the rung is \
          unreachable from the generators even though the DiT-level entry works"
     );
     let resident_after = run(None, &mut noop).expect("resident denoise after perturb");
     assert_eq!(
-        peak_relative_delta(&resident_after, &resident),
+        peak_rel_host(&resident_after, &resident, Some(1e-12)),
         0.0,
         "the resident loop must not re-read the file"
     );
@@ -809,7 +798,7 @@ fn every_denoise_entry_point_threads_the_window_through_to_the_blocks() {
         .map(|(label, run)| {
             let resident = run(None).unwrap_or_else(|e| panic!("{label} resident: {e}"));
             let windowed = run(Some(1)).unwrap_or_else(|e| panic!("{label} windowed: {e}"));
-            let delta = peak_relative_delta(&windowed, &resident);
+            let delta = peak_rel_host(&windowed, &resident, Some(1e-12));
             assert!(
                 delta < TOLERANCE,
                 "{label}: the windowed loop must match the resident one ({delta:e})"
@@ -824,13 +813,13 @@ fn every_denoise_entry_point_threads_the_window_through_to_the_blocks() {
     for ((label, run), (_, resident, _)) in entries.iter().zip(&baselines) {
         let windowed_after = run(Some(1)).unwrap_or_else(|e| panic!("{label} windowed after: {e}"));
         assert!(
-            peak_relative_delta(&windowed_after, resident) > 1e-3,
+            peak_rel_host(&windowed_after, resident, Some(1e-12)) > 1e-3,
             "{label} did not thread its `block_window` down to the blocks — rung 4 is unreachable \
              through this entry point even though the DiT-level entry works"
         );
         let resident_after = run(None).unwrap_or_else(|e| panic!("{label} resident after: {e}"));
         assert_eq!(
-            peak_relative_delta(&resident_after, resident),
+            peak_rel_host(&resident_after, resident, Some(1e-12)),
             0.0,
             "{label}: the resident loop must not re-read the file"
         );

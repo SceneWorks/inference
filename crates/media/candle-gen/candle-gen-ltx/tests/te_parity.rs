@@ -29,6 +29,7 @@
 // declared `candle_core::Result` that calls a `TierPaths` accessor fails to compile with "? could
 // not convert the error" — this is exactly that failure mode, fixed here.
 use candle_gen::candle_core::{safetensors, DType, Device, Result as CoreResult, Tensor};
+use candle_gen::testkit::tensor_peak_rel_host;
 use candle_gen_ltx::config::{ConnectorConfig, GemmaConfig};
 use candle_gen_ltx::text_encoder::LtxTextEncoder;
 use candle_gen_ltx::tier::TierPaths;
@@ -37,19 +38,6 @@ const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../mlx-gen/tools/golden/ltx_te_golden.safetensors"
 );
-
-fn peak_rel(got: &Tensor, want: &Tensor) -> CoreResult<f32> {
-    let got = got.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let want = want.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    assert_eq!(got.len(), want.len());
-    let mut diff = 0f32;
-    let mut mag = 0f32;
-    for (g, w) in got.iter().zip(want.iter()) {
-        diff = diff.max((g - w).abs());
-        mag = mag.max(w.abs());
-    }
-    Ok(diff / mag.max(1e-12))
-}
 
 fn tier_paths() -> TierPaths {
     let base = std::env::var("LTX_BASE_DIR").expect("set LTX_BASE_DIR to the q4/q8 tier directory");
@@ -96,8 +84,8 @@ fn full_text_encoder_matches_reference() -> candle_gen::Result<()> {
 
     let (feats, emb) = te.encode_with_features(&input_ids, &mask01)?;
 
-    let pr_feats = peak_rel(&feats, &golden["video_features"])?;
-    let pr_emb = peak_rel(&emb, &golden["video_embeddings"])?;
+    let pr_feats = tensor_peak_rel_host(&feats, &golden["video_features"], Some(1e-12));
+    let pr_emb = tensor_peak_rel_host(&emb, &golden["video_embeddings"], Some(1e-12));
     eprintln!(
         "candle TE: video_features peak_rel {pr_feats:.3e}  video_embeddings peak_rel {pr_emb:.3e}"
     );
@@ -140,10 +128,10 @@ fn full_text_encoder_av_matches_reference() -> candle_gen::Result<()> {
 
     let (vf, af, ve, ae) = te.encode_both_with_features(&input_ids, &mask01)?;
 
-    let pr_vf = peak_rel(&vf, &golden["video_features"])?;
-    let pr_ve = peak_rel(&ve, &golden["video_embeddings"])?;
-    let pr_af = peak_rel(&af, &golden["audio_features"])?;
-    let pr_ae = peak_rel(&ae, &golden["audio_embeddings"])?;
+    let pr_vf = tensor_peak_rel_host(&vf, &golden["video_features"], Some(1e-12));
+    let pr_ve = tensor_peak_rel_host(&ve, &golden["video_embeddings"], Some(1e-12));
+    let pr_af = tensor_peak_rel_host(&af, &golden["audio_features"], Some(1e-12));
+    let pr_ae = tensor_peak_rel_host(&ae, &golden["audio_embeddings"], Some(1e-12));
     eprintln!(
         "candle TE/AV: video_features {pr_vf:.3e} video_emb {pr_ve:.3e} | audio_features {pr_af:.3e} audio_emb {pr_ae:.3e}"
     );

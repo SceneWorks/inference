@@ -26,16 +26,8 @@ use std::sync::Arc;
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::Progress;
-use candle_gen::testkit::{env_path, read_ppm, write_ppm};
+use candle_gen::testkit::{env_path, max_abs_diff_u8, read_ppm, write_ppm};
 use candle_gen_flux::{Flux1ControlPaths, Flux1ControlRequest, Flux1DevControl};
-
-fn max_abs_diff_u8(a: &[u8], b: &[u8]) -> u32 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (*x as i32 - *y as i32).unsigned_abs())
-        .max()
-        .unwrap_or(0)
-}
 
 /// Real-weight: render the control hint at `control_scale = 0.7` (the steer), assert a coherent finite
 /// 1024² image distinct across seeds, and exercise the cancel contract (pre + mid-denoise). The

@@ -16,11 +16,11 @@
 //! it is still caught loudly. (Wan whole-forward compile-parity remains bit-identical on non-NAX;
 //! FLUX.2 now gates its f32 whole forward with a bounded-ULP contract rather than `== 0.0`.)
 
+use mlx_gen::testing::max_abs_diff_host;
 use mlx_gen::weights::Weights;
 use mlx_gen_z_image::{
     set_compile_glue, ZImageControlTransformer, ZImageTransformer, ZImageTransformerConfig,
 };
-use mlx_rs::Array;
 
 /// Peak-**relative** tolerance for the whole-forward compiled-vs-eager gates below (see the module
 /// doc). Under the MLX 0.32.0 pin `mx.compile`'s shapeless fusion drifts the *f32* result ~1 ULP
@@ -34,16 +34,6 @@ use mlx_rs::Array;
 /// class of regression is still caught loudly. Applied **relative** via [`mlx_gen::nn::max_rel_diff`];
 /// the NAX / dt26.2 path passes trivially (`0.0 ≤ tol`).
 const COMPILED_GLUE_F32_WHOLE_FWD_ULP_TOL: f32 = 16.0 * f32::EPSILON;
-
-fn max_abs(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap();
-    let b = b.reshape(&[n]).unwrap();
-    a.as_slice::<f32>()
-        .iter()
-        .zip(b.as_slice::<f32>())
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
-}
 
 fn base_cfg() -> ZImageTransformerConfig {
     ZImageTransformerConfig {
@@ -98,7 +88,7 @@ fn compiled_glue_bit_identical_to_eager_base() {
         eager.shape(),
         "Z-Image base compiled/eager shape"
     );
-    let d = max_abs(&compiled, &eager);
+    let d = max_abs_diff_host(&compiled, &eager);
     let rel = mlx_gen::nn::max_rel_diff(&compiled, &eager);
     println!("[z-image base compiled vs eager] max|Δ|={d:.3e} rel={rel:.3e}");
     // 0.32.0 non-NAX (hosted CI, dt15.0) shapeless-compile drift is ~2.5 ULP relative; NAX = 0.0.
@@ -140,7 +130,7 @@ fn compiled_glue_bit_identical_to_eager_control() {
         eager.shape(),
         "Z-Image control compiled/eager shape"
     );
-    let d = max_abs(&compiled, &eager);
+    let d = max_abs_diff_host(&compiled, &eager);
     let rel = mlx_gen::nn::max_rel_diff(&compiled, &eager);
     println!("[z-image control compiled vs eager] max|Δ|={d:.3e} rel={rel:.3e}");
     // 0.32.0 non-NAX (hosted CI, dt15.0) shapeless-compile drift is ~2 ULP relative; NAX = 0.0.

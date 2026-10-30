@@ -14,36 +14,10 @@
 //! Run with the `cuda` feature (absolute goldens path — cargo test cwd is the crate dir):
 //!   cargo test -p candle-gen-flux2 --features cuda --test integration vae_encode_parity:: -- --nocapture
 
-use candle_gen::candle_core::{DType, Result, Tensor};
+use candle_gen::candle_core::{DType, Result};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::testkit::{tensor_cosine, tensor_peak_rel_host_f64};
 use candle_gen_flux2::vae::Flux2Vae;
-
-/// Cosine similarity over all elements (flattened), computed in f64 on CPU.
-fn cosine(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    assert_eq!(a.len(), b.len(), "shape mismatch in cosine");
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += (*x as f64) * (*y as f64);
-        na += (*x as f64) * (*x as f64);
-        nb += (*y as f64) * (*y as f64);
-    }
-    Ok((dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32)
-}
-
-/// Peak relative error `max|a-b| / max|b|`, in f64 on CPU.
-fn peak_rel(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let a = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let mut max_diff = 0f64;
-    let mut max_b = 0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        max_diff = max_diff.max((*x - *y).abs() as f64);
-        max_b = max_b.max((*y).abs() as f64);
-    }
-    Ok((max_diff / max_b.max(1e-12)) as f32)
-}
 
 #[test]
 #[ignore = "needs the FLUX.2 vae snapshot (FLUX2_VAE_DIR) + goldens (FLUX2_VAE_ENCODE_GOLDENS)"]
@@ -102,8 +76,8 @@ fn flux2_vae_encode_matches_reference() -> Result<()> {
         mean_golden.dims(),
         "encode mean shape mismatch"
     );
-    let mean_pr = peak_rel(&mean, &mean_golden)?;
-    let mean_cos = cosine(&mean, &mean_golden)?;
+    let mean_pr = tensor_peak_rel_host_f64(&mean, &mean_golden, Some(1e-12)) as f32;
+    let mean_cos = tensor_cosine(&mean, &mean_golden) as f32;
     eprintln!("encode mean: peak_rel={mean_pr:.3e} cosine={mean_cos:.7}");
 
     // 2) Packed bn-normalized transformer latent (mean → patchify → bn-normalize).
@@ -113,8 +87,8 @@ fn flux2_vae_encode_matches_reference() -> Result<()> {
         packed_golden.dims(),
         "encode_packed shape mismatch"
     );
-    let packed_pr = peak_rel(&packed, &packed_golden)?;
-    let packed_cos = cosine(&packed, &packed_golden)?;
+    let packed_pr = tensor_peak_rel_host_f64(&packed, &packed_golden, Some(1e-12)) as f32;
+    let packed_cos = tensor_cosine(&packed, &packed_golden) as f32;
     eprintln!("encode_packed: peak_rel={packed_pr:.3e} cosine={packed_cos:.7}");
 
     // Single conv-encode pass; CUDA/CPU-vs-torch f32 should be tight.

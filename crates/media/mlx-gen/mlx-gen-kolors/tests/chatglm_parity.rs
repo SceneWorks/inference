@@ -9,9 +9,9 @@
 //!
 //! Run: `cargo test -p mlx-gen-kolors --test integration chatglm_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{abs, max, subtract};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Dtype;
 
+use mlx_gen::testing::peak_rel_native;
 use mlx_gen::weights::Weights;
 use mlx_gen_kolors::chatglm3::{ChatGlmConfig, ChatGlmModel};
 
@@ -24,12 +24,6 @@ const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/kolors_chatglm_golden.safetensors"
 );
-
-fn peak_rel(got: &Array, want: &Array) -> f32 {
-    let diff = abs(subtract(got, want).unwrap()).unwrap();
-    let denom = max(abs(want).unwrap(), None).unwrap().item::<f32>();
-    max(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
-}
 
 /// For one (dtype, case): run the forward + encode_prompt on the golden's ids/mask and assert every
 /// hidden state, plus the extracted context/pooled, is within `tol`.
@@ -49,7 +43,7 @@ fn check_case(model: &ChatGlmModel, g: &Weights, prefix: &str, num_hidden: usize
     let mut profile = Vec::new();
     for (i, h) in hiddens.iter().enumerate() {
         let want = g.require(&format!("{prefix}h_{i:02}")).unwrap();
-        let pr = peak_rel(h, want);
+        let pr = peak_rel_native(h, want, Some(1e-12));
         profile.push(pr);
         if pr > worst {
             worst = pr;
@@ -67,8 +61,16 @@ fn check_case(model: &ChatGlmModel, g: &Weights, prefix: &str, num_hidden: usize
     let (context, pooled) = model
         .encode_prompt(input_ids, attention_mask, None)
         .expect("encode_prompt");
-    let ctx_pr = peak_rel(&context, g.require(&format!("{prefix}context")).unwrap());
-    let pooled_pr = peak_rel(&pooled, g.require(&format!("{prefix}pooled")).unwrap());
+    let ctx_pr = peak_rel_native(
+        &context,
+        g.require(&format!("{prefix}context")).unwrap(),
+        Some(1e-12),
+    );
+    let pooled_pr = peak_rel_native(
+        &pooled,
+        g.require(&format!("{prefix}pooled")).unwrap(),
+        Some(1e-12),
+    );
     eprintln!(
         "{prefix} worst hidden peak_rel {worst:.3e} @ h{worst_i} | context {ctx_pr:.3e} | pooled {pooled_pr:.3e}"
     );

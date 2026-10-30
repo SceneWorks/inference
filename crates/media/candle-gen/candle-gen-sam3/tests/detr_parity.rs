@@ -12,10 +12,11 @@
 
 use std::path::Path;
 
-use crate::support::{cosine, max_abs_diff};
+use crate::support::max_abs_diff;
 use candle_gen::candle_core::Tensor;
 use candle_gen::candle_nn::ops::sigmoid;
 use candle_gen::default_device;
+use candle_gen::testkit::{tensor_cosine_device_sums, Denom};
 use candle_gen_sam3::{Sam3Detector, Sam3DetrConfig, Weights};
 
 /// instances = #{ sigmoid(logits)·sigmoid(presence) > 0.5 }.
@@ -83,8 +84,8 @@ fn detr_detector_matches_oracle() {
     let want_boxes = fx.require("pred_boxes").unwrap();
     let want_presence = fx.require("presence_logits").unwrap();
 
-    let logits_cos = cosine(&out.pred_logits, &want_logits);
-    let boxes_cos = cosine(&out.pred_boxes, &want_boxes);
+    let logits_cos = tensor_cosine_device_sums(&out.pred_logits, &want_logits, Denom::Exact);
+    let boxes_cos = tensor_cosine_device_sums(&out.pred_boxes, &want_boxes, Denom::Exact);
     let presence_diff = max_abs_diff(&out.presence_logits, &want_presence);
     let logits_maxabs = max_abs_diff(&out.pred_logits, &want_logits);
 

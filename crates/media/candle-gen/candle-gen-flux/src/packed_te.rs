@@ -617,19 +617,7 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::{DType, Device};
     use candle_gen::candle_nn::VarMap;
-
-    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-        (a.to_dtype(DType::F32)
-            .unwrap()
-            .sub(&b.to_dtype(DType::F32).unwrap())
-            .unwrap())
-        .abs()
-        .unwrap()
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
-    }
+    use candle_gen::testkit::tensor_max_abs_diff_f32;
 
     /// **Vendored CLIP ≡ stock candle-transformers CLIP (dense, 1e-4).** Both models load from the SAME
     /// random `VarMap` (identical `text_model.*` diffusers keys), so a byte-for-byte match of their
@@ -675,7 +663,7 @@ mod tests {
         let v = vendored.forward(&ids)?;
         let s = __model_proof_output!(stock.forward(&ids))?;
         assert_eq!(v.dims(), s.dims());
-        let d = max_abs_diff(&v, &s);
+        let d = tensor_max_abs_diff_f32(&v, &s);
         assert!(d < 1e-4, "vendored CLIP vs stock max|Δ| = {d}");
         #[cfg(feature = "model-inference-proof")]
         println!(
@@ -741,7 +729,7 @@ mod tests {
         let v = vendored.forward(&ids, DType::F32)?;
         let s = __model_proof_output!(stock.forward(&ids))?;
         assert_eq!(v.dims(), s.dims());
-        let d = max_abs_diff(&v, &s);
+        let d = tensor_max_abs_diff_f32(&v, &s);
         assert!(d < 1e-4, "vendored T5 encoder vs stock max|Δ| = {d}");
         #[cfg(feature = "model-inference-proof")]
         println!(
@@ -779,7 +767,7 @@ mod tests {
         let unmasked = enc.forward(&ids, DType::F32)?;
         let zeros = Tensor::zeros((1, 1, 1, 6), DType::F32, &dev)?;
         let masked_zero = enc.forward_masked(&ids, DType::F32, Some(&zeros))?;
-        assert_eq!(max_abs_diff(&unmasked, &masked_zero), 0.0);
+        assert_eq!(tensor_max_abs_diff_f32(&unmasked, &masked_zero), 0.0);
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED packed_te::tests::masked_forward_zero_mask_is_byte_identical_to_unmasked");
         Ok(())

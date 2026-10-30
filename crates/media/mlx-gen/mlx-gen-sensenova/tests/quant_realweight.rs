@@ -7,7 +7,7 @@
 //!
 //! Run: `cargo test -p mlx-gen-sensenova --test integration quant_realweight:: -- --ignored --nocapture`
 
-use mlx_gen::testing::require_env_path;
+use mlx_gen::testing::{cosine_f64_sums, require_env_path, Denom};
 use mlx_gen::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, Quant, WeightsSource,
 };
@@ -34,29 +34,6 @@ fn render(spec: &LoadSpec) -> Image {
     }
 }
 
-fn cosine(a: &Image, b: &Image) -> f64 {
-    assert_eq!(a.pixels.len(), b.pixels.len());
-    let dot: f64 = a
-        .pixels
-        .iter()
-        .zip(&b.pixels)
-        .map(|(&x, &y)| x as f64 * y as f64)
-        .sum();
-    let na: f64 = a
-        .pixels
-        .iter()
-        .map(|&x| (x as f64).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    let nb: f64 = b
-        .pixels
-        .iter()
-        .map(|&y| (y as f64).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    dot / (na * nb + 1e-12)
-}
-
 #[test]
 #[ignore = "needs the local 35GB checkpoint; run with --ignored"]
 fn quant_vs_bf16_t2i() {
@@ -73,8 +50,8 @@ fn quant_vs_bf16_t2i() {
     let q8 = render(&LoadSpec::new(src.clone()).with_quant(Quant::Q8));
     let q4 = render(&LoadSpec::new(src).with_quant(Quant::Q4));
 
-    let c8 = cosine(&bf16, &q8);
-    let c4 = cosine(&bf16, &q4);
+    let c8 = cosine_f64_sums(&bf16.pixels, &q8.pixels, Denom::PlusEps(1e-12));
+    let c4 = cosine_f64_sums(&bf16.pixels, &q4.pixels, Denom::PlusEps(1e-12));
     println!("Q8 vs bf16 cosine={c8:.5}   Q4 vs bf16 cosine={c4:.5}");
     // Q8 is near-lossless (the fidelity footprint choice). Q4 is the aggressive footprint mode:
     // 4-bit weight error, amplified by CFG (the precision sensitivity from sc-3189), shifts the

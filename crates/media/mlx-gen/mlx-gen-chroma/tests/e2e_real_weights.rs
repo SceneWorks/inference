@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::peak_rel_native;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, LoadSpec, Progress, WeightsSource};
 use mlx_gen_chroma::{encode_prompt, load_chroma, ChromaVariant};
@@ -30,14 +31,6 @@ fn hf_snapshot(repo: &str) -> PathBuf {
         .map(|e| e.path())
         .find(|p| p.is_dir())
         .expect("a snapshot dir")
-}
-
-fn peak_rel(got: &Array, golden: &Array) -> f32 {
-    let d = max(abs(subtract(got, golden).unwrap()).unwrap(), None)
-        .unwrap()
-        .item::<f32>();
-    let s = max(abs(golden).unwrap(), None).unwrap().item::<f32>();
-    d / s
 }
 
 /// Relative L2 `‖got−golden‖₂ / ‖golden‖₂` — robust to single-element outliers (unlike peak-rel).
@@ -125,7 +118,7 @@ fn chroma_hd_e2e_matches_diffusers() {
     let (pe, pm) = model
         .with_text_refs(|tokenizer, t5| encode_prompt(tokenizer, t5, PROMPT))
         .unwrap();
-    let pe_rel = peak_rel(&pe, g.require("prompt_embeds").unwrap());
+    let pe_rel = peak_rel_native(&pe, g.require("prompt_embeds").unwrap(), None);
     eprintln!("prompt_embeds peak-rel = {pe_rel:.4}");
     assert!(pe_rel < 5e-2, "masked T5 prompt_embeds diverged: {pe_rel}");
     let (nege, _) = model
@@ -133,7 +126,7 @@ fn chroma_hd_e2e_matches_diffusers() {
         .unwrap();
     eprintln!(
         "neg_embeds peak-rel = {:.4}",
-        peak_rel(&nege, g.require("neg_embeds").unwrap())
+        peak_rel_native(&nege, g.require("neg_embeds").unwrap(), None)
     );
     let pm_diff = max(
         abs(subtract(&pm, g.require("prompt_mask").unwrap()).unwrap()).unwrap(),
@@ -162,7 +155,7 @@ fn chroma_hd_e2e_matches_diffusers() {
             )
         })
         .unwrap();
-    let np_rel = peak_rel(&noise_pred, g.require("noise_pred").unwrap());
+    let np_rel = peak_rel_native(&noise_pred, g.require("noise_pred").unwrap(), None);
     eprintln!("noise_pred peak-rel = {np_rel:.4}");
     assert!(np_rel < 5e-2, "single DiT forward diverged: {np_rel}");
 

@@ -33,12 +33,11 @@
 
 use crate::common;
 
-use common::{
-    assert_parity, cosine, dit_fixture_config, l2_norm, rel, std_dev, DIT_FIXTURE, DIT_LAYOUT,
-};
+use common::{assert_parity, dit_fixture_config, l2_norm, rel, std_dev, DIT_FIXTURE, DIT_LAYOUT};
 
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::{cosine_device_sums_f32, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::dit::layers::DitAttention;
 use mlx_gen_minimax_h3::dit::positions::{self, KeyframeAnchor};
@@ -683,7 +682,7 @@ fn qk_norm_runs_per_head_before_the_rotary() {
         ("no qk-norm at all", &no_norm),
     ] {
         let (peak, _) = rel(variant, want);
-        let cos = cosine(variant, want);
+        let cos = cosine_device_sums_f32(variant, want, Denom::FloorAt(1e-12));
         println!(
             "  {label}: peak rel {peak:.3e} cosine {cos:.4} ||variant||={:.4} ||golden||={:.4}",
             l2_norm(variant),
@@ -884,7 +883,7 @@ fn reading_the_ffn_halves_gate_first_breaks_parity() {
         .unwrap();
 
     let (peak, mean) = rel(&mutated, &baseline);
-    let cos = cosine(&mutated, &baseline);
+    let cos = cosine_device_sums_f32(&mutated, &baseline, Denom::FloorAt(1e-12));
     println!(
         "FFN half-swap: rel-max-abs={peak:.3e} rel-mean={mean:.3e} cosine={cos:.4} \
          ||correct||={:.4} ||swapped||={:.4}  (parity residual with the correct layout: \
@@ -1041,7 +1040,7 @@ fn the_wrong_qkv_transform_breaks_parity() {
             .forward(x, Some((&rope, &tables)))
             .unwrap();
     let (peak, _) = rel(&mutated, &baseline);
-    let cos = cosine(&mutated, &baseline);
+    let cos = cosine_device_sums_f32(&mutated, &baseline, Denom::FloorAt(1e-12));
     println!("  wrong qkv transform: peak rel {peak:.3e} cosine {cos:.4}");
     assert!(
         peak > MUTATION_FLOOR,

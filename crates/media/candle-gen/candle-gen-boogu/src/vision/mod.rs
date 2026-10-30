@@ -576,6 +576,7 @@ mod tests {
 
     use super::*;
     use candle_gen::candle_core::safetensors;
+    use candle_gen::testkit::tensor_peak_rel_or_abs;
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -626,30 +627,6 @@ mod tests {
             Tensor::from_vec(biases, (out_dim, groups_per_row), &dev).unwrap(),
             Tensor::from_vec(grid, (out_dim, in_dim), &dev).unwrap(),
         )
-    }
-
-    /// **Relative max-abs deviation** — `max|a-b| / max|b|`. Never cosine: cosine is scale-invariant
-    /// and therefore structurally blind to a mis-decoded group scale, which is exactly the defect
-    /// class the packed path can produce.
-    fn rel_max_abs(a: &Tensor, b: &Tensor) -> f32 {
-        assert_eq!(a.dims(), b.dims(), "shape");
-        let max_abs = |t: &Tensor| -> f32 {
-            t.abs()
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .max(0)
-                .unwrap()
-                .to_vec0::<f32>()
-                .unwrap()
-        };
-        let d = max_abs(&(a - b).unwrap());
-        let scale = max_abs(b);
-        if scale == 0.0 {
-            d
-        } else {
-            d / scale
-        }
     }
 
     /// Insert the packed triple for `{base}` into a key map, returning the affine grid it decodes to.
@@ -912,7 +889,7 @@ mod tests {
         let reference = QLinear::dense(Linear::new(grid, Some(bias)));
 
         let x = Tensor::randn(0f32, 1f32, (6usize, in_dim), &dev)?;
-        let drift = rel_max_abs(&packed.forward(&x)?, &reference.forward(&x)?);
+        let drift = tensor_peak_rel_or_abs(&packed.forward(&x)?, &reference.forward(&x)?);
         assert!(
             drift < 1e-6,
             "packed vs affine-grid relative max-abs drift {drift:e} exceeds 1e-6"

@@ -558,19 +558,7 @@ mod tests {
     use super::*;
     use crate::testfix::{tiny_cfg, tiny_dit};
     use candle_gen::candle_core::{DType, Device, Tensor};
-
-    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
-        (a - b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
-    }
+    use candle_gen::testkit::tensor_max_abs_diff;
 
     fn params() -> GuidanceParams {
         GuidanceParams {
@@ -619,7 +607,11 @@ mod tests {
         let e_c = pf.velocity(&dit, &noisy, &[], t, &ctx_c).unwrap();
         let want = (&e_u + ((&e_c - &e_u).unwrap() * omega as f64).unwrap()).unwrap();
         assert_eq!(got.dims(), noisy.dims());
-        assert_eq!(max_abs(&got, &want), 0.0, "t2v must equal manual CFG");
+        assert_eq!(
+            tensor_max_abs_diff(&got, &want),
+            0.0,
+            "t2v must equal manual CFG"
+        );
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED forward::tests::t2v_mode_matches_manual_cfg");
@@ -636,7 +628,10 @@ mod tests {
         let v1 = Tensor::ones((1, 16, 1, 4, 4), DType::F32, &dev).unwrap();
         let c = pf.build_combos(&[v0.clone(), v1.clone()], &[]);
         assert_eq!(c.v.len(), 2, "video-only combo must carry both videos");
-        assert!(max_abs(&c.v[1].0, &v0) > 0.0, "v[1] must be the 2nd clip");
+        assert!(
+            tensor_max_abs_diff(&c.v[1].0, &v0) > 0.0,
+            "v[1] must be the 2nd clip"
+        );
         // source-ids mirror the `vi` combo's video portion (videos-first ordering).
         assert_eq!(c.v[0].1, c.vi[0].1);
         assert_eq!(c.v[1].1, c.vi[1].1);
@@ -671,7 +666,7 @@ mod tests {
             .velocity(&dit, &noisy, &[(img.clone(), 1.0)], 833.0, &ctx)
             .unwrap();
         assert_eq!(
-            max_abs(&warm, &hot),
+            tensor_max_abs_diff(&warm, &hot),
             0.0,
             "warm-cache velocity must be stable"
         );
@@ -681,7 +676,7 @@ mod tests {
             .velocity(&dit, &noisy, &[(img.clone(), 1.0)], 833.0, &ctx)
             .unwrap();
         assert_eq!(
-            max_abs(&warm, &fresh),
+            tensor_max_abs_diff(&warm, &fresh),
             0.0,
             "cache must equal a fresh build"
         );
@@ -693,9 +688,13 @@ mod tests {
         let id2_cold = cold
             .velocity(&dit, &noisy, &[(img, 2.0)], 833.0, &ctx)
             .unwrap();
-        assert_eq!(max_abs(&id2, &id2_cold), 0.0, "id-2 cached == fresh");
+        assert_eq!(
+            tensor_max_abs_diff(&id2, &id2_cold),
+            0.0,
+            "id-2 cached == fresh"
+        );
         assert!(
-            max_abs(&warm, &id2) > 0.0,
+            tensor_max_abs_diff(&warm, &id2) > 0.0,
             "distinct source-ids must differ"
         );
 
@@ -726,9 +725,9 @@ mod tests {
 
         let after = pf.embed_segment(&dit, &source, 1.0).unwrap();
         assert_eq!(before.3, after.3);
-        assert_eq!(max_abs(&before.0, &after.0), 0.0);
-        assert_eq!(max_abs(&before.1, &after.1), 0.0);
-        assert_eq!(max_abs(&before.2, &after.2), 0.0);
+        assert_eq!(tensor_max_abs_diff(&before.0, &after.0), 0.0);
+        assert_eq!(tensor_max_abs_diff(&before.1, &after.1), 0.0);
+        assert_eq!(tensor_max_abs_diff(&before.2, &after.2), 0.0);
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED forward::tests::poisoned_patch_cache_recovers_on_next_embed");
@@ -962,7 +961,7 @@ mod tests {
         let mut fresh: Vec<MomentumBuffer> = vec![MomentumBuffer::new(0.5)];
         let fresh_second = run(&mut fresh, 700.0);
         assert!(
-            max_abs(&carried, &fresh_second) > 0.0,
+            tensor_max_abs_diff(&carried, &fresh_second) > 0.0,
             "persistent momentum must change the second step"
         );
 
@@ -1036,7 +1035,7 @@ mod tests {
         .unwrap();
         assert_eq!(got.dims(), noisy.dims());
         assert_eq!(
-            max_abs(&got, &want),
+            tensor_max_abs_diff(&got, &want),
             0.0,
             "vae_txt_vit dispatch must equal manual combine"
         );

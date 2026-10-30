@@ -31,7 +31,8 @@ use mlx_gen_minimax_h3::{
     MiniMaxH3Dit, MiniMaxH3DitConfig, MmRope, TimestepSchedule, MODALITY_NUM, PUBLISHED_DIT_TENSORS,
 };
 
-use common::{assert_parity, cosine, dit_fixture_config, rel, DIT_FIXTURE};
+use common::{assert_parity, dit_fixture_config, rel, DIT_FIXTURE};
+use mlx_gen::testing::{cosine_device_sums_f32, Denom};
 
 /// The same `1e-2` `tests/dit_parity.rs` gates the block stack at, and for the same reason:
 /// **MLX's Metal matmul runs at reduced precision**, so an f32-vs-f32 comparison against a torch
@@ -80,7 +81,7 @@ fn the_timestep_mlp_reproduces_the_reference_embedding() {
     println!(
         "  time_proj + time_embedder over {timesteps:?}: rel-max-abs {peak:.3e} (mean {mean:.3e}, \
          cosine {:.6})",
-        cosine(&got, &want)
+        cosine_device_sums_f32(&got, &want, Denom::FloorAt(1e-12))
     );
     assert_parity(&got, &want, TOL, "time_embedder(time_proj(t))");
 
@@ -473,9 +474,9 @@ fn the_whole_model_reproduces_the_reference_velocity() {
         video_rows.shape(),
         audio_rows.shape(),
         rel(&video, &want_video).0,
-        cosine(&video, &want_video),
+        cosine_device_sums_f32(&video, &want_video, Denom::FloorAt(1e-12)),
         rel(&audio, &want_audio).0,
-        cosine(&audio, &want_audio),
+        cosine_device_sums_f32(&audio, &want_audio, Denom::FloorAt(1e-12)),
     );
     assert_parity(&video, &want_video, TOL, "whole-model video velocity");
     assert_parity(&audio, &want_audio, TOL, "whole-model audio velocity");

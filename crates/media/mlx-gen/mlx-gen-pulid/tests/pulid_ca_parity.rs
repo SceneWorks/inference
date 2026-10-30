@@ -9,6 +9,7 @@
 //! Run:
 //!   cargo test -p mlx-gen-pulid --release --test integration pulid_ca_parity:: -- --ignored --nocapture
 
+use mlx_gen::testing::{cosine_host_f64, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_flux::transformer::DitImageInjector;
 use mlx_gen_pulid::ca::PulidCa;
@@ -33,17 +34,6 @@ fn slice(a: &Array) -> Vec<f32> {
         .unwrap()
         .as_slice::<f32>()
         .to_vec()
-}
-
-fn cosine(got: &Array, want: &Array) -> f32 {
-    let (a, b) = (slice(got), slice(want));
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (&x, &y) in a.iter().zip(&b) {
-        dot += x as f64 * y as f64;
-        na += (x as f64).powi(2);
-        nb += (y as f64).powi(2);
-    }
-    (dot / (na.sqrt() * nb.sqrt())) as f32
 }
 
 fn mean_rel(got: &Array, want: &Array) -> f32 {
@@ -81,7 +71,7 @@ fn ca_forward_and_schedule_match_torch_f32() {
         }
         .unwrap_or_else(|| panic!("{kind} block {blk} should inject (ca[{ca_idx}])"));
         let want = g.require(&format!("ca_out_{ca_idx}")).unwrap();
-        let cos = cosine(&got, want);
+        let cos = cosine_host_f64(&got, want, Denom::Exact) as f32;
         let mr = mean_rel(&got, want);
         println!("{kind} blk {blk} -> ca[{ca_idx}]: cos {cos:.6} mean-rel {mr:.3e}");
         assert!(

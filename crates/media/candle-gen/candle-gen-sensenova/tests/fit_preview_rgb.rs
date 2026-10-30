@@ -54,9 +54,8 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::{CancelFlag, Image, PreviewSink, Progress};
 use candle_gen::preview::PreviewHook;
-use candle_gen::testkit::collecting_sink;
-use candle_gen::testkit::save_rgb8_png;
 use candle_gen::testkit::sha256_file;
+use candle_gen::testkit::{collecting_sink, save_rgb8_png_in};
 use candle_gen_sensenova::{load_understanding_for_diagnostics, tensor_to_image, T2iOptions};
 
 /// Four diverse prompt/seed renders whose pooled pixels determine the coefficients.
@@ -402,12 +401,6 @@ fn analytic_projection(pair: &Pair, coef: &[[f64; 3]; DIM]) -> Vec<u8> {
         .collect()
 }
 
-fn save_png(pixels: &[u8], width: u32, height: u32, name: &str) {
-    let path = artifact_dir().join(format!("{name}.png"));
-    save_rgb8_png(&path, pixels, width, height);
-    eprintln!("  saved {}", path.display());
-}
-
 fn inert_hook(sink: &PreviewSink) -> PreviewHook<'_> {
     PreviewHook::new(sink, |_: &Tensor| {
         panic!("an inert preview sink must not invoke projection")
@@ -673,17 +666,19 @@ fn fit_preview_rgb() {
                 "{split}[{index}]: the shipped projector diverges from the solved fit by {worst} \
                  RGB8 levels — the committed constants block does not match this measurement"
             );
-            save_png(
+            save_rgb8_png_in(
+                &artifact_dir(),
+                &format!("{}.png", &format!("fit_{split}_{index}_decoded")),
                 &pair.decoded.pixels,
                 pair.decoded.width,
                 pair.decoded.height,
-                &format!("fit_{split}_{index}_decoded"),
             );
-            save_png(
+            save_rgb8_png_in(
+                &artifact_dir(),
+                &format!("{}.png", &format!("fit_{split}_{index}_projected")),
                 &shipped.pixels,
                 shipped.width,
                 shipped.height,
-                &format!("fit_{split}_{index}_projected"),
             );
         }
     }

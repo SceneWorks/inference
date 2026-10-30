@@ -1569,6 +1569,7 @@ impl Module for AdaptLinear {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::tensor_max_abs;
     use crate::train::lora::reconstruct_lokr_delta;
     use candle_core::safetensors::MmapedSafetensors;
     use candle_core::{Device, Tensor};
@@ -2466,15 +2467,6 @@ mod tests {
         x.matmul(&delta.t().unwrap().contiguous().unwrap()).unwrap()
     }
 
-    fn max_abs(t: &Tensor) -> f32 {
-        t.abs()
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
-    }
-
     /// **Full-factor parity.** The structured vec-trick residual `vec(w1·X·w2ᵀ)` equals the
     /// materialized-delta residual `x·(kron(w1,w2))ᵀ` for a full `w1⊗w2` LoKr — proving the row-major
     /// Kronecker identity the whole port rests on, against candle's own `reconstruct_lokr_delta` fold.
@@ -2546,13 +2538,13 @@ mod tests {
         let want = delta_residual(&x, &delta);
         let got = factors.residual(&x).unwrap();
         assert_eq!(got.dims(), &[2, out]);
-        let dev_max = max_abs(&(got.clone() - &want).unwrap());
+        let dev_max = tensor_max_abs(&(got.clone() - &want).unwrap());
         assert!(
             dev_max < 1e-4,
             "structured LoKr residual != materialized-delta residual ({dev_max})"
         );
         assert!(
-            max_abs(&got) > 1e-2,
+            tensor_max_abs(&got) > 1e-2,
             "the LoKr residual must be materially non-zero"
         );
 
@@ -2619,7 +2611,7 @@ mod tests {
         )
         .unwrap();
         let dev_max =
-            max_abs(&(factors.residual(&x).unwrap() - delta_residual(&x, &delta)).unwrap());
+            tensor_max_abs(&(factors.residual(&x).unwrap() - delta_residual(&x, &delta)).unwrap());
         assert!(
             dev_max < 1e-4,
             "decomposed structured LoKr != materialized delta ({dev_max})"
@@ -2767,13 +2759,14 @@ mod tests {
             (out_dim, in_dim),
         )
         .unwrap();
-        let dev_max = max_abs(&(residual_actual.clone() - delta_residual(&x, &delta)).unwrap());
+        let dev_max =
+            tensor_max_abs(&(residual_actual.clone() - delta_residual(&x, &delta)).unwrap());
         assert!(
             dev_max < 1e-4,
             "packed structured LoKr residual != folded delta ({dev_max})"
         );
         assert!(
-            max_abs(&residual_actual) > 1e-3,
+            tensor_max_abs(&residual_actual) > 1e-3,
             "the LoKr must shift the packed forward"
         );
 
@@ -2793,7 +2786,8 @@ mod tests {
         .unwrap()
         .unwrap();
         zero.push_lokr_structured(f0).unwrap();
-        let zero_dev = max_abs(&(zero.forward(&x).unwrap() - base.forward(&x).unwrap()).unwrap());
+        let zero_dev =
+            tensor_max_abs(&(zero.forward(&x).unwrap() - base.forward(&x).unwrap()).unwrap());
         assert_eq!(
             zero_dev, 0.0,
             "scale-0 structured LoKr must be an exact no-op"
@@ -2973,11 +2967,11 @@ mod tests {
         let want_delta = (x.matmul(&a).unwrap().matmul(&b).unwrap() * 0.75).unwrap();
         let got_delta = (&adapted - &bare).unwrap();
         assert!(
-            max_abs(&(got_delta - &want_delta).unwrap()) < 1e-5,
+            tensor_max_abs(&(got_delta - &want_delta).unwrap()) < 1e-5,
             "the additive arm did not contribute the LoRA delta"
         );
         assert!(
-            max_abs(&(adapted - &bare).unwrap()) > 1e-4,
+            tensor_max_abs(&(adapted - &bare).unwrap()) > 1e-4,
             "the adapter must actually move the output"
         );
 
@@ -3062,7 +3056,7 @@ mod tests {
 
         let want = (&bare + delta_residual(&x, &delta)).unwrap();
         assert!(
-            max_abs(&(adapted - &want).unwrap()) < 1e-4,
+            tensor_max_abs(&(adapted - &want).unwrap()) < 1e-4,
             "structured LoKr over NVFP4 diverged from the reconstructed delta"
         );
 

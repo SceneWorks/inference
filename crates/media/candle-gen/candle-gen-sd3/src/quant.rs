@@ -180,25 +180,13 @@ mod tests {
     use candle_gen::candle_core::{DType, Device, Tensor};
     use candle_gen::candle_nn::Module;
     use candle_gen::quant::{DenseLinear, MatmulStrategy};
+    use candle_gen::testkit::tensor_cosine;
     use std::collections::HashMap;
 
     /// A dense `[out, in]` `QLinear` straight from explicit weight/bias tensors (no VarBuilder), so a
     /// test can capture the dense output and quantize the *same* weights for a 1:1 comparison.
     fn dense_from(w: &Tensor, b: Option<&Tensor>) -> QLinear {
         QLinear::from_dense(DenseLinear::Linear(Linear::new(w.clone(), b.cloned())))
-    }
-
-    /// Cosine similarity over all elements (f64).
-    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
-        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for (x, y) in a.iter().zip(b.iter()) {
-            dot += (*x as f64) * (*y as f64);
-            na += (*x as f64) * (*x as f64);
-            nb += (*y as f64) * (*y as f64);
-        }
-        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
     }
 
     /// A `[64, 32]` projection (in=32 = one Q4_0/Q8_0 block per row) quantizes and forwards
@@ -228,7 +216,7 @@ mod tests {
         for v in q.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
             assert!(v.is_finite(), "{quant:?} produced a non-finite output");
         }
-        let cos = cosine(&dense, &q);
+        let cos = tensor_cosine(&dense, &q) as f32;
         assert!(cos > min_cos, "{quant:?} cosine {cos:.5} ≤ {min_cos}");
     }
 
@@ -434,7 +422,7 @@ mod tests {
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev).unwrap();
         let packed_out = lin.forward(&x).unwrap();
         let ref_out = __model_proof_output!(ref_lin.forward(&x)).unwrap();
-        let cos = cosine(&ref_out, &packed_out);
+        let cos = tensor_cosine(&ref_out, &packed_out) as f32;
         assert!(
             cos > 0.9999,
             "packed forward must reproduce the affine grid it repacks (cosine {cos:.6})"
@@ -504,7 +492,7 @@ mod tests {
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev).unwrap();
         let got = __model_proof_output!(lin.forward(&x)).unwrap();
         let want = __model_proof_output!(ref_lin.forward(&x)).unwrap();
-        let cos = cosine(&want, &got);
+        let cos = tensor_cosine(&want, &got) as f32;
         assert!(
             cos > 0.9999,
             "AdaLN dense-detect must match the grid (cosine {cos:.6})"

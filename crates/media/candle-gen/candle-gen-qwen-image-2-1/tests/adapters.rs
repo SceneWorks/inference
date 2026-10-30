@@ -18,6 +18,7 @@ use candle_gen_qwen_image_2_1::quant::{Tier, GROUP_SIZE};
 use candle_gen_qwen_image_2_1::{load_transformer, QwenImage21Transformer};
 
 use crate::common::{fixtures, tiny_snapshot};
+use candle_gen::testkit::tensor_max_abs_diff;
 
 const DIM: usize = 32; // inner_dim of the miniature DiT
 const HIDDEN: usize = 64; // inner_dim · mlp_ratio
@@ -91,19 +92,6 @@ fn velocity(dit: &QwenImage21Transformer) -> Tensor {
     let latents = ramp((1, 4, 8), 1);
     let text = ramp((1, 3, DIM), 2);
     dit.forward(&latents, &text, 0.5, 2, 2).expect("forward")
-}
-
-fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-    (a - b)
-        .unwrap()
-        .abs()
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .max(0)
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap()
 }
 
 fn filled(shape: (usize, usize), seed: usize) -> Tensor {
@@ -224,7 +212,7 @@ fn lora_and_lokr_install_on_the_dense_dit_and_stack() {
     assert_eq!(report.residuals, 1);
     let single = velocity(&one);
     assert!(
-        max_abs_diff(&base, &single) > 1e-4,
+        tensor_max_abs_diff(&base, &single) > 1e-4,
         "the LoRA must move the output"
     );
 
@@ -244,14 +232,14 @@ fn lora_and_lokr_install_on_the_dense_dit_and_stack() {
     .unwrap();
     assert_eq!(report.residuals, 2);
     assert!(
-        max_abs_diff(&single, &velocity(&stacked)) > 1e-5,
+        tensor_max_abs_diff(&single, &velocity(&stacked)) > 1e-5,
         "the second adapter of the stack must apply"
     );
 
     // Per-adapter weight: the same file at 0 strength is inert.
     let mut zero = dense_dit();
     install(&mut zero, &[lora(&first, 0.0)], Tier::Bf16, &Device::Cpu).unwrap();
-    assert!(max_abs_diff(&base, &velocity(&zero)) < 1e-6);
+    assert!(tensor_max_abs_diff(&base, &velocity(&zero)) < 1e-6);
 
     let lokr = temp.path().join("lokr.safetensors");
     write_lokr(&lokr, ATTN_TARGET, (2, 2), (DIM / 2, DIM / 2));
@@ -264,7 +252,7 @@ fn lora_and_lokr_install_on_the_dense_dit_and_stack() {
     )
     .unwrap();
     assert_eq!(report.residuals, 1);
-    assert!(max_abs_diff(&base, &velocity(&kron)) > 1e-4);
+    assert!(tensor_max_abs_diff(&base, &velocity(&kron)) > 1e-4);
 
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::lora_and_lokr_install_on_the_dense_dit_and_stack");
@@ -295,7 +283,7 @@ fn lora_and_lokr_install_as_residuals_over_packed_projections() {
         .unwrap();
         assert!(checked);
         assert!(
-            max_abs_diff(&base, &velocity(&dit)) > 1e-4,
+            tensor_max_abs_diff(&base, &velocity(&dit)) > 1e-4,
             "{tier:?}: the residual must move the output"
         );
 
@@ -310,7 +298,10 @@ fn lora_and_lokr_install_as_residuals_over_packed_projections() {
         )
         .unwrap();
         assert_eq!(report.residuals, 1);
-        assert!(max_abs_diff(&base, &velocity(&kron)) > 1e-4, "{tier:?}");
+        assert!(
+            tensor_max_abs_diff(&base, &velocity(&kron)) > 1e-4,
+            "{tier:?}"
+        );
     }
 
     #[cfg(feature = "model-inference-proof")]
@@ -341,7 +332,7 @@ fn loha_folds_into_the_dense_dit() {
         Ok(())
     })
     .unwrap();
-    assert!(max_abs_diff(&base, &velocity(&dit)) > 1e-4);
+    assert!(tensor_max_abs_diff(&base, &velocity(&dit)) > 1e-4);
 
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED adapters::loha_folds_into_the_dense_dit");
@@ -507,7 +498,7 @@ fn a_transposed_loha_is_refused() {
         "{error}"
     );
     assert!(
-        max_abs_diff(&base, &velocity(&dit)) < 1e-6,
+        tensor_max_abs_diff(&base, &velocity(&dit)) < 1e-6,
         "nothing folded"
     );
     let error = refusal(preflight(
@@ -574,7 +565,7 @@ fn duplicate_spellings_of_one_projection_are_refused() {
         "{error}"
     );
     assert!(
-        max_abs_diff(&base, &velocity(&dit)) < 1e-6,
+        tensor_max_abs_diff(&base, &velocity(&dit)) < 1e-6,
         "nothing folded"
     );
     let error = refusal(preflight(
@@ -928,7 +919,7 @@ fn every_lora_spelling_applies_to_exactly_its_projections_on_the_dense_dit() {
         );
         assert_eq!(adapted(&mut dit), want, "{}", spelling.name);
         assert!(
-            max_abs_diff(&base, &velocity(&dit)) > 1e-4,
+            tensor_max_abs_diff(&base, &velocity(&dit)) > 1e-4,
             "{}: the LoRA must move the output",
             spelling.name
         );
@@ -962,7 +953,7 @@ fn every_lora_spelling_applies_over_a_packed_projection() {
                 spelling.name
             );
             assert!(
-                max_abs_diff(&base, &velocity(&dit)) > 1e-4,
+                tensor_max_abs_diff(&base, &velocity(&dit)) > 1e-4,
                 "{tier:?} {}: the residual must move the output",
                 spelling.name
             );
@@ -1121,7 +1112,7 @@ fn every_lycoris_lokr_layout_applies_on_dense_and_packed() {
                 layout.name
             );
             assert!(
-                max_abs_diff(&dense_base, &velocity(&dit)) > 1e-4,
+                tensor_max_abs_diff(&dense_base, &velocity(&dit)) > 1e-4,
                 "{}: the LoKr must move the output",
                 layout.name
             );
@@ -1162,7 +1153,7 @@ fn every_lycoris_lokr_layout_applies_on_dense_and_packed() {
                 layout.name
             );
             assert!(
-                max_abs_diff(&base, &velocity(&dit)) > 1e-4,
+                tensor_max_abs_diff(&base, &velocity(&dit)) > 1e-4,
                 "{tier:?} {}",
                 layout.name
             );
@@ -1244,9 +1235,12 @@ fn lycoris_lokr_scale_and_tucker_match_the_equivalent_full_factor_lokr() {
             Some(lokr_stamp("1", "1")),
             &format!("stamped-{name}"),
         );
-        assert!(max_abs_diff(&base, &stamped) > 1e-4, "{name}: not a no-op");
         assert!(
-            max_abs_diff(&thirdparty, &stamped) < 1e-5,
+            tensor_max_abs_diff(&base, &stamped) > 1e-4,
+            "{name}: not a no-op"
+        );
+        assert!(
+            tensor_max_abs_diff(&thirdparty, &stamped) < 1e-5,
             "{name}: the LyCORIS scale / rebuild must equal the full-factor LoKr"
         );
     }
@@ -1275,7 +1269,7 @@ fn changed_projections(
     probe(before)
         .into_iter()
         .zip(probe(after))
-        .filter(|((_, a), (_, b))| max_abs_diff(a, b) > 0.0)
+        .filter(|((_, a), (_, b))| tensor_max_abs_diff(a, b) > 0.0)
         .map(|((name, _), _)| name)
         .collect()
 }
@@ -1310,7 +1304,10 @@ fn loha_folds_under_every_key_spelling() {
             [ATTN_TARGET],
             "{module}: the fold lands on exactly to_q (txt_in.out_layer, img_mlp.proj, … bare)"
         );
-        assert!(max_abs_diff(&base, &velocity(&dit)) > 1e-4, "{module}");
+        assert!(
+            tensor_max_abs_diff(&base, &velocity(&dit)) > 1e-4,
+            "{module}"
+        );
     }
 
     #[cfg(feature = "model-inference-proof")]
@@ -1402,7 +1399,10 @@ fn an_mlx_trainer_adapter_loads_on_candle_without_conversion() {
         )
         .unwrap();
         assert_eq!(report.residuals, dense_targets.len(), "{network}");
-        assert!(max_abs_diff(&base, &velocity(&dit)) > 1e-4, "{network}");
+        assert!(
+            tensor_max_abs_diff(&base, &velocity(&dit)) > 1e-4,
+            "{network}"
+        );
 
         let packed_file = temp
             .path()
@@ -1417,7 +1417,7 @@ fn an_mlx_trainer_adapter_loads_on_candle_without_conversion() {
                 install(&mut dit, std::slice::from_ref(&spec), tier, &Device::Cpu).unwrap();
             assert_eq!(report.residuals, 1, "{tier:?} {network}");
             assert!(
-                max_abs_diff(&packed_base, &velocity(&dit)) > 1e-4,
+                tensor_max_abs_diff(&packed_base, &velocity(&dit)) > 1e-4,
                 "{tier:?} {network}"
             );
         }
@@ -1780,7 +1780,10 @@ fn a_mixed_adapter_stack_installs_with_independent_per_file_strengths() {
     assert_eq!(report.loha_folds, 1);
     let stacked = velocity(&dit);
     let base = velocity(&dense_dit());
-    assert!(max_abs_diff(&base, &stacked) > 1e-4, "the stack applies");
+    assert!(
+        tensor_max_abs_diff(&base, &stacked) > 1e-4,
+        "the stack applies"
+    );
 
     for (i, name) in MIXED_NAMES.iter().enumerate() {
         let mut zeroed = full;
@@ -1791,15 +1794,15 @@ fn a_mixed_adapter_stack_installs_with_independent_per_file_strengths() {
         moved[i] = full[i].map(|s| s * 2.0);
         let at_zero = stack.velocity(zeroed);
         assert!(
-            max_abs_diff(&at_zero, &stack.velocity(without)) < 1e-6,
+            tensor_max_abs_diff(&at_zero, &stack.velocity(without)) < 1e-6,
             "{name} at strength 0 must equal the stack without it"
         );
         assert!(
-            max_abs_diff(&stacked, &at_zero) > 1e-5,
+            tensor_max_abs_diff(&stacked, &at_zero) > 1e-5,
             "{name}'s own strength must matter inside the stack"
         );
         assert!(
-            max_abs_diff(&stacked, &stack.velocity(moved)) > 1e-5,
+            tensor_max_abs_diff(&stacked, &stack.velocity(moved)) > 1e-5,
             "{name} at twice its strength must move the stack"
         );
     }
@@ -1846,18 +1849,18 @@ fn loha_and_lycoris_lokr_strength_scales_the_projection_delta() {
         };
         let base = projection_output(&mut dense_dit(), target);
         assert_eq!(
-            max_abs_diff(&base, &at(0.0)),
+            tensor_max_abs_diff(&base, &at(0.0)),
             0.0,
             "{name}: strength 0 is bit-identical to the base"
         );
         let unit = (at(1.0) - &base).unwrap();
-        let unit_peak = max_abs_diff(&unit, &unit.zeros_like().unwrap());
+        let unit_peak = tensor_max_abs_diff(&unit, &unit.zeros_like().unwrap());
         assert!(unit_peak > 1e-3, "{name}: the adapter moves its projection");
         for strength in [0.5f32, 2.0, -0.75] {
             let delta = (at(strength) - &base).unwrap();
             let want = (&unit * f64::from(strength)).unwrap();
             assert!(
-                max_abs_diff(&delta, &want) <= 1e-4 * unit_peak,
+                tensor_max_abs_diff(&delta, &want) <= 1e-4 * unit_peak,
                 "{name}: strength {strength} must move the output by {strength}× the unit delta"
             );
         }

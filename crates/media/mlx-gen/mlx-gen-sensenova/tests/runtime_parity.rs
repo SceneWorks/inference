@@ -16,6 +16,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, Path, Qwen3Backbone, Sampler, ThinkRollout};
 // The shared KV cache reports its cached length via `KvCache::offset()` (sc-7159); bring the trait
 // into scope so the cache-equivalence assertions below can read it.
+use mlx_gen::testing::peak_rel_host;
 use mlx_llm::primitives::KvCache;
 use mlx_rs::Array;
 
@@ -52,20 +53,6 @@ fn index_rows(idx: &Array) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
     let flat = idx.as_slice::<i32>();
     let row = |r: usize| flat[r * s..(r + 1) * s].to_vec();
     (row(0), row(1), row(2))
-}
-
-/// peak-relative `max|Δ|/max|b|` between two same-shaped arrays.
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap();
-    let b = b.reshape(&[n]).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
-    let max_diff = a
-        .iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
-    max_diff / peak
 }
 
 fn argmax(v: &[f32]) -> i32 {
@@ -111,14 +98,14 @@ fn ar_runtime_matches_reference() {
         .forward_path(&embeds, &pt, &ph, &pw, Path::Und)
         .unwrap();
     let dense_logits = model.lm_head(&dense_hidden).unwrap();
-    let equiv = peak_rel(&prefill_logits, &dense_logits);
+    let equiv = peak_rel_host(&prefill_logits, &dense_logits, Some(1e-12));
     println!("cache-equivalence (prefill vs forward_path): peak-rel={equiv:.3e}");
     assert!(
         equiv < 1e-5,
         "cached prefill must equal forward_path (same backend), got {equiv:.3e}"
     );
 
-    let pr = peak_rel(&prefill_logits, want_prefix_logits);
+    let pr = peak_rel_host(&prefill_logits, want_prefix_logits, Some(1e-12));
     println!("prefill logits vs reference: peak-rel={pr:.3e}");
     assert!(pr < 5e-3, "prefill logits peak-rel {pr:.3e} exceeds 5e-3");
     assert_eq!(cache.offset(), prefix_len);
@@ -146,7 +133,7 @@ fn ar_runtime_matches_reference() {
         let want_row = want_decode_logits
             .take_axis(Array::from_slice(&[k as i32], &[1]), 0)
             .unwrap();
-        let rel = peak_rel(&row_arr, &want_row);
+        let rel = peak_rel_host(&row_arr, &want_row, Some(1e-12));
         assert!(
             rel < 5e-3,
             "decode step {k} logits peak-rel {rel:.3e} exceeds 5e-3"

@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 
 use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
+use candle_gen::testkit::{tensor_max_abs_host, tensor_peak_rel_host};
 use candle_gen_ltx::config::{AvConfig, ConnectorConfig};
 use candle_gen_ltx::gemma4_te::Ltx25TextEncoder;
 use candle_gen_ltx::tier::Ltx25Tier;
@@ -80,17 +81,8 @@ fn golden_connector_dims(device: &Device) -> (usize, usize) {
     (video, audio)
 }
 
-fn max_abs(t: &Tensor) -> f32 {
-    t.to_dtype(DType::F32)
-        .and_then(|t| t.flatten_all())
-        .and_then(|t| t.to_vec1::<f32>())
-        .expect("host copy")
-        .into_iter()
-        .fold(0f32, |a, v| a.max(v.abs()))
-}
-
 fn finite(name: &str, t: &Tensor) {
-    let hi = max_abs(t);
+    let hi = tensor_max_abs_host(t);
     assert!(hi.is_finite(), "{name} contains a non-finite value");
     // A head that failed to bind, or a stack that never got past the embedding, produces an
     // all-zero tensor that every shape assertion would still pass.
@@ -209,27 +201,6 @@ fn connector_inputs_match_the_reference_geometry_and_are_well_formed() {
     println!("\nMODEL_INFERENCE_BODY_COMPLETED ltx_2_5_te_connector_inputs::connector_inputs_match_the_reference_geometry_and_are_well_formed");
 }
 
-/// `max|got - want| / max|want|` — the peak-relative error the 2.3 TE sibling (`te_parity.rs`)
-/// asserts on, and the same bars are used below.
-fn peak_rel(got: &Tensor, want: &Tensor) -> f32 {
-    let g = got
-        .to_dtype(DType::F32)
-        .and_then(|t| t.flatten_all())
-        .and_then(|t| t.to_vec1::<f32>())
-        .expect("host copy");
-    let w = want
-        .to_dtype(DType::F32)
-        .and_then(|t| t.flatten_all())
-        .and_then(|t| t.to_vec1::<f32>())
-        .expect("host copy");
-    assert_eq!(g.len(), w.len(), "peak_rel over mismatched shapes");
-    let denom = w.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-12);
-    g.iter()
-        .zip(&w)
-        .fold(0f32, |a, (x, y)| a.max((x - y).abs()))
-        / denom
-}
-
 /// [`peak_rel`] restricted to token rows `[lo, hi)`, with the denominator taken over the same
 /// slice.
 ///
@@ -239,7 +210,7 @@ fn peak_rel(got: &Tensor, want: &Tensor) -> f32 {
 fn peak_rel_rows(got: &Tensor, want: &Tensor, lo: usize, hi: usize) -> f32 {
     let g = got.narrow(1, lo, hi - lo).expect("slice got");
     let w = want.narrow(1, lo, hi - lo).expect("slice want");
-    peak_rel(&g, &w)
+    tensor_peak_rel_host(&g, &w, Some(1e-12))
 }
 
 /// The four tensors both numeric tests compare, run once off the golden's own tokenization.
@@ -297,7 +268,10 @@ fn connector_inputs_match_the_2_5_reference_golden() {
     let (g, nv, [vf, af, _, _]) = against_the_golden(&device);
     let (want_vf, want_af) = (&g["video_features"], &g["audio_features"]);
 
-    let (pr_vf, pr_af) = (peak_rel(&vf, want_vf), peak_rel(&af, want_af));
+    let (pr_vf, pr_af) = (
+        tensor_peak_rel_host(&vf, want_vf, Some(1e-12)),
+        tensor_peak_rel_host(&af, want_af, Some(1e-12)),
+    );
     let lo = MAX_LEN - nv;
     let v_vf = peak_rel_rows(&vf, want_vf, lo, MAX_LEN);
     let v_af = peak_rel_rows(&af, want_af, lo, MAX_LEN);
@@ -342,7 +316,10 @@ fn connector_outputs_match_the_2_5_reference_golden() {
     let (g, nv, [_, _, ve, ae]) = against_the_golden(&device);
     let (want_ve, want_ae) = (&g["video_embeddings"], &g["audio_embeddings"]);
 
-    let (pr_ve, pr_ae) = (peak_rel(&ve, want_ve), peak_rel(&ae, want_ae));
+    let (pr_ve, pr_ae) = (
+        tensor_peak_rel_host(&ve, want_ve, Some(1e-12)),
+        tensor_peak_rel_host(&ae, want_ae, Some(1e-12)),
+    );
     // The connector reorders its input, so here the valid rows are the PREFIX.
     let v_ve = peak_rel_rows(&ve, want_ve, 0, nv);
     let v_ae = peak_rel_rows(&ae, want_ae, 0, nv);

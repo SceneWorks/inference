@@ -86,7 +86,12 @@ fn px_gt8(a: &[u8], b: &[u8]) -> (usize, f64) {
 
 fn save_png(name: &str, pixels: &[u8], w: u32, h: u32) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../tools/golden/{name}"));
-    image::save_buffer(&path, pixels, w, h, image::ExtendedColorType::Rgb8).unwrap();
+    let img = mlx_gen::media::Image {
+        width: w,
+        height: h,
+        pixels: pixels.to_vec(),
+    };
+    mlx_gen::testing::save_png(&img, &path);
     println!("saved {}", path.display());
 }
 

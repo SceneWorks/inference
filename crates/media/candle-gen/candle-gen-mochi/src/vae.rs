@@ -396,6 +396,7 @@ impl MochiVaeDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::testkit::tensor_max_abs;
     use std::collections::HashMap;
 
     /// Deterministic small "random" fill (bounded so 5 GroupNorm+conv stages stay well-conditioned).
@@ -539,15 +540,6 @@ mod tests {
         w
     }
 
-    fn max_abs(t: &Tensor) -> f32 {
-        t.abs()
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
-    }
-
     /// The synthetic decoder reproduces the AsymmVAE geometry (temporal `(T−1)·6+1`, spatial ×8,
     /// out_channels 3) and is deterministic across two runs — the CPU CI-green VAE gate (no weights).
     #[test]
@@ -608,7 +600,7 @@ mod tests {
         let single = dec.decode_denormalized(&latent).expect("single-shot");
         // Sanity: a non-constant decode, so "identical" is a real claim, not two flat tensors.
         assert!(
-            max_abs(&single) > 1e-4,
+            tensor_max_abs(&single) > 1e-4,
             "synthetic decode is ~constant — the equivalence assertion would be vacuous"
         );
 
@@ -622,7 +614,7 @@ mod tests {
                 single.dims(),
                 "chunk={chunk}: shape must match the single-shot decode"
             );
-            let d = max_abs(&(&chunked - &single).unwrap());
+            let d = tensor_max_abs(&(&chunked - &single).unwrap());
             assert_eq!(
                 d, 0.0,
                 "chunk={chunk}: chunked decode must be identical to single-shot (max abs diff {d:.3e})"

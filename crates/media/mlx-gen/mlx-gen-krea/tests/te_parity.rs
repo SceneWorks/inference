@@ -8,26 +8,18 @@
 
 use mlx_gen::weights::Weights;
 use mlx_gen_krea::KreaTextEncoder;
-use mlx_rs::ops::{all_close, multiply, sqrt, sum};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::ops::all_close;
+use mlx_rs::Array;
 
 use crate::common;
 
 use common::tiny_te_config;
+use mlx_gen::testing::cosine_f32_device;
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/te_golden.safetensors"
 );
-
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    let dot = sum(multiply(&a, &b).unwrap(), false).unwrap();
-    let na = sqrt(sum(multiply(&a, &a).unwrap(), false).unwrap()).unwrap();
-    let nb = sqrt(sum(multiply(&b, &b).unwrap(), false).unwrap()).unwrap();
-    (dot / (na * nb)).item::<f32>()
-}
 
 #[ignore = "model inference; explicit model-proof workflow"]
 #[test]
@@ -46,7 +38,7 @@ fn te_matches_reference() {
     let want = w.require("out.hiddens").unwrap();
     assert_eq!(hiddens.shape(), want.shape(), "stacked-context shape");
 
-    let c = cosine(&hiddens, want);
+    let c = cosine_f32_device(&hiddens, want);
     println!("Krea TE parity: cosine={c:.7}");
     assert!(c > 0.999, "TE cosine {c:.7} <= 0.999");
     assert!(

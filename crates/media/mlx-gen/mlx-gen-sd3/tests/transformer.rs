@@ -20,6 +20,7 @@
 //!     asserts cosine ≥ 0.99 on the predicted noise. Gated because no torch/diffusers env is present
 //!     in this workspace (see the PR / FOLLOW_UPS) — run it once a dump exists.
 
+use mlx_gen::testing::{cosine_host_f32, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen_sd3::config::Sd3Arch;
 use mlx_gen_sd3::convert::expected_transformer_tensors;
@@ -388,7 +389,7 @@ fn numeric_parity_vs_diffusers() {
     eval([&out]).unwrap();
     assert_eq!(out.shape(), reference.shape(), "shape parity");
 
-    let cos = cosine(&out, &reference);
+    let cos = cosine_host_f32(&out, &reference, Denom::PlusEps(1e-12));
     println!("[sd3 numeric parity] cosine={cos}");
     assert!(
         cos >= 0.99,
@@ -396,22 +397,4 @@ fn numeric_parity_vs_diffusers() {
     );
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED transformer::numeric_parity_vs_diffusers");
-}
-
-/// Flattened cosine similarity between two arrays (computed host-side).
-fn cosine(a: &Array, b: &Array) -> f32 {
-    let a: Vec<f32> = a
-        .as_dtype(mlx_rs::Dtype::Float32)
-        .unwrap()
-        .as_slice::<f32>()
-        .to_vec();
-    let b: Vec<f32> = b
-        .as_dtype(mlx_rs::Dtype::Float32)
-        .unwrap()
-        .as_slice::<f32>()
-        .to_vec();
-    let dot: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    dot / (na * nb + 1e-12)
 }

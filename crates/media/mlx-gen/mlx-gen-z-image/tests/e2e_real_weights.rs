@@ -8,6 +8,7 @@
 //! intermediates; the final test drives the **public** `load(id, spec).generate(req)` API and
 //! confirms the rendered image matches the fork's golden.
 
+use mlx_gen::testing::peak_rel_host;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     FlowMatchEuler, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
@@ -33,23 +34,6 @@ const Q4_GOLDEN: &str = concat!(
 
 use crate::common;
 use common::snapshot;
-
-/// Peak-relative error `max|a-b| / max|b|` — the meaningful metric for high-dynamic-range
-/// tensors compared against a bf16 golden.
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    // reshape to 1-D forces C-order materialization (decode/transpose views would otherwise
-    // expose physical, not logical, order through as_slice).
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap();
-    let b = b.reshape(&[n]).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
-    let max_diff = a
-        .iter()
-        .zip(b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
-    max_diff / peak
-}
 
 fn bf16(a: &Array) -> Array {
     a.as_dtype(Dtype::Bfloat16).unwrap()
@@ -159,7 +143,7 @@ fn e2e_transformer_single_forward_matches_golden() {
         .unwrap();
     let golden = g.require("v0").unwrap();
     assert_eq!(v.shape(), golden.shape(), "v0 shape");
-    let pr = peak_rel(&v, golden);
+    let pr = peak_rel_host(&v, golden, None);
     println!(
         "transformer single forward: v0 peak_rel={pr:.2e} shape={:?}",
         v.shape()
@@ -191,7 +175,7 @@ fn e2e_denoise_loop_matches_golden() {
 
     let golden = g.require("final_latents").unwrap();
     assert_eq!(out.shape(), golden.shape(), "final latents shape");
-    let pr = peak_rel(&out, golden);
+    let pr = peak_rel_host(&out, golden, None);
     println!(
         "denoise: final_latents peak_rel={pr:.2e} shape={:?}",
         out.shape()
@@ -254,7 +238,7 @@ fn e2e_vae_and_image_matches_golden() {
     // switched the golden to the production `for_static_shift(3.0)` sigmas). The RGB8 guardrail above
     // is authoritative; this only catches a gross decode shift, so the threshold tracks the re-dump
     // with the usual cushion (history: 2e-2 → 2.8e-2 → 3.5e-2 → 4.5e-2).
-    let pr = peak_rel(&decoded, golden);
+    let pr = peak_rel_host(&decoded, golden, None);
     println!("vae: decoded peak_rel={pr:.2e} shape={:?}", decoded.shape());
     assert!(pr < 4.5e-2, "VAE decode diverged: peak_rel {pr:.2e}");
     #[cfg(target_os = "macos")]
@@ -422,7 +406,7 @@ fn q_pipeline_matches_fork(
         xs.iter().zip(ys).map(|(x, y)| (x - y).abs()).sum::<f32>() / xs.len() as f32 / mabs;
     println!(
         "Q{bits} final_latents: mean_rel={mean_rel:.3e} peak_rel={:.3e} shape={:?}",
-        peak_rel(&latents, golden),
+        peak_rel_host(&latents, golden, None),
         latents.shape()
     );
     assert!(
@@ -518,18 +502,21 @@ fn q8_packing_byte_identical_to_fork() {
         .all(None)
         .unwrap()
         .item::<bool>();
-    let sc_pr = peak_rel(
+    let sc_pr = peak_rel_host(
         &scales.as_dtype(Dtype::Float32).unwrap(),
         g.require("scales").unwrap(),
+        None,
     );
-    let bi_pr = peak_rel(
+    let bi_pr = peak_rel_host(
         &biases.as_dtype(Dtype::Float32).unwrap(),
         g.require("biases").unwrap(),
+        None,
     );
     let qmm = quantized_matmul(&x, &wq, &scales, &biases, true, 64, 8).unwrap();
-    let qmm_pr = peak_rel(
+    let qmm_pr = peak_rel_host(
         &qmm.as_dtype(Dtype::Float32).unwrap(),
         g.require("qmm").unwrap(),
+        None,
     );
     println!(
         "Q8 packing vs fork: wq_exact={wq_match} scales_pr={sc_pr:.2e} biases_pr={bi_pr:.2e} qmm_pr={qmm_pr:.2e}"

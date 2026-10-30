@@ -665,7 +665,7 @@ pub fn synthetic_taehv_weights(cfg: &TaehvConfig, seed: u64) -> Result<Weights> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::ops::{abs, subtract};
+    use crate::testing::max_abs_diff;
     use mlx_rs::transforms::{eval, grad};
 
     /// A variant's real hyperparameters with tiny stage widths.
@@ -683,12 +683,6 @@ mod tests {
 
     fn latents(shape: &[i32], seed: u64) -> Array {
         random::normal::<f32>(shape, None, None, Some(&random::key(seed).unwrap())).unwrap()
-    }
-
-    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
-        let d = abs(subtract(a, b).unwrap()).unwrap().max(None).unwrap();
-        eval([&d]).unwrap();
-        d.item::<f32>()
     }
 
     #[test]

@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::{host_f32, max_abs_diff_slices};
 use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::{
     detect, AdaLayerNormOut, DitBlock, LinearBias, MiniMaxH3Dit, MiniMaxH3DitConfig, MmRope,
@@ -173,14 +174,7 @@ fn index_array(json: &serde_json::Value, key: &str) -> Array {
 /// returns the other argument), so finiteness is checked first and the max runs only over finite
 /// elements.
 fn finite_max_abs_diff(got: &Array, want: &[f32]) -> f32 {
-    let count = got.shape().iter().product::<i32>() as usize;
-    let got: Vec<f32> = got
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .reshape(&[count as i32])
-        .unwrap()
-        .as_slice::<f32>()
-        .to_vec();
+    let got = host_f32(got);
     assert!(
         got.iter().all(|v| v.is_finite()),
         "native output contains a non-finite value"
@@ -189,10 +183,7 @@ fn finite_max_abs_diff(got: &Array, want: &[f32]) -> f32 {
         want.iter().all(|v| v.is_finite()),
         "oracle contains a non-finite value"
     );
-    got.iter()
-        .zip(want)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max)
+    max_abs_diff_slices(&got, want)
 }
 
 fn assert_abs(got: &Array, want: &[f32], tol: f32, what: &str) {

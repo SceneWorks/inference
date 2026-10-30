@@ -20,6 +20,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::env_path_or_home;
 use mlx_gen::weights::Weights;
 use mlx_gen_scail2::{Scail2Config, Scail2Dit, Scail2Inputs};
 use mlx_rs::{Array, Dtype};
@@ -29,9 +30,7 @@ fn home() -> PathBuf {
 }
 
 fn snapshot_dir() -> PathBuf {
-    std::env::var("SCAIL2_SNAPSHOT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home().join(".cache/scail2-mlx-convert"))
+    env_path_or_home("SCAIL2_SNAPSHOT_DIR", ".cache/scail2-mlx-convert")
 }
 
 fn real_parity_dir() -> PathBuf {

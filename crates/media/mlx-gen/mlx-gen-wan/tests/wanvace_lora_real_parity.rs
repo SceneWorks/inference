@@ -21,6 +21,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::testing::env_path_opt;
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterKind, AdapterSpec};
 use mlx_gen_wan::config::WanVaceConfig;
@@ -29,8 +30,7 @@ use mlx_rs::Dtype;
 
 /// Resolve the snapshot dir (the one holding `transformer/`): `WANVACE_DIR`, else the HF cache.
 fn snapshot_dir() -> Option<PathBuf> {
-    let d = std::env::var("WANVACE_DIR").ok()?;
-    Some(PathBuf::from(d))
+    env_path_opt("WANVACE_DIR")
 }
 
 fn diff(got: &[f32], exp: &[f32]) -> (f32, f64) {

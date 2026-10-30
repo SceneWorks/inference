@@ -11,10 +11,10 @@
 //!
 //! Run: `cargo test -p mlx-gen-lens --test integration adapter_parity:: -- --ignored --nocapture`
 
-use mlx_rs::ops::{array_eq, multiply, sum};
+use mlx_rs::ops::array_eq;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::testing::peak_rel;
+use mlx_gen::testing::{cosine_device_sums, peak_rel, Denom};
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterKind, AdapterSpec};
 use mlx_gen_lens::adapters::apply_lens_adapters;
@@ -50,21 +50,6 @@ fn meta_usize(g: &Weights, key: &str) -> usize {
     g.metadata(key).unwrap().parse().unwrap()
 }
 
-fn cosine(got: &Array, want: &Array) -> f32 {
-    let dot = sum(multiply(got, want).unwrap(), None)
-        .unwrap()
-        .item::<f32>();
-    let na = sum(multiply(got, got).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    let nb = sum(multiply(want, want).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-        .sqrt();
-    dot / (na * nb).max(1e-12)
-}
-
 /// Build a fresh f32 DiT from the snapshot (adapters mutate it, so each scenario reloads).
 fn load_dit() -> LensTransformer {
     let weights = Weights::from_dir(transformer_dir()).expect("load transformer shards");
@@ -98,7 +83,7 @@ fn lens_adapters_match_reference() {
     let base_pr = peak_rel(&base, &f32("base_out"));
     eprintln!(
         "base: peak_rel {base_pr:.3e}  cosine {:.7}",
-        cosine(&base, &f32("base_out"))
+        cosine_device_sums(&base, &f32("base_out"), Denom::FloorAt(1e-12))
     );
     assert!(
         base_pr < 1.5e-2,
@@ -129,7 +114,7 @@ fn lens_adapters_match_reference() {
     assert!(report.applied > 0, "no LoRA targets matched");
     let lora = run(&dit);
     let lora_pr = peak_rel(&lora, &f32("lora_out"));
-    let lora_cos = cosine(&lora, &f32("lora_out"));
+    let lora_cos = cosine_device_sums(&lora, &f32("lora_out"), Denom::FloorAt(1e-12));
     eprintln!("lora: peak_rel {lora_pr:.3e}  cosine {lora_cos:.7}");
     assert!(
         lora_pr < 1.5e-2 && lora_cos > 0.9999,
@@ -147,7 +132,7 @@ fn lens_adapters_match_reference() {
     assert!(report.applied > 0, "no LoKr targets matched");
     let lokr = run(&dit);
     let lokr_pr = peak_rel(&lokr, &f32("lokr_out"));
-    let lokr_cos = cosine(&lokr, &f32("lokr_out"));
+    let lokr_cos = cosine_device_sums(&lokr, &f32("lokr_out"), Denom::FloorAt(1e-12));
     eprintln!("lokr: peak_rel {lokr_pr:.3e}  cosine {lokr_cos:.7}");
     assert!(
         lokr_pr < 1.5e-2 && lokr_cos > 0.9999,

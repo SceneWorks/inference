@@ -92,7 +92,7 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::testkit::cosine;
+use candle_gen::testkit::{cosine, env_path, max_abs_diff_slices};
 use candle_gen_sd3::conditioning::{aggregate, EncoderOutputs, Sd3TextEncoders};
 use candle_gen_sd3::config::Sd3Config;
 use candle_gen_sd3::transformer::Sd3Transformer;
@@ -174,10 +174,7 @@ fn reference_dir() -> PathBuf {
 /// `SD35_LARGE_SNAPSHOT`) — a passed-in snapshot dir. Inference never self-fetches or derives a cache
 /// location (epic 13657).
 fn snapshot_dir(tag: &str) -> PathBuf {
-    let env = format!("{}_SNAPSHOT", tag.to_uppercase());
-    PathBuf::from(std::env::var(&env).unwrap_or_else(|_| {
-        panic!("set {env} to a staged {tag} SD3.5 snapshot dir (inference does not self-fetch, epic 13657)")
-    }))
+    env_path(&format!("{}_SNAPSHOT", tag.to_uppercase()))
 }
 
 /// Load a variant's reference `.safetensors` (all f32) into a name→Tensor map on CPU.
@@ -237,15 +234,6 @@ fn flat(t: &Tensor) -> Vec<f32> {
         .unwrap()
 }
 
-/// Max absolute per-element difference between two equal-length flattened tensors.
-fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "shape mismatch in max_abs_diff");
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f32, f32::max)
-}
-
 /// Build a [`Parity`] for `name` comparing candle `got` to reference `want` under `tag`'s tolerances.
 fn compare(tag: &str, name: &str, got: &Tensor, want: &Tensor) -> Parity {
     assert_eq!(
@@ -261,7 +249,7 @@ fn compare(tag: &str, name: &str, got: &Tensor, want: &Tensor) -> Parity {
     Parity {
         name: name.to_string(),
         cosine: cosine(&g, &w),
-        max_abs: max_abs_diff(&g, &w),
+        max_abs: max_abs_diff_slices(&g, &w),
         cosine_min,
         max_abs_max,
     }
@@ -517,7 +505,7 @@ fn sd35_bigg_pad_token_ab() {
     let r = flat(ref_ctx);
 
     let cos_fixed_vs_prefix = cosine(&f, &p);
-    let maxabs_fixed_vs_prefix = max_abs_diff(&f, &p);
+    let maxabs_fixed_vs_prefix = max_abs_diff_slices(&f, &p);
     let cos_fixed_vs_ref = cosine(&f, &r);
     let cos_prefix_vs_ref = cosine(&p, &r);
 
@@ -593,7 +581,7 @@ fn sd35_bigg_pad_token_ab() {
         let vf = flat(&vel_fixed);
         let vp = flat(&vel_prefix);
         let vel_cos = cosine(&vf, &vp);
-        let vel_maxabs = max_abs_diff(&vf, &vp);
+        let vel_maxabs = max_abs_diff_slices(&vf, &vp);
         eprintln!("  step-0 DiT velocity [1,16,H,W] (bf16/CUDA):");
         eprintln!("    fixed↔pre-fix   cosine={vel_cos:.6}  max_abs={vel_maxabs:.3e}");
         assert!(

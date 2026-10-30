@@ -9,9 +9,9 @@
 //!
 //! The real-weights gate lives in `vae_decode_real_weights.rs` and is `#[ignore]`d.
 
-use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::testing::max_abs_diff_f32;
 use mlx_gen::weights::Weights;
 use mlx_gen_mage::vae::denoiser::{dct_position_table, MageVaeShape};
 use mlx_gen_mage::vae::MageVae;
@@ -55,14 +55,6 @@ fn row(a: &Array, i: i32) -> Array {
     a.take_axis(Array::from_int(i), 0).unwrap()
 }
 
-fn max_abs(a: &Array, b: &Array) -> f32 {
-    let a = a.as_dtype(Dtype::Float32).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap();
-    max(abs(subtract(&a, &b).unwrap()).unwrap(), None)
-        .unwrap()
-        .item::<f32>()
-}
-
 fn build(w: &Weights, shape: MageVaeShape, fold: bool) -> MageVae {
     MageVae::from_weights_with_shape(w, Dtype::Float32, fold, shape, "pipeline")
         .expect("build tiny Mage-VAE")
@@ -87,7 +79,7 @@ fn tiny_decode_matches_the_torch_reference() {
     let want = w.require("fixture.decoded").unwrap();
     assert_eq!(got.shape(), want.shape(), "decoded geometry");
 
-    let err = max_abs(&got, want);
+    let err = max_abs_diff_f32(&got, want);
     // f32 throughout on both sides; the residual is Metal's reduced-precision matmul/conv
     // accumulation over ~30 layers. A structural bug (transposed layout, wrong ordering, missing
     // padding) diverges by orders of magnitude — see the discrimination test below.
@@ -129,7 +121,7 @@ fn tiny_cod_decoder_matches_the_torch_reference() {
     let want = w.require("fixture.cond").unwrap();
 
     assert_eq!(got.shape(), want.shape(), "cond geometry");
-    let err = max_abs(&got, want);
+    let err = max_abs_diff_f32(&got, want);
     assert!(err < 5e-4, "CoD decoder max_abs {err}");
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::tiny_cod_decoder_matches_the_torch_reference");
@@ -162,7 +154,7 @@ fn a_wrong_attention_tile_is_rejected() {
         .unwrap()
         .transpose_axes(&[0, 3, 1, 2])
         .unwrap();
-    let err = max_abs(&got, want);
+    let err = max_abs_diff_f32(&got, want);
     assert!(
         err > 1e-2,
         "tile {} vs {}: max_abs {err} — the tiling assertion does not discriminate",
@@ -203,7 +195,7 @@ fn adaln_constant_folding_is_numerically_identical() {
 
     let a = folded.decode(&latent).unwrap();
     let b = unfolded.decode(&latent).unwrap();
-    let err = max_abs(&a, &b);
+    let err = max_abs_diff_f32(&a, &b);
     assert!(
         err < 1e-5,
         "algebraically folded and unfolded decode differ by max_abs {err}"
@@ -225,7 +217,7 @@ fn adaln_folded_values_match_the_torch_reference() {
     let t = mlx_rs::ops::zeros_dtype(&[1], Dtype::Float32).unwrap();
     let c = denoiser.conditioning(&t, Dtype::Float32).unwrap();
     let want_c = w.require("fixture.t_embed_zero").unwrap();
-    let err = max_abs(&c, want_c);
+    let err = max_abs_diff_f32(&c, want_c);
     assert!(err < 1e-5, "t_embedder(0) max_abs {err}");
 
     // `fixture.adaln_zero` is [num_cond_blocks, 6 * hidden] — the value each block folds.
@@ -240,14 +232,14 @@ fn adaln_folded_values_match_the_torch_reference() {
     assert_eq!(got.len(), shape.num_cond_blocks, "one modulation per block");
     for (i, g) in got.iter().enumerate() {
         let want_row = row(want, i as i32).reshape(&[1, 6 * shape.hidden]).unwrap();
-        let err = max_abs(g, &want_row);
+        let err = max_abs_diff_f32(g, &want_row);
         assert!(err < 1e-5, "block {i} adaLN modulation max_abs {err}");
     }
 
     // Discrimination: the six chunks are distinct, so a mis-ordered split would not match. If the
     // reference's own vectors were near-identical this test would pass on a wrong chunk order.
     let row0 = row(want, 0).reshape(&[6, shape.hidden]).unwrap();
-    let spread = max_abs(&row(&row0, 0), &row(&row0, 1));
+    let spread = max_abs_diff_f32(&row(&row0, 0), &row(&row0, 1));
     assert!(
         spread > 1e-2,
         "shift_msa and scale_msa differ by only {spread} — the chunk-order check is vacuous"
@@ -270,7 +262,7 @@ fn dct_position_table_matches_the_torch_reference() {
         let got = dct_position_table(patch, shape.max_freqs).unwrap();
         let want = w.require(key).unwrap();
         assert_eq!(got.shape(), want.shape(), "{key} geometry");
-        let err = max_abs(&got, want);
+        let err = max_abs_diff_f32(&got, want);
         assert!(err < 1e-5, "{key} max_abs {err}");
     }
 }
@@ -305,7 +297,7 @@ fn an_integer_frequency_ramp_would_not_match() {
         }
     }
     let wrong = Array::from_slice(&data, &[1, (p * p) as i32, (max_freqs * max_freqs) as i32]);
-    let err = max_abs(&wrong, want);
+    let err = max_abs_diff_f32(&wrong, want);
     assert!(
         err > 0.1,
         "an integer frequency ramp differs by only {err} — the DCT check does not discriminate"
@@ -383,7 +375,7 @@ fn non_square_decode_matches_the_torch_reference() {
         "decode must scale height and width independently"
     );
 
-    let err = max_abs(&got, want);
+    let err = max_abs_diff_f32(&got, want);
     assert!(err < 2e-3, "non-square decode max_abs {err}");
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::non_square_decode_matches_the_torch_reference");
@@ -416,7 +408,7 @@ fn non_square_cod_decoder_matches_the_torch_reference() {
     let want = w.require("fixture.cond_ns").unwrap();
 
     assert_eq!(got.shape(), want.shape(), "non-square cond geometry");
-    let err = max_abs(&got, want);
+    let err = max_abs_diff_f32(&got, want);
     assert!(err < 5e-4, "non-square CoD decoder max_abs {err}");
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::non_square_cod_decoder_matches_the_torch_reference");
@@ -467,7 +459,7 @@ fn tiled_decode_reproduces_the_dense_decode() {
         let dense = vae.decode(&latent).unwrap();
         let bounded = vae.decode_tiled(&latent, &cfg, None).unwrap();
         assert_eq!(bounded.shape(), dense.shape(), "fold={fold} geometry");
-        let err = max_abs(&dense, &bounded);
+        let err = max_abs_diff_f32(&dense, &bounded);
         assert!(
             err < 2e-4,
             "fold={fold}: bounded decode diverged from dense by max_abs {err}"
@@ -497,7 +489,7 @@ fn an_untiled_request_falls_through_to_the_dense_decode() {
     let vae = build(&w, shape, true);
     let dense = vae.decode(&latent).unwrap();
     let passthrough = vae.decode_tiled(&latent, &cfg, None).unwrap();
-    assert_eq!(max_abs(&dense, &passthrough), 0.0);
+    assert_eq!(max_abs_diff_f32(&dense, &passthrough), 0.0);
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED vae_decode_fixture::an_untiled_request_falls_through_to_the_dense_decode");
 }
@@ -551,7 +543,7 @@ fn per_crop_whole_decode_tiling_is_observably_wrong() {
     let per_crop = mlx_rs::ops::concatenate_axis(&[&left, &right], 3).unwrap();
     assert_eq!(per_crop.shape(), dense.shape());
 
-    let err = max_abs(&dense, &per_crop);
+    let err = max_abs_diff_f32(&dense, &per_crop);
     assert!(
         err > 1e-2,
         "per-crop whole-decode tiling must be observably different from the dense decode, else the \

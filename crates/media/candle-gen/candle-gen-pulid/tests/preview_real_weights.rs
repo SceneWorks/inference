@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{Image, PreviewFrame, PreviewSink, Progress};
 
-use candle_gen::testkit::save_rgb8_png;
+use candle_gen::testkit::save_rgb8_png_in;
 use candle_gen::testkit::{
     collecting_sink, correlation, downsample_nearest, downsample_nearest_raw, env_u32,
     mean_abs_delta, preview_strip_sheet, required_path,
@@ -73,15 +73,9 @@ fn artifact_dir() -> PathBuf {
 
 // ── Frame analysis ────────────────────────────────────────────────────────────────────────────────
 
-fn save_png(dir: &Path, pixels: &[u8], width: u32, height: u32, name: &str) {
-    let path = dir.join(name);
-    save_rgb8_png(&path, pixels, width, height);
-    eprintln!("  wrote {}", path.display());
-}
-
 fn save_strip(dir: &Path, frames: &[PreviewFrame], name: &str) {
     let (sheet, width, height) = preview_strip_sheet(frames);
-    save_png(dir, &sheet, width, height, name);
+    save_rgb8_png_in(dir, name, &sheet, width, height);
 }
 
 const MIN_FRAME_MOVEMENT: f64 = 0.1;
@@ -334,12 +328,12 @@ fn assert_pulid_previews_converge(
         min_acceleration,
     );
     save_strip(&dir, &frames, &format!("{label}-strip.png"));
-    save_png(
+    save_rgb8_png_in(
         &dir,
+        &format!("{label}-final.png"),
         &live.pixels,
         live.width,
         live.height,
-        &format!("{label}-final.png"),
     );
     events
 }

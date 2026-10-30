@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::testing::require_env_path;
+use mlx_gen::testing::{peak_rel_host, require_env_path};
 use mlx_gen_sensenova::{
     loader::load_raw, text::load_tokenizer, NeoChatConfig, T2iModel, T2iOptions,
 };
@@ -26,15 +26,6 @@ fn fixture() -> PathBuf {
 fn flat(a: &Array) -> Vec<f32> {
     let n = a.shape().iter().product::<i32>();
     a.reshape(&[n]).unwrap().as_slice::<f32>().to_vec()
-}
-
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let (a, b) = (flat(a), flat(b));
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-6);
-    a.iter()
-        .zip(&b)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
-        / peak
 }
 
 #[test]
@@ -70,7 +61,7 @@ fn it2i_realweight_matches_reference() {
 
     // preprocess_image must match the reference pixel_values.
     let (pix, (gh, gw)) = model.preprocess_image(&src).expect("preprocess");
-    let pp_rel = peak_rel(&pix, &want_pixels);
+    let pp_rel = peak_rel_host(&pix, &want_pixels, Some(1e-6));
     println!("preprocess pixel_values: peak-rel={pp_rel:.3e}  grid={gh}x{gw}");
     assert!(pp_rel < 1e-4, "preprocess_image mismatch {pp_rel:.3e}");
 
@@ -114,7 +105,7 @@ fn it2i_realweight_matches_reference() {
     let got_vit = model
         .und_vision_features(&pix, &[(gh, gw)])
         .expect("und vit");
-    let vit_rel = peak_rel(&got_vit, &want_vit);
+    let vit_rel = peak_rel_host(&got_vit, &want_vit, Some(1e-6));
     println!("und vision features: peak-rel={vit_rel:.3e}");
     assert!(
         vit_rel < 5e-3,
@@ -129,7 +120,7 @@ fn it2i_realweight_matches_reference() {
     let ph_cos = cosine(&got_ph, &want_ph);
     println!(
         "cond prefill hidden: cosine={ph_cos:.5}  peak-rel={:.3e}",
-        peak_rel(&got_ph, &want_ph)
+        peak_rel_host(&got_ph, &want_ph, Some(1e-6))
     );
     assert!(
         ph_cos > 0.999,
@@ -159,7 +150,7 @@ fn it2i_realweight_matches_reference() {
     let co_cos = cosine(&out_co.image, &want_cond_only);
     println!(
         "cond-only e2e: cosine={co_cos:.5}  peak-rel={:.3e}",
-        peak_rel(&out_co.image, &want_cond_only)
+        peak_rel_host(&out_co.image, &want_cond_only, Some(1e-6))
     );
     assert!(co_cos > 0.99, "cond-only e2e cosine {co_cos:.5} below 0.99");
 
@@ -187,7 +178,7 @@ fn it2i_realweight_matches_reference() {
     let edit_cos = cosine(&out.image, &want_image);
     println!(
         "it2i edit e2e (cfg={cfg_scale}, img_cfg={img_cfg_scale}): cosine={edit_cos:.5}  peak-rel={:.3e}",
-        peak_rel(&out.image, &want_image)
+        peak_rel_host(&out.image, &want_image, Some(1e-6))
     );
     assert!(edit_cos > 0.85, "edit e2e cosine {edit_cos:.5} below 0.85");
     crate::model_inference_device::record_model_inference_device();

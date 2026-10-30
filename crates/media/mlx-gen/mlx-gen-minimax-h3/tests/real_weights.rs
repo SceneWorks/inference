@@ -32,7 +32,8 @@ use mlx_gen_minimax_h3::{
     MINIMAX_ADDED_SPECIALS, VISION_PREFIX,
 };
 
-use common::{cosine, l2_norm, rel, snapshot, std_dev};
+use common::{l2_norm, rel, snapshot, std_dev};
+use mlx_gen::testing::{cosine_device_sums_f32, Denom};
 
 /// Total tensors in the published `vae/` component.
 const PUBLISHED_VAE_TENSORS: usize = 703;
@@ -801,7 +802,7 @@ origin = mlx_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             assert_eq!(got.shape(), want.shape(), "{name}.{label}: posterior shape");
 
             let (peak, mean_rel) = rel(&got, want);
-            let cos = cosine(&got, want);
+            let cos = cosine_device_sums_f32(&got, want, Denom::FloorAt(1e-12));
             let (n_got, n_want) = (l2_norm(&got), l2_norm(want));
             println!(
                 "REAL-WEIGHT ENCODE PARITY {name}.{label} vs {} {}: rel-max-abs={peak:.3e} \
