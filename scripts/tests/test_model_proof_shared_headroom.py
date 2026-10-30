@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -48,6 +49,7 @@ class SharedHeadroom(unittest.TestCase):
                     if body is not None:
                         body(receipt)
                 self.assertTrue(receipt['post_execution_verified'])
+                self.assertTrue(all(call.kwargs.get('selected_uuid') == UUID for call in inventory.call_args_list))
                 return receipt, inventory.call_count
 
     def test_shared_activity_and_changing_foreign_contexts_are_diagnostic_in_both_phases(self):
@@ -69,11 +71,57 @@ class SharedHeadroom(unittest.TestCase):
             self.assertTrue(all(item['predicates']['proof_shared_correctness_headroom'] for item in diagnostic['samples']))
             self.assertNotIn('selected_gpu_zero_utilization', json.dumps(diagnostic))
 
+    def test_unknown_foreign_census_is_explicit_and_cannot_masquerade_as_no_processes(self):
+        card = self.card(None, process_inventory_status='unknown/not-collected-diagnostic-only')
+        receipt, count = self.claim([([card], [])] * 11)
+        self.assertEqual(count, 11)
+        for phase in ('admission', 'release'):
+            self.assertEqual(receipt[phase + '_utilization_percent'], [None] * 5)
+            for sample in receipt[phase + '_background_activity']['samples']:
+                self.assertEqual(sample['process_inventory_status'], 'unknown/not-collected-diagnostic-only')
+                self.assertIsNone(sample['selected_process_count'])
+                self.assertIsNone(sample['selected_process_type_counts'])
+                self.assertIsNone(sample['context_identities_match_admission'])
+
+    def test_bound_profile_admits_without_slow_or_unavailable_census(self):
+        # CI_IMPACT: command stub only; no driver, GPU context, model, or host lease.
+        def driver(args, deadline):
+            if '--id=' + UUID not in args or '-x' in args or any('query-compute-apps' in arg for arg in args):
+                raise TimeoutError('MOCK optional host census exhausted sampling deadline')
+            return f'1, {UUID}, MOCK, 596.36, 97887, 5247, 92192, 100'
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            fake_os = SimpleNamespace(name='nt', fstat=os.fstat)
+            fake_lock = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lambda *_: None)
+            with patch.object(resources, 'os', fake_os), patch.dict(sys.modules, {'msvcrt': fake_lock}), \
+                    patch.object(guard, 'command', side_effect=driver) as probe, patch.object(guard.time, 'sleep'):
+                with resources.execution_claim('candle-cuda', POLICY, output,
+                                               {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK'},
+                                               constraints=self.configured) as receipt:
+                    self.assertEqual(receipt['physical_index'], 1)
+                self.assertTrue(receipt['post_execution_verified'])
+                self.assertEqual(probe.call_count, 11)
+                self.assertEqual(receipt['admission_utilization_percent'], [100] * 5)
+                self.assertIsNone(receipt['admission_background_activity']['samples'][0]['selected_process_count'])
+
+    def test_primary_timeout_preserves_refusal_details_and_never_enters_body(self):
+        for error in (TimeoutError('GPU inventory sampling deadline exhausted'),
+                      subprocess.TimeoutExpired('nvidia-smi', 5)):
+            valid = ([self.card()], [])
+            with self.subTest(error=error), self.assertRaises(resources.CudaClaimRejected) as caught:
+                self.claim([valid, valid, error], body=lambda _: self.fail('primary timeout reached body'))
+            self.assertIn(str(error), caught.exception.diagnostic['admission_error'])
+            self.assertEqual(caught.exception.diagnostic['admission_samples']['sample_count'], 1)
+            with self.assertRaises(resources.CudaReleaseRejected):
+                self.claim([valid] * 7 + [error])
+
     def test_memory_and_physical_identity_refusals_never_enter_body(self):
         # CI_IMPACT: pure snapshots exercise initial and later phase failures, not model computation.
         invalid = [self.card(uuid=OTHER), self.card(index=0), self.card(total_mib='97887'),
                    self.card(used_mib=-1), self.card(free_mib=97888), self.card(free_mib=10239, used_mib=87648),
-                   self.card(used_mib=9000), self.card(free_mib=True)]
+                   self.card(used_mib=9000), self.card(free_mib=True),
+                   self.card(total_mib=None), self.card(used_mib=float('nan')),
+                   self.card(free_mib=float('inf'))]
         for card in invalid:
             with self.subTest(card=card), self.assertRaises((ValueError, RuntimeError)):
                 self.claim([([card], [])], body=lambda _: self.fail('invalid admission reached body'))

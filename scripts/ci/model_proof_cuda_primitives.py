@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 
-GUARD_SHA = "301f0d0dd18b55aa9eaf5f3ffebac8122004f7bde59aaac4e7c5103e3451bf3f"
+GUARD_SHA = "2a08c3476534ae04c99ac6473a2d359304c8bff1ff143c046626861e0dab3a06"
 
 def component(name: str, expected: str):
     file = Path(__file__).resolve().parent / "vendor" / name
