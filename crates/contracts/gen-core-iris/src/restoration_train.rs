@@ -1524,7 +1524,10 @@ impl RestoreTrainResources {
                 let parent_config_path = d.join(super::BACKBONE_CONFIG_FILE);
                 let text = gen_core::__model_input_choose!(
                     std::fs::read_to_string(d.join(super::BACKBONE_CONFIG_FILE)),
-                    std::fs::read_to_string(&parent_config_path)
+                    {
+                        let parent_config_path = d.join(super::BACKBONE_CONFIG_FILE);
+                        std::fs::read_to_string(&parent_config_path)
+                    }
                 )
                 .map_err(|e| Error::Msg(format!("iris: read parent config: {e}")))?;
                 if super::downstream::parse_task_settings(&text)?.is_some() {
