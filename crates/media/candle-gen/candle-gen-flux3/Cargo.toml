@@ -36,6 +36,7 @@ sha2 = { workspace = true }
 # Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda` on
 # this provider crate selects the matching candle backend everywhere.
 default = []
+model-inference-proof = ["candle-gen/model-inference-proof", "candle-llm/model-inference-proof"]
 metal = ["candle-gen/metal", "candle-llm/metal"]
 cuda = ["candle-gen/cuda", "candle-llm/cuda", "candle-quant-kernels/cuda"]
 

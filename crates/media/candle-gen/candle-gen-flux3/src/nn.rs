@@ -554,7 +554,52 @@ impl Linear {
         };
         let mut shape = lead.to_vec();
         shape.push(out_dim);
-        Ok(y.reshape(shape)?)
+        __model_proof_output!(Ok(y.reshape(shape)?))
+    }
+
+    pub(crate) fn prepare_frozen_group(
+        layers: &mut [&mut Self],
+    ) -> Result<Option<candle_gen::train::projection::FrozenProjectionPack>> {
+        // Preserve the CPU half-precision oracle and every packed/native base.
+        if layers.iter().any(|l| !matches!(&l.base, Base::Dense(w) if !(w.track_op() || w.device().is_cpu() && w.dtype() != DType::F32))) {
+            return Ok(None);
+        }
+        for layer in layers.iter_mut() {
+            layer.adapted_mut()?;
+        }
+        let mut adapted = layers
+            .iter_mut()
+            .map(|l| l.adapted.as_mut().unwrap())
+            .collect::<Vec<_>>();
+        let pack =
+            candle_gen::train::projection::FrozenProjectionPack::prepare_adapt(&mut adapted)?;
+        if pack.is_some() {
+            for layer in layers {
+                layer.base = Base::Dense(
+                    layer
+                        .adapted
+                        .as_ref()
+                        .unwrap()
+                        .dense_base()
+                        .unwrap()
+                        .weight()
+                        .clone(),
+                );
+            }
+        }
+        Ok(pack)
+    }
+
+    pub(crate) fn forward_frozen_group(
+        pack: &candle_gen::train::projection::FrozenProjectionPack,
+        x: &Tensor,
+        layers: &[&Self],
+    ) -> Result<Vec<Tensor>> {
+        let adapted = layers
+            .iter()
+            .map(|l| l.adapted.as_ref().expect("prepared dense facade"))
+            .collect::<Vec<_>>();
+        Ok(pack.forward_adapt(&to(x, layers[0].dtype())?, &adapted)?)
     }
 
     fn adapted_mut(&mut self) -> Result<&mut candle_gen::quant::AdaptLinear> {
@@ -798,7 +843,7 @@ fn rmsnorm_rope_impl(x: &Tensor, scale: &Tensor, rope: &Rope, training: bool) ->
     let pairs = d / 2;
     let xf = to(x, DType::F32)?.contiguous()?;
     let normed = if training {
-        candle_gen::candle_nn::ops::rms_norm_slow(&xf, scale, RMS_EPS)?
+        candle_gen::train::norm::rms_norm_diff(&xf, scale, RMS_EPS as f64)?
     } else {
         candle_gen::candle_nn::ops::rms_norm(&xf, scale, RMS_EPS)?
     };
@@ -871,21 +916,27 @@ fn packed_attention_impl(
                 v.narrow(2, start, end - start)?.contiguous()?,
             )
         };
-        let o = candle_gen::sdpa_budgeted_bhsd(
-            &q,
-            &k,
-            &v,
-            scale,
-            None,
-            |scores| {
-                if training {
-                    candle_gen::candle_nn::ops::softmax(scores, D::Minus1)
-                } else {
-                    softmax_last_dim(scores)
-                }
-            },
-            candle_gen::ATTN_SCORES_BUDGET,
-        )?;
+        let o = if training {
+            candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
+                &q,
+                &k,
+                &v,
+                scale,
+                None,
+                |scores| candle_gen::candle_nn::ops::softmax(scores, D::Minus1),
+                candle_gen::ATTN_SCORES_BUDGET,
+            )?
+        } else {
+            candle_gen::sdpa_budgeted_bhsd(
+                &q,
+                &k,
+                &v,
+                scale,
+                None,
+                softmax_last_dim,
+                candle_gen::ATTN_SCORES_BUDGET,
+            )?
+        };
         Ok(to(&o, compute)?
             .transpose(1, 2)?
             .reshape((end - start, h * d))?)
@@ -953,6 +1004,7 @@ mod tests {
     /// *Mutations that red this:* skipping the f32 widening (CPU qmatmul rejects bf16), dropping
     /// the final rounding to the compute dtype, or transposing the packed weight.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn packed_forward_matches_the_dense_dequantized_reference() {
         let (n, k) = (48, 128);
         let w = seeded(n, k, 0.3);
@@ -981,6 +1033,9 @@ mod tests {
         // Q4_1 at an odd block count is refused, never run through the paired CPU kernel.
         let odd = QTensor::quantize(&seeded(8, 96, 0.1), GgmlDType::Q4_1).unwrap();
         assert!(Linear::from_packed_qtensor(odd, NativeDitStorage::GgmlQ4_1, DType::F32).is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED nn::tests::packed_forward_matches_the_dense_dequantized_reference");
     }
 
     /// CUDA: the GGML Q4_1/Q8_0 packed path stays packed ON DEVICE (a `QMatMul::QTensor` with CUDA
@@ -988,6 +1043,7 @@ mod tests {
     /// the Q8_1 activation quantization the CUDA kernels apply (same bound as the CPU test).
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn cuda_packed_ggml_path_stays_packed_and_matches_the_dequantized_reference() {
         let dev = Device::new_cuda(0).expect("CUDA device 0 (CUDA_VISIBLE_DEVICES selects GPU1)");
         let (n, k) = (48, 128);
@@ -1040,6 +1096,9 @@ mod tests {
             }
             drop(q_gpu);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED nn::tests::cuda_packed_ggml_path_stays_packed_and_matches_the_dequantized_reference");
     }
 
     /// The f32 widening is per planned launch: each chunk's f32 storage holds exactly its own
@@ -1070,6 +1129,7 @@ mod tests {
 
     /// Row chunking changes no bit: every row's activation quantization is independent.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn row_chunked_packed_forward_is_bit_identical() {
         let w = seeded(32, 64, 0.9);
         let x = seeded(10, 64, 2.1);
@@ -1089,11 +1149,15 @@ mod tests {
             assert_eq!(a, b);
             assert!(packed_forward(matmul, storage, &x, 32, DType::F32, per_row - 1).is_err());
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED nn::tests::row_chunked_packed_forward_is_bit_identical");
     }
 
     /// LoRA on a packed base is an additive residual over the strict packed output; the base is
     /// never folded, dequantized or trained.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn lora_on_a_packed_base_is_an_exact_additive_residual() {
         let (n, k, r) = (32, 64, 4);
         let w = seeded(n, k, 0.5);
@@ -1121,6 +1185,9 @@ mod tests {
         assert!(linear
             .push_lora(seeded(r, k + 32, 0.0), seeded(n, r, 0.0), 1.0)
             .is_err());
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED nn::tests::lora_on_a_packed_base_is_an_exact_additive_residual");
     }
 
     /// Source guard (sc-26241): nothing in this workspace may flip candle's global DMMV switch

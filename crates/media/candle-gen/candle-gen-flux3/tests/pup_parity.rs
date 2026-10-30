@@ -224,23 +224,40 @@ fn projection_keeps_ordinary_caption_and_locked_box_tokens() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn native_cpu_f32_text_matches_the_shared_oracle() {
     native_cpu_f32_case("t2i");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED pup_parity::native_cpu_f32_text_matches_the_shared_oracle");
 }
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn native_cpu_f32_text_with_boxes_matches_the_shared_oracle() {
     native_cpu_f32_case("t2i_bbox");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED pup_parity::native_cpu_f32_text_with_boxes_matches_the_shared_oracle");
 }
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn native_cpu_f32_edit_matches_the_shared_oracle() {
     native_cpu_f32_case("i2i");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED pup_parity::native_cpu_f32_edit_matches_the_shared_oracle");
 }
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn native_cpu_f32_edit_with_boxes_matches_the_shared_oracle() {
     native_cpu_f32_case("i2i_bbox");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED pup_parity::native_cpu_f32_edit_with_boxes_matches_the_shared_oracle");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn default_backend_executes_all_modes_with_ordered_references_and_locked_boxes() {
     // Intentionally no CPU override here: a CUDA build runs the real BF16 native VLM. Its
     // behavior is checked without treating a different backend's token margins as a golden.
@@ -316,4 +333,7 @@ fn default_backend_executes_all_modes_with_ordered_references_and_locked_boxes()
             Err(candle_gen::gen_core::Error::Canceled)
         ));
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED pup_parity::default_backend_executes_all_modes_with_ordered_references_and_locked_boxes");
 }

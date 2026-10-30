@@ -37,6 +37,11 @@
 //!
 //! [`gen_core::flux3`]: candle_gen::gen_core::flux3
 
+// Source-owned learned output witness for explicit model proofs.
+#[macro_use]
+#[path = "../../../../llm/test-support/model_proof.rs"]
+mod model_proof;
+
 pub mod adapters;
 pub mod autoencoder;
 pub mod convert;

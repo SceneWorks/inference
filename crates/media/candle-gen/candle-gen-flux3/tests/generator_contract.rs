@@ -50,6 +50,7 @@ fn request() -> GenerationRequest {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progress() {
     use candle_gen::gen_core::flux3::references::ReferenceOutputSize;
     use candle_gen::gen_core::{Conditioning, Image, Precision, RgbaImage};
@@ -284,9 +285,13 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
             "invalid pixel carriers fail before encoding/PUP/render"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progress");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn effective_caption_is_recorded_before_encoding_and_prompt_derived_seeding() {
     use candle_gen::gen_core::{PromptEnhancementReport, PromptEnhancementSink};
     use std::sync::{Arc, Mutex};
@@ -336,19 +341,33 @@ fn effective_caption_is_recorded_before_encoding_and_prompt_derived_seeding() {
         }
         other => panic!("expected images from both native requests: {other:?}"),
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::effective_caption_is_recorded_before_encoding_and_prompt_derived_seeding");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn gen_core_conformance_resident() {
     gen_core_testkit::conformance(|| load(OffloadPolicy::Resident), &profile());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::gen_core_conformance_resident");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn gen_core_conformance_sequential() {
     gen_core_testkit::conformance(|| load(OffloadPolicy::Sequential), &profile());
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::gen_core_conformance_sequential"
+    );
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn progress_is_steps_then_one_decoding_and_output_is_rgb8() {
     let g = load(OffloadPolicy::Resident);
     let mut events = Vec::new();
@@ -401,11 +420,15 @@ fn progress_is_steps_then_one_decoding_and_output_is_rgb8() {
         }
         _ => panic!("expected images"),
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::progress_is_steps_then_one_decoding_and_output_is_rgb8");
 }
 
 /// An unseeded request is seeded from its caption (`generate.py`'s `sha256(caption)`): it
 /// reproduces, and equals the explicitly seeded request at that seed.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn an_unseeded_request_is_seeded_from_its_prompt() {
     let g = load(OffloadPolicy::Resident);
     let unseeded = GenerationRequest {
@@ -445,11 +468,15 @@ fn an_unseeded_request_is_seeded_from_its_prompt() {
         }
         _ => panic!("expected images"),
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::an_unseeded_request_is_seeded_from_its_prompt");
 }
 
 /// A pre-tripped cancel refuses before any work; the request's own flag tripped mid-run surfaces
 /// as the typed `Canceled`, never a partial image.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn cancellation_is_typed() {
     let g = load(OffloadPolicy::Resident);
     let cancel = CancelFlag::new();
@@ -477,6 +504,9 @@ fn cancellation_is_typed() {
         Err(CoreError::Canceled) => {}
         other => panic!("expected Canceled mid-run, got {other:?}"),
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::cancellation_is_typed");
 }
 
 /// The flow map's typed refusals reach the caller through `validate` and `generate` alike, as
@@ -563,6 +593,7 @@ fn unhonourable_controls_are_refused_at_validation() {
 /// without them and without overrides is a load error naming the missing resource; an unknown
 /// component key is refused.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn components_override_the_bundled_copies() {
     let registry = candle_gen_flux3::provider_registry().unwrap();
     // A package directory holding only the DiT + config: the bundled copies are absent.
@@ -609,6 +640,9 @@ fn components_override_the_bundled_copies() {
         Err(CoreError::Unsupported(m)) => assert!(m.contains("upsampler"), "{m}"),
         other => panic!("expected a typed refusal, got {:?}", other.err()),
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::components_override_the_bundled_copies");
 }
 
 /// A CFG (base) package is a typed refusal at load, never sampled as a flow map — decided by its
@@ -688,6 +722,7 @@ fn base_and_quantized_packages_are_typed_refusals() {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn base_cfg_adapter_loads_through_the_public_provider_for_both_residencies() {
     use candle_gen::gen_core::{AdapterKind, AdapterSpec, Precision};
     let fixture = crate::common::fixtures();
@@ -763,9 +798,13 @@ fn base_cfg_adapter_loads_through_the_public_provider_for_both_residencies() {
             Err(CoreError::Unsupported(_))
         ));
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::base_cfg_adapter_loads_through_the_public_provider_for_both_residencies");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn callback_cancel_at_conditioning_boundary_stops_before_denoise() {
     for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
         let generator = load(policy);
@@ -795,10 +834,14 @@ fn callback_cancel_at_conditioning_boundary_stops_before_denoise() {
             "cancellation at the boundary must stop before the first forward: {events:?}"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::callback_cancel_at_conditioning_boundary_stops_before_denoise");
 }
 
 #[cfg(not(feature = "cuda"))]
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn prompt_upsampling_terminal_boundary_native_provider() {
     for id in [ID, "flux3_klein_base"] {
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
@@ -957,6 +1000,9 @@ fn prompt_upsampling_terminal_boundary_native_provider() {
             )));
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED generator_contract::prompt_upsampling_terminal_boundary_native_provider");
 }
 
 #[cfg(not(feature = "cuda"))]

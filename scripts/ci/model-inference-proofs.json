@@ -279879,5 +279879,3883 @@
       "source_identity": "crates/media/candle-gen/candle-gen/src/train/projection.rs::train::projection::tests::cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient",
       "requirements": []
     }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "candle_gen_flux3",
+    "target_kind": "lib",
+    "fqn": "model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest",
+    "source": "crates/media/candle-gen/candle-gen-flux3/src/model.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_flux3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/src/model.rs::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/src/model.rs::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/model.rs::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/model.rs::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/model.rs::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "candle_gen_flux3",
+    "target_kind": "lib",
+    "fqn": "model::tests::converted_ggml_package_loads_only_as_its_exact_tier_and_renders_close_to_dense",
+    "source": "crates/media/candle-gen/candle-gen-flux3/src/model.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_flux3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/src/model.rs::model::tests::converted_ggml_package_loads_only_as_its_exact_tier_and_renders_close_to_dense",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/src/model.rs::model::tests::converted_ggml_package_loads_only_as_its_exact_tier_and_renders_close_to_dense",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/model.rs::model::tests::converted_ggml_package_loads_only_as_its_exact_tier_and_renders_close_to_dense/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/model.rs::model::tests::converted_ggml_package_loads_only_as_its_exact_tier_and_renders_close_to_dense/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/model.rs::model::tests::converted_ggml_package_loads_only_as_its_exact_tier_and_renders_close_to_dense",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "candle_gen_flux3",
+    "target_kind": "lib",
+    "fqn": "nn::tests::cuda_packed_ggml_path_stays_packed_and_matches_the_dequantized_reference",
+    "source": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_flux3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::cuda_packed_ggml_path_stays_packed_and_matches_the_dequantized_reference",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::cuda_packed_ggml_path_stays_packed_and_matches_the_dequantized_reference",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::cuda_packed_ggml_path_stays_packed_and_matches_the_dequantized_reference/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::cuda_packed_ggml_path_stays_packed_and_matches_the_dequantized_reference",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "candle_gen_flux3",
+    "target_kind": "lib",
+    "fqn": "nn::tests::lora_on_a_packed_base_is_an_exact_additive_residual",
+    "source": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_flux3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::lora_on_a_packed_base_is_an_exact_additive_residual",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::lora_on_a_packed_base_is_an_exact_additive_residual",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::lora_on_a_packed_base_is_an_exact_additive_residual/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::lora_on_a_packed_base_is_an_exact_additive_residual",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "candle_gen_flux3",
+    "target_kind": "lib",
+    "fqn": "nn::tests::packed_forward_matches_the_dense_dequantized_reference",
+    "source": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_flux3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::packed_forward_matches_the_dense_dequantized_reference",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::packed_forward_matches_the_dense_dequantized_reference",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::packed_forward_matches_the_dense_dequantized_reference/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::packed_forward_matches_the_dense_dequantized_reference",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "candle_gen_flux3",
+    "target_kind": "lib",
+    "fqn": "nn::tests::row_chunked_packed_forward_is_bit_identical",
+    "source": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_flux3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::row_chunked_packed_forward_is_bit_identical",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::row_chunked_packed_forward_is_bit_identical",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::row_chunked_packed_forward_is_bit_identical/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/nn.rs::nn::tests::row_chunked_packed_forward_is_bit_identical",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "candle_gen_flux3",
+    "target_kind": "lib",
+    "fqn": "training::runner::tests::each_workflow_steps_exactly_the_factors_its_native_graph_reaches",
+    "source": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_flux3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs::training::runner::tests::each_workflow_steps_exactly_the_factors_its_native_graph_reaches",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs::training::runner::tests::each_workflow_steps_exactly_the_factors_its_native_graph_reaches",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs::training::runner::tests::each_workflow_steps_exactly_the_factors_its_native_graph_reaches/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs::training::runner::tests::each_workflow_steps_exactly_the_factors_its_native_graph_reaches",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "candle_gen_flux3",
+    "target_kind": "lib",
+    "fqn": "training::runner::tests::real_loop_interrupts_with_pending_gradient_resumes_identically_and_reloads",
+    "source": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_flux3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs::training::runner::tests::real_loop_interrupts_with_pending_gradient_resumes_identically_and_reloads",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs::training::runner::tests::real_loop_interrupts_with_pending_gradient_resumes_identically_and_reloads",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs::training::runner::tests::real_loop_interrupts_with_pending_gradient_resumes_identically_and_reloads/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs::training::runner::tests::real_loop_interrupts_with_pending_gradient_resumes_identically_and_reloads",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "candle_gen_flux3",
+    "target_kind": "lib",
+    "fqn": "training::runner::tests::trained_export_loads_through_the_public_base_provider_and_changes_generation",
+    "source": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_flux3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs::training::runner::tests::trained_export_loads_through_the_public_base_provider_and_changes_generation",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs::training::runner::tests::trained_export_loads_through_the_public_base_provider_and_changes_generation",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs::training::runner::tests::trained_export_loads_through_the_public_base_provider_and_changes_generation/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs::training::runner::tests::trained_export_loads_through_the_public_base_provider_and_changes_generation/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cpu",
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/src/training/runner.rs::training::runner::tests::trained_export_loads_through_the_public_base_provider_and_changes_generation",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "ae_parity::decode_random_tokens_matches_upstream",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::decode_random_tokens_matches_upstream",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::decode_random_tokens_matches_upstream",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::decode_random_tokens_matches_upstream/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::decode_random_tokens_matches_upstream",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "ae_parity::decode_random_tokens_matches_upstream_on_device",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::decode_random_tokens_matches_upstream_on_device",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::decode_random_tokens_matches_upstream_on_device",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::decode_random_tokens_matches_upstream_on_device/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::decode_random_tokens_matches_upstream_on_device/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::decode_random_tokens_matches_upstream_on_device",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "ae_parity::decode_round_trip_matches_upstream",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::decode_round_trip_matches_upstream",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::decode_round_trip_matches_upstream",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::decode_round_trip_matches_upstream/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::decode_round_trip_matches_upstream",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "ae_parity::encode_matches_upstream",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::encode_matches_upstream",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::encode_matches_upstream",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::encode_matches_upstream/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/ae_parity.rs::ae_parity::encode_matches_upstream",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "ae_training_precision::frozen_training_encoder_selected_precision_cpu_emulation",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/ae_training_precision.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/ae_training_precision.rs::ae_training_precision::frozen_training_encoder_selected_precision_cpu_emulation",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/ae_training_precision.rs::ae_training_precision::frozen_training_encoder_selected_precision_cpu_emulation",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/ae_training_precision.rs::ae_training_precision::frozen_training_encoder_selected_precision_cpu_emulation/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/ae_training_precision.rs::ae_training_precision::frozen_training_encoder_selected_precision_cpu_emulation",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "dit_parity::base_cfg_and_explicit_adapter_identity_match_frozen_source",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::base_cfg_and_explicit_adapter_identity_match_frozen_source",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::base_cfg_and_explicit_adapter_identity_match_frozen_source",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::base_cfg_and_explicit_adapter_identity_match_frozen_source/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::base_cfg_and_explicit_adapter_identity_match_frozen_source",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "dit_parity::flow_map_inputs_and_config_are_checked",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::flow_map_inputs_and_config_are_checked",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::flow_map_inputs_and_config_are_checked",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::flow_map_inputs_and_config_are_checked/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::flow_map_inputs_and_config_are_checked",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "dit_parity::ordered_reference_edits_match_frozen_source",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::ordered_reference_edits_match_frozen_source",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::ordered_reference_edits_match_frozen_source",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::ordered_reference_edits_match_frozen_source/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::ordered_reference_edits_match_frozen_source",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "dit_parity::single_sample_forward_matches_upstream_in_bf16",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::single_sample_forward_matches_upstream_in_bf16",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::single_sample_forward_matches_upstream_in_bf16",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::single_sample_forward_matches_upstream_in_bf16/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::single_sample_forward_matches_upstream_in_bf16/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::single_sample_forward_matches_upstream_in_bf16",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "dit_parity::single_sample_forward_matches_upstream_in_fp32",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::single_sample_forward_matches_upstream_in_fp32",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::single_sample_forward_matches_upstream_in_fp32",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::single_sample_forward_matches_upstream_in_fp32/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::single_sample_forward_matches_upstream_in_fp32",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "dit_parity::two_sample_pack_matches_upstream_in_fp32",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::two_sample_pack_matches_upstream_in_fp32",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::two_sample_pack_matches_upstream_in_fp32",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::two_sample_pack_matches_upstream_in_fp32/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/dit_parity.rs::dit_parity::two_sample_pack_matches_upstream_in_fp32",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "e2e_parity::bf16_release_policy_matches_upstream_autocast_loop",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/e2e_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/e2e_parity.rs::e2e_parity::bf16_release_policy_matches_upstream_autocast_loop",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/e2e_parity.rs::e2e_parity::bf16_release_policy_matches_upstream_autocast_loop",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/e2e_parity.rs::e2e_parity::bf16_release_policy_matches_upstream_autocast_loop/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/e2e_parity.rs::e2e_parity::bf16_release_policy_matches_upstream_autocast_loop/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/e2e_parity.rs::e2e_parity::bf16_release_policy_matches_upstream_autocast_loop",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "e2e_parity::generate_matches_upstream_from_injected_noise",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/e2e_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/e2e_parity.rs::e2e_parity::generate_matches_upstream_from_injected_noise",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/e2e_parity.rs::e2e_parity::generate_matches_upstream_from_injected_noise",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/e2e_parity.rs::e2e_parity::generate_matches_upstream_from_injected_noise/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/e2e_parity.rs::e2e_parity::generate_matches_upstream_from_injected_noise",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "generator_contract::an_unseeded_request_is_seeded_from_its_prompt",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::an_unseeded_request_is_seeded_from_its_prompt",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::an_unseeded_request_is_seeded_from_its_prompt",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::an_unseeded_request_is_seeded_from_its_prompt/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::an_unseeded_request_is_seeded_from_its_prompt/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::an_unseeded_request_is_seeded_from_its_prompt",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "generator_contract::base_cfg_adapter_loads_through_the_public_provider_for_both_residencies",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::base_cfg_adapter_loads_through_the_public_provider_for_both_residencies",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::base_cfg_adapter_loads_through_the_public_provider_for_both_residencies",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::base_cfg_adapter_loads_through_the_public_provider_for_both_residencies/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::base_cfg_adapter_loads_through_the_public_provider_for_both_residencies/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::base_cfg_adapter_loads_through_the_public_provider_for_both_residencies",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "generator_contract::callback_cancel_at_conditioning_boundary_stops_before_denoise",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::callback_cancel_at_conditioning_boundary_stops_before_denoise",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::callback_cancel_at_conditioning_boundary_stops_before_denoise",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::callback_cancel_at_conditioning_boundary_stops_before_denoise/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::callback_cancel_at_conditioning_boundary_stops_before_denoise/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::callback_cancel_at_conditioning_boundary_stops_before_denoise",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "generator_contract::cancellation_is_typed",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::cancellation_is_typed",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::cancellation_is_typed",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::cancellation_is_typed/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::cancellation_is_typed/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::cancellation_is_typed",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "generator_contract::components_override_the_bundled_copies",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::components_override_the_bundled_copies",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::components_override_the_bundled_copies",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::components_override_the_bundled_copies/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::components_override_the_bundled_copies/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::components_override_the_bundled_copies",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "generator_contract::effective_caption_is_recorded_before_encoding_and_prompt_derived_seeding",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::effective_caption_is_recorded_before_encoding_and_prompt_derived_seeding",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::effective_caption_is_recorded_before_encoding_and_prompt_derived_seeding",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::effective_caption_is_recorded_before_encoding_and_prompt_derived_seeding/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::effective_caption_is_recorded_before_encoding_and_prompt_derived_seeding/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::effective_caption_is_recorded_before_encoding_and_prompt_derived_seeding",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "generator_contract::gen_core_conformance_resident",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::gen_core_conformance_resident",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::gen_core_conformance_resident",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::gen_core_conformance_resident/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::gen_core_conformance_resident/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::gen_core_conformance_resident",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "generator_contract::gen_core_conformance_sequential",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::gen_core_conformance_sequential",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::gen_core_conformance_sequential",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::gen_core_conformance_sequential/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::gen_core_conformance_sequential/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::gen_core_conformance_sequential",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "generator_contract::progress_is_steps_then_one_decoding_and_output_is_rgb8",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::progress_is_steps_then_one_decoding_and_output_is_rgb8",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::progress_is_steps_then_one_decoding_and_output_is_rgb8",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::progress_is_steps_then_one_decoding_and_output_is_rgb8/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::progress_is_steps_then_one_decoding_and_output_is_rgb8/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::progress_is_steps_then_one_decoding_and_output_is_rgb8",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "generator_contract::prompt_upsampling_terminal_boundary_native_provider",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::prompt_upsampling_terminal_boundary_native_provider",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::prompt_upsampling_terminal_boundary_native_provider",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::prompt_upsampling_terminal_boundary_native_provider/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::prompt_upsampling_terminal_boundary_native_provider/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::prompt_upsampling_terminal_boundary_native_provider",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "generator_contract::public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progress",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progress",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progress",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progress/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progress/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/generator_contract.rs::generator_contract::public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progress",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "pup_parity::default_backend_executes_all_modes_with_ordered_references_and_locked_boxes",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::default_backend_executes_all_modes_with_ordered_references_and_locked_boxes",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::default_backend_executes_all_modes_with_ordered_references_and_locked_boxes",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::default_backend_executes_all_modes_with_ordered_references_and_locked_boxes/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::default_backend_executes_all_modes_with_ordered_references_and_locked_boxes/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::default_backend_executes_all_modes_with_ordered_references_and_locked_boxes",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "pup_parity::native_cpu_f32_edit_matches_the_shared_oracle",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_edit_matches_the_shared_oracle",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_edit_matches_the_shared_oracle",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_edit_matches_the_shared_oracle/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_edit_matches_the_shared_oracle",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "pup_parity::native_cpu_f32_edit_with_boxes_matches_the_shared_oracle",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_edit_with_boxes_matches_the_shared_oracle",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_edit_with_boxes_matches_the_shared_oracle",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_edit_with_boxes_matches_the_shared_oracle/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_edit_with_boxes_matches_the_shared_oracle",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "pup_parity::native_cpu_f32_text_matches_the_shared_oracle",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_text_matches_the_shared_oracle",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_text_matches_the_shared_oracle",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_text_matches_the_shared_oracle/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_text_matches_the_shared_oracle",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "pup_parity::native_cpu_f32_text_with_boxes_matches_the_shared_oracle",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_text_with_boxes_matches_the_shared_oracle",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_text_with_boxes_matches_the_shared_oracle",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_text_with_boxes_matches_the_shared_oracle/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_text_with_boxes_matches_the_shared_oracle",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::real_autoencoder_decode_matches_upstream",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Pinned externally installed FLUX3 package and existing source golden/output controls; crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_autoencoder_decode_matches_upstream",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_autoencoder_decode_matches_upstream",
+    "required_environment": [
+      "FLUX3_PACKAGE_DIR"
+    ],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_autoencoder_decode_matches_upstream/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_autoencoder_decode_matches_upstream/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_autoencoder_decode_matches_upstream",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::real_distilled_text_to_image_renders",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Pinned externally installed FLUX3 package and existing source golden/output controls; crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_distilled_text_to_image_renders",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_distilled_text_to_image_renders",
+    "required_environment": [
+      "FLUX3_PACKAGE_DIR",
+      "FLUX3_OUT"
+    ],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_distilled_text_to_image_renders/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_distilled_text_to_image_renders/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_distilled_text_to_image_renders",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::real_dit_forward_matches_upstream",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Pinned externally installed FLUX3 package and existing source golden/output controls; crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_dit_forward_matches_upstream",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_dit_forward_matches_upstream",
+    "required_environment": [
+      "FLUX3_PACKAGE_DIR"
+    ],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_dit_forward_matches_upstream/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_dit_forward_matches_upstream/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_dit_forward_matches_upstream",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::real_e2e_64_matches_upstream",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Pinned externally installed FLUX3 package and existing source golden/output controls; crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_e2e_64_matches_upstream",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_e2e_64_matches_upstream",
+    "required_environment": [
+      "FLUX3_PACKAGE_DIR"
+    ],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_e2e_64_matches_upstream/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_e2e_64_matches_upstream/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_e2e_64_matches_upstream",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::real_text_encoder_matches_upstream",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Pinned externally installed FLUX3 package and existing source golden/output controls; crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_text_encoder_matches_upstream",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_text_encoder_matches_upstream",
+    "required_environment": [
+      "FLUX3_PACKAGE_DIR"
+    ],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_text_encoder_matches_upstream/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_text_encoder_matches_upstream/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::real_text_encoder_matches_upstream",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "text_parity::pad_rows_are_identical_states_not_zeros",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::pad_rows_are_identical_states_not_zeros",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::pad_rows_are_identical_states_not_zeros",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::pad_rows_are_identical_states_not_zeros/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::pad_rows_are_identical_states_not_zeros",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "text_parity::stacking_the_wrong_layers_lands_far_outside_the_bound",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::stacking_the_wrong_layers_lands_far_outside_the_bound",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::stacking_the_wrong_layers_lands_far_outside_the_bound",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::stacking_the_wrong_layers_lands_far_outside_the_bound/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::stacking_the_wrong_layers_lands_far_outside_the_bound",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "text_parity::windows_positions_and_stacked_states_match_upstream",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::windows_positions_and_stacked_states_match_upstream",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::windows_positions_and_stacked_states_match_upstream",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::windows_positions_and_stacked_states_match_upstream/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::windows_positions_and_stacked_states_match_upstream",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "text_parity::windows_positions_and_stacked_states_match_upstream_on_device",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::windows_positions_and_stacked_states_match_upstream_on_device",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::windows_positions_and_stacked_states_match_upstream_on_device",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::windows_positions_and_stacked_states_match_upstream_on_device/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      },
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::windows_positions_and_stacked_states_match_upstream_on_device/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions and cases on actual source-selected devices; external assets and hardware required; missing work is not proof"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/text_parity.rs::text_parity::windows_positions_and_stacked_states_match_upstream_on_device",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "text_training::explicit_f32_teacher_is_not_bf16_output_upcast_and_honors_training_window",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/text_training.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/text_training.rs::text_training::explicit_f32_teacher_is_not_bf16_output_upcast_and_honors_training_window",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/text_training.rs::text_training::explicit_f32_teacher_is_not_bf16_output_upcast_and_honors_training_window",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/text_training.rs::text_training::explicit_f32_teacher_is_not_bf16_output_upcast_and_honors_training_window/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/text_training.rs::text_training::explicit_f32_teacher_is_not_bf16_output_upcast_and_honors_training_window",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "training_checkpoint::interrupted_gradient_accumulation_is_saved_and_resumed_without_reset",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs::training_checkpoint::interrupted_gradient_accumulation_is_saved_and_resumed_without_reset",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs::training_checkpoint::interrupted_gradient_accumulation_is_saved_and_resumed_without_reset",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs::training_checkpoint::interrupted_gradient_accumulation_is_saved_and_resumed_without_reset/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs::training_checkpoint::interrupted_gradient_accumulation_is_saved_and_resumed_without_reset",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "training_checkpoint::mismatched_identity_and_corrupted_state_are_refused_before_mutating_factors",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs::training_checkpoint::mismatched_identity_and_corrupted_state_are_refused_before_mutating_factors",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs::training_checkpoint::mismatched_identity_and_corrupted_state_are_refused_before_mutating_factors",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs::training_checkpoint::mismatched_identity_and_corrupted_state_are_refused_before_mutating_factors/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs::training_checkpoint::mismatched_identity_and_corrupted_state_are_refused_before_mutating_factors",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "training_checkpoint::real_saved_checkpoint_resumes_optimizer_then_adapter_reloads_with_effect_and_zero_identity",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs::training_checkpoint::real_saved_checkpoint_resumes_optimizer_then_adapter_reloads_with_effect_and_zero_identity",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs::training_checkpoint::real_saved_checkpoint_resumes_optimizer_then_adapter_reloads_with_effect_and_zero_identity",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs::training_checkpoint::real_saved_checkpoint_resumes_optimizer_then_adapter_reloads_with_effect_and_zero_identity/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/training_checkpoint.rs::training_checkpoint::real_saved_checkpoint_resumes_optimizer_then_adapter_reloads_with_effect_and_zero_identity",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "training_parity::all_six_projection_families_and_earlier_blocks_match_two_adamw_steps",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/training_parity.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed FLUX3 miniature source/golden fixtures; crates/media/candle-gen/candle-gen-flux3/tests/training_parity.rs::training_parity::all_six_projection_families_and_earlier_blocks_match_two_adamw_steps",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/training_parity.rs::training_parity::all_six_projection_families_and_earlier_blocks_match_two_adamw_steps",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "feature-only",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/training_parity.rs::training_parity::all_six_projection_families_and_earlier_blocks_match_two_adamw_steps/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Complete original assertions, all original loop cases, plus unchanged prerequisite and cancellation/error controls; no early-return or missing-body acceptance"
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/training_parity.rs::training_parity::all_six_projection_families_and_earlier_blocks_match_two_adamw_steps",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
   }
 ]

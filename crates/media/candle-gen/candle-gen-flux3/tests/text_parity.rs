@@ -121,15 +121,20 @@ fn check_windows_positions_and_stacked_states(te: &Flux3TextEncoder) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn windows_positions_and_stacked_states_match_upstream() {
     let te = encoder(&cpu());
     assert_eq!(te.dtype(), DType::F32, "the CPU tower runs in f32");
     check_windows_positions_and_stacked_states(&te);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED text_parity::windows_positions_and_stacked_states_match_upstream");
 }
 
 /// The same gate on the build's device: under `--features cuda` the tower runs the real bf16
 /// kernels (on a CPU build this is the test above again).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn windows_positions_and_stacked_states_match_upstream_on_device() {
     let device = device();
     let te = encoder(&device);
@@ -137,6 +142,9 @@ fn windows_positions_and_stacked_states_match_upstream_on_device() {
         assert_eq!(te.dtype(), DType::BF16, "the GPU tower runs in bf16");
     }
     check_windows_positions_and_stacked_states(&te);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED text_parity::windows_positions_and_stacked_states_match_upstream_on_device");
 }
 
 /// The pad rows are real conditioning (the pad token's state at position 1 over the real keys),
@@ -145,6 +153,7 @@ fn windows_positions_and_stacked_states_match_upstream_on_device() {
 /// *Mutation that reds this:* zeroing or dropping the pad rows, or giving the pads their
 /// sequential positions (the rows then differ from each other).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn pad_rows_are_identical_states_not_zeros() {
     let te = encoder(&cpu());
     let out = te.encode("a red fox in the snow").unwrap();
@@ -187,6 +196,11 @@ fn pad_rows_are_identical_states_not_zeros() {
         max_abs > 1e-2 * peak.max(1.0),
         "sequential pad positions must change the pad rows (max|Δ|={max_abs:.3e})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED text_parity::pad_rows_are_identical_states_not_zeros"
+    );
 }
 
 /// The evidence behind the CPU bound: stacking the wrong layers (every selected layer shifted by
@@ -197,6 +211,7 @@ fn pad_rows_are_identical_states_not_zeros() {
 /// *Mutation that reds this:* loosening `MAX_TOL` / `MEAN_TOL` toward the
 /// shifted-layer distance.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn stacking_the_wrong_layers_lands_far_outside_the_bound() {
     let config = tiny_config();
     let mut shifted_cfg = config.text_encoder.clone();
@@ -228,4 +243,7 @@ fn stacking_the_wrong_layers_lands_far_outside_the_bound() {
             "{name}: a one-layer shift must exceed three times the CPU mean bound"
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED text_parity::stacking_the_wrong_layers_lands_far_outside_the_bound");
 }

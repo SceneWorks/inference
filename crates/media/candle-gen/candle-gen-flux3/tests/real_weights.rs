@@ -130,6 +130,9 @@ fn real_text_encoder_matches_upstream() {
         g.require("text/tokens"),
         4e-2,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_text_encoder_matches_upstream");
 }
 
 /// One flow-map forward of the real DiT on the golden's inputs. Under bf16 the bound is 1.5× the
@@ -194,6 +197,9 @@ fn real_dit_forward_matches_upstream() {
             bound,
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_dit_forward_matches_upstream");
 }
 
 /// The real autoencoder decodes the golden's random tokens (4×4) to upstream's f32 image.
@@ -216,6 +222,11 @@ fn real_autoencoder_decode_matches_upstream() {
         &decoded,
         &batched_nchw(g.require("ae/decoded")),
         5e-3,
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_autoencoder_decode_matches_upstream"
     );
 }
 
@@ -291,6 +302,9 @@ fn real_e2e_64_matches_upstream() {
         (1.5 * distance).max(bound)
     };
     assert_close("real e2e/image", &image, &want_image, image_bound);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_e2e_64_matches_upstream");
 }
 
 /// The ordinary catalog route on the real package: `provider_registry().load("flux3_klein")` →
@@ -402,4 +416,7 @@ fn real_distilled_text_to_image_renders() {
         png.display()
     );
     let _ = Progress::Decoding;
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_distilled_text_to_image_renders");
 }

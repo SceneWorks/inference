@@ -101,6 +101,7 @@ fn numeric(label: &str, got: &Tensor, expected: &Tensor, absolute: f32, relative
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn all_six_projection_families_and_earlier_blocks_match_two_adamw_steps() {
     let device = Device::Cpu;
     let mut config = tiny_config();
@@ -213,6 +214,8 @@ fn all_six_projection_families_and_earlier_blocks_match_two_adamw_steps() {
             }
         }
     }
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED training_parity::all_six_projection_families_and_earlier_blocks_match_two_adamw_steps");
 }
 
 #[test]
