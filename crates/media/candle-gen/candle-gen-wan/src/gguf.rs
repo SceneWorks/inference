@@ -1399,7 +1399,7 @@ mod tests {
         tensors.insert("blocks.0.self_attn.q.weight".into(), qt);
         let path = write_gguf(&tmp, &tensors, "q4k-golden");
         let mut file = std::fs::File::open(&path).unwrap();
-        let content = gguf_file::Content::read_with_path(&mut file, path).unwrap();
+        let content = gguf_file::Content::read_with_path(&mut file, &path).unwrap();
         assert_eq!(
             content.tensor_infos["blocks.0.self_attn.q.weight"].ggml_dtype,
             GgmlDType::Q4K
