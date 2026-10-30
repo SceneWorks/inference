@@ -1169,6 +1169,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                                               stdout_path=stdout, stderr_path=stderr,
                                               event_path=case_work / (phase + '.events.jsonl'),
                                               require_gpu_sample=False,
+                                              reap_metadata_descendants=discover and discovery_policy.backend == 'windows-cpu',
                                               pass_fds=((int(env['SCENEWORKS_METAL_EXECUTION_LOCK_FD']),)
                                                         if 'SCENEWORKS_METAL_EXECUTION_LOCK_FD' in env else ()), **supervision)
                         result['commands'].append({'argv': argv, 'supervision': asdict(guarded), 'owned_tree_empty': True})
