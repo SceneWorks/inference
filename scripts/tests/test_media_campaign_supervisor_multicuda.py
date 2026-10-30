@@ -169,7 +169,7 @@ class MultiCudaSupervisorTests(unittest.TestCase):
                     self.assertEqual(len(timeline.stopped), 1)
                     path = self.root / f'failure-{basis}-{breach}.json'
                     safety.write_unaccepted_record(path, kind='test', coordinate='single', error=error)
-                    saved = json.loads(path.read_text())
+                    saved = json.loads(path.read_text(encoding='utf-8'))
                     self.assertFalse(saved['accepted'])
                     self.assertEqual(saved['watchdogDeviceMemory'], sample)
 

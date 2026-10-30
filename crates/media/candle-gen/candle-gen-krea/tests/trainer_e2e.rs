@@ -301,7 +301,7 @@ fn krea_bounded_acceleration_profile() {
         let metrics = serde_json::json!({
             "schema_version": 1,
             "completed_optimizer_updates": out.steps,
-            "reference_baseline": "Repaired dense standard-softmax Reference with one autograd owner and transient backward recomputation, common to reference/shared segments; not the original memory-unfit retained-score graph.",
+            "reference_baseline": "Repaired dense standard-softmax Reference with internal query tiles (at most 32Mi score elements, respecting smaller caller budgets), plus RMS/RoPE single autograd owners; common to matched segments. Original divide/reciprocal selection and F32 rounding boundaries retained. Not the original memory-unfit retained-intermediate graph.",
             "configuration": {
                 "rank": req.config.rank,
                 "alpha": req.config.alpha,

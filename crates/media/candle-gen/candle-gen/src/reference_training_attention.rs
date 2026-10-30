@@ -11,6 +11,23 @@ use gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use gen_core::CancelFlag;
 use std::sync::{Arc, Mutex};
 
+// A caller's budget is an upper limit, not a minimum tile size. Bound transient
+// dense scores in both passes even when the caller asks for unbounded attention.
+// This does not retain scores, change checkpointing, or select the streaming kernel.
+const REFERENCE_SCORE_TILE_ELEMENTS: u64 = 32 * 1024 * 1024;
+
+fn reference_plan(plan: AttentionPlan<'_>) -> AttentionPlan<'_> {
+    AttentionPlan {
+        budget: AttentionBudget::from_score_elements(
+            plan.budget
+                .max_score_elements()
+                .min(REFERENCE_SCORE_TILE_ELEMENTS),
+            plan.budget.eval_per_chunk(),
+        ),
+        cancel: plan.cancel,
+    }
+}
+
 fn eligible(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> bool {
     let (Ok((b, h, sq, d)), Ok((kb, kh, sk, kd))) = (q.dims4(), k.dims4()) else {
         return false;
@@ -49,8 +66,9 @@ pub(crate) fn try_forward(
     if mask.is_some() || !eligible(q, k, v, scale) {
         return Ok(None);
     }
-    // Detached arithmetic is the exact standard-softmax reference, including its
-    // query budget and dtype. No score tensor acquires an outer autograd edge.
+    // Same per-query standard-softmax arithmetic/dtype. Internal query tiles
+    // respect (and can be smaller than) the caller's scratch upper limit.
+    let plan = reference_plan(plan);
     let out = crate::attention::sdpa_planned_bhsd(
         &q.detach(),
         &k.detach(),
@@ -88,7 +106,7 @@ impl Reference {
             output: Arc::new(Mutex::new(Some(storage.try_clone(layout)?))),
             shape: out.shape().clone(),
             scale,
-            budget: plan.budget,
+            budget: reference_plan(plan).budget,
             cancel: plan.cancel.cloned(),
         })
     }
@@ -147,6 +165,19 @@ mod tests {
     #[test]
     #[ignore = "CUDA numerical proof; explicit manual raw arithmetic workflow"]
     fn dense_reference_forward_backward_matches_composable() -> crate::Result<()> {
+        let bounded = reference_plan(AttentionPlan::UNBOUNDED);
+        assert_eq!(
+            bounded.budget.max_score_elements(),
+            REFERENCE_SCORE_TILE_ELEMENTS
+        );
+        // Production Krea geometry must split even the originally unbounded
+        // request; smaller caller budgets still determine the finer partition.
+        assert!(bounded.budget.query_block_rows(48 * 4096, 4096) < 4096);
+        let fine = reference_plan(AttentionPlan::budgeted(
+            AttentionBudget::from_score_elements(24, true),
+        ));
+        assert_eq!(fine.budget.max_score_elements(), 24);
+        assert!(fine.budget.eval_per_chunk());
         let dev = Device::new_cuda(0)?;
         let values = |n: usize, offset: usize| {
             (0..n)
@@ -237,7 +268,7 @@ mod tests {
                 let owner = Reference::new(detached, scale, plan)?;
                 let slot = owner.output.clone();
                 let _out = qview.apply_op3(&kr, &vr, owner)?;
-                assert!(slot.lock().unwrap().is_none());
+                assert!(crate::lock_recover(&slot).is_none());
                 assert!(
                     Reference::new(legacy(&qview, &kr, &vr, scale, budget)?, scale, plan).is_err()
                 );

@@ -55,8 +55,9 @@ use candle_gen::quant::QLinear as SharedQLinear;
 use crate::loader::{linear, linear_detect, rms_scale_weight, Weights};
 use crate::quant::QLinear as KreaQLinear;
 use crate::transformer::block::{RmsScale, SwiGlu, TextFusionTransformer};
-use crate::transformer::rope::{apply_interleaved_rope, RopeTables};
+use crate::transformer::rope::RopeTables;
 use crate::transformer::{patchify, temb, unpatchify, RopeCache, ROPE_CACHE_CAP};
+use candle_gen::train::krea_ops::rotary_interleaved as apply_interleaved_rope;
 
 /// Default LoRA target suffixes — the single-stream blocks' attention projections (`to_out.0` is the
 /// first element of diffusers' `to_out` `ModuleList`, so the suffix literally carries the `.0`). With
@@ -70,7 +71,7 @@ pub const KREA_ATTN_TARGETS: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
 /// the same op the inference path applies — just one the autograd can traverse.
 pub(crate) fn rms_scale_diff(x: &Tensor, weight_f32: &Tensor, eps: f64) -> Result<Tensor> {
     candle_gen::train::profile::span("norm_forward", x.device(), || {
-        candle_gen::train::norm::rms_norm_diff(x, weight_f32, eps)
+        candle_gen::train::krea_ops::rms_scale(x, weight_f32, eps)
     })
 }
 

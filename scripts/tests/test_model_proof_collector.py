@@ -555,7 +555,7 @@ class Collector(unittest.TestCase):
             self.assertEqual(receipt['completed'], 0)
             self.assertFalse(receipt['accepted'])
             self.assertFalse(verified['accepted_model_run'])
-            result = json.loads((output / '00000/result.json').read_text())
+            result = json.loads((output / '00000/result.json').read_text(encoding='utf-8'))
             self.assertEqual(result['supervision_failure']['watchdog_device_memory'], error.watchdog_device_memory)
             self.assertEqual(receipt['cases'][0]['supervision_failure'], result['supervision_failure'])
 
