@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 struct Ranges {
     spans: BTreeMap<u64, u64>,
     bytes: u64,
+    published: u64,
     active: Option<(u64, LoadActivityFile)>,
     next: u64,
 }
@@ -24,6 +25,7 @@ pub struct SourceProgress {
     path: PathBuf,
     total: Option<u64>,
     ranges: Arc<Mutex<Ranges>>,
+    emission: Arc<Mutex<()>>,
 }
 impl std::fmt::Debug for SourceProgress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -41,27 +43,31 @@ impl SourceProgress {
         path: impl AsRef<Path>,
         total: Option<u64>,
     ) -> Self {
-        let path = path.as_ref().to_path_buf();
+        let path =
+            std::path::absolute(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
         context.reset_file(&path);
         Self {
             context,
             path,
             total,
             ranges: Arc::default(),
+            emission: Arc::default(),
         }
     }
     pub fn operation(&self) -> ReadOperation {
-        let activity = self
-            .context
-            .file(LoadActivityPhase::Loading, &self.path, self.total);
-        let (bytes, id) = {
+        let _emission = self.emission.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes = self.ranges.lock().unwrap_or_else(|e| e.into_inner()).bytes;
+        let activity =
+            self.context
+                .file_with_bytes(LoadActivityPhase::Loading, &self.path, self.total, bytes);
+        let id = {
             let mut r = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
             r.next += 1;
             let id = r.next;
             r.active = Some((id, activity.clone()));
-            (r.bytes, id)
+            r.published = bytes;
+            id
         };
-        activity.update(bytes);
         ReadOperation {
             source: self.clone(),
             activity,
@@ -81,6 +87,31 @@ impl SourceProgress {
 
 impl SourceProgress {
     fn record(&self, activity: &LoadActivityFile, start: u64, len: u64) {
+        let _emission = self.emission.lock().unwrap_or_else(|e| e.into_inner());
+        self.record_inner(activity, start, len);
+    }
+    fn record_read(&self, start: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let _emission = self.emission.lock().unwrap_or_else(|e| e.into_inner());
+        let (active, bytes) = {
+            let r = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
+            (r.active.as_ref().map(|(_, h)| h.clone()), r.bytes)
+        };
+        let transient = active.is_none();
+        let activity = active.unwrap_or_else(|| {
+            self.context
+                .file_with_bytes(LoadActivityPhase::Loading, &self.path, self.total, bytes)
+        });
+        self.record_inner(&activity, start, len);
+        if transient {
+            let bytes = self.ranges.lock().unwrap_or_else(|e| e.into_inner()).bytes;
+            activity.update(bytes);
+            activity.finish();
+        }
+    }
+    fn record_inner(&self, activity: &LoadActivityFile, start: u64, len: u64) {
         if len == 0 || !self.context.is_observed() {
             return;
         }
@@ -113,6 +144,12 @@ impl SourceProgress {
             }
             r.spans.insert(start, end);
             r.bytes += end - start;
+            // Primitive header parsers can perform millions of tiny reads. Keep exact interval
+            // accounting but bound observer traffic; operation completion flushes the remainder.
+            if r.bytes.saturating_sub(r.published) < 64 * 1024 {
+                return;
+            }
+            r.published = r.bytes;
             r.bytes
         };
         activity.update(bytes);
@@ -133,11 +170,24 @@ impl ReadOperation {
 }
 impl Drop for ReadOperation {
     fn drop(&mut self) {
-        {
+        let _emission = self
+            .source
+            .emission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let flush = {
             let mut r = self.source.ranges.lock().unwrap_or_else(|e| e.into_inner());
             if r.active.as_ref().is_some_and(|(id, _)| *id == self.id) {
                 r.active = None;
+                let changed = r.bytes != r.published;
+                r.published = r.bytes;
+                changed.then_some(r.bytes)
+            } else {
+                None
             }
+        };
+        if let Some(bytes) = flush {
+            self.activity.update(bytes);
         }
         self.activity.finish();
     }
@@ -161,25 +211,9 @@ impl<R> ProgressReader<R> {
 }
 impl<R: Read> Read for ProgressReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // A transient operation also permits persistent ZIP readers: each actual read is observed,
-        // while parsing/compute between archive calls never leaves a stale loading phase.
-        let active = self
-            .source
-            .ranges
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .active
-            .as_ref()
-            .map(|(_, h)| h.clone());
-        let transient = active.is_none().then(|| self.source.operation());
         let result = self.inner.read(buf);
         if let Ok(n) = result {
-            if let Some(operation) = transient.as_ref() {
-                operation.record(self.position, n as u64);
-            } else if let Some(activity) = active {
-                // Borrow the existing operation's handle without ending its lifetime.
-                self.source.record(&activity, self.position, n as u64);
-            }
+            self.source.record_read(self.position, n as u64);
             self.position = self.position.saturating_add(n as u64);
         }
         result
@@ -212,6 +246,10 @@ mod tests {
         reader.seek(SeekFrom::Start(2)).unwrap();
         reader.read_exact(&mut buf).unwrap();
         reader.finish();
+        reader.begin();
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_exact(&mut buf).unwrap();
+        reader.finish();
         let events = events.lock().unwrap();
         let counts: Vec<_> = events
             .iter()
@@ -239,6 +277,24 @@ mod tests {
         .unwrap();
         let events = events.lock().unwrap();
         assert!(events.iter().flatten().any(|v| v.bytes_read == 2));
+        assert_eq!(events.last(), Some(&None));
+    }
+    #[test]
+    fn primitive_reads_are_coalesced_and_completion_flushes_exact_bytes() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let _observer = LoadActivityObserver::new(move |v| output.lock().unwrap().push(v));
+        let source = SourceProgress::new("header.gguf", Some(1000));
+        {
+            let operation = source.operation();
+            for offset in 0..1000 {
+                operation.record(offset, 1);
+            }
+            assert_eq!(events.lock().unwrap().len(), 1);
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1].as_ref().unwrap().bytes_read, 1000);
         assert_eq!(events.last(), Some(&None));
     }
 }
