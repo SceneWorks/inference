@@ -479,6 +479,7 @@ impl DepthWindow {
             self.discard();
             return Ok(None);
         };
+        let cohort_loss = self.mean_loss() as f32;
         self.discard();
         let grads: Tensors = grads
             .into_iter()
@@ -488,7 +489,17 @@ impl DepthWindow {
         if let Some((ema, decay)) = ema {
             ema_update(ema, params, decay)?;
         }
+        let cohort_vars = super::cohort_before_named_update(params, &grads, opt)?;
         opt.step(params, &grads, lr)?;
+        candle_gen::train::profile::cohort_after_update();
+        if let Some(var) = cohort_vars.first() {
+            candle_gen::train::profile::cohort_end_step(
+                var.device(),
+                cohort_loss,
+                &cohort_vars,
+                "iris-depth",
+            )?;
+        }
         Ok(Some(norm))
     }
 }
@@ -838,6 +849,7 @@ impl Run {
                     cancelled = true;
                     break;
                 }
+                candle_gen::train::profile::cohort_begin_step(&self.model.device)?;
                 let batch = assemble_batch(req, &plan, &self.kept, &self.walk, epoch, pos)?;
                 let step = DepthStep::new(&batch, &plan.loss, &self.model.device)?;
                 drop(batch);

@@ -28,6 +28,7 @@ pub fn lin_bias(vb: &VarBuilder, name: &str) -> Result<Linear> {
 /// `w` broadcasts over the leading dims — used both for the per-head q/k norm (over `head_dim`) and
 /// the feature-axis norms. Reductions use f32; normalized values round before the weight.
 pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
+    candle_gen::train::profile::cohort_reuse("anima:shared-differentiable-RMS");
     Ok(candle_gen::train::norm::rms_norm_cast_before_weight(
         x, w, eps,
     )?)

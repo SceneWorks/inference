@@ -289,3 +289,157 @@ fn real_lora_trains_exports_and_renders() {
         "\nMODEL_INFERENCE_BODY_COMPLETED train_real_weights::real_lora_trains_exports_and_renders"
     );
 }
+
+#[cfg(feature = "model-inference-proof")]
+fn bounded_root() -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("MODEL_PROOF_OUTPUT_DIR").expect("manual executor output directory"),
+    )
+    .join("bespoke_acceptance");
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_runtime() -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("BESPOKE_RUNTIME_DIR")
+            .expect("source-owned persistent runtime checkpoint directory"),
+    );
+    assert!(root.is_absolute());
+    assert!(
+        root.join(".sc-26850-owned-runtime").is_file(),
+        "asset setup owns this runtime directory"
+    );
+    root
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, root: &std::path::Path) {
+    let peak = sampler.stop();
+    assert!(peak > 0);
+    std::fs::write(
+        root.join("peak_device_bytes.txt"),
+        (peak * 1024 * 1024).to_string(),
+    )
+    .unwrap();
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_export_receipt(root: &std::path::Path, path: &std::path::Path) {
+    assert!(
+        path.starts_with(bounded_runtime()),
+        "actual export stays in the owned runtime area"
+    );
+    let receipt = serde_json::json!({"actual_export":path, "bytes":std::fs::metadata(path).unwrap().len(),
+        "sha256":candle_gen::testkit::sha256_file(path), "runtime_directory":bounded_runtime(),
+        "publication":"complete model/control checkpoint retained in legitimate runtime storage; model-weight publication ban preserved",
+        "reload":"same exported path reopened/applied by production reader before sample; see actual reader receipts"});
+    std::fs::write(
+        root.join("retained_export.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+#[cfg(feature = "model-inference-proof")]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn iris_generation_bounded_acceleration_acceptance() {
+    use candle_gen::gen_core::{GenerationOutput, GenerationRequest};
+    let root = bounded_root();
+    assert!(
+        std::env::var_os("IRIS_TRAIN_DATA").is_none(),
+        "bounded source case uses existing repository-photo helper"
+    );
+    let items = dataset(&root);
+    let mut spec = LoadSpec::new(WeightsSource::Dir(env_dir("IRIS_WEIGHTS_DIR")));
+    spec.components.insert(
+        TEXT_ENCODER_COMPONENT.into(),
+        WeightsSource::Dir(env_dir("IRIS_TEXT_ENCODER_DIR")),
+    );
+    let mut config = TrainingConfig {
+        rank: 8,
+        alpha: 8.,
+        learning_rate: 1e-4,
+        steps: 4,
+        resolution: 256,
+        batch_size: 1,
+        gradient_accumulation: 1,
+        lr_warmup_steps: 0,
+        save_every: 0,
+        seed: 7,
+        train_dtype: "bf16".into(),
+        gradient_checkpointing: false,
+        ..Default::default()
+    };
+    config.model_options.insert(
+        OPTIONS_KEY.into(),
+        serde_json::json!({"text_conditioning":"cached", "ema_decay":0.5, "export_weights":"ema"}),
+    );
+    let sampler = candle_gen::testkit::PeakSampler::start_rendered();
+    let output = candle_gen::train::profile::with_bounded_cohort_for(
+        &root.join("metrics.json"),
+        &[
+            "iris:geometry-storage-hit",
+            "iris:frozen-GQA-projection-pack",
+        ],
+        || {
+            let mut trainer = candle_gen_iris::provider_registry()
+                .unwrap()
+                .load_trainer("iris_3b", &spec)
+                .unwrap();
+            let output = trainer
+                .train(
+                    &TrainingRequest {
+                        items,
+                        config,
+                        output_dir: bounded_runtime().join("generation"),
+                        file_name: "adapter.safetensors".into(),
+                        trigger_words: vec![],
+                        cancel: CancelFlag::new(),
+                    },
+                    &mut |_| {},
+                )
+                .unwrap();
+            assert_eq!(output.steps, 4);
+            assert!(output.final_loss.is_finite());
+            output
+        },
+    );
+    bounded_peak(sampler, &root);
+    // Iris also retains its mandatory final recovery checkpoint in runtime storage.
+    std::fs::create_dir_all(root.join("out")).unwrap();
+    let adapter = root.join("out/adapter.safetensors");
+    std::fs::copy(&output.adapter_path, &adapter).unwrap();
+    let generator = candle_gen_iris::provider_registry()
+        .unwrap()
+        .load(
+            "iris_3b",
+            &spec.with_adapters(vec![AdapterSpec::new(
+                output.adapter_path.clone(),
+                1.,
+                AdapterKind::Lora,
+            )]),
+        )
+        .unwrap();
+    let GenerationOutput::Images(images) = generator
+        .generate(
+            &GenerationRequest {
+                prompt: PROMPT.into(),
+                width: 256,
+                height: 256,
+                steps: Some(4),
+                seed: Some(7),
+                ..Default::default()
+            },
+            &mut |_| {},
+        )
+        .unwrap()
+    else {
+        panic!("expected image");
+    };
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].pixels.len(), 256 * 256 * 3);
+    assert!(images[0].pixels.iter().any(|p| *p != 0));
+    save_image_png(&root.join("adapter_sample.png"), &images[0]);
+    bounded_export_receipt(&root, &output.adapter_path);
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_real_weights::iris_generation_bounded_acceleration_acceptance");
+}

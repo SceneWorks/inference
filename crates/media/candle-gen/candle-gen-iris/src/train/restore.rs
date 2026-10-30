@@ -820,6 +820,7 @@ impl Run {
                     cancelled = true;
                     break;
                 }
+                candle_gen::train::profile::cohort_begin_step(&self.device)?;
                 let batch = self.batch(req, epoch, pos)?;
                 let (phase, sync) = phase_of(batch_count, accum);
                 batch_count += 1;
@@ -861,10 +862,19 @@ impl Run {
                                     .filter(|(k, _)| self.opt.is_trained(k))
                                     .collect();
                                 let (_, g) = clip_grads(g, plan.generator.clip)?;
+                                let cohort_vars =
+                                    super::cohort_before_named_update(&self.params, &g, &self.opt)?;
                                 self.opt.step(&self.params, &g, lr)?;
+                                candle_gen::train::profile::cohort_after_update();
                                 if let (Some(e), Some(d)) = (self.ema.as_mut(), plan.ema) {
                                     ema_update(e, &self.params, d)?;
                                 }
+                                candle_gen::train::profile::cohort_end_step(
+                                    &self.device,
+                                    g_sums[0] as f32,
+                                    &cohort_vars,
+                                    "iris-restoration-generator",
+                                )?;
                                 self.losses[..4].copy_from_slice(&g_sums);
                             }
                             g_sums = [0.0; 4];
@@ -899,7 +909,19 @@ impl Run {
                                     if let Some(g) = d_acc.grads.take() {
                                         let lr = self.lr_critic * self.factor();
                                         let (_, g) = clip_grads(g, plan.critic.clip)?;
+                                        let cohort_vars = super::cohort_before_named_update(
+                                            &self.head,
+                                            &g,
+                                            &self.critic_opt,
+                                        )?;
                                         self.critic_opt.step(&self.head, &g, lr)?;
+                                        candle_gen::train::profile::cohort_after_update();
+                                        candle_gen::train::profile::cohort_end_step(
+                                            &self.device,
+                                            loss as f32,
+                                            &cohort_vars,
+                                            "iris-restoration-critic",
+                                        )?;
                                     }
                                     self.losses[4] = loss;
                                 }

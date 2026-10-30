@@ -969,6 +969,7 @@ impl MossImageTrainer {
             estimate
                 .check(admission::Phase::Backward, budget)
                 .map_err(admission_error)?;
+            candle_gen::train::profile::cohort_begin_step(&self.device)?;
             let mut batch_loss = 0.;
             let mut batch_tokens = 0u64;
             let draw = plan.batch(step - 1)?;
@@ -1044,7 +1045,9 @@ impl MossImageTrainer {
             if step % c.gradient_accumulation == 0 || step == c.steps {
                 let mut grads = window.take(&set.vars)?;
                 opt.set_lr_scaled(lr_multiplier(c.lr_scheduler, update, updates, warmup));
+                candle_gen::train::profile::cohort_before_update(&grads, &set.vars)?;
                 lora::adapter_optimizer_step(&mut opt, &mut grads, &set, c, update, c.seed)?;
+                candle_gen::train::profile::cohort_after_update();
                 transformer.validate_residuals()?;
                 update += 1;
             }
@@ -1052,6 +1055,12 @@ impl MossImageTrainer {
             if let Some(probe) = &probe {
                 probe.update(|r| r.microsteps.push(step))?;
             }
+            candle_gen::train::profile::cohort_end_step(
+                &self.device,
+                final_loss,
+                &set.vars,
+                "moss-image",
+            )?;
             progress(TrainingProgress::Training {
                 step,
                 total: c.steps,

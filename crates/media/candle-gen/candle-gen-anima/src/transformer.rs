@@ -293,6 +293,7 @@ impl Attention {
         let sk = kv_src.dim(1)?;
 
         let (q, k, v) = if let Some(pack) = &self.projection_pack {
+            candle_gen::train::profile::cohort_reuse("anima:frozen-projection-pack");
             if encoder.is_none() {
                 let mut ys = pack
                     .forward_adapt(hidden, &[&self.to_q, &self.to_k, &self.to_v])?
@@ -620,6 +621,7 @@ impl CosmosDiT {
                 .validate(self.load_id, latents, self.cfg.patch_size)
                 .is_ok()
         }) {
+            candle_gen::train::profile::cohort_reuse("anima:geometry-storage-hit");
             return self.forward_prepared(latents, sigma, encoder, dtype, prepared);
         }
         let prepared = self.prepare_rope(latents)?;

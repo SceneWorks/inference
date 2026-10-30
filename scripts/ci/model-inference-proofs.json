@@ -302078,5 +302078,6371 @@
         }
       }
     }
+  },
+  {
+    "package": "candle-gen-anima",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "trainer_cuda_smoke::anima_bounded_acceleration_acceptance",
+    "source": "crates/media/candle-gen/candle-gen-anima/tests/trainer_cuda_smoke.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "64px BF16, checkpoint OFF, all 515 native DiT/conditioner linear targets; one 512px 1-step production sample. Real pinned installed model inputs, existing production trainer/dataset helpers. Header/path provisioning is not runtime content/named-revision attestation.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-anima/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::anima_bounded_acceleration_acceptance",
+    "required_environment": [
+      "ANIMA_TRAIN_SNAPSHOT",
+      "MODEL_PROOF_OUTPUT_DIR"
+    ],
+    "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
+    "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configuration_kind": "feature-only",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-anima/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::anima_bounded_acceleration_acceptance/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "64px BF16, checkpoint OFF, all 515 native DiT/conditioner linear targets; one 512px 1-step production sample",
+        "required_work": [
+          "Exactly one representative configuration/seed7/device; batch1 accumulation1, four TOTAL optimizer updates including first excluded timing warmup; hard shared <=20 guard; no resume/intermediate save/grid.",
+          "Finite loss/every expected active gradient, actual aggregate factor/parameter change and repeated actual source-owned preparation mechanism consumption; exact zero/inactive gradients retained and documented, focused nondegenerate fixtures preserved.",
+          "Synchronized step timings and sampled physical selected CUDA peak include diagnostic snapshots; load/cache preparation separated; sample and scalar diagnostics outside optimizer step timing.",
+          "Production save/reopen/apply then exactly ONE generated sample; full model/control checkpoints remain in legitimate owned runtime storage with export hash and actual reader witnesses; no checkpoint/archive publication bypass."
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1
+      }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-anima/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::anima_bounded_acceleration_acceptance",
+      "requirements": [
+        {
+          "slot": "anima-component-mmap-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "anima-decoder-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_file_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "anima-trainer-roundtrip-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "anima-generated-adapter-install",
+          "role": "artifact-input",
+          "readers": [
+            "crates/media/candle-gen/candle-gen/src/train/merge.rs::read_adapter_capped::std::fs::read@8751"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "output_artifacts": [
+      "bespoke_acceptance/metrics.json",
+      "bespoke_acceptance/peak_device_bytes.txt",
+      "bespoke_acceptance/adapter_sample.png",
+      "bespoke_acceptance/out/adapter.safetensors"
+    ],
+    "generated_adapter_artifacts": {
+      "bespoke_acceptance/out/adapter.safetensors": {
+        "kind": "lora",
+        "rank": 2,
+        "dtype": "F32",
+        "per_target_alpha": true,
+        "max_bytes": 19922944,
+        "targets": {
+          "blocks.0.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.0.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.0.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.0.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.0.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.0.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.0.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.0.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.0.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.0.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.0.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.0.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.0.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.0.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.0.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.0.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.1.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.1.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.1.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.1.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.1.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.1.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.1.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.1.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.1.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.1.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.1.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.1.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.1.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.1.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.1.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.1.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.10.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.10.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.10.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.10.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.10.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.10.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.10.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.10.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.10.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.10.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.10.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.10.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.10.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.10.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.10.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.10.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.11.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.11.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.11.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.11.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.11.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.11.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.11.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.11.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.11.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.11.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.11.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.11.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.11.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.11.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.11.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.11.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.12.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.12.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.12.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.12.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.12.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.12.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.12.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.12.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.12.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.12.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.12.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.12.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.12.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.12.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.12.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.12.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.13.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.13.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.13.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.13.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.13.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.13.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.13.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.13.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.13.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.13.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.13.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.13.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.13.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.13.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.13.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.13.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.14.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.14.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.14.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.14.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.14.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.14.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.14.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.14.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.14.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.14.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.14.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.14.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.14.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.14.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.14.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.14.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.15.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.15.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.15.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.15.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.15.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.15.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.15.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.15.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.15.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.15.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.15.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.15.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.15.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.15.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.15.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.15.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.16.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.16.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.16.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.16.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.16.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.16.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.16.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.16.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.16.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.16.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.16.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.16.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.16.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.16.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.16.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.16.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.17.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.17.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.17.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.17.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.17.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.17.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.17.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.17.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.17.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.17.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.17.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.17.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.17.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.17.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.17.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.17.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.18.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.18.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.18.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.18.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.18.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.18.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.18.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.18.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.18.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.18.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.18.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.18.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.18.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.18.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.18.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.18.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.19.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.19.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.19.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.19.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.19.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.19.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.19.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.19.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.19.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.19.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.19.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.19.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.19.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.19.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.19.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.19.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.2.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.2.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.2.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.2.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.2.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.2.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.2.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.2.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.2.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.2.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.2.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.2.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.2.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.2.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.2.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.2.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.20.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.20.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.20.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.20.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.20.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.20.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.20.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.20.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.20.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.20.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.20.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.20.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.20.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.20.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.20.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.20.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.21.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.21.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.21.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.21.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.21.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.21.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.21.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.21.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.21.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.21.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.21.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.21.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.21.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.21.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.21.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.21.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.22.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.22.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.22.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.22.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.22.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.22.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.22.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.22.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.22.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.22.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.22.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.22.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.22.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.22.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.22.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.22.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.23.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.23.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.23.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.23.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.23.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.23.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.23.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.23.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.23.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.23.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.23.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.23.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.23.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.23.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.23.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.23.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.24.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.24.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.24.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.24.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.24.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.24.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.24.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.24.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.24.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.24.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.24.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.24.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.24.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.24.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.24.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.24.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.25.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.25.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.25.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.25.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.25.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.25.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.25.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.25.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.25.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.25.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.25.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.25.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.25.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.25.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.25.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.25.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.26.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.26.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.26.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.26.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.26.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.26.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.26.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.26.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.26.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.26.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.26.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.26.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.26.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.26.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.26.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.26.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.27.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.27.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.27.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.27.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.27.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.27.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.27.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.27.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.27.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.27.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.27.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.27.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.27.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.27.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.27.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.27.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.3.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.3.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.3.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.3.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.3.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.3.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.3.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.3.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.3.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.3.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.3.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.3.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.3.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.3.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.3.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.3.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.4.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.4.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.4.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.4.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.4.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.4.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.4.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.4.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.4.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.4.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.4.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.4.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.4.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.4.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.4.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.4.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.5.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.5.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.5.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.5.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.5.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.5.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.5.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.5.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.5.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.5.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.5.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.5.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.5.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.5.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.5.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.5.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.6.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.6.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.6.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.6.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.6.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.6.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.6.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.6.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.6.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.6.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.6.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.6.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.6.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.6.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.6.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.6.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.7.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.7.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.7.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.7.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.7.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.7.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.7.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.7.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.7.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.7.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.7.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.7.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.7.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.7.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.7.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.7.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.8.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.8.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.8.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.8.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.8.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.8.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.8.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.8.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.8.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.8.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.8.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.8.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.8.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.8.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.8.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.8.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "blocks.9.adaln_modulation_cross_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.9.adaln_modulation_cross_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.9.adaln_modulation_mlp.1": [
+            256,
+            2048
+          ],
+          "blocks.9.adaln_modulation_mlp.2": [
+            6144,
+            256
+          ],
+          "blocks.9.adaln_modulation_self_attn.1": [
+            256,
+            2048
+          ],
+          "blocks.9.adaln_modulation_self_attn.2": [
+            6144,
+            256
+          ],
+          "blocks.9.cross_attn.k_proj": [
+            2048,
+            1024
+          ],
+          "blocks.9.cross_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.9.cross_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.9.cross_attn.v_proj": [
+            2048,
+            1024
+          ],
+          "blocks.9.mlp.layer1": [
+            8192,
+            2048
+          ],
+          "blocks.9.mlp.layer2": [
+            2048,
+            8192
+          ],
+          "blocks.9.self_attn.k_proj": [
+            2048,
+            2048
+          ],
+          "blocks.9.self_attn.output_proj": [
+            2048,
+            2048
+          ],
+          "blocks.9.self_attn.q_proj": [
+            2048,
+            2048
+          ],
+          "blocks.9.self_attn.v_proj": [
+            2048,
+            2048
+          ],
+          "final_layer.adaln_modulation.1": [
+            256,
+            2048
+          ],
+          "final_layer.adaln_modulation.2": [
+            4096,
+            256
+          ],
+          "final_layer.linear": [
+            64,
+            2048
+          ],
+          "llm_adapter.blocks.0.cross_attn.k_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.0.cross_attn.o_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.0.cross_attn.q_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.0.cross_attn.v_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.0.mlp.0": [
+            4096,
+            1024
+          ],
+          "llm_adapter.blocks.0.mlp.2": [
+            1024,
+            4096
+          ],
+          "llm_adapter.blocks.0.self_attn.k_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.0.self_attn.o_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.0.self_attn.q_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.0.self_attn.v_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.1.cross_attn.k_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.1.cross_attn.o_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.1.cross_attn.q_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.1.cross_attn.v_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.1.mlp.0": [
+            4096,
+            1024
+          ],
+          "llm_adapter.blocks.1.mlp.2": [
+            1024,
+            4096
+          ],
+          "llm_adapter.blocks.1.self_attn.k_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.1.self_attn.o_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.1.self_attn.q_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.1.self_attn.v_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.2.cross_attn.k_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.2.cross_attn.o_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.2.cross_attn.q_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.2.cross_attn.v_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.2.mlp.0": [
+            4096,
+            1024
+          ],
+          "llm_adapter.blocks.2.mlp.2": [
+            1024,
+            4096
+          ],
+          "llm_adapter.blocks.2.self_attn.k_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.2.self_attn.o_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.2.self_attn.q_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.2.self_attn.v_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.3.cross_attn.k_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.3.cross_attn.o_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.3.cross_attn.q_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.3.cross_attn.v_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.3.mlp.0": [
+            4096,
+            1024
+          ],
+          "llm_adapter.blocks.3.mlp.2": [
+            1024,
+            4096
+          ],
+          "llm_adapter.blocks.3.self_attn.k_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.3.self_attn.o_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.3.self_attn.q_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.3.self_attn.v_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.4.cross_attn.k_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.4.cross_attn.o_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.4.cross_attn.q_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.4.cross_attn.v_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.4.mlp.0": [
+            4096,
+            1024
+          ],
+          "llm_adapter.blocks.4.mlp.2": [
+            1024,
+            4096
+          ],
+          "llm_adapter.blocks.4.self_attn.k_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.4.self_attn.o_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.4.self_attn.q_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.4.self_attn.v_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.5.cross_attn.k_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.5.cross_attn.o_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.5.cross_attn.q_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.5.cross_attn.v_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.5.mlp.0": [
+            4096,
+            1024
+          ],
+          "llm_adapter.blocks.5.mlp.2": [
+            1024,
+            4096
+          ],
+          "llm_adapter.blocks.5.self_attn.k_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.5.self_attn.o_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.5.self_attn.q_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.blocks.5.self_attn.v_proj": [
+            1024,
+            1024
+          ],
+          "llm_adapter.out_proj": [
+            1024,
+            1024
+          ],
+          "t_embedder.1.linear_1": [
+            2048,
+            2048
+          ],
+          "t_embedder.1.linear_2": [
+            6144,
+            2048
+          ],
+          "x_embedder.proj.1": [
+            2048,
+            68
+          ]
+        }
+      }
+    }
+  },
+  {
+    "package": "candle-gen-mage",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "trainer_cuda_smoke::mage_bounded_acceleration_acceptance",
+    "source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "64px BF16 adapter mode checkpoint OFF, default image attention targets; shared full/adaptation loop has retained focused Full ownership fixture; one 512px 1-step production sample. Real pinned installed model inputs, existing production trainer/dataset helpers. Header/path provisioning is not runtime content/named-revision attestation.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::mage_bounded_acceleration_acceptance",
+    "required_environment": [
+      "MAGE_BASE_TRAIN_SNAPSHOT",
+      "MAGE_TRAIN_TEXT_ENCODER",
+      "MAGE_TRAIN_VAE",
+      "MODEL_PROOF_OUTPUT_DIR"
+    ],
+    "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
+    "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configuration_kind": "feature-only",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::mage_bounded_acceleration_acceptance/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "64px BF16 adapter mode checkpoint OFF, default image attention targets; shared full/adaptation loop has retained focused Full ownership fixture; one 512px 1-step production sample",
+        "required_work": [
+          "Exactly one representative configuration/seed7/device; batch1 accumulation1, four TOTAL optimizer updates including first excluded timing warmup; hard shared <=20 guard; no resume/intermediate save/grid.",
+          "Finite loss/every expected active gradient, actual aggregate factor/parameter change and repeated actual source-owned preparation mechanism consumption; exact zero/inactive gradients retained and documented, focused nondegenerate fixtures preserved.",
+          "Synchronized step timings and sampled physical selected CUDA peak include diagnostic snapshots; load/cache preparation separated; sample and scalar diagnostics outside optimizer step timing.",
+          "Production save/reopen/apply then exactly ONE generated sample; full model/control checkpoints remain in legitimate owned runtime storage with export hash and actual reader witnesses; no checkpoint/archive publication bypass."
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1
+      }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::mage_bounded_acceleration_acceptance",
+      "requirements": [
+        {
+          "slot": "mage-actual-private-model-tensor-source",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "mage-actual-oracle-or-produced-output-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case",
+          "case_generated_write_read": {
+            "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
+            "case_source_sha256": "f5674cb7ebf529cb0a7658fea89f39a2b3d8821655a6ad571fd0aa76598c4ef0",
+            "writer": "trainer_cuda_smoke::run(kind,full): trainer.train(output_dir,file_name=adapter.safetensors) writes output.adapter_path -> candle_core::safetensors::load(&output.adapter_path,Device::Cpu)"
+          }
+        },
+        {
+          "slot": "mage-actual-text-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "candle-gen-mage::text_encoder::MageTextEncoder::load_inner/tokenizer"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "mage-training-transformer-configuration",
+          "role": "configuration",
+          "readers": [
+            "gen-core::model_input_proof::read_configuration_to_string#candle-gen-mage::training::MageTrainer::train_impl"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "mage-generated-render-transformer-configuration",
+          "role": "configuration",
+          "readers": [
+            "gen-core::model_input_proof::read_configuration_to_string#candle-gen-mage::pipeline::MagePipeline::load_components",
+            "gen-core::model_input_proof::read_configuration_to_string#candle-gen-mage::pipeline::MagePipeline::load_heavy"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "mage-optional-training-packed-configuration",
+          "role": "configuration",
+          "readers": [
+            "gen-core::model_input_proof::read_configuration_to_string#candle-gen-mage::training::packed_component"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case",
+          "when": "external-present"
+        },
+        {
+          "slot": "mage-generated-source-training-png",
+          "role": "reference",
+          "readers": [
+            "crates/media/candle-gen/candle-gen/src/train/dataset.rs::decode_square::image::open@2345"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case",
+          "case_generated_write_read": {
+            "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
+            "case_source_sha256": "f5674cb7ebf529cb0a7658fea89f39a2b3d8821655a6ad571fd0aa76598c4ef0",
+            "writer": "trainer_cuda_smoke::run(kind,full): RgbImage::from_pixel(64,64,Rgb([210,160,30])).save(&input) -> TrainingItem::captioned(input) -> trainer.train -> cache_samples -> decode_square(item.image_path) -> observed image::open(path)"
+          }
+        },
+        {
+          "slot": "mage-installed-produced-adapter",
+          "role": "artifact-input",
+          "readers": [
+            "crates/media/candle-gen/candle-gen/src/train/merge.rs::read_adapter_capped::std::fs::read@8751"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case",
+          "case_generated_write_read": {
+            "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
+            "case_source_sha256": "f5674cb7ebf529cb0a7658fea89f39a2b3d8821655a6ad571fd0aa76598c4ef0",
+            "writer": "trainer_cuda_smoke::run(NetworkType::Lora/Lokr,false): trainer.train writes output.adapter_path -> adapted LoadSpec.with_adapters(AdapterSpec(output.adapter_path,1.0,...)) -> actual generate -> install_dotted_adapters -> read_adapter_capped reads produced file"
+          }
+        }
+      ]
+    },
+    "output_artifacts": [
+      "bespoke_acceptance/metrics.json",
+      "bespoke_acceptance/peak_device_bytes.txt",
+      "bespoke_acceptance/adapter_sample.png",
+      "bespoke_acceptance/out/adapter.safetensors"
+    ],
+    "generated_adapter_artifacts": {
+      "bespoke_acceptance/out/adapter.safetensors": {
+        "kind": "lora",
+        "rank": 2,
+        "dtype": "F32",
+        "per_target_alpha": true,
+        "max_bytes": 4194304,
+        "targets": {
+          "transformer_blocks.0.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.0.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.0.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.0.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.1.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.1.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.1.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.1.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.10.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.10.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.10.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.10.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.11.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.11.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.11.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.11.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.2.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.2.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.2.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.2.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.3.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.3.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.3.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.3.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.4.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.4.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.4.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.4.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.5.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.5.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.5.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.5.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.6.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.6.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.6.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.6.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.7.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.7.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.7.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.7.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.8.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.8.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.8.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.8.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.9.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.9.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.9.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer_blocks.9.attn.to_v": [
+            3072,
+            3072
+          ]
+        }
+      }
+    }
+  },
+  {
+    "package": "candle-gen-moss-image",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::moss_bounded_acceleration_acceptance",
+    "source": "crates/media/candle-gen/candle-gen-moss-image/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "64px BF16 Base, checkpoint OFF, all native transformer projections; SFT aliases same changed Transformer/driver; one 256px 2-step production sample. Real pinned installed model inputs, existing production trainer/dataset helpers. Header/path provisioning is not runtime content/named-revision attestation.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-moss-image/tests/real_weights.rs::real_weights::moss_bounded_acceleration_acceptance",
+    "required_environment": [
+      "MOSS_BASE_SNAPSHOT",
+      "MOSS_SHARED_SNAPSHOT",
+      "MODEL_PROOF_OUTPUT_DIR"
+    ],
+    "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
+    "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configuration_kind": "feature-only",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-moss-image/tests/real_weights.rs::real_weights::moss_bounded_acceleration_acceptance/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "64px BF16 Base, checkpoint OFF, all native transformer projections; SFT aliases same changed Transformer/driver; one 256px 2-step production sample",
+        "required_work": [
+          "Exactly one representative configuration/seed7/device; batch1 accumulation1, four TOTAL optimizer updates including first excluded timing warmup; hard shared <=20 guard; no resume/intermediate save/grid.",
+          "Finite loss/every expected active gradient, actual aggregate factor/parameter change and repeated actual source-owned preparation mechanism consumption; exact zero/inactive gradients retained and documented, focused nondegenerate fixtures preserved.",
+          "Synchronized step timings and sampled physical selected CUDA peak include diagnostic snapshots; load/cache preparation separated; sample and scalar diagnostics outside optimizer step timing.",
+          "Production save/reopen/apply then exactly ONE generated sample; full model/control checkpoints remain in legitimate owned runtime storage with export hash and actual reader witnesses; no checkpoint/archive publication bypass."
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1
+      }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-moss-image/tests/real_weights.rs::real_weights::moss_bounded_acceleration_acceptance",
+      "requirements": [
+        {
+          "slot": "moss-actual-native-model-files",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen-moss-image::loader::load_weights_cancellable"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "moss-actual-parsed-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "candle-gen-moss-image::text_encoder::tokenizer"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "moss-saved-adapter-roundtrip",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "output_artifacts": [
+      "bespoke_acceptance/metrics.json",
+      "bespoke_acceptance/peak_device_bytes.txt",
+      "bespoke_acceptance/adapter_sample.png",
+      "bespoke_acceptance/out/adapter.safetensors"
+    ],
+    "generated_adapter_artifacts": {
+      "bespoke_acceptance/out/adapter.safetensors": {
+        "kind": "lora",
+        "rank": 2,
+        "dtype": "F32",
+        "per_target_alpha": true,
+        "max_bytes": 19922944,
+        "targets": {
+          "layers.0.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.0.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.0.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.0.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.0.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.0.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.1.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.1.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.1.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.1.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.1.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.1.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.10.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.10.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.10.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.10.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.10.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.10.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.11.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.11.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.11.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.11.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.11.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.11.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.12.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.12.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.12.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.12.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.12.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.12.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.13.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.13.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.13.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.13.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.13.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.13.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.14.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.14.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.14.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.14.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.14.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.14.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.15.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.15.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.15.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.15.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.15.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.15.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.16.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.16.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.16.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.16.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.16.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.16.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.17.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.17.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.17.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.17.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.17.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.17.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.18.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.18.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.18.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.18.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.18.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.18.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.19.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.19.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.19.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.19.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.2.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.2.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.2.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.2.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.2.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.2.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.3.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.3.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.3.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.3.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.3.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.3.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.4.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.4.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.4.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.4.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.4.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.4.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.5.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.5.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.5.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.5.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.5.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.5.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.6.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.6.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.6.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.6.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.6.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.6.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.7.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.7.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.7.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.7.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.7.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.7.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.8.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.8.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.8.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.8.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.8.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.8.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.9.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.9.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.9.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.9.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.9.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.9.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.19.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.19.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.20.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.20.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.20.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.20.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.20.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.20.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.21.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.21.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.21.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.21.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.21.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.21.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.22.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.22.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.22.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.22.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.22.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.22.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.23.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.23.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.23.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.23.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.23.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.23.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.24.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.24.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.24.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.24.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.24.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.24.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.25.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.25.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.25.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.25.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.25.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.25.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.26.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.26.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.26.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.26.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.26.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.26.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.27.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.27.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.27.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.27.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.27.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.27.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.28.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.28.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.28.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.28.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.28.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.28.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.29.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.29.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.29.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.29.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.29.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.29.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.30.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.30.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.30.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.30.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.30.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.30.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.31.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.31.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.31.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.31.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.31.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.31.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.32.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.32.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.32.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.32.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.32.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.32.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.33.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.33.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.33.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.33.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.33.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.33.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.34.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.34.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.34.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.34.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.34.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.34.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.35.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.35.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.35.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.35.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.35.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.35.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.36.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.36.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.36.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.36.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.36.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.36.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.37.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.37.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.37.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.37.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.37.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.37.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.38.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.38.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.38.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.38.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.38.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.38.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.39.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.39.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.39.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.39.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.39.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.39.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.40.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.40.proj.ffn_up_gate": [
+            16384,
+            3072
+          ],
+          "layers.40.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.40.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.40.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.40.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.41.proj.k": [
+            3072,
+            3072
+          ],
+          "layers.41.proj.o": [
+            3072,
+            3072
+          ],
+          "layers.41.proj.q": [
+            3072,
+            3072
+          ],
+          "layers.41.proj.v": [
+            3072,
+            3072
+          ],
+          "layers.41.proj.ffn_down": [
+            3072,
+            8192
+          ],
+          "layers.41.proj.ffn_up_gate": [
+            16384,
+            3072
+          ]
+        }
+      }
+    }
+  },
+  {
+    "package": "candle-gen-flux3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "real_weights::flux3_bounded_acceleration_acceptance",
+    "source": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "64px BF16 undistilled Klein Base paired-edit, checkpoint OFF, caption dropout0, all image/image_cond/text/single targets; one 256px 4-step production sample. Real pinned installed model inputs, existing production trainer/dataset helpers. Header/path provisioning is not runtime content/named-revision attestation.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::flux3_bounded_acceleration_acceptance",
+    "required_environment": [
+      "FLUX3_BASE_PACKAGE_DIR",
+      "MODEL_PROOF_OUTPUT_DIR"
+    ],
+    "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
+    "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configuration_kind": "feature-only",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::flux3_bounded_acceleration_acceptance/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "64px BF16 undistilled Klein Base paired-edit, checkpoint OFF, caption dropout0, all image/image_cond/text/single targets; one 256px 4-step production sample",
+        "required_work": [
+          "Exactly one representative configuration/seed7/device; batch1 accumulation1, four TOTAL optimizer updates including first excluded timing warmup; hard shared <=20 guard; no resume/intermediate save/grid.",
+          "Finite loss/every expected active gradient, actual aggregate factor/parameter change and repeated actual source-owned preparation mechanism consumption; exact zero/inactive gradients retained and documented, focused nondegenerate fixtures preserved.",
+          "Synchronized step timings and sampled physical selected CUDA peak include diagnostic snapshots; load/cache preparation separated; sample and scalar diagnostics outside optimizer step timing.",
+          "Production save/reopen/apply then exactly ONE generated sample; full model/control checkpoints remain in legitimate owned runtime storage with export hash and actual reader witnesses; no checkpoint/archive publication bypass."
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1
+      }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::flux3_bounded_acceleration_acceptance",
+      "requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new",
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "output_artifacts": [
+      "bespoke_acceptance/metrics.json",
+      "bespoke_acceptance/peak_device_bytes.txt",
+      "bespoke_acceptance/adapter_sample.png",
+      "bespoke_acceptance/out/adapter.safetensors"
+    ],
+    "generated_adapter_artifacts": {
+      "bespoke_acceptance/out/adapter.safetensors": {
+        "kind": "lora",
+        "rank": 2,
+        "dtype": "F32",
+        "per_target_alpha": false,
+        "max_bytes": 22020096,
+        "targets": {
+          "transformer.mode_blocks.image.0.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.0.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.0.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.mode_blocks.image.0.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.mode_blocks.image.0.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.0.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.1.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.1.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.1.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.mode_blocks.image.1.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.mode_blocks.image.1.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.1.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.2.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.2.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.2.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.mode_blocks.image.2.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.mode_blocks.image.2.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.2.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.3.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.3.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.3.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.mode_blocks.image.3.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.mode_blocks.image.3.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.3.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.4.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.4.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.4.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.mode_blocks.image.4.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.mode_blocks.image.4.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image.4.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.0.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.0.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.0.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.0.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.mode_blocks.image_cond.0.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.0.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.1.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.1.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.1.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.1.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.mode_blocks.image_cond.1.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.1.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.2.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.2.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.2.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.2.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.mode_blocks.image_cond.2.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.2.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.3.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.3.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.3.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.3.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.mode_blocks.image_cond.3.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.3.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.4.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.4.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.4.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.4.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.mode_blocks.image_cond.4.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.mode_blocks.image_cond.4.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.0.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.0.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.0.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.0.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.0.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.0.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.1.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.1.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.1.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.1.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.1.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.1.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.10.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.10.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.10.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.10.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.10.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.10.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.11.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.11.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.11.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.11.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.11.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.11.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.12.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.12.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.12.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.12.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.12.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.12.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.13.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.13.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.13.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.13.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.13.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.13.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.14.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.14.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.14.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.14.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.14.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.14.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.15.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.15.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.15.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.15.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.15.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.15.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.16.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.16.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.16.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.16.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.16.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.16.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.17.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.17.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.17.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.17.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.17.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.17.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.18.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.18.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.18.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.18.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.18.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.18.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.19.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.19.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.19.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.19.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.19.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.19.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.2.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.2.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.2.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.2.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.2.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.2.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.20.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.20.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.20.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.20.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.20.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.20.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.21.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.21.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.21.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.21.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.21.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.21.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.22.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.22.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.22.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.22.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.22.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.22.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.23.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.23.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.23.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.23.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.23.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.23.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.24.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.24.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.24.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.24.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.24.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.24.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.25.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.25.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.25.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.25.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.25.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.25.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.26.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.26.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.26.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.26.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.26.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.26.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.27.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.27.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.27.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.27.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.27.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.27.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.3.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.3.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.3.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.3.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.3.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.3.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.4.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.4.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.4.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.4.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.4.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.4.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.5.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.5.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.5.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.5.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.5.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.5.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.6.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.6.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.6.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.6.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.6.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.6.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.7.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.7.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.7.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.7.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.7.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.7.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.8.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.8.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.8.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.8.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.8.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.8.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.9.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.9.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.9.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.single_transformer_blocks.9.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.single_transformer_blocks.9.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.single_transformer_blocks.9.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.0.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.0.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.0.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.txt_mode_blocks.0.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.txt_mode_blocks.0.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.0.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.1.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.1.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.1.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.txt_mode_blocks.1.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.txt_mode_blocks.1.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.1.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.2.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.2.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.2.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.txt_mode_blocks.2.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.txt_mode_blocks.2.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.2.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.3.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.3.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.3.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.txt_mode_blocks.3.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.txt_mode_blocks.3.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.3.attn.to_v": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.4.attn.to_out.0": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.4.attn.to_k": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.4.ff.linear_in": [
+            18432,
+            3072
+          ],
+          "transformer.txt_mode_blocks.4.ff.linear_out": [
+            3072,
+            9216
+          ],
+          "transformer.txt_mode_blocks.4.attn.to_q": [
+            3072,
+            3072
+          ],
+          "transformer.txt_mode_blocks.4.attn.to_v": [
+            3072,
+            3072
+          ]
+        }
+      }
+    }
+  },
+  {
+    "package": "candle-gen-iris",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "train_real_weights::iris_generation_bounded_acceleration_acceptance",
+    "source": "crates/media/candle-gen/candle-gen-iris/tests/train_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "256px BF16 generation LoRA, all patch-trunk projections, cached frozen text, EMA0.5; one 256px 4-step production sample. Real pinned installed model inputs, existing production trainer/dataset helpers. Header/path provisioning is not runtime content/named-revision attestation.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-iris/tests/train_real_weights.rs::train_real_weights::iris_generation_bounded_acceleration_acceptance",
+    "required_environment": [
+      "IRIS_WEIGHTS_DIR",
+      "IRIS_TEXT_ENCODER_DIR",
+      "BESPOKE_RUNTIME_DIR",
+      "MODEL_PROOF_OUTPUT_DIR"
+    ],
+    "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
+    "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configuration_kind": "feature-only",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/train_real_weights.rs::train_real_weights::iris_generation_bounded_acceleration_acceptance/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "256px BF16 generation LoRA, all patch-trunk projections, cached frozen text, EMA0.5; one 256px 4-step production sample",
+        "required_work": [
+          "Exactly one representative configuration/seed7/device; batch1 accumulation1, four TOTAL optimizer updates including first excluded timing warmup; hard shared <=20 guard; no resume/intermediate save/grid.",
+          "Finite loss/every expected active gradient, actual aggregate factor/parameter change and repeated actual source-owned preparation mechanism consumption; exact zero/inactive gradients retained and documented, focused nondegenerate fixtures preserved.",
+          "Synchronized step timings and sampled physical selected CUDA peak include diagnostic snapshots; load/cache preparation separated; sample and scalar diagnostics outside optimizer step timing.",
+          "Production save/reopen/apply then exactly ONE generated sample; full model/control checkpoints remain in legitimate owned runtime storage with export hash and actual reader witnesses; no checkpoint/archive publication bypass.",
+          "Generation/restoration adapter branches use actual frozen GQA packs; depth full tracked weights retain source-defined differentiable separate projection fallback."
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1
+      }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/train_real_weights.rs::train_real_weights::iris_generation_bounded_acceleration_acceptance",
+      "requirements": [
+        {
+          "slot": "iris-trainer-initial-model",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-trainer-generation-config",
+          "role": "configuration",
+          "readers": [
+            "gen-core::iris::IrisConfig::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-trainer-text-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-trainer-text-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::tokenizer::TextTokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-trainer-text-config",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/config.rs::from_dir::std::fs::read_to_string@50697"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-trained-adapter-install",
+          "role": "artifact-input",
+          "readers": [
+            "crates/media/candle-gen/candle-gen/src/train/merge.rs::read_adapter_capped::std::fs::read@8751"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "output_artifacts": [
+      "bespoke_acceptance/metrics.json",
+      "bespoke_acceptance/peak_device_bytes.txt",
+      "bespoke_acceptance/adapter_sample.png",
+      "bespoke_acceptance/retained_export.json",
+      "bespoke_acceptance/out/adapter.safetensors"
+    ],
+    "generated_adapter_artifacts": {
+      "bespoke_acceptance/out/adapter.safetensors": {
+        "kind": "lora",
+        "rank": 8,
+        "dtype": "F32",
+        "per_target_alpha": true,
+        "max_bytes": 52428800,
+        "targets": {
+          "blocks.0.attn.k_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.0.attn.k_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.0.attn.proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.0.attn.proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.0.attn.q_proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.0.attn.q_proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.0.attn.v_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.0.attn.v_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.0.attn_gate_x": [
+            2560,
+            2560
+          ],
+          "blocks.0.attn_gate_y": [
+            2560,
+            2560
+          ],
+          "blocks.0.mlp_x.w1": [
+            6826,
+            2560
+          ],
+          "blocks.0.mlp_x.w2": [
+            2560,
+            6826
+          ],
+          "blocks.0.mlp_x.w3": [
+            6826,
+            2560
+          ],
+          "blocks.0.mlp_y.w1": [
+            6826,
+            2560
+          ],
+          "blocks.0.mlp_y.w2": [
+            2560,
+            6826
+          ],
+          "blocks.0.mlp_y.w3": [
+            6826,
+            2560
+          ],
+          "blocks.1.attn.k_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.1.attn.k_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.1.attn.proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.1.attn.proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.1.attn.q_proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.1.attn.q_proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.1.attn.v_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.1.attn.v_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.1.attn_gate_x": [
+            2560,
+            2560
+          ],
+          "blocks.1.attn_gate_y": [
+            2560,
+            2560
+          ],
+          "blocks.1.mlp_x.w1": [
+            6826,
+            2560
+          ],
+          "blocks.1.mlp_x.w2": [
+            2560,
+            6826
+          ],
+          "blocks.1.mlp_x.w3": [
+            6826,
+            2560
+          ],
+          "blocks.1.mlp_y.w1": [
+            6826,
+            2560
+          ],
+          "blocks.1.mlp_y.w2": [
+            2560,
+            6826
+          ],
+          "blocks.1.mlp_y.w3": [
+            6826,
+            2560
+          ],
+          "blocks.10.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.10.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.10.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.10.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.10.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.10.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.10.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.10.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.11.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.11.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.11.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.11.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.11.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.11.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.11.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.11.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.12.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.12.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.12.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.12.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.12.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.12.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.12.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.12.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.13.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.13.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.13.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.13.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.13.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.13.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.13.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.13.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.14.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.14.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.14.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.14.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.14.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.14.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.14.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.14.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.15.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.15.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.15.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.15.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.15.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.15.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.15.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.15.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.16.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.16.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.16.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.16.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.16.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.16.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.16.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.16.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.17.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.17.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.17.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.17.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.17.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.17.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.17.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.17.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.18.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.18.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.18.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.18.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.18.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.18.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.18.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.18.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.19.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.19.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.19.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.19.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.19.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.19.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.19.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.19.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.2.attn.k_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.2.attn.k_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.2.attn.proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.2.attn.proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.2.attn.q_proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.2.attn.q_proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.2.attn.v_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.2.attn.v_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.2.attn_gate_x": [
+            2560,
+            2560
+          ],
+          "blocks.2.attn_gate_y": [
+            2560,
+            2560
+          ],
+          "blocks.2.mlp_x.w1": [
+            6826,
+            2560
+          ],
+          "blocks.2.mlp_x.w2": [
+            2560,
+            6826
+          ],
+          "blocks.2.mlp_x.w3": [
+            6826,
+            2560
+          ],
+          "blocks.2.mlp_y.w1": [
+            6826,
+            2560
+          ],
+          "blocks.2.mlp_y.w2": [
+            2560,
+            6826
+          ],
+          "blocks.2.mlp_y.w3": [
+            6826,
+            2560
+          ],
+          "blocks.20.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.20.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.20.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.20.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.20.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.20.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.20.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.20.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.21.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.21.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.21.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.21.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.21.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.21.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.21.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.21.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.22.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.22.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.22.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.22.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.22.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.22.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.22.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.22.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.23.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.23.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.23.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.23.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.23.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.23.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.23.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.23.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.3.attn.k_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.3.attn.k_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.3.attn.proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.3.attn.proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.3.attn.q_proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.3.attn.q_proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.3.attn.v_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.3.attn.v_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.3.attn_gate_x": [
+            2560,
+            2560
+          ],
+          "blocks.3.attn_gate_y": [
+            2560,
+            2560
+          ],
+          "blocks.3.mlp_x.w1": [
+            6826,
+            2560
+          ],
+          "blocks.3.mlp_x.w2": [
+            2560,
+            6826
+          ],
+          "blocks.3.mlp_x.w3": [
+            6826,
+            2560
+          ],
+          "blocks.3.mlp_y.w1": [
+            6826,
+            2560
+          ],
+          "blocks.3.mlp_y.w2": [
+            2560,
+            6826
+          ],
+          "blocks.3.mlp_y.w3": [
+            6826,
+            2560
+          ],
+          "blocks.4.attn.k_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.4.attn.k_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.4.attn.proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.4.attn.proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.4.attn.q_proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.4.attn.q_proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.4.attn.v_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.4.attn.v_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.4.attn_gate_x": [
+            2560,
+            2560
+          ],
+          "blocks.4.attn_gate_y": [
+            2560,
+            2560
+          ],
+          "blocks.4.mlp_x.w1": [
+            6826,
+            2560
+          ],
+          "blocks.4.mlp_x.w2": [
+            2560,
+            6826
+          ],
+          "blocks.4.mlp_x.w3": [
+            6826,
+            2560
+          ],
+          "blocks.4.mlp_y.w1": [
+            6826,
+            2560
+          ],
+          "blocks.4.mlp_y.w2": [
+            2560,
+            6826
+          ],
+          "blocks.4.mlp_y.w3": [
+            6826,
+            2560
+          ],
+          "blocks.5.attn.k_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.5.attn.k_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.5.attn.proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.5.attn.proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.5.attn.q_proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.5.attn.q_proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.5.attn.v_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.5.attn.v_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.5.attn_gate_x": [
+            2560,
+            2560
+          ],
+          "blocks.5.attn_gate_y": [
+            2560,
+            2560
+          ],
+          "blocks.5.mlp_x.w1": [
+            6826,
+            2560
+          ],
+          "blocks.5.mlp_x.w2": [
+            2560,
+            6826
+          ],
+          "blocks.5.mlp_x.w3": [
+            6826,
+            2560
+          ],
+          "blocks.5.mlp_y.w1": [
+            6826,
+            2560
+          ],
+          "blocks.5.mlp_y.w2": [
+            2560,
+            6826
+          ],
+          "blocks.5.mlp_y.w3": [
+            6826,
+            2560
+          ],
+          "blocks.6.attn.k_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.6.attn.k_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.6.attn.proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.6.attn.proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.6.attn.q_proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.6.attn.q_proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.6.attn.v_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.6.attn.v_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.6.attn_gate_x": [
+            2560,
+            2560
+          ],
+          "blocks.6.attn_gate_y": [
+            2560,
+            2560
+          ],
+          "blocks.6.mlp_x.w1": [
+            6826,
+            2560
+          ],
+          "blocks.6.mlp_x.w2": [
+            2560,
+            6826
+          ],
+          "blocks.6.mlp_x.w3": [
+            6826,
+            2560
+          ],
+          "blocks.6.mlp_y.w1": [
+            6826,
+            2560
+          ],
+          "blocks.6.mlp_y.w2": [
+            2560,
+            6826
+          ],
+          "blocks.6.mlp_y.w3": [
+            6826,
+            2560
+          ],
+          "blocks.7.attn.k_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.7.attn.k_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.7.attn.proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.7.attn.proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.7.attn.q_proj_x": [
+            2560,
+            2560
+          ],
+          "blocks.7.attn.q_proj_y": [
+            2560,
+            2560
+          ],
+          "blocks.7.attn.v_proj_x": [
+            640,
+            2560
+          ],
+          "blocks.7.attn.v_proj_y": [
+            640,
+            2560
+          ],
+          "blocks.7.attn_gate_x": [
+            2560,
+            2560
+          ],
+          "blocks.7.attn_gate_y": [
+            2560,
+            2560
+          ],
+          "blocks.7.mlp_x.w1": [
+            6826,
+            2560
+          ],
+          "blocks.7.mlp_x.w2": [
+            2560,
+            6826
+          ],
+          "blocks.7.mlp_x.w3": [
+            6826,
+            2560
+          ],
+          "blocks.7.mlp_y.w1": [
+            6826,
+            2560
+          ],
+          "blocks.7.mlp_y.w2": [
+            2560,
+            6826
+          ],
+          "blocks.7.mlp_y.w3": [
+            6826,
+            2560
+          ],
+          "blocks.8.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.8.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.8.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.8.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.8.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.8.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.8.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.8.v_proj": [
+            640,
+            2560
+          ],
+          "blocks.9.attn_gate": [
+            2560,
+            2560
+          ],
+          "blocks.9.attn_proj": [
+            2560,
+            2560
+          ],
+          "blocks.9.k_proj": [
+            640,
+            2560
+          ],
+          "blocks.9.mlp.w1": [
+            6826,
+            2560
+          ],
+          "blocks.9.mlp.w2": [
+            2560,
+            6826
+          ],
+          "blocks.9.mlp.w3": [
+            6826,
+            2560
+          ],
+          "blocks.9.q_proj": [
+            2560,
+            2560
+          ],
+          "blocks.9.v_proj": [
+            640,
+            2560
+          ]
+        }
+      }
+    }
+  },
+  {
+    "package": "candle-gen-iris",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "depth_train_real_weights::iris_depth_bounded_acceleration_acceptance",
+    "source": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "128px BF16 full depth weights, existing repository photo and aligned nonconstant ramp helper, L1; one native-depth predicted map from reloaded export. Real pinned installed model inputs, existing production trainer/dataset helpers. Header/path provisioning is not runtime content/named-revision attestation.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_real_weights.rs::depth_train_real_weights::iris_depth_bounded_acceleration_acceptance",
+    "required_environment": [
+      "IRIS_DEPTH_DIR",
+      "BESPOKE_RUNTIME_DIR",
+      "MODEL_PROOF_OUTPUT_DIR"
+    ],
+    "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
+    "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configuration_kind": "feature-only",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_real_weights.rs::depth_train_real_weights::iris_depth_bounded_acceleration_acceptance/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "128px BF16 full depth weights, existing repository photo and aligned nonconstant ramp helper, L1; one native-depth predicted map from reloaded export",
+        "required_work": [
+          "Exactly one representative configuration/seed7/device; batch1 accumulation1, four TOTAL optimizer updates including first excluded timing warmup; hard shared <=20 guard; no resume/intermediate save/grid.",
+          "Finite loss/every expected active gradient, actual aggregate factor/parameter change and repeated actual source-owned preparation mechanism consumption; exact zero/inactive gradients retained and documented, focused nondegenerate fixtures preserved.",
+          "Synchronized step timings and sampled physical selected CUDA peak include diagnostic snapshots; load/cache preparation separated; sample and scalar diagnostics outside optimizer step timing.",
+          "Production save/reopen/apply then exactly ONE generated sample; full model/control checkpoints remain in legitimate owned runtime storage with export hash and actual reader witnesses; no checkpoint/archive publication bypass."
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1
+      }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_real_weights.rs::depth_train_real_weights::iris_depth_bounded_acceleration_acceptance",
+      "requirements": [
+        {
+          "slot": "iris-depth-training-actual-tensor-files",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-depth-export-roundtrip-model",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-actual-export-configuration",
+          "role": "configuration",
+          "readers": [
+            "gen-core::iris::downstream::TaskExport::from_dir_impl"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-actual-export-conditioning",
+          "role": "tensor-input",
+          "readers": [
+            "gen-core::iris::downstream::EmptyPrompt::read"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "output_artifacts": [
+      "bespoke_acceptance/metrics.json",
+      "bespoke_acceptance/peak_device_bytes.txt",
+      "bespoke_acceptance/adapter_sample.png",
+      "bespoke_acceptance/retained_export.json"
+    ]
+  },
+  {
+    "package": "candle-gen-iris",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "restoration_train_real_weights::iris_restoration_bounded_acceleration_acceptance",
+    "source": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "256px BF16 restoration rank8/alpha8 with real LPIPS/critic, existing repository-photo degradation helper, EMA0.5; steps4 is TWO G plus TWO critic updates TOTAL4; one 64x48 to256x192 native restoration sample. Real pinned installed model inputs, existing production trainer/dataset helpers. Header/path provisioning is not runtime content/named-revision attestation.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_real_weights.rs::restoration_train_real_weights::iris_restoration_bounded_acceleration_acceptance",
+    "required_environment": [
+      "IRIS_UPSCALER_DIR",
+      "IRIS_LPIPS_VGG16_DIR",
+      "IRIS_LPIPS_LIN_DIR",
+      "IRIS_CRITIC_TRUNK_DIR",
+      "BESPOKE_RUNTIME_DIR",
+      "MODEL_PROOF_OUTPUT_DIR"
+    ],
+    "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
+    "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configuration_kind": "feature-only",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_real_weights.rs::restoration_train_real_weights::iris_restoration_bounded_acceleration_acceptance/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "256px BF16 restoration rank8/alpha8 with real LPIPS/critic, existing repository-photo degradation helper, EMA0.5; steps4 is TWO G plus TWO critic updates TOTAL4; one 64x48 to256x192 native restoration sample",
+        "required_work": [
+          "Exactly one representative configuration/seed7/device; batch1 accumulation1, four TOTAL optimizer updates including first excluded timing warmup; hard shared <=20 guard; no resume/intermediate save/grid.",
+          "Finite loss/every expected active gradient, actual aggregate factor/parameter change and repeated actual source-owned preparation mechanism consumption; exact zero/inactive gradients retained and documented, focused nondegenerate fixtures preserved.",
+          "Synchronized step timings and sampled physical selected CUDA peak include diagnostic snapshots; load/cache preparation separated; sample and scalar diagnostics outside optimizer step timing.",
+          "Production save/reopen/apply then exactly ONE generated sample; full model/control checkpoints remain in legitimate owned runtime storage with export hash and actual reader witnesses; no checkpoint/archive publication bypass."
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1
+      }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_real_weights.rs::restoration_train_real_weights::iris_restoration_bounded_acceleration_acceptance",
+      "requirements": [
+        {
+          "slot": "iris-restore-training-model",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-restore-training-perceptual-files",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::load",
+            "candle-core::pickle::read_all_with_key"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-restore-training-critic",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::PthTensors::get"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-actual-export-configuration",
+          "role": "configuration",
+          "readers": [
+            "gen-core::iris::downstream::TaskExport::from_dir_impl"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-actual-export-conditioning",
+          "role": "tensor-input",
+          "readers": [
+            "gen-core::iris::downstream::EmptyPrompt::read"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "output_artifacts": [
+      "bespoke_acceptance/metrics.json",
+      "bespoke_acceptance/peak_device_bytes.txt",
+      "bespoke_acceptance/adapter_sample.png",
+      "bespoke_acceptance/retained_export.json"
+    ]
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "trainer_e2e::krea_control_bounded_acceleration_acceptance",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "64px BF16 trained seven-block native ControlNet, checkpoint ON, full branch body/projection optimizer groups form one logical update; aligned target/control production VAE inputs; one 256px 4-step native control sample. Real pinned installed model inputs, existing production trainer/dataset helpers. Header/path provisioning is not runtime content/named-revision attestation.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs::trainer_e2e::krea_control_bounded_acceleration_acceptance",
+    "required_environment": [
+      "KREA_CONTROL_BASE_DIR",
+      "BESPOKE_RUNTIME_DIR",
+      "MODEL_PROOF_OUTPUT_DIR"
+    ],
+    "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
+    "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configuration_kind": "feature-only",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs::trainer_e2e::krea_control_bounded_acceleration_acceptance/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "64px BF16 trained seven-block native ControlNet, checkpoint ON, full branch body/projection optimizer groups form one logical update; aligned target/control production VAE inputs; one 256px 4-step native control sample",
+        "required_work": [
+          "Exactly one representative configuration/seed7/device; batch1 accumulation1, four TOTAL optimizer updates including first excluded timing warmup; hard shared <=20 guard; no resume/intermediate save/grid.",
+          "Finite loss/every expected active gradient, actual aggregate factor/parameter change and repeated actual source-owned preparation mechanism consumption; exact zero/inactive gradients retained and documented, focused nondegenerate fixtures preserved.",
+          "Synchronized step timings and sampled physical selected CUDA peak include diagnostic snapshots; load/cache preparation separated; sample and scalar diagnostics outside optimizer step timing.",
+          "Production save/reopen/apply then exactly ONE generated sample; full model/control checkpoints remain in legitimate owned runtime storage with export hash and actual reader witnesses; no checkpoint/archive publication bypass."
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1
+      }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs::trainer_e2e::krea_control_bounded_acceleration_acceptance",
+      "requirements": [
+        {
+          "slot": "krea-trainer-actual-model-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-trainer-vae",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-trainer-retained-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::ValidatedTokenizerSource::read_unchanged"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-actual-direct-te-configuration",
+          "role": "configuration",
+          "readers": [
+            "candle-gen-krea::text_encoder::KreaTeConfig::from_snapshot"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "output_artifacts": [
+      "bespoke_acceptance/metrics.json",
+      "bespoke_acceptance/peak_device_bytes.txt",
+      "bespoke_acceptance/adapter_sample.png",
+      "bespoke_acceptance/retained_export.json"
+    ]
   }
 ]

@@ -541,6 +541,7 @@ impl AnimaTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
+            candle_gen::train::profile::cohort_begin_step(device)?;
             let sample = step_sample(aux_driver.as_mut(), step, &schedule);
             let (x0, source, target_ids, mask_weight) = &cache[sample.entry];
             // Epic 2123 E8: an aux-only step trains at the (shifted) σ remapped into the window.
@@ -579,6 +580,7 @@ impl AnimaTrainer {
                 )?;
                 update_idx += 1;
             }
+            candle_gen::train::profile::cohort_end_step(device, last_loss, &set.vars, LABEL)?;
             steps_run = step;
             on_progress(TrainingProgress::Training {
                 step,

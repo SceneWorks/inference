@@ -3867,6 +3867,18 @@
       "grades": [
         "reader-binding"
       ]
+    },
+    "candle-gen-moss-image::loader::load_weights_cancellable": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-moss-image::text_encoder::tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
     }
   },
   "ordered_record_source_facts_sha256": "888da778962d6902bcf54ab53b83436e5677abc22668902d3421a23b67506f44"

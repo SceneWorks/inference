@@ -404,6 +404,7 @@ impl ControlTrainer {
     /// [`StepReport`]. A caller stepping manually should inspect [`StepReport::loss`] for a non-finite
     /// value (divergence) — [`run`](Self::run) does this and aborts; a bare `step` loop must too.
     pub fn step(&mut self) -> Result<StepReport> {
+        candle_gen::train::profile::cohort_begin_step(&self.device)?;
         let t0 = Instant::now();
         let mut acc = None;
         let mut loss_sum = 0f32;
@@ -422,6 +423,9 @@ impl ControlTrainer {
                 }
             } else {
                 self.preparation_hits += 1;
+                candle_gen::train::profile::cohort_reuse(
+                    "krea-control:active-item-conditioning-hit",
+                );
             }
             let s = &self.samples[index];
             let x0 = s.x0.to_device(&self.device)?;
@@ -471,8 +475,16 @@ impl ControlTrainer {
         };
         self.opt_body.set_lr_scaled(warm);
         self.opt_proj.set_lr_scaled(warm);
+        candle_gen::train::profile::cohort_before_update(&grads, &self.vars)?;
         self.opt_body.step(&grads)?;
         self.opt_proj.step(&grads)?;
+        candle_gen::train::profile::cohort_after_update();
+        candle_gen::train::profile::cohort_end_step(
+            &self.device,
+            loss_sum / self.cfg.batch as f32,
+            &self.vars,
+            "krea-control:body-and-projection",
+        )?;
 
         self.step += 1;
         Ok(StepReport {

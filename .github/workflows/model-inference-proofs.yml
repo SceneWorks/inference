@@ -149,6 +149,10 @@ jobs:
         env:
           CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
         run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda'
+      - name: Bind pinned installed bespoke bounded training inputs
+        if: matrix.asset_setup == 'bespoke-training' && runner.os == 'Windows'
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_bespoke_training_proof_assets.py --plan "%RUNNER_TEMP%\model-proof-plan.json"'
       - name: Bind provisioned Raw snapshot for bounded Krea training
         if: matrix.asset_setup == 'krea-training' && runner.os == 'Windows'
         shell: powershell

@@ -850,6 +850,7 @@ impl MageTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
+            candle_gen::train::profile::cohort_begin_step(&self.device)?;
             let (loss, losses) = run_step(
                 &transformer,
                 &cache,
@@ -881,6 +882,7 @@ impl MageTrainer {
                     step % accum
                 };
                 scale_grads(&mut grads, &vars, 1.0 / window as f64)?;
+                candle_gen::train::profile::cohort_before_update(&grads, &vars)?;
                 match &surface {
                     // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
                     TrainSurface::Adapter(set) => adapter_optimizer_step(
@@ -899,8 +901,10 @@ impl MageTrainer {
                         optimizer.step(&grads)?;
                     }
                 }
+                candle_gen::train::profile::cohort_after_update();
                 update += 1;
             }
+            candle_gen::train::profile::cohort_end_step(&self.device, last_loss, &vars, LABEL)?;
             on_progress(TrainingProgress::Training {
                 step,
                 total: req.config.steps,

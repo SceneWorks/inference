@@ -46,6 +46,7 @@ pub(crate) struct CandleSession {
     pub seed: u64,
     pub accumulation: u32,
     pending: Option<GradStore>,
+    cohort_loss: f32,
 }
 fn invalid(detail: impl std::fmt::Display) -> Error {
     Error::Unsupported(format!("flux3 training session: {detail}"))
@@ -154,6 +155,7 @@ impl CandleSession {
             seed,
             accumulation,
             pending: None,
+            cohort_loss: 0.,
         })
     }
     fn named_pending(&self) -> BTreeMap<String, Tensor> {
@@ -304,6 +306,7 @@ impl SourceTrainingSession for CandleSession {
                 return Err(invalid("empty micro-batch"));
             }
             let vars = self.graph.vars();
+            candle_gen::train::profile::cohort_begin_step(self.graph.dit.device())?;
             let mut raw_loss = 0.0f32;
             for (position, index) in indices.iter().enumerate() {
                 check(flag)?;
@@ -397,6 +400,7 @@ impl SourceTrainingSession for CandleSession {
                 accumulate_grads(&mut self.pending, gradients, &vars)?;
             }
             check(flag)?;
+            self.cohort_loss = raw_loss;
             Ok(raw_loss)
         })();
         result.map_err(Into::into)
@@ -434,7 +438,15 @@ impl SourceTrainingSession for CandleSession {
                 scale_grads(pending, &vars, coefficient as f64)?;
             }
             self.optimizer.set_lr_scaled(lr_multiplier);
+            candle_gen::train::profile::cohort_before_update(pending, &vars)?;
             self.optimizer.step(pending)?;
+            candle_gen::train::profile::cohort_after_update();
+            candle_gen::train::profile::cohort_end_step(
+                self.graph.dit.device(),
+                self.cohort_loss,
+                &vars,
+                "flux3",
+            )?;
             self.pending = None;
             check(flag)
         })();

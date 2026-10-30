@@ -28,6 +28,7 @@ from scripts.ci.model_proof_inputs import assess_inputs, receipt_claims, validat
 from scripts.ci import model_proof_multi_cuda as multi_cuda
 from scripts.ci.native_darwin_sdk import select_sdk as select_native_darwin_sdk
 from scripts.ci.prepare_iris_quant_proof_assets import validate_receipt as validate_iris_asset_receipt
+from scripts.ci.prepare_bespoke_training_proof_assets import exact_bindings as bespoke_training_bindings
 
 REGISTRY_PATH = Path(__file__).with_name('model-inference-proofs.json')
 IGNORE_PREFIX = 'model inference; explicit model-proof workflow'
@@ -1549,20 +1550,5 @@ def main() -> int:
                     and rows[0]['package'] + '/' + rows[0]['fqn'] in COHORT_TRAINING_BINDINGS
                     and value.get('configuration') == 'fixed_cuda'):
                 asset_setup = 'cohort-training'
-            plan = {'runner': runner, 'asset_setup': asset_setup, 'backend': args.backend, 'request': value, 'selected': len(rows),
-                    'bindings': [identity(row) for row in rows]}
-            configured = {identity(row): row['selected_configuration'] for row in rows if 'selected_configuration' in row}
-            if configured:
-                plan['configurations'] = configured
-            print(json.dumps(plan, indent=2))
-            return 0
-        if args.output is None:
-            raise ValueError('an owned workflow output directory is required')
-        return run(rows, args.backend, value, args.expected_sha, args.output)
-    except (ValueError, OSError, subprocess.SubprocessError) as error:
-        print('model proof rejected: ' + str(error), file=sys.stderr)
-        return 1
-
-
-if __name__ == '__main__':
-    raise SystemExit(main())
+            if bespoke_training_bindings(rows, args.backend) is not None:
+                asset_setup = 'bespoke-training'

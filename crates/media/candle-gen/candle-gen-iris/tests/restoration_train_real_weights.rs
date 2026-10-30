@@ -375,3 +375,126 @@ fn real_restoration_full_finetune_trains_exports_and_restores() {
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_real_weights::real_restoration_full_finetune_trains_exports_and_restores");
 }
+
+#[cfg(feature = "model-inference-proof")]
+fn bounded_root() -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("MODEL_PROOF_OUTPUT_DIR").expect("manual executor output directory"),
+    )
+    .join("bespoke_acceptance");
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_runtime() -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("BESPOKE_RUNTIME_DIR")
+            .expect("source-owned persistent runtime checkpoint directory"),
+    );
+    assert!(root.is_absolute());
+    assert!(
+        root.join(".sc-26850-owned-runtime").is_file(),
+        "asset setup owns this runtime directory"
+    );
+    root
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, root: &std::path::Path) {
+    let peak = sampler.stop();
+    assert!(peak > 0);
+    std::fs::write(
+        root.join("peak_device_bytes.txt"),
+        (peak * 1024 * 1024).to_string(),
+    )
+    .unwrap();
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_export_receipt(root: &std::path::Path, path: &std::path::Path) {
+    assert!(
+        path.starts_with(bounded_runtime()),
+        "actual export stays in the owned runtime area"
+    );
+    let receipt = serde_json::json!({"actual_export":path, "bytes":std::fs::metadata(path).unwrap().len(),
+        "sha256":candle_gen::testkit::sha256_file(path), "runtime_directory":bounded_runtime(),
+        "publication":"complete model/control checkpoint retained in legitimate runtime storage; model-weight publication ban preserved",
+        "reload":"same exported path reopened/applied by production reader before sample; see actual reader receipts"});
+    std::fs::write(
+        root.join("retained_export.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+#[cfg(feature = "model-inference-proof")]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn iris_restoration_bounded_acceleration_acceptance() {
+    let root = bounded_root();
+    let items = dataset(&root);
+    let (input, _) = restore_case();
+    let mut spec = LoadSpec::new(WeightsSource::Dir(env_path("IRIS_UPSCALER_DIR")));
+    for (component, var) in [
+        (VGG16_COMPONENT, "IRIS_LPIPS_VGG16_DIR"),
+        (LPIPS_LIN_COMPONENT, "IRIS_LPIPS_LIN_DIR"),
+        (CRITIC_TRUNK_COMPONENT, "IRIS_CRITIC_TRUNK_DIR"),
+    ] {
+        spec.components
+            .insert(component.into(), WeightsSource::Dir(env_path(var)));
+    }
+    // Native adversarial recipe alternates G,D: steps=4 microbatches performs
+    // TWO generator + TWO critic optimizer updates, FOUR TOTAL incl warmup.
+    let mut config = TrainingConfig {
+        rank: 8,
+        alpha: 8.,
+        learning_rate: 1e-5,
+        weight_decay: 0.01,
+        steps: 4,
+        resolution: 256,
+        batch_size: 1,
+        gradient_accumulation: 1,
+        save_every: 0,
+        lr_warmup_steps: 0,
+        seed: 7,
+        train_dtype: "bf16".into(),
+        ..Default::default()
+    };
+    config
+        .model_options
+        .insert(OPTIONS_KEY.into(), serde_json::json!({"ema_decay":0.5}));
+    let sampler = candle_gen::testkit::PeakSampler::start_rendered();
+    let output = candle_gen::train::profile::with_bounded_cohort_for(
+        &root.join("metrics.json"),
+        &[
+            "iris:geometry-storage-hit",
+            "iris:frozen-GQA-projection-pack",
+        ],
+        || {
+            let mut trainer = candle_gen_iris::provider_registry()
+                .unwrap()
+                .load_trainer("iris_3b_restore", &spec)
+                .unwrap();
+            let output = trainer
+                .train(
+                    &TrainingRequest {
+                        items,
+                        config,
+                        output_dir: bounded_runtime().join("restoration"),
+                        file_name: "restorer.safetensors".into(),
+                        trigger_words: vec![],
+                        cancel: CancelFlag::new(),
+                    },
+                    &mut |_| {},
+                )
+                .unwrap();
+            assert_eq!(output.steps, 4);
+            assert!(output.final_loss.is_finite());
+            output
+        },
+    );
+    bounded_peak(sampler, &root);
+    let sample = restore(output.adapter_path.parent().unwrap(), &input);
+    assert!(sample.pixels.iter().any(|v| *v != 0));
+    save_image_png(&root.join("adapter_sample.png"), &sample);
+    bounded_export_receipt(&root, &output.adapter_path);
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_real_weights::iris_restoration_bounded_acceleration_acceptance");
+}

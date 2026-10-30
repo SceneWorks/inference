@@ -299,6 +299,7 @@ impl JointAttention {
                        v: &QLinear|
          -> Result<(Tensor, Tensor, Tensor)> {
             if let Some(pack) = pack {
+                candle_gen::train::profile::cohort_reuse("mage:frozen-projection-pack");
                 let mut ys = pack.forward_adapt(x, &[q, k, v])?.into_iter();
                 Ok((ys.next().unwrap(), ys.next().unwrap(), ys.next().unwrap()))
             } else {
@@ -921,6 +922,7 @@ impl MageTransformer {
             if let Some((_, table)) = self.training_rope.iter().find(|(key, table)| {
                 key == layout && table.cos.device().same_device(image.device())
             }) {
+                candle_gen::train::profile::cohort_reuse("mage:geometry-storage-hit");
                 table
             } else {
                 temporary = RopeTable::build(layout, self.dtype, image.device())?;
@@ -942,6 +944,7 @@ impl MageTransformer {
                     "mage prepared conditioning invalidated by norm/base replacement"
                 );
             }
+            candle_gen::train::profile::cohort_reuse("mage:frozen-caption-base-hit-live-residual");
             self.text_in.apply_residuals(normed, output.clone())?
         } else {
             self.text_in

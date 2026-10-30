@@ -534,6 +534,7 @@ impl Block {
             .to_dtype(self.q.dtype())?;
         let (b, s, d) = y.dims3()?;
         let (q, k, v) = if let Some(pack) = &self.projection_pack {
+            candle_gen::train::profile::cohort_reuse("moss:frozen-projection-pack");
             let mut ys =
                 Linear::forward_frozen_group(pack, &y, &[&self.q, &self.k, &self.v])?.into_iter();
             (ys.next().unwrap(), ys.next().unwrap(), ys.next().unwrap())
@@ -1056,7 +1057,10 @@ impl Transformer {
             .iter()
             .find(|(key, _)| *key == (h, w, tokens, video.dtype()))
         {
-            Some((_, r)) => r.clone(),
+            Some((_, r)) => {
+                candle_gen::train::profile::cohort_reuse("moss:geometry-storage-hit");
+                r.clone()
+            }
             None => rope(
                 h,
                 w,
@@ -1067,6 +1071,7 @@ impl Transformer {
             )?,
         };
         let text = if let Some(text) = self.training_context.get(&context.id()) {
+            candle_gen::train::profile::cohort_reuse("moss:frozen-caption-storage-hit");
             text.clone()
         } else {
             let mut text = self.project_context(context)?;
@@ -1089,11 +1094,11 @@ impl Transformer {
                 .to_dtype(dtype)?
                 .broadcast_mul(&(head.i((.., 1, ..))?.unsqueeze(1)?.to_dtype(dtype)? + 1.)?)?
                 .broadcast_add(&head.i((.., 0, ..))?.unsqueeze(1)?.to_dtype(dtype)?)?;
-            let pred = self
+            let pred = __model_proof_output!(self
                 .final_linear
-                .forward(&y.to_dtype(self.final_linear.dtype())?)?
-                .transpose(1, 2)?
-                .reshape((1, c, h, w))?;
+                .forward(&y.to_dtype(self.final_linear.dtype())?))?
+            .transpose(1, 2)?
+            .reshape((1, c, h, w))?;
             Ok(candle_gen::train::flow_match::weighted_velocity_loss(
                 &pred, target, mask, mae,
             )?)

@@ -166,6 +166,7 @@ impl Block {
             rmsnorm_rope
         };
         let (q, k, v) = if let Some(pack) = &self.projection_pack {
+            candle_gen::train::profile::cohort_reuse("flux3:frozen-projection-pack");
             let mut ys = Linear::forward_frozen_group(
                 pack,
                 &x_mod,
@@ -689,6 +690,7 @@ impl Flux3Dit {
                 .map(|id| id.map(f32::to_bits))
                 .collect::<Vec<_>>(),
         ) {
+            candle_gen::train::profile::cohort_reuse("flux3:geometry-storage-hit");
             return Ok(Rope {
                 cos: rope.cos.clone(),
                 sin: rope.sin.clone(),
@@ -794,7 +796,12 @@ impl Flux3Dit {
             let x = match mode {
                 0 => self.emb_in_image.forward(&x)?,
                 1 => self.emb_in_image_cond.forward(&x)?,
-                _ if training && self.training_text_prepared => x.to_device(&self.device)?,
+                _ if training && self.training_text_prepared => {
+                    candle_gen::train::profile::cohort_reuse(
+                        "flux3:frozen-caption-projection-consumed",
+                    );
+                    x.to_device(&self.device)?
+                }
                 _ => self.txt_in.forward(&x)?,
             };
             let rope = self.rope(&ids[mode])?;

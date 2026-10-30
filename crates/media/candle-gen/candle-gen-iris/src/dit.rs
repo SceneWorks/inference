@@ -137,9 +137,13 @@ impl Qkv {
             }
             Qkv::Split { q, k, v, pack } => {
                 let (qo, ko, vo) = if let Some(pack) = pack {
+                    candle_gen::train::profile::cohort_reuse("iris:frozen-GQA-projection-pack");
                     let mut ys = Linear::forward_frozen_group(pack, x, &[q, k, v])?.into_iter();
                     (ys.next().unwrap(), ys.next().unwrap(), ys.next().unwrap())
                 } else {
+                    candle_gen::train::profile::cohort_reuse(
+                        "iris:separate-GQA-projection-fallback",
+                    );
                     (q.forward(x)?, k.forward(x)?, v.forward(x)?)
                 };
                 let head_dim = qo.dim(2)? / heads;
@@ -346,6 +350,7 @@ impl IrisDiT {
         let mut cache = candle_gen::lock_recover(&self.geometry.0);
         if let Some((cached, rope)) = &cache.ropes[slot] {
             if cached == &key && rope.cos.device().same_device(&self.device) {
+                candle_gen::train::profile::cohort_reuse("iris:geometry-storage-hit");
                 return Ok(Rope {
                     cos: rope.cos.clone(),
                     sin: rope.sin.clone(),

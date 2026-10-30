@@ -40,6 +40,12 @@ fn tokenizer(sources: &Sources, limit: u32) -> Result<TextTokenizer> {
             pad_to_max_length: false,
         },
     )?;
+    #[cfg(feature = "model-inference-proof")]
+    candle_gen::gen_core::model_input_proof::record_reader_paths(
+        "candle-gen-moss-image::text_encoder::tokenizer",
+        candle_gen::gen_core::model_input_proof::InputRole::Tokenizer,
+        &[sources.tokenizer.pin.canonical_target_path()],
+    );
     Ok(tokenizer)
 }
 pub(crate) fn token_bound(

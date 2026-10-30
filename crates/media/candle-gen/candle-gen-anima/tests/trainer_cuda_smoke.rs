@@ -121,3 +121,120 @@ fn anima_base_lokr_real_cuda() {
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::anima_base_lokr_real_cuda");
 }
+
+#[cfg(feature = "model-inference-proof")]
+fn bounded_root() -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("MODEL_PROOF_OUTPUT_DIR").expect("manual executor output directory"),
+    )
+    .join("bespoke_acceptance");
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, root: &std::path::Path) {
+    let peak = sampler.stop();
+    assert!(
+        peak > 0,
+        "selected physical CUDA device peak must be observed"
+    );
+    std::fs::write(
+        root.join("peak_device_bytes.txt"),
+        (peak * 1024 * 1024).to_string(),
+    )
+    .unwrap();
+}
+
+/// One source-owned invocation: four TOTAL updates (one warmup, three timed),
+/// one config/seed/device, then ONE production-generated saved-adapter sample.
+#[test]
+#[cfg(feature = "model-inference-proof")]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn anima_bounded_acceleration_acceptance() {
+    let root = bounded_root();
+    let snapshot =
+        PathBuf::from(std::env::var_os("ANIMA_TRAIN_SNAPSHOT").expect("pinned installed snapshot"));
+    let input = root.join("input.png");
+    image::RgbImage::from_pixel(64, 64, image::Rgb([80, 140, 210]))
+        .save(&input)
+        .unwrap();
+    let spec = LoadSpec::new(WeightsSource::Dir(snapshot.clone()));
+    let sampler = candle_gen::testkit::PeakSampler::start_rendered();
+    let output = candle_gen::train::profile::with_bounded_cohort_for(
+        &root.join("metrics.json"),
+        &[
+            "anima:geometry-storage-hit",
+            "anima:frozen-projection-pack",
+            "anima:shared-differentiable-RMS",
+        ],
+        || {
+            let mut trainer = candle_gen_anima::provider_registry()
+                .unwrap()
+                .load_trainer("anima_base", &spec)
+                .unwrap();
+            let req = TrainingRequest {
+                items: vec![TrainingItem::captioned(input, "a blue tile".into())],
+                config: TrainingConfig {
+                    rank: 2,
+                    alpha: 2.,
+                    learning_rate: 1e-3,
+                    steps: 4,
+                    resolution: 64,
+                    batch_size: 1,
+                    gradient_accumulation: 1,
+                    lr_warmup_steps: 0,
+                    save_every: 0,
+                    seed: 7,
+                    train_dtype: "bf16".into(),
+                    gradient_checkpointing: false,
+                    ..Default::default()
+                },
+                output_dir: root.join("out"),
+                file_name: "adapter.safetensors".into(),
+                trigger_words: vec![],
+                cancel: CancelFlag::new(),
+            };
+            let output = trainer.train(&req, &mut |_| {}).unwrap();
+            assert_eq!(output.steps, 4);
+            assert!(output.final_loss.is_finite());
+            output
+        },
+    );
+    bounded_peak(sampler, &root);
+    let reopened =
+        candle_gen::candle_core::safetensors::load(&output.adapter_path, &Device::Cpu).unwrap();
+    assert!(!reopened.is_empty());
+    drop(reopened);
+    let generator = candle_gen_anima::provider_registry()
+        .unwrap()
+        .load(
+            "anima_base",
+            &spec.with_adapters(vec![AdapterSpec::new(
+                output.adapter_path,
+                1.,
+                AdapterKind::Lora,
+            )]),
+        )
+        .unwrap();
+    let GenerationOutput::Images(images) = generator
+        .generate(
+            &GenerationRequest {
+                prompt: "a blue tile".into(),
+                width: 512,
+                height: 512,
+                steps: Some(1),
+                seed: Some(7),
+                ..Default::default()
+            },
+            &mut |_| {},
+        )
+        .unwrap()
+    else {
+        panic!("expected image");
+    };
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].pixels.len(), 512 * 512 * 3);
+    assert!(images[0].pixels.iter().any(|p| *p != 0));
+    candle_gen::testkit::save_image_png(&root.join("adapter_sample.png"), &images[0]);
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::anima_bounded_acceleration_acceptance");
+}
