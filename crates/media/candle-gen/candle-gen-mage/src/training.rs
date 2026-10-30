@@ -744,7 +744,7 @@ impl MageTrainer {
         .map_err(|error| CandleError::Msg(format!("{LABEL}: read config: {error}")))?;
         let dit_cfg = MageConfig::from_json(&cfg_text)?;
         let compute_dtype = flow_match::parse_compute_dtype(&req.config.train_dtype);
-        let (transformer, surface) = if req.config.full_finetune {
+        let (mut transformer, surface) = if req.config.full_finetune {
             let (transformer, named) =
                 MageTransformer::load_trainable(&self.dirs.transformer, &dit_cfg, &self.device)?;
             (transformer, TrainSurface::Full(named))
@@ -777,6 +777,17 @@ impl MageTrainer {
             };
             (transformer, TrainSurface::Adapter(set))
         };
+        let inputs = cache
+            .iter()
+            .map(|sample| (&sample.text, &sample.layout))
+            .collect::<Vec<_>>();
+        check_aux_memory(
+            LABEL,
+            component_bytes(&self.dirs.transformer, "", LABEL)?,
+            aux_bytes.saturating_add(transformer.training_preparation_bytes(&inputs)),
+            device_training_budget_bytes(&self.device, LABEL),
+        )?;
+        transformer.prepare_training(&inputs)?;
         let vars = surface.vars();
         let mut optimizer = TrainOptimizer::from_config(
             &req.config.optimizer,
@@ -1200,7 +1211,11 @@ mod tests {
             MageTransformer::load_dtype(fixture.path(), &cfg, DType::F32, &Device::Cpu).unwrap();
         let set = build_adapt_lora_targets(
             &mut adapter,
-            &["proj_out".to_string(), "to_q".to_string()],
+            &[
+                "proj_out".to_string(),
+                "to_q".to_string(),
+                "txt_in".to_string(),
+            ],
             2,
             2.0,
             7,
@@ -1211,24 +1226,59 @@ mod tests {
             var.set(&Tensor::randn(0f32, 0.02f32, var.as_tensor().dims(), &Device::Cpu).unwrap())
                 .unwrap();
         }
-        let (full, named) =
+        let (mut full, named) =
             MageTransformer::load_trainable(fixture.path(), &cfg, &Device::Cpu).unwrap();
         let full_vars = named.iter().map(|(_, var)| var.clone()).collect::<Vec<_>>();
         let noise = Tensor::from_vec(values(16, 0.07), (1, 4, 4), &Device::Cpu).unwrap();
         let half: Vec<f32> = vec![1.0, 0.0, 1.0, 0.0];
+        let source = masked_sample(None);
+        for (model, vars) in [(&mut adapter, &set.vars), (&mut full, &full_vars)] {
+            let raw = step_loss(model, &source, &noise, 0.5, DType::F32, false, None)
+                .unwrap()
+                .0;
+            let raw_grads = raw.backward().unwrap();
+            model
+                .prepare_training(&[(&source.text, &source.layout)])
+                .unwrap();
+            let optimized = step_loss(model, &source, &noise, 0.5, DType::F32, false, None)
+                .unwrap()
+                .0;
+            let optimized_grads = optimized.backward().unwrap();
+            assert!(
+                (raw.to_scalar::<f32>().unwrap() - optimized.to_scalar::<f32>().unwrap()).abs()
+                    < 1e-5
+            );
+            for var in vars {
+                let a = raw_grads.get(var.as_tensor()).expect("raw gradient");
+                let b = optimized_grads
+                    .get(var.as_tensor())
+                    .expect("optimized gradient");
+                let magnitude = a
+                    .abs()
+                    .unwrap()
+                    .max_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                let error = a
+                    .sub(b)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                assert!(error <= magnitude * 2e-5 + 1e-7, "{error}/{magnitude}");
+            }
+        }
         for (model, vars) in [(&adapter, &set.vars), (&full, &full_vars)] {
             let loss = |mask: Option<&[f32]>| {
-                step_loss(
-                    model,
-                    &masked_sample(mask),
-                    &noise,
-                    0.5,
-                    DType::F32,
-                    false,
-                    None,
-                )
-                .unwrap()
-                .0
+                let mut sample = masked_sample(mask);
+                sample.text = source.text.clone();
+                step_loss(model, &sample, &noise, 0.5, DType::F32, false, None)
+                    .unwrap()
+                    .0
             };
             let plain = loss(None).to_scalar::<f32>().unwrap();
             let ones = loss(Some(&[1.0; 4])).to_scalar::<f32>().unwrap();
@@ -1246,6 +1296,27 @@ mod tests {
             assert!(mid > 0.0 && mid < plain, "{mid} vs {plain}");
         }
 
+        let before = step_loss(&adapter, &source, &noise, 0.5, DType::F32, false, None)
+            .unwrap()
+            .0
+            .to_scalar::<f32>()
+            .unwrap();
+        let (_, factor) = set
+            .named_vars()
+            .into_iter()
+            .find(|(name, _)| name == "txt_in.lora_B.weight")
+            .unwrap();
+        factor.set(&(factor.as_tensor() + 0.1).unwrap()).unwrap();
+        let after = step_loss(&adapter, &source, &noise, 0.5, DType::F32, false, None)
+            .unwrap()
+            .0
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_ne!(
+            before.to_bits(),
+            after.to_bits(),
+            "cached conditioning base must keep txt_in residuals live"
+        );
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_adapter_and_full_step_loss");
     }
