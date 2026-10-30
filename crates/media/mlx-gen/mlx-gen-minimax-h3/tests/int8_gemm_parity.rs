@@ -259,11 +259,27 @@ fn extreme_accumulation_beyond_f32_integer_range_is_exact() {
     }
 }
 
-fn w4a8(rng: &mut Rng, n: i32, k: i32, bias: bool) -> AdaptableLinear {
+/// Every E4M3 group-scale byte the published contract admits: `validate_s_rel` accepts only
+/// non-negative finite values, i.e. sign-clear bytes other than the 0x7F NaN code (normals,
+/// subnormals, +0) plus the sign-SET 0x80 byte, which decodes to -0.0. Every other sign-set byte is
+/// negative and refused at load (see `negative_s_rel_codes_are_refused_before_any_kernel`), so it
+/// can never reach either kernel.
+fn admissible_s_rel(rng: &mut Rng) -> u8 {
+    match rng.next() % 16 {
+        0 => 0x80,
+        _ => (rng.next() % 0x7F) as u8,
+    }
+}
+
+fn w4a8_operands(
+    rng: &mut Rng,
+    n: i32,
+    k: i32,
+    bias: bool,
+    s_rel: impl Fn(&mut Rng) -> u8,
+) -> Weights {
     let packed: Vec<i8> = (0..n * k / 2).map(|_| rng.code()).collect();
-    // Positive finite E4M3 bytes (sign clear, never the 0x7F NaN code), spanning normals and the
-    // subnormal range.
-    let s_rel: Vec<u8> = (0..n * k / 16).map(|_| (rng.next() % 0x7F) as u8).collect();
+    let s_rel: Vec<u8> = (0..n * k / 16).map(|_| s_rel(rng)).collect();
     let codebook: Vec<f32> = (0..16)
         .map(|i| (i as f32 - 7.5) * (0.6 + rng.unit()))
         .collect();
@@ -303,7 +319,11 @@ fn w4a8(rng: &mut Rng, n: i32, k: i32, bias: bool) -> AdaptableLinear {
                 .unwrap(),
         );
     }
-    let linear = quant::lin(&Weights::from_map(map), "p", bias).unwrap();
+    Weights::from_map(map)
+}
+
+fn w4a8(rng: &mut Rng, n: i32, k: i32, bias: bool) -> AdaptableLinear {
+    let linear = quant::lin(&w4a8_operands(rng, n, k, bias, admissible_s_rel), "p", bias).unwrap();
     assert!(
         linear.w4a8_base().is_some(),
         "must reach the native W4A8 base"
@@ -312,16 +332,25 @@ fn w4a8(rng: &mut Rng, n: i32, k: i32, bias: bool) -> AdaptableLinear {
 }
 
 /// Packed W4A8: in-tile int4 decode vs the serial `[TILE_COLS, K]` decode scratch, including a
-/// width that spans several reference tiles and ragged GEMM tiles.
+/// width that spans several reference tiles and ragged GEMM tiles, depths that are whole flush
+/// windows (512, 1024, 3584) AND depths that end in a partial window (768, 1280, and H3's own
+/// W4A8 K = 5376 = 10.5 x 512), and the -0.0 (0x80) group-scale byte.
 #[test]
 #[ignore = "executes the Metal INT8 GEMM; explicit synthetic-w4a8-mlx route only"]
 fn tiled_w4a8_matches_serial_reference_on_random_packed_codes() {
     require_metal();
+    // The 0x80 (-0.0) scale actually reaches the kernels, and a negative one never does.
+    let mut probe = Rng(7);
+    assert!((0..4096).any(|_| admissible_s_rel(&mut probe) == 0x80));
+    negative_s_rel_codes_are_refused_before_any_kernel();
     let mut rng = Rng(0x3_26691);
     for (m, n, k, bias) in [
         (37, 300, 512, true),
         (65, 64, 1024, false),
         (3, 520, 3584, true),
+        (70, 130, 768, true),
+        (9, 66, 1280, false),
+        (129, 200, 5376, true),
     ] {
         let linear = w4a8(&mut rng, n, k, bias);
         let base = linear.w4a8_base().unwrap();
@@ -488,4 +517,22 @@ fn microbench_h3_projection_shapes() {
          projections_reference_s={step_reference:.1} speedup={:.1}x",
         step_reference / step_tiled
     );
+}
+
+/// The sign-set E4M3 bytes the parity generator omits are not an untested decode path: the
+/// published contract refuses them at load, before any kernel exists. A plain helper (called by
+/// the W4A8 parity body) so the route's executed-test count is unchanged.
+fn negative_s_rel_codes_are_refused_before_any_kernel() {
+    for byte in [0x81u8, 0x88, 0xB8, 0xFE] {
+        let mut rng = Rng(u64::from(byte));
+        let refused = quant::lin(
+            &w4a8_operands(&mut rng, 8, 256, false, |_| byte),
+            "p",
+            false,
+        );
+        assert!(
+            refused.is_err(),
+            "negative s_rel byte {byte:#04x} must be refused at load"
+        );
+    }
 }
