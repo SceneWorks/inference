@@ -1632,21 +1632,20 @@ mod tests {
         );
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let out = events.clone();
-        let _observer = gen_core::LoadActivityObserver::new(move |v| out.lock().unwrap().push(v));
+        let _observer =
+            gen_core::LoadActivityObserver::new(move |v| crate::lock_recover(&out).push(v));
         let plan = plan_dense(&path);
         assert!(
-            events
-                .lock()
-                .unwrap()
+            crate::lock_recover(&events)
                 .iter()
                 .flatten()
                 .any(|v| v.bytes_read >= descriptor.len() as u64),
             "planning reads the descriptor through the neutral source reader"
         );
-        events.lock().unwrap().clear();
+        crate::lock_recover(&events).clear();
         let weights = read_logical_weights(&path, &plan, &Device::Cpu).unwrap();
         assert_eq!(dense_f32(&weights, "q.weight"), vec![1.; 4]);
-        let reports = events.lock().unwrap();
+        let reports = crate::lock_recover(&events);
         let file = std::fs::read(&path).unwrap();
         let header = 8 + u64::from_le_bytes(file[..8].try_into().unwrap());
         assert_eq!(
