@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::testkit::{env_path, tensor_max_abs, tensor_peak_rel};
+use candle_gen::testkit::{env_path, tensor_peak_rel};
 use candle_gen::Weights;
 use candle_gen_mochi::{
     load_transformer_var_builder, MochiDitConfig, MochiTransformer3DModel, DIT_DTYPE,
