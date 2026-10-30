@@ -294,6 +294,41 @@ fn krea_bounded_acceleration_profile() {
         assert_eq!(images[0].pixels.len(), 1024 * 1024 * 3);
         assert!(images[0].pixels.iter().any(|b| *b != 0));
         save_image_png(&tmp.join("adapter_sample.png"), &images[0]);
+        // The existing proof publisher retains only explicitly declared files.
+        // Keep the scalar run evidence beside the selected adapter/sample; the
+        // complete per-step timings, attribution and go/no-go remain in the
+        // independently retained body.stderr.log, where the driver emits them.
+        let metrics = serde_json::json!({
+            "schema_version": 1,
+            "completed_optimizer_updates": out.steps,
+            "configuration": {
+                "rank": req.config.rank,
+                "alpha": req.config.alpha,
+                "learning_rate": req.config.learning_rate,
+                "optimizer": &req.config.optimizer,
+                "resolution": req.config.resolution,
+                "train_dtype": &req.config.train_dtype,
+                "gradient_accumulation": req.config.gradient_accumulation,
+                "gradient_checkpointing": req.config.gradient_checkpointing,
+                "seed": req.config.seed,
+                "sample_every": req.config.sample_every,
+                "save_every": req.config.save_every,
+                "complete_source_configuration_debug": format!("{:?}",req.config)
+            },
+            "losses_by_physical_update": losses,
+            "selected_adapter_final_loss": out.final_loss,
+            "peak_device_mib_training_and_preparation": peak_mib,
+            "adapter": "out/krea_bounded.safetensors",
+            "sample": "adapter_sample.png",
+            "profile_log": "body.stderr.log",
+            "profile_records": ["KREA_PROFILE_STEP", "KREA_PROFILE_ATTRIBUTION", "KREA_PROFILE_OPTIMIZER", "KREA_PROFILE_RESULT"],
+            "claim_limit": "Bounded smoke and throughput only; four steady updates per segment. Device peak includes preparation and is not a per-process allocation measurement. Provisioned snapshot path/layout does not attest weight integrity; actual input receipts and learned-device witnesses are separate."
+        });
+        std::fs::write(
+            tmp.join("metrics.json"),
+            serde_json::to_vec_pretty(&metrics).unwrap(),
+        )
+        .expect("write declared bounded-profile metrics artifact");
         println!(
             "KREA_PROFILE_ARTIFACT adapter={} peak_device_mib={peak_mib} sample={}",
             out.adapter_path.display(),

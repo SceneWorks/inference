@@ -49825,6 +49825,122 @@
     "package": "candle-gen-krea",
     "target": "integration",
     "target_kind": "test",
+    "fqn": "trainer_e2e::krea_bounded_acceleration_profile",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Krea 2 Raw BF16 with actual external model/tokenizer/configuration readers and two source-generated swatches; matched reference/shared/candidate segments totaling 18 optimizer updates, selected adapter reload/apply and one generated sample. Provisioned path/layout is not content-integrity or named-revision attestation.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs::trainer_e2e::krea_bounded_acceleration_profile",
+    "required_environment": [
+      "KREA_RAW_DIR",
+      "MODEL_PROOF_OUTPUT_DIR"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, one late actual-FQN BODY and actual learned candle-cuda DEVICE witnesses; required input receipts retain their declared grades. Retain the three declared generated files plus body stdout/stderr. metrics.json records completed updates, fixed configuration, losses, selected adapter final loss and training/preparation device peak; body.stderr.log carries synchronized attribution, warmup/steady timings, dispatch counts, candidate go/no-go and the unchanged >=25% target result. A successful smoke body is not a speed-target PASS or convergence evidence.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs::trainer_e2e::krea_bounded_acceleration_profile/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "One CUDA Krea Raw invocation: rank16/alpha16, BF16, 1024px, batch1, accumulation1, checkpoint OFF, seed7, 18 total optimizer updates, preview cadence500, no intermediate save; one saved-adapter sample after timing.",
+        "required_work": [
+          "Three six-update segments restore deep adapter snapshots and fresh optimizer state, replaying identical seeded logical inputs; all warmup/reference work counts within 18 total updates.",
+          "First two updates per segment excluded from steady timing; first update records synchronized inclusive attribution; four steady updates remain. Preparation, diagnostic gradient readbacks and final sample are outside step timing.",
+          "Finite losses and every adapter gradient, actual adapter updates, candidate/reference dispatch counts, measured step timing and sampled training/preparation device peak.",
+          "Save the selected optimized adapter, reopen/apply it through the production Raw loader and generate exactly one 1024px, 28-step sample with seed7.",
+          "Publish declared adapter, sample and scalar metrics alongside full body logs; report candidate go/no-go and >=25% target honestly without interpreting smoke success as convergence or speed acceptance."
+        ],
+        "required_cuda_physical_index": 1
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs::trainer_e2e::krea_bounded_acceleration_profile",
+      "requirements": [
+        {
+          "slot": "krea-trainer-actual-model-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-trainer-vae",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-trainer-retained-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::ValidatedTokenizerSource::read_unchanged"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-actual-direct-te-configuration",
+          "role": "configuration",
+          "readers": [
+            "candle-gen-krea::text_encoder::KreaTeConfig::from_snapshot"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "output_artifacts": [
+      "krea_bounded_acceleration/out/krea_bounded.safetensors",
+      "krea_bounded_acceleration/adapter_sample.png",
+      "krea_bounded_acceleration/metrics.json"
+    ],
+    "required_cuda_physical_index": 1
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
     "fqn": "trainer_e2e::krea_lora_trains_and_is_well_formed",
     "source": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs",
     "cargo_target_metadata": {
