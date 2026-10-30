@@ -46,6 +46,7 @@ class MultiCudaRunner(unittest.TestCase):
                     raise ValueError('MOCK secondary post-idle failed')
         def guarded(argv, **kwargs):
             discovery = '--list' in argv
+            self.assertEqual(kwargs['reap_metadata_descendants'], discovery)
             observed.append(kwargs)
             text = (case['fqn'] + ': test\n\n1 test, 0 benchmarks\n') if discovery else (
                 'test result: ok. 1 passed; 0 failed; 0 ignored;\n'

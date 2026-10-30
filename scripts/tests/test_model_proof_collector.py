@@ -402,6 +402,7 @@ class Collector(unittest.TestCase):
             return {'prebuilt': 'MOCK; not executed'}
         def guarded(argv, **kwargs):
             self.assertEqual(kwargs['env']['CARGO_ENCODED_RUSTFLAGS'], 'MOCK_NATIVE_LINKER_FLAGS')
+            self.assertFalse(kwargs['reap_metadata_descendants'])  # macOS metadata and model bodies keep their lifetime.
             discovery = '--list' in argv
             if not discovery:
                 for name, payload in (generated_outputs or {}).items():

@@ -1090,6 +1090,7 @@ def run_guarded(
     require_gpu_sample: bool = True, pass_fds: tuple[int, ...] = (),
     additional_cuda_policies: tuple[SafetyPolicy, ...] = (),
     additional_cuda_probes: tuple[object, ...] = (),
+    reap_metadata_descendants: bool = False,
 ) -> RunResult:
     """Run one row under runtime-guarded, estimate-plus-reserve admission.
 
@@ -1099,6 +1100,9 @@ def run_guarded(
     """
     if type(require_gpu_sample) is not bool:
         raise SupervisionError("invalid-policy", "GPU sample requirement must be boolean")
+    if (type(reap_metadata_descendants) is not bool or
+            (reap_metadata_descendants and (policy.backend != "windows-cpu" or require_gpu_sample))):
+        raise SupervisionError("invalid-policy", "metadata descendant reaping requires an explicit Windows CPU-only discovery")
     admission = None
     cuda_states: tuple[_CudaWatch, ...] = ()
     spawned: list[int] = []
@@ -1130,6 +1134,7 @@ def run_guarded(
             stdout_path=stdout_path, stderr_path=stderr_path, event_path=event_path,
             probe=probe, clock=clock, on_spawn=record_spawn, require_gpu_sample=require_gpu_sample, pass_fds=pass_fds,
             cuda_states=cuda_states,
+            reap_metadata_descendants=reap_metadata_descendants,
         )
     except SupervisionError as error:
         error.admission = admission
@@ -1145,6 +1150,7 @@ def _run_admitted(
     event_path: Path | None, probe: object | None, clock: Callable[[], float],
     on_spawn: Callable[[int, int | None], None], require_gpu_sample: bool = True,
     pass_fds: tuple[int, ...] = (), cuda_states: tuple[_CudaWatch, ...] = (),
+    reap_metadata_descendants: bool = False,
 ) -> RunResult:
     if (not isinstance(pass_fds, tuple) or any(type(fd) is not int or fd < 3 for fd in pass_fds)
             or (os.name == 'nt' and pass_fds)):
@@ -1303,6 +1309,19 @@ def _run_admitted(
                     pids = None
                 else:
                     failed_tree_ticks.succeeded()
+                    if reap_metadata_descendants and status is not None and pids:
+                        # Cargo's completed --list can leave MSVC's VCTIP telemetry
+                        # helper alive. Only metadata discovery opts into reclaiming
+                        # these owned descendants; model bodies keep their normal
+                        # lifetime. Retained, authenticated process handles must all
+                        # signal exit before an empty Job can complete discovery.
+                        try:
+                            job.terminate_and_reap(child, policy.term_grace_millis / 1000)
+                        except windows.WindowsJobError as error:
+                            raise SupervisionError("cleanup-failure", str(error)) from error
+                        pids, owned = owned_processes()
+                        if pids or owned:
+                            raise SupervisionError("cleanup-failure", "metadata Job still has owned processes after reaping")
                     finished = finished_result(status, pids, owned)
                     if finished is not None:
                         return finished
