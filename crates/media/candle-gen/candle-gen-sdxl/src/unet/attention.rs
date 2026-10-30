@@ -323,14 +323,19 @@ impl CrossAttention {
             // `self.scale` is already applied to `key` in the un-guarded path via `key.t()·scale`; the
             // helper applies it to the scores instead (`(q·kᵀ)·scale` == `q·(kᵀ·scale)`).
             let _enter = self.span_softmax.enter();
-            candle_gen::sdpa_budgeted_flat(
-                &query,
-                &key,
-                &value,
+            let (batch_heads, query_len, dim) = query.dims3()?;
+            let batch = batch_heads / self.heads;
+            let key_len = key.dim(1)?;
+            candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
+                &query.reshape((batch, self.heads, query_len, dim))?,
+                &key.reshape((batch, self.heads, key_len, dim))?,
+                &value.reshape((batch, self.heads, key_len, dim))?,
                 self.scale,
+                None,
                 |s| nn::ops::softmax(s, D::Minus1),
                 crate::request_attention_budget(),
             )?
+            .reshape((batch_heads, query_len, dim))?
             .to_dtype(in_dtype)?
         };
         self.reshape_batch_dim_to_heads(&xs)

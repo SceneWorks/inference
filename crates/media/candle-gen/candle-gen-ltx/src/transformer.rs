@@ -265,7 +265,7 @@ impl Attention {
         let qf = qh.to_dtype(DType::F32)?.contiguous()?;
         let kf = kh.to_dtype(DType::F32)?.contiguous()?;
         let vf = vh.to_dtype(DType::F32)?.contiguous()?;
-        let out = candle_gen::sdpa_budgeted_bhsd(
+        let out = candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
             &qf,
             &kf,
             &vf,

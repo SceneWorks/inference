@@ -355,7 +355,7 @@ fn to_heads(x: &Tensor, heads: usize, head_dim: usize, norm: Option<&RmsNorm>) -
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor, head_dim: usize) -> Result<Tensor> {
     let (b, h, s, d) = q.dims4()?;
     let scale = (head_dim as f64).powf(-0.5);
-    let o = candle_gen::sdpa_budgeted_bhsd(
+    let o = candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
         q,
         k,
         v,

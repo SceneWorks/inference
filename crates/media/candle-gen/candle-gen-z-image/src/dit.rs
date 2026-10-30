@@ -257,7 +257,7 @@ impl ZImageAttention {
             }
             None => None,
         };
-        let context = candle_gen::sdpa_planned_bhsd(
+        let context = candle_gen::fused_attention::training_sdpa_bhsd(
             &q,
             &k,
             &v,

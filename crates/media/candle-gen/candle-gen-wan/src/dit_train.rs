@@ -176,9 +176,15 @@ impl TrainAttention {
         }
         let scale = (self.head_dim as f64).powf(-0.5);
         // Composable SDPA (NOT the fused `softmax_last_dim` — that CustomOp has no backward).
-        let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * scale)?;
-        let attn = softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
-        let out = attn.matmul(&v.contiguous()?)?; // [B,H,S,d]
+        let out = candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            None,
+            |scores| softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype()),
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?; // [B,H,S,d]
         let out = out
             .transpose(1, 2)?
             .reshape((b, s, self.num_heads * self.head_dim))?;

@@ -183,7 +183,7 @@ impl TrainJointAttention {
         // rows (byte-identical for common sizes). The softmax closure preserves the exact f32-upcast
         // composable `softmax(_, D::Minus1)` so the backward is unchanged.
         let qd = q.dtype();
-        let o = candle_gen::sdpa_budgeted_bhsd(
+        let o = candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
             &q,
             &k,
             &v,

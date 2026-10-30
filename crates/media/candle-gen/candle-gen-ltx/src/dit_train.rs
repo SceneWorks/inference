@@ -186,7 +186,7 @@ impl TrainAttention {
         let q = q.to_dtype(DType::F32)?.contiguous()?;
         let k = k.to_dtype(DType::F32)?.contiguous()?;
         let v = v.to_dtype(DType::F32)?.contiguous()?;
-        let out = candle_gen::sdpa_budgeted_bhsd(
+        let out = candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
             &q,
             &k,
             &v,
