@@ -1549,6 +1549,26 @@ jobs:
           python3 -I scripts/ci/check_compiled_model_ignores.py --list-only -- cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
           if errorlevel 1 exit /b 1
           python scripts/ci/test_suites.py routine -- cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-fail-fast
+      # sc-26856: raw QKV/adapter arithmetic only, explicitly selected in this
+      # dispatch-only lane. Never override ignored learned bodies in ordinary CI.
+      - name: Prove streaming training attention raw CUDA arithmetic
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked -p candle-gen --lib --features cuda training_attention::tests::streaming_forward_backward_matches_composable -- --exact --ignored --nocapture > "%RUNNER_TEMP%\training-attention-proof.log" 2>&1
+          if errorlevel 1 (type "%RUNNER_TEMP%\training-attention-proof.log" & exit /b 1)
+          type "%RUNNER_TEMP%\training-attention-proof.log"
+          findstr /c:"test result: ok. 1 passed; 0 failed; 0 ignored;" "%RUNNER_TEMP%\training-attention-proof.log" >nul
+          if errorlevel 1 exit /b 1
+      - name: Prove half precision adapter rounding raw CUDA arithmetic
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked -p candle-gen --lib --features cuda train::projection::tests::half_precision_keeps_output_scale_rounding -- --exact --ignored --nocapture > "%RUNNER_TEMP%\adapter-rounding-proof.log" 2>&1
+          if errorlevel 1 (type "%RUNNER_TEMP%\adapter-rounding-proof.log" & exit /b 1)
+          type "%RUNNER_TEMP%\adapter-rounding-proof.log"
+          findstr /c:"test result: ok. 1 passed; 0 failed; 0 ignored;" "%RUNNER_TEMP%\adapter-rounding-proof.log" >nul
+          if errorlevel 1 exit /b 1
       - name: Test LLM-only CUDA bundle
         shell: cmd
         run: |

@@ -44,6 +44,7 @@ pub fn take_training_attention_counts() -> (u64, u64) {
 
 /// Pure eligibility, usable by source/CPU tests without allocating a CUDA tensor.
 /// All address products (including the packed gradient buffer) must fit i32.
+#[allow(clippy::too_many_arguments)]
 pub fn streaming_eligible(
     cuda: bool,
     same_device: bool,
@@ -116,10 +117,18 @@ pub(crate) fn try_streaming(
         // Compile refusal is a supported fallback. Launch/allocation errors are
         // propagated: retrying after a failed CUDA launch is not a safe fallback.
         let dev = q.device().as_cuda_device()?;
-        if SOURCE.compiled(dev).is_ok() {
-            let output = cuda::forward(q, k, v, scale as f32)?;
-            COUNTS.set((COUNTS.get().0 + 1, COUNTS.get().1));
-            return Ok(Some(output));
+        match SOURCE.compiled(dev) {
+            Ok(_) => {
+                let output = cuda::forward(q, k, v, scale as f32)?;
+                COUNTS.set((COUNTS.get().0 + 1, COUNTS.get().1));
+                return Ok(Some(output));
+            }
+            Err(error) => {
+                // The compile seam already caches failures. Log the first
+                // refusal so a zero-dispatch no-go has a concrete diagnosis.
+                static REPORTED: std::sync::Once = std::sync::Once::new();
+                REPORTED.call_once(|| eprintln!("training attention candidate refused: {error}"));
+            }
         }
     }
     #[cfg(not(feature = "cuda"))]
@@ -202,15 +211,17 @@ mod cuda {
             out: &Tensor,
             grad: &Tensor,
         ) -> candle_core::Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
-            let packed = q.apply_op3_no_bwd(
-                k,
-                v,
-                &Backward {
-                    scale: self.0,
-                    out: out.detach(),
-                    grad: grad.contiguous()?.detach(),
-                },
-            )?;
+            let packed = crate::train::profile::span("attention_backward", q.device(), || {
+                q.apply_op3_no_bwd(
+                    k,
+                    v,
+                    &Backward {
+                        scale: self.0,
+                        out: out.detach(),
+                        grad: grad.contiguous()?.detach(),
+                    },
+                )
+            })?;
             let nq = q.elem_count();
             let nk = k.elem_count();
             Ok((
@@ -383,16 +394,20 @@ mod tests {
                         .to_dtype(dtype)?,
                 )?;
                 let scale = 1. / (d as f64).sqrt();
+                // Nonunit final stride and nonzero storage offset must retain
+                // correct gradients to the original variables through copies.
+                let qview = q.transpose(2, 3)?.contiguous()?.transpose(2, 3)?;
+                let kview = Tensor::cat(&[k.as_tensor(), k.as_tensor()], 2)?.narrow(2, sk, sk)?;
                 let reference = crate::attention::sdpa_budgeted_bhsd(
-                    &q,
-                    &crate::attention::repeat_kv(&k, h / hk)?,
+                    &qview,
+                    &crate::attention::repeat_kv(&kview, h / hk)?,
                     &crate::attention::repeat_kv(&v, h / hk)?,
                     scale,
                     None,
                     |s| candle_nn::ops::softmax(s, D::Minus1),
                     usize::MAX,
                 )?;
-                let actual = cuda::forward(&q, &k, &v, scale as f32)?;
+                let actual = cuda::forward(&qview, &kview, &v, scale as f32)?;
                 let upstream = Tensor::from_vec(values(b * h * sq * d, 3), (b, h, sq, d), &dev)?;
                 let ga = actual
                     .to_dtype(DType::F32)?
@@ -415,10 +430,10 @@ mod tests {
                     ("dk", ga.get(&k).unwrap(), gr.get(&k).unwrap()),
                     ("dv", ga.get(&v).unwrap(), gr.get(&v).unwrap()),
                 ] {
-                    let err = (a.to_dtype(DType::F32)? - r.to_dtype(DType::F32)?)?
-                        .abs()?
-                        .max_all()?
-                        .to_scalar::<f32>()?;
+                    let delta = (a.to_dtype(DType::F32)? - r.to_dtype(DType::F32)?)?.abs()?;
+                    // sum propagates NaNs; a CUDA max reduction alone may ignore them.
+                    assert!(delta.sum_all()?.to_scalar::<f32>()?.is_finite());
+                    let err = delta.max_all()?.to_scalar::<f32>()?;
                     assert!(
                         err.is_finite() && err < tol,
                         "{label} {dtype:?} b{b} h{h}/{hk} sq{sq} sk{sk} d{d}: {err} >= {tol}"

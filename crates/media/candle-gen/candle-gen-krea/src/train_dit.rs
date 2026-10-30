@@ -68,7 +68,9 @@ pub const KREA_ATTN_TARGETS: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
 /// runs in f32 (the reference upcasts) and the result is cast back to `x`'s dtype, so it is numerically
 /// the same op the inference path applies — just one the autograd can traverse.
 pub(crate) fn rms_scale_diff(x: &Tensor, weight_f32: &Tensor, eps: f64) -> Result<Tensor> {
-    candle_gen::train::norm::rms_norm_diff(x, weight_f32, eps)
+    candle_gen::train::profile::span("norm_forward", x.device(), || {
+        candle_gen::train::norm::rms_norm_diff(x, weight_f32, eps)
+    })
 }
 
 /// The sequence-major GQA kv broadcast (`[b,s,hkv,hd] → [b,s,hkv·groups,hd]`) matching the inference
@@ -107,15 +109,17 @@ pub(crate) fn sdpa_diff_budgeted(
     scale: f64,
     budget: usize,
 ) -> Result<Tensor> {
-    candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
-        q,
-        k,
-        v,
-        scale,
-        None,
-        |s| softmax(s, D::Minus1),
-        budget,
-    )
+    candle_gen::train::profile::span("attention_forward", q.device(), || {
+        candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
+            q,
+            k,
+            v,
+            scale,
+            None,
+            |s| softmax(s, D::Minus1),
+            budget,
+        )
+    })
 }
 
 /// Build a frozen base `Linear` (no bias) from the mmap'd `Weights` and wrap it as a trainable
@@ -332,23 +336,26 @@ impl TrainAttention {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.heads, self.kv_heads, self.head_dim);
 
-        let projected = match &self.projections {
-            Some(pack) => pack.forward_lora(
-                x,
-                &[
-                    self.q.lora().unwrap(),
-                    self.k.lora().unwrap(),
-                    self.v.lora().unwrap(),
-                    self.gate.lora().unwrap(),
-                ],
-            )?,
-            None => vec![
-                self.q.forward(x)?,
-                self.k.forward(x)?,
-                self.v.forward(x)?,
-                self.gate.forward(x)?,
-            ],
-        };
+        let projected =
+            candle_gen::train::profile::span("qkvg_projection_forward", x.device(), || {
+                Ok(match &self.projections {
+                    Some(pack) => pack.forward_lora(
+                        x,
+                        &[
+                            self.q.lora().unwrap(),
+                            self.k.lora().unwrap(),
+                            self.v.lora().unwrap(),
+                            self.gate.lora().unwrap(),
+                        ],
+                    )?,
+                    None => vec![
+                        self.q.forward(x)?,
+                        self.k.forward(x)?,
+                        self.v.forward(x)?,
+                        self.gate.forward(x)?,
+                    ],
+                })
+            })?;
         let q = projected[0].reshape((b, s, nh, hd))?;
         let k = projected[1].reshape((b, s, nkv, hd))?;
         let v = projected[2].reshape((b, s, nkv, hd))?;
@@ -374,8 +381,11 @@ impl TrainAttention {
         let o = sdpa_diff_budgeted(&q, &k, &v, self.scale, self.attn_budget)?;
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
 
-        let gated = (o * sigmoid(gate)?)?;
-        self.o.forward(&gated)
+        let gated =
+            candle_gen::train::profile::span("attention_gate", x.device(), || o * sigmoid(gate)?)?;
+        candle_gen::train::profile::span("output_projection_forward", x.device(), || {
+            self.o.forward(&gated)
+        })
     }
 }
 
@@ -440,13 +450,19 @@ impl TrainBlock {
             .broadcast_mul(&(prescale + 1.0)?)?
             .broadcast_add(preshift)?;
         let attn = self.attn.forward(&pre, Some((cos, sin)))?;
-        let x = (x + attn.broadcast_mul(pregate)?)?;
+        let x = candle_gen::train::profile::span("residual_forward", x.device(), || {
+            x + attn.broadcast_mul(pregate)?
+        })?;
 
         let post = rms_scale_diff(&x, &self.postnorm, self.eps)?
             .broadcast_mul(&(postscale + 1.0)?)?
             .broadcast_add(postshift)?;
-        let mlp = self.mlp.forward(&post)?;
-        &x + mlp.broadcast_mul(postgate)?
+        let mlp = candle_gen::train::profile::span("ffn_forward", x.device(), || {
+            self.mlp.forward(&post)
+        })?;
+        candle_gen::train::profile::span("residual_forward", x.device(), || {
+            &x + mlp.broadcast_mul(postgate)?
+        })
     }
 }
 

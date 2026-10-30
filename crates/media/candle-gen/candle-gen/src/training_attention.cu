@@ -16,13 +16,16 @@ extern "C" __global__ void attention_forward(
     float acc[8] = {}, m = -__int_as_float(0x7f800000), z = 0;
     for (int j = 0; j < sk; ++j) {
         float score = 0;
-        for (int t = lane; t < d; t += 32) score += q[row*d+t] * k[kb+j*d+t];
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) if (lane+32*t < d) score += q[row*d+lane+32*t] * k[kb+j*d+lane+32*t];
         score = warp_sum(score) * scale;
         float next = fmaxf(m, score), a = expf(m-next), p = expf(score-next);
-        for (int t = lane; t < d; t += 32) acc[t/32] = a*acc[t/32] + p*v[kb+j*d+t];
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) if (lane+32*t < d) acc[t] = a*acc[t] + p*v[kb+j*d+lane+32*t];
         z = a*z + p; m = next;
     }
-    for (int t = lane; t < d; t += 32) out[row*(d+1)+t] = acc[t/32]/z;
+    #pragma unroll
+        for (int t = 0; t < 8; ++t) if (lane+32*t < d) out[row*(d+1)+lane+32*t] = acc[t]/z;
     if (lane == 0) out[row*(d+1)+d] = m + logf(z);
 }
 extern "C" __global__ void attention_dq(
@@ -34,20 +37,24 @@ extern "C" __global__ void attention_dq(
     int batch = row/(hq*sq), head = (row/sq)%hq;
     int kb = (batch*hk + head/(hq/hk))*sk*d;
     float delta = 0, acc[8] = {};
-    for (int t = lane; t < d; t += 32) delta += out[row*(d+1)+t]*grad[row*(d+1)+t];
+    #pragma unroll
+        for (int t = 0; t < 8; ++t) if (lane+32*t < d) delta += out[row*(d+1)+lane+32*t]*grad[row*(d+1)+lane+32*t];
     delta = warp_sum(delta);
     float lse = out[row*(d+1)+d];
     for (int j = 0; j < sk; ++j) {
         float score = 0, dp = 0;
-        for (int t = lane; t < d; t += 32) {
-            score += q[row*d+t]*k[kb+j*d+t];
-            dp += grad[row*(d+1)+t]*v[kb+j*d+t];
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) if (lane+32*t < d) {
+            score += q[row*d+lane+32*t]*k[kb+j*d+lane+32*t];
+            dp += grad[row*(d+1)+lane+32*t]*v[kb+j*d+lane+32*t];
         }
         float p = expf(warp_sum(score)*scale-lse);
         float ds = p*(warp_sum(dp)-delta)*scale;
-        for (int t = lane; t < d; t += 32) acc[t/32] += ds*k[kb+j*d+t];
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) if (lane+32*t < d) acc[t] += ds*k[kb+j*d+lane+32*t];
     }
-    for (int t = lane; t < d; t += 32) dst[row*d+t] = acc[t/32];
+    #pragma unroll
+        for (int t = 0; t < 8; ++t) if (lane+32*t < d) dst[row*d+lane+32*t] = acc[t];
 }
 extern "C" __global__ void attention_dkv(
     const float* q, const float* k, const float* v, const float* out,
@@ -63,21 +70,24 @@ extern "C" __global__ void attention_dkv(
         for (int i = 0; i < sq; ++i) {
             int qr = qb+i;
             float score = 0, dp = 0, delta = 0;
-            for (int t = lane; t < d; t += 32) {
-                score += q[qr*d+t]*k[row*d+t];
-                dp += grad[qr*(d+1)+t]*v[row*d+t];
-                delta += grad[qr*(d+1)+t]*out[qr*(d+1)+t];
+            #pragma unroll
+        for (int t = 0; t < 8; ++t) if (lane+32*t < d) {
+                score += q[qr*d+lane+32*t]*k[row*d+lane+32*t];
+                dp += grad[qr*(d+1)+lane+32*t]*v[row*d+lane+32*t];
+                delta += grad[qr*(d+1)+lane+32*t]*out[qr*(d+1)+lane+32*t];
             }
             float p = expf(warp_sum(score)*scale-out[qr*(d+1)+d]);
             float ds = p*(warp_sum(dp)-warp_sum(delta))*scale;
-            for (int t = lane; t < d; t += 32) {
-                dk[t/32] += ds*q[qr*d+t];
-                dv[t/32] += p*grad[qr*(d+1)+t];
+            #pragma unroll
+        for (int t = 0; t < 8; ++t) if (lane+32*t < d) {
+                dk[t] += ds*q[qr*d+lane+32*t];
+                dv[t] += p*grad[qr*(d+1)+lane+32*t];
             }
         }
     }
-    for (int t = lane; t < d; t += 32) {
-        dst[qrows*d+row*d+t] = dk[t/32];
-        dst[(qrows+rows)*d+row*d+t] = dv[t/32];
+    #pragma unroll
+        for (int t = 0; t < 8; ++t) if (lane+32*t < d) {
+        dst[qrows*d+row*d+lane+32*t] = dk[t];
+        dst[(qrows+rows)*d+row*d+lane+32*t] = dv[t];
     }
 }

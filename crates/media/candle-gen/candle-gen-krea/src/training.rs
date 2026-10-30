@@ -240,10 +240,17 @@ fn compute_conditioned_step_loss_grads(
     let x_t = x_t_f32.to_dtype(compute_dtype)?;
     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
 
-    let (combined, ctx) = match conditioning {
-        TrainingConditioning::Raw(cap) => dit.forward_pre_main(&x_t, &t, &cap.unsqueeze(0)?)?,
-        TrainingConditioning::Prepared(cap) => dit.forward_pre_main_caption(&x_t, &t, cap)?,
-    };
+    let (combined, ctx) =
+        candle_gen::train::profile::span("conditioning_pre_main", device, || {
+            Ok(match conditioning {
+                TrainingConditioning::Raw(cap) => {
+                    dit.forward_pre_main(&x_t, &t, &cap.unsqueeze(0)?)?
+                }
+                TrainingConditioning::Prepared(cap) => {
+                    dit.forward_pre_main_caption(&x_t, &t, cap)?
+                }
+            })
+        })?;
     if use_checkpoint {
         // The breakdown of the final segment's last evaluation, kept for reporting.
         let breakdown = std::cell::Cell::new(None);
@@ -281,7 +288,7 @@ fn compute_conditioned_step_loss_grads(
         // Dense backward: one monolithic `loss.backward()`. Raw DiT velocity (no negation).
         let v = dit.forward_main(combined, &ctx)?;
         let (loss, losses) = step_loss(&v, &target, &x_t_f32, sigma, mask_weight, mae, aux)?;
-        let grads = loss.backward()?;
+        let grads = candle_gen::train::profile::span("whole_backward", device, || loss.backward())?;
         Ok((losses, grads))
     }
 }

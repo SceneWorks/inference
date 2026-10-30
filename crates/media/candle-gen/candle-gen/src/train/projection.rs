@@ -8,7 +8,7 @@ use crate::quant::AdaptLinear;
 
 /// Apply a two-dimensional factor without materializing one copy per leading batch.
 pub(crate) fn apply_factor(x: &Tensor, w: &Tensor) -> candle_core::Result<Tensor> {
-    if w.rank() != 2 || x.rank() <= 2 {
+    if super::profile::reference_math() || w.rank() != 2 || x.rank() <= 2 {
         return x.broadcast_matmul(w);
     }
     let dims = x.dims();
@@ -29,6 +29,9 @@ pub(crate) fn scaled_lora(
     scale: f64,
 ) -> candle_core::Result<Tensor> {
     let rank = apply_factor(x, down)?;
+    if super::profile::reference_math() {
+        return apply_factor(&rank, up)? * scale;
+    }
     if scale == 1.0 {
         // The common alpha == rank convention needs no scaling kernel at any dtype.
         apply_factor(&rank, up)

@@ -191,6 +191,118 @@ fn read_meta(path: &Path) -> HashMap<String, String> {
     md.metadata().clone().unwrap_or_default()
 }
 
+/// sc-26850 terminal acceptance: ONE invocation, eighteen total optimizer
+/// updates including attribution/warmup. This is smoke/throughput evidence,
+/// not a convergence claim. The existing historical tests remain separate.
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn krea_bounded_acceleration_profile() {
+    #[cfg(not(feature = "model-inference-proof"))]
+    panic!("requires explicit model-inference-proof feature and registered CUDA lane");
+    #[cfg(feature = "model-inference-proof")]
+    {
+        let raw = std::env::var("KREA_RAW_DIR")
+            .map(PathBuf::from)
+            .expect("KREA_RAW_DIR required; Turbo is not a Raw timing baseline");
+        let tmp = std::env::var_os("MODEL_PROOF_OUTPUT_DIR")
+            .map(PathBuf::from)
+            .expect("existing model-proof executor must bind its owned generated output directory")
+            .join("krea_bounded_acceleration");
+        let items = make_dataset(&tmp.join("data"));
+        let mut cfg = config(NetworkType::Lora, 18, false);
+        cfg.rank = 16;
+        cfg.alpha = 16.;
+        cfg.resolution = 1024;
+        cfg.gradient_accumulation = 1;
+        // Preserve the established production preview policy; the one acceptance
+        // sample below is generated after save/reload/apply, outside step timing.
+        cfg.sample_every = 500;
+        let req = TrainingRequest {
+            items,
+            config: cfg,
+            output_dir: tmp.join("out"),
+            file_name: "krea_bounded.safetensors".into(),
+            trigger_words: vec![],
+            cancel: CancelFlag::new(),
+        };
+        let sampler = candle_gen::testkit::PeakSampler::start_rendered();
+        let mut trainer = candle_gen_krea::provider_registry()
+            .unwrap()
+            .load_trainer(
+                "krea_2_raw",
+                &LoadSpec::new(WeightsSource::Dir(raw.clone())),
+            )
+            .unwrap();
+        let mut losses = Vec::new();
+        let out = candle_gen::train::profile::with_bounded_krea_profile(|| {
+            trainer.train(&req, &mut |p| {
+                if let TrainingProgress::Training { loss, .. } = p {
+                    losses.push(loss);
+                }
+            })
+        })
+        .expect("bounded matched profile succeeds");
+        drop(trainer);
+        let peak_mib = sampler.stop();
+        assert!(
+            peak_mib > 0,
+            "peak sampler must observe the selected physical GPU"
+        );
+        assert_eq!(out.steps, 18);
+        assert_eq!(losses.len(), 18);
+        assert!(losses.iter().all(|l| l.is_finite()));
+        assert_eq!(
+            read_meta(&out.adapter_path).get("rank").map(String::as_str),
+            Some("16")
+        );
+        assert_eq!(
+            adapter_keys(&out.adapter_path)
+                .iter()
+                .filter(|k| k.ends_with(".lora_A.weight"))
+                .count(),
+            112
+        );
+        // Production loader reopens the saved file and applies it to the Raw
+        // snapshot. One sample only; no baseline/scale sweep or extra training.
+        let gen = candle_gen_krea::provider_registry()
+            .unwrap()
+            .load(
+                "krea_2_raw",
+                &LoadSpec::new(WeightsSource::Dir(raw)).with_adapters(vec![AdapterSpec::new(
+                    out.adapter_path.clone(),
+                    1.,
+                    AdapterKind::Lora,
+                )]),
+            )
+            .expect("reload/apply saved adapter");
+        let request = GenerationRequest {
+            prompt: "a solid colour swatch number 0".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            seed: Some(7),
+            steps: Some(28),
+            ..Default::default()
+        };
+        let GenerationOutput::Images(images) = gen
+            .generate(&request, &mut |_| {})
+            .expect("one saved-adapter sample")
+        else {
+            panic!("expected images")
+        };
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].pixels.len(), 1024 * 1024 * 3);
+        assert!(images[0].pixels.iter().any(|b| *b != 0));
+        save_image_png(&tmp.join("adapter_sample.png"), &images[0]);
+        println!(
+            "KREA_PROFILE_ARTIFACT adapter={} peak_device_mib={peak_mib} sample={}",
+            out.adapter_path.display(),
+            tmp.join("adapter_sample.png").display()
+        );
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::krea_bounded_acceleration_profile");
+    }
+}
+
 /// Sorted tensor keys of the adapter file (via candle's loader).
 fn adapter_keys(path: &Path) -> Vec<String> {
     let map = candle_gen::candle_core::safetensors::load(path, &Device::Cpu).unwrap();

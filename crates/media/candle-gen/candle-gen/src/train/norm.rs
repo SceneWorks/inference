@@ -14,7 +14,11 @@ pub fn rms_normalize_f32(x: &Tensor, eps: f64) -> candle_core::Result<Tensor> {
     }
     let mean = (xf.sqr()?.sum_keepdim(D::Minus1)? / width as f64)?;
     // Multiply by reciprocal rather than broadcast-dividing every full-width element.
-    xf.broadcast_mul(&(mean + eps)?.sqrt()?.recip()?)
+    if super::profile::reference_math() {
+        xf.broadcast_div(&(mean + eps)?.sqrt()?)
+    } else {
+        xf.broadcast_mul(&(mean + eps)?.sqrt()?.recip()?)
+    }
 }
 
 /// Apply f32 weight before the final activation cast (Krea's pre-folded scale+1 contract).

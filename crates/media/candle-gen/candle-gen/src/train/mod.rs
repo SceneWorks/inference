@@ -53,5 +53,6 @@ pub mod taehv;
 
 /// Differentiable normalization with explicit reference casting order.
 pub mod norm;
+pub mod profile;
 /// Run-owned frozen same-input projection packing.
 pub mod projection;

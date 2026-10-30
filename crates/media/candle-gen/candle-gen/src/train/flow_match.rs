@@ -967,6 +967,21 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
 ) -> Result<TrainingOutput> {
     let cfg = &req.config;
     let device = model.device();
+    let bounded_profile = super::profile::active();
+    if bounded_profile
+        && (T::LABEL != "krea trainer"
+            || cfg.steps != 18
+            || cfg.gradient_accumulation != 1
+            || cfg.resume
+            || cfg.gradient_checkpointing
+            || cfg.rank != 16
+            || cfg.resolution != 1024
+            || !device.is_cuda()
+            || cfg.sample_every < cfg.steps
+            || cfg.save_every != 0)
+    {
+        return Err(CandleError::Msg("bounded Krea profile requires CUDA,18 total updates,rank16,1024px,accum1,checkpoint OFF,no resume/intermediate save,and existing preview cadence beyond the bounded run".into()));
+    }
     on_progress(TrainingProgress::Preparing);
     model.preflight(req)?;
     if req.cancel.is_cancelled() {
@@ -1005,7 +1020,11 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         effective_weight_decay(cfg),
     )?;
     let accum = cfg.gradient_accumulation.max(1);
-    let (total_updates, warmup_updates) = schedule_updates(cfg.steps, accum, cfg.lr_warmup_steps);
+    let (total_updates, warmup_updates) = schedule_updates(
+        if bounded_profile { 6 } else { cfg.steps },
+        accum,
+        cfg.lr_warmup_steps,
+    );
     let stem = file_stem(&req.file_name).to_string();
 
     // --- optional full-state resume ---
@@ -1020,7 +1039,27 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         }
     }
 
-    model.prepare_training(&mut dit, &mut cache, &mut aux, req, device)?;
+    if !bounded_profile {
+        model.prepare_training(&mut dit, &mut cache, &mut aux, req, device)?;
+    }
+    // Deep snapshots: Var clones share storage and would NOT restore initial
+    // parameters. Fresh optimizer construction below restores moments/counters.
+    let initial = if bounded_profile {
+        set.vars
+            .iter()
+            .map(|v| v.as_tensor().detach().copy())
+            .collect::<candle_core::Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    let mut optimized_final = Vec::new();
+    let mut profile_times: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::new());
+    let mut profile_losses: [Vec<f32>; 3] = std::array::from_fn(|_| Vec::new());
+    let mut profile_candidates = [0u64; 3];
+    let mut segment_cfg = cfg.clone();
+    if bounded_profile {
+        segment_cfg.steps = 6;
+    }
 
     // --- train loop ---
     let mut accumulated: Option<GradStore> = None;
@@ -1064,10 +1103,89 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         if req.cancel.is_cancelled() {
             break;
         }
-        let sample = step_sample(aux_driver.as_mut(), step, &schedule);
+        let segment = if bounded_profile {
+            ((step - 1) / 6) as usize
+        } else {
+            0
+        };
+        let logical_step = if bounded_profile {
+            (step - 1) % 6 + 1
+        } else {
+            step
+        };
+        if bounded_profile {
+            // Preparation is timed separately, never mixed into warmup's
+            // operator attribution or the steady optimizer-step totals.
+            super::profile::begin_step(segment, 0);
+            if logical_step == 1 && segment > 0 {
+                for (var, value) in set.vars.iter().zip(&initial) {
+                    var.set(value)?;
+                }
+                opt = TrainOptimizer::from_config(
+                    &cfg.optimizer,
+                    set.vars.clone(),
+                    cfg.learning_rate,
+                    effective_weight_decay(cfg),
+                )?;
+                update_idx = 0;
+                if segment == 1 {
+                    device.synchronize()?;
+                    let prepare_start = std::time::Instant::now();
+                    model.prepare_training(&mut dit, &mut cache, &mut aux, req, device)?;
+                    device.synchronize()?;
+                    eprintln!(
+                        "KREA_PROFILE_PREPARATION seconds={:.6}",
+                        prepare_start.elapsed().as_secs_f64()
+                    );
+                }
+            }
+            device.synchronize()?;
+            crate::training_attention::take_training_attention_counts();
+            super::profile::begin_step(segment, logical_step);
+        }
+        let step_start = bounded_profile.then(std::time::Instant::now);
+        let sample = step_sample(aux_driver.as_mut(), logical_step, &schedule);
         let cached = &cache[sample.entry];
-        let (loss, grads) =
-            model.micro_step(&dit, &set.vars, cached, &aux, cfg, step, sample, device)?;
+        let mode = if bounded_profile && segment == 2 {
+            crate::training_attention::TrainingAttentionMode::StreamingCandidate
+        } else {
+            crate::training_attention::TrainingAttentionMode::Reference
+        };
+        let compute = || {
+            model.micro_step(
+                &dit,
+                &set.vars,
+                cached,
+                &aux,
+                &segment_cfg,
+                logical_step,
+                sample,
+                device,
+            )
+        };
+        let (loss, grads) = if bounded_profile {
+            crate::training_attention::with_training_attention_mode(mode, compute)?
+        } else {
+            compute()?
+        };
+        if bounded_profile && !loss.is_finite() {
+            return Err(CandleError::Msg("non-finite bounded profile loss".into()));
+        }
+        // Hold the already-produced gradient buffers for verification AFTER the
+        // timed update. No diagnostic kernels or scalar readbacks enter steady
+        // timings; cloning these handles allocates no device storage.
+        let gradient_witnesses = if bounded_profile {
+            set.vars
+                .iter()
+                .map(|var| {
+                    grads.get(var.as_tensor()).cloned().ok_or_else(|| {
+                        CandleError::Msg("bounded profile missing adapter gradient".into())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         last_loss = loss;
         steps_run = step;
         accumulate_grads(&mut accumulated, grads, &set.vars)?;
@@ -1075,13 +1193,19 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         // `step` counts every micro-step (loop runs `1..=cfg.steps`, one micro per iteration), so a full
         // accumulation window closes exactly when `step` is a multiple of `accum`. (Previously tracked by
         // a separate `micro` counter that was never reset and thus always equalled `step`.)
-        if step.is_multiple_of(accum) {
+        let optimizer_start = if bounded_profile && logical_step == 1 {
+            device.synchronize()?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        if logical_step.is_multiple_of(accum) {
             apply_update(
                 &mut opt,
                 &mut accumulated,
                 &set,
                 pending,
-                cfg,
+                &segment_cfg,
                 update_idx,
                 total_updates,
                 warmup_updates,
@@ -1089,6 +1213,71 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             )?;
             pending = 0;
             update_idx += 1;
+        }
+
+        if bounded_profile {
+            device.synchronize()?;
+            let elapsed = step_start.unwrap().elapsed().as_secs_f64();
+            if let Some(start) = optimizer_start {
+                eprintln!(
+                    "KREA_PROFILE_OPTIMIZER segment={segment} synchronized_seconds={:.6}",
+                    start.elapsed().as_secs_f64()
+                );
+            }
+            let (candidate, reference) =
+                crate::training_attention::take_training_attention_counts();
+            profile_candidates[segment] += candidate;
+            profile_losses[segment].push(loss);
+            if logical_step > 2 {
+                profile_times[segment].push(elapsed);
+            }
+            eprintln!("KREA_PROFILE_STEP physical_update={step}/18 segment={segment} logical_step={logical_step} warmup={} seconds={elapsed:.6} loss={loss} attention_candidate={candidate} attention_reference={reference}",logical_step<=2);
+            super::profile::finish_attribution(segment);
+            for grad in &gradient_witnesses {
+                let maximum = grad
+                    .to_dtype(DType::F32)?
+                    .sqr()?
+                    .sum_all()?
+                    .to_scalar::<f32>()?;
+                if !maximum.is_finite() {
+                    return Err(CandleError::Msg(
+                        "non-finite bounded profile gradient".into(),
+                    ));
+                }
+            }
+            eprintln!(
+                "KREA_PROFILE_GRADIENTS physical_update={step}/18 finite={} total={}",
+                gradient_witnesses.len(),
+                set.vars.len()
+            );
+            if logical_step == 6 {
+                let mut changed = false;
+                for (var, start) in set.vars.iter().zip(&initial) {
+                    let delta = (var.as_tensor() - start)?
+                        .to_dtype(DType::F32)?
+                        .sqr()?
+                        .sum_all()?
+                        .to_scalar::<f32>()?;
+                    if !delta.is_finite() {
+                        return Err(CandleError::Msg(
+                            "non-finite bounded profile adapter update".into(),
+                        ));
+                    }
+                    changed |= delta > 0.;
+                }
+                if !changed {
+                    return Err(CandleError::Msg(
+                        "bounded profile produced no adapter update".into(),
+                    ));
+                }
+                if segment == 1 {
+                    optimized_final = set
+                        .vars
+                        .iter()
+                        .map(|v| v.as_tensor().detach().copy())
+                        .collect::<candle_core::Result<Vec<_>>>()?;
+                }
+            }
         }
 
         on_progress(TrainingProgress::Training {
@@ -1215,6 +1404,27 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         }
     }
 
+    if bounded_profile {
+        if steps_run != 18 || profile_times.iter().any(|t| t.len() != 4) {
+            return Err(CandleError::Msg(
+                "bounded profile incomplete; no timing/adoption proof".into(),
+            ));
+        }
+        let means: [f64; 3] = std::array::from_fn(|i| profile_times[i].iter().sum::<f64>() / 4.);
+        let loss_parity = profile_losses[1]
+            .iter()
+            .zip(&profile_losses[2])
+            .all(|(a, b)| (a - b).abs() <= 0.01 * a.abs().max(1.));
+        let go = profile_candidates[2] > 0 && loss_parity && means[2] < means[1];
+        if !go {
+            for (var, value) in set.vars.iter().zip(&optimized_final) {
+                var.set(value)?;
+            }
+            last_loss = *profile_losses[1].last().unwrap();
+        }
+        let selected = if go { 2 } else { 1 };
+        eprintln!("KREA_PROFILE_RESULT updates=18 steady_updates_per_segment=4 reference_s={} optimized_s={} candidate_s={} candidate_dispatched={} loss_parity={} candidate_go={} selected_segment={} reduction={} target_met={}",means[0],means[1],means[2],profile_candidates[2],loss_parity,go,selected,1.-means[selected]/means[0],means[selected]<=0.75*means[0]);
+    }
     // --- save final adapter ---
     on_progress(TrainingProgress::Saving);
     create_output_dir(&req.output_dir)?;
