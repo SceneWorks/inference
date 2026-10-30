@@ -352,6 +352,39 @@ fn native_graph_cases(device: Device) {
                     &CancelFlag::new(),
                 )
                 .unwrap();
+                let (_, _, height, width) = x.dims4().unwrap();
+                let preparation_bytes =
+                    model.training_preparation_bytes(&[(&context, height, width)]);
+                assert!(preparation_bytes > 0);
+                model
+                    .prepare_training(&[(&context, height, width)])
+                    .unwrap();
+                let resident = model.resident_bytes();
+                let (prepared_loss, prepared_grads) = training::loss_grads(
+                    &model,
+                    &set,
+                    &cfg,
+                    &x,
+                    &context,
+                    &noise,
+                    0.375,
+                    None,
+                    &CancelFlag::new(),
+                )
+                .unwrap();
+                assert!((loss - prepared_loss).abs() < 1e-5);
+                for (_, var) in set.named_vars() {
+                    close(
+                        &gradient(&plain, &var),
+                        &gradient(&prepared_grads, &var),
+                        if dtype == DType::F32 { 2e-5 } else { 0.005 },
+                    );
+                }
+                assert_eq!(
+                    model.resident_bytes(),
+                    resident,
+                    "steps must reuse frozen preparation without cache growth"
+                );
                 let noisy = (((&x * 0.625).unwrap()) + ((&noise * 0.375).unwrap())).unwrap();
                 let target = noise.sub(&x).unwrap();
                 let predicted = generation(&model, &noisy, &context);

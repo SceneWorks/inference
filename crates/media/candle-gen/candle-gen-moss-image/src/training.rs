@@ -901,6 +901,28 @@ impl MossImageTrainer {
             window = pending;
             transformer.validate_residuals()?;
         }
+        let preparation_inputs = plan
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                contexts[entry.item].as_ref().map(|context| {
+                    (
+                        context,
+                        entry.height as usize / 16,
+                        entry.width as usize / 16,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let preparation_bytes = transformer.training_preparation_bytes(&preparation_inputs);
+        let preparation_peak = estimate
+            .backward
+            .max(estimate.preview)
+            .saturating_add(preparation_bytes);
+        if preparation_peak > budget {
+            return Err(CandleError::Msg(format!("MOSS frozen preparation needs {preparation_peak} device bytes including {preparation_bytes} retained cache bytes, budget {budget}")));
+        }
+        transformer.prepare_training(&preparation_inputs)?;
         let (updates, warmup) =
             schedule_updates(c.steps, c.gradient_accumulation, c.lr_warmup_steps);
 
