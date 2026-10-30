@@ -1202,13 +1202,16 @@ mod tests {
             .unwrap()
             .iter()
             .flatten()
-            .last()
+            .next_back()
             .unwrap()
             .bytes_read;
         archive.read_tensor("test", &spec).unwrap();
         let events = events.lock().unwrap();
         assert!(first > 0 && first <= total);
-        assert_eq!(events.iter().flatten().last().unwrap().bytes_read, first);
+        assert_eq!(
+            events.iter().flatten().next_back().unwrap().bytes_read,
+            first
+        );
         assert!(events
             .iter()
             .flatten()

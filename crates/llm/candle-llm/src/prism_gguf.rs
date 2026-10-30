@@ -93,7 +93,6 @@ pub(crate) struct RawGguf {
     pub tensors: HashMap<String, RawTensorInfo>,
     data_offset: u64,
     file: load_progress::reader::ProgressReader<std::fs::File>,
-    file_len: u64,
     progress: load_progress::reader::SourceProgress,
 }
 
@@ -184,7 +183,6 @@ impl RawGguf {
                 tensors,
                 data_offset,
                 file,
-                file_len,
                 progress,
             }),
             "candle-llm::prism_gguf::RawGguf::open",
@@ -220,7 +218,7 @@ impl RawGguf {
             .checked_add(info.offset)
             .ok_or_else(|| Error::Config("GGUF tensor offset overflow".into()))?;
         // The declared extent must lie inside the file *before* allocating it (sc-27299).
-        let file_len = self.file_len;
+        let file_len = self.file.get_ref().metadata()?.len();
         let end = u64::try_from(bytes).ok().and_then(|b| start.checked_add(b));
         if end.is_none_or(|end| end > file_len) {
             return Err(Error::Config(format!(

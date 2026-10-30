@@ -202,6 +202,9 @@ pub struct ProgressReader<R> {
     operation: Option<ReadOperation>,
 }
 impl<R> ProgressReader<R> {
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
     pub fn begin(&mut self) {
         self.operation = Some(self.source.operation());
     }

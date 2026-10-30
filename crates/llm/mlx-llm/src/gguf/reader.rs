@@ -519,12 +519,12 @@ mod tests {
             .unwrap()
             .iter()
             .flatten()
-            .last()
+            .next_back()
             .unwrap()
             .bytes_read;
         mapped.tensor_data(&mapped.tensors[0]).unwrap();
         let events = events.lock().unwrap();
-        let last = events.iter().flatten().last().unwrap();
+        let last = events.iter().flatten().next_back().unwrap();
         assert_eq!(last.bytes_read, first);
         assert!(last.bytes_read <= b.len() as u64);
         assert_eq!(events.last(), Some(&None));

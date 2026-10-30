@@ -38,7 +38,7 @@ mod gguf {
             assert_eq!(events.lock().unwrap().last(), Some(&None));
         }
         let events = events.lock().unwrap();
-        let last = events.iter().flatten().last().unwrap();
+        let last = events.iter().flatten().next_back().unwrap();
         assert_eq!(last.bytes_read, header_len + 4);
         assert_eq!(last.total_bytes, Some(68));
         assert_eq!(last.component, "transformer");
@@ -79,7 +79,7 @@ mod ggml {
         Content::read_with_path(&mut std::io::Cursor::new(bytes), &Device::Cpu, "model.ggml")
             .unwrap();
         let events = events.lock().unwrap();
-        let last = events.iter().flatten().last().unwrap();
+        let last = events.iter().flatten().next_back().unwrap();
         assert_eq!((last.bytes_read, last.total_bytes), (32, Some(32)));
         assert_eq!(events.last(), Some(&None));
     }
@@ -109,12 +109,12 @@ mod pth {
             .unwrap()
             .iter()
             .flatten()
-            .last()
+            .next_back()
             .unwrap()
             .bytes_read;
         archive.get(name).unwrap().unwrap();
         let events = events.lock().unwrap();
-        let last = events.iter().flatten().last().unwrap();
+        let last = events.iter().flatten().next_back().unwrap();
         assert_eq!(last.bytes_read, first);
         assert!(last.bytes_read <= last.total_bytes.unwrap());
         assert_eq!(events.last(), Some(&None));
@@ -144,7 +144,7 @@ mod numpy {
                 .unwrap()
                 .iter()
                 .flatten()
-                .last()
+                .next_back()
                 .cloned()
                 .unwrap();
             assert_eq!(last.bytes_read, std::fs::metadata(&npy).unwrap().len());
@@ -159,12 +159,12 @@ mod numpy {
             .unwrap()
             .iter()
             .flatten()
-            .last()
+            .next_back()
             .unwrap()
             .bytes_read;
         archive.get(&name).unwrap().unwrap();
         let events = events.lock().unwrap();
-        let last = events.iter().flatten().last().unwrap();
+        let last = events.iter().flatten().next_back().unwrap();
         assert_eq!(last.bytes_read, first);
         assert!(last.bytes_read <= last.total_bytes.unwrap());
         assert_eq!(events.last(), Some(&None));
