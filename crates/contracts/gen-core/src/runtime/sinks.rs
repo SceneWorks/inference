@@ -363,3 +363,61 @@ pub enum LoadPhase {
     /// The heavy render bundle — the transformer/U-Net, the VAE, and any control/PiD overlay.
     Renderer,
 }
+
+/// Bracket a logical prompt-encoding call without evaluating, synchronizing, or altering its result.
+/// The closing event also clears the stage when the encoder returns an error or cancellation.
+pub fn with_prompt_encoding<T, E>(
+    on_progress: &mut dyn FnMut(Progress),
+    encode: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    on_progress(Progress::Loading(LoadPhase::EncodingPrompt));
+    let result = encode();
+    on_progress(Progress::PromptEncodingComplete);
+    result
+}
+
+#[cfg(test)]
+mod prompt_progress_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn logical_encoding_closes_on_success_error_and_cancellation_without_extra_work() {
+        for outcome in [
+            Ok(7),
+            Err(crate::Error::Canceled),
+            Err(crate::Error::Msg("encode".into())),
+        ] {
+            let active = Cell::new(false);
+            let calls = Cell::new(0);
+            let ends = Cell::new(0);
+            let result = with_prompt_encoding(
+                &mut |event| match event {
+                    Progress::Loading(LoadPhase::EncodingPrompt) => assert!(!active.replace(true)),
+                    Progress::PromptEncodingComplete => {
+                        assert!(active.replace(false));
+                        ends.set(ends.get() + 1);
+                    }
+                    _ => panic!("unexpected encoding event: {event:?}"),
+                },
+                || {
+                    assert!(
+                        active.get(),
+                        "the callback executes within the encoding stage"
+                    );
+                    calls.set(calls.get() + 1);
+                    outcome
+                },
+            );
+            assert!(!active.get());
+            assert_eq!(calls.get(), 1);
+            assert_eq!(ends.get(), 1);
+            match result {
+                Ok(value) => assert_eq!(value, 7),
+                Err(crate::Error::Canceled) => {}
+                Err(crate::Error::Msg(message)) => assert_eq!(message, "encode"),
+                other => panic!("result changed: {other:?}"),
+            }
+        }
+    }
+}
