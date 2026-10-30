@@ -478,7 +478,10 @@ pub fn apply_update(
         .take()
         .expect("apply_update called with a pending accumulation");
     scale_grads(&mut avg, &set.vars, 1.0 / micro_count as f64)?;
-    adapter_optimizer_step(opt, &mut avg, set, cfg, update_idx, noise_seed)
+    super::profile::cohort_before_update(&avg, &set.vars)?;
+    adapter_optimizer_step(opt, &mut avg, set, cfg, update_idx, noise_seed)?;
+    super::profile::cohort_after_update();
+    Ok(())
 }
 
 /// The preview-sample plan a [`FlowMatchTrainer::cache`] builds while the text encoder (and any VAE
@@ -1103,6 +1106,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         if req.cancel.is_cancelled() {
             break;
         }
+        super::profile::cohort_begin_step(device)?;
         let segment = if bounded_profile {
             ((step - 1) / 6) as usize
         } else {
@@ -1280,6 +1284,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             }
         }
 
+        super::profile::cohort_end_step(device, last_loss, &set.vars, T::LABEL)?;
         on_progress(TrainingProgress::Training {
             step,
             total: cfg.steps,
