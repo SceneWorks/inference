@@ -37,7 +37,7 @@ impl Rng {
     /// activations.
     fn activation(&mut self) -> f32 {
         let v = (self.unit() + self.unit() + self.unit() + self.unit() - 2.0) * 1.7;
-        if self.next() % 97 == 0 {
+        if self.next().is_multiple_of(97) {
             v * 24.0
         } else {
             v

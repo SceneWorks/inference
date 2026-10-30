@@ -478,13 +478,13 @@ mod tests {
         assert!(bound < 1 << 24, "{bound}");
         assert_eq!(bound as f32 as u64, bound);
         // ...whereas a single H3 FFN-down reduction is NOT: this is why the K axis is windowed.
-        assert!(14_336 * MAX_PRODUCT > 1 << 24);
+        const { assert!(14_336 * MAX_PRODUCT > 1 << 24) }
     }
 
     #[test]
     fn the_int32_accumulator_cannot_overflow_at_max_k() {
-        assert!(MAX_K as u64 * MAX_PRODUCT <= i32::MAX as u64);
-        assert!((MAX_K as u64 + 1) * MAX_PRODUCT > i32::MAX as u64);
+        const { assert!(MAX_K as u64 * MAX_PRODUCT <= i32::MAX as u64) }
+        const { assert!((MAX_K as u64 + 1) * MAX_PRODUCT > i32::MAX as u64) }
         assert!(check_geometry(1, 1, MAX_K - MAX_K % BK).is_ok());
         assert!(check_geometry(1, 1, MAX_K + BK).is_err());
     }
