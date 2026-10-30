@@ -138,12 +138,7 @@ pub(crate) fn try_streaming(
 }
 
 /// Shared compile-once kernel descriptor; useful for compile-only validation.
-pub const SOURCE: candle_quant_kernels::nvrtc::KernelSource =
-    candle_quant_kernels::nvrtc::KernelSource {
-        name: "candle_gen_training_attention_v1",
-        src: include_str!("training_attention.cu"),
-        cc_floor: (7, 0),
-    };
+pub use candle_quant_kernels::training_attention::SOURCE;
 
 #[cfg(feature = "cuda")]
 mod cuda {

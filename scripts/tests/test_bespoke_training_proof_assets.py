@@ -31,7 +31,7 @@ class BespokeTrainingAssets(unittest.TestCase):
                 with self.assertRaises(ValueError): assets.validate_paths({"TEST_ASSET":root})
                 (root/"config.json").write_bytes(b"")
                 with self.assertRaises(ValueError): assets.validate_paths({"TEST_ASSET":root})
-                (root/"config.json").write_text("{}")
+                (root/"config.json").write_text("{}", encoding="utf-8")
                 assets.validate_paths({"TEST_ASSET":root})
     def test_workflow_rebuilds_the_plan_on_the_actual_worker_before_asset_setup(self):
         root = Path(__file__).resolve().parents[2]
