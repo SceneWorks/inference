@@ -203,8 +203,30 @@ pub fn cohort_begin_step(device: &candle_core::Device) -> candle_core::Result<()
     Ok(())
 }
 
+/// Capture factors before timing starts when a bespoke loop owns several experts.
+/// The diagnostic copies are run-owned and included in observed device peak.
+pub fn cohort_capture_initial(vars: &[candle_core::Var]) -> candle_core::Result<()> {
+    #[cfg(feature = "model-inference-proof")]
+    COHORT.with(|state| -> candle_core::Result<()> {
+        let mut state = state.borrow_mut();
+        let Some(state) = state.as_mut() else {
+            return Ok(());
+        };
+        for var in vars {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                state.initial.entry(var.as_tensor().id())
+            {
+                entry.insert(var.as_tensor().detach().copy()?);
+            }
+        }
+        Ok(())
+    })?;
+    let _ = vars;
+    Ok(())
+}
+
 /// Clone already-produced gradients at the actual optimizer boundary. Initial
-/// factor copies happen only in the excluded first update for each expert.
+/// factor copies happen only in excluded warmup (bespoke experts can pre-capture).
 pub fn cohort_before_update(
     grads: &candle_core::backprop::GradStore,
     vars: &[candle_core::Var],
@@ -277,6 +299,7 @@ pub fn cohort_end_step(
             changed |= delta > 0.;
         }
         if !changed || nonzero_gradients == 0 { candle_core::bail!("cohort optimizer produced no actual adapter update"); }
+        if state.updates >= 3 && nonzero_gradients != gradient_count { candle_core::bail!("bounded final updates must reach every adapter factor with nonzero gradients"); }
         let warmup = state.steps.is_empty();
         state.steps.push(serde_json::json!({"update":state.updates,"owner":owner,"warmup":warmup,
             "seconds":seconds,"loss":loss,"finite_gradients":gradient_count,"nonzero_gradients":nonzero_gradients,
