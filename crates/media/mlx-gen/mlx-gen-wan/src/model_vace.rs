@@ -46,7 +46,7 @@ use crate::pipeline::{
     reject_over_area, resolve_sampler_knobs, seq_len, staged_expert_swap,
 };
 use crate::scheduler::{make_scheduler, SolverKind, WanScheduler};
-use crate::text_encoder::encode_text_staged_for_tier;
+use crate::text_encoder::encode_text_staged_for_tier_with_progress;
 use crate::vace::{
     build_vace_control, denoise_vace, denoise_vace_moe, denoise_vace_range, prepare_masks,
     prepare_video_latents, vace_control_scales, WanVaceTransformer,
@@ -179,13 +179,14 @@ fn vace_prep(
     let num_ref = references.len();
 
     // --- Stage 1: UMT5 text encode ---
-    let (context, context_null) = encode_text_staged_for_tier(
+    let (context, context_null) = encode_text_staged_for_tier_with_progress(
         root,
         base,
         &req.prompt,
         &neg_prompt,
         cfg_disabled,
         load_quant,
+        on_progress,
     )?;
     // Each CFG branch's context is zero-padded to `text_len` (512) exactly as the reference
     // (diffusers `WanVACEPipeline` / original Wan) and base Wan build it; the transformer then

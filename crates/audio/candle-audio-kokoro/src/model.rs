@@ -302,6 +302,8 @@ impl Generator for KokoroGenerator {
         let pack = self.voice_pack(voice)?;
         let ref_s = pack.ref_s(tokens.len()).to_vec();
 
+        on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
+
         // target_duration → speed factor from the duration head's natural estimate, clamped
         // to the model's usable range.
         let speed = match audio.target_duration {

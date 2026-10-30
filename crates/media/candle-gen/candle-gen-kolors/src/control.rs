@@ -565,6 +565,9 @@ impl KolorsControl {
 
         // CFG batch is [neg, pos] = uncond-first (the Kolors txt2img convention); without guidance only
         // the positive branch is built. Shared CFG-concat (sc-9001); the ChatGLM3 encode stays local.
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (context, pooled, batch) = common::cfg_batch_context(
             &req.prompt,
             &req.negative,
@@ -736,6 +739,9 @@ impl KolorsControl {
             },
             self.device.clone(),
         );
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (context, pooled, batch) = common::cfg_batch_context(
             &req.prompt,
             &req.negative,

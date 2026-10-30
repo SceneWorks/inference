@@ -435,6 +435,15 @@ impl MossImage {
         if state.release_for_request(resolved.acceleration, edit.is_some()) {
             self.sources.drain_cache()?;
         }
+        if inputs.positive.is_none()
+            || (resolved.acceleration == MossImageAcceleration::Off
+                && resolved.guidance != 1.0
+                && inputs.negative.is_none())
+        {
+            progress(Progress::Loading(
+                mlx_gen::gen_core::LoadPhase::EncodingPrompt,
+            ));
+        }
         let (positive, negative, conditioning) =
             self.encode_conditioning(request, inputs, &resolved)?;
         check(&request.cancel)?;

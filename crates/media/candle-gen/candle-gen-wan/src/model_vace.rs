@@ -216,6 +216,9 @@ impl Pipeline {
         let num_ref = references.len();
 
         // Stage 1: UMT5 text encode + project to the DiT context.
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let pos = self.encode(comps, &req.prompt)?;
         let ctx_pos = comps.dit.embed_text(&pos)?;
         let ctx_neg = if cfg_disabled {

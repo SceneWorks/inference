@@ -618,6 +618,9 @@ pub fn render_staged(
             "ideogram: empty prompt token sequence".into(),
         ));
     }
+    on_progress(Progress::Loading(
+        candle_gen::gen_core::LoadPhase::EncodingPrompt,
+    ));
     let te_out = encode_prompt(&text, &ids, device)?;
     text.release()?;
 

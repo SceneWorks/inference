@@ -338,6 +338,9 @@ impl Supra2Image {
         let per_image = cfg.latent_numel();
         check(&request.cancel)?;
 
+        progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (cond, tokens) = self.encode_prompt(&request.prompt)?;
         let (uncond, used_stored) = if r.use_cfg {
             let (u, stored) = self.unconditional()?;

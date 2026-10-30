@@ -335,6 +335,9 @@ impl Supra2Image {
         let per_image = cfg.latent_numel();
         check(&request.cancel)?;
 
+        progress(Progress::Loading(
+            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (cond, tokens) = self.encode_prompt(&request.prompt)?;
         let (cond_ctx, cond_mask) = Self::broadcast(&cond, n)?;
         let (uncond, used_stored) = if r.use_cfg {

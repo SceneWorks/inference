@@ -327,6 +327,9 @@ impl MossImageGenerator {
             transformer::check_cancel(&req.cancel)?;
             state.text = Some(self.sources.text(&self.device)?);
         }
+        if need_text {
+            on_progress(Progress::Loading(LoadPhase::EncodingPrompt));
+        }
         let positive = if let Some(e) = inputs.positive {
             text_encoder::supplied(e, &self.device)?
         } else {

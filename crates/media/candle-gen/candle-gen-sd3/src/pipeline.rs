@@ -585,6 +585,9 @@ impl Pipeline {
 
         // Conditioning is seed- and image-independent: encode once for the whole batch. `cfg_scale`
         // gates the uncond encode — at 1.0 the CFG blend collapses to cond, so it's skipped (sc-8993).
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (cond, uncond) = self.conditioning(&components.encoders, req, cfg_scale)?;
 
         // Per-step latent preview (epic 16948, sc-16958). Opting in is the sc-16949 projector hook and
@@ -662,6 +665,9 @@ impl Pipeline {
             self.device.clone(),
             "triple text encoders",
         );
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (cond, uncond) = self.conditioning(&text, req, cfg_scale)?;
         text.release()?;
 

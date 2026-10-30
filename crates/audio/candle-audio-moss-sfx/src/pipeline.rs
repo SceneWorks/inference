@@ -109,6 +109,8 @@ fn crop_decoded_audio(mut samples: Vec<f32>, requested_samples: usize) -> Vec<f3
 /// progress sink is borrowed exactly once).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineProgress {
+    /// Text conditioning is about to be encoded.
+    EncodingPrompt,
     /// Solver step `k` of the run just completed (`k = 1..=steps`).
     Step(usize),
     /// The terminal VAE decode is about to run (fires exactly once).
@@ -263,6 +265,7 @@ impl MossSfxPipeline {
 
         // Text conditioning: positive prompt carries the duration suffix; the negative prompt
         // is passed through as-is (reference behavior).
+        progress(PipelineProgress::EncodingPrompt);
         let positive = with_duration_suffix(prompt, seconds);
         let ctx_pos = self.dit.embed_context(&self.encode_context(&positive)?)?;
         let use_cfg = params.cfg_scale != 1.0;

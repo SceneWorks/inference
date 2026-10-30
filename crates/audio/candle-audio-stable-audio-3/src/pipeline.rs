@@ -1279,6 +1279,7 @@ impl StableAudio3Pipeline {
                 None,
                 ReferenceInputValidation::Required,
                 hooks,
+                &mut || {},
             )?
             .0)
     }
@@ -1309,6 +1310,7 @@ impl StableAudio3Pipeline {
             None,
             ReferenceInputValidation::Required,
             hooks,
+            &mut || {},
         )
     }
 
@@ -1347,6 +1349,7 @@ impl StableAudio3Pipeline {
             conditioning,
             ReferenceInputValidation::Required,
             hooks,
+            &mut || {},
         )
     }
 
@@ -1357,12 +1360,14 @@ impl StableAudio3Pipeline {
         request: SynthesisRequest<'_>,
         conditioning: ValidatedForwardedConditioning<'_>,
         hooks: SynthesisHooks<'_>,
+        on_encoding: &mut dyn FnMut(),
     ) -> Result<Vec<f32>> {
         self.synthesize_conditioned_with_validation(
             request,
             conditioning.into_inner(),
             ReferenceInputValidation::Complete,
             hooks,
+            on_encoding,
         )
     }
 
@@ -1372,13 +1377,21 @@ impl StableAudio3Pipeline {
         conditioning: ForwardedConditioning<'_>,
         reference_validation: ReferenceInputValidation,
         hooks: SynthesisHooks<'_>,
+        on_encoding: &mut dyn FnMut(),
     ) -> Result<Vec<f32>> {
         conditioning.check()?;
         let ForwardedConditioning {
             reference, edit, ..
         } = conditioning;
         Ok(self
-            .synthesize_traced(request, reference, edit, reference_validation, hooks)?
+            .synthesize_traced(
+                request,
+                reference,
+                edit,
+                reference_validation,
+                hooks,
+                on_encoding,
+            )?
             .0)
     }
 
@@ -1397,6 +1410,7 @@ impl StableAudio3Pipeline {
             Some(edit),
             ReferenceInputValidation::Required,
             hooks,
+            &mut || {},
         )
     }
 
@@ -1412,6 +1426,7 @@ impl StableAudio3Pipeline {
         edit: Option<AudioEdit<'_>>,
         reference_validation: ReferenceInputValidation,
         mut hooks: SynthesisHooks<'_>,
+        on_encoding: &mut dyn FnMut(),
     ) -> Result<(Vec<f32>, Option<ReferenceDrawOrder>)> {
         let parameters = request.parameters;
         let is_canceled = hooks.is_canceled;
@@ -1511,6 +1526,7 @@ impl StableAudio3Pipeline {
                 .is_some_and(|(_, resolved)| edit_retained_latent_count(resolved) > 0),
             tensor_has_nonzero(&local)?,
         )?;
+        on_encoding();
         let (sampled, padding) = self.sample(
             &request,
             &geometry,

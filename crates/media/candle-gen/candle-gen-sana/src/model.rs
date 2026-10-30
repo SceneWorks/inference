@@ -385,6 +385,9 @@ fn generate_base_images(
     let steps = req.steps.map(|s| s as usize);
     let guidance_scale = req.true_cfg.or(req.guidance);
     let guidance = guidance_scale.unwrap_or(crate::pipeline::DEFAULT_GUIDANCE);
+    on_progress(Progress::Loading(
+        candle_gen::gen_core::LoadPhase::EncodingPrompt,
+    ));
     let conditioning = pipeline
         .encode_batch(
             &SanaGenerateRequest {
@@ -656,6 +659,9 @@ fn generate_sprint_images(
         .unwrap_or((None, None));
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let steps = req.steps.map(|s| s as usize);
+    on_progress(Progress::Loading(
+        candle_gen::gen_core::LoadPhase::EncodingPrompt,
+    ));
     let conditioning = pipeline
         .encode_batch(&req.prompt)
         .map_err(gen_core::Error::from)?;

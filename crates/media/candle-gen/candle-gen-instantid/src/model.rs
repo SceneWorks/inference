@@ -1010,6 +1010,9 @@ impl InstantId {
 
         // Everything that borrows `&self`, computed into owned values BEFORE the `&mut self.unet`
         // `set_ip_context` (so the disjoint-field borrows don't overlap).
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (conditioning, pooled) = Self::require(&self.conditioner, "dual CLIP conditioner")?
             .encode(&req.prompt, &req.negative, cfg_on)?;
         let batch = conditioning.dim(0)?;
@@ -1282,6 +1285,9 @@ impl InstantId {
         let side = req.width;
         let cfg_on = req.guidance > 1.0;
 
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (conditioning, pooled) = Self::require(&self.conditioner, "dual CLIP conditioner")?
             .encode(&req.prompt, &req.negative, cfg_on)?;
         let batch = conditioning.dim(0)?;

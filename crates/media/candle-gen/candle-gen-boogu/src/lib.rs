@@ -293,6 +293,7 @@ impl BooguGenerator {
                             preflight,
                             pipeline::DEFAULT_STEPS,
                             &self.device,
+                            on_progress,
                         )?
                     } else {
                         let RequestPreflight::Turbo(preflight) = preflight else {
@@ -306,6 +307,7 @@ impl BooguGenerator {
                             req,
                             preflight,
                             &self.device,
+                            on_progress,
                         )?
                     }
                 }
@@ -324,6 +326,7 @@ impl BooguGenerator {
                         &references,
                         preflight,
                         &self.device,
+                        on_progress,
                     )?
                 }
             };

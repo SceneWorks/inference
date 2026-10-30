@@ -305,6 +305,9 @@ impl Pipeline {
 
         // Encode the prompt(s) once for the whole batch (seed- and image-independent). The negative
         // branch is skipped entirely when guidance ≤ 1 (Flash single-forward) — bit-exact `pred = pos`.
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let pos_embeds = self.encode(components, &req.prompt)?;
         let neg = if guidance > 1.0 {
             Some(self.encode(components, negative)?)
@@ -403,6 +406,9 @@ impl Pipeline {
             self.device.clone(),
             "conditioning components",
         );
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let pos_embeds = self.encode_parts(&text.tokenizer, &text.t5, &req.prompt)?;
         let neg = if guidance > 1.0 {
             Some(self.encode_parts(&text.tokenizer, &text.t5, negative)?)

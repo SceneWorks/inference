@@ -667,6 +667,9 @@ impl Pipeline {
         let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
         let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
 
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (features, mask) = self.encode_prompt(
             &comps.text,
             &req.prompt,
@@ -773,6 +776,9 @@ impl Pipeline {
         } else {
             self.load_resident_text_components()?
         };
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (features, mask) = self.encode_prompt(
             &text,
             &req.prompt,

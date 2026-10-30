@@ -112,6 +112,9 @@ impl Pipeline {
         }
 
         // T5-XXL masked encode (`_get_t5_prompt_embeds`), positive + the CFG-unconditional branch.
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let pos = encode_prompt(&comps.tokenizer, &comps.t5, &req.prompt, &self.device)?;
         let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
         let neg = encode_prompt(&comps.tokenizer, &comps.t5, neg_prompt, &self.device)?;

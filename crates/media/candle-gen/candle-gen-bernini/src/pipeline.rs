@@ -251,6 +251,9 @@ impl BerniniRenderer {
         }
 
         // --- Text encode (pos + neg) once; project to each expert's context (per-expert embedder) ---
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let pos = self.encode(comps, &req.prompt)?;
         let neg_prompt = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
         let neg = self.encode(comps, neg_prompt)?;

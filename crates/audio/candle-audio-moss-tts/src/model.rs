@@ -311,6 +311,7 @@ impl MossTtsdGenerator {
         let seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
+        on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
         let mut on_position = |step: usize| {
             on_progress(Progress::Step {
                 current: (step as u32) + 1,

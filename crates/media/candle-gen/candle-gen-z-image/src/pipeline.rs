@@ -417,6 +417,9 @@ fn run_three_stage<Text, Encoded, Renderer, Latents, Decoder, Output>(
     candle_gen::check_cancel(cancel)?;
     on_progress(Progress::Loading(LoadPhase::TextEncoder));
     let text = load_text()?;
+    on_progress(Progress::Loading(
+        candle_gen::gen_core::LoadPhase::EncodingPrompt,
+    ));
     let encoded = encode(&text);
     let text_sync = device.synchronize();
     drop(text);
@@ -1550,6 +1553,9 @@ impl Pipeline {
         let lat_w = (req.width / SPATIAL_SCALE) as usize;
 
         // Text embeddings are seed- and image-independent: encode once for the whole batch.
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let cap =
             self.text_embeddings(&components.text_encoder, &components.tokenizer, &req.prompt)?;
 
@@ -1725,6 +1731,9 @@ impl Pipeline {
 
         // Text embeddings are seed- and image-independent: encode once for the whole batch. The uncond
         // branch (negative prompt, empty when unset) is only encoded when CFG is active.
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let cap =
             self.text_embeddings(&components.text_encoder, &components.tokenizer, &req.prompt)?;
         let neg_cap = if cfg_on {

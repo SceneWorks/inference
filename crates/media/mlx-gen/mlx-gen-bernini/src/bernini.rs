@@ -714,7 +714,7 @@ impl Bernini {
 
         // --- Stage 2: T5 prompt encode + concat_with_zero_init for the 4 renderer streams ---
         let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), self.config.text_len)?;
-        let (t5_pos, t5_neg) = self.encode_t5(&tokenizer, req, &full.neg)?;
+        let (t5_pos, t5_neg) = self.encode_t5(&tokenizer, req, &full.neg, on_progress)?;
         // Residency discipline (sc-10840): the UMT5-XXL text encoder is now dropped (end of
         // `encode_t5`) and `t5_pos`/`t5_neg` are materialized — flush its freed pages before the
         // two ~28 GB expert loads, the same F-174/F-175 seam discipline applied at the planner drop.
@@ -937,11 +937,15 @@ impl Bernini {
         tokenizer: &mlx_gen::tokenizer::TextTokenizer,
         req: &GenerationRequest,
         neg: &str,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(Array, Array)> {
         let w = Weights::from_file(self.root.join("t5_encoder.safetensors"))?;
         let enc = Umt5Encoder::from_weights(&w, &self.config)?;
         // `encode` returns `[T, 4096]` (no batch); the planner streams are `[1, S, 4096]`, so add
         // the batch axis for the `concat_with_zero_init` sequence-axis concat.
+        on_progress(Progress::Loading(
+            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let pos = enc
             .encode(tokenizer, &req.prompt)?
             .expand_dims(0)?

@@ -309,6 +309,9 @@ impl IpAdapterSdxl {
 
         // Everything that borrows `&self`, computed into owned values BEFORE the `&mut self.unet`
         // `set_ip_context` (so the disjoint-field borrows don't overlap — the InstantID pattern).
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (conditioning, pooled) = self
             .conditioner
             .encode(&req.prompt, &req.negative, cfg_on)?;

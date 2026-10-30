@@ -988,6 +988,9 @@ impl Bernini {
         // --- Stage 2: UMT5 text encode + concat_with_zero_init for the 4 renderer streams ---
         // UMT5 encoder + tokenizer are cached components (F-097), not reloaded per generate.
         let (t5_pos, t5_neg) = {
+            on_progress(Progress::Loading(
+                candle_gen::gen_core::LoadPhase::EncodingPrompt,
+            ));
             let pos = umt5_encode(&comps.te, &comps.tok, &req.prompt, dev)?;
             let neg = umt5_encode(&comps.te, &comps.tok, &neg, dev)?;
             (pos, neg)

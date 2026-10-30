@@ -549,8 +549,8 @@ impl Flux2Edit {
         let cfg_on = !embedded_guidance && guidance > 1.0;
 
         // Prompt embeds are seed-independent: encode once. Negative only under klein CFG.
-        let encode_prompt = |te: &Flux2PromptEncoder,
-                             upsampler: Option<&CaptionUpsampler>|
+        let mut encode_prompt = |te: &Flux2PromptEncoder,
+                                 upsampler: Option<&CaptionUpsampler>|
          -> Result<(Tensor, Option<Tensor>)> {
             let enhancement_request = candle_gen::gen_core::GenerationRequest {
                 prompt: req.prompt.clone(),
@@ -570,6 +570,9 @@ impl Flux2Edit {
                 references,
             )?;
             candle_gen::check_cancel(&req.cancel)?;
+            on_progress(Progress::Loading(
+                candle_gen::gen_core::LoadPhase::EncodingPrompt,
+            ));
             let prompt = self.pipe.encode(te, &self.tokenizer, &effective)?;
             let negative = if cfg_on {
                 let neg = if req.negative.trim().is_empty() {

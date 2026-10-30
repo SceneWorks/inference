@@ -634,6 +634,9 @@ impl Pipeline {
         // guidance — so UMT5-encode + project the negative for an expert only when its own guidance
         // enables CFG. At guidance <= 1.0 the denoise loop never touches `*_neg`, so the 24-layer UMT5
         // forward over the negative and its projection are pure waste (sc-8993).
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let pos = self.encode(comps, &req.prompt)?;
         let high_pos = comps.high.embed_text(&pos)?;
         let low_pos = comps.low.embed_text(&pos)?;
@@ -756,6 +759,9 @@ impl Pipeline {
         let (pos, neg) = {
             on_progress(Progress::Loading(LoadPhase::TextEncoder));
             let te = self.load_te()?;
+            on_progress(Progress::Loading(
+                candle_gen::gen_core::LoadPhase::EncodingPrompt,
+            ));
             let pos = self.encode_raw(&tok, &te, &req.prompt)?;
             let neg = match self.negative_prompt(req, &knobs) {
                 Some(neg_prompt) => Some(self.encode_raw(&tok, &te, neg_prompt)?),

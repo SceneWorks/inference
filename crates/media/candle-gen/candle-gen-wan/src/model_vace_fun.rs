@@ -242,7 +242,12 @@ impl Pipeline {
         Ok(Tensor::cat(&frames.iter().collect::<Vec<_>>(), 2)?)
     }
 
-    fn prepare(&self, req: &GenerationRequest, shared: &SharedComponents) -> CResult<Prepared> {
+    fn prepare(
+        &self,
+        req: &GenerationRequest,
+        shared: &SharedComponents,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<Prepared> {
         let clip = req
             .control_clip()
             .ok_or_else(|| CandleError::Msg("wan VACE-Fun requires a ControlClip".into()))?;
@@ -291,6 +296,9 @@ impl Pipeline {
         let (pt, ph, pw) = self.vace_cfg.base.patch;
         let (cos, sin) =
             WanRope::new(&self.vace_cfg.base).cos_sin(t / pt, h / ph, w / pw, &self.device)?;
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let pos = self.encode_text(shared, &req.prompt)?;
         // VACE-Fun inherits the Wan2.2 T2V-A14B MoE defaults: low/high CFG 3/4. A scalar request
         // override applies to both experts, matching mlx-gen-wan.
@@ -606,12 +614,12 @@ impl Generator for WanVaceFunGenerator {
         let (mut prepared, resident_shared) = match effective_offload {
             OffloadPolicy::Resident => {
                 let shared = self.shared(&pipeline)?;
-                let prepared = pipeline.prepare(req, &shared)?;
+                let prepared = pipeline.prepare(req, &shared, on_progress)?;
                 (prepared, Some(shared))
             }
             OffloadPolicy::Sequential => {
                 let shared = pipeline.load_shared()?;
-                let prepared = pipeline.prepare(req, &shared)?;
+                let prepared = pipeline.prepare(req, &shared, on_progress)?;
                 self.device.synchronize().map_err(CandleError::from)?;
                 drop(shared);
                 (prepared, None)

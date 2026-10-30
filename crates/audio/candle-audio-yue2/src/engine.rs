@@ -273,6 +273,9 @@ pub enum StageEvent {
 
 /// Observes an engine run. Every method has a no-op default.
 pub trait EngineObserver {
+    /// An autoregressive prefix is about to be encoded after its model is available.
+    fn on_prompt_encoding(&mut self) {}
+
     /// A stage started, finished or was reused.
     fn on_stage(&mut self, stage: Stage, event: StageEvent) {
         let _ = (stage, event);
@@ -1251,6 +1254,7 @@ impl Yue2Engine {
                 check_generation_budget(planning.prefix().len(), None, generation.abc(), 1.0)
                     .map_err(msg)?;
                 let nar = self.lock_nar_for_ar()?;
+                hooks.observer.on_prompt_encoding();
                 let mut rng = stage_rng(request.seed());
                 let mut forward = TokenForward {
                     stage: Stage::Plan,
@@ -1292,6 +1296,7 @@ impl Yue2Engine {
             .semantic_conditioning(&self.tokenizer, generation.semantic())
             .map_err(msg)?;
         let nar = self.lock_nar_for_ar()?;
+        hooks.observer.on_prompt_encoding();
         let mut rng = stage_rng(plan.request().seed());
         let mut forward = TokenForward {
             stage: Stage::Semantic,

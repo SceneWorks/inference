@@ -526,6 +526,9 @@ impl BerniniRenderer {
         let (context, context_null) = {
             let w = Weights::from_file(self.root.join("t5_encoder.safetensors"))?;
             let enc = Umt5Encoder::from_weights(&w, cfg)?;
+            on_progress(Progress::Loading(
+                mlx_gen::gen_core::LoadPhase::EncodingPrompt,
+            ));
             let context = enc.encode(&tokenizer, &req.prompt)?;
             let context_null = enc.encode(&tokenizer, &neg)?;
             eval([&context, &context_null])?;

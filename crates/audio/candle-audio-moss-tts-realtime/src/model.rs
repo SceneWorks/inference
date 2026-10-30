@@ -414,6 +414,9 @@ impl MossTtsRealtimeGenerator {
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
 
+        if synth_turns > 0 {
+            on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
+        }
         let rendered = {
             let mut frame_count = 0u32;
             let mut on_frame =
@@ -509,6 +512,7 @@ impl MossTtsRealtimeGenerator {
         let seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
+        on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
         let mut on_frame = |step: usize, _frame: &[u32]| {
             on_progress(Progress::Step {
                 current: (step as u32) + 1,
@@ -600,6 +604,7 @@ impl MossTtsRealtimeGenerator {
 
         let mut chunker = crate::chunk::StreamingChunker::new(codec.as_ref(), decode_schedule);
         let mut canceled = false;
+        on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
         let run = {
             // The AR loop hands each emitted frame here; the chunker decodes + streams block-wise.
             let mut on_frame =
@@ -747,6 +752,7 @@ impl ConversationSession for MossConversationSession {
         let probe = move || cancel.is_cancelled();
         let total = budget as u32;
 
+        on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
         let frames = {
             // Disjoint field borrows: the decoder/tokenizer/voice-clone (shared) and the cache state
             // (mutable) come from different fields, so this is a legal simultaneous borrow of `self`.

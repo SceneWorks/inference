@@ -282,6 +282,9 @@ impl Generator for MossSfxGenerator {
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
         let mut progress = |p: crate::pipeline::PipelineProgress| match p {
+            crate::pipeline::PipelineProgress::EncodingPrompt => {
+                on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt))
+            }
             crate::pipeline::PipelineProgress::Step(k) => on_progress(Progress::Step {
                 current: k as u32,
                 total,

@@ -492,6 +492,7 @@ impl ChatterboxGenerator {
 
         let mut guard = lock_recover(&self.t3);
         let t3 = guard.as_mut().unwrap();
+        on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
         let mut on_step = |step: usize| {
             on_progress(Progress::Step {
                 current: step as u32,

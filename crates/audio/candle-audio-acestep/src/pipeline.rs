@@ -98,6 +98,8 @@ pub const COVER_SFT_STEPS: usize = 24;
 /// Pipeline-level progress events, mapped by the provider onto `gen_core::Progress`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineProgress {
+    /// Text conditioning is about to be encoded.
+    EncodingPrompt,
     Step(usize),
     Decoding,
 }
@@ -344,6 +346,7 @@ impl AceStepPipeline {
             return Err(AudioError::Canceled);
         }
 
+        progress(PipelineProgress::EncodingPrompt);
         let ctx_raw =
             self.encode_context(prompt, &params.lyrics, &params.metadata, params.seconds)?;
         let ctx = self.dit.embed_context(&ctx_raw)?;
@@ -518,6 +521,7 @@ impl AceStepPipeline {
             Tensor::cat(&[&src_full, &mask], candle_audio::candle_core::D::Minus1)?;
 
         // 5. Condition context (prompt + lyrics + metadata) — identical to text-to-music.
+        progress(PipelineProgress::EncodingPrompt);
         let ctx_raw = self.encode_context(
             prompt,
             &params.base.lyrics,
@@ -645,6 +649,7 @@ impl AceStepPipeline {
         // 4. Condition context from the NEW prompt (special-token timbre, like text-to-music). The
         //    context is embedded by the sft cover DiT (its `condition_embedder` weights differ from
         //    turbo's), then consumed by that same DiT below.
+        progress(PipelineProgress::EncodingPrompt);
         let ctx_raw =
             self.encode_context(prompt, &params.lyrics, &params.metadata, params.seconds)?;
         let ctx = cover_dit.embed_context(&ctx_raw)?;

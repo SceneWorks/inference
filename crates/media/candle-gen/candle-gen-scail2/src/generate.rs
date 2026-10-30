@@ -425,6 +425,9 @@ pub fn generate(
     // The tokenizer is loaded+parsed once at component load (sc-8991 / F-011) — reuse the cached one.
     let tok = &comps.tok;
     let pad_id = te_cfg.pad_token_id.max(0) as u32;
+    on_progress(Progress::Loading(
+        candle_gen::gen_core::LoadPhase::EncodingPrompt,
+    ));
     let context = encode_text(&comps.te, tok, job.prompt, pad_id, dev)?;
     let context_null = if cfg_disabled {
         context.clone()

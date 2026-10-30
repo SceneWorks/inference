@@ -456,6 +456,9 @@ pub fn generate(
         let tok = load_tokenizer(root.join("tokenizer.json"), cfg.wan.text_len)?;
         let w = Weights::from_file(root.join("t5_encoder.safetensors"))?;
         let enc = Umt5Encoder::from_weights(&w, &cfg.wan)?;
+        on_progress(Progress::Loading(
+            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let c = enc.encode(&tok, job.prompt)?;
         let cn = if cfg_disabled {
             c.clone()

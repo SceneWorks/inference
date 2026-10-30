@@ -439,6 +439,9 @@ impl Pipeline {
         // Conditioning is seed-independent — encode once. CFG batch is [uncond, cond] (candle's chunk
         // order); without guidance only the positive branch is built. The ChatGLM3 encode stays local
         // (it threads `components`); the shared helper owns only the identical CFG-concat convention.
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (context, pooled, batch) = common::cfg_batch_context(
             &req.prompt,
             negative,
@@ -573,6 +576,9 @@ impl Pipeline {
 
         ensure_not_cancelled(req)?;
         let conditioner = SynchronizedPhase::new(self.load_conditioner()?, self.device.clone());
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (context, pooled, batch) = common::cfg_batch_context(
             &req.prompt,
             negative,

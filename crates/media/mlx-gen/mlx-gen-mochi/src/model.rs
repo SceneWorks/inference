@@ -243,6 +243,9 @@ impl Mochi {
 
         // T5-XXL masked encode (`_get_t5_prompt_embeds`), positive + the CFG-unconditional branch (the
         // reference encodes the negative prompt, or "" when unset, with `do_classifier_free_guidance`).
+        on_progress(Progress::Loading(
+            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let pos = encode_prompt(&self.tokenizer, &self.t5, &req.prompt)?;
         let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
         let neg = encode_prompt(&self.tokenizer, &self.t5, neg_prompt)?;

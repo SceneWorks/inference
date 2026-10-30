@@ -283,7 +283,10 @@ impl Generator for YueGenerator {
             YueEvent::StageLoaded(Stage::Stage1 | Stage::Stage2) => {
                 on_progress(Progress::Loading(LoadPhase::Renderer))
             }
-            YueEvent::SegmentStarted { total: n, .. } => total = n as u32 + 2,
+            YueEvent::SegmentStarted { total: n, .. } => {
+                total = n as u32 + 2;
+                on_progress(Progress::Loading(LoadPhase::EncodingPrompt));
+            }
             YueEvent::SegmentFinished { .. } | YueEvent::TrackUpsampled(_) => {
                 done += 1;
                 on_progress(Progress::Step {

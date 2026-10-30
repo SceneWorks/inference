@@ -515,7 +515,7 @@ impl Generator for SdxlGenerator {
                         candle_gen::residency::check_cancel(&req.cancel)?;
                         verify_artifacts(&self.artifact_seal)?;
                         state.0 = Some(self.file_pin_spec.read_prepared_files_unchanged(|| {
-                            pipe.text_embeddings(&tokenizers, &req.prompt, negative)
+                            pipe.text_embeddings(&tokenizers, &req.prompt, negative, state.2)
                         })?);
                         Ok(())
                     },
@@ -561,6 +561,9 @@ impl Generator for SdxlGenerator {
                     .components(&pipe)
                     .map_err(candle_gen::CandleError::from)?;
                 let result = (|| {
+                    on_progress(Progress::Loading(
+                        candle_gen::gen_core::LoadPhase::EncodingPrompt,
+                    ));
                     let embeddings =
                         pipe.text_embeddings_resident(&tokenizers, &text, &req.prompt, negative)?;
                     pipe.render(

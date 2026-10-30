@@ -708,6 +708,7 @@ fn encode_prompt(
     cfg: &KreaRealtimeConfig,
     prompt: &str,
     te_quant: Option<WanQuant>,
+    on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     let tokenizer = load_tokenizer(root.join("tokenizer.json"), cfg.wan.text_len)?;
     materialize_and_release_phase(|| {
@@ -716,6 +717,9 @@ fn encode_prompt(
             Some(q) => Umt5Encoder::from_weights_quantized(&mut w, &cfg.wan, q)?,
             None => Umt5Encoder::from_weights(&w, &cfg.wan)?,
         };
+        on_progress(Progress::Loading(
+            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         enc.encode(&tokenizer, prompt)
     })
 }
@@ -996,7 +1000,7 @@ fn stage_components(
 )> {
     let te_quant = resolve_te_quant(root, cfg, quant)?;
     on_progress(Progress::Loading(mlx_gen::LoadPhase::TextEncoder));
-    let context = encode_prompt(root, cfg, prompt, te_quant)?;
+    let context = encode_prompt(root, cfg, prompt, te_quant, on_progress)?;
     // SC-15449/sc-22738: the conditioning phase EXIT. `encode_prompt` has evaluated the context and
     // released the UMT5; the DiT and VAE below are not loaded yet.
     crate::memory_strategy::calibration_fault(memory, MemoryPhase::Conditioning)?;

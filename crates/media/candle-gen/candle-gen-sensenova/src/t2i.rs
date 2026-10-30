@@ -420,6 +420,9 @@ impl T2iModel {
         );
         let ids_cond = tokenizer.encode_ids(&query_cond, true)?;
         let attention = self.attention_plan(opts, Some(cancel));
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (mut cache_cond, text_len) = self.prefill(&ids_cond, attention)?;
 
         // ---- Uncondition prefix (CFG) ----
@@ -520,6 +523,9 @@ impl T2iModel {
         let cond_ids = self.build_it2i_query_ids(tokenizer, &cond_query, &grids)?;
         let (cond_embeds, cond_t, cond_h, cond_w) =
             self.build_it2i_prefix(&cond_ids, Some(&pixel_values), &grids)?;
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (mut cache_cond, _, cond_temporal) =
             self.prefill_prefix(&cond_embeds, &cond_t, &cond_h, &cond_w, attention)?;
 

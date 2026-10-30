@@ -605,6 +605,7 @@ impl Pipeline {
         toks: &SdxlTokenizers,
         prompt: &str,
         uncond: &str,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         // sc-20528: a prompt past CLIP's 77-token window is chunked, not rejected. The chunk count is
         // decided ONCE for the whole request — the two encoders are concatenated on the feature axis
@@ -616,8 +617,24 @@ impl Pipeline {
             &[(&plan_l, &toks.tok_l), (&plan_g, &toks.tok_g)],
             &[uncond, prompt],
         )?;
-        let l = self.encode_one(Clip::L, &toks.tok_l, &plan_l, prompt, uncond, chunks)?;
-        let g = self.encode_one(Clip::BigG, &toks.tok_g, &plan_g, prompt, uncond, chunks)?;
+        let l = self.encode_one(
+            Clip::L,
+            &toks.tok_l,
+            &plan_l,
+            prompt,
+            uncond,
+            chunks,
+            on_progress,
+        )?;
+        let g = self.encode_one(
+            Clip::BigG,
+            &toks.tok_g,
+            &plan_g,
+            prompt,
+            uncond,
+            chunks,
+            on_progress,
+        )?;
         Ok(Tensor::cat(&[l, g], D::Minus1)?)
     }
 
@@ -675,8 +692,12 @@ impl Pipeline {
         prompt: &str,
         uncond: &str,
         chunks: usize,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         let text_model = self.load_text_model(which)?;
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let result = self.encode_loaded(&text_model, tokenizer, plan, prompt, uncond, chunks);
         candle_gen::residency::synchronize_result(&self.device, result)
     }

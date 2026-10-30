@@ -495,6 +495,9 @@ impl SanaPipeline {
         preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> Result<Image> {
         let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let conditioning = self.encode_conditioning(req, guidance)?;
         self.generate_with_conditioning(req, &conditioning, device, cancel, on_progress, preview)
     }
@@ -715,6 +718,9 @@ pub(crate) fn generate_base_staged(
     revalidate_before_load(&mut check)?;
     let text = load_text_encoder(root, device)?;
     let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
+    on_progress(Progress::Loading(
+        candle_gen::gen_core::LoadPhase::EncodingPrompt,
+    ));
     let (cond, cond_mask) = text.encode_with_mask(req.prompt)?;
     let (uncond, uncond_mask) = if guidance > 1.0 {
         let (uncond, uncond_mask) = text.encode_with_mask(req.negative_prompt.unwrap_or(""))?;
@@ -1113,6 +1119,9 @@ impl SanaSprintPipeline {
         on_progress: &mut dyn FnMut(Progress),
         preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> Result<Image> {
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let conditioning = self.encode_conditioning(req.prompt)?;
         self.generate_with_conditioning(req, &conditioning, device, cancel, on_progress, preview)
     }
@@ -1275,6 +1284,9 @@ pub(crate) fn generate_sprint_staged(
 ) -> Result<Vec<Image>> {
     revalidate_before_load(&mut check)?;
     let text = load_text_encoder(root, device)?;
+    on_progress(Progress::Loading(
+        candle_gen::gen_core::LoadPhase::EncodingPrompt,
+    ));
     let (cond, cond_mask) = text.encode_with_mask(req.prompt)?;
     let conditioning = SanaSprintConditioning { cond, cond_mask };
     device.synchronize()?;

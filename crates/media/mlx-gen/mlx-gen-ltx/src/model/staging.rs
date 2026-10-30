@@ -128,6 +128,7 @@ impl Ltx {
     pub(super) fn stage_text_phase(
         &self,
         req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<StagedTextConditioning> {
         let te = self.build_text_encoder()?;
         // Prompt enhancement (sc-2845) reuses the just-built Gemma backbone (the censored path); the
@@ -139,6 +140,9 @@ impl Ltx {
             // turn an enhancement request into ordinary conditioning.
             StagedTextEncoder::Gemma4(_) => (self.maybe_enhance_gemma4(req)?, None),
         };
+        on_progress(Progress::Loading(
+            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let prompt = enhanced.as_deref().unwrap_or(req.prompt.as_str());
         let (ids, mask) = self.tokenizer.encode(prompt, MAX_PROMPT_TOKENS)?;
         let (video_ctx, audio_ctx) = te.encode_av(&ids, &mask)?;

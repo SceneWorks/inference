@@ -321,6 +321,7 @@ pub(crate) fn stage_encode_base(
     preflight: &TextPreflight,
     default_steps: usize,
     device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
 ) -> Result<StagedCondition> {
     let reference = resolve_reference(req, crate::BOOGU_IMAGE_ID)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(default_steps);
@@ -340,6 +341,7 @@ pub(crate) fn stage_encode_base(
         _ => None,
     };
     let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
     let cond = text
         .te
         .last_hidden(&text.tok.text_ids_to_tensor(&preflight.positive)?)?;
@@ -368,6 +370,7 @@ pub(crate) fn stage_encode_turbo(
     req: &GenerationRequest,
     preflight: &TextPreflight,
     device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
 ) -> Result<StagedCondition> {
     let reference = resolve_reference(req, crate::BOOGU_IMAGE_TURBO_ID)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_TURBO_STEPS);
@@ -386,6 +389,7 @@ pub(crate) fn stage_encode_turbo(
         )?),
         _ => None,
     };
+    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
     let cond = text
         .te
         .last_hidden(&text.tok.text_ids_to_tensor(&preflight.positive)?)?;
@@ -403,12 +407,14 @@ pub(crate) fn stage_encode_edit(
     references: &[&Image],
     preflight: &EditPreflight,
     device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
 ) -> Result<StagedCondition> {
     validate_edit_reference_dims(references)?;
     let ref_latents = references
         .iter()
         .map(|reference| vae_encode(&edit.vae_encoder, reference, device))
         .collect::<Result<Vec<_>>>()?;
+    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
     let cond =
         encode_image_instruction_parts(&text.tok, &text.te, edit, references, preflight, device)?;
     let uncond = if req.guidance.unwrap_or(DEFAULT_GUIDANCE) > 1.0 {
@@ -680,6 +686,9 @@ pub(crate) fn render_base(
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
     // Condition encoding (seed-independent): positive instruction + CFG-negative (empty) instruction.
+    on_progress(Progress::Loading(
+        candle_gen::gen_core::LoadPhase::EncodingPrompt,
+    ));
     let cond = comps
         .te
         .last_hidden(&comps.tok.text_ids_to_tensor(&preflight.positive)?)?;
@@ -785,6 +794,9 @@ pub(crate) fn render_turbo(
 ) -> Result<Vec<Image>> {
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    on_progress(Progress::Loading(
+        candle_gen::gen_core::LoadPhase::EncodingPrompt,
+    ));
     let cond = comps
         .te
         .last_hidden(&comps.tok.text_ids_to_tensor(&preflight.positive)?)?;
@@ -957,6 +969,9 @@ pub(crate) fn render_edit(
     // Condition encoding (seed-independent): image-conditioned edit instruction (the MLLM sees every
     // reference) + text-only CFG-negative (empty/drop instruction). Both DiT passes carry the same
     // reference latents.
+    on_progress(Progress::Loading(
+        candle_gen::gen_core::LoadPhase::EncodingPrompt,
+    ));
     let cond = encode_image_instruction(comps, edit, references, preflight, device)?;
     let do_cfg = guidance > 1.0;
     let uncond = if do_cfg {

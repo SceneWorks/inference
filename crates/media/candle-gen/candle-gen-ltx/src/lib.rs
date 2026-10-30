@@ -1106,6 +1106,9 @@ impl Pipeline {
 
         // Text encode → video (1,256,4096) + audio (1,256,2048) contexts (one Gemma pass).
         let (input_ids, mask01) = self.tokenize(&comps.tokenizer, &req.prompt)?;
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (video_ctx, audio_ctx) = comps.te.encode_both(&input_ids, &mask01)?;
         let negative_context = if self.transformer_variant.is_dev() {
             // Empty negative text is the official unconditional conditioning when a caller omits
