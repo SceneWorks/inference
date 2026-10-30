@@ -498,6 +498,12 @@ impl Generator for AceStepGenerator {
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
         let mut progress = |p: PipelineProgress| match p {
+            PipelineProgress::EncodingPrompt => {
+                on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt))
+            }
+            PipelineProgress::PromptEncodingComplete => {
+                on_progress(Progress::PromptEncodingComplete)
+            }
             PipelineProgress::Step(k) => on_progress(Progress::Step {
                 current: k as u32,
                 total,

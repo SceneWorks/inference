@@ -198,8 +198,11 @@ impl MmAudio44kPipeline {
         let sync_rgb = resample_frames(frames, src_fps, SYNC_FPS, sync_rgb_count)?;
 
         let clip_feat = self.encode_clip_visual(&clip_rgb)?; // (1, clip_seq_len, 1024)
-        let text_feat = self.encode_text(prompt)?; // (1, 77, 1024)
-        let neg_text_feat = self.encode_text(negative_prompt)?; // (1, 77, 1024)
+        let (text_feat, neg_text_feat) = crate::generator::with_prompt_encoding(progress, || {
+            let text_feat = self.encode_text(prompt)?; // (1, 77, 1024)
+            let neg_text_feat = self.encode_text(negative_prompt)?; // (1, 77, 1024)
+            Ok((text_feat, neg_text_feat))
+        })?;
         if probe() {
             return Err(AudioError::Canceled);
         }
@@ -425,6 +428,12 @@ impl Generator for MmAudioLarge44kGenerator {
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
         let mut progress = |p: PipelineProgress| match p {
+            PipelineProgress::EncodingPrompt => {
+                on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt))
+            }
+            PipelineProgress::PromptEncodingComplete => {
+                on_progress(Progress::PromptEncodingComplete)
+            }
             PipelineProgress::Step(k) => on_progress(Progress::Step {
                 current: k as u32,
                 total,

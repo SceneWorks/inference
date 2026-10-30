@@ -92,12 +92,17 @@ pub(crate) struct RawGguf {
     pub metadata: HashMap<String, RawValue>,
     pub tensors: HashMap<String, RawTensorInfo>,
     data_offset: u64,
-    file: std::fs::File,
+    file: load_progress::reader::ProgressReader<std::fs::File>,
+    progress: load_progress::reader::SourceProgress,
 }
 
 impl RawGguf {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut file = std::fs::File::open(path)?;
+        let file = std::fs::File::open(path)?;
+        let file_len = file.metadata()?.len();
+        let progress = load_progress::reader::SourceProgress::new(path, Some(file_len));
+        let _operation = progress.operation();
+        let mut file = progress.reader(file)?;
         if u32le(&mut file)? != 0x4655_4747 {
             return Err(Error::Config("GGUF bad magic".into()));
         }
@@ -105,7 +110,6 @@ impl RawGguf {
         if !(2..=3).contains(&version) {
             return Err(Error::Config(format!("GGUF version {version} unsupported")));
         }
-        let file_len = file.metadata()?.len();
         let tensor_count = u64le(&mut file)?;
         let metadata_count = u64le(&mut file)?;
         let pos = file.stream_position()?;
@@ -179,6 +183,7 @@ impl RawGguf {
                 tensors,
                 data_offset,
                 file,
+                progress,
             }),
             "candle-llm::prism_gguf::RawGguf::open",
             ModelWeights,
@@ -213,13 +218,14 @@ impl RawGguf {
             .checked_add(info.offset)
             .ok_or_else(|| Error::Config("GGUF tensor offset overflow".into()))?;
         // The declared extent must lie inside the file *before* allocating it (sc-27299).
-        let file_len = self.file.metadata()?.len();
+        let file_len = self.file.get_ref().metadata()?.len();
         let end = u64::try_from(bytes).ok().and_then(|b| start.checked_add(b));
         if end.is_none_or(|end| end > file_len) {
             return Err(Error::Config(format!(
                 "GGUF tensor {name} ({bytes} bytes at {start}) extends past the {file_len}-byte file"
             )));
         }
+        let _operation = self.progress.operation();
         self.file.seek(SeekFrom::Start(start))?;
         let mut data = vec![0u8; bytes];
         self.file.read_exact(&mut data)?;

@@ -26,7 +26,7 @@ class TestSuites(unittest.TestCase):
             "reason": "compiler-artifact",
             "profile": {"test": True},
             "package_id": "fixture-id",
-            "target": {"kind": [kind], "name": target},
+            "target": {"kind": [kind], "name": target, "src_path": str(suites.ROOT / "scripts/ci/test_suites.py")},
             "executable": "fixture-binary",
             "features": list(features),
         }
@@ -40,7 +40,7 @@ class TestSuites(unittest.TestCase):
             calls.append(command)
             self.assertGreater(timeout, 0)
             if command[0:2] == ["cargo", "metadata"]:
-                return json.dumps({"target_directory": "/target", "packages": [{"id": "fixture-id", "name": "fixture", "manifest_path": str(suites.ROOT / "Cargo.toml"), "version": "0.0.0"}]})
+                return json.dumps({"target_directory": "/target", "packages": [{"id": "fixture-id", "name": "fixture", "manifest_path": str(suites.ROOT / "Cargo.toml"), "version": "0.0.0", "targets": [artifact["target"]]}]})
             if command[0] == "rustc":
                 return "/rust/lib\n"
             if command[0:2] == ["cargo", "test"]:
@@ -71,6 +71,131 @@ class TestSuites(unittest.TestCase):
         self.assertIn(["fixture-binary", "--test-threads=1", "--skip", "numerical::sweep"], calls)
         self.assertFalse(any("--ignored" in call and "--list" not in call for call in calls))
 
+    def safe_execute(self, *, controls=None, **fake):
+        calls = []
+        with patch.object(suites, "run", self.fake_run(calls, **fake)):
+            suites.execute_safe(["cargo", "test", "--lib", "--tests", "-p", "fixture"],
+                                [self.case(test="contract::shape")] if controls is None else controls, 60)
+        return calls
+
+    def test_safe_mode_never_runs_backend_defaults(self):
+        calls = self.safe_execute()
+        execution = [call for call in calls if call[0] == "fixture-binary" and "--list" not in call]
+        self.assertEqual(execution, [["fixture-binary", "--exact", "contract::shape", "--test-threads=1"]])
+        self.assertTrue(any("--no-run" in call for call in calls))
+
+    def test_unknown_custom_harness_is_compiled_without_listing_or_execution(self):
+        calls = self.safe_execute(controls=[self.case(package="other")])
+        self.assertFalse(any(call[0] == "fixture-binary" for call in calls))
+        self.assertTrue(any("--no-run" in call for call in calls))
+
+    def test_known_custom_harness_is_rejected_before_listing(self):
+        calls = []
+        with patch.object(suites, "run", self.fake_run(calls)), patch.object(suites.tomllib, "loads", return_value={"lib": {"harness": False}}):
+            with self.assertRaisesRegex(ValueError, "libtest protocol"):
+                suites.execute_safe(["cargo", "test", "--lib"], [self.case(test="contract::shape")], 60)
+        self.assertFalse(any(call[0] == "fixture-binary" for call in calls))
+
+    def test_safe_control_missing_ignored_zero_or_misbound_fails(self):
+        for fake in (
+            {"names": {"numerical::sweep"}, "ignored": set()},
+            {"ignored": {"contract::shape"}},
+            {"result": "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out;"},
+            {"result": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"},
+            {"artifact": self.artifact(target="renamed")},
+        ):
+            with self.subTest(fake=fake), self.assertRaises(ValueError):
+                self.safe_execute(**fake)
+
+    def test_safe_control_cannot_be_bound_to_another_package_source(self):
+        with self.assertRaisesRegex(ValueError, "another package"):
+            self.safe_execute(controls=[self.case(test="contract::shape", source="../outside.rs")])
+
+    def test_safe_mode_rejects_alias_or_driver_prefix_before_any_subprocess(self):
+        for command in (
+            ['cargo', '--config', 'alias.probe=!model_driver', 'probe', 'test'],
+            ['cargo', 'run', '--bin', 'test'],
+            ['cargo', 'test', '--', '--no-run'],
+        ):
+            with self.subTest(command=command), patch.object(suites, 'run') as run:
+                with self.assertRaises(ValueError):
+                    suites.execute_safe(command, [self.case()], 60)
+                run.assert_not_called()
+
+    def test_safe_table_is_nonempty_and_source_bound(self):
+        controls = suites.safe_controls()
+        self.assertEqual(len(controls), 21)
+        self.assertTrue(all(control['protocol'] == 'libtest' for control in controls))
+        self.assertTrue(any('cancellation' in control['test'] for control in controls))
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'empty.json'
+            path.write_text('{"version":1,"controls":[]}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, 'empty'):
+                suites.safe_controls(path)
+
+    def test_ordinary_tooling_uses_a_fresh_venv_without_learned_libraries(self):
+        import yaml
+        steps = yaml.safe_load((suites.ROOT / '.github/workflows/ci.yml').read_text(encoding="utf-8"))['jobs']['workspace']['steps']
+        install = next(step['run'] for step in steps if step.get('name') == 'Install pinned tooling test dependencies')
+        self.assertIn('test ! -e "$RUNNER_TEMP/ordinary-tooling"', install)
+        self.assertIn('python3 -m venv', install)
+        self.assertNotIn('--system-site-packages', install)
+        self.assertIn('numpy==2.4.3 safetensors==0.8.0 PyYAML==6.0.3', install)
+        self.assertIn('"$GITHUB_PATH"', install)
+        verify = next(step['run'] for step in steps if step.get('name') == 'Verify isolated model-free tooling environment')
+        self.assertIn('unset PYTHONPATH PYTHONHOME', verify)
+        self.assertIn('sys.prefix != sys.base_prefix', verify)
+        self.assertIn('not site.ENABLE_USER_SITE', verify)
+        for name in ('torch', 'mlx', 'transformers', 'diffusers', 'accelerate', 'tokenizers'):
+            self.assertIn('"' + name + '"', verify)
+        names = [step.get('name') for step in steps]
+        self.assertLess(names.index('Verify isolated model-free tooling environment'), names.index('Test repository tooling'))
+
+    def test_manual_baseline_retains_full_package_graphs_profiles_and_evidence(self):
+        import re
+        import shlex
+        import yaml
+        normal = yaml.safe_load((suites.ROOT / '.github/workflows/ci.yml').read_text(encoding="utf-8"))['jobs']
+        manual = yaml.safe_load((suites.ROOT / '.github/workflows/model-test-suites.yml').read_text(encoding="utf-8"))['jobs']
+        base = next(row for row in manual['candle-cpu']['strategy']['matrix']['include'] if row['group'] == 'base')
+        self.assertEqual(base['packages'], '-p candle-llm -p candle-quant-kernels -p candle-audio* -p runtime-cpu')
+        self.assertEqual(base['targets'], '--lib')
+        cpu = next(step for step in manual['candle-cpu']['steps'] if step.get('name') == 'Run former CPU conformance and bundle baselines')
+        for command in (
+            'cargo test --locked -j 1 -p candle-llm --test conformance',
+            'cargo test --locked --no-default-features --lib -p runtime-cpu',
+            'cargo test --locked --no-default-features --features audio --lib -p runtime-cpu',
+            'cargo test --locked --no-default-features --features media --lib -p runtime-cpu',
+        ):
+            self.assertIn(command, cpu['run'])
+        mlx = next(step['run'] for step in manual['mlx-metal']['steps'] if step.get('name') == 'Run selected MLX suite')
+        packages = lambda text: set(re.findall(r'-p\s+([^\s]+)', text))
+        selector = next(step['run'] for step in normal['macos-metal']['steps'] if step.get('name') == 'Test MLX packages')
+        selected = next(line for line in selector.splitlines() if 'test_scope.py select' in line).removesuffix(')')
+        baseline = mlx.split('then\n', 1)[1].split('\nelse', 1)[0]
+        self.assertEqual(packages(' '.join(shlex.split(selected))), packages(' '.join(shlex.split(baseline))))
+        self.assertIn('--features mlx-llm/campaign', baseline)
+        profiles = next(step['run'] for step in manual['mlx-metal']['steps'] if step.get('name') == 'Run former Metal, runtime and iOS host baselines')
+        for command in (
+            '--no-default-features --lib -p runtime-macos -p runtime-ios',
+            '--lib -p runtime-ios --features device-capture',
+            '--lib -p mlx-gen-ios-catalog --features device-capture',
+            '--no-default-features --features audio --lib -p runtime-macos',
+            '--features metal --test integration -- metal_strided_reduce:: metal_reference_latents::',
+            '--manifest-path ios-host/smoke/Cargo.toml --features media --lib -- --skip smoke_passes_on_the_host',
+        ):
+            self.assertIn(command, profiles)
+        for name in ('candle-cpu', 'mlx-metal'):
+            steps = manual[name]['steps']
+            upload = next(step for step in steps if step.get('name') == 'Upload exact suite evidence')
+            self.assertEqual(upload['if'], 'always()')
+            self.assertEqual(upload['with']['if-no-files-found'], 'error')
+            evidence = next(step['run'] for step in steps if step.get('name') == 'Record source, fixture, toolchain and device identities')
+            for identity in ('git rev-parse HEAD', 'git ls-tree -r HEAD', 'rustc -vV', 'cargo -V', 'device.txt'):
+                self.assertIn(identity, evidence)
+
     def test_explicit_exhaustive_runs_each_exact_unignored_case(self):
         calls = self.execute("exhaustive")
         self.assertIn(["fixture-binary", "--exact", "numerical::sweep", "--test-threads=1"], calls)
@@ -97,7 +222,7 @@ class TestSuites(unittest.TestCase):
                 self.execute(names=names, ignored=ignored)
 
     def test_target_rename_fails_instead_of_losing_all_registered_cases(self):
-        with self.assertRaisesRegex(ValueError, "targets absent"):
+        with self.assertRaisesRegex(ValueError, "target.*absent"):
             self.execute(artifact=self.artifact(target="renamed"))
 
     def test_platform_and_feature_gates_do_not_hide_stale_active_cases(self):
@@ -169,11 +294,11 @@ class TestSuites(unittest.TestCase):
         ordinary = yaml.safe_load((suites.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
         dispatch = ordinary.get("on", ordinary.get(True))["workflow_dispatch"]["inputs"]
         self.assertEqual(set(dispatch), {"lanes"})
-        for name in ("candle-cpu-test", "macos-metal", "macos-nax", "windows-cuda"):
+        for name in ("candle-cpu-test", "macos-metal", "windows-cuda-check"):
             job = ordinary["jobs"][name]
             commands = [step.get("run", "") for step in job["steps"] if "test_suites.py" in step.get("run", "")]
             self.assertTrue(commands, name)
-            self.assertTrue(all("routine -- cargo test" in command for command in commands))
+            self.assertTrue(all("audited-safe -- cargo" in command for command in commands))
             self.assertTrue(all("exhaustive" not in command for command in commands))
             self.assertIn(name, ordinary["jobs"]["gate"]["needs"])
         manual = yaml.safe_load((suites.ROOT / ".github/workflows/model-test-suites.yml").read_text(encoding="utf-8"))
@@ -181,7 +306,10 @@ class TestSuites(unittest.TestCase):
         self.assertEqual(set(manual["jobs"]), {"candle-cpu", "mlx-metal", "candle-cuda"})
         for job in manual["jobs"].values():
             self.assertIn("github.event_name == 'workflow_dispatch'", job["if"])
-            self.assertTrue(any("exhaustive -- cargo test" in step.get("run", "") for step in job["steps"]))
+            if job is manual["jobs"]["candle-cuda"]:
+                self.assertTrue(any("exhaustive -- cargo test" in step.get("run", "") for step in job["steps"]))
+        self.assertEqual(manual.get("on", manual.get(True))["workflow_dispatch"]["inputs"]["test_suite"]["default"], "exhaustive")
+        self.assertEqual(manual.get("on", manual.get(True))["workflow_call"]["inputs"]["test_suite"]["default"], "exhaustive")
         bridge = yaml.safe_load((suites.ROOT / ".github/workflows/real-weights.yml").read_text(encoding="utf-8"))["jobs"]["model-exhaustive-tests"]
         self.assertEqual(bridge["uses"], "./.github/workflows/model-test-suites.yml")
         self.assertEqual(bridge["needs"], "validate-selection")
@@ -232,7 +360,7 @@ class TestSuites(unittest.TestCase):
         for step in steps:
             self.assertNotIn("continue-on-error", step)
             self.assertIn("-j 1", step["run"])
-            self.assertIn('test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" routine -- cargo test', step["run"])
+            self.assertIn('test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" audited-safe -- cargo test', step["run"])
         self.assertEqual(jobs["macos-metal"]["timeout-minutes"], 90)
 
     def test_hosted_mlx_full_graph_has_explicit_suite_headroom_only_at_its_step(self):
@@ -244,7 +372,7 @@ class TestSuites(unittest.TestCase):
         self.assertNotIn("TEST_SUITE_DEADLINE_SECONDS", metal.get("env", {}))
         step = next(step for step in metal["steps"] if step.get("name") == "Test MLX packages")
         self.assertEqual(step["env"]["TEST_SUITE_DEADLINE_SECONDS"], 3600)
-        self.assertIn('test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" routine -- cargo test --locked --no-fail-fast --lib --tests "${packages[@]}"', step["run"])
+        self.assertIn('test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" audited-safe -- cargo test --locked --no-fail-fast --lib --tests "${packages[@]}"', step["run"])
         self.assertIn("-p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos", step["run"])
         for name, job in jobs.items():
             if name == "candle-cpu-test":

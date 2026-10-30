@@ -59,7 +59,7 @@ use gen_core::ProviderRegistryBuilder;
 
 use crate::quant::{Nvfp4KitchenExt as _, Nvfp4Tensor};
 
-use crate::candle_core::safetensors::MmapedSafetensors;
+use crate::candle_core::safetensors::{self as cst, MmapedSafetensors};
 use crate::candle_core::{DType, Device, Tensor};
 use crate::{CandleError, Result};
 
@@ -444,7 +444,9 @@ fn scalar_f32(bytes: &[u8], what: &str) -> Result<f32> {
             bytes.len()
         )));
     }
-    Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    Ok(cst::read_source_bytes(bytes, |bytes| {
+        f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }))
 }
 
 fn companion_bytes<'a>(
@@ -933,11 +935,12 @@ fn decode(
             };
             match tensor.residency.mode {
                 ResidencyMode::Dense => {
-                    let values: Vec<f32> = view
-                        .data()
-                        .iter()
-                        .map(|&byte| element(byte) * weight_scale)
-                        .collect();
+                    let values: Vec<f32> = cst::read_tensor_bytes(&view, |bytes| {
+                        bytes
+                            .iter()
+                            .map(|&byte| element(byte) * weight_scale)
+                            .collect()
+                    });
                     LogicalTensor::Dense(upload_bf16(values, source_shape, device)?)
                 }
                 ResidencyMode::Packed => {
@@ -982,13 +985,15 @@ fn decode(
             )?;
             let scales = companion_bytes(st, tensor, scale)?;
             let mut values = Vec::new();
-            gen_core::decode_mxfp8(
-                view.data(),
-                scales,
-                *stored_shape,
-                [source_shape[0], source_shape[1]],
-                &mut values,
-            )
+            cst::read_source_byte_sets(&[view.data(), scales], || {
+                gen_core::decode_mxfp8(
+                    view.data(),
+                    scales,
+                    *stored_shape,
+                    [source_shape[0], source_shape[1]],
+                    &mut values,
+                )
+            })
             .map_err(|error| {
                 CandleError::Msg(format!(
                     "codec {}: tensor {:?}: {error}",
@@ -1018,14 +1023,16 @@ fn decode(
             match tensor.residency.mode {
                 ResidencyMode::Dense => {
                     let mut values = Vec::new();
-                    gen_core::decode_nvfp4(
-                        view.data(),
-                        scales,
-                        global,
-                        *stored_shape,
-                        [source_shape[0], source_shape[1]],
-                        &mut values,
-                    )
+                    cst::read_source_byte_sets(&[view.data(), scales], || {
+                        gen_core::decode_nvfp4(
+                            view.data(),
+                            scales,
+                            global,
+                            *stored_shape,
+                            [source_shape[0], source_shape[1]],
+                            &mut values,
+                        )
+                    })
                     .map_err(|error| {
                         CandleError::Msg(format!(
                             "codec {}: tensor {:?}: {error}",
@@ -1055,24 +1062,28 @@ fn decode(
                     // inside `decode_nvfp4`; the packed repack preserves scale bytes verbatim, so
                     // a NaN or sign-bit E4M3 block scale must be refused here or it reaches the
                     // GEMM as a corrupted multiplier no later stage re-examines.
-                    gen_core::validate_nvfp4_block_scale_payload(
-                        scales,
-                        *stored_shape,
-                        [source_shape[0], source_shape[1]],
-                    )
+                    cst::read_source_byte_sets(&[scales], || {
+                        gen_core::validate_nvfp4_block_scale_payload(
+                            scales,
+                            *stored_shape,
+                            [source_shape[0], source_shape[1]],
+                        )
+                    })
                     .map_err(|error| {
                         CandleError::Msg(format!(
                             "codec {}: tensor {:?}: {error}",
                             tensor.codec_id, tensor.physical_key
                         ))
                     })?;
-                    let tensor_packed = Nvfp4Tensor::from_kitchen_parts(
-                        view.data(),
-                        scales,
-                        global,
-                        stored_shape[0],
-                        stored_shape[1],
-                    )
+                    let tensor_packed = cst::read_source_byte_sets(&[view.data(), scales], || {
+                        Nvfp4Tensor::from_kitchen_parts(
+                            view.data(),
+                            scales,
+                            global,
+                            stored_shape[0],
+                            stored_shape[1],
+                        )
+                    })
                     .map_err(|error| {
                         CandleError::Msg(format!(
                             "codec {}: tensor {:?} planned packed-native NVFP4 residency but its \
@@ -1114,16 +1125,20 @@ fn decode(
                         rows * 4
                     )));
                 }
-                scale_bytes
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect()
+                cst::read_source_bytes(scale_bytes, |bytes| {
+                    bytes
+                        .chunks_exact(4)
+                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                        .collect()
+                })
             };
             let codes: &[u8] = view.data();
             let mut values = Vec::new();
             gen_core::decode_int8_per_row(
                 // SAFETY-free reinterpretation: i8 and u8 share layout; map explicitly instead.
-                &codes.iter().map(|&byte| byte as i8).collect::<Vec<i8>>(),
+                &cst::read_source_bytes(codes, |bytes| {
+                    bytes.iter().map(|&byte| byte as i8).collect::<Vec<i8>>()
+                }),
                 &scales,
                 cols,
                 &mut values,
@@ -1590,6 +1605,55 @@ mod tests {
             BASELINE_CODECS,
             gen_core::checkpoint_codec::BASELINE_CHECKPOINT_CODECS
         );
+    }
+
+    #[test]
+    fn raw_fp8_decode_and_companion_payload_reads_emit_source_progress() {
+        let dir = fixture_dir();
+        let path = dir.path().join("raw-fp8.safetensors");
+        let descriptor = br#"{"format":"float8_e4m3fn"}"#;
+        write_safetensors(
+            &path,
+            &[
+                ("model.q.weight", "F8_E4M3", &[2, 2], vec![0x38; 4]),
+                (
+                    "model.q.weight_scale",
+                    "F32",
+                    &[],
+                    1f32.to_le_bytes().to_vec(),
+                ),
+                (
+                    "model.q.comfy_quant",
+                    "U8",
+                    &[descriptor.len()],
+                    descriptor.to_vec(),
+                ),
+            ],
+        );
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let out = events.clone();
+        let _observer =
+            gen_core::LoadActivityObserver::new(move |v| crate::lock_recover(&out).push(v));
+        let plan = plan_dense(&path);
+        assert!(
+            crate::lock_recover(&events)
+                .iter()
+                .flatten()
+                .any(|v| v.bytes_read >= descriptor.len() as u64),
+            "planning reads the descriptor through the neutral source reader"
+        );
+        crate::lock_recover(&events).clear();
+        let weights = read_logical_weights(&path, &plan, &Device::Cpu).unwrap();
+        assert_eq!(dense_f32(&weights, "q.weight"), vec![1.; 4]);
+        let reports = crate::lock_recover(&events);
+        let file = std::fs::read(&path).unwrap();
+        let header = 8 + u64::from_le_bytes(file[..8].try_into().unwrap());
+        assert_eq!(
+            reports.iter().flatten().map(|v| v.bytes_read).max(),
+            Some(header + 8),
+            "raw FP8 codes and scalar companion are source reads even without TensorView::load"
+        );
+        assert_eq!(reports.last(), Some(&None));
     }
 
     /// Golden: `fp8-e4m3-scalar-v1` dense fallback decodes exactly to the gen-core reference

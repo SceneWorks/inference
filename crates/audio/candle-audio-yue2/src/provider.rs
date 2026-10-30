@@ -679,6 +679,14 @@ fn saturating_u32(v: impl TryInto<u32>) -> u32 {
 }
 
 impl EngineObserver for ProgressBridge<'_> {
+    fn on_prompt_encoding(&mut self) {
+        (self.on_progress)(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
+    }
+
+    fn on_prompt_encoding_complete(&mut self) {
+        (self.on_progress)(Progress::PromptEncodingComplete);
+    }
+
     fn on_stage(&mut self, stage: Stage, event: StageEvent) {
         match (stage, event) {
             (Stage::Plan | Stage::Semantic, StageEvent::Started) => self.tokens = 0,

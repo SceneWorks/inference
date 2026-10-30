@@ -758,6 +758,32 @@ impl SenseNovaUnderstanding {
     pub fn run_vqa(
         &self,
         context: &gen_core::MemoryRunContext,
+        request: GenerationRequest,
+        question: &str,
+        images: &[Tensor],
+        max_new_tokens: usize,
+        sampler: Sampler,
+        options: T2iOptions,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<String> {
+        self.run_vqa_with_progress(
+            context,
+            request,
+            question,
+            images,
+            max_new_tokens,
+            sampler,
+            options,
+            cancel,
+            &mut |_| {},
+        )
+    }
+
+    /// Progress-capable sibling preserving the original entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_vqa_with_progress(
+        &self,
+        context: &gen_core::MemoryRunContext,
         mut request: GenerationRequest,
         question: &str,
         images: &[Tensor],
@@ -765,6 +791,7 @@ impl SenseNovaUnderstanding {
         sampler: Sampler,
         mut options: T2iOptions,
         cancel: Option<&CancelFlag>,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<String> {
         self.validate_direct_request(
             context,
@@ -778,7 +805,7 @@ impl SenseNovaUnderstanding {
         Self::run_direct_scope(&mut *scope, &mut request, |configured_request| {
             Self::apply_request_memory(configured_request, &mut options);
             self.with_runtime(|model, tokenizer| {
-                model.vqa_with_options(
+                model.vqa_with_options_and_progress(
                     tokenizer,
                     question,
                     images,
@@ -786,6 +813,7 @@ impl SenseNovaUnderstanding {
                     sampler,
                     &options,
                     cancel,
+                    on_progress,
                 )
             })
         })
@@ -794,6 +822,38 @@ impl SenseNovaUnderstanding {
     /// Run Document Studio interleave under the exact admitted request and lifecycle scope.
     #[allow(clippy::too_many_arguments)]
     pub fn run_interleave(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        request: GenerationRequest,
+        prompt: &str,
+        input_images: &[Tensor],
+        width: usize,
+        height: usize,
+        options: T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        cancel: &CancelFlag,
+    ) -> Result<InterleaveOutput> {
+        self.run_interleave_with_progress(
+            context,
+            request,
+            prompt,
+            input_images,
+            width,
+            height,
+            options,
+            system_message,
+            max_new_tokens,
+            max_images,
+            cancel,
+            &mut |_| {},
+        )
+    }
+
+    /// Progress-capable sibling preserving the original entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_interleave_with_progress(
         &self,
         context: &gen_core::MemoryRunContext,
         mut request: GenerationRequest,
@@ -806,6 +866,7 @@ impl SenseNovaUnderstanding {
         max_new_tokens: usize,
         max_images: usize,
         cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<InterleaveOutput> {
         validate_interleave_count(&request, max_images)?;
         if request.width != width as u32 || request.height != height as u32 {
@@ -826,7 +887,7 @@ impl SenseNovaUnderstanding {
         Self::run_direct_scope(&mut *scope, &mut request, |configured_request| {
             Self::apply_request_memory(configured_request, &mut options);
             self.with_runtime(|model, tokenizer| {
-                model.interleave_gen(
+                model.interleave_gen_with_progress(
                     tokenizer,
                     prompt,
                     input_images,
@@ -837,6 +898,7 @@ impl SenseNovaUnderstanding {
                     max_new_tokens,
                     max_images,
                     cancel,
+                    on_progress,
                 )
             })
         })

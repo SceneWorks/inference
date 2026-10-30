@@ -4,6 +4,7 @@ use super::{k_quants, GgmlDType, QStorage};
 use crate::{Device, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::collections::HashMap;
+use std::io::Seek;
 
 // https://github.com/ggerganov/llama.cpp/blob/468ea24fb4633a0d681f7ac84089566c1c6190cb/llama.h#L37
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +236,22 @@ impl Content {
         reader: &mut R,
         device: &Device,
     ) -> Result<Content> {
+        Self::read_with_path(reader, device, "<unknown GGML source>")
+    }
+
+    /// Read a GGML source with its file identity for request-local load progress.
+    pub fn read_with_path<R: std::io::Seek + std::io::Read>(
+        reader: &mut R,
+        device: &Device,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Content> {
+        let position = reader.stream_position()?;
+        let total = reader.seek(std::io::SeekFrom::End(0))?;
+        reader.seek(std::io::SeekFrom::Start(position))?;
+        let progress = load_progress::reader::SourceProgress::new(path, Some(total));
+        let _operation = progress.operation();
+        let mut tracked = progress.reader(reader)?;
+        let reader = &mut tracked;
         // https://github.com/ggerganov/llama.cpp/blob/468ea24fb4633a0d681f7ac84089566c1c6190cb/llama.cpp#L505
         let last_position = reader.seek(std::io::SeekFrom::End(0))?;
         reader.seek(std::io::SeekFrom::Start(0))?;

@@ -112,7 +112,7 @@ impl Asset {
     /// wholly within the pin callback cannot substitute different tensor/config/tokenizer bytes.
     pub fn authenticated_bytes(&self) -> gen_core::Result<Vec<u8>> {
         self.pin.read_unchanged(|p| {
-            let bytes = std::fs::read(p)?;
+            let bytes = candle_gen::candle_core::safetensors::read_file_bytes(p)?;
             self.verify_owned_bytes(&bytes)?;
             Ok(bytes)
         })
@@ -908,6 +908,12 @@ fn asset_headers(
                         "MOSS opened source size mismatch".into(),
                     ));
                 }
+                let source = gen_core::load_activity::reader::SourceProgress::new(
+                    path,
+                    Some(identity.bytes),
+                );
+                let mut file = source.reader(file)?;
+                file.begin();
                 stream_headers_with_check(file, identity.bytes, a.pin.content_sha256(), check)
             });
             check()?;
@@ -985,6 +991,10 @@ fn validate_fp32(
             .ok()
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| gen_core::Error::Unsupported("MOSS source too large".into()))?;
+        let source =
+            gen_core::load_activity::reader::SourceProgress::new(path, Some(identity.bytes));
+        let mut file = source.reader(file)?;
+        file.begin();
         let mut reader = HashReader {
             inner: file.take(identity.bytes + 1),
             hash: Sha256::new(),

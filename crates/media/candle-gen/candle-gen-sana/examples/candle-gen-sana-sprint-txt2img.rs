@@ -119,6 +119,7 @@ fn main() -> Result<()> {
         Progress::Decoding => println!("\n[sana-sprint] decoding"),
         Progress::Loading(_)
         | Progress::PromptUpsamplingComplete
+        | Progress::PromptEncodingComplete
         | Progress::ConditioningComplete
         | Progress::Upsampling { .. } => {}
     };

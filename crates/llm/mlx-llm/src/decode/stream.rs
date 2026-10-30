@@ -249,6 +249,7 @@ pub(crate) fn generate_with_observer(
         // Prefill the whole prompt at offset 0; logits are for the last prompt position.  The
         // observation is deliberately after dispatch so a sampler sees the actual prefill peak.
         let prompt = input_ids(prompt_ids);
+        core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
         let logits = decoder.step(&prompt, cache.as_mut(), 0)?;
         if let Some(observer) = observer.as_deref_mut() {
             // This host read is campaign-only.  Normal generation does not materialize logits or
@@ -436,6 +437,7 @@ pub fn generate_with_cache(
 
     let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
     let suffix = input_ids(&prompt_ids[offset..]);
+    core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
     let logits = decoder.step(&suffix, cache, offset as i32)?;
 
     decode_loop(
@@ -517,6 +519,7 @@ pub(crate) fn generate_with_cache_observed(
         ));
     }
     let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
     let logits = decoder.step(&input_ids(prompt_ids), cache, 0)?;
     decode_loop(
         decoder,
@@ -648,6 +651,8 @@ pub(crate) fn decode_loop(
         if let Some(c) = &mut constraint {
             c.accept(next);
         }
+
+        core_llm::report_generation_phase(core_llm::GenerationPhase::Generating);
 
         on_event(StreamEvent::Token { id: next, step });
         if step == 0 {

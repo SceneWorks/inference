@@ -526,9 +526,15 @@ impl BerniniRenderer {
         let (context, context_null) = {
             let w = Weights::from_file(self.root.join("t5_encoder.safetensors"))?;
             let enc = Umt5Encoder::from_weights(&w, cfg)?;
-            let context = enc.encode(&tokenizer, &req.prompt)?;
-            let context_null = enc.encode(&tokenizer, &neg)?;
-            eval([&context, &context_null])?;
+            let (context, context_null) = mlx_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, mlx_gen::Error> {
+                    let context = enc.encode(&tokenizer, &req.prompt)?;
+                    let context_null = enc.encode(&tokenizer, &neg)?;
+                    eval([&context, &context_null])?;
+                    Ok((context, context_null))
+                },
+            )?;
             (context, context_null)
         };
         // Residency discipline (epic 10834, sc-10840): the UMT5-XXL text encoder + its `Weights` are

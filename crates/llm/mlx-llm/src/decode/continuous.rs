@@ -808,6 +808,7 @@ fn admit_lane(
     let reused = run.reuse_prefix(&mut selection, &r.prompt_ids)?;
     run.reused[ri] = reused;
     run.reserve_prefill(&selection, r.prompt_ids.len())?;
+    core_llm::report_generation_phase_for(ri, Some(core_llm::GenerationPhase::Prefilling));
     // batch-1 prefill of the positions no stored prefix covers
     let logits = model.decode_logits(
         &input_ids(&r.prompt_ids[reused..]),
@@ -895,6 +896,16 @@ fn record_token(
     tok: i32,
     on_event: &mut dyn FnMut(usize, StreamEvent),
 ) -> LaneStep {
+    core_llm::report_generation_phase_for(
+        lane.req_index,
+        Some(core_llm::GenerationPhase::Generating),
+    );
+    let mut sink = |index, event| {
+        if matches!(event, StreamEvent::Done { .. }) {
+            core_llm::report_generation_phase_for(index, None);
+        }
+        on_event(index, event);
+    };
     record_lane_token(
         sched,
         lane.seq,
@@ -902,7 +913,7 @@ fn record_token(
         tok,
         &mut lane.history,
         &mut lane.next_token,
-        on_event,
+        &mut sink,
     )
 }
 

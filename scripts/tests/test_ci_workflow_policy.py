@@ -1409,7 +1409,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         ]
         indices = [names.index(name) for name in order]
         self.assertEqual(indices, sorted(indices))
-        self.assert_candle_metal_pins_select_real_modules(steps[names.index(order[-1])]["run"])
+        automatic = steps[names.index(order[-1])]["run"]
+        self.assertIn("audited-safe -- cargo test", automatic)
+        self.assertIn("--test integration", automatic)
+        manual = yaml.safe_load((WORKFLOW.parent / "model-test-suites.yml").read_text(encoding="utf-8"))
+        baseline = next(step for step in manual["jobs"]["mlx-metal"]["steps"] if step.get("name") == "Run former Metal, runtime and iOS host baselines")
+        pins = next(line for line in baseline["run"].splitlines() if "metal_strided_reduce::" in line)
+        self.assert_candle_metal_pins_select_real_modules(pins)
         # The image-payload prune still runs, but in the background: inline it was 3.6 minutes on
         # the critical path. It must start before the cache restore so the I/O overlaps the build.
         reclaim = "Reclaim runner disk (background)"
@@ -4467,7 +4473,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(len(tests), 1, tests)
         # The whole-device smoke drives Metal; the shared hosted runner runs only the
         # weights-free tests. MLX has no CPU-default switch, so the skip is the guard.
-        self.assertIn("--features media --lib -- --skip smoke_passes_on_the_host", tests[0])
+        self.assertIn("test_suites.py audited-safe -- cargo --config", tests[0])
+        self.assertIn("--features media --lib", tests[0])
+        self.assertNotIn("--skip", tests[0])
+        manual = yaml.safe_load((WORKFLOW.parent / "model-test-suites.yml").read_text(encoding="utf-8"))
+        baseline = next(step for step in manual["jobs"]["mlx-metal"]["steps"] if step.get("name") == "Run former Metal, runtime and iOS host baselines")
+        self.assertIn("--features media --lib -- --skip smoke_passes_on_the_host", baseline["run"])
         # The device-capture surface is tested and linted on the host lane.
         self.assertTrue(
             any("cargo test --locked --no-fail-fast --lib -p runtime-ios --features device-capture" in run for run in metal)

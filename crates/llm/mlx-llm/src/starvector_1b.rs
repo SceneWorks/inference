@@ -164,6 +164,7 @@ impl StarVector1bProvider {
         request: &StarVectorRequest,
         on_event: &mut dyn FnMut(StarVectorStreamEvent),
     ) -> CoreResult<(StarVectorOutput, Option<DecodeReport>)> {
+        let _progress = request.text_request.install_progress();
         self.validate_svg(request)?;
         if request.text_request.cancel.is_cancelled() {
             return Err(CoreError::Canceled);
@@ -187,6 +188,7 @@ impl StarVector1bProvider {
                 return Ok((output, None));
             }
         }
+        core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
         let (first_logits, mut cache) = self.model.prefill(image, &prompt).map_err(to_core)?;
         let params = SamplingParams::from(&request.text_request.sampling);
         let config = GenerationConfig {

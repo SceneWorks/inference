@@ -120,6 +120,7 @@ fn main() -> Result<()> {
         Progress::Decoding => println!("\n[sana] decoding"),
         Progress::Loading(_)
         | Progress::PromptUpsamplingComplete
+        | Progress::PromptEncodingComplete
         | Progress::ConditioningComplete
         | Progress::Upsampling { .. } => {}
     };

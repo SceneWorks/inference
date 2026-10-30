@@ -490,6 +490,7 @@ where
     if let Some(b) = split {
         cache.capture_boundary(b);
     }
+    core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
     let out = target.forward(
         &mut cache,
         &input_ids(&prompt[reused..]),
@@ -622,6 +623,7 @@ pub(crate) fn generate_cached_with_observer(
     }
     let mut observed_cache = ObservedCache::default();
     let suffix = input_ids(&prompt_ids[matched_len..]);
+    core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
     let logits = model.decode_logits(&suffix, cache.as_mut(), matched_len as i32)?;
     if let Some(observer) = observer.as_deref_mut() {
         let values = crate::primitives::sampler::counted_host_f32(&logits)?;

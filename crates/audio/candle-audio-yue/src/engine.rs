@@ -53,6 +53,10 @@ pub enum Stage {
 /// What the engine reports while it renders.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum YueEvent {
+    /// A segment prompt is being prefilled.
+    PromptEncodingStarted,
+    /// The segment prefill yielded before token sampling.
+    PromptEncodingComplete,
     /// A stage's weights were loaded.
     StageLoaded(Stage),
     /// A stage's weights were released.
@@ -316,12 +320,25 @@ impl YueEngine {
                 total,
                 label: block.label.clone(),
             });
-            stage1.begin_segment(&SegmentStart {
-                index,
-                prompt: &block.ids,
-                guidance_scale: req.decode.guidance.scale_for(index),
-                decode: &req.decode,
-            })?;
+            gen_core::with_prompt_encoding(
+                &mut |event| match event {
+                    gen_core::Progress::Loading(gen_core::LoadPhase::EncodingPrompt) => {
+                        on_event(YueEvent::PromptEncodingStarted)
+                    }
+                    gen_core::Progress::PromptEncodingComplete => {
+                        on_event(YueEvent::PromptEncodingComplete)
+                    }
+                    _ => unreachable!("prompt helper emits only prompt boundaries"),
+                },
+                || {
+                    stage1.begin_segment(&SegmentStart {
+                        index,
+                        prompt: &block.ids,
+                        guidance_scale: req.decode.guidance.scale_for(index),
+                        decode: &req.decode,
+                    })
+                },
+            )?;
             let mut tokens = Vec::new();
             while tokens.len() < req.decode.max_new_tokens as usize {
                 check_cancel(cancel)?;

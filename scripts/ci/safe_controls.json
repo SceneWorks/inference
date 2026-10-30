@@ -1,0 +1,279 @@
+{
+  "version": 1,
+  "controls": [
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "residency::tests::shared_two_phase_driver_syncs_and_drops_before_heavy_load",
+      "source": "crates/media/candle-gen/candle-gen/src/residency.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Generic lifecycle closures carry u8/usize values and drop/log witnesses; CPU synchronization only. No learned encoder, renderer, decode or kernel executes."
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "residency::tests::encode_error_synchronizes_before_text_drop_and_skips_heavy_load",
+      "source": "crates/media/candle-gen/candle-gen/src/residency.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Generic lifecycle closures carry u8/usize values and drop/log witnesses; CPU synchronization only. No learned encoder, renderer, decode or kernel executes."
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "residency::tests::request_selection_stages_a_previously_warm_candle_residency",
+      "source": "crates/media/candle-gen/candle-gen/src/residency.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Generic lifecycle closures carry u8/usize values and drop/log witnesses; CPU synchronization only. No learned encoder, renderer, decode or kernel executes."
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "residency::tests::three_stage_driver_keeps_video_phases_disjoint",
+      "source": "crates/media/candle-gen/candle-gen/src/residency.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Generic lifecycle closures carry u8/usize values and drop/log witnesses; CPU synchronization only. No learned encoder, renderer, decode or kernel executes."
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "residency::tests::endpoint_denoise_failure_syncs_before_drop_and_never_loads_decode",
+      "source": "crates/media/candle-gen/candle-gen/src/residency.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Generic lifecycle closures carry u8/usize values and drop/log witnesses; CPU synchronization only. No learned encoder, renderer, decode or kernel executes."
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "residency::tests::endpoint_primary_failure_survives_cleanup_failure",
+      "source": "crates/media/candle-gen/candle-gen/src/residency.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Generic lifecycle closures carry u8/usize values and drop/log witnesses; CPU synchronization only. No learned encoder, renderer, decode or kernel executes."
+    },
+    {
+      "package": "candle-gen",
+      "kind": "test",
+      "target": "integration",
+      "test": "load_progress::safetensors_buffered_and_mapped_loads_count_consumed_file_bytes",
+      "source": "crates/media/candle-gen/candle-gen/tests/load_progress.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Raw CPU tensor storage copies, safetensors headers/mappings and alias/request accounting only; no learned module, inference arithmetic or generation."
+    },
+    {
+      "package": "candle-gen",
+      "kind": "test",
+      "target": "integration",
+      "test": "load_progress::explicit_shards_aggregate_and_repeated_views_do_not_count_twice",
+      "source": "crates/media/candle-gen/candle-gen/tests/load_progress.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Raw CPU tensor storage copies, safetensors headers/mappings and alias/request accounting only; no learned module, inference arithmetic or generation."
+    },
+    {
+      "package": "candle-gen",
+      "kind": "test",
+      "target": "integration",
+      "test": "load_progress::cached_mapped_reader_routes_consumption_to_the_evaluating_request_and_retains_slots",
+      "source": "crates/media/candle-gen/candle-gen/tests/load_progress.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Raw CPU tensor storage copies, safetensors headers/mappings and alias/request accounting only; no learned module, inference arithmetic or generation."
+    },
+    {
+      "package": "candle-gen",
+      "kind": "test",
+      "target": "integration",
+      "test": "load_progress::raw_mapped_bytes_and_borrowed_quant_storage_are_observed_before_owned_aliases",
+      "source": "crates/media/candle-gen/candle-gen/tests/load_progress.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Raw CPU tensor storage copies, safetensors headers/mappings and alias/request accounting only; no learned module, inference arithmetic or generation."
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "load_progress::tests::same_reader_keeps_separate_evaluation_requests_and_origin_fallback",
+      "source": "crates/llm/mlx-llm/src/load_progress.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Raw U8 safetensors Load/eval copies test asynchronous file ranges and request tokens; no model, learned arithmetic, forward or inference kernel."
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "load_progress::tests::unobserved_creation_still_binds_evaluating_job_and_accumulates_all_leaves",
+      "source": "crates/llm/mlx-llm/src/load_progress.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Raw U8 safetensors Load/eval copies test asynchronous file ranges and request tokens; no model, learned arithmetic, forward or inference kernel."
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "load_progress::tests::rebound_read_failure_clears_only_executing_request",
+      "source": "crates/llm/mlx-llm/src/load_progress.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Raw U8 safetensors Load/eval copies test asynchronous file ranges and request tokens; no model, learned arithmetic, forward or inference kernel."
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "load_progress::tests::overlapping_lazy_evaluations_keep_distinct_request_tokens",
+      "source": "crates/llm/mlx-llm/src/load_progress.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Raw U8 safetensors Load/eval copies test asynchronous file ranges and request tokens; no model, learned arithmetic, forward or inference kernel."
+    },
+    {
+      "package": "mlx-gen-moss-image",
+      "kind": "lib",
+      "target": "mlx_gen_moss_image",
+      "test": "loader::cpu_tests::metadata_reader_is_bounded_header_only_and_matches_owned_parser",
+      "source": "crates/media/mlx-gen/mlx-gen-moss-image/src/loader.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Bounded JSON/header reader and typed cancellation/malformed-input refusals only. No model or MLX array is constructed."
+    },
+    {
+      "package": "mlx-gen-moss-image",
+      "kind": "lib",
+      "target": "mlx_gen_moss_image",
+      "test": "loader::cpu_tests::metadata_reader_cancellation_is_typed_before_and_between_reads",
+      "source": "crates/media/mlx-gen/mlx-gen-moss-image/src/loader.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Bounded JSON/header reader and typed cancellation/malformed-input refusals only. No model or MLX array is constructed."
+    },
+    {
+      "package": "mlx-gen-moss-image",
+      "kind": "lib",
+      "target": "mlx_gen_moss_image",
+      "test": "loader::cpu_tests::metadata_reader_refuses_malformed_truncated_and_out_of_bounds_headers",
+      "source": "crates/media/mlx-gen/mlx-gen-moss-image/src/loader.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Bounded JSON/header reader and typed cancellation/malformed-input refusals only. No model or MLX array is constructed."
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "load_memory::tests::safetensors_admission_headers_report_checks_without_payload_credit",
+      "source": "crates/llm/mlx-llm/src/load_memory.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Raw safetensors header reads and progress phase/byte assertions only; no payload arrays or model execution."
+    },
+    {
+      "package": "mlx-llm",
+      "kind": "lib",
+      "target": "mlx_llm",
+      "test": "gguf::reader::tests::metadata_probe_checks_header_and_never_credits_unread_tensor_payload",
+      "source": "crates/llm/mlx-llm/src/gguf/reader.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "GGUF header parsing and raw tensor byte-view length only; does not dequantize or construct/execute a model."
+    },
+    {
+      "package": "mlx-gen-moss-image",
+      "kind": "lib",
+      "target": "mlx_gen_moss_image",
+      "test": "edit::tests::authenticated_edit_weight_bytes_report_reads_hashes_and_clear_errors",
+      "source": "crates/media/mlx-gen/mlx-gen-moss-image/src/edit.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Owned raw byte reads, pinned file identity and SHA authentication with renamed files; no edit model or MLX array is constructed."
+    },
+    {
+      "package": "candle-gen-catalog",
+      "kind": "lib",
+      "target": "candle_gen_catalog",
+      "test": "tests::every_registered_memory_strategy_rejects_cross_route_decode_geometry",
+      "source": "crates/media/candle-gen/candle-gen-catalog/src/tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Catalog descriptors, memory-contract surface matrices and nonexistent-source decode-geometry refusals only; registers constructors without invoking model loading or inference."
+    }
+  ]
+}

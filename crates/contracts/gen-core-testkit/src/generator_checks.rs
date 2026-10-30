@@ -520,6 +520,7 @@ pub fn check_progress_contract_with(
         Progress::Step { current, total } => steps.push((current, total)),
         Progress::Decoding => decoding_count += 1,
         Progress::PromptUpsamplingComplete
+        | Progress::PromptEncodingComplete
         | Progress::ConditioningComplete
         | Progress::Loading(_)
         | Progress::Upsampling { .. } => {}

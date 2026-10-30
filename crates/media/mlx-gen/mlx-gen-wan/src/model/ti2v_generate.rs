@@ -184,13 +184,14 @@ impl Wan {
             dense_decode_tiling(req, out_width as u32, out_height as u32, out_frames as u32)?;
 
         // --- Stage 1: UMT5 text encode (loaded → used → freed) ---
-        let (context, context_null) = encode_text_staged_for_tier(
+        let (context, context_null) = encode_text_staged_for_tier_with_progress(
             &self.root,
             cfg,
             &req.prompt,
             &neg_prompt,
             cfg_disabled,
             self.quant,
+            on_progress,
         )?;
         // sc-12796: `encode_text_staged` already drops the UMT5 encoder before returning (only the small
         // `[L, dim]` contexts survive — the DiT projects them through its own `text_embedding` below).

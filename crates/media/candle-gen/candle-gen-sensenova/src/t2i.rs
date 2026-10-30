@@ -420,20 +420,26 @@ impl T2iModel {
         );
         let ids_cond = tokenizer.encode_ids(&query_cond, true)?;
         let attention = self.attention_plan(opts, Some(cancel));
-        let (mut cache_cond, text_len) = self.prefill(&ids_cond, attention)?;
+        let (mut cache_cond, text_len, mut cache_uncond, uncond_text_len) =
+            candle_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, candle_gen::CandleError> {
+                    let (cache_cond, text_len) = self.prefill(&ids_cond, attention)?;
 
-        // ---- Uncondition prefix (CFG) ----
-        let needs_cfg = opts.cfg_scale > 1.0;
-        let mut cache_uncond: Option<KvCache> = None;
-        let mut uncond_text_len = 0;
-        if needs_cfg {
-            let query_uncond = format!("{}<img>", build_neo1_query("", ""));
-            let ids_uncond = tokenizer.encode_ids(&query_uncond, true)?;
-            let (cache, plen) = self.prefill(&ids_uncond, attention)?;
-            cache_uncond = Some(cache);
-            uncond_text_len = plen;
-        }
-
+                    // ---- Uncondition prefix (CFG) ----
+                    let needs_cfg = opts.cfg_scale > 1.0;
+                    let mut cache_uncond: Option<KvCache> = None;
+                    let mut uncond_text_len = 0;
+                    if needs_cfg {
+                        let query_uncond = format!("{}<img>", build_neo1_query("", ""));
+                        let ids_uncond = tokenizer.encode_ids(&query_uncond, true)?;
+                        let (cache, plen) = self.prefill(&ids_uncond, attention)?;
+                        cache_uncond = Some(cache);
+                        uncond_text_len = plen;
+                    }
+                    Ok((cache_cond, text_len, cache_uncond, uncond_text_len))
+                },
+            )?;
         let base_noise = gaussian((1, 3, height, width), opts.seed, &self.device)?;
         let image = self.denoise(
             &mut cache_cond,
@@ -520,32 +526,41 @@ impl T2iModel {
         let cond_ids = self.build_it2i_query_ids(tokenizer, &cond_query, &grids)?;
         let (cond_embeds, cond_t, cond_h, cond_w) =
             self.build_it2i_prefix(&cond_ids, Some(&pixel_values), &grids)?;
-        let (mut cache_cond, _, cond_temporal) =
-            self.prefill_prefix(&cond_embeds, &cond_t, &cond_h, &cond_w, attention)?;
+        let (mut cache_cond, cond_temporal, mut cache_img, mut cache_uncond) =
+            candle_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, candle_gen::CandleError> {
+                    let (cache_cond, _, cond_temporal) =
+                        self.prefill_prefix(&cond_embeds, &cond_t, &cond_h, &cond_w, attention)?;
 
-        let mut cache_img = if needs_img {
-            let query = format!(
-                "{}<img>",
-                build_neo1_query(&"<image>".repeat(images.len()), "")
-            );
-            let ids = self.build_it2i_query_ids(tokenizer, &query, &grids)?;
-            let (embeds, t, h, w) = self.build_it2i_prefix(&ids, Some(&pixel_values), &grids)?;
-            let (cache, _, temporal) = self.prefill_prefix(&embeds, &t, &h, &w, attention)?;
-            Some((cache, temporal))
-        } else {
-            None
-        };
+                    let cache_img = if needs_img {
+                        let query = format!(
+                            "{}<img>",
+                            build_neo1_query(&"<image>".repeat(images.len()), "")
+                        );
+                        let ids = self.build_it2i_query_ids(tokenizer, &query, &grids)?;
+                        let (embeds, t, h, w) =
+                            self.build_it2i_prefix(&ids, Some(&pixel_values), &grids)?;
+                        let (cache, _, temporal) =
+                            self.prefill_prefix(&embeds, &t, &h, &w, attention)?;
+                        Some((cache, temporal))
+                    } else {
+                        None
+                    };
 
-        let mut cache_uncond = if needs_uncond {
-            let query = format!("{}<img>", build_neo1_query("", ""));
-            let ids = tokenizer.encode_ids(&query, true)?;
-            let (embeds, t, h, w) = self.build_it2i_prefix(&ids, None, &[])?;
-            let (cache, _, temporal) = self.prefill_prefix(&embeds, &t, &h, &w, attention)?;
-            Some((cache, temporal))
-        } else {
-            None
-        };
-
+                    let cache_uncond = if needs_uncond {
+                        let query = format!("{}<img>", build_neo1_query("", ""));
+                        let ids = tokenizer.encode_ids(&query, true)?;
+                        let (embeds, t, h, w) = self.build_it2i_prefix(&ids, None, &[])?;
+                        let (cache, _, temporal) =
+                            self.prefill_prefix(&embeds, &t, &h, &w, attention)?;
+                        Some((cache, temporal))
+                    } else {
+                        None
+                    };
+                    Ok((cache_cond, cond_temporal, cache_img, cache_uncond))
+                },
+            )?;
         let img_temporal = cache_img.as_ref().map_or(0, |(_, temporal)| *temporal);
         let uncond_temporal = cache_uncond.as_ref().map_or(0, |(_, temporal)| *temporal);
         let base_noise = gaussian((1, 3, height, width), opts.seed, &self.device)?;
@@ -1030,6 +1045,31 @@ impl T2iModel {
         opts: &T2iOptions,
         cancel: Option<&CancelFlag>,
     ) -> Result<String> {
+        self.vqa_with_options_and_progress(
+            tokenizer,
+            question,
+            images,
+            max_new_tokens,
+            sampler,
+            opts,
+            cancel,
+            &mut |_| {},
+        )
+    }
+
+    /// Progress-capable sibling preserving the original entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vqa_with_options_and_progress(
+        &self,
+        tokenizer: &SenseNovaTokenizer,
+        question: &str,
+        images: &[Tensor],
+        max_new_tokens: usize,
+        sampler: Sampler,
+        opts: &T2iOptions,
+        cancel: Option<&CancelFlag>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<String> {
         let attention = self.attention_plan(opts, cancel);
         let mut pv_parts = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len());
@@ -1061,8 +1101,19 @@ impl T2iModel {
             self.build_it2i_query_ids(tokenizer, &base, &grids)?
         };
 
-        let (mut cache, last_logits, t_idx) =
-            self.prefill_it2i_logits_planned(&ids, pixel_values.as_ref(), &grids, attention)?;
+        let (mut cache, last_logits, t_idx) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let (cache, last_logits, t_idx) = self.prefill_it2i_logits_planned(
+                    &ids,
+                    pixel_values.as_ref(),
+                    &grids,
+                    attention,
+                )?;
+                Ok((cache, last_logits, t_idx))
+            },
+        )?;
+        on_progress(Progress::ConditioningComplete);
         let toks = self.decode_text_planned(
             &last_logits,
             &mut cache,
@@ -1360,6 +1411,40 @@ impl T2iModel {
         })
     }
 
+    /// Interleave with universal progress, preserving the preview-free API.
+    #[allow(clippy::too_many_arguments)]
+    pub fn interleave_gen_with_progress(
+        &self,
+        tokenizer: &SenseNovaTokenizer,
+        prompt: &str,
+        input_images: &[Tensor],
+        width: usize,
+        height: usize,
+        opts: &T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<InterleaveOutput> {
+        crate::preview::with_inert_t2i_preview(self.cell(), |preview| {
+            self.interleave_gen_with_preview_and_progress(
+                tokenizer,
+                prompt,
+                input_images,
+                width,
+                height,
+                opts,
+                system_message,
+                max_new_tokens,
+                max_images,
+                cancel,
+                preview,
+                on_progress,
+            )
+        })
+    }
+
     /// Preview-aware sibling of [`Self::interleave_gen`]. The legacy method preserves the original
     /// public signature and delegates here with an inert hook; callers with a preview carrier use
     /// this method to receive frames from the same interleave denoise loop.
@@ -1377,6 +1462,39 @@ impl T2iModel {
         max_images: usize,
         cancel: &CancelFlag,
         preview: &PreviewHook<'_>,
+    ) -> Result<InterleaveOutput> {
+        self.interleave_gen_with_preview_and_progress(
+            tokenizer,
+            prompt,
+            input_images,
+            width,
+            height,
+            opts,
+            system_message,
+            max_new_tokens,
+            max_images,
+            cancel,
+            preview,
+            &mut |_| {},
+        )
+    }
+
+    /// Progress-capable sibling preserving the original entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn interleave_gen_with_preview_and_progress(
+        &self,
+        tokenizer: &SenseNovaTokenizer,
+        prompt: &str,
+        input_images: &[Tensor],
+        width: usize,
+        height: usize,
+        opts: &T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        cancel: &CancelFlag,
+        preview: &PreviewHook<'_>,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<InterleaveOutput> {
         let cell = self.cell();
         if !width.is_multiple_of(cell) || !height.is_multiple_of(cell) {
@@ -1413,23 +1531,45 @@ impl T2iModel {
         } else {
             self.build_it2i_query_ids(tokenizer, &cond_query, &grids)?
         };
-        let (mut cache_cond, cond_logits, mut t_cond) =
-            self.prefill_it2i_logits_planned(&cond_ids, pixel_values.as_ref(), &grids, attention)?;
+        let (mut cache_cond, cond_logits, mut t_cond, mut cache_tu, mut t_tu, mut cache_iu, iu_max) =
+            candle_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, candle_gen::CandleError> {
+                    let (cache_cond, cond_logits, t_cond) = self.prefill_it2i_logits_planned(
+                        &cond_ids,
+                        pixel_values.as_ref(),
+                        &grids,
+                        attention,
+                    )?;
 
-        let tu_query = build_neo1_query(&"<image>".repeat(input_images.len()), "");
-        let tu_ids = if input_images.is_empty() {
-            tokenizer.encode_ids(&tu_query, true)?
-        } else {
-            self.build_it2i_query_ids(tokenizer, &tu_query, &grids)?
-        };
-        let (mut cache_tu, _, mut t_tu) =
-            self.prefill_it2i_logits_planned(&tu_ids, pixel_values.as_ref(), &grids, attention)?;
+                    let tu_query = build_neo1_query(&"<image>".repeat(input_images.len()), "");
+                    let tu_ids = if input_images.is_empty() {
+                        tokenizer.encode_ids(&tu_query, true)?
+                    } else {
+                        self.build_it2i_query_ids(tokenizer, &tu_query, &grids)?
+                    };
+                    let (cache_tu, _, t_tu) = self.prefill_it2i_logits_planned(
+                        &tu_ids,
+                        pixel_values.as_ref(),
+                        &grids,
+                        attention,
+                    )?;
 
-        let iu_query = format!("{}<img>", build_neo1_query("", ""));
-        let iu_ids = tokenizer.encode_ids(&iu_query, true)?;
-        let (mut cache_iu, _, iu_max) =
-            self.prefill_it2i_logits_planned(&iu_ids, None, &[], attention)?;
-
+                    let iu_query = format!("{}<img>", build_neo1_query("", ""));
+                    let iu_ids = tokenizer.encode_ids(&iu_query, true)?;
+                    let (cache_iu, _, iu_max) =
+                        self.prefill_it2i_logits_planned(&iu_ids, None, &[], attention)?;
+                    Ok((
+                        cache_cond,
+                        cond_logits,
+                        t_cond,
+                        cache_tu,
+                        t_tu,
+                        cache_iu,
+                        iu_max,
+                    ))
+                },
+            )?;
         let mut text = String::new();
         let mut images: Vec<Tensor> = Vec::new();
         let mut total_tokens = 0usize;
@@ -1437,6 +1577,7 @@ impl T2iModel {
         let mut segment_logits = cond_logits;
 
         loop {
+            on_progress(Progress::ConditioningComplete);
             // ---- Text generation on the condition cache ----
             // One segment is the shared engine's greedy token-at-a-time rollout (epic sc-24432 E8,
             // the host argmax of every row) until `<|im_end|>` / `<img>` or the request's remaining
@@ -1493,7 +1634,15 @@ impl T2iModel {
                 opts.seed.wrapping_add(images.len() as u64),
                 &self.device,
             )?;
-            let mut sink = |_p: Progress| {};
+            let offset = images.len().saturating_mul(opts.num_steps) as u32;
+            let total = max_images.saturating_mul(opts.num_steps) as u32;
+            let mut progress = |event| match event {
+                Progress::Step { current, .. } => on_progress(Progress::Step {
+                    current: offset.saturating_add(current),
+                    total,
+                }),
+                event => on_progress(event),
+            };
             let image = self.it2i_denoise(
                 &mut cache_cond,
                 t_cond + 1,
@@ -1506,31 +1655,48 @@ impl T2iModel {
                 &base_noise,
                 opts,
                 cancel,
-                &mut sink,
+                &mut progress,
                 preview,
             )?;
 
             // Re-encode the generated image back into the condition + text-uncondition caches.
-            let (cond_next, nt_cond) = self.append_generated_image_planned(
-                &image,
-                token_h,
-                token_w,
-                t_cond,
-                &mut cache_cond,
-                attention,
+            let cond_next = candle_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, candle_gen::CandleError> {
+                    let (cond_next, nt_cond) = self.append_generated_image_planned(
+                        &image,
+                        token_h,
+                        token_w,
+                        t_cond,
+                        &mut cache_cond,
+                        attention,
+                    )?;
+                    t_cond = nt_cond;
+                    let (_, nt_tu) = self.append_generated_image_planned(
+                        &image,
+                        token_h,
+                        token_w,
+                        t_tu,
+                        &mut cache_tu,
+                        attention,
+                    )?;
+                    t_tu = nt_tu;
+                    Ok(cond_next)
+                },
             )?;
-            t_cond = nt_cond;
-            let (_, nt_tu) = self.append_generated_image_planned(
-                &image,
-                token_h,
-                token_w,
-                t_tu,
-                &mut cache_tu,
-                attention,
-            )?;
-            t_tu = nt_tu;
             images.push(image);
             segment_logits = cond_next;
+        }
+
+        if !images.is_empty() {
+            if images.len() < max_images {
+                let total = max_images.saturating_mul(opts.num_steps) as u32;
+                on_progress(Progress::Step {
+                    current: total,
+                    total,
+                });
+            }
+            on_progress(Progress::Decoding);
         }
 
         Ok(InterleaveOutput { text, images })

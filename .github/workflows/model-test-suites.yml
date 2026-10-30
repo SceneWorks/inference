@@ -1,9 +1,19 @@
-name: Explicit exhaustive model test suites
+name: Explicit model test suites
 
 # CI_IMPACT: dispatch only. No PR/push learned execution or added automatic runner cost.
 on:
   workflow_call:
+    inputs:
+      test_suite:
+        type: string
+        default: exhaustive
   workflow_dispatch:
+    inputs:
+      test_suite:
+        description: Former ordinary backend baseline or registered exhaustive cases
+        type: choice
+        options: [exhaustive, baseline]
+        default: exhaustive
 
 permissions:
   contents: read
@@ -18,12 +28,13 @@ jobs:
       matrix:
         include:
           - group: base
-            packages: '-p candle-llm -p candle-quant-kernels -p candle-audio -p runtime-cpu'
+            packages: '-p candle-llm -p candle-quant-kernels -p candle-audio* -p runtime-cpu'
             targets: '--lib'
           - group: gen
             packages: '-p candle-gen*'
             targets: '--lib --tests'
     env:
+      TEST_SUITE: ${{ inputs.test_suite || 'exhaustive' }}
       CARGO_BUILD_JOBS: '1'
       RUST_TEST_THREADS: '1'
     steps:
@@ -36,24 +47,70 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           python3 scripts/ci/test_suites.py check
-      - name: Run only registered exhaustive CPU cases
+          case "$TEST_SUITE" in baseline|exhaustive) ;; *) exit 1 ;; esac
+      - name: Record source, fixture, toolchain and device identities
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/model-test-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/model-test-evidence/source.txt"
+          git status --porcelain >> "$RUNNER_TEMP/model-test-evidence/source.txt"
+          git ls-tree -r HEAD > "$RUNNER_TEMP/model-test-evidence/source-and-fixture-tree.txt"
+          rustc -vV > "$RUNNER_TEMP/model-test-evidence/toolchain.txt"
+          cargo -V >> "$RUNNER_TEMP/model-test-evidence/toolchain.txt"
+          uname -a > "$RUNNER_TEMP/model-test-evidence/device.txt"
+          if [ "$(uname)" = Darwin ]; then system_profiler SPHardwareDataType SPDisplaysDataType >> "$RUNNER_TEMP/model-test-evidence/device.txt"; fi
+          cp scripts/ci/test_suites.json scripts/ci/safe_controls.json "$RUNNER_TEMP/model-test-evidence/"
+          printf '%s\n' "$TEST_SUITE" > "$RUNNER_TEMP/model-test-evidence/selection.txt"
+      - name: Run selected CPU suite
         shell: bash
         env:
           PACKAGES: ${{ matrix.packages }}
           TARGETS: ${{ matrix.targets }}
         run: |
+          set -o pipefail
+          exec > >(tee "$RUNNER_TEMP/model-test-evidence/commands-and-results.log") 2>&1
+          set -x
           read -r -a packages <<< "$PACKAGES"
           read -r -a targets <<< "$TARGETS"
-          python3 scripts/ci/test_suites.py --deadline-seconds 7200 exhaustive -- cargo test --locked "${targets[@]}" -j 1 "${packages[@]}"
+          mode=exhaustive
+          if [ "$TEST_SUITE" = baseline ]; then mode=routine; fi
+          python3 scripts/ci/test_suites.py --deadline-seconds 7200 "$mode" -- cargo test --locked "${targets[@]}" -j 1 "${packages[@]}"
+
+      - name: Run former CPU conformance and bundle baselines
+        if: inputs.test_suite == 'baseline' && matrix.group == 'base'
+        shell: bash
+        timeout-minutes: 120
+        run: |
+          set -o pipefail
+          exec > >(tee "$RUNNER_TEMP/model-test-evidence/profiles.log") 2>&1
+          set -x
+          cargo test --locked -j 1 -p candle-llm --test conformance
+          cargo test --locked -j 1 -p candle-audio-stable-audio-3 --test provider --test dtype_policy --test variant_quality --test conformance --test sampler_oracle --test same_oracle --test primitive_oracle --test listening_stimuli --test reference_audio --test reference_window --test audio_edit --test adapters -- --nocapture
+          cargo test --locked --no-default-features --lib -p runtime-cpu
+          cargo test --locked --no-default-features --features audio --lib -p runtime-cpu
+          cargo test --locked --no-default-features --features media --lib -p runtime-cpu
+      - name: Upload exact suite evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: model-test-${{ inputs.test_suite || 'exhaustive' }}-cpu-${{ matrix.group }}
+          path: ${{ runner.temp }}/model-test-evidence
+          if-no-files-found: error
 
   mlx-metal:
     if: github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     timeout-minutes: 180
     env:
+      TEST_SUITE: ${{ inputs.test_suite || 'exhaustive' }}
       CARGO_BUILD_JOBS: '1'
       RUST_TEST_THREADS: '1'
       MACOSX_DEPLOYMENT_TARGET: '15.0'
+      # Match the existing hosted lane's lean graph and build-script artifact identity.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -63,6 +120,20 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           python3 scripts/ci/test_suites.py check
+          case "$TEST_SUITE" in baseline|exhaustive) ;; *) exit 1 ;; esac
+      - name: Record source, fixture, toolchain and device identities
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/model-test-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/model-test-evidence/source.txt"
+          git status --porcelain >> "$RUNNER_TEMP/model-test-evidence/source.txt"
+          git ls-tree -r HEAD > "$RUNNER_TEMP/model-test-evidence/source-and-fixture-tree.txt"
+          rustc -vV > "$RUNNER_TEMP/model-test-evidence/toolchain.txt"
+          cargo -V >> "$RUNNER_TEMP/model-test-evidence/toolchain.txt"
+          uname -a > "$RUNNER_TEMP/model-test-evidence/device.txt"
+          if [ "$(uname)" = Darwin ]; then system_profiler SPHardwareDataType SPDisplaysDataType >> "$RUNNER_TEMP/model-test-evidence/device.txt"; fi
+          cp scripts/ci/test_suites.json scripts/ci/safe_controls.json "$RUNNER_TEMP/model-test-evidence/"
+          printf '%s\n' "$TEST_SUITE" > "$RUNNER_TEMP/model-test-evidence/selection.txt"
       - name: Provision pinned MLX native dependency
         run: |
           if ! xcrun --find metal >/dev/null 2>&1; then sudo xcodebuild -downloadComponent MetalToolchain; fi
@@ -71,12 +142,45 @@ jobs:
           rc=$?
           set -e
           if [ "$rc" != 0 ] && [ "$rc" != 1 ]; then exit "$rc"; fi
-      - name: Run only registered exhaustive MLX cases
+      - name: Run selected MLX suite
+        shell: bash
         run: |
-          python3 scripts/ci/test_suites.py --deadline-seconds 7200 exhaustive -- cargo test --locked --lib --tests -j 1 -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos --features mlx-llm/campaign
+          set -o pipefail
+          exec > >(tee "$RUNNER_TEMP/model-test-evidence/commands-and-results.log") 2>&1
+          set -x
+          if [ "$TEST_SUITE" = baseline ]; then
+            python3 scripts/ci/test_suites.py --deadline-seconds 7200 routine -- cargo test --locked --no-fail-fast --lib --tests -j 1 -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train --features mlx-llm/campaign
+          else
+            python3 scripts/ci/test_suites.py --deadline-seconds 7200 exhaustive -- cargo test --locked --lib --tests -j 1 -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos --features mlx-llm/campaign
+          fi
+      - name: Run former Metal, runtime and iOS host baselines
+        if: inputs.test_suite == 'baseline'
+        shell: bash
+        timeout-minutes: 120
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          set -o pipefail
+          exec > >(tee "$RUNNER_TEMP/model-test-evidence/profiles.log") 2>&1
+          set -x
+          cargo test --locked --no-fail-fast --no-default-features --lib -p runtime-macos -p runtime-ios
+          cargo test --locked --no-fail-fast --lib -p runtime-ios --features device-capture
+          cargo test --locked --no-fail-fast --lib -p mlx-gen-ios-catalog --features device-capture
+          cargo test --locked --no-fail-fast --no-default-features --features audio --lib -p runtime-macos
+          cargo test --locked --no-fail-fast -p candle-gen -p candle-gen-qwen-image-2-1 --features metal --test integration -- metal_strided_reduce:: metal_reference_latents::
+          cargo --config 'profile.dev.package."*".opt-level=3' test --locked --no-fail-fast --manifest-path ios-host/smoke/Cargo.toml --features media --lib -- --skip smoke_passes_on_the_host
+
+
+      - name: Upload exact suite evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: model-test-${{ inputs.test_suite || 'exhaustive' }}-mlx-metal
+          path: ${{ runner.temp }}/model-test-evidence
+          if-no-files-found: error
 
   candle-cuda:
-    if: github.event_name == 'workflow_dispatch' && github.repository == 'SceneWorks/inference'
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'SceneWorks/inference' && inputs.test_suite != 'baseline'
     runs-on: [self-hosted, windows, cuda]
     timeout-minutes: 180
     env:

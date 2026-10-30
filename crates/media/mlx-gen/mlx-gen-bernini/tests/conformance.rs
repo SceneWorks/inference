@@ -183,10 +183,12 @@ fn bernini_full_pipeline_emits_its_declared_phase_boundaries_in_order() {
     let mut marks: Vec<String> = Vec::new();
     gen.generate(&t2i_request("t2i", 2), &mut |p| match p {
         Progress::Loading(LoadPhase::TextEncoder) => marks.push("conditioning".into()),
+        Progress::Loading(LoadPhase::EncodingPrompt) => marks.push("encoding".into()),
         Progress::Loading(LoadPhase::Renderer) => marks.push("renderer".into()),
         Progress::Decoding => marks.push("decode".into()),
         Progress::Step { current, .. } => marks.push(format!("step:{current}")),
         Progress::PromptUpsamplingComplete
+        | Progress::PromptEncodingComplete
         | Progress::ConditioningComplete
         | Progress::Upsampling { .. } => {}
     })
@@ -199,7 +201,7 @@ fn bernini_full_pipeline_emits_its_declared_phase_boundaries_in_order() {
         .collect();
     assert_eq!(
         phases,
-        vec!["conditioning", "renderer", "decode"],
+        vec!["conditioning", "encoding", "renderer", "decode"],
         "declared phases must open once each, in contract order: {marks:?}"
     );
     let index = |name: &str| marks.iter().position(|m| m == name).unwrap();
@@ -209,9 +211,9 @@ fn bernini_full_pipeline_emits_its_declared_phase_boundaries_in_order() {
         "conditioning opens first: {marks:?}"
     );
     assert_eq!(
-        marks[index("renderer") - 1],
+        marks[index("encoding") - 1],
         "step:25",
-        "the renderer phase opens after the last planner step, before the first renderer step: \
+        "prompt encoding opens after the last planner step, before renderer loading: \
          {marks:?}"
     );
     assert_eq!(

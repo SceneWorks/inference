@@ -1,162 +1,98 @@
-# Routine and exhaustive test execution
+# Automatic controls and separately dispatched backend suites
 
-Ordinary PR, merge-group, main and tag CI compile the original selected test
-targets and execute bounded regressions. `scripts/ci/test_suites.json` identifies
-167 exhaustive synthetic training and numerical cases by package, Cargo target,
-exact libtest name, source and body/helper rationale. These cases execute only
-when an operator selects `test_suite: exhaustive`. Existing real-weight ignores,
-scheduled/dispatch real-weight routes and the dedicated H3/MOSS numerical routes
-keep their own selection and admission contracts.
+Ordinary PR, push, merge-group and tag CI compile/link the original selected backend
+test targets, run strict lint and documentation checks, and execute only the exact
+backend controls in `scripts/ci/safe_controls.json` through `audited-safe` mode.
+Tensor-neutral contract packages retain their ordinary suites. Learned model,
+module, layer, inference-kernel, generation, encode/decode and training/optimizer
+execution belongs in separately dispatched validation, including CPU execution
+with tiny or synthetic inputs.
 
-## Classification boundary
+The former open-ended routine partition was insufficient: an unregistered learned
+test could run automatically. The small safe-control table is closed. Each entry
+binds package, target kind/name, exact case, source, libtest protocol, platform and
+source-review rationale. Every other backend target is **compiled only**, never
+reported as a passed test. No Rust assertions, ignore attributes or test bodies
+are changed by this separation.
 
-The registry covers 15 packages on both backends:
+## Execution boundary
 
-| Area | Exhaustive execution | Retained routine regression examples |
-| --- | --- | --- |
-| MLX/Candle Iris | 80-step depth/restoration overfits; repeated interrupted/resumed trajectories; rank replication, reshard and failure campaigns; dtype/checkpoint/adapter/shape matrices | Two-update AdamW/Muon/LoRA/LoKr committed-oracle cases; two-step export/load/render contracts; missing-text-encoder and malformed-mesh refusals; tiny optimizer arithmetic |
-| MLX/Candle LLM | Statistical sampling campaigns; attention/GatedDelta/Prism shape and dtype matrices; long prefills and compressed-cache/materialization measurements | Fixed-seed and argmax selection; short recurrence; dense paging lifecycle; fixed geometry and dispatch/refusal regressions; RoPE schedule/rounding checks |
-| Shared MLX and media providers | Production QKV/P3 geometry matrices; whole-model checkpoint-gradient parity; convergence runs (including misleadingly named five-step `one_optimizer_step_descends` helpers); Qwen and Krea multistep convergence; FLUX3 repeated resume and trained-export/render runs; FLUX3 all-factor/precision oracles | Primitive one-backward/optimizer state contracts; per-family fixed-geometry prologue regressions; one-microbatch FLUX3 workflow/optimizer partition contracts; stored-gradient optimizer replay; scalar CPU oracles |
+`audited-safe` compiles the complete selected graph with
+`--no-run --message-format=json`. Before listing any approved executable, it binds
+its target/source to Cargo metadata and checks the package manifest for the
+standard libtest harness. Unknown targets, including custom harnesses, are never
+probed with a guessed `--list`. Approved cases must exist, be non-ignored and run
+with `--exact`; the runner checks one passing case, zero failures/ignores and the
+expected filtered count. Missing or renamed controls, wrong package binding,
+custom harnesses and zero-case executions fail. Cargo working directory, manifest
+environment and dynamic-loader paths are preserved.
 
-This is a reviewed execution classification, not a name-based filter. A test called
-`training_precision` may only compare short RoPE schedules, while a wrapper called
-`cpu_process` can spawn a complete multi-rank or 80-step training run. Each moved
-case retains its original body and attributes. The JSON records the traced reason;
-no blanket module ignore, new early return or correctness-test deletion is used.
-The single necessary test-body exception is Iris' CUDA rank-device refusal case:
-its existing child override selected literal physical device `0`, replacing the
-lane's GPU1 UUID. The case now preserves and validates that incoming single-card
-mapping, is compiled only with CUDA, and fails when its required device is absent.
-A pure string-helper regression exercises valid UUID/index-1 and malformed,
-absent, physical-index-0 and multi-device mappings without touching a GPU.
-The two FLUX3 `real_loop_interrupts_with_pending_gradient_resumes_identically_and_reloads`
-cases run five continuous microsteps against four interrupted plus one resumed
-microstep; their `trained_export_loads_through_the_public_base_provider_and_changes_generation`
-companions train five microsteps and compare three three-step public renders.
-They belong to exhaustive validation on both backends. The two stored-gradient
-AdamW replay cases only update small factor tensors twice and remain ordinary,
-as do Candle's fixed tiny chunked-attention and additive-mask/stride contracts.
-Large memory/artifact contract fixtures remain ordinary even when they are slow.
-Iris' MLX `restoration_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged`
-is exhaustive: full/LoRA/LoKr × plain/checkpointed runs six four-step training
-trajectories, then checks export/reload and whole-tensor equality. Its same-named
-Candle counterpart compares only two two-step trajectories and remains routine.
+`scripts/check_model_inference_policy.py` binds the exact safe runner and control
+table hashes. Its ordinary workflow exception accepts only `audited-safe`;
+`routine` and `exhaustive` are manual-only. Broad/direct backend `cargo test`
+commands, including unknown listings, are rejected. Direct tensor-neutral
+contract suites and the existing runtime-ios compile-fail interface doctests
+remain ordinary checks. Python tooling uses a fresh venv with no user/system
+site packages, unset Python path/home, pinned numpy 2.4.3, safetensors 0.8.0 and
+PyYAML 6.0.3, and asserts that Torch, MLX, transformers, diffusers, accelerate and
+tokenizers are absent before running tooling tests.
 
-## Operator validation
+## Required baseline and exhaustive validation
 
-To execute every registered exhaustive case on its applicable backend, dispatch
-the existing CI workflow against the desired ref:
+Dispatch the existing workflow against the prepared candidate:
 
 ```sh
-gh workflow run ci.yml --repo SceneWorks/inference --ref YOUR_REF \
-  -f lanes=all -f test_suite=exhaustive -f synthetic_w4a8=none
+gh workflow run model-test-suites.yml --repo SceneWorks/inference --ref YOUR_REF \
+  -f test_suite=baseline
+gh workflow run model-test-suites.yml --repo SceneWorks/inference --ref YOUR_REF \
+  -f test_suite=exhaustive
 ```
 
-`lanes=windows-cuda` with the same `test_suite=exhaustive` selects the Candle CUDA
-subset, preserving physical GPU1 binding, device sharing for rank fixtures and
-the offline synthetic cache. A full `lanes=all` run includes hosted Candle CPU,
-hosted MLX, and the existing manual NAX/CUDA jobs. The explicit exhaustive mode
-executes every registry entry present in each selected package/target/feature
-graph by exact name, including the portable sampler cases in Candle's
-`device_sampler` integration target. It does not substitute a default
-`cargo test -- --ignored` invocation. Run ordinary CI as well for the retained
-regressions; exhaustive mode selects the separated cases rather than repeating
-the routine suite. Dedicated H3/MOSS and real-weight acceptance remain separate.
+The baseline is required delivery evidence for this execution-policy migration.
+It retains the original ordinary suite commands/assertions, with the original
+routine partition semantics for the two CPU groups and full MLX graph:
 
-For a focused local invocation on a suitable, available host:
+| Existing hosted job | Baseline execution retained |
+| --- | --- |
+| Candle CPU, base | `--lib` over candle-llm, candle-quant-kernels, **candle-audio*** and runtime-cpu; separate candle-llm conformance; all named SA3 integration targets; runtime-cpu no-default LLM, audio and media profiles |
+| Candle CPU, gen | `--lib --tests -p 'candle-gen*'`, retaining all integration targets |
+| MLX Metal | Full original `--lib --tests` package graph, including runtime-ios, neutral packages and mlx-llm/campaign; LLM-only runtime-macos/runtime-ios; both device-capture surfaces; macOS audio; both Candle Metal reduction/reference-latent integration modules; iOS host media library with its original smoke exclusion |
 
-```sh
-python3 scripts/ci/test_suites.py routine -- cargo test --locked --lib --tests -p mlx-gen-iris
-python3 scripts/ci/test_suites.py exhaustive -- cargo test --locked --lib --tests -p mlx-gen-iris
-python3 scripts/ci/test_suites.py check
-```
+`exhaustive` remains the default for both direct dispatch and `workflow_call`,
+including the existing real-weights `model-exhaustive-tests` bridge. It executes
+registered exact cases in `scripts/ci/test_suites.json`, including registered
+ignored cases. That registry and bespoke real-weight/H3/MOSS acceptance routes
+are unchanged. NAX and CUDA numerical execution, physical GPU1 binding, rank
+sharing, compute-capability requirements and cache isolation remain dispatch-only
+under their existing contracts. Baseline runs on hosted Ubuntu/macOS, avoiding
+the developer Mac GPU.
 
-The runner compiles with `--no-run --message-format=json`, then validates actual
-libtest membership and ignored status before executing anything. Target renames,
-missing cases, stale ignore changes and substring collisions fail visibly. CUDA
-cases are selected using the compiled artifact's features; MLX cases require
-macOS. Direct execution retains Cargo's package working directory, manifest and
-loader environment, and forces one test thread, including child-process fixtures.
-`--no-fail-fast` retains aggregate failure collection without turning a failed
-test into a successful suite.
+The baseline proves the former default suites actually execute. It is not a
+per-case benchmark, full real-model acceptance or proof of asset-gated cases.
+Ignored, cfg-absent, missing-asset or self-skipped cases are omissions, never model
+acceptance passes. Required real-weight/product acceptance remains separate.
 
-## Budgets and evidence
+## Evidence and bounds
 
-Healthy retained Candle CPU artifact/memory targets took 411s (`candle-gen-flux2`),
-320s (`candle-gen-krea`) and 300s (`candle-gen-qwen-image`) in main run
-40240078690. Routine target execution has a 900s ceiling, above those observations;
-exhaustive cases have a 600s ceiling each. Listing and metadata calls are bounded
-to 60s/120s, compilation to 2400s, and whole suite invocations to 2700s routine or
-7200s exhaustive by default. For full native package graphs, the two Candle CPU
-matrix members explicitly allow 4500s routine per invocation, and hosted
-`Test MLX packages` allows 3600s routine. Both retain 7200s exhaustive. A timeout
-terminates the child process tree, including rank fixtures. All CI jobs also have explicit
-deadlines; ordinary Candle CPU members and hosted Metal are each bounded to
-90 minutes, with explicit exhaustive budgets of 150 and 180 minutes respectively.
+Each hosted manual job always uploads logs, exact commands/features, candidate
+SHA and tracked source/fixture tree identities, toolchain and device data,
+selection and both registries. Evidence must be associated with its exact run and
+candidate; failed or omitted execution remains visible. Synthetic fixtures are
+identified by the tracked source that constructs them. External asset omissions
+do not become passed acceptance merely because the suite exits successfully.
 
-The CPU split preserves the existing full graph: 20 base native targets and 76 gen
-native targets, with the original package selectors, `--lib`/`--tests` flags and
-`-j 1` linker limit. They run independently on hosted runners under the existing
-`candle-cpu-test` job ID. Matrix fail-fast is disabled, and either member's failure
-fails that required dependency of `CI gate`; neither member masks failures.
+Automatic suite deadlines remain the existing 4500s CPU/3600s full MLX overrides
+and 90-minute jobs. Safe control execution is bounded to 120s per exact case;
+metadata/listing to 120s/60s and compilation to 2400s, all within the invocation
+deadline. Routine manual targets retain 900s and exhaustive cases 600s bounds;
+selected manual invocations allow 7200s and jobs retain 150/180-minute limits.
+Timeouts terminate child process trees. Dependency-aware package selection,
+compilation, strict lint, caches, failure propagation and gate job IDs remain.
 
-In run 40310828863, the former serial job's base group took 15m05s (9m11s
-compilation, 5m53s execution). The gen group's compilation took another 11m27s;
-the 60-minute job limit canceled it while its healthy Qwen Image target had run
-for 4m32s. Compared with completed baseline run 40240078690, 63 of 76 gen targets
-had finished and 13 remained or were active; those 13 baseline runtimes sum to
-337.90s. The matched completed targets ran at 1.509 times the baseline aggregate
-duration. Applying that observed ratio to the remaining work estimates about
-64 minutes for the serial job and 48 minutes for gen's invocation. These are
-estimates, not completion measurements. The subsequent cold split run 40329999413
-passed: base finished in 21m04s and gen in 56m05s, with gen's test step taking
-approximately 55m29s. That leaves only about 4m31s below the initial 60-minute
-invocation limit. The CPU routine invocation limit is therefore 75 minutes,
-about 35% above that observed cold step, and its job limit is 90 minutes for
-setup/cache headroom. The 900s target watchdog and explicit exhaustive budgets
-are unchanged. The hosted Metal job headroom is documented below. This is
-deadline headroom, not a latency claim.
-
-The pinned `Swatinem/rust-cache` action includes `key: ${{ matrix.group }}` in
-both primary and restore prefixes, alongside the job, platform and Rust environment.
-Base and gen therefore save distinct main-only dependency caches: a fast base run
-cannot fill gen's immutable key with only base dependencies. This changes the
-previous cache prefix, so the first runs will be cold until main saves each group;
-PR runs still only restore. Gen also loses dependencies compiled by the old prior
-base step. The cold split timing above includes that extra compilation; future
-runner and cache variance remains possible, and no warm-cache speedup is assumed.
-
-Hosted Metal job 121596995674 passed in 54m29s; `Test MLX packages` ran from
-13:32:14 to 14:13:21 (41m07s), compared with 36m55s in the prior run. That leaves
-only 3m53s below the default 45-minute routine suite limit. Its explicit 60-minute
-routine invocation budget provides headroom for the full native graph while
-preserving the 900s target watchdog and 120-minute exhaustive invocation budget.
-The override belongs only to that step; other callers retain their existing
-budgets.
-
-Main runs 40691949793 (`0b80ec518`) and 40732695026 (`9ddabbea2`) passed all
-product build, lint and test steps, including 268 successful test-result summaries
-in each hosted Metal job, then their 75-minute job deadlines cancelled the
-main-only Rust cache upload. The last product test completed after 74m50s and
-73m46s respectively, leaving insufficient time for cache cleanup, compression
-and upload. The hosted Metal job now has a 90-minute bound for that post-job
-work and runner variance. Target, suite and exhaustive invocation budgets,
-package selection and required-gate failure handling stay the same.
-
-CI_IMPACT: this changes only the existing hosted Metal job deadline, adding no
-jobs, tests or model execution. Two existing policy-test expectations follow the
-new deadline; their suite, watchdog, cache and failure assertions stay intact.
-Its maximum wall-clock allowance increases by
-15 minutes; build/test work and compilation inputs are unchanged. The two main
-runs above are the measured evidence. Post-cache completion cost remains
-variable; the extra headroom is an engineering allowance, not a latency claim.
-
-These bounds prevent an accidental campaign/hang from consuming the former
-six-hour job default. They are not performance claims. This change was validated
-with source checks and synthetic runner tests, without local model/GPU execution.
-
-The PR package/dependency scope remains owned by `test_scope.py`; main, tags and
-dispatches still select all packages. Broad all-target Clippy, rustdoc, CUDA
-compile-only coverage, and package globs remain intact. Edits to the suite runner
-or registry force full package selection so execution-policy changes cannot hide
-behind an empty component scope.
+CI_IMPACT: no new jobs or automatic learned computation. Execution moves from
+ordinary checks to the existing dispatched jobs. A prior full hosted MLX job took
+about 53 minutes, including about 28 minutes in its test step; this is historical
+evidence, not a forecast. Added manual compilation/download and full baseline
+runtime are unknown until the required candidate dispatch. No new benchmark or
+calibration campaign is introduced. Local verification uses synthetic runner and
+policy transcripts only, with no model execution.

@@ -399,6 +399,7 @@ impl MossTtsRealtimeGenerator {
         on_chunk: &mut dyn FnMut(AudioChunk),
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<AudioTrack> {
+        let progress = std::cell::RefCell::new(on_progress);
         let pipeline = self.pipeline()?;
         let codec = self.codec(pipeline.decoder.cfg.rvq)?;
         let voice_clone = self.reference_codes(req)?;
@@ -419,13 +420,13 @@ impl MossTtsRealtimeGenerator {
             let mut on_frame =
                 |_step: usize, _frame: &[u32]| -> candle_audio::candle_core::Result<()> {
                     frame_count = (frame_count + 1).min(total);
-                    on_progress(Progress::Step {
+                    (progress.borrow_mut())(Progress::Step {
                         current: frame_count,
                         total,
                     });
                     Ok(())
                 };
-            conversation::render_conversation(
+            conversation::render_conversation_with_prompt_progress(
                 &pipeline.decoder,
                 &pipeline.tokenizer,
                 &pipeline.decoder.cfg,
@@ -435,13 +436,14 @@ impl MossTtsRealtimeGenerator {
                 budget,
                 &probe,
                 &mut on_frame,
+                &mut |event| (progress.borrow_mut())(event),
             )
             .map_err(gen_core::Error::Msg)?
         };
         let Some(rendered) = rendered else {
             return Err(gen_core::Error::Canceled);
         };
-        on_progress(Progress::Decoding);
+        (progress.borrow_mut())(Progress::Decoding);
 
         // Decode each synthesized turn's frames independently (they are separate utterances), stream
         // them as chunks, and concatenate into the assistant's side of the conversation. The decode is
@@ -489,6 +491,7 @@ impl MossTtsRealtimeGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<crate::decode::DecodeResult> {
+        let progress = std::cell::RefCell::new(on_progress);
         self.validate(req)?;
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
@@ -509,8 +512,9 @@ impl MossTtsRealtimeGenerator {
         let seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
+
         let mut on_frame = |step: usize, _frame: &[u32]| {
-            on_progress(Progress::Step {
+            (progress.borrow_mut())(Progress::Step {
                 current: (step as u32) + 1,
                 total,
             });
@@ -518,13 +522,14 @@ impl MossTtsRealtimeGenerator {
         };
         let result = pipeline
             .decoder
-            .run(
+            .run_with_prompt_progress(
                 plan.prefill,
                 &plan.streamed_text,
                 budget,
                 seed,
                 &probe,
                 &mut on_frame,
+                &mut |event| (progress.borrow_mut())(event),
             )
             .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: AR decode: {e}")))?;
         match result {
@@ -578,6 +583,7 @@ impl MossTtsRealtimeGenerator {
         if let Some(turns) = self.conversation_turns(req)? {
             return self.synthesize_conversation(req, turns.as_slice(), on_chunk, on_progress);
         }
+        let progress = std::cell::RefCell::new(on_progress);
         let pipeline = self.pipeline()?;
         let codec = self.codec(pipeline.decoder.cfg.rvq)?;
 
@@ -600,11 +606,12 @@ impl MossTtsRealtimeGenerator {
 
         let mut chunker = crate::chunk::StreamingChunker::new(codec.as_ref(), decode_schedule);
         let mut canceled = false;
+
         let run = {
             // The AR loop hands each emitted frame here; the chunker decodes + streams block-wise.
             let mut on_frame =
                 |step: usize, frame: &[u32]| -> candle_audio::candle_core::Result<()> {
-                    on_progress(Progress::Step {
+                    (progress.borrow_mut())(Progress::Step {
                         current: (step as u32) + 1,
                         total,
                     });
@@ -615,20 +622,21 @@ impl MossTtsRealtimeGenerator {
                 };
             pipeline
                 .decoder
-                .run(
+                .run_with_prompt_progress(
                     plan.prefill,
                     &plan.streamed_text,
                     budget,
                     seed,
                     &probe,
                     &mut on_frame,
+                    &mut |event| (progress.borrow_mut())(event),
                 )
                 .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: AR decode: {e}")))?
         };
         if canceled || run.is_none() {
             return Err(gen_core::Error::Canceled);
         }
-        on_progress(Progress::Decoding);
+        (progress.borrow_mut())(Progress::Decoding);
         // Flush any remaining frames below a full block into a final chunk and take the full track.
         match chunker
             .finish(&probe, on_chunk)
@@ -730,6 +738,7 @@ impl ConversationSession for MossConversationSession {
         on_chunk: &mut dyn FnMut(AudioChunk),
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<AudioTrack> {
+        let progress = std::cell::RefCell::new(on_progress);
         if self.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
@@ -759,13 +768,13 @@ impl ConversationSession for MossConversationSession {
             let mut on_frame =
                 |_step: usize, _frame: &[u32]| -> candle_audio::candle_core::Result<()> {
                     frame_count = (frame_count + 1).min(total);
-                    on_progress(Progress::Step {
+                    (progress.borrow_mut())(Progress::Step {
                         current: frame_count,
                         total,
                     });
                     Ok(())
                 };
-            conversation::advance_turn(
+            conversation::advance_turn_with_prompt_progress(
                 decoder,
                 tokenizer,
                 cfg,
@@ -776,13 +785,14 @@ impl ConversationSession for MossConversationSession {
                 budget,
                 &probe,
                 &mut on_frame,
+                &mut |event| (progress.borrow_mut())(event),
             )
             .map_err(gen_core::Error::Msg)?
         };
         let Some(frames) = frames else {
             return Err(gen_core::Error::Canceled);
         };
-        on_progress(Progress::Decoding);
+        (progress.borrow_mut())(Progress::Decoding);
 
         // A context turn: it is now in the warm cache; return its provided audio unchanged.
         if !is_synth {

@@ -17,6 +17,7 @@ name = "gen_core"
 model-inference-proof = ["core-llm/model-inference-proof"]
 
 [dependencies]
+sceneworks-load-progress = { workspace = true }
 # Shared pins live in the workspace root [workspace.dependencies] (F-151). gen-core deliberately
 # depends on NOTHING tensor-related — thiserror (error) and core-llm. Text tokenization, image/EXR
 # decode and the `.pth` zip reader moved to the sibling `gen-core-*` crates with the code that uses

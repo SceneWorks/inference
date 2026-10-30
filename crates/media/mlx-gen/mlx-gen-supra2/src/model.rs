@@ -335,14 +335,21 @@ impl Supra2Image {
         let per_image = cfg.latent_numel();
         check(&request.cancel)?;
 
-        let (cond, tokens) = self.encode_prompt(&request.prompt)?;
-        let (cond_ctx, cond_mask) = Self::broadcast(&cond, n)?;
-        let (uncond, used_stored) = if r.use_cfg {
-            let (u, stored) = self.unconditional()?;
-            (Some(Self::broadcast(&u, n)?), stored)
-        } else {
-            (None, false)
-        };
+        let (_cond, cond_ctx, cond_mask, uncond, used_stored, tokens) =
+            mlx_gen::gen_core::with_prompt_encoding(
+                progress,
+                || -> std::result::Result<_, mlx_gen::Error> {
+                    let (cond, tokens) = self.encode_prompt(&request.prompt)?;
+                    let (cond_ctx, cond_mask) = Self::broadcast(&cond, n)?;
+                    let (uncond, used_stored) = if r.use_cfg {
+                        let (u, stored) = self.unconditional()?;
+                        (Some(Self::broadcast(&u, n)?), stored)
+                    } else {
+                        (None, false)
+                    };
+                    Ok((cond, cond_ctx, cond_mask, uncond, used_stored, tokens))
+                },
+            )?;
         check(&request.cancel)?;
 
         let z0: Vec<f32> = match noise {

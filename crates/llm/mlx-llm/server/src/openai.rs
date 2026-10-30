@@ -199,6 +199,7 @@ impl ChatRequest {
             tools: Vec::new(),
             stop: self.stop.map(StringOrVec::into_vec).unwrap_or_default(),
             cancel: Default::default(),
+            progress: None,
             kv_compression,
         })
     }

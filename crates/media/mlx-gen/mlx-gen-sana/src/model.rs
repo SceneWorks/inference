@@ -920,7 +920,7 @@ pub(crate) fn run_staged_img2img<T, C, E, H, L, M, O>(
     on_progress(Progress::Loading(mlx_gen::LoadPhase::TextEncoder));
     let encoded = {
         let text = load_text()?;
-        let encoded = encode(&text)?;
+        let encoded = mlx_gen::gen_core::with_prompt_encoding(on_progress, || encode(&text))?;
         materialize_encoded(&encoded)?;
         encoded
     };
@@ -1230,6 +1230,26 @@ mod tests {
     /// stops before the next load. The registered generator routes Sequential img2img through it.
     #[test]
     fn sequential_img2img_encodes_the_reference_alone_between_text_and_trunk() {
+        // This driver test uses only byte state and drop witnesses, never learned tensors.
+        #[cfg(target_os = "macos")]
+        {
+            const CHILD: &str = "SANA_STAGED_LIFECYCLE_CHILD";
+            if std::env::var_os(CHILD).is_none() {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "model::tests::sequential_img2img_encodes_the_reference_alone_between_text_and_trunk",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                return;
+            }
+            mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+            assert!(crate::test_metal_guard::forbid_metal());
+        }
         struct Part(&'static str, std::rc::Rc<RefCell<Vec<String>>>);
         impl Drop for Part {
             fn drop(&mut self) {
@@ -1296,7 +1316,9 @@ mod tests {
             [
                 "Loading(TextEncoder)",
                 "load text",
+                "Loading(EncodingPrompt)",
                 "encode",
+                "PromptEncodingComplete",
                 "materialize",
                 "drop text",
                 "Loading(Renderer)",

@@ -22,6 +22,7 @@ members = [
     "crates/contracts/core-llm",
     "crates/contracts/core-llm/core-llm-testkit",
     "crates/contracts/gen-core",
+    "crates/contracts/load-progress",
     "crates/contracts/gen-core-checkpoint",
     "crates/contracts/gen-core-dist",
     "crates/contracts/gen-core-family",
@@ -58,6 +59,7 @@ exclude = [
 # Internal packages are paths so a checkout has one contract package, one
 # provider registry, and no dependency on unpublished repository state.
 [workspace.dependencies]
+sceneworks-load-progress = { path = "crates/contracts/load-progress" }
 core-llm = { path = "crates/contracts/core-llm" }
 core-llm-testkit = { path = "crates/contracts/core-llm/core-llm-testkit" }
 mlx-llm = { path = "crates/llm/mlx-llm" }
@@ -116,8 +118,8 @@ candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
 # Metal, CUDA, and no-GPU backend definitions, and fail-closed Metal ABI/index/dispatch admission on top of the
 # collision-free retained compiler leases and safe TLS teardown while preserving MLX 0.32.0.
 # See mlx-gen/Cargo.toml for lineage.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "355e2ae4e81c13032233a4244e956bc3547f49e4" }
-mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "355e2ae4e81c13032233a4244e956bc3547f49e4" }
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "11d0ff7c81e628beaa548e1872db974c10529efe" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "11d0ff7c81e628beaa548e1872db974c10529efe" }
 
 # Candle pins are shared by media and LLM providers.
 # Upstream PR #3531 removes O(groups) launches from unit-stride depthwise convs (sc-12111).

@@ -916,7 +916,10 @@ impl Weights {
             // Real ComfyUI export: raw I8 bytes reinterpreted as signed codes (candle can't decode I8).
             ::safetensors::Dtype::I8 => {
                 let shape = view.shape().to_vec();
-                let codes: Vec<i64> = view.data().iter().map(|&b| b as i8 as i64).collect();
+                let codes: Vec<i64> =
+                    candle_gen::candle_core::safetensors::read_tensor_bytes(&view, |bytes| {
+                        bytes.iter().map(|&b| b as i8 as i64).collect()
+                    });
                 Tensor::from_vec(codes, shape, &Device::Cpu)
             }
             // Test / any-int fixture: load whatever integer dtype it is, then widen to I64.
@@ -930,7 +933,10 @@ impl Weights {
         let view = self.st.get(native_weight)?;
         let shape = view.shape().to_vec();
         let rows = shape[0];
-        let codes: Vec<i64> = view.data().iter().map(|&byte| byte as i8 as i64).collect();
+        let codes: Vec<i64> =
+            candle_gen::candle_core::safetensors::read_tensor_bytes(&view, |bytes| {
+                bytes.iter().map(|&byte| byte as i8 as i64).collect()
+            });
         let codes = Tensor::from_vec(codes, shape, &Device::Cpu)?
             .to_device(&self.device)?
             .to_dtype(DType::F32)?;
@@ -964,7 +970,11 @@ impl Weights {
     /// older/plain int8 export); the caller then falls back to the checkpoint default (256).
     fn get_convrot_groupsize(&self, native_base: &str) -> Option<usize> {
         let view = self.st.get(&format!("{native_base}.comfy_quant")).ok()?;
-        let j: serde_json::Value = serde_json::from_slice(view.data()).ok()?;
+        let j: serde_json::Value =
+            candle_gen::candle_core::safetensors::read_tensor_bytes(&view, |bytes| {
+                serde_json::from_slice(bytes)
+            })
+            .ok()?;
         j.get("convrot_groupsize")?.as_u64().map(|g| g as usize)
     }
 
@@ -1184,7 +1194,10 @@ fn validate_plain_int8_tensorwise(st: &MmapedSafetensors) -> Result<bool> {
             )));
         }
         let json: serde_json::Value =
-            serde_json::from_slice(descriptor.data()).map_err(|error| {
+            candle_gen::candle_core::safetensors::read_tensor_bytes(&descriptor, |bytes| {
+                serde_json::from_slice(bytes)
+            })
+            .map_err(|error| {
                 candle_gen::candle_core::Error::Msg(format!(
                     "krea plain int8: `{descriptor_key}` is not valid JSON: {error}"
                 ))
@@ -1268,7 +1281,10 @@ fn descriptors_declare_int8_tensorwise(
             ))
         })?;
         let json: serde_json::Value =
-            serde_json::from_slice(descriptor.data()).map_err(|error| {
+            candle_gen::candle_core::safetensors::read_tensor_bytes(&descriptor, |bytes| {
+                serde_json::from_slice(bytes)
+            })
+            .map_err(|error| {
                 candle_gen::candle_core::Error::Msg(format!(
                     "krea plain int8: `{descriptor_key}` is not valid JSON: {error}"
                 ))
@@ -1303,7 +1319,10 @@ fn validate_convrot_descriptors(st: &MmapedSafetensors) -> Result<()> {
             )));
         }
         let json: serde_json::Value =
-            serde_json::from_slice(descriptor.data()).map_err(|error| {
+            candle_gen::candle_core::safetensors::read_tensor_bytes(&descriptor, |bytes| {
+                serde_json::from_slice(bytes)
+            })
+            .map_err(|error| {
                 candle_gen::candle_core::Error::Msg(format!(
                     "krea convrot: `{descriptor_key}` is not valid JSON: {error}"
                 ))

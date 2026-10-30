@@ -214,6 +214,7 @@ impl StarVector8bProvider {
         request: &StarVectorRequest,
         on_event: &mut dyn FnMut(StarVectorStreamEvent),
     ) -> CoreResult<(StarVectorOutput, Option<DecodeReport>)> {
+        let _progress = request.text_request.install_progress();
         self.validate_svg(request)?;
         if request.text_request.cancel.is_cancelled() {
             return Err(CoreError::Canceled);
@@ -237,6 +238,7 @@ impl StarVector8bProvider {
                 return Ok((output, None));
             }
         }
+        core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
         let (first_logits, mut cache) = self.model.prefill(image, &prompt).map_err(to_core)?;
         let config = GenerationConfig {
             max_new_tokens: request.text_request.max_new_tokens as usize,
@@ -368,6 +370,7 @@ impl TextLlm for StarVector8bProvider {
         request: &TextLlmRequest,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> CoreResult<TextLlmOutput> {
+        let _progress = request.install_progress();
         let prompt_tokens = self.tokenizer.encode(SVG_PROMPT, false)?.len() as u32;
         // StarVector advertises no proposer and has no prefix cache: the shared scaffolding joins
         // the request's speculative fallback and the prefix-cache reason to the measured report in

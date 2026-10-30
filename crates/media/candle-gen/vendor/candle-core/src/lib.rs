@@ -106,6 +106,7 @@ pub mod op;
 pub mod pickle;
 pub mod quantized;
 pub mod safetensors;
+mod safetensors_progress;
 pub mod scalar;
 pub mod shape;
 mod sort;

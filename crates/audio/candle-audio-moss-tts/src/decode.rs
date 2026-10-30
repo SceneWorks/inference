@@ -135,6 +135,19 @@ impl Decoder {
         cancel: &dyn Fn() -> bool,
         on_position: &mut dyn FnMut(usize),
     ) -> CandleResult<Option<DecodeResult>> {
+        self.run_with_prompt_progress(grid, max_positions, seed, cancel, on_position, &mut |_| {})
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_prompt_progress(
+        &self,
+        grid: Vec<Frame>,
+        max_positions: usize,
+        seed: u64,
+        cancel: &dyn Fn() -> bool,
+        on_position: &mut dyn FnMut(usize),
+        on_prompt_progress: &mut dyn FnMut(candle_audio::gen_core::Progress),
+    ) -> CandleResult<Option<DecodeResult>> {
         let cfg = &self.cfg;
         let ch = cfg.channels;
         let strip = ch - 1;
@@ -159,7 +172,9 @@ impl Decoder {
             }
             let hidden = if !prefilled {
                 prefilled = true;
-                self.backbone.prefill(&input, &mut cache)?
+                candle_audio::gen_core::with_prompt_encoding(on_prompt_progress, || {
+                    self.backbone.prefill(&input, &mut cache)
+                })?
             } else {
                 self.backbone
                     .step(input.last().expect("a prior position"), &mut cache)?

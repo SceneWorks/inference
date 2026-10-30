@@ -35,6 +35,17 @@ use release::release_then_sync;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+fn needs_prompt_encoding(
+    inputs: MossImageAdvancedInputs<'_>,
+    acceleration: MossImageAcceleration,
+    guidance: f32,
+) -> bool {
+    inputs.positive.is_none()
+        || (acceleration == MossImageAcceleration::Off
+            && guidance != 1.0
+            && inputs.negative.is_none())
+}
+
 #[derive(Default)]
 struct State {
     text: Option<Qwen35Model>,
@@ -316,10 +327,7 @@ impl MossImageGenerator {
         } else {
             req.prompt_batch.clone()
         };
-        let need_text = inputs.positive.is_none()
-            || (matches!(r.acceleration, MossImageAcceleration::Off)
-                && r.guidance != 1.0
-                && inputs.negative.is_none());
+        let need_text = needs_prompt_encoding(inputs, r.acceleration, r.guidance);
         if need_text && state.text.is_none() {
             if staged {
                 on_progress(Progress::Loading(LoadPhase::TextEncoder));
@@ -327,40 +335,51 @@ impl MossImageGenerator {
             transformer::check_cancel(&req.cancel)?;
             state.text = Some(self.sources.text(&self.device)?);
         }
-        let positive = if let Some(e) = inputs.positive {
-            text_encoder::supplied(e, &self.device)?
-        } else {
-            text_encoder::strings(
-                &self.sources,
-                state.text.as_ref().expect("text loaded"),
-                &prompts,
-                r.max_sequence_length,
-                &self.device,
-                &req.cancel,
-            )?
-        };
-        let negative = if matches!(r.acceleration, MossImageAcceleration::Off) && r.guidance != 1.0
-        {
-            Some(if let Some(e) = inputs.negative {
+        let encode = || -> candle_gen::Result<_> {
+            let positive = if let Some(e) = inputs.positive {
                 text_encoder::supplied(e, &self.device)?
             } else {
-                let texts = inputs
-                    .negative_prompts
-                    .map(<[String]>::to_vec)
-                    .unwrap_or_else(|| {
-                        vec![req.negative_prompt.clone().unwrap_or_default(); positive.rows.len()]
-                    });
                 text_encoder::strings(
                     &self.sources,
                     state.text.as_ref().expect("text loaded"),
-                    &texts,
+                    &prompts,
                     r.max_sequence_length,
                     &self.device,
                     &req.cancel,
                 )?
-            })
+            };
+            let negative =
+                if matches!(r.acceleration, MossImageAcceleration::Off) && r.guidance != 1.0 {
+                    Some(if let Some(e) = inputs.negative {
+                        text_encoder::supplied(e, &self.device)?
+                    } else {
+                        let texts = inputs
+                            .negative_prompts
+                            .map(<[String]>::to_vec)
+                            .unwrap_or_else(|| {
+                                vec![
+                                    req.negative_prompt.clone().unwrap_or_default();
+                                    positive.rows.len()
+                                ]
+                            });
+                        text_encoder::strings(
+                            &self.sources,
+                            state.text.as_ref().expect("text loaded"),
+                            &texts,
+                            r.max_sequence_length,
+                            &self.device,
+                            &req.cancel,
+                        )?
+                    })
+                } else {
+                    None
+                };
+            Ok((positive, negative))
+        };
+        let (positive, negative) = if need_text {
+            candle_gen::gen_core::with_prompt_encoding(on_progress, encode)?
         } else {
-            None
+            encode()?
         };
         transformer::check_cancel(&req.cancel)?;
         if staged {

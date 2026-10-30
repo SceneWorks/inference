@@ -45,7 +45,7 @@ class PackageSelectorSourceTests(unittest.TestCase):
 
     def errors(self, *, mutate_array='', collection=False):
         wrapper = 'python3 tools/run_ci_collection.py -- ' if collection else ''
-        source = '''args=$(python3 tools/arbitrary_selector.py select --scope "$TEST_SCOPE" -p candle-llm -p 'candle-gen*')
+        source = '''args=$(python3 tools/arbitrary_selector.py select --scope "$TEST_SCOPE" -p core-llm -p sceneworks-gen-core)
 read -r -a packages <<< "$args"
 if [[ ${#packages[@]} -eq 0 ]]; then
     echo "No package selected"

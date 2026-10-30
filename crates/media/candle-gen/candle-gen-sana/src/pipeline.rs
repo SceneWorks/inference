@@ -495,7 +495,9 @@ impl SanaPipeline {
         preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> Result<Image> {
         let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
-        let conditioning = self.encode_conditioning(req, guidance)?;
+        let conditioning = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+            self.encode_conditioning(req, guidance)
+        })?;
         self.generate_with_conditioning(req, &conditioning, device, cancel, on_progress, preview)
     }
 
@@ -715,19 +717,26 @@ pub(crate) fn generate_base_staged(
     revalidate_before_load(&mut check)?;
     let text = load_text_encoder(root, device)?;
     let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
-    let (cond, cond_mask) = text.encode_with_mask(req.prompt)?;
-    let (uncond, uncond_mask) = if guidance > 1.0 {
-        let (uncond, uncond_mask) = text.encode_with_mask(req.negative_prompt.unwrap_or(""))?;
-        (Some(uncond), Some(uncond_mask))
-    } else {
-        (None, None)
-    };
-    let conditioning = SanaConditioning {
-        cond,
-        cond_mask,
-        uncond,
-        uncond_mask,
-    };
+    let conditioning = candle_gen::gen_core::with_prompt_encoding(
+        on_progress,
+        || -> std::result::Result<_, candle_gen::CandleError> {
+            let (cond, cond_mask) = text.encode_with_mask(req.prompt)?;
+            let (uncond, uncond_mask) = if guidance > 1.0 {
+                let (uncond, uncond_mask) =
+                    text.encode_with_mask(req.negative_prompt.unwrap_or(""))?;
+                (Some(uncond), Some(uncond_mask))
+            } else {
+                (None, None)
+            };
+            let conditioning = SanaConditioning {
+                cond,
+                cond_mask,
+                uncond,
+                uncond_mask,
+            };
+            Ok(conditioning)
+        },
+    )?;
     device.synchronize()?;
     drop(text);
     if cancel.is_cancelled() {
@@ -1113,7 +1122,9 @@ impl SanaSprintPipeline {
         on_progress: &mut dyn FnMut(Progress),
         preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> Result<Image> {
-        let conditioning = self.encode_conditioning(req.prompt)?;
+        let conditioning = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+            self.encode_conditioning(req.prompt)
+        })?;
         self.generate_with_conditioning(req, &conditioning, device, cancel, on_progress, preview)
     }
 
@@ -1275,8 +1286,14 @@ pub(crate) fn generate_sprint_staged(
 ) -> Result<Vec<Image>> {
     revalidate_before_load(&mut check)?;
     let text = load_text_encoder(root, device)?;
-    let (cond, cond_mask) = text.encode_with_mask(req.prompt)?;
-    let conditioning = SanaSprintConditioning { cond, cond_mask };
+    let conditioning = candle_gen::gen_core::with_prompt_encoding(
+        on_progress,
+        || -> std::result::Result<_, candle_gen::CandleError> {
+            let (cond, cond_mask) = text.encode_with_mask(req.prompt)?;
+            let conditioning = SanaSprintConditioning { cond, cond_mask };
+            Ok(conditioning)
+        },
+    )?;
     device.synchronize()?;
     drop(text);
     if cancel.is_cancelled() {

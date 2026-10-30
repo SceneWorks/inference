@@ -3214,6 +3214,7 @@ impl LlamaProvider {
                 if req.cancel.is_cancelled() {
                     return Err(CoreError::Canceled);
                 }
+                let _progress = req.install_progress();
                 let (prompt, prompt_ids) = self.render_prompt(req, &req.messages)?;
                 let max_context = self.descriptor.capabilities.max_context_tokens;
                 validate_context_window(max_context, prompt_ids.len(), req.max_new_tokens)?;
@@ -3336,6 +3337,9 @@ impl LlamaProvider {
             block_size: 16,
             exactness: crate::decode::BatchExactness::Throughput,
         };
+        let _progress = core_llm::install_generation_batch_progress(
+            admitted.iter().map(|(i, _, _)| reqs[*i].progress.clone()),
+        );
         let outputs = crate::decode::generate_continuous_kv(
             model,
             &batch,
@@ -3799,6 +3803,7 @@ impl LlamaProvider {
         packed: Option<&crate::decode::observe::CompressedKvArm>,
         prefix_cache: Option<&mut crate::decode::PrefixCache>,
     ) -> CoreResult<TextLlmOutput> {
+        let _progress = req.install_progress();
         self.validate(req)?;
         if req.cancel.is_cancelled() {
             return Err(CoreError::Canceled); // typed pre-inference cancel
@@ -4072,11 +4077,13 @@ impl LlamaProvider {
         // becomes the effective sequence). `None` on the text-only path.
         let qwen_prefill_started = (multimodal && !gemma4_mm_request).then(Instant::now);
         let mm = if multimodal && !gemma4_mm_request {
+            core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
             Some(self.prepare_multimodal(&prompt_ids, &req.messages)?)
         } else {
             None
         };
         let g4 = if gemma4_mm_request {
+            core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
             Some(self.prepare_gemma4(&prompt_ids, &req.messages)?)
         } else {
             None
@@ -5910,15 +5917,17 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 pub fn can_load(spec: &LoadSpec) -> bool {
     let dir = Path::new(&spec.source);
     if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
-        let language_is_prism = crate::gguf::GgufFile::open(dir).ok().is_some_and(|g| {
-            g.meta_str("general.architecture") == Some("qwen35")
-                && g.meta("prism.hadamard.version").is_some()
-        });
+        let language_is_prism = crate::gguf::GgufFile::open_metadata(dir)
+            .ok()
+            .is_some_and(|g| {
+                g.meta_str("general.architecture") == Some("qwen35")
+                    && g.meta("prism.hadamard.version").is_some()
+            });
         if !language_is_prism {
             return false;
         }
         return spec.projector_source.as_deref().is_none_or(|source| {
-            crate::gguf::GgufFile::open(source)
+            crate::gguf::GgufFile::open_metadata(source)
                 .ok()
                 .is_some_and(|projector| crate::prism_vision_gguf::validate(&projector).is_ok())
         });

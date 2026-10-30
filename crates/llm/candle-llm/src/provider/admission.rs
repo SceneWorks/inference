@@ -702,7 +702,7 @@ pub(super) fn gguf_working_set(
         ))
     };
     let mut file = std::fs::File::open(path).map_err(|e| unreadable(e.to_string()))?;
-    let content = candle_core::quantized::gguf_file::Content::read(&mut file)
+    let content = candle_core::quantized::gguf_file::Content::read_with_path(&mut file, path)
         .map_err(|e| unreadable(e.to_string()))?;
     // A GGUF load re-quantizes only to GGML; NVFP4 refuses a GGUF before admission.
     let quant = match requested {

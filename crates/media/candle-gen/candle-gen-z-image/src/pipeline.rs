@@ -417,7 +417,7 @@ fn run_three_stage<Text, Encoded, Renderer, Latents, Decoder, Output>(
     candle_gen::check_cancel(cancel)?;
     on_progress(Progress::Loading(LoadPhase::TextEncoder));
     let text = load_text()?;
-    let encoded = encode(&text);
+    let encoded = candle_gen::gen_core::with_prompt_encoding(on_progress, || encode(&text));
     let text_sync = device.synchronize();
     drop(text);
     let encoded = encoded?;
@@ -1550,9 +1550,9 @@ impl Pipeline {
         let lat_w = (req.width / SPATIAL_SCALE) as usize;
 
         // Text embeddings are seed- and image-independent: encode once for the whole batch.
-        let cap =
-            self.text_embeddings(&components.text_encoder, &components.tokenizer, &req.prompt)?;
-
+        let cap = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+            self.text_embeddings(&components.text_encoder, &components.tokenizer, &req.prompt)
+        })?;
         // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
         // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
         // else `None` → the native VAE decode. Shared across `count` images (same prompt).
@@ -1725,15 +1725,27 @@ impl Pipeline {
 
         // Text embeddings are seed- and image-independent: encode once for the whole batch. The uncond
         // branch (negative prompt, empty when unset) is only encoded when CFG is active.
-        let cap =
-            self.text_embeddings(&components.text_encoder, &components.tokenizer, &req.prompt)?;
-        let neg_cap = if cfg_on {
-            let neg = req.negative_prompt.as_deref().unwrap_or("");
-            Some(self.uncond_embeddings(&components.text_encoder, &components.tokenizer, neg)?)
-        } else {
-            None
-        };
-
+        let (cap, neg_cap) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let cap = self.text_embeddings(
+                    &components.text_encoder,
+                    &components.tokenizer,
+                    &req.prompt,
+                )?;
+                let neg_cap = if cfg_on {
+                    let neg = req.negative_prompt.as_deref().unwrap_or("");
+                    Some(self.uncond_embeddings(
+                        &components.text_encoder,
+                        &components.tokenizer,
+                        neg,
+                    )?)
+                } else {
+                    None
+                };
+                Ok((cap, neg_cap))
+            },
+        )?;
         // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
         // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
         // else `None` → the native VAE decode. Shared across `count` images (same prompt).
@@ -2220,6 +2232,8 @@ mod tests {
             progress,
             [
                 Progress::Loading(LoadPhase::TextEncoder),
+                Progress::Loading(LoadPhase::EncodingPrompt),
+                Progress::PromptEncodingComplete,
                 Progress::Loading(LoadPhase::Renderer),
                 Progress::Loading(LoadPhase::Renderer),
             ]

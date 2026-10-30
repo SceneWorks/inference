@@ -465,6 +465,7 @@ where
     if let Some(b) = split {
         request = request.with_snapshot_at(b - reused);
     }
+    core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
     let out = model.forward_step(cache, request)?;
     if cancel.is_cancelled() {
         // Cancelled while the forward ran: no snapshot of a prefill the request abandons.

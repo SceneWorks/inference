@@ -271,7 +271,11 @@ impl Tensor {
     pub fn read_npy<T: AsRef<Path>>(path: T) -> Result<Self> {
         #[cfg(feature = "model-inference-proof")]
         let __input_path = path.as_ref();
-        let mut reader = File::open(crate::__model_input_choose!(path.as_ref(), __input_path))?;
+        let file = File::open(crate::__model_input_choose!(path.as_ref(), __input_path))?;
+        let progress =
+            load_progress::reader::SourceProgress::new(path.as_ref(), Some(file.metadata()?.len()));
+        let _operation = progress.operation();
+        let mut reader = progress.reader(file)?;
         let header = read_header(&mut reader)?;
         let header = Header::parse(&header)?;
         if header.fortran_order {
@@ -289,10 +293,11 @@ impl Tensor {
     pub fn read_npz<T: AsRef<Path>>(path: T) -> Result<Vec<(String, Self)>> {
         #[cfg(feature = "model-inference-proof")]
         let __input_path = path.as_ref();
-        let zip_reader = BufReader::new(File::open(crate::__model_input_choose!(
-            path.as_ref(),
-            __input_path
-        ))?);
+        let file = File::open(crate::__model_input_choose!(path.as_ref(), __input_path))?;
+        let progress =
+            load_progress::reader::SourceProgress::new(path.as_ref(), Some(file.metadata()?.len()));
+        let _operation = progress.operation();
+        let zip_reader = BufReader::new(progress.reader(file)?);
         let mut zip = zip::ZipArchive::new(zip_reader)?;
         let mut result = vec![];
         for i in 0..zip.len() {
@@ -321,10 +326,11 @@ impl Tensor {
     pub fn read_npz_by_name<T: AsRef<Path>>(path: T, names: &[&str]) -> Result<Vec<Self>> {
         #[cfg(feature = "model-inference-proof")]
         let __input_path = path.as_ref();
-        let zip_reader = BufReader::new(File::open(crate::__model_input_choose!(
-            path.as_ref(),
-            __input_path
-        ))?);
+        let file = File::open(crate::__model_input_choose!(path.as_ref(), __input_path))?;
+        let progress =
+            load_progress::reader::SourceProgress::new(path.as_ref(), Some(file.metadata()?.len()));
+        let _operation = progress.operation();
+        let zip_reader = BufReader::new(progress.reader(file)?);
         let mut zip = zip::ZipArchive::new(zip_reader)?;
         let mut result = vec![];
         for name in names.iter() {
@@ -396,6 +402,7 @@ impl Tensor {
 /// Lazy tensor loader.
 pub struct NpzTensors {
     index_per_name: HashMap<String, usize>,
+    progress: load_progress::reader::SourceProgress,
     path: std::path::PathBuf,
     // We do not store a zip reader as it needs mutable access to extract data. Instead we
     // re-create a zip reader for each tensor.
@@ -404,7 +411,11 @@ pub struct NpzTensors {
 impl NpzTensors {
     pub fn new<T: AsRef<Path>>(path: T) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        let zip_reader = BufReader::new(File::open(&path)?);
+        let file = File::open(&path)?;
+        let progress =
+            load_progress::reader::SourceProgress::new(&path, Some(file.metadata()?.len()));
+        let _operation = progress.operation();
+        let zip_reader = BufReader::new(progress.reader(file)?);
         let mut zip = zip::ZipArchive::new(zip_reader)?;
         let mut index_per_name = HashMap::new();
         for i in 0..zip.len() {
@@ -418,6 +429,7 @@ impl NpzTensors {
         Ok(Self {
             index_per_name,
             path,
+            progress,
         })
     }
 
@@ -432,7 +444,8 @@ impl NpzTensors {
             None => crate::bail!("cannot find tensor {name}"),
             Some(index) => *index,
         };
-        let zip_reader = BufReader::new(File::open(&self.path)?);
+        let _operation = self.progress.operation();
+        let zip_reader = BufReader::new(self.progress.reader(File::open(&self.path)?)?);
         let mut zip = zip::ZipArchive::new(zip_reader)?;
         let mut reader = zip.by_index(index)?;
         let header = read_header(&mut reader)?;
@@ -446,7 +459,8 @@ impl NpzTensors {
             Some(index) => *index,
         };
         // We hope that the file has not changed since first reading it.
-        let zip_reader = BufReader::new(File::open(&self.path)?);
+        let _operation = self.progress.operation();
+        let zip_reader = BufReader::new(self.progress.reader(File::open(&self.path)?)?);
         let mut zip = zip::ZipArchive::new(zip_reader)?;
         let mut reader = zip.by_index(index)?;
         let header = read_header(&mut reader)?;

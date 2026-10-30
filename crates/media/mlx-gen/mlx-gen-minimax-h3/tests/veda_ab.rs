@@ -431,6 +431,7 @@ fn veda_ab_render_one_cell() {
             Progress::Decoding => decoding_at = Some(Instant::now()),
             Progress::Loading(_)
             | Progress::PromptUpsamplingComplete
+            | Progress::PromptEncodingComplete
             | Progress::ConditioningComplete
             | Progress::Upsampling { .. } => {}
         })
