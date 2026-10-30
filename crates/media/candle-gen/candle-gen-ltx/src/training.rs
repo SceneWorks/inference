@@ -1062,6 +1062,8 @@ fn apply_modality_conditioning(
 /// them; concatenating their own RoPE positions is the bit that prevents a reference from merely
 /// replacing arbitrary target tokens.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn append_active_reference(
     plan: &ModalityConditioningPlan,
     condition_tensors: &HashMap<String, Tensor>,
@@ -1072,6 +1074,32 @@ fn append_active_reference(
     target: Tensor,
     loss: Tensor,
     positions: Tensor,
+) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    append_active_reference_with_positions(
+        plan,
+        condition_tensors,
+        condition_positions,
+        seed,
+        sample_index,
+        input,
+        target,
+        loss,
+        positions,
+        None,
+    )
+}
+
+fn append_active_reference_with_positions(
+    plan: &ModalityConditioningPlan,
+    condition_tensors: &HashMap<String, Tensor>,
+    condition_positions: &HashMap<String, Tensor>,
+    seed: u64,
+    sample_index: u64,
+    input: Tensor,
+    target: Tensor,
+    loss: Tensor,
+    positions: Tensor,
+    prepared_positions: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
     let active = plan
         .conditions
@@ -1122,7 +1150,10 @@ fn append_active_reference(
         Tensor::cat(&[&input, reference], 1)?,
         Tensor::cat(&[&target, &zeros], 1)?,
         Tensor::cat(&[&loss, &zero_loss], 1)?,
-        Tensor::cat(&[&positions, reference_positions], 2)?,
+        match prepared_positions {
+            Some(positions) => positions.clone(),
+            None => Tensor::cat(&[&positions, reference_positions], 2)?,
+        },
     ))
 }
 
@@ -1292,6 +1323,7 @@ pub struct AvTrainingExample {
     condition_tensors: HashMap<String, Tensor>,
     condition_positions: HashMap<String, Tensor>,
     positions: AvTrainingPositions,
+    prepared_positions: Option<AvTrainingPositions>,
     video_geometry: Option<LtxTokenGeometry>,
     audio_geometry: Option<LtxTokenGeometry>,
     condition_seed: u64,
@@ -2760,7 +2792,8 @@ fn compute_av_step_loss_grads(
                    geometry: Option<LtxTokenGeometry>,
                    positions: Option<&Tensor>,
                    plan: &ModalityConditioningPlan,
-                   noise: Option<&Tensor>|
+                   noise: Option<&Tensor>,
+                   prepared_positions: Option<&Tensor>|
      -> Result<Option<ActiveModality>> {
         if !plan.present {
             // Presence is an executable routing control, not merely validation metadata.  An
@@ -2794,7 +2827,7 @@ fn compute_av_step_loss_grads(
             cached.condition_seed,
             cached.sample_index,
         )?;
-        let (input, target, loss_mask, positions) = append_active_reference(
+        let (input, target, loss_mask, positions) = append_active_reference_with_positions(
             plan,
             &cached.condition_tensors,
             &cached.condition_positions,
@@ -2804,6 +2837,7 @@ fn compute_av_step_loss_grads(
             target,
             loss_mask,
             positions.clone(),
+            prepared_positions,
         )?;
         // The flexible strategy's generated/loss mask is also the token-wise sigma multiplier:
         // intrinsic, clean/frozen, and appended reference tokens all remain at timestep zero.
@@ -2828,6 +2862,10 @@ fn compute_av_step_loss_grads(
         cached.positions.video.as_ref(),
         &cached.conditioning.video,
         video_noise,
+        cached
+            .prepared_positions
+            .as_ref()
+            .and_then(|p| p.video.as_ref()),
     )?;
     let audio = prepare(
         cached.audio_clean.as_ref(),
@@ -2836,6 +2874,10 @@ fn compute_av_step_loss_grads(
         cached.positions.audio.as_ref(),
         &cached.conditioning.audio,
         audio_noise,
+        cached
+            .prepared_positions
+            .as_ref()
+            .and_then(|p| p.audio.as_ref()),
     )?;
     for (name, modality) in [("video", video.as_ref()), ("audio", audio.as_ref())] {
         if let Some(modality) = modality {
@@ -3061,6 +3103,7 @@ pub(crate) fn production_masked_av_lifecycle(
         validation: LTX25_VALIDATION_DEFAULTS.into(),
     };
     let cached = AvTrainingExample {
+        prepared_positions: None,
         video_clean: video_present.then(|| video_clean.clone()),
         audio_clean: audio_present.then(|| audio_clean.clone()),
         video_context: video_present.then(|| video_context.clone()),
@@ -3557,6 +3600,7 @@ impl FlowMatchTrainer for LtxTrainer {
                         _ => Vec::new(),
                     };
                     cached.push(TrainingCached::Ltx25(Box::new(AvTrainingExample {
+                        prepared_positions: None,
                         video_clean: prepared.video_clean,
                         audio_clean: prepared.audio_clean,
                         video_context: conditioning.video.present.then_some(video_context),
@@ -3623,6 +3667,86 @@ impl FlowMatchTrainer for LtxTrainer {
                 Ok((cached, TrainingAux::Ltx25(aux), sample_plan))
             }
         }
+    }
+
+    fn prepare_training(
+        &self,
+        dit: &mut Self::Dit,
+        cache: &mut [Self::Cached],
+        _aux: &mut Self::Aux,
+        _req: &TrainingRequest,
+        _device: &Device,
+    ) -> Result<()> {
+        match dit {
+            TrainingDiT::Ltx23(dit) => {
+                dit.prepare_training()?;
+                for item in cache {
+                    if let TrainingCached::Ltx23 {
+                        context, positions, ..
+                    } = item
+                    {
+                        *context = context.to_dtype(DType::F32)?;
+                        dit.prepare_training_positions(positions)?;
+                    }
+                }
+            }
+            TrainingDiT::Ltx25(dit) => {
+                dit.prepare_training()?;
+                for item in cache {
+                    if let TrainingCached::Ltx25(example) = item {
+                        let effective = |base: Option<&Tensor>,
+                                         plan: &ModalityConditioningPlan|
+                         -> Result<Option<Tensor>> {
+                            let Some(base) = base else { return Ok(None) };
+                            let active =
+                                plan.conditions
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(ordinal, condition)| {
+                                        condition.reference
+                                            && condition_draw(
+                                                example.condition_seed,
+                                                example.sample_index,
+                                                *ordinal,
+                                            ) < condition.probability
+                                    });
+                            match active {
+                                Some((_, condition)) => {
+                                    let key = condition
+                                        .tensor_key
+                                        .as_deref()
+                                        .expect("validated reference key");
+                                    let reference =
+                                        example.condition_positions.get(key).ok_or_else(|| {
+                                            CandleError::Msg(format!(
+                                                "missing reference positions {key}"
+                                            ))
+                                        })?;
+                                    Ok(Some(Tensor::cat(&[base, reference], 2)?))
+                                }
+                                None => Ok(Some(base.clone())),
+                            }
+                        };
+                        let positions = AvTrainingPositions {
+                            video: effective(
+                                example.positions.video.as_ref(),
+                                &example.conditioning.video,
+                            )?,
+                            audio: effective(
+                                example.positions.audio.as_ref(),
+                                &example.conditioning.audio,
+                            )?,
+                        };
+                        dit.prepare_training_positions(
+                            positions.video.as_ref(),
+                            positions.audio.as_ref(),
+                        )?;
+                        example.prepared_positions = Some(positions);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn build_dit(&self, _req: &TrainingRequest, device: &Device) -> Result<TrainingDiT> {
@@ -5480,6 +5604,7 @@ mod ltx25_depth_anchoring_tests {
         let loss = loss.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let depth_frames = select_depth_frames(&loss, GEOM.frames, GEOM.height * GEOM.width, 2);
         let example = AvTrainingExample {
+            prepared_positions: None,
             video_clean: Some(video_clean),
             audio_clean: with_audio.then(|| audio_clean.clone()),
             video_context: Some(context.clone()),

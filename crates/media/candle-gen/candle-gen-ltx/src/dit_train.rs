@@ -10,13 +10,13 @@
 //! attention uses composable [`softmax`] and `apply_rope_diff`. Both implement the same forward math;
 //! the zero-adapter parity tests compare this model with the inference AvDiT video reduction.
 
-use candle_gen::candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_gen::candle_core::{DType, Device, Module, Result, Tensor, TensorId, D};
 use candle_gen::candle_nn::{ops::sigmoid, ops::softmax, VarBuilder};
 use candle_gen::train::gradient_checkpoint::Segment;
 use candle_gen::train::lora::{LoraHost, LoraLinear};
 
 use crate::config::TransformerConfig;
-use crate::quant::{qlinear, QLinear};
+use crate::quant::{qlinear, QLinear, TrainingProjectionPacks};
 use crate::rope::precompute_split_freqs_nd;
 
 /// Default PEFT suffixes for every adapted attention projection.
@@ -45,11 +45,7 @@ fn gated(x: &Tensor, out: &Tensor, gate: &Tensor) -> Result<Tensor> {
 }
 
 fn rms_noweight(x: &Tensor, eps: f64) -> Result<Tensor> {
-    let xf = x.to_dtype(DType::F32)?.contiguous()?;
-    let inv = (xf.sqr()?.mean_keepdim(D::Minus1)? + eps)?
-        .sqrt()?
-        .recip()?;
-    xf.broadcast_mul(&inv)?.to_dtype(x.dtype())
+    candle_gen::train::norm::rms_normalize_f32(x, eps)?.to_dtype(x.dtype())
 }
 
 fn rms_weighted(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
@@ -103,6 +99,7 @@ fn apply_rope_diff(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 }
 
 struct TrainAttention {
+    packs: TrainingProjectionPacks,
     to_q: LoraLinear,
     to_k: LoraLinear,
     to_v: LoraLinear,
@@ -119,6 +116,7 @@ impl TrainAttention {
     fn load(vb: VarBuilder, heads: usize, dim_head: usize, eps: f64) -> Result<Self> {
         let inner = heads * dim_head;
         Ok(Self {
+            packs: TrainingProjectionPacks::default(),
             to_q: lora_linear(&vb, "to_q", inner, inner)?,
             to_k: lora_linear(&vb, "to_k", inner, inner)?,
             to_v: lora_linear(&vb, "to_v", inner, inner)?,
@@ -130,6 +128,17 @@ impl TrainAttention {
             dim_head,
             eps,
         })
+    }
+
+    fn prepare_training(&mut self, self_attention: bool) -> Result<()> {
+        self.packs = TrainingProjectionPacks::prepare(
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+            self.gate.lora_mut(),
+            self_attention,
+        )?;
+        Ok(())
     }
 
     fn visit_lora_mut(
@@ -155,14 +164,16 @@ impl TrainAttention {
         context: Option<&Tensor>,
         rope: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
-        let ctx = context.unwrap_or(x);
-        let q = rms_weighted(&self.to_q.forward(x)?.contiguous()?, &self.q_norm, self.eps)?;
-        let k = rms_weighted(
-            &self.to_k.forward(ctx)?.contiguous()?,
-            &self.k_norm,
-            self.eps,
+        let (q, k, v, gate_logits) = self.packs.forward(
+            x,
+            context,
+            &self.to_q,
+            &self.to_k,
+            &self.to_v,
+            self.gate.lora(),
         )?;
-        let v = self.to_v.forward(ctx)?;
+        let q = rms_weighted(&q.contiguous()?, &self.q_norm, self.eps)?;
+        let k = rms_weighted(&k.contiguous()?, &self.k_norm, self.eps)?;
         let mut q = self.to_heads(&q)?;
         let mut k = self.to_heads(&k)?;
         let v = self.to_heads(&v)?;
@@ -190,7 +201,11 @@ impl TrainAttention {
             .transpose(1, 2)?
             .reshape((b, s, inner))?
             .to_dtype(x.dtype())?;
-        let gates = (sigmoid(&self.gate.forward(x)?)? * 2.0)?.reshape((b, s, self.heads, 1))?;
+        let logits = match gate_logits {
+            Some(logits) => logits,
+            None => self.gate.forward(x)?,
+        };
+        let gates = (sigmoid(&logits)? * 2.0)?.reshape((b, s, self.heads, 1))?;
         out = out
             .reshape((b, s, self.heads, self.dim_head))?
             .broadcast_mul(&gates)?
@@ -320,6 +335,7 @@ pub struct LtxDiT {
     cfg: TransformerConfig,
     device: Device,
     dtype: DType,
+    training_rope: Vec<(TensorId, Tensor, Tensor)>,
 }
 
 impl LtxDiT {
@@ -344,7 +360,35 @@ impl LtxDiT {
             cfg: cfg.clone(),
             device: vb.device().clone(),
             dtype: vb.dtype(),
+            training_rope: Vec::new(),
         })
+    }
+
+    pub(crate) fn prepare_training(&mut self) -> Result<()> {
+        for block in &mut self.blocks {
+            block.attn1.prepare_training(true)?;
+            block.attn2.prepare_training(false)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_training_positions(&mut self, positions: &Tensor) -> Result<()> {
+        if !self
+            .training_rope
+            .iter()
+            .any(|(id, _, _)| *id == positions.id())
+        {
+            let (cos, sin) = precompute_split_freqs_nd(
+                positions,
+                self.cfg.inner_dim(),
+                self.cfg.rope_theta,
+                &self.cfg.rope_max_pos,
+                self.cfg.num_heads,
+                &self.device,
+            )?;
+            self.training_rope.push((positions.id(), cos, sin));
+        }
+        Ok(())
     }
 
     /// Dense composition of pre-main, all block segments, and the velocity head.
@@ -381,14 +425,21 @@ impl LtxDiT {
         let (prompt_ts, _) = self
             .prompt_adaln
             .forward(&ts_flat, &self.device, self.dtype)?;
-        let (cos, sin) = precompute_split_freqs_nd(
-            positions,
-            inner,
-            self.cfg.rope_theta,
-            &self.cfg.rope_max_pos,
-            self.cfg.num_heads,
-            &self.device,
-        )?;
+        let (cos, sin) = match self
+            .training_rope
+            .iter()
+            .find(|(id, _, _)| *id == positions.id())
+        {
+            Some((_, cos, sin)) => (cos.clone(), sin.clone()),
+            None => precompute_split_freqs_nd(
+                positions,
+                inner,
+                self.cfg.rope_theta,
+                &self.cfg.rope_max_pos,
+                self.cfg.num_heads,
+                &self.device,
+            )?,
+        };
         Ok((
             self.patchify.forward(&latent.to_dtype(self.dtype)?)?,
             MainCtx {
@@ -1049,6 +1100,20 @@ pub(crate) mod tests {
                 .unwrap();
         }
         let (latent, context, positions) = inputs(&dev);
+        let reference_loss = model
+            .forward(&latent, 0.37, &context, &positions)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .mean_all()
+            .unwrap();
+        let reference_grads = reference_loss.backward().unwrap();
+        model.prepare_training().unwrap();
+        model.prepare_training_positions(&positions).unwrap();
+        assert!(model
+            .blocks
+            .iter()
+            .all(|block| block.attn1.packs.active() && block.attn2.packs.active()));
         let (hidden, ctx) = model
             .forward_pre_main(&latent, 0.37, &context, &positions)
             .unwrap();
@@ -1068,6 +1133,18 @@ pub(crate) mod tests {
             let grad = grads
                 .get(var.as_tensor())
                 .unwrap_or_else(|| panic!("LoRA factor {i} has no gradient"));
+            let error = (grad - reference_grads.get(var.as_tensor()).unwrap())
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                error < 1e-4,
+                "prepared/fused/checkpoint factor {i} gradient {error}"
+            );
             let max = grad
                 .abs()
                 .unwrap()
@@ -1127,6 +1204,29 @@ pub(crate) mod tests {
         let (video, video_context, video_positions) = inputs(&dev);
         let audio = Tensor::randn(0f32, 1f32, (1, 2, 8), &dev).unwrap();
         let audio_positions = crate::rope::create_audio_position_grid(2, &dev).unwrap();
+        for var in &set.vars {
+            var.set(&Tensor::randn(0f32, 0.03f32, var.dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let reference = model
+            .forward(
+                &video,
+                &audio,
+                0.37,
+                &video_context,
+                &video_context,
+                &video_positions,
+                &audio_positions,
+            )
+            .unwrap();
+        let reference_loss = (reference.0.sqr().unwrap().mean_all().unwrap()
+            + reference.1.sqr().unwrap().mean_all().unwrap())
+        .unwrap();
+        let reference_grads = reference_loss.backward().unwrap();
+        model.prepare_training().unwrap();
+        model
+            .prepare_training_positions(Some(&video_positions), Some(&audio_positions))
+            .unwrap();
         let (video_velocity, audio_velocity) = model
             .forward(
                 &video,
@@ -1138,6 +1238,23 @@ pub(crate) mod tests {
                 &audio_positions,
             )
             .unwrap();
+        for (expected, actual) in [
+            (&reference.0, &video_velocity),
+            (&reference.1, &audio_velocity),
+        ] {
+            let error = (expected - actual)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                error < 1e-5,
+                "AV prepared projection/geometry parity {error}"
+            );
+        }
         let loss = (video_velocity
             .to_dtype(DType::F32)
             .unwrap()
@@ -1160,6 +1277,36 @@ pub(crate) mod tests {
                 .any(|var| grads.get(var.as_tensor()).is_some()),
             "AV loss must reach installed LoRA factors"
         );
+        let mut qk_factors = 0;
+        for (name, var) in set.named_vars() {
+            if name.contains(".to_q.") || name.contains(".to_k.") {
+                let grad = grads
+                    .get(var.as_tensor())
+                    .unwrap_or_else(|| panic!("{name}: missing Q/K RMS/RoPE/softmax gradient"));
+                let magnitude = grad
+                    .abs()
+                    .unwrap()
+                    .max_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                assert!(
+                    magnitude.is_finite() && magnitude > 0.0,
+                    "{name}: {magnitude}"
+                );
+                let error = (grad - reference_grads.get(var.as_tensor()).unwrap())
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                assert!(error < 1e-4, "{name}: packed Q/K gradient {error}");
+                qk_factors += 1;
+            }
+        }
+        assert!(qk_factors >= 24, "both factors of Q/K in six AV attentions");
         // Enter the real training loss/mask path, not just a sibling AV forward. This protects
         // first-frame conditioning, active-modality normalization and QLoRA backward together.
         let (masked_loss, masked_grads) = crate::training::production_masked_av_lifecycle(

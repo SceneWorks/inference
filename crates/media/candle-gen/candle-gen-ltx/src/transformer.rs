@@ -17,7 +17,7 @@ use candle_gen::candle_nn::{ops::rms_norm, ops::sigmoid, ops::softmax_last_dim, 
 use candle_gen::gen_core::CancelFlag;
 
 use crate::config::AvConfig;
-use crate::quant::{qlinear, QLinear};
+use crate::quant::{qlinear, QLinear, TrainingProjectionPacks};
 use crate::rope::{apply_split_rope, precompute_split_freqs_nd, time_axis};
 use candle_gen::train::lora::{LoraHost, LoraLinear};
 
@@ -106,6 +106,7 @@ fn ada_values(table: &Tensor, ts_emb: &Tensor, lo: usize, hi: usize) -> Result<V
 }
 
 struct Attention {
+    training_packs: TrainingProjectionPacks,
     to_q: QLinear,
     to_k: QLinear,
     to_v: QLinear,
@@ -131,6 +132,7 @@ impl Attention {
     /// (heads 32 × head_dim 64 = 2048), and the q/kv input dims ride on the loaded weight shapes.
     fn load_with_dims(vb: VarBuilder, heads: usize, dim_head: usize, eps: f64) -> Result<Self> {
         Ok(Self {
+            training_packs: TrainingProjectionPacks::default(),
             to_q: linear(&vb, "to_q")?,
             to_k: linear(&vb, "to_k")?,
             to_v: linear(&vb, "to_v")?,
@@ -143,6 +145,18 @@ impl Attention {
             eps,
             attn_budget: candle_gen::ATTN_SCORES_BUDGET,
         })
+    }
+
+    fn prepare_training(&mut self, self_attention: bool) -> Result<()> {
+        if let (Some(q), Some(k), Some(v)) = (
+            self.to_q.lora_mut(),
+            self.to_k.lora_mut(),
+            self.to_v.lora_mut(),
+        ) {
+            self.training_packs =
+                TrainingProjectionPacks::prepare(q, k, v, self.gate.lora_mut(), self_attention)?;
+        }
+        Ok(())
     }
 
     /// Select ladder rung 3's score budget for this attention.
@@ -205,18 +219,34 @@ impl Attention {
         k_rope: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
         let ctx = context.unwrap_or(x);
-        // q/k RMSNorm over the full inner dim (pre-head), then head reshape.
-        let q = rms_norm(
-            &self.to_q.forward(x)?.contiguous()?,
-            &self.q_norm,
-            self.eps as f32,
-        )?;
-        let k = rms_norm(
-            &self.to_k.forward(ctx)?.contiguous()?,
-            &self.k_norm,
-            self.eps as f32,
-        )?;
-        let v = self.to_v.forward(ctx)?;
+        let (q, k, v, gate_logits) = if self.training_packs.active() {
+            self.training_packs.forward(
+                x,
+                context,
+                self.to_q.lora().unwrap(),
+                self.to_k.lora().unwrap(),
+                self.to_v.lora().unwrap(),
+                self.gate.lora(),
+            )?
+        } else {
+            (
+                self.to_q.forward(x)?,
+                self.to_k.forward(ctx)?,
+                self.to_v.forward(ctx)?,
+                None,
+            )
+        };
+        // Keep the activation cast before weighting, matching the fused RMS forward's
+        // half-precision rounding. A tracked projection must retain its upstream graph.
+        let normalize = |x: &Tensor, weight: &Tensor| -> Result<Tensor> {
+            if x.track_op() || weight.track_op() {
+                candle_gen::train::norm::rms_norm_cast_before_weight(x, weight, self.eps)
+            } else {
+                rms_norm(&x.contiguous()?, weight, self.eps as f32)
+            }
+        };
+        let q = normalize(&q, &self.q_norm)?;
+        let k = normalize(&k, &self.k_norm)?;
         let mut qh = self.to_heads(&q)?;
         let mut kh = self.to_heads(&k)?;
         let vh = self.to_heads(&v)?;
@@ -241,7 +271,13 @@ impl Attention {
             &vf,
             scale,
             None,
-            softmax_last_dim,
+            |scores| {
+                if scores.track_op() {
+                    candle_gen::candle_nn::ops::softmax(scores, D::Minus1)
+                } else {
+                    softmax_last_dim(scores)
+                }
+            },
             self.attn_budget,
         )?; // (b,h,s,d)
         let (b, s, _) = x.dims3()?;
@@ -251,7 +287,10 @@ impl Attention {
             .reshape((b, s, inner))?
             .to_dtype(x.dtype())?;
         // Per-head gate: 2·sigmoid(logits) (zero-init → identity).
-        let logits = self.gate.forward(x)?;
+        let logits = match gate_logits {
+            Some(logits) => logits,
+            None => self.gate.forward(x)?,
+        };
         let gates = (sigmoid(&logits)? * 2.0)?.reshape((b, s, self.heads, 1))?;
         out = out
             .reshape((b, s, self.heads, self.dim_head))?
@@ -1134,6 +1173,15 @@ impl AvBlocks {
     }
 }
 
+struct TrainingRopeTable {
+    positions: TensorIdentity,
+    dim: usize,
+    heads: usize,
+    max_pos: Vec<i32>,
+    cos: Tensor,
+    sin: Tensor,
+}
+
 pub struct AvDiT {
     video: AvStream,
     audio: AvStream,
@@ -1148,9 +1196,114 @@ pub struct AvDiT {
     cfg: AvConfig,
     device: Device,
     load_id: u64,
+    training_rope: Option<std::sync::Mutex<Vec<TrainingRopeTable>>>,
 }
 
 impl AvDiT {
+    pub(crate) fn prepare_training(&mut self) -> Result<()> {
+        let AvBlocks::Resident(blocks) = &mut self.blocks else {
+            candle_gen::candle_core::bail!("LTX training requires resident blocks");
+        };
+        for block in blocks {
+            block.attn1.prepare_training(true)?;
+            block.a_attn1.prepare_training(true)?;
+            for attention in [
+                &mut block.attn2,
+                &mut block.a_attn2,
+                &mut block.a2v,
+                &mut block.v2a,
+            ] {
+                attention.prepare_training(false)?;
+            }
+        }
+        self.training_rope = Some(std::sync::Mutex::new(Vec::new()));
+        Ok(())
+    }
+
+    pub(crate) fn prepare_training_positions(
+        &self,
+        video: Option<&Tensor>,
+        audio: Option<&Tensor>,
+    ) -> Result<()> {
+        for (positions, dim, heads, max_pos) in [
+            (
+                video,
+                self.cfg.video.inner_dim(),
+                self.cfg.video.num_heads,
+                self.cfg.video.rope_max_pos.to_vec(),
+            ),
+            (
+                video,
+                self.cfg.cross_inner,
+                self.cfg.video.num_heads,
+                vec![self.cfg.cross_max_pos],
+            ),
+            (
+                audio,
+                self.cfg.audio_inner(),
+                self.cfg.audio_heads,
+                vec![self.cfg.audio_max_pos],
+            ),
+            (
+                audio,
+                self.cfg.cross_inner,
+                self.cfg.audio_heads,
+                vec![self.cfg.cross_max_pos],
+            ),
+        ] {
+            if let Some(positions) = positions {
+                self.training_freqs(
+                    positions,
+                    dim,
+                    self.cfg.video.rope_theta,
+                    &max_pos,
+                    heads,
+                    &self.device,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn training_freqs(
+        &self,
+        positions: &Tensor,
+        dim: usize,
+        theta: f64,
+        max_pos: &[i32],
+        heads: usize,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        let mut cache = self.training_rope.as_ref().map(candle_gen::lock_recover);
+        if let Some(cache) = &cache {
+            if let Some(entry) = cache.iter().find(|entry| {
+                entry.positions.matches(positions)
+                    && entry.dim == dim
+                    && entry.heads == heads
+                    && entry.max_pos == max_pos
+            }) {
+                return Ok((entry.cos.clone(), entry.sin.clone()));
+            }
+        }
+        let effective = if max_pos.len() == 1 && positions.dim(1)? != 1 {
+            time_axis(positions)?
+        } else {
+            positions.clone()
+        };
+        let (cos, sin) = precompute_split_freqs_nd(&effective, dim, theta, max_pos, heads, device)?;
+        if let Some(cache) = &mut cache {
+            cache.push(TrainingRopeTable {
+                positions: TensorIdentity::new(positions),
+                dim,
+                heads,
+                max_pos: max_pos.to_vec(),
+                cos: cos.clone(),
+                sin: sin.clone(),
+            });
+        }
+        Ok((cos, sin))
+    }
+
     /// Build from a VarBuilder rooted at `model.diffusion_model.`.
     pub fn new(vb: VarBuilder, cfg: &AvConfig) -> Result<Self> {
         let (device, video, audio) = Self::streams(&vb, cfg)?;
@@ -1172,6 +1325,7 @@ impl AvDiT {
             cfg: cfg.clone(),
             device,
             load_id: next_avdit_load_id(),
+            training_rope: None,
         })
     }
 
@@ -1227,6 +1381,7 @@ impl AvDiT {
             cfg: cfg.clone(),
             device,
             load_id: next_avdit_load_id(),
+            training_rope: None,
         })
     }
 
@@ -1381,7 +1536,7 @@ impl AvDiT {
         let device = &self.device;
         let theta = self.cfg.video.rope_theta;
         // Self RoPE (video 3-axis @4096, audio 1-axis @2048) + cross RoPE (time axis @2048 both).
-        let (v_cos, v_sin) = precompute_split_freqs_nd(
+        let (v_cos, v_sin) = self.training_freqs(
             video_grid,
             self.cfg.video.inner_dim(),
             theta,
@@ -1389,15 +1544,15 @@ impl AvDiT {
             self.cfg.video.num_heads,
             device,
         )?;
-        let (vc_cos, vc_sin) = precompute_split_freqs_nd(
-            &time_axis(video_grid)?,
+        let (vc_cos, vc_sin) = self.training_freqs(
+            video_grid,
             self.cfg.cross_inner,
             theta,
             &[self.cfg.cross_max_pos],
             self.cfg.video.num_heads,
             device,
         )?;
-        let (a_cos, a_sin) = precompute_split_freqs_nd(
+        let (a_cos, a_sin) = self.training_freqs(
             audio_grid,
             self.cfg.audio_inner(),
             theta,
@@ -1405,8 +1560,8 @@ impl AvDiT {
             self.cfg.audio_heads,
             device,
         )?;
-        let (ac_cos, ac_sin) = precompute_split_freqs_nd(
-            &time_axis(audio_grid)?,
+        let (ac_cos, ac_sin) = self.training_freqs(
+            audio_grid,
             self.cfg.cross_inner,
             theta,
             &[self.cfg.cross_max_pos],
@@ -1838,7 +1993,7 @@ impl AvDiT {
             b,
             &self.device,
         )?;
-        let (v_cos, v_sin) = precompute_split_freqs_nd(
+        let (v_cos, v_sin) = self.training_freqs(
             video_grid,
             self.cfg.video.inner_dim(),
             self.cfg.video.rope_theta,
@@ -1924,7 +2079,7 @@ impl AvDiT {
             b,
             &self.device,
         )?;
-        let (a_cos, a_sin) = precompute_split_freqs_nd(
+        let (a_cos, a_sin) = self.training_freqs(
             audio_grid,
             self.cfg.audio_inner(),
             self.cfg.video.rope_theta,
@@ -1991,7 +2146,7 @@ impl AvDiT {
             self.cfg.video.timestep_scale_multiplier,
             &self.device,
         )?;
-        let (a_cos, a_sin) = precompute_split_freqs_nd(
+        let (a_cos, a_sin) = self.training_freqs(
             audio_grid,
             self.cfg.audio_inner(),
             self.cfg.video.rope_theta,
@@ -2084,7 +2239,7 @@ impl AvDiT {
             self.cfg.video.timestep_scale_multiplier,
             &self.device,
         )?;
-        let (v_cos, v_sin) = precompute_split_freqs_nd(
+        let (v_cos, v_sin) = self.training_freqs(
             video_grid,
             self.cfg.video.inner_dim(),
             self.cfg.video.rope_theta,
