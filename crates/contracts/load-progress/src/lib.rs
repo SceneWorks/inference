@@ -198,6 +198,15 @@ impl LoadActivityContext {
             .consumed
             .retain(|(_, p), _| p != &path);
     }
+    /// Start a new source lifetime for one phase without erasing another phase's counters.
+    pub fn reset_file_phase(&self, path: impl AsRef<Path>, phase: LoadActivityPhase) {
+        let path = absolute(path.as_ref());
+        self.request
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .consumed
+            .remove(&(phase, path));
+    }
     pub fn report(&self, activity: Option<LoadActivity>) {
         let _emission = self.emission.lock().unwrap_or_else(|e| e.into_inner());
         let observer = self

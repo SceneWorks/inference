@@ -654,14 +654,7 @@ pub fn encoding_is_supported(encoding: WeightEncoding) -> bool {
 fn load_planned_file(path: &Path) -> Result<HashMap<String, Array>> {
     // Keep the shared contiguous/full-coverage validation: native MLX alone accepts overlapping
     // or gapped ranges. This is a header read, never crediting the untouched tensor payload.
-    let check = gen_core::LoadActivityScope::file(
-        gen_core::LoadActivityPhase::Checking,
-        path,
-        Some(std::fs::metadata(path)?.len()),
-    );
-    let layout = gen_core::safetensors_file_tensor_locations(path)?;
-    check.update(layout.data_start);
-    check.finish();
+    gen_core::safetensors_file_tensor_locations(path)?;
     let arrays = Weights::from_file(path)?.into_tensors();
     #[cfg(feature = "model-inference-proof")]
     gen_core::model_input_proof::record_reader_paths(

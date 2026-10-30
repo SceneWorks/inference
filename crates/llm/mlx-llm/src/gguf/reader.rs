@@ -192,6 +192,19 @@ impl AsRef<[u8]> for Backing {
 impl GgufFile {
     /// Read and parse a `.gguf` file from disk.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_header_phase(path, load_progress::LoadActivityPhase::Loading)
+    }
+
+    /// Inspect a file's metadata without labelling the header as tensor materialization.
+    /// If tensor data is subsequently requested, it still reports Loading for those ranges.
+    pub fn open_metadata(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_header_phase(path, load_progress::LoadActivityPhase::Checking)
+    }
+
+    fn open_with_header_phase(
+        path: impl AsRef<Path>,
+        phase: load_progress::LoadActivityPhase,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let file = std::fs::File::open(path)
             .map_err(|e| Error::Msg(format!("gguf: open {}: {e}", path.display())))?;
@@ -200,7 +213,7 @@ impl GgufFile {
         let mmap = unsafe { Mmap::map(&file) }
             .map_err(|e| Error::Msg(format!("gguf: mmap {}: {e}", path.display())))?;
         crate::__model_input_result!(
-            Self::parse_backing(Backing::Mapped(mmap), Some(path)),
+            Self::parse_backing(Backing::Mapped(mmap), Some(path), phase),
             "mlx-llm::gguf::GgufFile::open",
             TensorInput,
             &[path]
@@ -209,13 +222,26 @@ impl GgufFile {
 
     /// Parse an in-memory GGUF image.
     pub fn parse(bytes: Vec<u8>) -> Result<Self> {
-        Self::parse_backing(Backing::Owned(bytes), None)
+        Self::parse_backing(
+            Backing::Owned(bytes),
+            None,
+            load_progress::LoadActivityPhase::Loading,
+        )
     }
 
-    fn parse_backing(bytes: Backing, path: Option<&Path>) -> Result<Self> {
+    fn parse_backing(
+        bytes: Backing,
+        path: Option<&Path>,
+        phase: load_progress::LoadActivityPhase,
+    ) -> Result<Self> {
         let raw = bytes.as_ref();
-        let progress = path
-            .map(|path| load_progress::reader::SourceProgress::new(path, Some(raw.len() as u64)));
+        let progress = path.map(|path| {
+            load_progress::reader::SourceProgress::new_with_phase(
+                path,
+                Some(raw.len() as u64),
+                phase,
+            )
+        });
         let operation = progress.as_ref().map(|p| p.operation());
         let mut c = Cursor::new(raw);
         c.progress = operation.as_ref();
@@ -300,6 +326,14 @@ impl GgufFile {
             ));
         }
 
+        drop(operation);
+        let progress = if phase == load_progress::LoadActivityPhase::Loading {
+            progress
+        } else {
+            path.map(|path| {
+                load_progress::reader::SourceProgress::new(path, Some(raw.len() as u64))
+            })
+        };
         Ok(Self {
             metadata,
             tensors,
@@ -459,6 +493,45 @@ mod tests {
     /// Build a minimal valid GGUF image in memory: two metadata entries (a string and a u32) and
     /// one f32 tensor `[2, 3]`, then assert the parser recovers all of it including the reversed
     /// (torch-order) shape and the correctly-aligned tensor data.
+    #[test]
+    fn metadata_probe_checks_header_and_never_credits_unread_tensor_payload() {
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        let bytes = header_with(&[2], None);
+        std::fs::write(&path, &bytes).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let _observer = load_progress::LoadActivityObserver::new(move |event| {
+            output.lock().unwrap().push(event)
+        });
+        let file = GgufFile::open_metadata(&path).unwrap();
+        {
+            let events = events.lock().unwrap();
+            assert!(events
+                .iter()
+                .flatten()
+                .all(|event| event.phase == load_progress::LoadActivityPhase::Checking));
+            assert!(events
+                .iter()
+                .flatten()
+                .all(|event| event.bytes_read < bytes.len() as u64));
+            assert_eq!(events.last(), Some(&None));
+        }
+        events.lock().unwrap().clear();
+        assert_eq!(file.tensor_data(&file.tensors[0]).unwrap().len(), 8);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.iter().flatten().map(|event| event.bytes_read).max(),
+            Some(8)
+        );
+        assert!(events
+            .iter()
+            .flatten()
+            .all(|event| event.phase == load_progress::LoadActivityPhase::Loading));
+        assert_eq!(events.last(), Some(&None));
+    }
+
     #[test]
     fn parse_minimal_gguf_roundtrip() {
         let mut b: Vec<u8> = Vec::new();

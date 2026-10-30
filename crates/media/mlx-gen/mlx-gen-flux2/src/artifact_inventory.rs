@@ -224,8 +224,13 @@ fn tensor_content_sha256(file: &Path, id: &Identity) -> CoreResult<String> {
     layout
         .tensors
         .sort_by(|a, b| a.header.name.cmp(&b.header.name));
-    let mut reader =
-        BufReader::new(std::fs::File::open(file).map_err(|e| CoreError::Msg(e.to_string()))?);
+    let mut reader = BufReader::new(
+        mlx_gen::gen_core::load_activity::reader::open_with_phase(
+            file,
+            mlx_gen::gen_core::LoadActivityPhase::Verifying,
+        )
+        .map_err(|e| CoreError::Msg(e.to_string()))?,
+    );
     let mut hash = Sha256::new();
     hash.update(b"flux2-true-v2-tensors-v1\0");
     let mut buffer = vec![0u8; 1024 * 1024];

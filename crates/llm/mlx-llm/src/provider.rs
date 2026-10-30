@@ -5917,15 +5917,17 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 pub fn can_load(spec: &LoadSpec) -> bool {
     let dir = Path::new(&spec.source);
     if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
-        let language_is_prism = crate::gguf::GgufFile::open(dir).ok().is_some_and(|g| {
-            g.meta_str("general.architecture") == Some("qwen35")
-                && g.meta("prism.hadamard.version").is_some()
-        });
+        let language_is_prism = crate::gguf::GgufFile::open_metadata(dir)
+            .ok()
+            .is_some_and(|g| {
+                g.meta_str("general.architecture") == Some("qwen35")
+                    && g.meta("prism.hadamard.version").is_some()
+            });
         if !language_is_prism {
             return false;
         }
         return spec.projector_source.as_deref().is_none_or(|source| {
-            crate::gguf::GgufFile::open(source)
+            crate::gguf::GgufFile::open_metadata(source)
                 .ok()
                 .is_some_and(|projector| crate::prism_vision_gguf::validate(&projector).is_ok())
         });

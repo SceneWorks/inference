@@ -89,17 +89,20 @@ pub fn read_control_scalar_f32(path: &std::path::Path, key: &str) -> Result<f32>
         .iter()
         .find(|location| location.header.name == key)
         .ok_or_else(|| Error::Msg(format!("missing adapter alpha control {key}")))?;
-    let mut file = std::fs::File::open(path)?;
+    let mut file = gen_core::load_activity::reader::open_with_phase(
+        path,
+        gen_core::LoadActivityPhase::Checking,
+    )?;
     read_control_scalar_f32_at(&mut file, location, layout.file_len)
 }
 
 fn read_control_scalar_f32_at(
-    file: &mut std::fs::File,
+    file: &mut (impl std::io::Read + std::io::Seek),
     location: &gen_core::weightsmeta::SafetensorsTensorLocation,
     file_len: u64,
 ) -> Result<f32> {
     use gen_core::weightsmeta::Dtype as S;
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::SeekFrom;
     let key = &location.header.name;
     if key != "alpha" && !key.ends_with(".alpha") {
         return Err(Error::Unsupported(

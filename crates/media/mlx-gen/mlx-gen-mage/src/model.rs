@@ -1204,7 +1204,11 @@ fn verify_checkpoint_identity(
     let path = root
         .join("transformer")
         .join("diffusion_pytorch_model.safetensors");
-    let mut file = std::fs::File::open(&path).map_err(|error| {
+    let mut file = mlx_gen::gen_core::load_activity::reader::open_with_phase(
+        &path,
+        mlx_gen::gen_core::LoadActivityPhase::Checking,
+    )
+    .map_err(|error| {
         Error::Msg(format!(
             "{id}: cannot open transformer checkpoint {}: {error}",
             path.display()
@@ -1260,6 +1264,7 @@ fn verify_checkpoint_identity(
     }
     file.seek(SeekFrom::Start(8 + header_len + start))?;
     let mut bytes = vec![0u8; identity_bytes];
+    file.set_phase(mlx_gen::gen_core::LoadActivityPhase::Verifying);
     file.read_exact(&mut bytes)?;
     let got = format!("{:x}", Sha256::digest(bytes));
     if got != expected_sha256 {
@@ -1910,6 +1915,62 @@ mage_memory_registration!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Identity verification reads and hashes source bytes; it constructs no model or arrays.
+    #[test]
+    fn checkpoint_identity_reports_header_checks_then_only_actual_hash_bytes() {
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("transformer")).unwrap();
+        let path = dir
+            .path()
+            .join("transformer/diffusion_pytorch_model.safetensors");
+        let header = br#"{"identity":{"dtype":"BF16","shape":[4],"data_offsets":[0,8]}}"#;
+        let payload = [0u8; 8];
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&payload);
+        std::fs::write(path, &bytes).unwrap();
+        let digest = format!("{:x}", Sha256::digest(payload));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let _observer = mlx_gen::gen_core::LoadActivityObserver::new(move |event| {
+            output.lock().unwrap().push(event)
+        });
+        verify_checkpoint_identity(
+            dir.path(),
+            MageVariant::Base,
+            "fixture",
+            "identity",
+            8,
+            &[4],
+            &digest,
+        )
+        .unwrap();
+        let events = events.lock().unwrap();
+        for (phase, expected) in [
+            (
+                mlx_gen::gen_core::LoadActivityPhase::Checking,
+                8 + header.len() as u64,
+            ),
+            (mlx_gen::gen_core::LoadActivityPhase::Verifying, 8),
+        ] {
+            assert_eq!(
+                events
+                    .iter()
+                    .flatten()
+                    .filter(|event| event.phase == phase)
+                    .map(|event| event.bytes_read)
+                    .max(),
+                Some(expected)
+            );
+        }
+        assert!(!events
+            .iter()
+            .flatten()
+            .any(|event| event.phase == mlx_gen::gen_core::LoadActivityPhase::Loading));
+        assert_eq!(events.last(), Some(&None));
+    }
 
     #[cfg(unix)]
     #[test]

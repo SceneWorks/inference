@@ -94,11 +94,22 @@ impl Asset {
         })
     }
     pub(crate) fn bytes(&self) -> Result<Vec<u8>> {
+        self.read_bytes(false)
+    }
+    fn weight_bytes(&self) -> Result<Vec<u8>> {
+        self.read_bytes(true)
+    }
+    fn read_bytes(&self, weights: bool) -> Result<Vec<u8>> {
         self.pin.read_unchanged(|path| {
-            let bytes = mlx_gen::gen_core::load_activity::reader::read(path)?;
+            let (bytes, actual): (Vec<u8>, [u8; 32]) = if weights {
+                mlx_gen::gen_core::weightsmeta::read_hashed_file(path)?
+            } else {
+                let bytes = std::fs::read(path)?;
+                let digest = Sha256::digest(&bytes).into();
+                (bytes, digest)
+            };
             #[cfg(feature = "test-support")]
             if let Some(expected) = self.fixture_digest {
-                let actual = Sha256::digest(&bytes);
                 if actual[..] != expected[..] || actual[..] != self.pin.content_sha256()[..] {
                     return Err(Error::Unsupported(
                         "synthetic fixture consumed bytes changed".into(),
@@ -111,7 +122,11 @@ impl Asset {
             let expected = moss_image_asset(self.repo, self.revision, &self.relative)
                 .ok_or_else(|| Error::Unsupported("unknown MOSS byte identity".into()))?;
             if bytes.len() as u64 != expected.bytes
-                || format!("{:x}", Sha256::digest(&bytes)) != expected.sha256
+                || actual
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+                    != expected.sha256
             {
                 return Err(Error::Unsupported(format!(
                     "consumed MOSS bytes mismatch: {}",
@@ -232,7 +247,10 @@ fn pinned_headers_with_check(
     check: &mut dyn FnMut() -> mlx_gen::gen_core::Result<()>,
 ) -> mlx_gen::gen_core::Result<Vec<SafetensorsTensorHeader>> {
     check_pin(pin, check)?;
-    let file = mlx_gen::gen_core::load_activity::reader::open(pin.loader_path())?;
+    let file = mlx_gen::gen_core::load_activity::reader::open_with_phase(
+        pin.loader_path(),
+        mlx_gen::gen_core::LoadActivityPhase::Checking,
+    )?;
     let parsed = checked_headers(
         file,
         pin.target_fingerprint().size,
@@ -820,7 +838,7 @@ pub(crate) fn read_weights<'a>(
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let bytes = asset.bytes()?;
+        let bytes = asset.weight_bytes()?;
         let meta = CheckpointMeta::from_bytes(bytes)?;
         let expected = match asset.role {
             MossImageAssetRole::DmdLora => Some(dmd_lora_shapes()),
@@ -921,7 +939,7 @@ mod cpu_tests {
     fn authenticated_owned_bytes_and_bounded_headers_report_shared_source_progress() {
         use std::sync::Arc;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("weights.safetensors");
+        let path = dir.path().join("renamed-weights");
         let bytes = header_fixture();
         std::fs::write(&path, &bytes).unwrap();
         let asset = Asset {
@@ -940,7 +958,7 @@ mod cpu_tests {
         let context = mlx_gen::gen_core::LoadActivityContext::capture()
             .with_components([(path.clone(), "transformer".to_owned())]);
         let _scope = context.install();
-        assert_eq!(asset.bytes().unwrap(), bytes);
+        assert_eq!(asset.weight_bytes().unwrap(), bytes);
         {
             let events = events.lock().unwrap();
             let reports: Vec<_> = events
@@ -966,7 +984,7 @@ mod cpu_tests {
             let reports: Vec<_> = events
                 .iter()
                 .flatten()
-                .filter(|event| event.phase == mlx_gen::gen_core::LoadActivityPhase::Loading)
+                .filter(|event| event.phase == mlx_gen::gen_core::LoadActivityPhase::Checking)
                 .collect();
             assert_eq!(
                 reports.iter().map(|event| event.bytes_read).max(),
@@ -976,7 +994,7 @@ mod cpu_tests {
         }
         std::fs::write(&path, b"changed").unwrap();
         assert!(
-            asset.bytes().is_err(),
+            asset.weight_bytes().is_err(),
             "the shared reader must retain pinned identity checks"
         );
     }

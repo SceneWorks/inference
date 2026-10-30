@@ -53,7 +53,10 @@ pub fn configured_adapter_facts(
         let mut control_file = None;
         let mut alpha_control = |key: &str| -> Result<f32> {
             if control_file.is_none() {
-                control_file = Some(std::fs::File::open(&spec.path)?);
+                control_file = Some(gen_core::load_activity::reader::open_with_phase(
+                    &spec.path,
+                    gen_core::LoadActivityPhase::Checking,
+                )?);
             }
             let location = locations
                 .get(key)

@@ -4,7 +4,7 @@
 //! dropping an operation clears its phase even on an error. Seeks and overlapping/repeated reads
 //! never inflate the unique source-byte count.
 use crate::{LoadActivityContext, LoadActivityFile, LoadActivityPhase};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -14,6 +14,7 @@ struct Ranges {
     spans: BTreeMap<u64, u64>,
     bytes: u64,
     published: u64,
+    started: bool,
     active: Option<(u64, LoadActivityFile)>,
     next: u64,
 }
@@ -24,6 +25,7 @@ pub struct SourceProgress {
     context: LoadActivityContext,
     path: PathBuf,
     total: Option<u64>,
+    phase: LoadActivityPhase,
     ranges: Arc<Mutex<Ranges>>,
     emission: Arc<Mutex<()>>,
 }
@@ -43,23 +45,39 @@ impl SourceProgress {
         path: impl AsRef<Path>,
         total: Option<u64>,
     ) -> Self {
+        Self::with_context_phase(context, path, total, LoadActivityPhase::Loading)
+    }
+    pub fn new_with_phase(
+        path: impl AsRef<Path>,
+        total: Option<u64>,
+        phase: LoadActivityPhase,
+    ) -> Self {
+        Self::with_context_phase(LoadActivityContext::capture(), path, total, phase)
+    }
+    pub fn with_context_phase(
+        context: LoadActivityContext,
+        path: impl AsRef<Path>,
+        total: Option<u64>,
+        phase: LoadActivityPhase,
+    ) -> Self {
         let path =
             std::path::absolute(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
-        context.reset_file(&path);
         Self {
             context,
             path,
             total,
+            phase,
             ranges: Arc::default(),
             emission: Arc::default(),
         }
     }
     pub fn operation(&self) -> ReadOperation {
         let _emission = self.emission.lock().unwrap_or_else(|e| e.into_inner());
+        self.start_phase();
         let bytes = self.ranges.lock().unwrap_or_else(|e| e.into_inner()).bytes;
-        let activity =
-            self.context
-                .file_with_bytes(LoadActivityPhase::Loading, &self.path, self.total, bytes);
+        let activity = self
+            .context
+            .file_with_bytes(self.phase, &self.path, self.total, bytes);
         let id = {
             let mut r = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
             r.next += 1;
@@ -80,12 +98,26 @@ impl SourceProgress {
             inner,
             position,
             source: self.clone(),
+            phases: HashMap::from([(self.phase, self.clone())]),
             operation: None,
         })
     }
 }
 
 impl SourceProgress {
+    // Constructing a metadata probe must not reset unrelated payload progress. Start a phase
+    // only when its first operation/read actually begins; resumed operations retain its ranges.
+    fn start_phase(&self) {
+        let first = {
+            let mut ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
+            let first = !ranges.started;
+            ranges.started = true;
+            first
+        };
+        if first {
+            self.context.reset_file_phase(&self.path, self.phase);
+        }
+    }
     fn record(&self, activity: &LoadActivityFile, start: u64, len: u64) {
         let _emission = self.emission.lock().unwrap_or_else(|e| e.into_inner());
         self.record_inner(activity, start, len);
@@ -95,6 +127,7 @@ impl SourceProgress {
             return;
         }
         let _emission = self.emission.lock().unwrap_or_else(|e| e.into_inner());
+        self.start_phase();
         let (active, bytes) = {
             let r = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
             (r.active.as_ref().map(|(_, h)| h.clone()), r.bytes)
@@ -102,7 +135,7 @@ impl SourceProgress {
         let transient = active.is_none();
         let activity = active.unwrap_or_else(|| {
             self.context
-                .file_with_bytes(LoadActivityPhase::Loading, &self.path, self.total, bytes)
+                .file_with_bytes(self.phase, &self.path, self.total, bytes)
         });
         self.record_inner(&activity, start, len);
         if transient {
@@ -200,6 +233,7 @@ pub struct ProgressReader<R> {
     inner: R,
     position: u64,
     source: SourceProgress,
+    phases: HashMap<LoadActivityPhase, SourceProgress>,
     operation: Option<ReadOperation>,
 }
 impl<R> ProgressReader<R> {
@@ -208,6 +242,28 @@ impl<R> ProgressReader<R> {
     }
     pub fn begin(&mut self) {
         self.operation = Some(self.source.operation());
+    }
+    /// Begin a different operation on the same handle without moving its cursor. The new phase
+    /// has its own retained ranges, so parsed header bytes cannot masquerade as hashed payload;
+    /// returning to a phase resumes its cumulative count without counting repeated ranges twice.
+    pub fn set_phase(&mut self, phase: LoadActivityPhase) {
+        if self.source.phase == phase {
+            return;
+        }
+        self.finish();
+        self.source = self
+            .phases
+            .entry(phase)
+            .or_insert_with(|| {
+                SourceProgress::with_context_phase(
+                    self.source.context.clone(),
+                    &self.source.path,
+                    self.source.total,
+                    phase,
+                )
+            })
+            .clone();
+        self.begin();
     }
     pub fn finish(&mut self) {
         self.operation = None;
@@ -235,9 +291,17 @@ impl<R: Seek> Seek for ProgressReader<R> {
 /// Metadata and bytes come from the same handle. Callers keep their own integrity/cancellation
 /// guards around this generic reader; it neither reopens a path nor authenticates model content.
 pub fn open(path: impl AsRef<Path>) -> io::Result<ProgressReader<std::fs::File>> {
+    open_with_phase(path, LoadActivityPhase::Loading)
+}
+
+/// Open a file for a specific operation. Only callers actually hashing bytes use Verifying.
+pub fn open_with_phase(
+    path: impl AsRef<Path>,
+    phase: LoadActivityPhase,
+) -> io::Result<ProgressReader<std::fs::File>> {
     let path = path.as_ref();
     let file = std::fs::File::open(path)?;
-    let source = SourceProgress::new(path, Some(file.metadata()?.len()));
+    let source = SourceProgress::new_with_phase(path, Some(file.metadata()?.len()), phase);
     let mut reader = source.reader(file)?;
     reader.begin();
     Ok(reader)
@@ -246,7 +310,12 @@ pub fn open(path: impl AsRef<Path>) -> io::Result<ProgressReader<std::fs::File>>
 /// Read one file into an owned buffer, reporting successful reads in bounded chunks.
 /// The returned bytes are the same buffer callers can authenticate and parse without reopening.
 pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
-    let reader = open(path)?;
+    read_with_phase(path, LoadActivityPhase::Loading)
+}
+
+/// Read an owned file buffer for a specific operation, retaining bounded I/O and error clearing.
+pub fn read_with_phase(path: impl AsRef<Path>, phase: LoadActivityPhase) -> io::Result<Vec<u8>> {
+    let reader = open_with_phase(path, phase)?;
     let len = usize::try_from(reader.get_ref().metadata()?.len())
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "file exceeds address space"))?;
     let mut bytes = Vec::new();
@@ -268,6 +337,80 @@ pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::LoadActivityObserver;
+    #[test]
+    fn an_unread_source_cannot_erase_completed_payload_ranges() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let _observer = LoadActivityObserver::new(move |event| output.lock().unwrap().push(event));
+        LoadActivityContext::capture().register_files([
+            (PathBuf::from("transformer/a"), 16),
+            (PathBuf::from("transformer/b"), 16),
+        ]);
+        let a = SourceProgress::new("transformer/a", Some(16));
+        let read = a.operation();
+        read.record(0, 8);
+        drop(read);
+        let _unread = SourceProgress::new("transformer/a", Some(16));
+        let b = SourceProgress::new("transformer/b", Some(16));
+        let _read = b.operation();
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .next_back()
+                .unwrap()
+                .component_bytes_read,
+            8
+        );
+    }
+
+    #[test]
+    fn phase_switches_preserve_independent_ranges_and_resume_loading() {
+        use std::io::{Cursor, SeekFrom};
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let _observer = LoadActivityObserver::new(move |event| output.lock().unwrap().push(event));
+        let source = SourceProgress::new("transformer/model.safetensors", Some(16));
+        let mut reader = source.reader(Cursor::new([0u8; 16])).unwrap();
+        let mut chunk = [0u8; 4];
+        reader.begin();
+        reader.read_exact(&mut chunk).unwrap();
+        reader.set_phase(LoadActivityPhase::Checking);
+        reader.read_exact(&mut chunk).unwrap();
+        reader.set_phase(LoadActivityPhase::Verifying);
+        reader.read_exact(&mut chunk).unwrap();
+        reader.set_phase(LoadActivityPhase::Loading);
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_exact(&mut chunk).unwrap();
+        reader.seek(SeekFrom::Start(12)).unwrap();
+        reader.read_exact(&mut chunk).unwrap();
+        reader.set_phase(LoadActivityPhase::Checking);
+        reader.seek(SeekFrom::Start(4)).unwrap();
+        reader.read_exact(&mut chunk).unwrap();
+        drop(reader);
+        let events = events.lock().unwrap();
+        for (phase, expected) in [
+            (LoadActivityPhase::Loading, 8),
+            (LoadActivityPhase::Checking, 4),
+            (LoadActivityPhase::Verifying, 4),
+        ] {
+            let counts: Vec<_> = events
+                .iter()
+                .flatten()
+                .filter(|event| event.phase == phase)
+                .map(|event| event.bytes_read)
+                .collect();
+            assert_eq!(counts.iter().max(), Some(&expected));
+            assert!(
+                counts.windows(2).all(|pair| pair[0] <= pair[1]),
+                "resuming {phase:?} reset its count: {counts:?}"
+            );
+        }
+        assert_eq!(events.last(), Some(&None));
+    }
+
     #[test]
     fn overlapping_same_source_operations_flush_and_restore_cumulative_bytes() {
         let events = Arc::new(Mutex::new(Vec::new()));
