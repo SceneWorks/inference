@@ -515,6 +515,65 @@ def reviewed_storage_cleanup(root: Path) -> bool:
     return True
 
 
+NEUTRAL_TEST_PACKAGES = {
+    'core-llm', 'core-llm-testkit', 'sceneworks-load-progress',
+    'sceneworks-gen-core', 'sceneworks-gen-core-testkit',
+    'sceneworks-gen-core-dist', 'sceneworks-gen-core-telemetry',
+    'sceneworks-gen-core-checkpoint', 'sceneworks-gen-core-family',
+    'sceneworks-gen-core-flux3', 'sceneworks-gen-core-h3',
+    'sceneworks-gen-core-image', 'sceneworks-gen-core-iris',
+    'sceneworks-gen-core-ltx', 'sceneworks-gen-core-memory-wan',
+    'sceneworks-gen-core-moss-image', 'sceneworks-gen-core-tokenizer',
+    'sceneworks-gen-core-train',
+}
+
+
+def cargo_operation(args):
+    """Separate real Cargo options/subcommand from arguments passed to a harness."""
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in ('--config', '--color', '-Z'):
+            index += 2
+        elif arg.startswith(('+', '--config=', '--color=')) or arg in ('--offline', '--locked', '--frozen', '--verbose', '-v', '-vv', '--quiet', '-q'):
+            index += 1
+        else:
+            break
+    operation = args[index] if index < len(args) else None
+    options = args[index + 1:]
+    return operation, options[:options.index('--')] if '--' in options else options
+
+
+def unsupported_test_scope(options):
+    return any(arg.startswith(('--package=', '--manifest-path', '--workspace', '--exclude'))
+               or arg.startswith('-p') and arg != '-p' or arg == '--all' for arg in options)
+
+
+def neutral_test_scope(options):
+    selectors = [options[index + 1] for index, arg in enumerate(options[:-1]) if arg in ('-p', '--package')]
+    return bool(selectors) and set(selectors) <= NEUTRAL_TEST_PACKAGES and not unsupported_test_scope(options)
+
+
+def reviewed_native_harness(command):
+    """Only the two existing tensor-neutral CLIP certificate/hasher producers."""
+    return command[:-1] in (
+        ['cargo', 'rustc', '--locked', '-p', 'regex', '--lib', '--', '--test', '-o'],
+        ['rustc', '--edition', '2021', '--test', 'vendor/clip-regex/build-verify.rs', '-o'],
+    )
+
+
+def cargo_test_compilation(command):
+    if command[:1] == ['cargo']:
+        cargo = command
+    elif (len(command) > 4 and command[1].replace('\\', '/').endswith('/run_ci_collection.py')
+          and command[2:4] == ['--', 'cargo']):
+        cargo = command[3:]
+    else:
+        return None
+    operation, options = cargo_operation(cargo[1:])
+    return options if operation == 'test' and '--no-run' in options and '--message-format=json' in options else None
+
+
 class RunGraph:
     """Resolve repository script/driver edges, without importing or executing the scripts.
 
@@ -571,24 +630,32 @@ class RunGraph:
             self.finding('model', chain, 'native model parent/product driver')
         if not listing and any(option in args for option in ('--snapshot', '--llama-snapshot', '--qwen-snapshot')) and any(mode in args for mode in ('parent', 'noise-floor-parent')):
             self.finding('model', chain, 'snapshot-bound native model parent')
-        if leaf in ('cargo', 'rustc') and '--test' in args and '-o' in args:
-            at = args.index('-o')
-            if at + 1 < len(args):
-                self.test_artifacts[args[at + 1]] = ' -> '.join(chain)
+        if leaf in ('cargo', 'rustc') and reviewed_native_harness([leaf, *args]):
+            self.test_artifacts[args[-1]] = ' -> '.join(chain)
         if head in self.test_artifacts and (listing or not any(flag in args for flag in ('--ignored', '--include-ignored', '--run-ignored'))):
             self.finding('ordinary', chain, 'ordinary libtest artifact compiled at ' + self.test_artifacts[head])
             return
         if leaf == 'cargo':
-            if '--no-run' in args or listing:
+            operation, options = cargo_operation(args)
+            if operation == 'test' and '--no-run' in options:
                 self.finding('ordinary', chain, 'Cargo compilation/listing: ' + ' '.join(args))
                 return
+            if operation == 'test':
+                selectors = [options[index + 1] for index, arg in enumerate(options[:-1]) if arg in ('-p', '--package')]
+                # Only the reviewed tensor-neutral contract packages execute directly.
+                # Unknown backend targets may have custom harnesses which execute even
+                # for --list. The audited-safe runner owns backend listing/execution.
+                compile_fail_docs = '--doc' in options and selectors == ['runtime-ios']
+                if unsupported_test_scope(options) or not compile_fail_docs and not neutral_test_scope(options):
+                    self.finding('unknown', chain, 'unapproved direct backend Cargo test/listing; use audited-safe: ' + ' '.join(args))
+                    return
             if any(flag in args for flag in ('--ignored', '--include-ignored', '--run-ignored')):
                 self.finding('model', chain, 'Cargo overrides model-test ignores')
-            elif 'run' in args:
+            elif operation == 'run':
                 self.finding('model', chain, 'Cargo native driver execution')
-            elif not any(sub in args for sub in ('test', 'build', 'check', 'clippy', 'fmt', 'metadata', 'tree', 'doc', 'clean', 'install', 'deny', 'rustc', '--version')):
+            elif operation not in ('test', 'build', 'check', 'clippy', 'fmt', 'metadata', 'tree', 'doc', 'clean', 'install', 'deny', 'rustc', '--version'):
                 self.finding('unknown', chain, 'unresolved Cargo subcommand: ' + ' '.join(args))
-            elif any('$' in arg or UNKNOWN in arg for arg in args) and 'test' in args:
+            elif any('$' in arg or UNKNOWN in arg for arg in args) and operation == 'test':
                 self.finding('unknown', chain, 'dynamic Cargo test arguments')
             else:
                 self.finding('ordinary', chain, 'Cargo metadata/build/lint/ordinary ignored-model test: ' + ' '.join(args))
@@ -716,22 +783,25 @@ class RunGraph:
         if not path.is_file():
             self.finding('unknown', chain, 'unresolved script: ' + name)
             return
-        # The exact reviewed suite runner may execute the literal routine partition in
+        # The exact reviewed suite runner may execute only literal audited-safe mode in
         # ordinary CI. Its executable argv is built from Cargo compiler-artifact records,
         # which this graph cannot resolve statically; bind the entire source body and CLI
         # mode instead of blessing arbitrary dynamic subprocess calls.
         if relative == 'scripts/ci/test_suites.py':
-            reviewed_sha = 'a4b0d80b4c34becb98b056ee9351eec4bbf622c6ca72865e54c4c7ac488aa488'
+            reviewed_sha = '1c0870e7957b49521942eff9b1c8b16b18a15ed50d80461e90155869ea70e3a5'
+            controls_sha = '5f4ea9ac7635b5faedbf6854151b97036aeb7c4be8e6cb18c1d5ae856749e5dd'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha
-                    or args[:command_at].count('routine') != 1
-                    or any(mode in args[:command_at] for mode in ('exhaustive', 'check'))
-                    or command[:2] != ['cargo', 'test']
+                    or not (self.root / 'scripts/ci/safe_controls.json').is_file()
+                    or hashlib.sha256((self.root / 'scripts/ci/safe_controls.json').read_bytes()).hexdigest() != controls_sha
+                    or args[:command_at].count('audited-safe') != 1
+                    or any(mode in args[:command_at] for mode in ('routine', 'exhaustive', 'check'))
+                    or command[:1] != ['cargo'] or 'test' not in command or '--' in command
                     or any(flag in command for flag in ('--ignored', '--include-ignored', '--run-ignored'))):
                 self.finding('unknown', chain, 'unreviewed suite source, mode, or Cargo command')
             else:
-                self.finding('ordinary', chain, 'exact-source routine suite over ordinary ignored-model Cargo tests')
+                self.finding('ordinary', chain, 'exact-source closed audited-safe controls; all other backend targets compile only')
             return
         key = (relative, tuple(args))
         if key in self.active:
@@ -805,6 +875,10 @@ class RunGraph:
                 mutated_parser_attributes.add((target.value.id, target.attr))
 
         artifact_schema = any(isinstance(item, ast.If) and all(piece in ast.unparse(item.test) for piece in ("get('reason') == 'compiler-artifact'", "get('profile', {}).get('test')", "get('executable')")) for item in ast.walk(tree))
+        if artifact_schema:
+            # A preceding neutral helper must not authorize this invocation's
+            # backend/custom artifacts through a shared unresolved-output token.
+            self.test_artifacts.pop('__MODEL_POLICY_CARGO_HARNESS__', None)
         assignments = {}
         for node in ast.walk(tree):
             if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
@@ -1233,10 +1307,11 @@ class RunGraph:
 
         # Artifact construction is a source fact independent of AST traversal order.
         for candidate, where in pending:
-            if isinstance(candidate, list) and candidate and candidate[0] in ('cargo', 'rustc') and '--test' in candidate and '-o' in candidate:
-                at = candidate.index('-o')
-                if at + 1 < len(candidate): self.test_artifacts[str(candidate[at + 1])] = ' -> '.join(where)
-        if artifact_schema and any(isinstance(candidate, list) and any(candidate[index:index + 2] == ['cargo', 'test'] for index in range(len(candidate) - 1)) and '--no-run' in candidate and '--message-format=json' in candidate for candidate, _ in pending):
+            if isinstance(candidate, list) and reviewed_native_harness(candidate):
+                self.test_artifacts[str(candidate[-1])] = ' -> '.join(where)
+        compilations = [options for candidate, _ in pending if isinstance(candidate, list)
+                        and (options := cargo_test_compilation(candidate)) is not None]
+        if artifact_schema and compilations and all(neutral_test_scope(options) for options in compilations):
             self.test_artifacts['__MODEL_POLICY_CARGO_HARNESS__'] = ' -> '.join(chain) + ': guarded Cargo compiler-artifact test/executable records from --no-run compilation'
         for candidate, where in pending:
             if isinstance(candidate, list): self.command([str(piece) for piece in candidate], where)
@@ -1279,11 +1354,9 @@ class RunGraph:
                     lookup = re.fullmatch(r"\s*command\s+-v\s+([\w.-]+)\s*", code)
                     managed = re.fullmatch(r'\s*uv python find [0-9.]+ --managed-python(?: --no-project)? --no-config\s*', code)
                     result = lookup[1] if lookup else 'python3' if managed else output if isinstance(output, str) else UNKNOWN
-                    # Build stdout is a compiler-artifact JSON record, filtered to exactly one
-                    # test executable by a metadata-only Python reader before being copied.
-                    if all(piece in code for piece in ('cargo test ', '--no-run', '--message-format=json', 'compiler-artifact', 'm.get("profile", {}).get("test")', 'm.get("executable")', 'print(found[-1] if len(found) == 1 else "")')):
-                        result = '__MODEL_POLICY_CARGO_HARNESS__'
-                        self.test_artifacts[result] = ' -> '.join(chain) + ': Cargo --no-run compiler-artifact test executable selection'
+                    # Compiler-output substrings alone never grant native execution.
+                    # The AST producer above binds neutral compilations; backend
+                    # executables are owned exclusively by audited-safe mode.
                     # A tool-lookup function may return either command -v TOOL or one
                     # literal fallback path with the SAME executable basename. This is
                     # source provenance, not a helper/function-name exemption.

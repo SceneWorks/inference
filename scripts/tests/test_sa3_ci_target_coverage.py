@@ -1,4 +1,8 @@
-"""Enforce the Stable Audio 3 weight-free CI coverage invariant.
+"""Enforce Stable Audio 3 automatic compilation and manual baseline execution.
+
+Every named target must occur in both routes. The automatic audited-safe runner
+compiles it; the separately dispatched baseline executes the unchanged assertions.
+The historical target-selection drift below still applies to both routes.
 
 `ci.yml` runs the SA3 crate's integration tests by naming each target explicitly
 (`--test provider --test dtype_policy ...`) rather than widening to `--tests`, because
@@ -56,14 +60,14 @@ def live_case_counts() -> dict[str, int]:
     return counts
 
 
-def named_targets() -> set[str]:
+def named_targets(workflow=WORKFLOW, step_name=STEP_NAME) -> set[str]:
     """Extract the `--test <name>` flags from the weight-free step's `run:` block.
 
     Only the `run:` scalar is scanned: the step carries a long `#` comment block that also
     mentions target names, and matching those would let the real command drift silently.
     """
-    lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
-    marker = f"- name: {STEP_NAME}"
+    lines = workflow.read_text(encoding="utf-8").splitlines()
+    marker = f"- name: {step_name}"
     start = next((i for i, line in enumerate(lines) if line.strip() == marker), None)
     if start is None:
         raise AssertionError(f"missing ci.yml step: {STEP_NAME}")
@@ -93,8 +97,16 @@ class Sa3CiTargetCoverageTests(unittest.TestCase):
         )
         self.assertTrue(named_targets(), f"parsed no --test flags from the {STEP_NAME!r} step")
 
-    def test_every_weight_free_target_runs_on_pull_requests(self) -> None:
-        named = named_targets()
+    def test_every_target_compiles_automatically_and_executes_in_baseline(self) -> None:
+        import yaml
+        normal = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["candle-cpu-conformance"]
+        step = next(step for step in normal["steps"] if step.get("name") == STEP_NAME)
+        self.assertIn("audited-safe -- cargo test", step["run"])
+        manual = yaml.safe_load((ROOT / ".github/workflows/model-test-suites.yml").read_text(encoding="utf-8"))
+        baseline = next(step for step in manual["jobs"]["candle-cpu"]["steps"] if step.get("name") == "Run former CPU conformance and bundle baselines")
+        self.assertIn("inputs.test_suite == 'baseline'", baseline["if"])
+        manual_targets = set(re.findall(r"--test\s+([A-Za-z0-9_]+)", baseline["run"]))
+        named = named_targets() & manual_targets
         missing = sorted(
             f"{target} ({count} non-#[ignore]d case{'s' if count != 1 else ''})"
             for target, count in live_case_counts().items()
@@ -103,7 +115,7 @@ class Sa3CiTargetCoverageTests(unittest.TestCase):
         self.assertEqual(
             missing,
             [],
-            "SA3 integration targets carry weight-free cases that run in no CI lane: "
+            "SA3 targets missing automatic compilation or explicit baseline execution: "
             + ", ".join(missing)
             + ". Add `--test <target>` to the "
             + f"{STEP_NAME!r} step in .github/workflows/ci.yml (that step names each target "
