@@ -172,6 +172,10 @@ jobs:
           # actual files consumed; this path is not a substitute for those receipts.
           Write-Host "Bound existing Krea Raw snapshot: $snapshot; shards=$($shards -join ',')"
           "KREA_RAW_DIR=$snapshot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Bind installed pinned assets for exact bounded cohort CUDA proof
+        if: matrix.asset_setup == 'cohort-training' && runner.os == 'Windows'
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_cohort_training_proof_assets.py'
       - name: Run exact registered model tests under external guards (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash

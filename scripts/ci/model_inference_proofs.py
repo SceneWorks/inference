@@ -1544,6 +1544,11 @@ def main() -> int:
                     and rows[0]['package'] == 'candle-gen-krea'
                     and rows[0]['fqn'] == 'trainer_e2e::krea_bounded_acceleration_profile'):
                 asset_setup = 'krea-training'
+            from scripts.ci.prepare_cohort_training_proof_assets import BINDINGS as COHORT_TRAINING_BINDINGS
+            if (args.backend == 'candle-cuda' and len(rows) == 1
+                    and rows[0]['package'] + '/' + rows[0]['fqn'] in COHORT_TRAINING_BINDINGS
+                    and value.get('configuration') == 'fixed_cuda'):
+                asset_setup = 'cohort-training'
             plan = {'runner': runner, 'asset_setup': asset_setup, 'backend': args.backend, 'request': value, 'selected': len(rows),
                     'bindings': [identity(row) for row in rows]}
             configured = {identity(row): row['selected_configuration'] for row in rows if 'selected_configuration' in row}
