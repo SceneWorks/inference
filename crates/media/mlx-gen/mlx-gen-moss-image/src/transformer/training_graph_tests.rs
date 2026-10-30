@@ -555,12 +555,17 @@ fn cpu_native_backward_updates_only_factors_and_reload_changes_generation() {
                 crate::adapters::apply_pinned(&mut fresh, variant, &[lease_spec], &[pin]).is_err(),
                 "changed adapter bypassed its exact source token"
             );
-            let wrong = if variant == MossImageVariant::Base {
+            // Base and SFT share one architecture, so the sibling checkpoint accepts this
+            // adapter too (2026-10-29 product decision; formerly an exact-parent refusal).
+            let sibling = if variant == MossImageVariant::Base {
                 MossImageVariant::Sft
             } else {
                 MossImageVariant::Base
             };
-            assert!(crate::adapters::apply(&mut reloaded, wrong, &[spec]).is_err());
+            let mut cross =
+                Transformer::load(&weights(&f["weights"], Dtype::Float32), g.clone()).unwrap();
+            let reports = crate::adapters::apply(&mut cross, sibling, &[spec]).unwrap();
+            assert!(reports[0].applied > 0 && reports[0].skipped.is_empty());
         }
     }
 }
