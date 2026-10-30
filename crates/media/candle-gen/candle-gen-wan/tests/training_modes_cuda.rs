@@ -180,8 +180,14 @@ fn bounded_run(id: &str, env: &str) {
         .unwrap()
         .load_trainer(id, &LoadSpec::new(WeightsSource::Dir(snapshot.clone())))
         .unwrap();
-    let output =
-        candle_gen::train::profile::with_bounded_cohort(&retained.join("metrics.json"), || {
+    let output = candle_gen::train::profile::with_bounded_cohort_for(
+        &retained.join("metrics.json"),
+        &[
+            "wan:shared-differentiable-RMS",
+            "wan:expert-owned-caption-storage-hit",
+            "wan:actual-frozen-projection-pack",
+        ],
+        || {
             trainer
                 .train(
                     &TrainingRequest {
@@ -208,7 +214,8 @@ fn bounded_run(id: &str, env: &str) {
                     &mut |_| {},
                 )
                 .unwrap()
-        });
+        },
+    );
     bounded_peak(sampler, &retained);
     assert_eq!(output.steps, 4);
     assert!(output.final_loss.is_finite());

@@ -281,17 +281,25 @@ fn ltx23_bounded_acceleration_acceptance() {
 
     let mut cached = Vec::new();
     let mut trained = Vec::new();
-    let output = candle_gen::train::profile::with_bounded_cohort(&tmp.join("metrics.json"), || {
-        trainer
-            .train(&request, &mut |progress| match progress {
-                TrainingProgress::Caching { current, total } => cached.push((current, total)),
-                TrainingProgress::Training {
-                    step, total, loss, ..
-                } => trained.push((step, total, loss)),
-                _ => {}
-            })
-            .expect("bounded LTX training")
-    });
+    let output = candle_gen::train::profile::with_bounded_cohort_for(
+        &tmp.join("metrics.json"),
+        &[
+            "ltx:shared-differentiable-RMS",
+            "ltx23:rope-storage-hit",
+            "ltx23:native-incompatible-projection-fallback",
+        ],
+        || {
+            trainer
+                .train(&request, &mut |progress| match progress {
+                    TrainingProgress::Caching { current, total } => cached.push((current, total)),
+                    TrainingProgress::Training {
+                        step, total, loss, ..
+                    } => trained.push((step, total, loss)),
+                    _ => {}
+                })
+                .expect("bounded LTX training")
+        },
+    );
     bounded_peak(sampler, &tmp);
     assert_eq!(cached, [(1, 1)]);
     assert_eq!(trained.len(), 4);
@@ -423,8 +431,14 @@ fn ltx25_bounded_acceleration_acceptance() {
         cancel: CancelFlag::new(),
     };
     let sampler = candle_gen::testkit::PeakSampler::start_rendered();
-    let output =
-        candle_gen::train::profile::with_bounded_cohort(&root.join("metrics.json"), || {
+    let output = candle_gen::train::profile::with_bounded_cohort_for(
+        &root.join("metrics.json"),
+        &[
+            "ltx25:differentiable-QK-RMS",
+            "ltx25:exact-grid-rope-storage-hit",
+            "ltx25:native-incompatible-projection-fallback",
+        ],
+        || {
             let mut trainer = candle_gen_ltx::provider_registry()
                 .unwrap()
                 .load_trainer(candle_gen_ltx::MODEL_25_ID, &spec)
@@ -432,7 +446,8 @@ fn ltx25_bounded_acceleration_acceptance() {
             trainer
                 .train(&request, &mut |_| {})
                 .expect("four joint AV optimizer updates")
-        });
+        },
+    );
     bounded_peak(sampler, &root);
     assert_eq!(output.steps, 4);
     assert!(output.final_loss.is_finite());

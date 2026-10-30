@@ -497,10 +497,15 @@ fn lens_bounded_acceleration_acceptance() {
     let tmp = bounded_output_root().join("data");
     let retained = bounded_output_root();
     let sampler = candle_gen::testkit::PeakSampler::start_rendered();
-    let out =
-        candle_gen::train::profile::with_bounded_cohort(&retained.join("metrics.json"), || {
-            run(&tmp, "bounded.safetensors", NetworkType::Lora, 4)
-        });
+    let out = candle_gen::train::profile::with_bounded_cohort_for(
+        &retained.join("metrics.json"),
+        &[
+            "lens:shared-differentiable-RMS",
+            "lens:frozen-caption-storage-hit",
+            "lens:rope-storage-hit;E3-already-fused-native-QKV",
+        ],
+        || run(&tmp, "bounded.safetensors", NetworkType::Lora, 4),
+    );
     bounded_peak(sampler, &retained);
 
     assert_eq!(

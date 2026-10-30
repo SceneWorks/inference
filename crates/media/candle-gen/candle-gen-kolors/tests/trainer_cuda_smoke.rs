@@ -175,10 +175,15 @@ fn bounded_run(kind: NetworkType) {
         trigger_words: vec![],
         cancel: CancelFlag::new(),
     };
-    let output =
-        candle_gen::train::profile::with_bounded_cohort(&retained.join("metrics.json"), || {
-            trainer.train(&request, &mut |_| {}).unwrap()
-        });
+    let output = candle_gen::train::profile::with_bounded_cohort_for(
+        &retained.join("metrics.json"),
+        &[
+            "sdxl-or-kolors:differentiable-LayerNorm",
+            "sdxl-or-kolors:frozen-cross-base-KV-storage-hit",
+            "sdxl:actual-frozen-projection-pack",
+        ],
+        || trainer.train(&request, &mut |_| {}).unwrap(),
+    );
     bounded_peak(sampler, &retained);
     assert_eq!(output.steps, 4);
     assert!(output.final_loss.is_finite());

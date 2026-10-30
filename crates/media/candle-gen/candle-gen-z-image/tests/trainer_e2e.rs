@@ -580,10 +580,16 @@ fn z_image_bounded_acceleration_acceptance() {
     let tmp = bounded_output_root().join("data");
     let retained = bounded_output_root();
     let sampler = candle_gen::testkit::PeakSampler::start_rendered();
-    let out =
-        candle_gen::train::profile::with_bounded_cohort(&retained.join("metrics.json"), || {
-            run(&tmp, "bounded.safetensors", NetworkType::Lora, 4, false)
-        });
+    let out = candle_gen::train::profile::with_bounded_cohort_for(
+        &retained.join("metrics.json"),
+        &[
+            "z-image:shared-differentiable-RMS",
+            "zimage:frozen-caption-and-mask-storage-hit",
+            "zimage:exact-geometry-mask-storage-hit",
+            "zimage:actual-frozen-QKV-pack",
+        ],
+        || run(&tmp, "bounded.safetensors", NetworkType::Lora, 4, false),
+    );
     bounded_peak(sampler, &retained);
 
     let meta = read_meta(&out.adapter_path);

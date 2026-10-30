@@ -538,10 +538,15 @@ fn wan_t2v_14b_bounded_acceleration_acceptance() {
     // 96 steps ⇒ 48 micro-steps per expert — enough for a clear median fall on each band.
     let retained = bounded_output_root();
     let sampler = candle_gen::testkit::PeakSampler::start_rendered();
-    let out =
-        candle_gen::train::profile::with_bounded_cohort(&retained.join("metrics.json"), || {
-            run(&tmp, "bounded.safetensors", NetworkType::Lora, 4)
-        });
+    let out = candle_gen::train::profile::with_bounded_cohort_for(
+        &retained.join("metrics.json"),
+        &[
+            "wan:shared-differentiable-RMS",
+            "wan:expert-owned-caption-storage-hit",
+            "wan:actual-frozen-projection-pack",
+        ],
+        || run(&tmp, "bounded.safetensors", NetworkType::Lora, 4),
+    );
     bounded_peak(sampler, &retained);
 
     for p in [&out.high_path, &out.low_path] {

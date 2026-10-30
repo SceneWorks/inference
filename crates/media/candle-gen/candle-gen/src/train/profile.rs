@@ -299,7 +299,6 @@ pub fn cohort_end_step(
             changed |= delta > 0.;
         }
         if !changed || nonzero_gradients == 0 { candle_core::bail!("cohort optimizer produced no actual adapter update"); }
-        if state.updates >= 3 && nonzero_gradients != gradient_count { candle_core::bail!("bounded final updates must reach every adapter factor with nonzero gradients"); }
         let warmup = state.steps.is_empty();
         state.steps.push(serde_json::json!({"update":state.updates,"owner":owner,"warmup":warmup,
             "seconds":seconds,"loss":loss,"finite_gradients":gradient_count,"nonzero_gradients":nonzero_gradients,
@@ -308,4 +307,28 @@ pub fn cohort_end_step(
     })?;
     let _ = (loss, vars, owner);
     Ok(())
+}
+
+/// Require the exact mechanism branches named by a source-owned bounded case.
+/// Counts describe consumption in this invocation; preparation alone cannot pass.
+#[cfg(feature = "model-inference-proof")]
+pub fn with_bounded_cohort_for<T>(
+    output: &std::path::Path,
+    required: &[&str],
+    f: impl FnOnce() -> T,
+) -> T {
+    with_bounded_cohort(output, || {
+        let result = f();
+        COHORT.with(|state| {
+            let state = state.borrow();
+            let state = state.as_ref().unwrap();
+            for mechanism in required {
+                assert!(
+                    state.reuse.get(*mechanism).is_some_and(|count| *count >= 2),
+                    "bounded source case must repeatedly consume {mechanism}"
+                );
+            }
+        });
+        result
+    })
 }

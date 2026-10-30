@@ -538,10 +538,15 @@ fn sdxl_bounded_acceleration_acceptance() {
     let tmp = bounded_output_root().join("data");
     let retained = bounded_output_root();
     let sampler = candle_gen::testkit::PeakSampler::start_rendered();
-    let out =
-        candle_gen::train::profile::with_bounded_cohort(&retained.join("metrics.json"), || {
-            run(&tmp, "bounded.safetensors", NetworkType::Lora, 4, false)
-        });
+    let out = candle_gen::train::profile::with_bounded_cohort_for(
+        &retained.join("metrics.json"),
+        &[
+            "sdxl-or-kolors:differentiable-LayerNorm",
+            "sdxl-or-kolors:frozen-cross-base-KV-storage-hit",
+            "sdxl:actual-frozen-projection-pack",
+        ],
+        || run(&tmp, "bounded.safetensors", NetworkType::Lora, 4, false),
+    );
     bounded_peak(sampler, &retained);
 
     // The adapter carries PEFT keys under the SDXL prefix + reload metadata.

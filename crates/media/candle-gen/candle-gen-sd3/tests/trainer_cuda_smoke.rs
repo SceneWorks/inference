@@ -176,8 +176,14 @@ fn bounded_run(id: &str, env: &str, kind: NetworkType) {
         .unwrap()
         .load_trainer(id, &LoadSpec::new(WeightsSource::Dir(snapshot.clone())))
         .unwrap();
-    let output =
-        candle_gen::train::profile::with_bounded_cohort(&retained.join("metrics.json"), || {
+    let output = candle_gen::train::profile::with_bounded_cohort_for(
+        &retained.join("metrics.json"),
+        &[
+            "sd3:differentiable-QK-RMS",
+            "sd3:frozen-context-storage-hit",
+            "sd3:actual-frozen-QKV-pack",
+        ],
+        || {
             trainer
                 .train(
                     &TrainingRequest {
@@ -202,7 +208,8 @@ fn bounded_run(id: &str, env: &str, kind: NetworkType) {
                     &mut |_| {},
                 )
                 .unwrap()
-        });
+        },
+    );
     bounded_peak(sampler, &retained);
     assert_eq!(output.steps, 4);
     assert!(output.final_loss.is_finite());
