@@ -7,6 +7,8 @@ from contextlib import redirect_stderr
 import json
 from pathlib import Path
 import subprocess
+import shlex
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -71,7 +73,14 @@ class HostedCpuRoutingTests(unittest.TestCase):
                 base = "HEAD^" if path_selected else "HEAD"
             env = dict(os.environ, EVENT_NAME=event, DISPATCH_LANES=lanes, REF_TYPE=ref_type,
                        GITHUB_OUTPUT=str(output), BASE_SHA=base, HEAD_SHA="HEAD")
-            subprocess.run(["bash", "-e", "-c", script], cwd=repository, env=env, check=True, capture_output=True)
+            from scripts.tests.test_ci_workflow_policy import posix_shell
+            shell = posix_shell()
+            if shell is None:
+                self.skipTest("POSIX shell unavailable")
+            # Windows' bash/python3 App Execution Alias stubs are not the test
+            # runtime. Keep the selector unchanged and bind its interpreter.
+            prelude = f'python3() {{ {shlex.quote(Path(sys.executable).as_posix())} "$@"; }}\n'
+            subprocess.run([shell, "-e", "-c", prelude + script], cwd=repository, env=env, check=True, capture_output=True)
             return dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
 
     def test_exact_manual_choice_and_only_two_fixed_hosted_rows(self):
@@ -100,7 +109,10 @@ class HostedCpuRoutingTests(unittest.TestCase):
         ordinary = self.workflow()
         manual = self.model_workflow()
         bridge = yaml.load(BRIDGE_WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
-        self.assertEqual(set(ordinary["on"]["workflow_dispatch"]["inputs"]), {"lanes"})
+        inputs = ordinary["on"]["workflow_dispatch"]["inputs"]
+        self.assertEqual(set(inputs), {"lanes", "raw_training_math_only"})
+        self.assertEqual(inputs["raw_training_math_only"]["type"], "boolean")
+        self.assertEqual(inputs["raw_training_math_only"]["default"], "false")  # BaseLoader preserves scalar spelling
         self.assertNotIn("moss-cpu-fixture", ordinary["jobs"])
         self.assertEqual(set(manual["on"]), {"workflow_call", "workflow_dispatch"})
         job = bridge["jobs"]["moss-fixture-bridge"]
@@ -295,7 +307,7 @@ class DiagnosticBatchTests(unittest.TestCase):
                 root = Path(directory)
                 binary, log = root / "binary", root / "run.log"
                 binary.write_bytes(b"protocol artifact only")
-                log.write_text(self.red(profile.PHASE_TEST), encoding="utf-8")
+                log.write_text(self.red(profile.PHASE_TEST), encoding="utf-8", newline="\n")
                 owner = mock.Mock(peak=173)
                 owner.child.returncode = 101
                 owner.collect.return_value = {123: (1, 1, 173)} if mode == "ownership" else {}

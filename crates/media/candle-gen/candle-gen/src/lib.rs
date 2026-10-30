@@ -100,6 +100,7 @@ pub mod rope;
 // Fused-attention dispatch (sc-26691): FlashAttention-2 for unmasked bf16/f16 CUDA attention when the
 // build enables `flash-attn`, the planned budgeted path above for everything else.
 pub mod fused_attention;
+mod reference_training_attention;
 pub mod training_attention;
 pub use fused_attention::{sdpa_dispatch_bhsd, AttentionKernel, FlashRefusal};
 

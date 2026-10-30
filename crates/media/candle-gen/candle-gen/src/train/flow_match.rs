@@ -1015,7 +1015,9 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
 
     // --- cache (latents + conditioning); the encoders load and drop inside the hook ---
     on_progress(TrainingProgress::LoadingModel);
+    super::profile::boundary("phase=cache-start")?;
     let (mut cache, mut aux, sample_plan) = model.cache(req, device, on_progress)?;
+    super::profile::boundary("phase=cache-complete")?;
     if req.cancel.is_cancelled() {
         return Err(CandleError::Canceled);
     }
@@ -1030,7 +1032,9 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     }
 
     // --- build the trainable DiT + install adapters ---
+    super::profile::boundary("phase=dit-build-start")?;
     let mut dit = model.build_dit(req, device)?;
+    super::profile::boundary("phase=dit-build-complete")?;
     let suffixes = resolve_target_suffixes(cfg, model.default_targets());
     let set = install_adapters(&mut dit, cfg, &suffixes, cfg.seed, device)?;
 
@@ -1164,6 +1168,9 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             crate::training_attention::take_training_attention_counts();
             super::profile::begin_step(segment, logical_step);
         }
+        if bounded_profile {
+            super::profile::boundary(&format!("phase=update-start physical_update={step} segment={segment} logical_step={logical_step}"))?;
+        }
         let step_start = bounded_profile.then(std::time::Instant::now);
         let sample = step_sample(aux_driver.as_mut(), logical_step, &schedule);
         let cached = &cache[sample.entry];
@@ -1239,10 +1246,13 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         if bounded_profile {
             device.synchronize()?;
             let elapsed = step_start.unwrap().elapsed().as_secs_f64();
-            if let Some(start) = optimizer_start {
+            let optimizer_elapsed = optimizer_start.map(|start| start.elapsed().as_secs_f64());
+            // The measured interval is closed before synchronous diagnostic I/O.
+            super::profile::boundary(&format!("phase=update-committed physical_update={step} segment={segment} logical_step={logical_step}"))?;
+            if let Some(seconds) = optimizer_elapsed {
                 eprintln!(
                     "KREA_PROFILE_OPTIMIZER segment={segment} synchronized_seconds={:.6}",
-                    start.elapsed().as_secs_f64()
+                    seconds
                 );
             }
             let (candidate, reference) =

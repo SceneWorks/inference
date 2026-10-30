@@ -115,6 +115,38 @@ pub fn training_sdpa_budgeted_bhsd(
     crate::attention::sdpa_budgeted_bhsd(q, k, v, scale, mask, softmax, budget)
 }
 
+/// Known standard composable-softmax training contract. Reference uses a single
+/// dense autograd owner instead of retaining every score intermediate per layer.
+/// Arbitrary softmax callbacks must use `training_sdpa_bhsd` above.
+pub fn training_sdpa_standard_bhsd(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+    plan: AttentionPlan<'_>,
+) -> crate::Result<Tensor> {
+    if plan.is_cancelled() {
+        return Err(crate::CandleError::Canceled);
+    }
+    if let Some(out) = crate::training_attention::try_streaming(q, k, v, scale, mask.is_some())? {
+        return Ok(out);
+    }
+    if let Some(out) = crate::reference_training_attention::try_forward(q, k, v, scale, mask, plan)?
+    {
+        return Ok(out);
+    }
+    sdpa_planned_bhsd(
+        q,
+        k,
+        v,
+        scale,
+        mask,
+        |s| candle_nn::ops::softmax(s, candle_core::D::Minus1),
+        plan,
+    )
+}
+
 /// Largest `head_dim` the dispatcher hands to the fused kernel. candle-flash-attn compiles
 /// kernels up to 512 at this rev, but the 256 ceiling is the long-standing FA2 envelope and covers
 /// every media head dim in the tree (MiniMax-H3's DiT is 128, the Qwen3-VL tower 72).

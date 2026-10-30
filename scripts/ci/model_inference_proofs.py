@@ -1169,6 +1169,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                                               stdout_path=stdout, stderr_path=stderr,
                                               event_path=case_work / (phase + '.events.jsonl'),
                                               require_gpu_sample=False,
+                                              reap_metadata_descendants=discover and discovery_policy.backend == 'windows-cpu',
                                               pass_fds=((int(env['SCENEWORKS_METAL_EXECUTION_LOCK_FD']),)
                                                         if 'SCENEWORKS_METAL_EXECUTION_LOCK_FD' in env else ()), **supervision)
                         result['commands'].append({'argv': argv, 'supervision': asdict(guarded), 'owned_tree_empty': True})
@@ -1230,7 +1231,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                     result['cuda_release_diagnostic'] = error.diagnostic
                 if isinstance(error, SupervisionError):
                     result['supervision_failure'] = {'reason': error.reason, 'admission': error.admission,
-                                                     'pid': error.pid, 'watchdog_child_footprint': error.watchdog_child_footprint}
+                                                     'pid': error.pid, 'watchdog_child_footprint': error.watchdog_child_footprint,
+                                                     'watchdog_device_memory': error.watchdog_device_memory}
                     if approved_uuids:
                         result['cuda_devices'] = list(getattr(error, 'cuda_devices', ()))
                 # Publish only bounded/redacted regular logs from this owned case, even on failure.

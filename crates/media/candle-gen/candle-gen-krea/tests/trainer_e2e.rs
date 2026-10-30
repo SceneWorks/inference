@@ -201,6 +201,11 @@ fn krea_bounded_acceleration_profile() {
     panic!("requires explicit model-inference-proof feature and registered CUDA lane");
     #[cfg(feature = "model-inference-proof")]
     {
+        let graph_retaining_backward = candle_gen::candle_core::backprop::grad_do_not_detach();
+        assert!(
+            !graph_retaining_backward,
+            "bounded Krea baseline requires the default first-order owners; graph-retaining backward is a separate composable contract"
+        );
         let raw = std::env::var("KREA_RAW_DIR")
             .map(PathBuf::from)
             .expect("KREA_RAW_DIR required; Turbo is not a Raw timing baseline");
@@ -301,6 +306,8 @@ fn krea_bounded_acceleration_profile() {
         let metrics = serde_json::json!({
             "schema_version": 1,
             "completed_optimizer_updates": out.steps,
+            "graph_retaining_backward": graph_retaining_backward,
+            "reference_baseline": "Repaired dense standard-softmax Reference with internal query tiles (at most 32Mi score elements, respecting smaller caller budgets), plus RMS/RoPE single autograd owners; common to matched segments. Original divide/reciprocal selection and F32 rounding boundaries retained. Not the original memory-unfit retained-intermediate graph.",
             "configuration": {
                 "rank": req.config.rank,
                 "alpha": req.config.alpha,
@@ -321,7 +328,7 @@ fn krea_bounded_acceleration_profile() {
             "adapter": "out/krea_bounded.safetensors",
             "sample": "adapter_sample.png",
             "profile_log": "body.stderr.log",
-            "profile_records": ["KREA_PROFILE_STEP", "KREA_PROFILE_ATTRIBUTION", "KREA_PROFILE_OPTIMIZER", "KREA_PROFILE_RESULT"],
+            "profile_records": ["KREA_PROFILE_BOUNDARY", "KREA_PROFILE_STEP", "KREA_PROFILE_ATTRIBUTION", "KREA_PROFILE_OPTIMIZER", "KREA_PROFILE_RESULT"],
             "claim_limit": "Bounded smoke and throughput only; four steady updates per segment. Device peak includes preparation and is not a per-process allocation measurement. Provisioned snapshot path/layout does not attest weight integrity; actual input receipts and learned-device witnesses are separate."
         });
         std::fs::write(

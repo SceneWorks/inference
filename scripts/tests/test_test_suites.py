@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from scripts.ci import test_suites as suites
@@ -62,9 +63,22 @@ class TestSuites(unittest.TestCase):
 
     def execute(self, mode="routine", *, cases=None, **fake):
         calls = []
-        with patch.object(suites, "run", self.fake_run(calls, **fake)):
+        with patch.object(suites, "run", self.fake_run(calls, **fake)), patch.object(
+                suites, "require_windows_gpu1_before_model_case") as admission:
             suites.execute(mode, ["cargo", "test", "--lib", "--tests", "-p", "fixture"], cases or [self.case()], 60)
+            # This harness uses only mocked executable transcripts: it must not
+            # query physical hardware, but every exhaustive case still admits.
+            self.assertEqual(admission.call_count, sum("--exact" in call for call in calls))
         return calls
+
+    def test_exhaustive_admission_failure_prevents_even_mock_case_execution(self):
+        calls = []
+        with patch.object(suites, "run", self.fake_run(calls)), patch.object(
+                suites, "require_windows_gpu1_before_model_case", side_effect=ValueError("fixture admission refused")) as admission:
+            with self.assertRaisesRegex(ValueError, "fixture admission refused"):
+                suites.execute("exhaustive", ["cargo", "test", "--lib", "-p", "fixture"], [self.case()], 60)
+        admission.assert_called_once()
+        self.assertFalse(any("--exact" in call for call in calls))
 
     def test_routine_compiles_full_graph_and_excludes_only_exact_reviewed_cases(self):
         calls = self.execute()
@@ -266,13 +280,13 @@ class TestSuites(unittest.TestCase):
             env = suites.test_environment({"target_directory": "/target"}, package, artifact, output, "/rust/lib\n")
         self.assertEqual(env["RUST_TEST_THREADS"], "1")
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "GPU-fixture")
-        self.assertEqual(env["CARGO_MANIFEST_DIR"], "/repo/crate")
+        self.assertEqual(Path(env["CARGO_MANIFEST_DIR"]), Path("/repo/crate"))
         self.assertEqual(env["OUT_DIR"], "/target/debug/build/fixture/out")
         key = "PATH" if suites.os.name == "nt" else "DYLD_FALLBACK_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
         paths = env[key].split(suites.os.pathsep)
         for path in ("/target/debug/deps", "/target/debug", "/target/debug/build/native", "/rust/lib"):
-            self.assertIn(path, paths)
-        self.assertNotIn("/outside/not-cargo-runtime", paths)
+            self.assertIn(Path(path), [Path(value) for value in paths])
+        self.assertNotIn(Path("/outside/not-cargo-runtime"), [Path(value) for value in paths])
 
     def test_no_fail_fast_collects_failure_without_masking_suite_status(self):
         calls = []
@@ -293,7 +307,9 @@ class TestSuites(unittest.TestCase):
         import yaml
         ordinary = yaml.safe_load((suites.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
         dispatch = ordinary.get("on", ordinary.get(True))["workflow_dispatch"]["inputs"]
-        self.assertEqual(set(dispatch), {"lanes"})
+        self.assertEqual(set(dispatch), {'lanes', 'raw_training_math_only'})
+        self.assertEqual(dispatch['raw_training_math_only']['type'], 'boolean')
+        self.assertIs(dispatch['raw_training_math_only']['default'], False)
         for name in ("candle-cpu-test", "macos-metal", "windows-cuda-check"):
             job = ordinary["jobs"][name]
             commands = [step.get("run", "") for step in job["steps"] if "test_suites.py" in step.get("run", "")]

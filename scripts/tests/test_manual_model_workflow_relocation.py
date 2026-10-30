@@ -102,7 +102,9 @@ class ManualModelWorkflowRelocationTests(unittest.TestCase):
             self.assertNotIn(job, self.ordinary['jobs'])
         events = self.ordinary.get('on', self.ordinary.get(True))
         inputs = events['workflow_dispatch']['inputs']
-        self.assertEqual(set(inputs), {'lanes'})
+        self.assertEqual(set(inputs), {'lanes', 'raw_training_math_only'})
+        self.assertEqual(inputs['raw_training_math_only']['type'], 'boolean')
+        self.assertIs(inputs['raw_training_math_only']['default'], False)
         self.assertEqual(inputs['lanes']['options'], ['all', 'windows-cuda', 'windows-gpu-diagnostic'])
         for job in self.ordinary['jobs'].values():
             for step in job.get('steps', []):

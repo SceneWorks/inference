@@ -65,6 +65,9 @@ class SupervisionError(ValueError):
         # The owned-tree sample that tripped the child-footprint cap, when one did: the
         # breaching total, its per-process split and the run's footprint trajectory.
         self.watchdog_child_footprint: dict[str, object] | None = None
+        # Exact sample that tripped either device predicate, including the WDDM
+        # global upper-bound basis. Never present this as attributed child usage.
+        self.watchdog_device_memory: dict[str, object] | None = None
 
 
 def digest(raw: bytes) -> str:
@@ -921,6 +924,8 @@ def write_unaccepted_record(path: Path, *, kind: str, coordinate: str, error: Su
            if error.watchdog_host_memory is not None else {}),
         **({"watchdogChildFootprint": error.watchdog_child_footprint}
            if error.watchdog_child_footprint is not None else {}),
+        **({"watchdogDeviceMemory": error.watchdog_device_memory}
+           if error.watchdog_device_memory is not None else {}),
     })
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as stream:
@@ -1085,6 +1090,7 @@ def run_guarded(
     require_gpu_sample: bool = True, pass_fds: tuple[int, ...] = (),
     additional_cuda_policies: tuple[SafetyPolicy, ...] = (),
     additional_cuda_probes: tuple[object, ...] = (),
+    reap_metadata_descendants: bool = False,
 ) -> RunResult:
     """Run one row under runtime-guarded, estimate-plus-reserve admission.
 
@@ -1094,6 +1100,9 @@ def run_guarded(
     """
     if type(require_gpu_sample) is not bool:
         raise SupervisionError("invalid-policy", "GPU sample requirement must be boolean")
+    if (type(reap_metadata_descendants) is not bool or
+            (reap_metadata_descendants and (policy.backend != "windows-cpu" or require_gpu_sample))):
+        raise SupervisionError("invalid-policy", "metadata descendant reaping requires an explicit Windows CPU-only discovery")
     admission = None
     cuda_states: tuple[_CudaWatch, ...] = ()
     spawned: list[int] = []
@@ -1125,6 +1134,7 @@ def run_guarded(
             stdout_path=stdout_path, stderr_path=stderr_path, event_path=event_path,
             probe=probe, clock=clock, on_spawn=record_spawn, require_gpu_sample=require_gpu_sample, pass_fds=pass_fds,
             cuda_states=cuda_states,
+            reap_metadata_descendants=reap_metadata_descendants,
         )
     except SupervisionError as error:
         error.admission = admission
@@ -1140,6 +1150,7 @@ def _run_admitted(
     event_path: Path | None, probe: object | None, clock: Callable[[], float],
     on_spawn: Callable[[int, int | None], None], require_gpu_sample: bool = True,
     pass_fds: tuple[int, ...] = (), cuda_states: tuple[_CudaWatch, ...] = (),
+    reap_metadata_descendants: bool = False,
 ) -> RunResult:
     if (not isinstance(pass_fds, tuple) or any(type(fd) is not int or fd < 3 for fd in pass_fds)
             or (os.name == 'nt' and pass_fds)):
@@ -1298,6 +1309,19 @@ def _run_admitted(
                     pids = None
                 else:
                     failed_tree_ticks.succeeded()
+                    if reap_metadata_descendants and status is not None and pids:
+                        # Cargo's completed --list can leave MSVC's VCTIP telemetry
+                        # helper alive. Only metadata discovery opts into reclaiming
+                        # these owned descendants; model bodies keep their normal
+                        # lifetime. Retained, authenticated process handles must all
+                        # signal exit before an empty Job can complete discovery.
+                        try:
+                            job.terminate_and_reap(child, policy.term_grace_millis / 1000)
+                        except windows.WindowsJobError as error:
+                            raise SupervisionError("cleanup-failure", str(error)) from error
+                        pids, owned = owned_processes()
+                        if pids or owned:
+                            raise SupervisionError("cleanup-failure", "metadata Job still has owned processes after reaping")
                     finished = finished_result(status, pids, owned)
                     if finished is not None:
                         return finished
@@ -1398,7 +1422,24 @@ def _run_admitted(
                                 raise SupervisionError("event-cap", "process/device sample spool exceeded cap")
                         if device_free < device.gpu_free_reserve_bytes or device_used > device.child_gpu_cap_bytes:
                             label = f" on {device.cuda_device_uuid}" if multi_cuda else ""
-                            raise SupervisionError("device-memory", f"owned CUDA use or free reserve exceeded cap{label}")
+                            error = SupervisionError("device-memory", f"owned CUDA use or free reserve exceeded cap{label}")
+                            error.watchdog_device_memory = {
+                                "cudaDeviceUuid": device.cuda_device_uuid,
+                                "gpuUsageBasis": basis,
+                                "gpuFreeBytes": device_free,
+                                "childGpuCapBytes": device.child_gpu_cap_bytes,
+                                "gpuFreeReserveBytes": device.gpu_free_reserve_bytes,
+                                "capExceeded": device_used > device.child_gpu_cap_bytes,
+                                "reserveBreached": device_free < device.gpu_free_reserve_bytes,
+                                "elapsedSeconds": clock() - started,
+                                "atNs": time.time_ns(),
+                                "ownedGpuBytes": device_used if basis == "owned-process-attributed" else None,
+                                "globalUsedUpperBoundBytes": device_used if basis == "global-used-upper-bound" else None,
+                                "sampledOwnedPeakBytes": state.peak if state.peak > 0 else None,
+                                "sampledGlobalUpperBoundPeakBytes": state.global_upper_bound_peak if state.global_upper_bound_samples else None,
+                                "globalUpperBoundSampleCount": state.global_upper_bound_samples,
+                            }
+                            raise error
                 time.sleep(policy.poll_millis / 1000)
         except BaseException:
             try:
