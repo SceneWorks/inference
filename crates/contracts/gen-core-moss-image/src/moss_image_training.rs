@@ -62,13 +62,28 @@ pub fn metadata(variant: MossImageVariant, sampler: &str) -> BTreeMap<String, St
     .collect()
 }
 
-pub fn validate_metadata(variant: MossImageVariant, meta: &BTreeMap<String, String>) -> Result<()> {
-    for (key, expected) in metadata(variant, "") {
+/// Validates a native adapter's stamp set and returns the parent checkpoint it names.
+///
+/// Base and SFT share one transformer architecture, so an adapter trained on either parent loads
+/// on both checkpoints (2026-10-29 product decision; loaders accept the returned parent either
+/// way, while a native EXPORT must still name its actual trained parent — the testkit asserts
+/// that separately). The stamps must still name ONE parent consistently: a repository or revision
+/// that contradicts the named parent is a provenance defect, not a cross-checkpoint application.
+pub fn validate_metadata(meta: &BTreeMap<String, String>) -> Result<MossImageVariant> {
+    let parent = meta
+        .get("baseModel")
+        .and_then(|id| MossImageVariant::from_provider_id(id))
+        .ok_or_else(|| {
+            Error::Unsupported(
+                "MOSS adapter baseModel must name moss_image_base or moss_image_sft".into(),
+            )
+        })?;
+    for (key, expected) in metadata(parent, "") {
         if key == "training_sampler" {
             continue;
         }
         if meta.get(&key) != Some(&expected) {
-            return Err(Error::Unsupported(format!("MOSS adapter {key} must be {expected:?}; use an adapter trained for this exact checkpoint")));
+            return Err(Error::Unsupported(format!("MOSS adapter {key} must be {expected:?}; use an adapter trained for the MOSS Base/SFT checkpoint pair")));
         }
     }
     if meta.get("training_sampler").is_none_or(|s| s.is_empty()) {
@@ -76,7 +91,43 @@ pub fn validate_metadata(variant: MossImageVariant, meta: &BTreeMap<String, Stri
             "MOSS adapter has no sampler provenance".into(),
         ));
     }
-    Ok(())
+    Ok(parent)
+}
+
+/// Key prefix external MOSS trainers (the maltrainer / ComfyUI convention) put on transformer
+/// targets. Loaders strip it per key; the native format stores unprefixed `layers.*` paths.
+pub const EXTERNAL_KEY_PREFIX: &str = "diffusion_model.";
+
+/// Whether the adapter declares the native SceneWorks format. No format stamp at all means an
+/// external adapter, admitted on tensor evidence (key namespace, geometry, finite factors)
+/// alone; any OTHER declared format is refused rather than guessed at.
+pub fn is_native_format(meta: &BTreeMap<String, String>) -> Result<bool> {
+    match meta.get("sceneworks_adapter_format").map(String::as_str) {
+        None => Ok(false),
+        Some(value) if value == FORMAT => Ok(true),
+        Some(other) => Err(Error::Unsupported(format!(
+            "unsupported MOSS adapter format {other:?}; expected {FORMAT:?} or an unstamped external PEFT LoRA"
+        ))),
+    }
+}
+
+/// The global LoRA alpha an external adapter declares (`alpha`, or kohya's `ss_network_alpha`),
+/// used only for targets that carry no per-module alpha scalar. `None` when neither stamp exists;
+/// a stamp that is present but malformed or non-finite is an error, never a silent fallback.
+pub fn external_global_alpha(meta: &BTreeMap<String, String>) -> Result<Option<f32>> {
+    for key in ["alpha", "ss_network_alpha"] {
+        let Some(raw) = meta.get(key) else { continue };
+        let alpha = raw.parse::<f32>().map_err(|_| {
+            Error::Unsupported(format!("external MOSS adapter {key} must be a number"))
+        })?;
+        if !alpha.is_finite() {
+            return Err(Error::Unsupported(format!(
+                "external MOSS adapter {key} must be finite"
+            )));
+        }
+        return Ok(Some(alpha));
+    }
+    Ok(None)
 }
 
 // Abramowitz-Stegun normal CDF (absolute error < 8e-8). The table is normalized at a=.95,
@@ -140,11 +191,45 @@ mod tests {
         assert!(target_paths(42, &["text_encoder.q_proj".into()]).is_err());
         assert!(target_paths(42, &["q".into(), "typo".into()]).is_err());
         let meta = metadata(MossImageVariant::Base, SAMPLER);
-        validate_metadata(MossImageVariant::Base, &meta).unwrap();
-        assert!(validate_metadata(MossImageVariant::Sft, &meta).is_err());
+        // The stamp set names its parent; both checkpoints accept it (Base-trained loads on SFT).
+        assert_eq!(validate_metadata(&meta).unwrap(), MossImageVariant::Base);
+        assert_eq!(
+            validate_metadata(&metadata(MossImageVariant::Sft, SAMPLER)).unwrap(),
+            MossImageVariant::Sft
+        );
+        // Internal consistency is still required: stamps contradicting the named parent fail.
         let mut bad = meta.clone();
         bad.insert("base_revision".into(), "wrong".into());
-        assert!(validate_metadata(MossImageVariant::Base, &bad).is_err());
+        assert!(validate_metadata(&bad).is_err());
+        let mut crossed = meta.clone();
+        crossed.insert("baseModel".into(), "moss_image_sft".into());
+        assert!(validate_metadata(&crossed).is_err());
+        let mut unnamed = meta.clone();
+        unnamed.insert("baseModel".into(), "sdxl".into());
+        assert!(validate_metadata(&unnamed).is_err());
+    }
+
+    #[test]
+    fn external_format_and_alpha_admission() {
+        let native = metadata(MossImageVariant::Base, SAMPLER);
+        assert!(is_native_format(&native).unwrap());
+        let mut meta = BTreeMap::new();
+        assert!(!is_native_format(&meta).unwrap());
+        assert_eq!(external_global_alpha(&meta).unwrap(), None);
+        meta.insert("ss_network_alpha".into(), "8".into());
+        assert_eq!(external_global_alpha(&meta).unwrap(), Some(8.0));
+        // `alpha` wins over the kohya stamp, and malformed/non-finite stamps are errors.
+        meta.insert("alpha".into(), "2.5".into());
+        assert_eq!(external_global_alpha(&meta).unwrap(), Some(2.5));
+        meta.insert("alpha".into(), "NaN".into());
+        assert!(external_global_alpha(&meta).is_err());
+        meta.insert("alpha".into(), "oops".into());
+        assert!(external_global_alpha(&meta).is_err());
+        meta.insert(
+            "sceneworks_adapter_format".into(),
+            "somebody_elses_v2".into(),
+        );
+        assert!(is_native_format(&meta).is_err());
     }
     #[test]
     fn stage3_is_discrete_rescaled_truncated_mixture_not_generic_logit_normal() {

@@ -1,4 +1,8 @@
-//! Exact-parent, transformer-only portable adapters. The supplied DMD stack is independent.
+//! Transformer-only portable adapters, native or external. The native format validates its full
+//! stamp set; an unstamped external PEFT LoRA (maltrainer / ComfyUI convention) is admitted on
+//! tensor evidence, with `diffusion_model.`-prefixed keys stripped and bf16/f16 factors upcast to
+//! the same FP32 residual stack. Base- and SFT-trained adapters load on either checkpoint
+//! (2026-10-29). The supplied DMD stack is independent.
 use crate::{precision::linear_fp32, transformer::Transformer};
 use gen_core_moss_image::moss_image_training as contract;
 use mlx_gen::{
@@ -242,9 +246,11 @@ pub(crate) fn validate_lora(adapter: &Adapter) -> Result<()> {
     }
 }
 
+/// `_variant` is deliberately unused since the Base/SFT pair accepts either parent's adapters
+/// (2026-10-29): kept in the signature so every call site still states which checkpoint it loads.
 pub(crate) fn apply(
     host: &mut Transformer,
-    variant: MossImageVariant,
+    _variant: MossImageVariant,
     specs: &[AdapterSpec],
 ) -> Result<Vec<gen_core::AdapterApplyReport>> {
     let allowed = host.adaptable_paths();
@@ -257,19 +263,39 @@ pub(crate) fn apply(
             ));
         }
         let meta = gen_core::weightsmeta::safetensors_file_metadata(&spec.path)?;
-        contract::validate_metadata(variant, &meta)?;
+        let native = contract::is_native_format(&meta)?;
         let lokr = meta.get("networkType").is_some_and(|v| v == "lokr");
-        if !matches!(
-            (&spec.kind, lokr),
-            (AdapterKind::Lora, false) | (AdapterKind::Lokr, true)
-        ) {
+        if native {
+            // Loading accepts either Base/SFT parent; the stamps only have to be consistent.
+            contract::validate_metadata(&meta)?;
+            if !matches!(
+                (&spec.kind, lokr),
+                (AdapterKind::Lora, false) | (AdapterKind::Lokr, true)
+            ) {
+                return Err(Error::Unsupported(
+                    "MOSS adapter kind does not match its safetensors metadata".into(),
+                ));
+            }
+        } else if matches!(spec.kind, AdapterKind::Lokr) || lokr {
             return Err(Error::Unsupported(
-                "MOSS adapter kind does not match its safetensors metadata".into(),
+                "external MOSS adapters load as PEFT LoRA only; LoKr needs the native \
+                 moss_transformer_adapter_v1 format"
+                    .into(),
             ));
         }
-        let (metadata_rank, metadata_alpha) = contract::lokr_scaling(&meta)?;
+        // Native files stamp a global rank/alpha; external PEFT files carry per-target alpha
+        // scalars (with `alpha`/`ss_network_alpha` as the file-level fallback) and their rank is
+        // whatever each target's factors say — SVD-resized external adapters legitimately vary it.
+        let (metadata_rank, fallback_alpha) = if native {
+            let (rank, alpha) = contract::lokr_scaling(&meta)?;
+            (Some(rank), Some(alpha))
+        } else {
+            (None, contract::external_global_alpha(&meta)?)
+        };
         let scale = if lokr {
-            let (rank, alpha) = (metadata_rank, metadata_alpha);
+            let (Some(rank), Some(alpha)) = (metadata_rank, fallback_alpha) else {
+                unreachable!("LoKr is native-only, which always carries rank/alpha stamps");
+            };
             let scale = (alpha / rank) * spec.scale;
             if !scale.is_finite() {
                 return Err(Error::Unsupported(
@@ -290,20 +316,51 @@ pub(crate) fn apply(
             &[".lora_A.weight", ".lora_B.weight", ".alpha"]
         };
         let mut groups = BTreeMap::<String, BTreeMap<String, Vec<usize>>>::new();
+        // Logical `{path}.{factor}` → the file's own key, so external `diffusion_model.`-prefixed
+        // tensors are read back under the exact name they were validated by.
+        let mut stored_keys = BTreeMap::<String, String>::new();
         for header in headers {
-            if header.dtype != gen_core::weightsmeta::Dtype::F32 {
+            // The native format is FP32 by contract; external trainers ship bf16/f16, upcast
+            // losslessly to the same FP32 residual stack at install below.
+            if header.dtype != gen_core::weightsmeta::Dtype::F32
+                && (native
+                    || !matches!(
+                        header.dtype,
+                        gen_core::weightsmeta::Dtype::BF16 | gen_core::weightsmeta::Dtype::F16
+                    ))
+            {
                 return Err(Error::Unsupported(format!(
-                    "MOSS adapter tensor {} must be FP32",
-                    header.name
+                    "MOSS adapter tensor {} must be FP32{}",
+                    header.name,
+                    if native { "" } else { ", BF16 or F16" }
                 )));
             }
-            let (path, factor) = gen_core::weightsmeta::split_factor_key(&header.name, suffixes)
+            let logical = if native {
+                header.name.as_str()
+            } else {
+                header
+                    .name
+                    .strip_prefix(contract::EXTERNAL_KEY_PREFIX)
+                    .unwrap_or(&header.name)
+            };
+            let (path, factor) = gen_core::weightsmeta::split_factor_key(logical, suffixes)
                 .ok_or_else(|| {
                     Error::Unsupported(format!("unsupported MOSS adapter tensor {}", header.name))
                 })?;
             if !allowed.iter().any(|p| p == path) {
                 return Err(Error::Unsupported(format!(
                     "MOSS adapter target {path} is not a transformer projection"
+                )));
+            }
+            // Two spellings of one logical factor (prefixed and unprefixed) must not silently
+            // shadow each other: the maps key by the logical name, so an unchecked insert would
+            // drop one supplied tensor and still report successful application.
+            if let Some(previous) =
+                stored_keys.insert(format!("{path}.{factor}"), header.name.clone())
+            {
+                return Err(Error::Unsupported(format!(
+                    "MOSS adapter tensors {previous} and {} name the same factor {path}.{factor}",
+                    header.name
                 )));
             }
             groups
@@ -349,44 +406,69 @@ pub(crate) fn apply(
                         }
                     }
                 }
-                if !matches!((rank_a,rank_b),(Some(a),Some(b)) if a == b && a as f32 == metadata_rank)
+                if !matches!((rank_a, rank_b), (Some(a), Some(b)) if a == b
+                    && metadata_rank.is_none_or(|rank| a as f32 == rank))
                 {
                     return Err(Error::Unsupported(
-                        "MOSS LoRA factors must agree with native metadata rank".into(),
+                        "MOSS LoRA factors must agree on one rank per target (and match the \
+                         metadata rank on a native adapter)"
+                            .into(),
                     ));
+                }
+                if fallback_alpha.is_none() && !group.contains_key("alpha") {
+                    return Err(Error::Unsupported(format!(
+                        "external MOSS adapter target {path} has no alpha scalar and the file \
+                         declares no alpha/ss_network_alpha fallback"
+                    )));
                 }
             }
         }
-        validated.push((groups, scale, metadata_alpha));
+        validated.push((groups, stored_keys, scale, fallback_alpha));
     }
     let mut reports = Vec::new();
-    for (spec, (groups, scale, metadata_alpha)) in specs.iter().zip(validated) {
+    for (spec, (groups, stored_keys, scale, fallback_alpha)) in specs.iter().zip(validated) {
         let weights = mlx_gen::weights::Weights::from_file(&spec.path)?;
         // Consume CPU-only lazy file reads before finite checks or residual math enter Metal.
         weights.materialize()?;
         for key in weights.keys() {
             finite(weights.require(key)?, &format!("source tensor {key}"))?;
         }
+        // One reader for both key spaces: the stored-key map resolves the logical
+        // `{path}.{factor}` back to the file's own (possibly `diffusion_model.`-prefixed) name,
+        // and the upcast folds external bf16/f16 factors into the same FP32 residual stack the
+        // native format mandates (a no-op on already-FP32 tensors).
+        let stored = |logical: &str| -> Result<Array> {
+            let key = stored_keys
+                .get(logical)
+                .map(String::as_str)
+                .unwrap_or(logical);
+            Ok(weights.require(key)?.as_dtype(Dtype::Float32)?)
+        };
         let applied = match spec.kind {
             AdapterKind::Lora => {
                 // Validate RAW portable factors too: alpha folding must not make this backend
                 // accept a file that overflows Candle's otherwise identical raw execution.
                 for path in groups.keys() {
                     validate_lora_factors(
-                        weights.require(&format!("{path}.lora_A.weight"))?,
-                        weights.require(&format!("{path}.lora_B.weight"))?,
+                        &stored(&format!("{path}.lora_A.weight"))?,
+                        &stored(&format!("{path}.lora_B.weight"))?,
                         if scale == 0. { 0. } else { 1. },
                     )?;
                 }
                 for path in groups.keys() {
-                    let a = weights.require(&format!("{path}.lora_A.weight"))?;
-                    let b = weights.require(&format!("{path}.lora_B.weight"))?;
+                    let a = stored(&format!("{path}.lora_A.weight"))?;
+                    let b = stored(&format!("{path}.lora_B.weight"))?;
                     let alpha = if groups[path].contains_key("alpha") {
-                        crate::pipeline::logical_f32_readback(
-                            weights.require(&format!("{path}.alpha"))?,
-                        )?[0]
+                        crate::pipeline::logical_f32_readback(&stored(&format!("{path}.alpha"))?)?
+                            [0]
                     } else {
-                        metadata_alpha
+                        fallback_alpha.ok_or_else(|| {
+                            Error::Unsupported(
+                                "MOSS LoRA target lost its alpha provenance between validation \
+                                 and installation"
+                                    .into(),
+                            )
+                        })?
                     };
                     let effective = (alpha / a.shape()[0] as f32) * scale;
                     if !alpha.is_finite() || !effective.is_finite() {
@@ -394,7 +476,7 @@ pub(crate) fn apply(
                             "MOSS LoRA effective scale must be finite".into(),
                         ));
                     }
-                    validate_lora_factors(a, b, effective)?;
+                    validate_lora_factors(&a, &b, effective)?;
                     host.adaptable_mut(&path.split('.').collect::<Vec<_>>())
                         .ok_or_else(|| Error::Unsupported("MOSS LoRA target disappeared".into()))?
                         .push(Adapter::Lora {
@@ -413,12 +495,7 @@ pub(crate) fn apply(
                         .ok_or_else(|| Error::Msg("MOSS adapter path disappeared".into()))?;
                     let tensors = group
                         .keys()
-                        .map(|factor| {
-                            Ok((
-                                factor.clone(),
-                                weights.require(&format!("{path}.{factor}"))?.clone(),
-                            ))
-                        })
+                        .map(|factor| Ok((factor.clone(), stored(&format!("{path}.{factor}"))?)))
                         .collect::<Result<BTreeMap<_, _>>>()?;
                     host.push_lokr(path, Lokr::from_group(&tensors, &facts.base_shape, scale)?)?;
                 }
@@ -445,8 +522,13 @@ pub(crate) fn estimated_bytes(
         gen_core::weightsmeta::safetensors_path_tensor_headers(&spec.path)?
             .iter()
             .try_fold(bytes, |total, header| {
-                total
-                    .checked_add(header.data_bytes)
+                // Resident size, not file size: external bf16/f16 factors are upcast to FP32 at
+                // installation, so estimate four bytes per element for every float dtype.
+                header
+                    .shape
+                    .iter()
+                    .try_fold(4u64, |n, &d| n.checked_mul(d as u64))
+                    .and_then(|resident| total.checked_add(resident.max(header.data_bytes)))
                     .ok_or_else(|| Error::Unsupported("MOSS adapter byte overflow".into()))
             })
     })

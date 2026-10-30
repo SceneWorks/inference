@@ -574,7 +574,13 @@ impl RunProbe {
     ) -> Result<()> {
         let info = snapshot::inspect(path, step, update, AUDIT_WORKSPACE_BYTES)?;
         let metadata: BTreeMap<_, _> = info.export_identity.iter().cloned().collect();
-        gen_core_moss_image::moss_image_training::validate_metadata(variant, &metadata)?;
+        // Loading accepts either parent, but an EXPORT must name the checkpoint it was
+        // actually trained on — that exactness is asserted here, not in validate_metadata.
+        if gen_core_moss_image::moss_image_training::validate_metadata(&metadata)? != variant {
+            return Err(Error::Unsupported(
+                "native export must name its actual trained parent checkpoint".into(),
+            ));
+        }
         let request = self
             .owner
             .receipts

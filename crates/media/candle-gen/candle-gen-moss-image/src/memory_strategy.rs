@@ -96,8 +96,15 @@ fn adapter_bytes(s: &Sources) -> gen_core::Result<u64> {
     let mut bytes = 0u64;
     for spec in &s.spec.adapters {
         for header in gen_core::weightsmeta::safetensors_path_tensor_headers(&spec.path)? {
-            bytes = bytes
-                .checked_add(header.data_bytes)
+            // Resident size, not file size: external bf16/f16 factors are coerced to FP32 at
+            // load, so price four bytes per element for every float dtype.
+            let resident = header
+                .shape
+                .iter()
+                .try_fold(4u64, |n, &d| n.checked_mul(d as u64))
+                .map(|resident| resident.max(header.data_bytes));
+            bytes = resident
+                .and_then(|resident| bytes.checked_add(resident))
                 .ok_or_else(|| gen_core::Error::Unsupported("MOSS adapter byte overflow".into()))?;
         }
     }
