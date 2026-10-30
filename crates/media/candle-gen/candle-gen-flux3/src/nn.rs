@@ -920,8 +920,8 @@ pub fn expect_shape(name: &str, a: &Tensor, want: &[usize]) -> Result<()> {
 mod tests {
     use super::*;
     use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
-    use gen_core_flux3::artifacts::NativeDitStorage;
     use candle_gen::testkit::tensor_peak_rel;
+    use gen_core_flux3::artifacts::NativeDitStorage;
 
     fn seeded(n: usize, k: usize, salt: f32) -> Tensor {
         let data: Vec<f32> = (0..n * k)
