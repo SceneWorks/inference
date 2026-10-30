@@ -1362,22 +1362,57 @@ mod tests {
             assert!(mid > 0.0 && mid < plain, "{mid} vs {plain}");
         }
 
-        let before = step_loss(&adapter, &source, &noise, 0.5, DType::F32, false, None)
-            .unwrap()
-            .0
-            .to_scalar::<f32>()
-            .unwrap();
+        // A distinct tensor identity with identical values bypasses the prepared text
+        // entry, providing the actual uncached conditioning path as a control.
+        let mut uncached = masked_sample(None);
+        uncached.text = source.text.copy().unwrap();
+        assert_ne!(uncached.text.id(), source.text.id());
+        let loss = |sample: &CachedSample| {
+            step_loss(&adapter, sample, &noise, 0.5, DType::F32, false, None)
+                .unwrap()
+                .0
+                .to_scalar::<f32>()
+                .unwrap()
+        };
+        let before = loss(&source);
+        let before_raw = loss(&uncached);
+        assert!((before - before_raw).abs() < 1e-5);
         let (_, factor) = set
             .named_vars()
             .into_iter()
             .find(|(name, _)| name == "txt_in.lora_B.weight")
             .unwrap();
-        factor.set(&(factor.as_tensor() + 0.1).unwrap()).unwrap();
-        let after = step_loss(&adapter, &source, &noise, 0.5, DType::F32, false, None)
-            .unwrap()
-            .0
-            .to_scalar::<f32>()
-            .unwrap();
+        let (channels, rank) = factor.as_tensor().dims2().unwrap();
+        assert_eq!(rank, 2);
+        assert_eq!(channels % 4, 0);
+        // A uniform B increment adds the same scalar to every output channel.
+        // Every subsequent text consumer starts with LayerNorm, which removes that
+        // common-mode shift. Use two independent, zero-mean channel patterns so the
+        // mutation changes the normalized text state instead of its discarded mean.
+        let delta: Vec<f32> = (0..channels)
+            .flat_map(|channel| {
+                (0..rank).map(move |column| {
+                    if (channel >> column) % 2 == 0 {
+                        0.5
+                    } else {
+                        -0.5
+                    }
+                })
+            })
+            .collect();
+        let delta = Tensor::from_vec(delta, (channels, rank), &Device::Cpu).unwrap();
+        factor.set(&(factor.as_tensor() + delta).unwrap()).unwrap();
+        let after = loss(&source);
+        let after_raw = loss(&uncached);
+        assert!(
+            (after - after_raw).abs() < 1e-5,
+            "prepared/raw after mutation: {after}/{after_raw}"
+        );
+        assert_ne!(
+            before_raw.to_bits(),
+            after_raw.to_bits(),
+            "nonuniform txt_in mutation must reach the uncached loss"
+        );
         assert_ne!(
             before.to_bits(),
             after.to_bits(),

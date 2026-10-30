@@ -283522,12 +283522,54 @@
       "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_edit_matches_the_shared_oracle",
       "requirements": [
         {
-          "slot": "flux3-source-tensors",
-          "role": "tensor-input",
+          "slot": "flux3-pup-model-weights",
+          "role": "model-weights",
           "readers": [
-            "candle-core::safetensors::MmapedSafetensors::multi",
-            "candle-core::safetensors::MmapedSafetensors::new",
-            "candle-core::safetensors::load"
+            "candle-llm::primitives::Weights::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "core-llm::tokenizer::Tokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-dispatch-config",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/starvector.rs::read_config::std::fs::read_to_string@10042"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-provider-configs",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/provider.rs::read_json::std::fs::read_to_string@267613"
+          ],
+          "minimum_collections": 3,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-chat-template",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/provider.rs::sidecar_chat_template::std::fs::read_to_string@189409"
           ],
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -283595,12 +283637,54 @@
       "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_edit_with_boxes_matches_the_shared_oracle",
       "requirements": [
         {
-          "slot": "flux3-source-tensors",
-          "role": "tensor-input",
+          "slot": "flux3-pup-model-weights",
+          "role": "model-weights",
           "readers": [
-            "candle-core::safetensors::MmapedSafetensors::multi",
-            "candle-core::safetensors::MmapedSafetensors::new",
-            "candle-core::safetensors::load"
+            "candle-llm::primitives::Weights::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "core-llm::tokenizer::Tokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-dispatch-config",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/starvector.rs::read_config::std::fs::read_to_string@10042"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-provider-configs",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/provider.rs::read_json::std::fs::read_to_string@267613"
+          ],
+          "minimum_collections": 3,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-chat-template",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/provider.rs::sidecar_chat_template::std::fs::read_to_string@189409"
           ],
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -283668,12 +283752,54 @@
       "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_text_matches_the_shared_oracle",
       "requirements": [
         {
-          "slot": "flux3-source-tensors",
-          "role": "tensor-input",
+          "slot": "flux3-pup-model-weights",
+          "role": "model-weights",
           "readers": [
-            "candle-core::safetensors::MmapedSafetensors::multi",
-            "candle-core::safetensors::MmapedSafetensors::new",
-            "candle-core::safetensors::load"
+            "candle-llm::primitives::Weights::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "core-llm::tokenizer::Tokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-dispatch-config",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/starvector.rs::read_config::std::fs::read_to_string@10042"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-provider-configs",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/provider.rs::read_json::std::fs::read_to_string@267613"
+          ],
+          "minimum_collections": 3,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-chat-template",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/provider.rs::sidecar_chat_template::std::fs::read_to_string@189409"
           ],
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -283741,12 +283867,54 @@
       "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_text_with_boxes_matches_the_shared_oracle",
       "requirements": [
         {
-          "slot": "flux3-source-tensors",
-          "role": "tensor-input",
+          "slot": "flux3-pup-model-weights",
+          "role": "model-weights",
           "readers": [
-            "candle-core::safetensors::MmapedSafetensors::multi",
-            "candle-core::safetensors::MmapedSafetensors::new",
-            "candle-core::safetensors::load"
+            "candle-llm::primitives::Weights::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "core-llm::tokenizer::Tokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-dispatch-config",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/starvector.rs::read_config::std::fs::read_to_string@10042"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-provider-configs",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/provider.rs::read_json::std::fs::read_to_string@267613"
+          ],
+          "minimum_collections": 3,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-pup-chat-template",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/provider.rs::sidecar_chat_template::std::fs::read_to_string@189409"
           ],
           "minimum_collections": 1,
           "minimum_items": 1,
