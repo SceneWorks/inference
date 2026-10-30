@@ -179,12 +179,13 @@ impl Drop for ReadOperation {
             let mut r = self.source.ranges.lock().unwrap_or_else(|e| e.into_inner());
             if r.active.as_ref().is_some_and(|(id, _)| *id == self.id) {
                 r.active = None;
-                let changed = r.bytes != r.published;
-                r.published = r.bytes;
-                changed.then_some(r.bytes)
-            } else {
-                None
             }
+            // A newer overlapping operation may already have finished and cleared `active`.
+            // The remaining operation still owns its actual tail reads and must flush them.
+            // Preserve a different live owner while publishing this source's cumulative extent.
+            let changed = r.bytes != r.published;
+            r.published = r.bytes;
+            changed.then_some(r.bytes)
         };
         if let Some(bytes) = flush {
             self.activity.update(bytes);
@@ -234,6 +235,45 @@ impl<R: Seek> Seek for ProgressReader<R> {
 mod tests {
     use super::*;
     use crate::LoadActivityObserver;
+    #[test]
+    fn overlapping_same_source_operations_flush_and_restore_cumulative_bytes() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let out = events.clone();
+        let _observer = LoadActivityObserver::new(move |v| out.lock().unwrap().push(v));
+        let source = SourceProgress::new("shared.weights", Some(128));
+        let older = source.operation();
+        older.record(0, 16);
+        let newer = source.operation();
+        newer.record(16, 32);
+        drop(newer);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .bytes_read,
+            48,
+            "restoring the older live operation must retain the newer consumed extent"
+        );
+        older.record(48, 16);
+        drop(older);
+        let events = events.lock().unwrap();
+        let counts: Vec<_> = events.iter().flatten().map(|v| v.bytes_read).collect();
+        assert!(
+            counts.windows(2).all(|v| v[0] <= v[1]),
+            "overlap regressed: {counts:?}"
+        );
+        assert_eq!(
+            counts.last(),
+            Some(&64),
+            "last surviving operation must flush its actual tail bytes"
+        );
+        assert_eq!(events.last(), Some(&None));
+    }
+
     #[test]
     fn reads_count_unique_ranges_not_seeks_and_clear_on_error() {
         let events = Arc::new(Mutex::new(Vec::new()));

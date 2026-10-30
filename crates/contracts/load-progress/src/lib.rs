@@ -495,6 +495,32 @@ mod tests {
     }
 
     #[test]
+    fn finishing_newer_same_file_scope_cannot_restore_an_older_byte_count() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let out = events.clone();
+        let _observer = LoadActivityObserver::new(move |v| out.lock().unwrap().push(v));
+        let context = LoadActivityContext::capture();
+        let older =
+            context.file_with_bytes(LoadActivityPhase::Loading, "same.weights", Some(100), 16);
+        let newer =
+            context.file_with_bytes(LoadActivityPhase::Loading, "same.weights", Some(100), 16);
+        newer.update(48);
+        newer.finish();
+        let restored = events.lock().unwrap().last().unwrap().clone().unwrap();
+        assert_eq!(restored.bytes_read, 48);
+        older.update(64);
+        older.finish();
+        let events = events.lock().unwrap();
+        let counts: Vec<_> = events.iter().flatten().map(|v| v.bytes_read).collect();
+        assert!(
+            counts.windows(2).all(|v| v[0] <= v[1]),
+            "same-source progress regressed: {counts:?}"
+        );
+        assert_eq!(counts.last(), Some(&64));
+        assert_eq!(events.last(), Some(&None));
+    }
+
+    #[test]
     fn ending_latest_parallel_read_restores_still_running_source() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let out = events.clone();

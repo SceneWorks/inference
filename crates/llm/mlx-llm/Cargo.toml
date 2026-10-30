@@ -13,7 +13,6 @@ categories = ["science"]
 autotests = false
 
 [dependencies]
-sceneworks-load-progress = { workspace = true }
 # mlx-rs is pinned to the pmetal fork by commit SHA — the SAME pin mlx-gen uses, so the two
 # build ONE mlx-rs and share a single `Array` type (the inversion: mlx-gen will consume mlx-llm).
 # `pmetal-mlx-rs` is mlx-rs 0.25 whose mlx-sys builds MLX core 0.32.0 (epic 12742; faster Metal
