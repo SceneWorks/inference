@@ -209,9 +209,9 @@ pub fn env_path_opt(key: &str) -> Option<PathBuf> {
 /// cache** a test builds itself (a converted-weights directory). A provided input must hard-fail
 /// instead (`require_env_path` / `env_path`), never default (epic 13657).
 pub fn env_path_or_home(var: &str, home_relative: &str) -> PathBuf {
-    std::env::var(var).map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").expect("HOME")).join(home_relative)
-    })
+    std::env::var(var)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").expect("HOME")).join(home_relative))
 }
 
 #[cfg(test)]
@@ -225,7 +225,12 @@ mod tests {
         assert_eq!(Denom::FloorAt(0.5).apply_f64(2.0), 2.0);
         assert_eq!(Denom::FloorAt(0.5).apply_f64(0.25), 0.5);
         // The f32 copies spelled these literals directly; the f64 → f32 rounding must agree.
-        for (wide, narrow) in [(1e-12f64, 1e-12f32), (1e-6, 1e-6), (1e-9, 1e-9), (1e-30, 1e-30)] {
+        for (wide, narrow) in [
+            (1e-12f64, 1e-12f32),
+            (1e-6, 1e-6),
+            (1e-9, 1e-9),
+            (1e-30, 1e-30),
+        ] {
             assert_eq!((wide as f32).to_bits(), narrow.to_bits());
         }
     }

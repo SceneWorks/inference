@@ -282,8 +282,12 @@ mod tests {
 
         // bf16 cast placement: 256 − 1.5 = 254.5 needs 9 significant bits, so a bf16 difference
         // rounds it (ties-to-even) to 254 while the f32-first difference keeps 254.5.
-        let x = Array::from_slice(&[256.0f32], &[1]).as_dtype(Dtype::Bfloat16).unwrap();
-        let y = Array::from_slice(&[1.5f32], &[1]).as_dtype(Dtype::Bfloat16).unwrap();
+        let x = Array::from_slice(&[256.0f32], &[1])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let y = Array::from_slice(&[1.5f32], &[1])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
         assert_eq!(max_abs_diff(&x, &y), 254.0);
         assert_eq!(max_abs_diff_f32(&x, &y), 254.5);
         assert_eq!(max_abs_diff_host(&x, &y), 254.5);
