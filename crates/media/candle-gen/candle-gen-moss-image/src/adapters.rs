@@ -1,5 +1,9 @@
-//! Portable exact-parent adapters. Raw FP32 factors serve training, recomputation and generation;
-//! no projection-sized Kronecker delta is ever constructed.
+//! Portable adapters, native or external. The native format validates its full stamp set; an
+//! unstamped external PEFT LoRA (maltrainer / ComfyUI convention) is admitted on tensor evidence,
+//! with `diffusion_model.`-prefixed keys stripped and bf16/f16 factors upcast by the F32-coercing
+//! reader. Base- and SFT-trained adapters load on either checkpoint (2026-10-29). Raw FP32
+//! factors serve training, recomputation and generation; no projection-sized Kronecker delta is
+//! ever constructed.
 use crate::{loader::tensor_f32, transformer::Transformer};
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::candle_nn::{Linear, Module};
@@ -300,7 +304,9 @@ impl Residual {
 /// precede tensor allocation; source tokens are checked before and after consuming their bytes.
 pub(crate) fn apply(
     host: &mut Transformer,
-    variant: MossImageVariant,
+    // Deliberately unused since the Base/SFT pair accepts either parent's adapters (2026-10-29):
+    // kept in the signature so every call site still states which checkpoint it loads.
+    _variant: MossImageVariant,
     specs: &[gen_core::AdapterSpec],
     pins: &[gen_core::PinnedWeightsFile],
 ) -> Result<Vec<gen_core::AdapterApplyReport>> {
@@ -322,13 +328,36 @@ pub(crate) fn apply(
             ));
         }
         let meta = gen_core::weightsmeta::safetensors_file_metadata(&spec.path)?;
-        contract::validate_metadata(variant, &meta)?;
-        let lokr = match (&spec.kind, meta.get("networkType").map(String::as_str)) {
-            (gen_core::AdapterKind::Lora, Some("lora")) => false,
-            (gen_core::AdapterKind::Lokr, Some("lokr")) => true,
-            _ => return Err(invalid("kind disagrees with networkType")),
+        let native = contract::is_native_format(&meta)?;
+        let lokr = if native {
+            // Loading accepts either Base/SFT parent; the stamps only have to be consistent.
+            contract::validate_metadata(&meta)?;
+            match (&spec.kind, meta.get("networkType").map(String::as_str)) {
+                (gen_core::AdapterKind::Lora, Some("lora")) => false,
+                (gen_core::AdapterKind::Lokr, Some("lokr")) => true,
+                _ => return Err(invalid("kind disagrees with networkType")),
+            }
+        } else {
+            // External adapters are PEFT LoRA only; an unstamped networkType means LoRA.
+            if !matches!(spec.kind, gen_core::AdapterKind::Lora)
+                || meta.get("networkType").is_some_and(|v| v != "lora")
+            {
+                return Err(invalid(
+                    "external adapters load as PEFT LoRA only; LoKr needs the native \
+                     moss_transformer_adapter_v1 format",
+                ));
+            }
+            false
         };
-        let (metadata_rank, metadata_alpha) = contract::lokr_scaling(&meta)?;
+        // Native files stamp a global rank/alpha; external PEFT files carry per-target alpha
+        // scalars (with `alpha`/`ss_network_alpha` as the file-level fallback) and their rank is
+        // whatever each target's factors say — SVD-resized external adapters legitimately vary it.
+        let (metadata_rank, fallback_alpha) = if native {
+            let (rank, alpha) = contract::lokr_scaling(&meta)?;
+            (Some(rank), Some(alpha))
+        } else {
+            (None, contract::external_global_alpha(&meta)?)
+        };
         let suffixes: &[&str] = if lokr {
             &gen_core::weightsmeta::LOKR_SUFFIXES
         } else {
@@ -339,14 +368,48 @@ pub(crate) fn apply(
             return Err(invalid("empty adapter"));
         }
         let mut groups = BTreeMap::<String, BTreeMap<String, Vec<usize>>>::new();
+        // Logical `{path}.{factor}` → the file's own key, so external `diffusion_model.`-prefixed
+        // tensors are read back under the exact name they were validated by.
+        let mut stored_keys = BTreeMap::<String, String>::new();
         for header in headers {
-            if header.dtype != gen_core::weightsmeta::Dtype::F32 {
-                return Err(invalid(format!("{} must be FP32", header.name)));
+            // The native format is FP32 by contract; external trainers ship bf16/f16, which the
+            // F32-coercing weight reader upcasts losslessly into the same FP32 residual stack.
+            if header.dtype != gen_core::weightsmeta::Dtype::F32
+                && (native
+                    || !matches!(
+                        header.dtype,
+                        gen_core::weightsmeta::Dtype::BF16 | gen_core::weightsmeta::Dtype::F16
+                    ))
+            {
+                return Err(invalid(format!(
+                    "{} must be FP32{}",
+                    header.name,
+                    if native { "" } else { ", BF16 or F16" }
+                )));
             }
-            let (path, factor) = gen_core::weightsmeta::split_factor_key(&header.name, suffixes)
+            let logical = if native {
+                header.name.as_str()
+            } else {
+                header
+                    .name
+                    .strip_prefix(contract::EXTERNAL_KEY_PREFIX)
+                    .unwrap_or(&header.name)
+            };
+            let (path, factor) = gen_core::weightsmeta::split_factor_key(logical, suffixes)
                 .ok_or_else(|| invalid(format!("unknown tensor {}", header.name)))?;
             if !shapes.contains_key(path) {
                 return Err(invalid(format!("unknown transformer projection {path}")));
+            }
+            // Two spellings of one logical factor (prefixed and unprefixed) must not silently
+            // shadow each other: the maps key by the logical name, so an unchecked insert would
+            // drop one supplied tensor and still report successful application.
+            if let Some(previous) =
+                stored_keys.insert(format!("{path}.{factor}"), header.name.clone())
+            {
+                return Err(invalid(format!(
+                    "tensors {previous} and {} name the same factor {path}.{factor}",
+                    header.name
+                )));
             }
             groups
                 .entry(path.into())
@@ -382,11 +445,21 @@ pub(crate) fn apply(
         for (path, group) in groups {
             let tensors = group
                 .keys()
-                .map(|key| Ok((key.clone(), weights.require(&format!("{path}.{key}"))?)))
+                .map(|key| {
+                    let logical = format!("{path}.{key}");
+                    let stored = stored_keys
+                        .get(&logical)
+                        .map(String::as_str)
+                        .unwrap_or(&logical);
+                    Ok((key.clone(), weights.require(stored)?))
+                })
                 .collect::<Result<BTreeMap<_, _>>>()?;
             let (output, input) = shapes[&path];
             let scale = if lokr {
-                f64::from((metadata_alpha / metadata_rank) * spec.scale)
+                let (Some(rank), Some(alpha)) = (metadata_rank, fallback_alpha) else {
+                    unreachable!("LoKr is native-only, which always carries rank/alpha stamps");
+                };
+                f64::from((alpha / rank) * spec.scale)
             } else {
                 // PEFT per-target alpha is optional only when the file supplies valid global alpha.
                 let rank = tensors["lora_A.weight"].dim(0)? as f32;
@@ -397,14 +470,13 @@ pub(crate) fn apply(
                     }
                     v[0]
                 } else {
-                    meta.get("alpha")
-                        .ok_or_else(|| invalid("missing LoRA alpha"))?
-                        .parse::<f32>()
-                        .map_err(|_| invalid("malformed LoRA alpha"))?
+                    fallback_alpha.ok_or_else(|| {
+                        invalid("target has no alpha scalar and the file declares no alpha")
+                    })?
                 };
-                if !alpha.is_finite() || rank != metadata_rank {
+                if !alpha.is_finite() || metadata_rank.is_some_and(|m| rank != m) {
                     return Err(invalid(
-                        "LoRA alpha must be finite and tensor rank must match metadata",
+                        "LoRA alpha must be finite and tensor rank must match native metadata",
                     ));
                 }
                 f64::from((alpha / rank) * spec.scale)
