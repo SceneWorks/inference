@@ -525,3 +525,5 @@ mod tests {
         assert_eq!(events.lock().unwrap().last(), Some(&None));
     }
 }
+
+pub mod reader;
