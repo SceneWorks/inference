@@ -65,6 +65,9 @@ class SupervisionError(ValueError):
         # The owned-tree sample that tripped the child-footprint cap, when one did: the
         # breaching total, its per-process split and the run's footprint trajectory.
         self.watchdog_child_footprint: dict[str, object] | None = None
+        # Exact sample that tripped either device predicate, including the WDDM
+        # global upper-bound basis. Never present this as attributed child usage.
+        self.watchdog_device_memory: dict[str, object] | None = None
 
 
 def digest(raw: bytes) -> str:
@@ -921,6 +924,8 @@ def write_unaccepted_record(path: Path, *, kind: str, coordinate: str, error: Su
            if error.watchdog_host_memory is not None else {}),
         **({"watchdogChildFootprint": error.watchdog_child_footprint}
            if error.watchdog_child_footprint is not None else {}),
+        **({"watchdogDeviceMemory": error.watchdog_device_memory}
+           if error.watchdog_device_memory is not None else {}),
     })
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as stream:
@@ -1398,7 +1403,24 @@ def _run_admitted(
                                 raise SupervisionError("event-cap", "process/device sample spool exceeded cap")
                         if device_free < device.gpu_free_reserve_bytes or device_used > device.child_gpu_cap_bytes:
                             label = f" on {device.cuda_device_uuid}" if multi_cuda else ""
-                            raise SupervisionError("device-memory", f"owned CUDA use or free reserve exceeded cap{label}")
+                            error = SupervisionError("device-memory", f"owned CUDA use or free reserve exceeded cap{label}")
+                            error.watchdog_device_memory = {
+                                "cudaDeviceUuid": device.cuda_device_uuid,
+                                "gpuUsageBasis": basis,
+                                "gpuFreeBytes": device_free,
+                                "childGpuCapBytes": device.child_gpu_cap_bytes,
+                                "gpuFreeReserveBytes": device.gpu_free_reserve_bytes,
+                                "capExceeded": device_used > device.child_gpu_cap_bytes,
+                                "reserveBreached": device_free < device.gpu_free_reserve_bytes,
+                                "elapsedSeconds": clock() - started,
+                                "atNs": time.time_ns(),
+                                "ownedGpuBytes": device_used if basis == "owned-process-attributed" else None,
+                                "globalUsedUpperBoundBytes": device_used if basis == "global-used-upper-bound" else None,
+                                "sampledOwnedPeakBytes": state.peak if state.peak > 0 else None,
+                                "sampledGlobalUpperBoundPeakBytes": state.global_upper_bound_peak if state.global_upper_bound_samples else None,
+                                "globalUpperBoundSampleCount": state.global_upper_bound_samples,
+                            }
+                            raise error
                 time.sleep(policy.poll_millis / 1000)
         except BaseException:
             try:

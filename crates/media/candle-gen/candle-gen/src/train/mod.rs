@@ -51,6 +51,7 @@ pub mod vae_anchor;
 pub mod tae;
 pub mod taehv;
 
+pub mod krea_ops;
 /// Differentiable normalization with explicit reference casting order.
 pub mod norm;
 pub mod profile;

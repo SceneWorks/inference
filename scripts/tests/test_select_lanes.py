@@ -181,8 +181,12 @@ class SelectLanesTests(unittest.TestCase):
         )
         root = REPO_ROOT.resolve()
         crate_dirs = set()
-        for match in re.finditer(r"\((/[^)]+)\)", result.stdout):
-            path = Path(match.group(1)).resolve()
+        for match in re.finditer(r"\(([^)]+)\)", result.stdout):
+            # Cargo emits native absolute paths (including drive letters on Windows).
+            path = Path(match.group(1))
+            if not path.is_absolute():
+                continue
+            path = path.resolve()
             if path.is_relative_to(root):
                 crate_dirs.add(path.relative_to(root).as_posix())
         self.assertIn("crates/bundles/runtime-ios", crate_dirs)
@@ -256,8 +260,12 @@ class SelectLanesTests(unittest.TestCase):
         )
         root = REPO_ROOT.resolve()
         crate_dirs = set()
-        for match in re.finditer(r"\((/[^)]+)\)", result.stdout):
-            path = Path(match.group(1)).resolve()
+        for match in re.finditer(r"\(([^)]+)\)", result.stdout):
+            # Cargo emits native absolute paths (including drive letters on Windows).
+            path = Path(match.group(1))
+            if not path.is_absolute():
+                continue
+            path = path.resolve()
             if path.is_relative_to(root):
                 crate_dirs.add(path.relative_to(root).as_posix())
         self.assertIn("ios-host/smoke", crate_dirs)

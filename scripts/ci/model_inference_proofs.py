@@ -1230,7 +1230,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                     result['cuda_release_diagnostic'] = error.diagnostic
                 if isinstance(error, SupervisionError):
                     result['supervision_failure'] = {'reason': error.reason, 'admission': error.admission,
-                                                     'pid': error.pid, 'watchdog_child_footprint': error.watchdog_child_footprint}
+                                                     'pid': error.pid, 'watchdog_child_footprint': error.watchdog_child_footprint,
+                                                     'watchdog_device_memory': error.watchdog_device_memory}
                     if approved_uuids:
                         result['cuda_devices'] = list(getattr(error, 'cuda_devices', ()))
                 # Publish only bounded/redacted regular logs from this owned case, even on failure.

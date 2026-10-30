@@ -14,6 +14,7 @@ import yaml
 
 from scripts.check_model_inference_policy import automatic_jobs
 from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
+from scripts.tests.test_ci_workflow_policy import evaluate_condition, workflow_input_context
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / '.github/workflows/ci.yml'
@@ -22,7 +23,7 @@ MAPPER = ROOT / 'scripts/ci/windows-gpu1-luid.cpp'
 LANE = 'windows-gpu-diagnostic'
 
 
-def selected_jobs(workflow, event, lane, *, selected=True, fork=False, tag=False):
+def selected_jobs(workflow, event, lane, *, selected=True, fork=False, tag=False, raw_only=None):
     """Evaluate actual job expressions with upstream lanes adversarially selected.
 
     Always returns true even after dependency failure, so a missing diagnostic
@@ -38,16 +39,16 @@ def selected_jobs(workflow, event, lane, *, selected=True, fork=False, tag=False
         # without it `startsWith(github.ref, ...)` mangling turns `github.ref_type` into invalid
         # Python. The MOSS CUDA unit lane gates on both.
         'github.ref_type': 'branch',
-        'inputs.lanes': lane,
     }
+    overrides = {'lanes': lane}
+    if raw_only is not None:
+        overrides['raw_training_math_only'] = raw_only
+    context.update(workflow_input_context(workflow, event, overrides))
     result = set()
     for name, job in workflow['jobs'].items():
         expression = job.get('if', 'True')
         expression = re.sub(r'needs\.changes\.outputs\.\w+', repr(str(selected).lower()), expression)
-        for key in sorted(context, key=len, reverse=True):
-            expression = expression.replace(key, repr(context[key]))
-        expression = expression.replace('&&', ' and ').replace('||', ' or ')
-        if eval(expression, {'__builtins__': {}}, {'always': lambda: True, 'startsWith': str.startswith}):
+        if evaluate_condition(expression, context):
             result.add(name)
     return result
 
@@ -202,21 +203,40 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
         self.assertGreater(len(self.workflow['jobs']), 15)
 
     def test_isolation_detects_each_removed_sibling_barrier(self):
-        guard = "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')"
+        barrier = "inputs.lanes != 'windows-gpu-diagnostic'"
         for name, job in self.workflow['jobs'].items():
             if name == LANE:
                 continue
             with self.subTest(job=name):
                 condition = job['if']
                 selector = f"inputs.lanes == '{name}'"
-                # Exact positive selectors and negative sibling guards both isolate jobs.
-                self.assertTrue(condition.startswith(guard) or selector in condition, name)
-                condition = condition.removeprefix(guard).removeprefix(' && ')
-                condition = condition.replace(selector, f"inputs.lanes == '{LANE}'")
+                # Remove just the isolating predicate, retaining the rest of
+                # the actual condition (including changes/gate's invalid-input
+                # validation exception). Adversarial upstream lanes are true.
+                self.assertTrue(barrier in condition or selector in condition, name)
+                weakened = condition.replace(barrier, 'true', 1) if barrier in condition else condition.replace(selector, f"inputs.lanes == '{LANE}'", 1)
                 mutated = copy.deepcopy(self.workflow)
-                tail = job['if'][len(guard):].removeprefix(' && ')
-                mutated['jobs'][name]['if'] = tail or 'True'
+                mutated['jobs'][name]['if'] = weakened
                 self.assertNotEqual(diagnostic_isolation_errors(mutated), [])
+
+    def test_missing_and_default_raw_flag_preserve_diagnostic_but_invalid_true_only_validates(self):
+        for flag in (None, False):
+            self.assertEqual(selected_jobs(self.workflow, 'workflow_dispatch', LANE, raw_only=flag), {LANE})
+        for selected in (False, True):
+            self.assertEqual(selected_jobs(self.workflow, 'workflow_dispatch', LANE,
+                                           raw_only=True, selected=selected), {'changes', 'gate'})
+        # Other events have no inputs context, even when the fixture supplies
+        # values adversarially. The false default is typed, not string 'false'.
+        context = workflow_input_context(self.workflow, 'workflow_dispatch')
+        self.assertIs(context['inputs.raw_training_math_only'], False)
+        absent = workflow_input_context(self.workflow, 'pull_request', {'raw_training_math_only': True})
+        self.assertEqual(absent['inputs.raw_training_math_only'], '')
+        self.assertTrue(evaluate_condition('!inputs.raw_training_math_only', absent))
+        self.assertTrue(evaluate_condition('!inputs.not_declared', {}))
+        self.assertFalse(evaluate_condition('inputs.raw_training_math_only', context))
+        self.assertTrue(evaluate_condition("inputs.lanes != 'windows-cuda'", context))
+        with self.assertRaises(AssertionError):
+            evaluate_condition('github.unprovided_context', {})
 
     def test_h3_profiles_run_only_their_separate_manual_routes(self):
         manual = yaml.safe_load(real_weights_inline_text())
@@ -228,7 +248,9 @@ class WindowsGpu1DiagnosticTests(unittest.TestCase):
             self.assertEqual(selected_model_jobs(manual, 'workflow_dispatch', profile), expected)
             self.assertFalse(expected & {'windows-cuda', 'macos-nax', 'moss-edit-cuda', 'moss-edit-metal', LANE})
         inputs = self.workflow.get('on', self.workflow.get(True))['workflow_dispatch']['inputs']
-        self.assertEqual(set(inputs), {'lanes'})
+        self.assertEqual(set(inputs), {'lanes', 'raw_training_math_only'})
+        self.assertEqual(inputs['raw_training_math_only']['type'], 'boolean')
+        self.assertIs(inputs['raw_training_math_only']['default'], False)
         self.assertEqual(inputs['lanes']['options'], ['all', 'windows-cuda', LANE])
         for name in ('synthetic-w4a8-cuda', 'synthetic-w4a8-mlx', 'h3-pruned-hosted-metal', 'moss-edit-cuda', 'moss-edit-metal'):
             self.assertNotIn(name, self.workflow['jobs'])
