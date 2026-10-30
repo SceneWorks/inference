@@ -462,6 +462,7 @@ pub fn miniature_parts(
     let (frozen, head, sn) = build_frozen(res, plan, nets.as_ref(), device)?;
     Ok((
         TrainModel {
+            geometry: Default::default(),
             cfg: config.model.clone(),
             compute,
             device: device.clone(),
@@ -571,6 +572,7 @@ impl Run {
         let (model, mut params) = match &plan.artifact {
             RestoreArtifact::Full => (
                 TrainModel {
+                    geometry: Default::default(),
                     cfg: config.model.clone(),
                     compute,
                     device: device.clone(),
@@ -628,12 +630,14 @@ impl Run {
                 }
                 (
                     TrainModel {
+                        geometry: Default::default(),
                         cfg: config.model.clone(),
                         compute,
                         device: device.clone(),
                         trainable: Trainable::Adapter {
                             kind,
                             targets,
+                            packs: super::model::prepare_adapter_projection_packs(&mut base)?,
                             base,
                         },
                     },

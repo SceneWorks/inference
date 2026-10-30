@@ -245,6 +245,7 @@ impl Trainer for IrisDepthTrainer {
 
 /// The trainable depth model: the frozen empty-prompt conditioning, the compute dtype, the device.
 pub struct DepthModel {
+    pub geometry: crate::dit::TrainingGeometry,
     pub config: IrisConfig,
     pub compute: DType,
     pub device: Device,
@@ -263,6 +264,7 @@ impl DepthModel {
         device: &Device,
     ) -> Result<Self> {
         Ok(Self {
+            geometry: Default::default(),
             config,
             compute,
             device: device.clone(),
@@ -291,6 +293,7 @@ impl DepthModel {
         let channels = cfg.in_channels + DEPTH_EXTRA_INPUT_CHANNELS;
         let build = |ckpt: &Checkpoint| {
             IrisDiT::from_checkpoint_widened(ckpt, cfg, self.compute, &self.device, channels)
+                .map(|dit| dit.with_training_geometry(&self.geometry))
         };
         let ckpt = Checkpoint::from_tensors(backbone, &self.device);
         let dit = build(&ckpt)?;
@@ -785,6 +788,7 @@ impl Run {
         retire_foreign_checkpoints(&ckpt_root, resume_src.as_deref())?;
         Ok(Self {
             model: DepthModel {
+                geometry: Default::default(),
                 ac: plan.ac,
                 ..DepthModel::new(config, compute, &prompt, &device)?
             },

@@ -120,6 +120,7 @@ fn full_model(rope_aspect: &str) -> TrainModel {
     let mut cfg = tiny_config().model;
     cfg.rope_aspect = rope_aspect.into();
     TrainModel {
+        geometry: Default::default(),
         cfg,
         compute: DType::F32,
         device: cpu(),
@@ -556,6 +557,7 @@ fn mb(i: usize) -> StepBatch {
 
 fn model_at(compute: DType) -> TrainModel {
     TrainModel {
+        geometry: Default::default(),
         cfg: tiny_config().model,
         compute,
         device: cpu(),

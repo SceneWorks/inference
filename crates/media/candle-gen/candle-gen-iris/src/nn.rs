@@ -735,6 +735,47 @@ impl Linear {
         Ok(y.reshape(shape)?)
     }
 
+    pub(crate) fn forward_frozen_group(
+        pack: &candle_gen::train::projection::FrozenProjectionPack,
+        x: &Tensor,
+        layers: &[&Self],
+    ) -> Result<Vec<Tensor>> {
+        let facades = layers
+            .iter()
+            .map(|layer| {
+                let Base::Dense { weight, bias } = &layer.base else {
+                    return Err(Error::Msg(
+                        "Iris frozen pack invalidated by packed base".into(),
+                    ));
+                };
+                let (out, input) = weight.dims2()?;
+                Ok(candle_gen::quant::AdaptLinear::from_dense(
+                    candle_gen::candle_nn::Linear::new(weight.clone(), bias.clone()),
+                    input,
+                    out,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let x = to(x, layers[0].compute_dtype())?;
+        let mut shape = x.dims().to_vec();
+        let input = shape
+            .pop()
+            .ok_or_else(|| Error::Msg("Iris scalar projection input".into()))?;
+        let x = x.reshape((x.elem_count() / input, input))?;
+        pack.forward_adapt(&x, &facades.iter().collect::<Vec<_>>())?
+            .into_iter()
+            .zip(layers)
+            .map(|(mut y, layer)| {
+                for residual in &layer.residuals {
+                    y = y.add(&to(&residual.forward(&x)?, y.dtype())?)?;
+                }
+                let mut output_shape = shape.clone();
+                output_shape.push(layer.logical_shape()?.0);
+                Ok(y.reshape(output_shape)?)
+            })
+            .collect()
+    }
+
     /// The dtype the projection returns (its compute dtype).
     fn compute_dtype(&self) -> DType {
         match &self.base {
@@ -951,7 +992,19 @@ pub fn attention(
     // composable softmax over the same axis.
     let differentiable = q.track_op() || k.track_op() || v.track_op() || composable_forced();
     let scope = attention_scope();
-    let out = if differentiable {
+    if scope.as_ref().is_some_and(|s| s.cancel.is_cancelled()) {
+        return Err(Error::Canceled);
+    }
+    // The native candidate owns its own backward. Select it OUTSIDE fold3: replaying a
+    // nested CustomOp inside the folded tape would violate the fold's operand contract.
+    let candidate = if differentiable {
+        candle_gen::fused_attention::try_training_sdpa_bhsd(&q, &k, &v, scale, mask.as_ref())?
+    } else {
+        None
+    };
+    let out = if let Some(out) = candidate {
+        out
+    } else if differentiable {
         // One tape node (sc-25690): the scores, their scaled / masked forms and the softmax's own
         // intermediates are `[B, heads, N, N]` each and none is an operand of anything else. The
         // node wraps whichever kernel the request scope selects, so its chunks (query rows, and

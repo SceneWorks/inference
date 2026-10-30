@@ -760,6 +760,7 @@ impl Run {
                 };
                 (
                     TrainModel {
+                        geometry: Default::default(),
                         cfg: config.model.clone(),
                         compute,
                         device: device.clone(),
@@ -769,7 +770,7 @@ impl Run {
                 )
             }
             art => {
-                let base = source.ok_or_else(|| {
+                let mut base = source.ok_or_else(|| {
                     Error::Msg("iris training: adapter runs need backbone weights".into())
                 })?;
                 let (kind, targets_paths) = match art {
@@ -811,12 +812,14 @@ impl Run {
                 let params = init_adapter(kind, &targets, plan.seed, &device)?;
                 (
                     TrainModel {
+                        geometry: Default::default(),
                         cfg: config.model.clone(),
                         compute,
                         device: device.clone(),
                         trainable: Trainable::Adapter {
                             kind,
                             targets,
+                            packs: model::prepare_adapter_projection_packs(&mut base)?,
                             base,
                         },
                     },
