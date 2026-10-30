@@ -758,8 +758,6 @@ fn prepare_projections(
         )));
     }
 
-    let _activity =
-        crate::gen_core::LoadActivityScope::enter(crate::gen_core::LoadActivity::VerifyingFiles);
     let mut prepared = Vec::new();
     for base in bases {
         check_cancel(cancel)?;
@@ -1417,7 +1415,11 @@ fn check_cancel(cancel: Option<&CancelFlag>) -> Result<()> {
 fn hash_source_bytes(hash: &mut Sha256, bytes: &[u8], cancel: Option<&CancelFlag>) -> Result<()> {
     for chunk in bytes.chunks(HASH_CANCEL_CHUNK_BYTES) {
         check_cancel(cancel)?;
-        hash.update(chunk);
+        candle_core::safetensors::with_source_bytes(
+            chunk,
+            crate::gen_core::LoadActivityPhase::Verifying,
+            || hash.update(chunk),
+        );
         #[cfg(any(test, feature = "testkit"))]
         source_cancel_test_hook(cancel);
         check_cancel(cancel)?;
@@ -1669,12 +1671,14 @@ fn validate_sidecar_counted(
 
 fn validation_payload_digest(bytes: &[u8], cancel: Option<&CancelFlag>) -> Result<[u8; 32]> {
     check_cancel(cancel)?;
-    let _activity =
-        crate::gen_core::LoadActivityScope::enter(crate::gen_core::LoadActivity::VerifyingFiles);
     let mut hash = Sha256::new();
     for chunk in bytes.chunks(HASH_CANCEL_CHUNK_BYTES) {
         check_cancel(cancel)?;
-        hash.update(chunk);
+        candle_core::safetensors::with_source_bytes(
+            chunk,
+            crate::gen_core::LoadActivityPhase::Verifying,
+            || hash.update(chunk),
+        );
         #[cfg(test)]
         validation_cancel_test_hook(cancel);
         check_cancel(cancel)?;
@@ -2110,7 +2114,9 @@ mod tests {
         )?;
         assert!(first.cache_dir().starts_with(external.path()));
         assert!(crate::lock_recover(&activities)
-            .contains(&Some(crate::gen_core::LoadActivity::VerifyingFiles)));
+            .iter()
+            .flatten()
+            .any(|activity| activity.phase == crate::gen_core::LoadActivityPhase::Verifying));
         crate::lock_recover(&activities).clear();
         let (_, warm) = PackedWeightSidecars::open_and_prepare_with_external_cache_root(
             std::slice::from_ref(&source_path),
@@ -2123,7 +2129,10 @@ mod tests {
         assert_eq!(warm.payload_bytes_hashed(), 0);
         assert_eq!(warm.reused_count(), 1);
         assert!(
-            crate::lock_recover(&activities).is_empty(),
+            crate::lock_recover(&activities)
+                .iter()
+                .flatten()
+                .all(|activity| activity.phase != crate::gen_core::LoadActivityPhase::Verifying),
             "memo hits must not claim to verify files"
         );
         Ok(())

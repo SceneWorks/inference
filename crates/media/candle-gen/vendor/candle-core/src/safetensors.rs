@@ -212,7 +212,8 @@ impl Tensor {
         shape: &[usize],
         device: &Device,
     ) -> Result<Self> {
-        match dtype {
+        let consumption = crate::safetensors_progress::consuming(data);
+        let result = match dtype {
             DType::U8 => convert_slice::<u8>(data, shape, device),
             DType::U32 => convert_slice::<u32>(data, shape, device),
             DType::I16 => convert_slice::<i16>(data, shape, device),
@@ -279,12 +280,19 @@ impl Tensor {
                 let op = BackpropOp::none();
                 Ok(from_storage(storage, shape, op, false))
             }
+        };
+        if result.is_ok() {
+            if let Some(read) = consumption {
+                read.complete();
+            }
         }
+        result
     }
 }
 
 fn convert(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
-    match view.dtype() {
+    let consumption = crate::safetensors_progress::consuming(view.data());
+    let result = match view.dtype() {
         st::Dtype::U8 => convert_::<u8>(view, device),
         st::Dtype::U16 => {
             let conv = |x| Ok(u32::from(x));
@@ -306,7 +314,13 @@ fn convert(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
             convert_dummy(view, device)
         }
         dtype => Err(Error::UnsupportedSafeTensorDtype(dtype)),
+    };
+    if result.is_ok() {
+        if let Some(read) = consumption {
+            read.complete();
+        }
     }
+    result
 }
 
 fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
@@ -400,7 +414,10 @@ fn convert_back(tensor: &Tensor) -> Result<Vec<u8>> {
 pub fn load<P: AsRef<Path>>(filename: P, device: &Device) -> Result<HashMap<String, Tensor>> {
     #[cfg(feature = "model-inference-proof")]
     let __input_path = filename.as_ref();
-    let data = std::fs::read(__model_input_select!(filename.as_ref(), __input_path))?;
+    let data = crate::safetensors_progress::read_file(__model_input_select!(
+        filename.as_ref(),
+        __input_path
+    ))?;
     __model_input_inspect!(load_buffer(&data[..], device), |_| {
         if std::env::var_os("MODEL_INFERENCE_CASE_FQN").is_some() {
             use sha2::Digest;
@@ -415,6 +432,22 @@ pub fn load<P: AsRef<Path>>(filename: P, device: &Device) -> Result<HashMap<Stri
             );
         }
     })
+}
+
+/// Observe a shared consumer of a mapped source byte range (for example checksum hashing).
+/// The closure must consume the supplied bytes synchronously. Unmapped buffers carry no file
+/// identity and produce no file activity. Merely obtaining a TensorView never calls this helper.
+pub fn with_source_bytes<T>(
+    data: &[u8],
+    phase: load_progress::LoadActivityPhase,
+    consume: impl FnOnce() -> T,
+) -> T {
+    let read = crate::safetensors_progress::consuming_phase(data, phase);
+    let result = consume();
+    if let Some(read) = read {
+        read.complete();
+    }
+    result
 }
 
 pub fn load_buffer(data: &[u8], device: &Device) -> Result<HashMap<String, Tensor>> {
@@ -438,6 +471,7 @@ struct SafeTensors_<'a>(SafeTensors<'a>);
 pub struct MmapedSafetensors {
     safetensors: Vec<yoke::Yoke<SafeTensors_<'static>, memmap2::Mmap>>,
     routing: Option<HashMap<String, usize>>,
+    _reads: Vec<std::sync::Arc<crate::safetensors_progress::MappedRead>>,
 }
 
 impl MmapedSafetensors {
@@ -452,6 +486,8 @@ impl MmapedSafetensors {
         let file = memmap2::MmapOptions::new()
             .map(&file)
             .map_err(|e| Error::from(e).with_path(p))?;
+        let read = crate::safetensors_progress::MappedRead::new(p, &file);
+        let header = read.header(&file);
         let safetensors = yoke::Yoke::<SafeTensors_<'static>, memmap2::Mmap>::try_attach_to_cart(
             file,
             |data: &[u8]| {
@@ -460,6 +496,8 @@ impl MmapedSafetensors {
                 Ok::<_, Error>(SafeTensors_(st))
             },
         )?;
+        header.complete();
+        drop(header);
         #[cfg(feature = "model-inference-proof")]
         crate::model_input_proof::record_reader_paths(
             "candle-core::safetensors::MmapedSafetensors::new",
@@ -469,6 +507,7 @@ impl MmapedSafetensors {
         Ok(Self {
             safetensors: vec![safetensors],
             routing: None,
+            _reads: vec![read],
         })
     }
 
@@ -482,6 +521,13 @@ impl MmapedSafetensors {
     pub unsafe fn multi<P: AsRef<Path>>(paths: &[P]) -> Result<Self> {
         #[cfg(feature = "model-inference-proof")]
         let mut __input_paths = Vec::with_capacity(paths.len());
+        let context = load_progress::LoadActivityContext::capture();
+        context.register_files(paths.iter().filter_map(|p| {
+            std::fs::metadata(p.as_ref())
+                .ok()
+                .map(|m| (p.as_ref().to_path_buf(), m.len()))
+        }));
+        let mut reads = vec![];
         let mut routing = HashMap::new();
         let mut safetensors = vec![];
         for (index, p) in paths.iter().enumerate() {
@@ -492,6 +538,8 @@ impl MmapedSafetensors {
             let file = memmap2::MmapOptions::new()
                 .map(&file)
                 .map_err(|e| Error::from(e).with_path(p))?;
+            let read = crate::safetensors_progress::MappedRead::new(p, &file);
+            let header = read.header(&file);
             let data = yoke::Yoke::<SafeTensors_<'static>, memmap2::Mmap>::try_attach_to_cart(
                 file,
                 |data: &[u8]| {
@@ -500,6 +548,9 @@ impl MmapedSafetensors {
                     Ok::<_, Error>(SafeTensors_(st))
                 },
             )?;
+            header.complete();
+            drop(header);
+            reads.push(read);
             for k in data.get().0.names() {
                 routing.insert(k.to_string(), index);
             }
@@ -514,6 +565,7 @@ impl MmapedSafetensors {
         Ok(Self {
             safetensors,
             routing: Some(routing),
+            _reads: reads,
         })
     }
 
@@ -619,6 +671,7 @@ impl BufferedSafetensors {
 pub struct MmapedFile {
     path: std::path::PathBuf,
     inner: memmap2::Mmap,
+    read: std::sync::Arc<crate::safetensors_progress::MappedRead>,
 }
 
 impl MmapedFile {
@@ -634,15 +687,19 @@ impl MmapedFile {
         let inner = memmap2::MmapOptions::new()
             .map(&file)
             .map_err(|e| Error::from(e).with_path(p))?;
+        let read = crate::safetensors_progress::MappedRead::new(p, &inner);
         Ok(Self {
+            read,
             inner,
             path: p.to_path_buf(),
         })
     }
 
     pub fn deserialize(&self) -> Result<SafeTensors<'_>> {
+        let header = self.read.header(&self.inner);
         let st = safetensors::SafeTensors::deserialize(&self.inner)
             .map_err(|e| Error::from(e).with_path(&self.path))?;
+        header.complete();
         Ok(st)
     }
 }

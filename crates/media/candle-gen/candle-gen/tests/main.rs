@@ -37,6 +37,9 @@ mod cuda_quant_smoke;
 #[path = "int8_per_channel_numerics.rs"]
 mod int8_per_channel_numerics;
 
+#[path = "load_progress.rs"]
+mod load_progress;
+
 #[path = "metal_strided_reduce.rs"]
 mod metal_strided_reduce;
 

@@ -20,6 +20,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [dependencies]
+sceneworks-load-progress = { path = "../../../../contracts/load-progress" }
 sha2 = { version = "0.10", optional = true }
 accelerate-src = { version = "0.3.2", optional = true }
 byteorder = "1.4.3"
