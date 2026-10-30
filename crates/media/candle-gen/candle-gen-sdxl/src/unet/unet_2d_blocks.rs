@@ -526,6 +526,16 @@ impl UNetMidBlock2DCrossAttn {
         }
         Ok(())
     }
+
+    pub fn visit_attention_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut CrossAttention) -> Result<()>,
+    ) -> Result<()> {
+        for (attn, _resnet) in self.attn_resnets.iter_mut() {
+            attn.visit_attention_mut(f)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -797,6 +807,16 @@ impl CrossAttnDownBlock2D {
     ) -> Result<()> {
         for attn in self.attentions.iter_mut() {
             attn.visit_cross_attn_mut(f)?;
+        }
+        Ok(())
+    }
+
+    pub fn visit_attention_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut CrossAttention) -> Result<()>,
+    ) -> Result<()> {
+        for attn in self.attentions.iter_mut() {
+            attn.visit_attention_mut(f)?;
         }
         Ok(())
     }
@@ -1075,6 +1095,16 @@ impl CrossAttnUpBlock2D {
     ) -> Result<()> {
         for attn in self.attentions.iter_mut() {
             attn.visit_cross_attn_mut(f)?;
+        }
+        Ok(())
+    }
+
+    pub fn visit_attention_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut CrossAttention) -> Result<()>,
+    ) -> Result<()> {
+        for attn in self.attentions.iter_mut() {
+            attn.visit_attention_mut(f)?;
         }
         Ok(())
     }

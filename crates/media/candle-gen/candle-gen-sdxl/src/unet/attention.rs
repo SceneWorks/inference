@@ -1,10 +1,28 @@
 //! Attention Based Building Blocks
-use candle_core::{DType, Result, Tensor, D};
+use candle_core::{DType, Result, Tensor, TensorId, D};
 use candle_gen::train::lora::{lora_linear_detect, lora_linear_no_bias_detect, LoraLinear};
+use candle_gen::train::projection::FrozenProjectionPack;
 use candle_nn as nn;
 use candle_nn::Module;
 
 use super::{layer_norm_to_device, DenseGroupNorm};
+
+fn layer_norm_training(norm: &nn::LayerNorm, x: &Tensor) -> Result<Tensor> {
+    if !x.track_op() && !norm.weight().track_op() {
+        return __model_proof_output!(norm.forward(x));
+    }
+    let xf = x.to_dtype(DType::F32)?;
+    let centered = xf.broadcast_sub(&xf.mean_keepdim(D::Minus1)?)?;
+    let variance = centered.sqr()?.mean_keepdim(D::Minus1)?;
+    let normalized = centered
+        .broadcast_div(&(variance + norm.eps())?.sqrt()?)?
+        .to_dtype(x.dtype())?;
+    let y = normalized.broadcast_mul(norm.weight())?;
+    match norm.bias() {
+        Some(bias) => y.broadcast_add(bias),
+        None => Ok(y),
+    }
+}
 
 // sc-9416: every attention/FF/proj Linear in this vendored UNet packed-detects through the shared
 // `candle_gen::quant` seam — the MLX SDXL tiers (SceneWorks/sdxl-base-mlx q4/q8) pack the whole Linear
@@ -113,6 +131,9 @@ fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Ten
 
 #[derive(Debug)]
 pub struct CrossAttention {
+    training_pack: Option<FrozenProjectionPack>,
+    self_attention: bool,
+    training_kv: Vec<(TensorId, TensorId, TensorId, Tensor, Tensor)>,
     // sc-5165: the four SDXL LoRA/LoKr target projections are `LoraLinear` (frozen base + optional
     // trainable residual) rather than `nn::Linear`. With no adapter installed they are exactly the
     // stock `nn::Linear` (forward parity is pinned by a CPU test), so inference is unchanged.
@@ -161,6 +182,7 @@ impl CrossAttention {
         use_flash_attn: bool,
         group_size: usize,
     ) -> Result<Self> {
+        let self_attention = context_dim.is_none();
         let inner_dim = dim_head * heads;
         let context_dim = context_dim.unwrap_or(query_dim);
         let scale = 1.0 / f64::sqrt(dim_head as f64);
@@ -175,6 +197,9 @@ impl CrossAttention {
         let span_attn = tracing::span!(tracing::Level::TRACE, "xa-attn");
         let span_softmax = tracing::span!(tracing::Level::TRACE, "xa-softmax");
         Ok(Self {
+            training_pack: None,
+            self_attention,
+            training_kv: Vec::new(),
             to_q,
             to_k,
             to_v,
@@ -191,6 +216,60 @@ impl CrossAttention {
             ip_scale: 0.0,
             ip_kv: None,
         })
+    }
+
+    pub(super) fn training_cache_bytes(&self, contexts: &[Tensor]) -> usize {
+        if self.self_attention {
+            return 0;
+        }
+        let (Some(k), Some(v)) = (self.to_k.dense_base(), self.to_v.dense_base()) else {
+            return 0;
+        };
+        if k.weight().track_op() || v.weight().track_op() {
+            return 0;
+        }
+        contexts
+            .iter()
+            .filter(|context| !context.track_op())
+            .map(|context| {
+                let rows = context.elem_count() / context.dims()[context.rank() - 1];
+                rows * (k.weight().dims()[0] + v.weight().dims()[0])
+                    * context.dtype().size_in_bytes()
+            })
+            .sum()
+    }
+
+    pub(super) fn prepare_training(&mut self, contexts: &[Tensor]) -> Result<()> {
+        self.training_kv.clear();
+        self.training_pack = if self.self_attention {
+            FrozenProjectionPack::prepare_lora(&mut [
+                &mut self.to_q,
+                &mut self.to_k,
+                &mut self.to_v,
+            ])?
+        } else {
+            FrozenProjectionPack::prepare_lora(&mut [&mut self.to_k, &mut self.to_v])?
+        };
+        if !self.self_attention {
+            if let (Some(k), Some(v)) = (self.to_k.dense_base(), self.to_v.dense_base()) {
+                if !k.weight().track_op() && !v.weight().track_op() {
+                    for context in contexts.iter().filter(|context| !context.track_op()) {
+                        // Only frozen bases enter the cache. Live adapter residuals are reapplied
+                        // on every forward from the current factors, including after optimizer updates.
+                        let key = __model_proof_output!(k.forward(context))?;
+                        let value = __model_proof_output!(v.forward(context))?;
+                        self.training_kv.push((
+                            context.id(),
+                            k.weight().id(),
+                            v.weight().id(),
+                            key,
+                            value,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn reshape_heads_to_batch_dim(&self, xs: &Tensor) -> Result<Tensor> {
@@ -259,10 +338,52 @@ impl CrossAttention {
 
     pub fn forward(&self, xs: &Tensor, context: Option<&Tensor>) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let query = self.to_q.forward(xs)?;
-        let context = context.unwrap_or(xs).contiguous()?;
-        let key = self.to_k.forward(&context)?;
-        let value = self.to_v.forward(&context)?;
+        let (query, key, value) = if context.is_none() {
+            match &self.training_pack {
+                Some(pack) if self.self_attention => {
+                    let values = pack.forward_lora(xs, &[&self.to_q, &self.to_k, &self.to_v])?;
+                    (values[0].clone(), values[1].clone(), values[2].clone())
+                }
+                _ => (
+                    self.to_q.forward(xs)?,
+                    self.to_k.forward(xs)?,
+                    self.to_v.forward(xs)?,
+                ),
+            }
+        } else {
+            let context = context.unwrap();
+            let key = self
+                .training_kv
+                .iter()
+                .find(|(id, _, _, _, _)| *id == context.id());
+            let (key, value) = match key {
+                Some((_, k_id, v_id, key, value)) => {
+                    if self.to_k.dense_base().map(|b| b.weight().id()) != Some(*k_id)
+                        || self.to_v.dense_base().map(|b| b.weight().id()) != Some(*v_id)
+                    {
+                        candle_core::bail!(
+                            "SDXL prepared conditioning invalidated by base replacement"
+                        );
+                    }
+                    (
+                        self.to_k.apply_residuals(context, key.clone())?,
+                        self.to_v.apply_residuals(context, value.clone())?,
+                    )
+                }
+                None => match &self.training_pack {
+                    Some(pack) if !self.self_attention => {
+                        let values =
+                            pack.forward_lora(&context.contiguous()?, &[&self.to_k, &self.to_v])?;
+                        (values[0].clone(), values[1].clone())
+                    }
+                    _ => (
+                        self.to_k.forward(&context.contiguous()?)?,
+                        self.to_v.forward(&context.contiguous()?)?,
+                    ),
+                },
+            };
+            (self.to_q.forward(xs)?, key, value)
+        };
         let query = self.reshape_heads_to_batch_dim(&query)?;
         let key = self.reshape_heads_to_batch_dim(&key)?;
         let value = self.reshape_heads_to_batch_dim(&value)?;
@@ -401,15 +522,13 @@ impl BasicTransformerBlock {
         let _enter = self.span.enter();
         let xs = (self
             .attn1
-            .forward(&__model_proof_output!(self.norm1.forward(xs))?, None)?
+            .forward(&layer_norm_training(&self.norm1, xs)?, None)?
             + xs)?;
         let xs = (self
             .attn2
-            .forward(&__model_proof_output!(self.norm2.forward(&xs))?, context)?
+            .forward(&layer_norm_training(&self.norm2, &xs)?, context)?
             + xs)?;
-        self.ff
-            .forward(&__model_proof_output!(self.norm3.forward(&xs))?)?
-            + xs
+        self.ff.forward(&layer_norm_training(&self.norm3, &xs)?)? + xs
     }
 
     fn visit_lora_mut(
@@ -431,6 +550,14 @@ impl BasicTransformerBlock {
         &mut self,
         f: &mut dyn FnMut(&mut CrossAttention) -> Result<()>,
     ) -> Result<()> {
+        f(&mut self.attn2)
+    }
+
+    fn visit_attention_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut CrossAttention) -> Result<()>,
+    ) -> Result<()> {
+        f(&mut self.attn1)?;
         f(&mut self.attn2)
     }
 
@@ -652,6 +779,16 @@ impl SpatialTransformer {
     ) -> Result<()> {
         for block in self.transformer_blocks.iter_mut() {
             block.visit_cross_attn_mut(f)?;
+        }
+        Ok(())
+    }
+
+    pub fn visit_attention_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut CrossAttention) -> Result<()>,
+    ) -> Result<()> {
+        for block in self.transformer_blocks.iter_mut() {
+            block.visit_attention_mut(f)?;
         }
         Ok(())
     }

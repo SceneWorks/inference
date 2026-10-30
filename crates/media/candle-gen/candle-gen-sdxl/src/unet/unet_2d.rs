@@ -518,6 +518,21 @@ impl UNet2DConditionModel {
         Ok(())
     }
 
+    /// Retained frozen cross-K/V activation bytes, excluding source contexts still required
+    /// by live adapter residuals. Bucket clones are deduplicated by the caller.
+    pub fn training_preparation_bytes(&mut self, contexts: &[Tensor]) -> Result<usize> {
+        let mut bytes = 0;
+        self.visit_attention_mut(&mut |attention| {
+            bytes += attention.training_cache_bytes(contexts);
+            Ok(())
+        })?;
+        Ok(bytes)
+    }
+
+    pub fn prepare_training(&mut self, contexts: &[Tensor]) -> Result<()> {
+        self.visit_attention_mut(&mut |attention| attention.prepare_training(contexts))
+    }
+
     /// The PEFT module paths of every adaptable attention projection (`to_q`/`to_k`/`to_v`/`to_out.0`
     /// across the down/mid/up cross-attention blocks), in deterministic walk order. Drives trainer
     /// target resolution + the `mid_block` exclusion check for LoKr (sc-2640).
@@ -775,6 +790,24 @@ impl UNet2DConditionModel {
             }
         }
         self.mid_block.visit_cross_attn_mut(f)?;
+        Ok(())
+    }
+
+    fn visit_attention_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut CrossAttention) -> Result<()>,
+    ) -> Result<()> {
+        for db in self.down_blocks.iter_mut() {
+            if let UNetDownBlock::CrossAttn(b) = db {
+                b.visit_attention_mut(f)?;
+            }
+        }
+        for ub in self.up_blocks.iter_mut() {
+            if let UNetUpBlock::CrossAttn(b) = ub {
+                b.visit_attention_mut(f)?;
+            }
+        }
+        self.mid_block.visit_attention_mut(f)?;
         Ok(())
     }
 }

@@ -1025,6 +1025,28 @@ impl SdxlTrainer {
                 device,
             )?,
         };
+        let mut contexts = std::collections::HashMap::<_, Tensor>::new();
+        for (_, context, _) in &mut cache {
+            let id = context.id();
+            *context = match contexts.get(&id) {
+                Some(context) => context.clone(),
+                None => {
+                    let context = context.to_dtype(compute_dtype)?;
+                    contexts.insert(id, context.clone());
+                    context
+                }
+            };
+        }
+        let contexts = contexts.into_values().collect::<Vec<_>>();
+        let preparation_bytes = unet.training_preparation_bytes(&contexts)? as u64;
+        flow_match::check_aux_memory(
+            LABEL,
+            flow_match::component_bytes(&self.root, "unet", LABEL)?,
+            preparation_bytes,
+            flow_match::device_training_budget_bytes(device, LABEL),
+        )?;
+        unet.prepare_training(&contexts)?;
+        drop(contexts);
         let use_checkpoint = cfg.gradient_checkpointing;
 
         // --- scheduler + optimizer + schedule ---
@@ -1352,7 +1374,15 @@ mod tests {
         let dev = Device::Cpu;
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-        let mut unet = tiny_unet(vb);
+        let _fixture = tiny_unet(vb);
+        let weights = vm
+            .data()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_tensor().detach()))
+            .collect();
+        let mut unet = tiny_unet(VarBuilder::from_tensors(weights, DType::F32, &dev));
         // sc-11679 widened `visit_lora_mut` to the time-embedding heads, but the checkpoint backward
         // treats the time embedding as a detached per-step constant (compute_loss_grads), so a
         // `time_embedding` adapter carries a gradient in the dense forward but NOT the checkpoint one —
@@ -1378,6 +1408,22 @@ mod tests {
         let cond = Tensor::randn(0f32, 1f32, (1, 7, 64), &dev).unwrap();
         let noise = Tensor::randn(0f32, 1f32, (1, 4, 16, 16), &dev).unwrap();
 
+        let (loss_ref, g_ref) = compute_loss_grads(
+            &unet,
+            scheduler.as_ref(),
+            &set.vars,
+            &x0,
+            &cond,
+            500,
+            &noise,
+            false,
+            None,
+            DType::F32,
+            false,
+        )
+        .unwrap();
+        assert!(unet.training_preparation_bytes(&[cond.clone()]).unwrap() > 0);
+        unet.prepare_training(&[cond.clone()]).unwrap();
         let (loss_d, g_d) = compute_loss_grads(
             &unet,
             scheduler.as_ref(),
@@ -1408,6 +1454,10 @@ mod tests {
         .unwrap();
 
         assert!(
+            (loss_ref - loss_d).abs() < 1e-4,
+            "prepared/fused UNet loss {loss_ref} vs {loss_d}"
+        );
+        assert!(
             (loss_d - loss_c).abs() < 1e-4,
             "loss: dense {loss_d} vs checkpoint {loss_c}"
         );
@@ -1420,6 +1470,12 @@ mod tests {
             let a = grad_vec(&g_d, v);
             let b = grad_vec(&g_c, v);
             assert_eq!(a.len(), b.len());
+            for (reference, cached) in grad_vec(&g_ref, v).iter().zip(&a) {
+                assert!(
+                    (reference - cached).abs() < 1e-4,
+                    "prepared/fused UNet gradient {idx}: {reference} vs {cached}"
+                );
+            }
             for (x, y) in a.iter().zip(b.iter()) {
                 assert!(
                     (x - y).abs() < 1e-4,
@@ -1431,6 +1487,32 @@ mod tests {
             }
         }
         assert!(saw_nonzero, "expected nonzero adapter grads to compare");
+
+        // A cached frozen K/V base must still read the newly updated live residual.
+        let (_, factor) = set
+            .named_vars()
+            .into_iter()
+            .find(|(name, _)| name.contains("attn2.to_k.") && name.contains("lora_B"))
+            .unwrap();
+        factor.set(&(factor.as_tensor() + 0.02).unwrap()).unwrap();
+        let (updated, _) = compute_loss_grads(
+            &unet,
+            scheduler.as_ref(),
+            &set.vars,
+            &x0,
+            &cond,
+            500,
+            &noise,
+            false,
+            None,
+            DType::F32,
+            false,
+        )
+        .unwrap();
+        assert!(
+            (updated - loss_d).abs() > 1e-9,
+            "cached K/V swallowed a live adapter update"
+        );
 
         #[cfg(feature = "model-inference-proof")]
         println!(
