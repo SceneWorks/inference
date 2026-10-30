@@ -504,6 +504,7 @@ dependencies = [
  "rayon",
  "safetensors 0.7.0",
  "sceneworks-gen-core",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
  "tempfile",
