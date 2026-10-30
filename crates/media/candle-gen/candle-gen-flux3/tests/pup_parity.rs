@@ -90,7 +90,8 @@ fn content_projection(up: &Flux3PromptUpsampler, raw: &[i32], margins: &[f32]) -
     visible
 }
 
-fn native_cpu_f32_case(case: &str) {
+// Returns true only in the process that actually completes the native oracle body.
+fn native_cpu_f32_case(case: &str) -> bool {
     // The frozen decoder IDs/margins were computed in Torch F32 on CPU. The native loader
     // normally selects BF16 on CUDA/Metal; those margins cannot certify its argmax. Use the
     // existing device override in a child process, never mutate process-global env around a
@@ -98,7 +99,9 @@ fn native_cpu_f32_case(case: &str) {
     if std::env::var("CANDLE_LLM_DEVICE").as_deref() != Ok("cpu") {
         let name = std::thread::current().name().unwrap().to_owned();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &name, "--nocapture"])
+            // The parent is explicitly selected from ignored model proofs. Select
+            // that same ignored test in the CPU child; plain --exact would skip it.
+            .args(["--exact", &name, "--ignored", "--nocapture"])
             .env("CANDLE_LLM_DEVICE", "cpu")
             .status()
             .unwrap();
@@ -106,7 +109,7 @@ fn native_cpu_f32_case(case: &str) {
             status.success(),
             "{case}: native Torch CPU/F32 oracle parity"
         );
-        return;
+        return false;
     }
     let up = Flux3PromptUpsampler::load(&fixtures().join("tiny-pup-snapshot")).unwrap();
     let golden = fixture("flux3_pup_golden.safetensors");
@@ -194,6 +197,7 @@ fn native_cpu_f32_case(case: &str) {
             "{case}: EOS versus budget completion"
         );
     }
+    true
 }
 
 #[test]
@@ -229,7 +233,11 @@ fn projection_keeps_ordinary_caption_and_locked_box_tokens() {
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn native_cpu_f32_text_matches_the_shared_oracle() {
-    native_cpu_f32_case("t2i");
+    if !native_cpu_f32_case("t2i") {
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_PARENT_COMPLETED pup_parity::native_cpu_f32_text_matches_the_shared_oracle");
+        return;
+    }
 
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED pup_parity::native_cpu_f32_text_matches_the_shared_oracle");
@@ -237,7 +245,11 @@ fn native_cpu_f32_text_matches_the_shared_oracle() {
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn native_cpu_f32_text_with_boxes_matches_the_shared_oracle() {
-    native_cpu_f32_case("t2i_bbox");
+    if !native_cpu_f32_case("t2i_bbox") {
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_PARENT_COMPLETED pup_parity::native_cpu_f32_text_with_boxes_matches_the_shared_oracle");
+        return;
+    }
 
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED pup_parity::native_cpu_f32_text_with_boxes_matches_the_shared_oracle");
@@ -245,7 +257,11 @@ fn native_cpu_f32_text_with_boxes_matches_the_shared_oracle() {
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn native_cpu_f32_edit_matches_the_shared_oracle() {
-    native_cpu_f32_case("i2i");
+    if !native_cpu_f32_case("i2i") {
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_PARENT_COMPLETED pup_parity::native_cpu_f32_edit_matches_the_shared_oracle");
+        return;
+    }
 
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED pup_parity::native_cpu_f32_edit_matches_the_shared_oracle");
@@ -253,7 +269,11 @@ fn native_cpu_f32_edit_matches_the_shared_oracle() {
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn native_cpu_f32_edit_with_boxes_matches_the_shared_oracle() {
-    native_cpu_f32_case("i2i_bbox");
+    if !native_cpu_f32_case("i2i_bbox") {
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_PARENT_COMPLETED pup_parity::native_cpu_f32_edit_with_boxes_matches_the_shared_oracle");
+        return;
+    }
 
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED pup_parity::native_cpu_f32_edit_with_boxes_matches_the_shared_oracle");

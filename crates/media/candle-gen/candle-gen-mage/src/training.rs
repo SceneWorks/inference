@@ -1004,6 +1004,10 @@ mod tests {
     }
 
     fn tiny_transformer_dir() -> tempfile::TempDir {
+        tiny_transformer_dir_with_depth(1)
+    }
+
+    fn tiny_transformer_dir_with_depth(depth: usize) -> tempfile::TempDir {
         let temp = tempfile::tempdir().unwrap();
         let mut map = HashMap::new();
         insert_linear(&mut map, "img_in", 4, 128);
@@ -1024,40 +1028,42 @@ mod tests {
             128,
             128,
         );
-        let block = "transformer_blocks.0";
-        insert_linear(&mut map, &format!("{block}.img_mod.1"), 128, 768);
-        insert_linear(&mut map, &format!("{block}.txt_mod.1"), 128, 768);
-        for name in [
-            "to_q",
-            "to_k",
-            "to_v",
-            "to_out.0",
-            "add_q_proj",
-            "add_k_proj",
-            "add_v_proj",
-            "to_add_out",
-        ] {
-            insert_linear(&mut map, &format!("{block}.attn.{name}"), 128, 128);
-        }
-        for name in [
-            "norm_q.weight",
-            "norm_k.weight",
-            "norm_added_q.weight",
-            "norm_added_k.weight",
-        ] {
-            map.insert(
-                format!("{block}.attn.{name}"),
-                Tensor::ones(128, DType::F32, &Device::Cpu).unwrap(),
-            );
-        }
-        for stream in ["img", "txt"] {
-            insert_linear(
-                &mut map,
-                &format!("{block}.{stream}_mlp.net.0.proj"),
-                128,
-                256,
-            );
-            insert_linear(&mut map, &format!("{block}.{stream}_mlp.net.2"), 256, 128);
+        for index in 0..depth {
+            let block = format!("transformer_blocks.{index}");
+            insert_linear(&mut map, &format!("{block}.img_mod.1"), 128, 768);
+            insert_linear(&mut map, &format!("{block}.txt_mod.1"), 128, 768);
+            for name in [
+                "to_q",
+                "to_k",
+                "to_v",
+                "to_out.0",
+                "add_q_proj",
+                "add_k_proj",
+                "add_v_proj",
+                "to_add_out",
+            ] {
+                insert_linear(&mut map, &format!("{block}.attn.{name}"), 128, 128);
+            }
+            for name in [
+                "norm_q.weight",
+                "norm_k.weight",
+                "norm_added_q.weight",
+                "norm_added_k.weight",
+            ] {
+                map.insert(
+                    format!("{block}.attn.{name}"),
+                    Tensor::ones(128, DType::F32, &Device::Cpu).unwrap(),
+                );
+            }
+            for stream in ["img", "txt"] {
+                insert_linear(
+                    &mut map,
+                    &format!("{block}.{stream}_mlp.net.0.proj"),
+                    128,
+                    256,
+                );
+                insert_linear(&mut map, &format!("{block}.{stream}_mlp.net.2"), 256, 128);
+            }
         }
         insert_linear(&mut map, "norm_out.linear", 128, 256);
         insert_linear(&mut map, "proj_out", 128, 4);
@@ -1207,8 +1213,11 @@ mod tests {
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
     fn subject_mask_weight_reaches_adapter_and_full_step_loss() {
-        let fixture = tiny_transformer_dir();
-        let cfg = tiny_config();
+        // Two blocks keep the first text MLP/output live through the next block's
+        // image attention, while the final text state is deliberately discarded.
+        let mut cfg = tiny_config();
+        cfg.depth = 2;
+        let fixture = tiny_transformer_dir_with_depth(cfg.depth);
         let mut adapter =
             MageTransformer::load_dtype(fixture.path(), &cfg, DType::F32, &Device::Cpu).unwrap();
         let set = build_adapt_lora_targets(
@@ -1230,11 +1239,32 @@ mod tests {
         }
         let (mut full, named) =
             MageTransformer::load_trainable(fixture.path(), &cfg, &Device::Cpu).unwrap();
-        let full_vars = named.iter().map(|(_, var)| var.clone()).collect::<Vec<_>>();
         let noise = Tensor::from_vec(values(16, 0.07), (1, 4, 4), &Device::Cpu).unwrap();
         let half: Vec<f32> = vec![1.0, 0.0, 1.0, 0.0];
         let source = masked_sample(None);
-        for (model, vars) in [(&mut adapter, &set.vars), (&mut full, &full_vars)] {
+        let adapter_named = set.named_vars();
+        // Full training owns every loaded base tensor, including exactly these six
+        // final-text-only leaves. They have no path to the returned image loss.
+        // Do not fabricate their gradients or silently accept any other omission.
+        let disconnected = [
+            "transformer_blocks.1.attn.to_add_out.bias",
+            "transformer_blocks.1.attn.to_add_out.weight",
+            "transformer_blocks.1.txt_mlp.net.0.proj.bias",
+            "transformer_blocks.1.txt_mlp.net.0.proj.weight",
+            "transformer_blocks.1.txt_mlp.net.2.bias",
+            "transformer_blocks.1.txt_mlp.net.2.weight",
+        ];
+        assert_eq!(
+            named
+                .iter()
+                .filter(|(name, _)| disconnected.contains(&name.as_str()))
+                .count(),
+            disconnected.len()
+        );
+        for (surface, model, vars) in [
+            ("adapter", &mut adapter, &adapter_named),
+            ("full", &mut full, &named),
+        ] {
             let raw = step_loss(model, &source, &noise, 0.5, DType::F32, false, None)
                 .unwrap()
                 .0;
@@ -1250,11 +1280,18 @@ mod tests {
                 (raw.to_scalar::<f32>().unwrap() - optimized.to_scalar::<f32>().unwrap()).abs()
                     < 1e-5
             );
-            for var in vars {
-                let a = raw_grads.get(var.as_tensor()).expect("raw gradient");
-                let b = optimized_grads
-                    .get(var.as_tensor())
-                    .expect("optimized gradient");
+            for (name, var) in vars {
+                let a = raw_grads.get(var.as_tensor());
+                let b = optimized_grads.get(var.as_tensor());
+                if surface == "full" && disconnected.contains(&name.as_str()) {
+                    assert!(
+                        a.is_none() && b.is_none(),
+                        "final text-only leaf unexpectedly reached: {name}"
+                    );
+                    continue;
+                }
+                let a = a.unwrap_or_else(|| panic!("missing {surface} raw gradient: {name}"));
+                let b = b.unwrap_or_else(|| panic!("missing {surface} optimized gradient: {name}"));
                 let magnitude = a
                     .abs()
                     .unwrap()
@@ -1271,10 +1308,26 @@ mod tests {
                     .unwrap()
                     .to_scalar::<f32>()
                     .unwrap();
-                assert!(error <= magnitude * 2e-5 + 1e-7, "{error}/{magnitude}");
+                assert!(
+                    error <= magnitude * 2e-5 + 1e-7,
+                    "{surface} {name}: {error}/{magnitude}"
+                );
+                if surface == "full"
+                    && (name == "txt_norm.weight"
+                        || name.starts_with("transformer_blocks.0.txt_mlp.")
+                        || name.starts_with("transformer_blocks.0.attn.to_add_out."))
+                {
+                    assert!(
+                        magnitude.is_finite() && magnitude > 0.0,
+                        "live full text path: {name} = {magnitude}"
+                    );
+                }
             }
         }
-        for (model, vars) in [(&adapter, &set.vars), (&full, &full_vars)] {
+        for (surface, model, vars) in [
+            ("adapter", &adapter, &adapter_named),
+            ("full", &full, &named),
+        ] {
             let loss = |mask: Option<&[f32]>| {
                 let mut sample = masked_sample(mask);
                 sample.text = source.text.clone();
@@ -1288,10 +1341,21 @@ mod tests {
             let zero = loss(Some(&[0.0; 4]));
             assert_eq!(zero.to_scalar::<f32>().unwrap(), 0.0);
             let grads = zero.backward().unwrap();
-            for var in vars.iter() {
-                if let Some(g) = grads.get(var.as_tensor()) {
+            for (name, var) in vars {
+                let g = grads.get(var.as_tensor());
+                if surface == "full" && disconnected.contains(&name.as_str()) {
+                    assert!(
+                        g.is_none(),
+                        "final text-only leaf unexpectedly reached: {name}"
+                    );
+                } else {
+                    let g =
+                        g.unwrap_or_else(|| panic!("missing {surface} masked gradient: {name}"));
                     let g = g.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-                    assert!(g.iter().all(|x| *x == 0.0), "nonzero trainable grad");
+                    assert!(
+                        g.iter().all(|x| *x == 0.0),
+                        "nonzero {surface} masked gradient: {name}"
+                    );
                 }
             }
             let mid = loss(Some(&half)).to_scalar::<f32>().unwrap();

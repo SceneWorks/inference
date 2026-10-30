@@ -36,6 +36,38 @@ def row():
 
 
 class FeatureConfigurations(unittest.TestCase):
+    def test_flux3_cpu_oracles_require_the_completed_exact_child(self):
+        # Real registrations, synthetic protocol text only: never invoke a native test.
+        registry = json.loads((ROOT / 'scripts/ci/model-inference-proofs.json').read_text(encoding='utf-8'))
+        cases = [case for case in registry if case['package'] == 'candle-gen-flux3'
+                 and case['fqn'].startswith('pup_parity::native_cpu_f32_')]
+        self.assertEqual(len(cases), 4)
+        summary = 'test result: ok. 1 passed; 0 failed; 0 ignored;\n'
+        for case in cases:
+            with self.subTest(case=case['fqn']):
+                selected = proof.select((case,), proof.identity(case), 'candle-cpu', 'fixed_cpu')[0]
+                self.assertEqual(selected['execution_role'], 'cpu_child')
+                environment = {'CANDLE_LLM_DEVICE': 'cpu', 'UNRELATED': 'preserved'}
+                proof.apply_configuration(selected, environment)
+                self.assertEqual(environment, {'UNRELATED': 'preserved'})
+                body = 'MODEL_INFERENCE_BODY_COMPLETED ' + case['fqn'] + '\n'
+                parent = 'MODEL_INFERENCE_PARENT_COMPLETED ' + case['fqn'] + '\n'
+                device = 'MODEL_INFERENCE_DEVICE ' + case['fqn'] + ' candle-cpu\n'
+                complete = body + device + summary + parent + summary
+                self.assertEqual(proof.verify_execution(selected, complete)['successful_libtest_summaries'], 2)
+                invalid = [
+                    complete.replace(summary, 'test result: ok. 0 passed; 0 failed; 1 ignored;\n', 1),
+                    complete + body,
+                    complete.replace(parent, ''),
+                    complete.replace(summary, '', 1),
+                    complete.replace(device, ''),
+                    # Original false success: only the waiting parent emits BODY.
+                    summary.replace('1 passed; 0 failed; 0 ignored;', '0 passed; 0 failed; 1 ignored;') + body + summary,
+                ]
+                for text in invalid:
+                    with self.assertRaises(ValueError):
+                        proof.verify_execution(selected, text)
+
     def test_no_nn_source_default_refuses_exact_all_and_package_selection_without_omission(self):
         case = row()
         proof.validate_configurations(case)

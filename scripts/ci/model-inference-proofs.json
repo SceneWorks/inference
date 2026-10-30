@@ -283480,7 +283480,7 @@
         "bin"
       ]
     },
-    "execution_role": "direct",
+    "execution_role": "cpu_child",
     "backend": "candle-cpu",
     "expected_devices": [
       "candle-cpu"
@@ -283492,14 +283492,18 @@
     "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_edit_matches_the_shared_oracle",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
-    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
-    "configuration_kind": "feature-only",
-    "configuration_controls": [],
+    "output_contract": "Exactly two successful libtest summaries (same-executable waiting parent and exact ignored CPU child), exactly one child-only late actual-FQN BODY, exactly one waiting PARENT, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "source-controls",
+    "configuration_controls": [
+      "CANDLE_LLM_DEVICE"
+    ],
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
         "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_edit_matches_the_shared_oracle/fixed_cpu",
-        "environment": {},
+        "environment": {
+          "CANDLE_LLM_DEVICE": null
+        },
         "cargo_features": [
           "model-inference-proof"
         ],
@@ -283531,7 +283535,8 @@
           "scope": "case"
         }
       ]
-    }
+    },
+    "parent_completion_marker": "MODEL_INFERENCE_PARENT_COMPLETED pup_parity::native_cpu_f32_edit_matches_the_shared_oracle"
   },
   {
     "package": "candle-gen-flux3",
@@ -283548,7 +283553,7 @@
         "bin"
       ]
     },
-    "execution_role": "direct",
+    "execution_role": "cpu_child",
     "backend": "candle-cpu",
     "expected_devices": [
       "candle-cpu"
@@ -283560,14 +283565,18 @@
     "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_edit_with_boxes_matches_the_shared_oracle",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
-    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
-    "configuration_kind": "feature-only",
-    "configuration_controls": [],
+    "output_contract": "Exactly two successful libtest summaries (same-executable waiting parent and exact ignored CPU child), exactly one child-only late actual-FQN BODY, exactly one waiting PARENT, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "source-controls",
+    "configuration_controls": [
+      "CANDLE_LLM_DEVICE"
+    ],
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
         "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_edit_with_boxes_matches_the_shared_oracle/fixed_cpu",
-        "environment": {},
+        "environment": {
+          "CANDLE_LLM_DEVICE": null
+        },
         "cargo_features": [
           "model-inference-proof"
         ],
@@ -283599,7 +283608,8 @@
           "scope": "case"
         }
       ]
-    }
+    },
+    "parent_completion_marker": "MODEL_INFERENCE_PARENT_COMPLETED pup_parity::native_cpu_f32_edit_with_boxes_matches_the_shared_oracle"
   },
   {
     "package": "candle-gen-flux3",
@@ -283616,7 +283626,7 @@
         "bin"
       ]
     },
-    "execution_role": "direct",
+    "execution_role": "cpu_child",
     "backend": "candle-cpu",
     "expected_devices": [
       "candle-cpu"
@@ -283628,14 +283638,18 @@
     "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_text_matches_the_shared_oracle",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
-    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
-    "configuration_kind": "feature-only",
-    "configuration_controls": [],
+    "output_contract": "Exactly two successful libtest summaries (same-executable waiting parent and exact ignored CPU child), exactly one child-only late actual-FQN BODY, exactly one waiting PARENT, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "source-controls",
+    "configuration_controls": [
+      "CANDLE_LLM_DEVICE"
+    ],
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
         "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_text_matches_the_shared_oracle/fixed_cpu",
-        "environment": {},
+        "environment": {
+          "CANDLE_LLM_DEVICE": null
+        },
         "cargo_features": [
           "model-inference-proof"
         ],
@@ -283667,7 +283681,8 @@
           "scope": "case"
         }
       ]
-    }
+    },
+    "parent_completion_marker": "MODEL_INFERENCE_PARENT_COMPLETED pup_parity::native_cpu_f32_text_matches_the_shared_oracle"
   },
   {
     "package": "candle-gen-flux3",
@@ -283684,7 +283699,7 @@
         "bin"
       ]
     },
-    "execution_role": "direct",
+    "execution_role": "cpu_child",
     "backend": "candle-cpu",
     "expected_devices": [
       "candle-cpu"
@@ -283696,14 +283711,18 @@
     "configuration_source": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_text_with_boxes_matches_the_shared_oracle",
     "required_environment": [],
     "device_witness": "Source-owned successful learned Linear/DiT/autoencoder/text/VLM output before host copying; feature-off observer preserves original expression",
-    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
-    "configuration_kind": "feature-only",
-    "configuration_controls": [],
+    "output_contract": "Exactly two successful libtest summaries (same-executable waiting parent and exact ignored CPU child), exactly one child-only late actual-FQN BODY, exactly one waiting PARENT, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_kind": "source-controls",
+    "configuration_controls": [
+      "CANDLE_LLM_DEVICE"
+    ],
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
         "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/pup_parity.rs::pup_parity::native_cpu_f32_text_with_boxes_matches_the_shared_oracle/fixed_cpu",
-        "environment": {},
+        "environment": {
+          "CANDLE_LLM_DEVICE": null
+        },
         "cargo_features": [
           "model-inference-proof"
         ],
@@ -283735,7 +283754,8 @@
           "scope": "case"
         }
       ]
-    }
+    },
+    "parent_completion_marker": "MODEL_INFERENCE_PARENT_COMPLETED pup_parity::native_cpu_f32_text_with_boxes_matches_the_shared_oracle"
   },
   {
     "package": "candle-gen-flux3",

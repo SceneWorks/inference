@@ -989,19 +989,54 @@ mod tests {
             .mean_all()
             .unwrap();
         let grads1 = loss1.backward().unwrap();
-        for factors in set.vars.chunks_exact(2) {
-            let g = grads1
-                .get(factors[1].as_tensor())
-                .expect("Q/K B gradient through RMSNorm");
-            assert!(
-                g.abs()
+        let named = set.named_vars();
+        assert_eq!(
+            set.len(),
+            10,
+            "joint Q/K in both blocks plus image-only Q/K"
+        );
+        // The final context_pre_only block discards text attention output. Attention
+        // is rowwise in Q, so its text-query factors are connected through cat/narrow
+        // but have an exactly zero derivative. Text K remains live in image rows.
+        let discarded_query = "transformer_blocks.1.attn.add_q_proj.lora_B.weight";
+        assert_eq!(
+            named.iter().filter(|(n, _)| n == discarded_query).count(),
+            1
+        );
+        for factors in named.chunks_exact(2) {
+            let (name, b) = &factors[1];
+            let a_grad = grads1
+                .get(factors[0].1.as_tensor())
+                .unwrap_or_else(|| panic!("missing initial A gradient for {name}"));
+            assert_eq!(
+                a_grad
+                    .abs()
                     .unwrap()
                     .sum_all()
                     .unwrap()
                     .to_scalar::<f32>()
-                    .unwrap()
-                    > 0.0
+                    .unwrap(),
+                0.0,
+                "zero-initialized B must give zero initial A gradient: {name}"
             );
+            let g = grads1
+                .get(b.as_tensor())
+                .unwrap_or_else(|| panic!("missing Q/K B gradient through RMSNorm: {name}"));
+            let magnitude = g
+                .abs()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            if name == discarded_query {
+                assert_eq!(magnitude, 0.0, "discarded final text-query rows: {name}");
+            } else {
+                assert!(
+                    magnitude.is_finite() && magnitude > 0.0,
+                    "live Q/K B gradient: {name} = {magnitude}"
+                );
+            }
         }
         let mut optimizer =
             TrainOptimizer::from_config("adam", set.vars.clone(), 0.05, 0.0).unwrap();
@@ -1014,19 +1049,26 @@ mod tests {
             .mean_all()
             .unwrap();
         let grads2 = loss2.backward().unwrap();
-        for factors in set.vars.chunks_exact(2) {
+        for factors in named.chunks_exact(2) {
+            let (name, a) = &factors[0];
             let g = grads2
-                .get(factors[0].as_tensor())
-                .expect("Q/K A gradient after B update");
-            assert!(
-                g.abs()
-                    .unwrap()
-                    .sum_all()
-                    .unwrap()
-                    .to_scalar::<f32>()
-                    .unwrap()
-                    > 0.0
-            );
+                .get(a.as_tensor())
+                .unwrap_or_else(|| panic!("missing Q/K A gradient after B update: {name}"));
+            let magnitude = g
+                .abs()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            if factors[1].0 == discarded_query {
+                assert_eq!(magnitude, 0.0, "discarded final text-query rows: {name}");
+            } else {
+                assert!(
+                    magnitude.is_finite() && magnitude > 0.0,
+                    "live Q/K A gradient after B update: {name} = {magnitude}"
+                );
+            }
         }
         assert!(
             set.vars.len() >= 12,
