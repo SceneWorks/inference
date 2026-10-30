@@ -601,6 +601,223 @@ fn strict_application_rejects_unscaled_intermediate_overflow_before_success() {
     });
 }
 
+/// External maltrainer/ComfyUI MOSS LoRAs load AS-IS (2026-10-29 product decision): the
+/// `diffusion_model.` key prefix is stripped, BF16 factors upcast losslessly to the FP32 residual
+/// stack, per-target alpha scalars take precedence over the kohya `ss_network_alpha` fallback,
+/// per-target rank may vary (SVD-resized exports), and both Base/SFT checkpoints accept any MOSS
+/// adapter regardless of its trained parent. The parity arm proves strip+upcast is semantically
+/// the identity: the same factors through the external and native formats generate identically.
+#[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
+fn external_prefixed_bf16_lora_loads_as_is_on_both_checkpoints() {
+    let _device = crate::cpu_test_device();
+    mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+        let temp = tempfile::tempdir().unwrap();
+        let f = fixture();
+        let (weights, g) = base(&f, Dtype::Float32);
+        let x = mlx_gen::attention::slice_axis(&from_json(&f["inputs"]["hidden_states"]), 0, 0, 1)
+            .unwrap();
+        let context = mlx_gen::attention::slice_axis(
+            &from_json(&f["inputs"]["encoder_hidden_states"]),
+            0,
+            0,
+            1,
+        )
+        .unwrap();
+        let forward = |model: &Transformer| {
+            read(
+                &model
+                    .forward(
+                        &x,
+                        &[370.],
+                        std::slice::from_ref(&context),
+                        &[],
+                        &CancelFlag::new(),
+                    )
+                    .unwrap(),
+            )
+        };
+        // Power-of-two factor values so the BF16 round-trip is exact and parity can be bitwise.
+        let full = |v: f32, shape: [i32; 2]| {
+            Array::from_slice(&vec![v; (shape[0] * shape[1]) as usize], &shape)
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+        };
+        let q_only: Vec<(&str, Array)> = vec![
+            (
+                "diffusion_model.layers.0.proj.q.lora_A.weight",
+                full(0.125, [2, 16]),
+            ),
+            (
+                "diffusion_model.layers.0.proj.q.lora_B.weight",
+                full(0.25, [16, 2]),
+            ),
+            ("diffusion_model.layers.0.proj.q.alpha", Array::from_f32(4.)),
+        ];
+        // Second target with a DIFFERENT rank and no alpha scalar: covers SVD-resized per-target
+        // rank variation and the kohya ss_network_alpha fallback in one file.
+        let mut external: Vec<(&str, Array)> = q_only.clone();
+        external.extend([
+            (
+                "diffusion_model.layers.1.proj.ffn_up_gate.lora_A.weight",
+                full(0.0625, [3, 16]),
+            ),
+            (
+                "diffusion_model.layers.1.proj.ffn_up_gate.lora_B.weight",
+                full(0.5, [48, 3]),
+            ),
+        ]);
+        let kohya: std::collections::HashMap<String, String> = [
+            ("ss_base_model_version", "moss_image_base"),
+            ("ss_network_module", "maltrainer.models.moss_image.lora"),
+            ("ss_network_dim", "8"),
+            ("ss_network_alpha", "9"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let save = |name: &str,
+                    tensors: &[(&str, Array)],
+                    meta: &std::collections::HashMap<String, String>| {
+            let path = temp.path().join(name);
+            Array::save_safetensors(tensors.iter().map(|(k, v)| (*k, v)), Some(meta), &path)
+                .unwrap();
+            path
+        };
+        let external_path = save("external.safetensors", &external, &kohya);
+        let baseline = forward(&Transformer::load(&weights, g.clone()).unwrap());
+        for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+            let mut host = Transformer::load(&weights, g.clone()).unwrap();
+            let spec = AdapterSpec::new(external_path.clone(), 1., AdapterKind::Lora);
+            let reports = crate::adapters::apply(&mut host, variant, &[spec]).unwrap();
+            assert_eq!(reports[0].applied, 2);
+            assert!(reports[0].skipped.is_empty());
+            assert!(
+                forward(&host)
+                    .iter()
+                    .zip(&baseline)
+                    .any(|(a, b)| (a - b).abs() > 1e-7),
+                "external adapter must change generation on {variant:?}"
+            );
+        }
+        // Parity: the stripped/upcast external q target equals the native-format q target with
+        // the same values — and the native file is Base-stamped while applied to an SFT host,
+        // which also pins the relaxed cross-checkpoint acceptance for native adapters.
+        let mut native_meta: std::collections::HashMap<String, String> =
+            mlx_gen::gen_core::moss_image_training::metadata(
+                MossImageVariant::Base,
+                mlx_gen::gen_core::moss_image_training::SAMPLER,
+            )
+            .into_iter()
+            .collect();
+        native_meta.extend([
+            ("networkType".to_owned(), "lora".to_owned()),
+            ("rank".to_owned(), "2".to_owned()),
+            ("alpha".to_owned(), "4".to_owned()),
+        ]);
+        let native_q: Vec<(&str, Array)> = q_only
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.strip_prefix("diffusion_model.").unwrap(),
+                    v.as_dtype(Dtype::Float32).unwrap(),
+                )
+            })
+            .collect();
+        let native_path = save("native.safetensors", &native_q, &native_meta);
+        let external_q_path = save("external-q.safetensors", &q_only, &kohya);
+        let outputs: Vec<Vec<f32>> = [
+            (external_q_path, MossImageVariant::Base),
+            (native_path, MossImageVariant::Sft),
+        ]
+        .into_iter()
+        .map(|(path, variant)| {
+            let mut host = Transformer::load(&weights, g.clone()).unwrap();
+            let spec = AdapterSpec::new(path, 1., AdapterKind::Lora);
+            crate::adapters::apply(&mut host, variant, &[spec]).unwrap();
+            forward(&host)
+        })
+        .collect();
+        assert_eq!(
+            outputs[0], outputs[1],
+            "stripped/upcast external factors must generate identically to the native format"
+        );
+        // Fallback-alpha equivalence: ss_network_alpha(9) with no scalar == explicit alpha(9).
+        let mut ffn_explicit: Vec<(&str, Array)> = external.clone();
+        ffn_explicit.push((
+            "diffusion_model.layers.1.proj.ffn_up_gate.alpha",
+            Array::from_f32(9.),
+        ));
+        let explicit_path = save("explicit-alpha.safetensors", &ffn_explicit, &kohya);
+        let outputs: Vec<Vec<f32>> = [&external_path, &explicit_path]
+            .into_iter()
+            .map(|path| {
+                let mut host = Transformer::load(&weights, g.clone()).unwrap();
+                let spec = AdapterSpec::new(path.clone(), 1., AdapterKind::Lora);
+                crate::adapters::apply(&mut host, MossImageVariant::Base, &[spec]).unwrap();
+                forward(&host)
+            })
+            .collect();
+        assert_eq!(
+            outputs[0], outputs[1],
+            "ss_network_alpha fallback must scale exactly like a per-target alpha scalar"
+        );
+        // Refusals stay actionable: external LoKr, missing alpha provenance, unknown targets,
+        // and a native-stamped file with non-FP32 tensors.
+        let refusal = |path: std::path::PathBuf, kind: AdapterKind, needle: &str| {
+            let mut host = Transformer::load(&weights, g.clone()).unwrap();
+            let result = crate::adapters::apply(
+                &mut host,
+                MossImageVariant::Base,
+                &[AdapterSpec::new(path, 1., kind)],
+            );
+            assert!(
+                matches!(result, Err(mlx_gen::Error::Unsupported(ref m)) if m.contains(needle)),
+                "expected refusal containing {needle:?}: {result:?}"
+            );
+            assert_eq!(forward(&host), baseline, "refusal must install nothing");
+        };
+        refusal(external_path.clone(), AdapterKind::Lokr, "PEFT LoRA only");
+        let mut no_alpha_meta = kohya.clone();
+        no_alpha_meta.remove("ss_network_alpha");
+        let no_alpha: Vec<(&str, Array)> = external
+            .iter()
+            .filter(|(k, _)| !k.ends_with(".alpha"))
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        refusal(
+            save("no-alpha.safetensors", &no_alpha, &no_alpha_meta),
+            AdapterKind::Lora,
+            "no alpha",
+        );
+        let stray: Vec<(&str, Array)> = vec![
+            (
+                "diffusion_model.text_encoder.q.lora_A.weight",
+                full(0.125, [2, 16]),
+            ),
+            (
+                "diffusion_model.text_encoder.q.lora_B.weight",
+                full(0.25, [16, 2]),
+            ),
+        ];
+        refusal(
+            save("stray.safetensors", &stray, &kohya),
+            AdapterKind::Lora,
+            "not a transformer projection",
+        );
+        let native_bf16: Vec<(&str, Array)> = native_q
+            .iter()
+            .map(|(k, v)| (*k, v.as_dtype(Dtype::Bfloat16).unwrap()))
+            .collect();
+        refusal(
+            save("native-bf16.safetensors", &native_bf16, &native_meta),
+            AdapterKind::Lora,
+            "must be FP32",
+        );
+    });
+}
+
 #[test]
 #[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
 fn periodic_and_final_exports_preserve_request_trigger_words() {

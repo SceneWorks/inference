@@ -49,6 +49,7 @@ CPU_MODEL_TESTS = {
         'tests::training_contract_tests::cached_renderer_invalidates_on_adapter_replacement_or_removal',
         'tests::training_contract_tests::committed_mlx_cpu_adapters_generate_portably',
         'tests::training_contract_tests::cpu_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reload',
+        'tests::training_contract_tests::external_prefixed_bf16_lora_loads_as_is_on_both_checkpoints',
         'tests::training_contract_tests::periodic_and_final_exports_preserve_request_trigger_words',
         'tests::training_contract_tests::strict_adapter_rejects_orphans_crossed_axes_nonfinite_and_derived_overflow',
         'tests::training_contract_tests::strict_application_rejects_unscaled_intermediate_overflow_before_success',
@@ -58,6 +59,7 @@ CPU_MODEL_TESTS = {
     'mlx': (
         'portable_exchange_tests::committed_candle_cpu_adapters_generate_portably',
         'portable_exchange_tests::cpu_train_export_and_import_portable_adapters',
+        'portable_exchange_tests::external_prefixed_bf16_lora_loads_as_is_on_both_checkpoints',
         'portable_exchange_tests::periodic_and_final_exports_preserve_request_trigger_words',
         'portable_exchange_tests::strict_application_rejects_unscaled_intermediate_overflow_before_success',
         'transformer::review_fix_tests::all_projection_lokr_keeps_raw_factors_in_dense_and_checkpointed_backward',
@@ -185,7 +187,7 @@ def mutations(backend: str) -> list[dict]:
         result.extend([
             {"id": "native-lora-global-alpha-fallback",
              "path": "crates/media/mlx-gen/mlx-gen-moss-image/src/adapters.rs",
-             "old": "                    } else {\n                        metadata_alpha\n                    };",
+             "old": "                    } else {\n                        fallback_alpha.ok_or_else(|| {\n                            Error::Unsupported(\n                                \"MOSS LoRA target lost its alpha provenance between validation \\\n                                 and installation\"\n                                    .into(),\n                            )\n                        })?\n                    };",
              "new": "                    } else {\n                        a.shape()[0] as f32\n                    };",
              "test": "transformer::review_structured_math_tests::real_loader_uses_nondefault_rank_alpha_and_user_strength_on_the_projection",
              "panic": "native LoRA global alpha fallback/target precedence differs from Candle parity oracle"},

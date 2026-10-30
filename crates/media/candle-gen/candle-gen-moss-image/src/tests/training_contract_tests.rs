@@ -487,7 +487,8 @@ fn native_graph_cases(device: Device) {
                 let path = temp.path().join("trained.safetensors");
                 save(&set, variant, &path);
                 let meta = gen_core::weightsmeta::safetensors_file_metadata(&path).unwrap();
-                contract::validate_metadata(variant, &meta).unwrap();
+                // Loading accepts either parent, but an export must name its trained parent.
+                assert_eq!(contract::validate_metadata(&meta).unwrap(), variant);
                 assert_eq!(meta["alpha"], "0.7");
                 let spec = adapter_spec(path.clone(), network == NetworkType::Lokr, 1.);
                 let pin = PinnedWeightsFile::pin(&path).unwrap();
@@ -1156,6 +1157,162 @@ fn strict_adapter_rejects_orphans_crossed_axes_nonfinite_and_derived_overflow() 
             "malformed file {defect}"
         );
         close(&before, &generation(&host, &x, &context), 0.);
+    }
+}
+
+/// External maltrainer/ComfyUI MOSS LoRAs load AS-IS (2026-10-29 product decision): the
+/// `diffusion_model.` key prefix is stripped, BF16 factors upcast by the F32-coercing reader,
+/// per-target alpha scalars take precedence over the kohya `ss_network_alpha` fallback,
+/// per-target rank may vary (SVD-resized exports), and both Base/SFT checkpoints accept any MOSS
+/// adapter regardless of its trained parent. The parity arm proves strip+upcast is semantically
+/// the identity: the same factors through the external and native formats generate identically.
+#[test]
+#[ignore = "manual MOSS CPU model proof; CI lanes=moss-cpu-fixture"]
+fn external_prefixed_bf16_lora_loads_as_is_on_both_checkpoints() {
+    let temp = tempfile::tempdir().unwrap();
+    // Power-of-two factor values so the BF16 round-trip is exact and parity can be bitwise.
+    let t = |v: f32, shape: (usize, usize)| Tensor::full(v, shape, &Device::Cpu).unwrap();
+    let bf = |v: f32, shape: (usize, usize)| t(v, shape).to_dtype(DType::BF16).unwrap();
+    let scalar = |v: f32| Tensor::from_vec(vec![v], (1,), &Device::Cpu).unwrap();
+    let q_only = BTreeMap::from([
+        (
+            "diffusion_model.layers.0.proj.q.lora_A.weight".to_owned(),
+            bf(0.125, (2, 16)),
+        ),
+        (
+            "diffusion_model.layers.0.proj.q.lora_B.weight".to_owned(),
+            bf(0.25, (16, 2)),
+        ),
+        (
+            "diffusion_model.layers.0.proj.q.alpha".to_owned(),
+            scalar(4.),
+        ),
+    ]);
+    // Second target with a DIFFERENT rank and no alpha scalar: covers SVD-resized per-target
+    // rank variation and the kohya ss_network_alpha fallback in one file.
+    let mut external = q_only.clone();
+    external.extend([
+        (
+            "diffusion_model.layers.1.proj.ffn_up_gate.lora_A.weight".to_owned(),
+            bf(0.0625, (3, 16)),
+        ),
+        (
+            "diffusion_model.layers.1.proj.ffn_up_gate.lora_B.weight".to_owned(),
+            bf(0.5, (48, 3)),
+        ),
+    ]);
+    let kohya = BTreeMap::from([
+        (
+            "ss_base_model_version".to_owned(),
+            "moss_image_base".to_owned(),
+        ),
+        (
+            "ss_network_module".to_owned(),
+            "maltrainer.models.moss_image.lora".to_owned(),
+        ),
+        ("ss_network_dim".to_owned(), "8".to_owned()),
+        ("ss_network_alpha".to_owned(), "9".to_owned()),
+    ]);
+    let external_path = temp.path().join("external.safetensors");
+    write_adapter_file(&external_path, &external, &kohya);
+    let apply_one = |path: &std::path::Path, lokr: bool, variant: MossImageVariant| {
+        let (mut host, _, x, context) = data(&Device::Cpu, DType::F32);
+        let result = crate::adapters::apply(
+            &mut host,
+            variant,
+            &[adapter_spec(path.to_path_buf(), lokr, 1.)],
+            &[PinnedWeightsFile::pin(path).unwrap()],
+        );
+        (host, x, context, result)
+    };
+    let bare = {
+        let (host, _, x, context) = data(&Device::Cpu, DType::F32);
+        generation(&host, &x, &context)
+    };
+    for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+        let (host, x, context, result) = apply_one(&external_path, false, variant);
+        let reports = result.unwrap();
+        assert_eq!(reports[0].applied, 2);
+        assert!(reports[0].skipped.is_empty());
+        // q: per-target alpha 4 over rank 2; ffn_up_gate: kohya fallback alpha 6 over rank 3.
+        let mut scales = host.adapter_scales();
+        scales.sort_by(f64::total_cmp);
+        assert_eq!(scales, vec![2., 3.]);
+        assert!(
+            values(&generation(&host, &x, &context))
+                .iter()
+                .zip(values(&bare))
+                .any(|(a, b)| (a - b).abs() > 1e-7),
+            "external adapter must change generation on {variant:?}"
+        );
+    }
+    // Parity: the stripped/upcast external q target equals the native-format q target with the
+    // same values — and the native file is Base-stamped while applied to an SFT host, which also
+    // pins the relaxed cross-checkpoint acceptance for native adapters.
+    let mut native_meta = contract::metadata(MossImageVariant::Base, contract::SAMPLER);
+    native_meta.extend([
+        ("networkType".to_owned(), "lora".to_owned()),
+        ("rank".to_owned(), "2".to_owned()),
+        ("alpha".to_owned(), "4".to_owned()),
+    ]);
+    let native_q: BTreeMap<String, Tensor> = q_only
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.strip_prefix("diffusion_model.").unwrap().to_owned(),
+                v.to_dtype(DType::F32).unwrap(),
+            )
+        })
+        .collect();
+    let native_path = temp.path().join("native.safetensors");
+    write_adapter_file(&native_path, &native_q, &native_meta);
+    let external_q_path = temp.path().join("external-q.safetensors");
+    write_adapter_file(&external_q_path, &q_only, &kohya);
+    let (host_external, x_e, context_e, result) =
+        apply_one(&external_q_path, false, MossImageVariant::Base);
+    result.unwrap();
+    let (host_native, _, _, result) = apply_one(&native_path, false, MossImageVariant::Sft);
+    result.unwrap();
+    close(
+        &generation(&host_external, &x_e, &context_e),
+        &generation(&host_native, &x_e, &context_e),
+        0.,
+    );
+    // Refusals stay actionable and install nothing: external LoKr, missing alpha provenance,
+    // unknown targets. (A native-stamped bf16 tensor is already pinned refused by the "bf16"
+    // defect case above.)
+    let mut no_alpha_meta = kohya.clone();
+    no_alpha_meta.remove("ss_network_alpha");
+    let no_alpha: BTreeMap<String, Tensor> = external
+        .iter()
+        .filter(|(k, _)| !k.ends_with(".alpha"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let no_alpha_path = temp.path().join("no-alpha.safetensors");
+    write_adapter_file(&no_alpha_path, &no_alpha, &no_alpha_meta);
+    let stray = BTreeMap::from([
+        (
+            "diffusion_model.text_encoder.q.lora_A.weight".to_owned(),
+            bf(0.125, (2, 16)),
+        ),
+        (
+            "diffusion_model.text_encoder.q.lora_B.weight".to_owned(),
+            bf(0.25, (16, 2)),
+        ),
+    ]);
+    let stray_path = temp.path().join("stray.safetensors");
+    write_adapter_file(&stray_path, &stray, &kohya);
+    for (path, lokr, needle) in [
+        (&external_path, true, "PEFT LoRA only"),
+        (&no_alpha_path, false, "no alpha"),
+        (&stray_path, false, "unknown transformer projection"),
+    ] {
+        let (host, x, context, result) = apply_one(path, lokr, MossImageVariant::Base);
+        assert!(
+            matches!(result, Err(CandleError::Unsupported(ref m)) if m.contains(needle)),
+            "expected refusal containing {needle:?}"
+        );
+        close(&generation(&host, &x, &context), &bare, 0.);
     }
 }
 
