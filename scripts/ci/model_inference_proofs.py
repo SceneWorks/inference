@@ -769,7 +769,7 @@ def validate_generated_lora_bytes(raw: bytes, spec: dict) -> None:
     def reject_constant(value):
         raise ValueError('nonfinite generated adapter JSON constant: ' + value)
     try:
-        header = json.loads(raw[8:8+size], object_pairs_hook=unique,
+        header = json.loads(raw[8:8+size].decode('utf-8'), object_pairs_hook=unique,
                             parse_constant=reject_constant)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError('invalid generated adapter safetensors header') from error

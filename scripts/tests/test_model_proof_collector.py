@@ -114,6 +114,12 @@ class Collector(unittest.TestCase):
         for raw in (adapter_bytes()[:-1], adapter_bytes()+b'extra', b'\xff'*8+b'{}', b'x'*4097):
             with self.assertRaises(ValueError):
                 proof.validate_generated_lora_bytes(raw, adapter_spec())
+        valid = adapter_bytes()
+        size = int.from_bytes(valid[:8], 'little')
+        utf16_header = valid[8:8+size].decode('utf-8').encode('utf-16')
+        with self.assertRaises(ValueError):
+            proof.validate_generated_lora_bytes(
+                len(utf16_header).to_bytes(8, 'little') + utf16_header + valid[8+size:], adapter_spec())
 
     def test_adapter_publisher_preserves_checkpoint_input_link_and_size_bans(self):
         with tempfile.TemporaryDirectory() as temporary:
