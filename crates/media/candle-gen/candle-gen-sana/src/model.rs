@@ -1191,15 +1191,28 @@ mod tests {
             .to_vec();
 
         let inert = PreviewSink::default();
+        let mut phases = Vec::new();
         let actual = generate_base_images(
             &pipeline,
             &request,
             &Device::Cpu,
-            &mut |_| {},
+            &mut |phase| {
+                assert_eq!(
+                    pipeline.encoder_calls.get(),
+                    0,
+                    "phase must precede encoding"
+                );
+                assert!(pipeline.rendered_seeds.borrow().is_empty());
+                phases.push(phase);
+            },
             &inert_hook(&inert),
         )
         .unwrap();
 
+        assert!(matches!(
+            phases.as_slice(),
+            [Progress::Loading(gen_core::LoadPhase::EncodingPrompt)]
+        ));
         assert_eq!(pipeline.encoder_calls.get(), 2);
         assert_eq!(pipeline.reference_encoder_calls.get(), 1);
         assert_eq!(
@@ -1289,15 +1302,28 @@ mod tests {
             .to_vec();
 
         let inert = PreviewSink::default();
+        let mut phases = Vec::new();
         let actual = generate_sprint_images(
             &pipeline,
             &request,
             &Device::Cpu,
-            &mut |_| {},
+            &mut |phase| {
+                assert_eq!(
+                    pipeline.encoder_calls.get(),
+                    0,
+                    "phase must precede encoding"
+                );
+                assert!(pipeline.rendered_seeds.borrow().is_empty());
+                phases.push(phase);
+            },
             &inert_hook(&inert),
         )
         .unwrap();
 
+        assert!(matches!(
+            phases.as_slice(),
+            [Progress::Loading(gen_core::LoadPhase::EncodingPrompt)]
+        ));
         assert_eq!(pipeline.encoder_calls.get(), 1);
         assert_eq!(pipeline.reference_encoder_calls.get(), 1);
         assert_eq!(*pipeline.rendered_seeds.borrow(), vec![11, 12, 13]);

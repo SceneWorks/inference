@@ -683,8 +683,9 @@ mod tests {
     fn legacy_interleave_signature_delegates_to_the_preview_aware_method() {
         let t2i = shipped_t2i();
         let legacy_at = t2i.find("    pub fn interleave_gen(").unwrap();
-        let preview_at = t2i.find("    pub fn interleave_gen_with_preview(").unwrap();
-        let wrapper = &t2i[legacy_at..preview_at];
+        let legacy_end =
+            legacy_at + t2i[legacy_at..].find("\n    }\n").unwrap() + "\n    }\n".len();
+        let wrapper = &t2i[legacy_at..legacy_end];
         let legacy_signature = wrapper
             .split_once(") -> Result<InterleaveOutput>")
             .expect("legacy interleave_gen declaration must end at its return type")
@@ -845,6 +846,7 @@ mod tests {
             "    fn denoise(",
             "    fn it2i_denoise(",
             "    pub fn interleave_gen_with_preview(",
+            "    pub fn interleave_gen_with_preview_and_progress(",
         ] {
             assert_eq!(
                 preview_parameter(t2i, declaration),
@@ -856,7 +858,7 @@ mod tests {
         }
         assert_eq!(
             hook_parameters(t2i),
-            5,
+            6,
             "the registered txt2img and it2i routes plus interleave must carry `&PreviewHook` under \
              that exact name — a hop renamed `_preview:` is one that no longer uses it"
         );

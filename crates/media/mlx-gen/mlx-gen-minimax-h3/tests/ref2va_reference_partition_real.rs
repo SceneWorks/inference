@@ -388,6 +388,7 @@ fn reference_partition_step_cost_against_base() {
     let mut on_progress = |p: Progress| {
         let label = match p {
             Progress::Loading(LoadPhase::TextEncoder) => "conditioning-start".to_owned(),
+            Progress::Loading(LoadPhase::EncodingPrompt) => "prompt-encoding-start".to_owned(),
             Progress::Loading(LoadPhase::Renderer) => "dit-load-start".to_owned(),
             Progress::Step { current, total } => {
                 if current == total && !keep_decode {

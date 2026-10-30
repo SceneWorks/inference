@@ -414,7 +414,7 @@ impl MossTtsRealtimeGenerator {
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
 
-        if synth_turns > 0 {
+        if !turns.is_empty() {
             on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
         }
         let rendered = {

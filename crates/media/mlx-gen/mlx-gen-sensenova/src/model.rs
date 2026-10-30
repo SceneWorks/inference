@@ -256,6 +256,32 @@ impl SenseNova {
     pub fn run_vqa(
         &self,
         context: &gen_core::MemoryRunContext,
+        request: GenerationRequest,
+        question: &str,
+        images: &[Array],
+        max_new_tokens: usize,
+        sampler: crate::runtime::Sampler,
+        options: T2iOptions,
+        cancel: Option<&gen_core::CancelFlag>,
+    ) -> Result<String> {
+        self.run_vqa_with_progress(
+            context,
+            request,
+            question,
+            images,
+            max_new_tokens,
+            sampler,
+            options,
+            cancel,
+            &mut |_| {},
+        )
+    }
+
+    /// Progress-capable sibling preserving the original entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_vqa_with_progress(
+        &self,
+        context: &gen_core::MemoryRunContext,
         mut request: GenerationRequest,
         question: &str,
         images: &[Array],
@@ -263,6 +289,7 @@ impl SenseNova {
         sampler: crate::runtime::Sampler,
         mut options: T2iOptions,
         cancel: Option<&gen_core::CancelFlag>,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<String> {
         self.validate_direct_request(
             context,
@@ -274,7 +301,7 @@ impl SenseNova {
         Self::run_direct_scope(&mut *scope, &mut request, |request| {
             Self::apply_request_memory(request, &mut options);
             self.with_runtime(|model, tokenizer| {
-                model.vqa_with_options(
+                model.vqa_with_options_and_progress(
                     tokenizer,
                     question,
                     images,
@@ -282,6 +309,7 @@ impl SenseNova {
                     sampler,
                     &options,
                     cancel,
+                    on_progress,
                 )
             })
         })

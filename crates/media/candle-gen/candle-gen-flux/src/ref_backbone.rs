@@ -170,8 +170,21 @@ impl FluxRefBackbone {
         prompt: &str,
         cancel: &CancelFlag,
     ) -> Result<(Tensor, Tensor)> {
+        self.encode_text_with_memory_and_progress(prompt, cancel, &mut |_| {})
+    }
+
+    /// Report prompt compute after the warm or request-staged text encoder is available.
+    pub fn encode_text_with_memory_and_progress(
+        &self,
+        prompt: &str,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> Result<(Tensor, Tensor)> {
         candle_gen::check_cancel(cancel)?;
         if let Some(components) = &self.components {
+            on_progress(candle_gen::gen_core::Progress::Loading(
+                candle_gen::gen_core::LoadPhase::EncodingPrompt,
+            ));
             let encoded = self.pipeline.text_embeddings(components, prompt)?;
             candle_gen::check_cancel(cancel)?;
             return Ok(encoded);
@@ -179,6 +192,9 @@ impl FluxRefBackbone {
         let encoders = self.pipeline.load_text_residency()?;
         let encoded = (|| {
             candle_gen::check_cancel(cancel)?;
+            on_progress(candle_gen::gen_core::Progress::Loading(
+                candle_gen::gen_core::LoadPhase::EncodingPrompt,
+            ));
             let encoded = self.pipeline.encode_residency(&encoders, prompt)?;
             candle_gen::check_cancel(cancel)?;
             Ok(encoded)

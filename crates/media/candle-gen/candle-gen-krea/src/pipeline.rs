@@ -1193,6 +1193,7 @@ pub fn render(
 ) -> Result<Vec<Image>> {
     // Condition encoding (seed-independent): the 12 selected Qwen3-VL hidden layers, stacked +
     // prefix-dropped → the DiT's text_fusion context [1, n_tok, 12, 2560]. CFG-free, B=1.
+    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
     let context = encode_prompt_context(&comps.text, req)?;
     render_from_context(&comps.heavy, req, device, &context, on_progress)
 }
@@ -1243,6 +1244,7 @@ pub(crate) fn render_three_stage_with_native(
     } else {
         load_text_cancelable(root, text_encoder_source, device, Some(&req.cancel))?
     };
+    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
     let context = encode_prompt_context(&text, req)?;
     device.synchronize()?;
     drop(text);
@@ -1427,6 +1429,7 @@ pub fn render_tap_reweight(
     weights: &[f32],
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
+    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
     let context = encode_prompt_context(&comps.text, req)?;
     let context = apply_tap_weights(&context, weights)?;
     render_from_context(&comps.heavy, req, device, &context, on_progress)
@@ -1614,6 +1617,7 @@ pub fn render_img2img(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     // Condition encoding (seed-independent), identical to `render`: img2img changes only the init latent.
+    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
     let context = encode_prompt_context(&comps.text, req)?;
     render_img2img_from_context(
         &comps.heavy,
@@ -1738,6 +1742,7 @@ pub fn render_base(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
+    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
     let (context, neg_context) = encode_base_contexts(&comps.text, req, guidance)?;
     render_base_from_contexts(
         &comps.heavy,
@@ -2239,6 +2244,7 @@ pub fn render_base_img2img(
     // The conditional + unconditional condition encoding (seed-independent), identical to `render_base`
     // (the shared `encode_base_contexts` seam): img2img changes only the init latent + schedule start,
     // not the conditioning.
+    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
     let (context, neg_context) = encode_base_contexts(&comps.text, req, guidance)?;
     render_base_img2img_from_contexts(
         &comps.heavy,
@@ -2412,6 +2418,7 @@ pub fn render_edit(
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
+    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
     let encoded = encode_edit_context(&comps.text, req, references, distilled, device)?;
     render_edit_from_context(
         &comps.heavy,

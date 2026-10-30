@@ -1517,3 +1517,42 @@ fn a_cached_decode_resumed_with_the_other_decoder_is_refused() {
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::a_cached_decode_resumed_with_the_other_decoder_is_refused");
 }
+
+#[test]
+fn reused_engine_stages_do_not_claim_prompt_encoding() {
+    let mut events = Vec::new();
+    {
+        let mut progress = |event| events.push(event);
+        let mut bridge = ProgressBridge {
+            on_progress: &mut progress,
+            abc_total: 8,
+            semantic_total: 8,
+            tokens: 0,
+        };
+        for stage in Stage::ALL {
+            bridge.on_stage(stage, StageEvent::Reused);
+        }
+    }
+    assert!(events.is_empty());
+    {
+        let mut progress = |event| events.push(event);
+        let mut bridge = ProgressBridge {
+            on_progress: &mut progress,
+            abc_total: 8,
+            semantic_total: 8,
+            tokens: 0,
+        };
+        bridge.on_prompt_encoding();
+        bridge.on_token(Stage::Plan, 1);
+    }
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Progress::Loading(gen_core::LoadPhase::EncodingPrompt),
+            Progress::Step {
+                current: 1,
+                total: 8
+            },
+        ]
+    ));
+}

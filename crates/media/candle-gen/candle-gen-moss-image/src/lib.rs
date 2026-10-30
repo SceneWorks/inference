@@ -35,6 +35,17 @@ use release::release_then_sync;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+fn needs_prompt_encoding(
+    inputs: MossImageAdvancedInputs<'_>,
+    acceleration: MossImageAcceleration,
+    guidance: f32,
+) -> bool {
+    inputs.positive.is_none()
+        || (acceleration == MossImageAcceleration::Off
+            && guidance != 1.0
+            && inputs.negative.is_none())
+}
+
 #[derive(Default)]
 struct State {
     text: Option<Qwen35Model>,
@@ -316,10 +327,7 @@ impl MossImageGenerator {
         } else {
             req.prompt_batch.clone()
         };
-        let need_text = inputs.positive.is_none()
-            || (matches!(r.acceleration, MossImageAcceleration::Off)
-                && r.guidance != 1.0
-                && inputs.negative.is_none());
+        let need_text = needs_prompt_encoding(inputs, r.acceleration, r.guidance);
         if need_text && state.text.is_none() {
             if staged {
                 on_progress(Progress::Loading(LoadPhase::TextEncoder));

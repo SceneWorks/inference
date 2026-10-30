@@ -40,6 +40,7 @@ impl MiniMaxH3 {
         prompt: &str,
         window: Option<u32>,
         cancel: &mlx_gen::gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<mlx_rs::Array> {
         #[cfg(test)]
         if self.fixture.is_some() {
@@ -57,6 +58,9 @@ impl MiniMaxH3 {
         };
         let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
         let te = self.build_te(w.as_ref(), &cfg, window, cancel)?;
+        on_progress(Progress::Loading(
+            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let context = te.forward(&ids, &mask)?;
         // Force it BEFORE the encoder is dropped: under lazy evaluation the context is a graph node
         // holding every weight it was computed from, so dropping first would free nothing and the
@@ -80,6 +84,7 @@ impl MiniMaxH3 {
         keyframes: &[&mlx_gen::media::Image],
         window: Option<u32>,
         cancel: &mlx_gen::gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(mlx_rs::Array, Vec<i32>)> {
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let mut w = self.map_te_shards(true)?;
@@ -118,6 +123,9 @@ impl MiniMaxH3 {
             }
         };
         let te = self.build_te(w.as_ref(), &cfg, window, cancel)?;
+        on_progress(Progress::Loading(
+            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let context = te.forward_with_images(
             &ids,
             &mask,
@@ -154,6 +162,7 @@ impl MiniMaxH3 {
         references: &[Ref2VaReference],
         window: Option<u32>,
         cancel: &mlx_gen::gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(mlx_rs::Array, Vec<i32>)> {
         use crate::reference::{
             sample_video_condition_frames, ReferencePresentation, VIDEO_SAMPLE_FPS,
@@ -266,6 +275,9 @@ impl MiniMaxH3 {
             }
         };
         let te = self.build_te(w.as_ref(), &cfg, window, cancel)?;
+        on_progress(Progress::Loading(
+            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let context = te.forward_with_references(
             &ids,
             &mask,

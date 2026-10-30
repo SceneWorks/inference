@@ -963,12 +963,25 @@ impl Generator for KreaGenerator {
             .as_ref()
             .is_some_and(|memory| memory.stage_residency);
         let synchronize = |result| candle_gen::synchronize_result(&self.device, result);
+        // Resident text phases are markers; their warm pipeline encodes in the render closure.
+        // Suppress the shared marker's no-work event, then forward the actual encode boundary.
+        let deferred_encoding =
+            std::cell::Cell::new(!stage_residency && !self.residency.is_sequential());
+        let mut progress = |event| {
+            if !matches!(
+                event,
+                Progress::Loading(gen_core::LoadPhase::EncodingPrompt)
+            ) || !deferred_encoding.get()
+            {
+                on_progress(event);
+            }
+        };
         let images = self.residency.run_request_scoped(
             stage_residency,
             false,
             &req.cancel,
             req.use_pid,
-            on_progress,
+            &mut progress,
             |text| match text {
                 // Multi-phase: the `Resident` path encodes in the heavy branch from the warm text phase
                 // (stays on the `Resident` marker); the `Sequential` path must encode here, before the
@@ -1030,7 +1043,9 @@ impl Generator for KreaGenerator {
                     let resolved = mp_resolved
                         .as_ref()
                         .expect("mp_resolved is Some in this arm");
+                    deferred_encoding.set(false);
                     let comps = &resident.components;
+                    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
                     let (context, negative) =
                         pipeline::encode_multiphase_contexts(comps.text(), req, mp_need_neg)?;
                     self.file_pin_spec.read_files_unchanged(
@@ -1073,6 +1088,7 @@ impl Generator for KreaGenerator {
                     ))
                 }
                 (KreaHeavyPhase::Resident(resident), KreaEncoded::Resident) => {
+                    deferred_encoding.set(false);
                     let comps = &resident.components;
                     let result = if edit {
                         let edit = resident.edit_components()?;

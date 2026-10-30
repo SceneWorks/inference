@@ -1036,6 +1036,31 @@ impl T2iModel {
         opts: &T2iOptions,
         cancel: Option<&CancelFlag>,
     ) -> Result<String> {
+        self.vqa_with_options_and_progress(
+            tokenizer,
+            question,
+            images,
+            max_new_tokens,
+            sampler,
+            opts,
+            cancel,
+            &mut |_| {},
+        )
+    }
+
+    /// Progress-capable sibling preserving the original entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vqa_with_options_and_progress(
+        &self,
+        tokenizer: &SenseNovaTokenizer,
+        question: &str,
+        images: &[Tensor],
+        max_new_tokens: usize,
+        sampler: Sampler,
+        opts: &T2iOptions,
+        cancel: Option<&CancelFlag>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<String> {
         let attention = self.attention_plan(opts, cancel);
         let mut pv_parts = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len());
@@ -1067,8 +1092,12 @@ impl T2iModel {
             self.build_it2i_query_ids(tokenizer, &base, &grids)?
         };
 
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (mut cache, last_logits, t_idx) =
             self.prefill_it2i_logits_planned(&ids, pixel_values.as_ref(), &grids, attention)?;
+        on_progress(Progress::ConditioningComplete);
         let toks = self.decode_text_planned(
             &last_logits,
             &mut cache,
@@ -1366,6 +1395,40 @@ impl T2iModel {
         })
     }
 
+    /// Interleave with universal progress, preserving the preview-free API.
+    #[allow(clippy::too_many_arguments)]
+    pub fn interleave_gen_with_progress(
+        &self,
+        tokenizer: &SenseNovaTokenizer,
+        prompt: &str,
+        input_images: &[Tensor],
+        width: usize,
+        height: usize,
+        opts: &T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<InterleaveOutput> {
+        crate::preview::with_inert_t2i_preview(self.cell(), |preview| {
+            self.interleave_gen_with_preview_and_progress(
+                tokenizer,
+                prompt,
+                input_images,
+                width,
+                height,
+                opts,
+                system_message,
+                max_new_tokens,
+                max_images,
+                cancel,
+                preview,
+                on_progress,
+            )
+        })
+    }
+
     /// Preview-aware sibling of [`Self::interleave_gen`]. The legacy method preserves the original
     /// public signature and delegates here with an inert hook; callers with a preview carrier use
     /// this method to receive frames from the same interleave denoise loop.
@@ -1383,6 +1446,39 @@ impl T2iModel {
         max_images: usize,
         cancel: &CancelFlag,
         preview: &PreviewHook<'_>,
+    ) -> Result<InterleaveOutput> {
+        self.interleave_gen_with_preview_and_progress(
+            tokenizer,
+            prompt,
+            input_images,
+            width,
+            height,
+            opts,
+            system_message,
+            max_new_tokens,
+            max_images,
+            cancel,
+            preview,
+            &mut |_| {},
+        )
+    }
+
+    /// Progress-capable sibling preserving the original entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn interleave_gen_with_preview_and_progress(
+        &self,
+        tokenizer: &SenseNovaTokenizer,
+        prompt: &str,
+        input_images: &[Tensor],
+        width: usize,
+        height: usize,
+        opts: &T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        cancel: &CancelFlag,
+        preview: &PreviewHook<'_>,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<InterleaveOutput> {
         let cell = self.cell();
         if !width.is_multiple_of(cell) || !height.is_multiple_of(cell) {
@@ -1419,6 +1515,9 @@ impl T2iModel {
         } else {
             self.build_it2i_query_ids(tokenizer, &cond_query, &grids)?
         };
+        on_progress(Progress::Loading(
+            candle_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (mut cache_cond, cond_logits, mut t_cond) =
             self.prefill_it2i_logits_planned(&cond_ids, pixel_values.as_ref(), &grids, attention)?;
 
@@ -1443,6 +1542,7 @@ impl T2iModel {
         let mut segment_logits = cond_logits;
 
         loop {
+            on_progress(Progress::ConditioningComplete);
             // ---- Text generation on the condition cache ----
             // One segment is the shared engine's greedy token-at-a-time rollout (epic sc-24432 E8,
             // the host argmax of every row) until `<|im_end|>` / `<img>` or the request's remaining
@@ -1499,7 +1599,15 @@ impl T2iModel {
                 opts.seed.wrapping_add(images.len() as u64),
                 &self.device,
             )?;
-            let mut sink = |_p: Progress| {};
+            let offset = images.len().saturating_mul(opts.num_steps) as u32;
+            let total = max_images.saturating_mul(opts.num_steps) as u32;
+            let mut progress = |event| match event {
+                Progress::Step { current, .. } => on_progress(Progress::Step {
+                    current: offset.saturating_add(current),
+                    total,
+                }),
+                event => on_progress(event),
+            };
             let image = self.it2i_denoise(
                 &mut cache_cond,
                 t_cond + 1,
@@ -1512,11 +1620,14 @@ impl T2iModel {
                 &base_noise,
                 opts,
                 cancel,
-                &mut sink,
+                &mut progress,
                 preview,
             )?;
 
             // Re-encode the generated image back into the condition + text-uncondition caches.
+            on_progress(Progress::Loading(
+                candle_gen::gen_core::LoadPhase::EncodingPrompt,
+            ));
             let (cond_next, nt_cond) = self.append_generated_image_planned(
                 &image,
                 token_h,
@@ -1537,6 +1648,17 @@ impl T2iModel {
             t_tu = nt_tu;
             images.push(image);
             segment_logits = cond_next;
+        }
+
+        if !images.is_empty() {
+            if images.len() < max_images {
+                let total = max_images.saturating_mul(opts.num_steps) as u32;
+                on_progress(Progress::Step {
+                    current: total,
+                    total,
+                });
+            }
+            on_progress(Progress::Decoding);
         }
 
         Ok(InterleaveOutput { text, images })

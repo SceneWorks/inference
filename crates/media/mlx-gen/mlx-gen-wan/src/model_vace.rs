@@ -143,6 +143,7 @@ fn vace_prep(
     req: &GenerationRequest,
     cfg_disabled: bool,
     load_quant: Option<Quant>,
+    on_progress: &mut dyn FnMut(Progress),
 ) -> Result<VacePrep> {
     let base = &config.base;
     let clip = req.control_clip().expect("validated present");
@@ -568,7 +569,14 @@ impl WanVace {
         let cfg_disabled = guidance <= 1.0;
 
         // Stages 1–2 + noise seeding (shared with the dual-expert path, F-072).
-        let prep = vace_prep(&self.root, &self.config, req, cfg_disabled, self.quantize)?;
+        let prep = vace_prep(
+            &self.root,
+            &self.config,
+            req,
+            cfg_disabled,
+            self.quantize,
+            on_progress,
+        )?;
 
         // --- Stage 3: load the VACE DiT, embed contexts, CFG denoise ---
         let latents = {
@@ -1028,7 +1036,14 @@ impl WanVaceFun {
         let cfg_disabled = low_gs <= 1.0 && high_gs <= 1.0;
 
         // Stages 1–2 + noise seeding (shared with the single-expert path, F-072).
-        let prep = vace_prep(&self.root, &self.config, req, cfg_disabled, self.quantize)?;
+        let prep = vace_prep(
+            &self.root,
+            &self.config,
+            req,
+            cfg_disabled,
+            self.quantize,
+            on_progress,
+        )?;
 
         if sequential {
             // `vace_prep` materializes the raw text contexts and control latent before returning;

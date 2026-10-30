@@ -265,7 +265,7 @@ impl MossSfxPipeline {
 
         // Text conditioning: positive prompt carries the duration suffix; the negative prompt
         // is passed through as-is (reference behavior).
-        progress(PipelineProgress::EncodingPrompt);
+        on_progress(PipelineProgress::EncodingPrompt);
         let positive = with_duration_suffix(prompt, seconds);
         let ctx_pos = self.dit.embed_context(&self.encode_context(&positive)?)?;
         let use_cfg = params.cfg_scale != 1.0;

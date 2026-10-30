@@ -1372,6 +1372,7 @@ impl Yue2Engine {
         // The acoustic stage prefills the song prefix with the AR path: always the exact BF16
         // originals, never the FP8 mode (upstream `synthesize` → `restore_ar`).
         fp8::restore_ar_bf16(nar.lm_mut())?;
+        hooks.observer.on_prompt_encoding();
         let mut forward = ProgressForward {
             observer: &mut *hooks.observer,
         };

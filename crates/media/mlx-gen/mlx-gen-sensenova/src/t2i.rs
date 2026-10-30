@@ -1393,6 +1393,31 @@ impl T2iModel {
         opts: &T2iOptions,
         cancel: Option<&CancelFlag>,
     ) -> Result<String> {
+        self.vqa_with_options_and_progress(
+            tokenizer,
+            question,
+            images,
+            max_new_tokens,
+            sampler,
+            opts,
+            cancel,
+            &mut |_| {},
+        )
+    }
+
+    /// Progress-capable sibling preserving the original entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vqa_with_options_and_progress(
+        &self,
+        tokenizer: &TextTokenizer,
+        question: &str,
+        images: &[Array],
+        max_new_tokens: usize,
+        sampler: Sampler,
+        opts: &T2iOptions,
+        cancel: Option<&CancelFlag>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<String> {
         // Preprocess any source images.
         let mut pv_parts = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len());
@@ -1427,12 +1452,16 @@ impl T2iModel {
             self.build_it2i_query_ids(tokenizer, &base, &grids)?
         };
 
+        on_progress(Progress::Loading(
+            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (mut cache, last_logits, t_idx) = self.prefill_it2i_logits_budgeted(
             &ids,
             pixel_values.as_ref(),
             &grids,
             attention_plan(opts, cancel),
         )?;
+        on_progress(Progress::ConditioningComplete);
         let tokens = self.decode_text_budgeted(
             &last_logits,
             &mut cache,
@@ -1591,6 +1620,9 @@ impl T2iModel {
         } else {
             self.build_it2i_query_ids(tokenizer, &cond_query, &grids)?
         };
+        on_progress(Progress::Loading(
+            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
+        ));
         let (mut cache_cond, cond_logits, mut t_cond) = self.prefill_it2i_logits_budgeted(
             &cond_ids,
             pixel_values.as_ref(),
@@ -1627,6 +1659,7 @@ impl T2iModel {
         let mut segment_logits = cond_logits;
 
         loop {
+            on_progress(Progress::ConditioningComplete);
             // ---- Text generation on the condition cache ----
             // One segment is the shared engine's greedy token-at-a-time rollout (epic sc-24432 E8):
             // the first token is the host argmax of the segment's row, every later one the argmax
@@ -1713,6 +1746,9 @@ impl T2iModel {
             let image = traj.into_iter().last().expect("at least one step");
 
             // Re-encode the generated image back into the condition + text-uncondition caches.
+            on_progress(Progress::Loading(
+                mlx_gen::gen_core::LoadPhase::EncodingPrompt,
+            ));
             let (cond_next, nt_cond) = self.append_generated_image_budgeted(
                 &image,
                 token_h,

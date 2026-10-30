@@ -298,9 +298,11 @@ impl Flux1DevControl {
         // Conditioning (seed-independent): text (T5 seq + CLIP pooled) + the packed control latent.
         self.backbone
             .validate_native_vae_request(false, &req.cancel)?;
-        let (t5_emb, clip_emb) = self
-            .backbone
-            .encode_text_with_memory(&req.prompt, &req.cancel)?;
+        let (t5_emb, clip_emb) = self.backbone.encode_text_with_memory_and_progress(
+            &req.prompt,
+            &req.cancel,
+            on_progress,
+        )?;
         let heavy = self.backbone.load_heavy(&req.cancel)?;
         let control_latent = self.encode_control_latent(
             heavy.as_ref(),

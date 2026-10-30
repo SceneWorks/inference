@@ -684,6 +684,7 @@ impl Pipeline {
     /// `plan` is this encoder's half of [`Self::chunk_plans`]; `chunks` is the request-wide window
     /// count, the SAME for both encoders and both texts, so the returned
     /// `[2, chunks·window, embed_dim]` tensors concatenate on the feature axis.
+    #[allow(clippy::too_many_arguments)]
     fn encode_one(
         &self,
         which: Clip,
