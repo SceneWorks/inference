@@ -52,11 +52,11 @@ const GOLDEN: &str = concat!(
 /// [`peak_rel`] over token rows `[lo, hi)` of a `[1, seq, dim]` pair, denominator over the same
 /// slice — the valid-row bar must not hide behind (or be drowned by) the register rows.
 fn peak_rel_rows(got: &Tensor, want: &Tensor, lo: usize, hi: usize) -> CoreResult<f32> {
-    tensor_peak_rel_host(
+    Ok(tensor_peak_rel_host(
         &got.narrow(1, lo, hi - lo)?,
         &want.narrow(1, lo, hi - lo)?,
         Some(1e-12),
-    )
+    ))
 }
 
 /// The golden's `mask01` (stored int) → the connector's `nv` (valid, non-padding token count).

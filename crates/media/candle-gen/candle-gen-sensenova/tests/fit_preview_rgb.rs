@@ -54,7 +54,6 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::{CancelFlag, Image, PreviewSink, Progress};
 use candle_gen::preview::PreviewHook;
-use candle_gen::testkit::save_rgb8_png;
 use candle_gen::testkit::sha256_file;
 use candle_gen::testkit::{collecting_sink, save_rgb8_png_in};
 use candle_gen_sensenova::{load_understanding_for_diagnostics, tensor_to_image, T2iOptions};

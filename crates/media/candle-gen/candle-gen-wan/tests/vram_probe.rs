@@ -199,7 +199,7 @@ fn recipe(engine_id: &str) -> Recipe {
 /// `candle_resolve_wan_adapters`: strength 1.0, tagged per MoE expert.
 fn lightning_adapters() -> Vec<AdapterSpec> {
     // WAN_VRAM_LIGHTNING=0 ⇒ deliberate no-distill A/B.
-    if env_or::<u32>("WAN_VRAM_LIGHTNING", 1) == 0 {
+    if env_parse_or::<u32>("WAN_VRAM_LIGHTNING", 1) == 0 {
         return Vec::new();
     }
     let high = env("WAN_VRAM_LORA_HIGH").unwrap_or_else(|| {
