@@ -1,40 +1,41 @@
 //! `Flux3Klein` — the distilled FLUX 3 Image Klein text-to-image [`Generator`] on Candle:
 //! descriptor, load, request validation and the staged generate (text encoder → DiT +
 //! autoencoder), registered as [`MODEL_ID`]. The request/load surface is the MLX twin's, field for
-//! field (both read `gen_core::flux3`).
+//! field (both read `gen_core_flux3`).
 
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device};
-use candle_gen::gen_core::flux3::artifacts::{ArtifactBackend, NativeDitStorage};
-use candle_gen::gen_core::flux3::conversion::ComponentRole;
-use candle_gen::gen_core::flux3::quantization::DitFormat;
-use candle_gen::gen_core::flux3::{
-    validate_generation_request, Flux3Config, GenerationParams, GenerationResources, BASE_MODEL_ID,
-    DISTILLED_MODEL_ID, FAMILY, SAMPLERS, TEXT_ENCODER_COMPONENT,
-};
+use candle_gen::gen_core::flux3::{BASE_MODEL_ID, DISTILLED_MODEL_ID};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationReport, GenerationRequest, Generator, LoadSpec,
     Modality, ModelDescriptor, Precision, Progress, SizeFloor,
 };
 use candle_gen::residency::Residency;
 use candle_gen::{CandleError as Error, Result};
+use gen_core_flux3::artifacts::{ArtifactBackend, NativeDitStorage};
+use gen_core_flux3::conversion::ComponentRole;
+use gen_core_flux3::quantization::DitFormat;
+use gen_core_flux3::{
+    validate_generation_request, Flux3Config, GenerationParams, GenerationResources, FAMILY,
+    SAMPLERS, TEXT_ENCODER_COMPONENT,
+};
 
 use crate::autoencoder::Flux3AutoEncoder;
 use crate::dit::Flux3Dit;
 use crate::pipeline::{decode_tokens, denoise_one_with_references};
 use crate::text_encoder::{Flux3TextEncoder, TextConditioning};
-use gen_core::flux3::references::{self, PreparedReferences};
+use gen_core_flux3::{references, references::PreparedReferences};
 
 /// Registry id (the SceneWorks worker's `payload.model`) — the same id as the MLX twin, bound to
 /// the `candle` backend by the descriptor.
 pub const MODEL_ID: &str = DISTILLED_MODEL_ID;
 /// Output sides must be multiples of the token size.
-pub const SIZE_MULTIPLE: u32 = gen_core::flux3::DOWNSAMPLING_RATIO;
+pub const SIZE_MULTIPLE: u32 = gen_core_flux3::DOWNSAMPLING_RATIO;
 /// Smallest side (`pipeline.MIN_SIDE`).
-pub const MIN_SIZE: u32 = gen_core::flux3::MIN_SIDE;
+pub const MIN_SIZE: u32 = gen_core_flux3::MIN_SIDE;
 /// Largest side (`pipeline.MAX_SIDE`).
-pub const MAX_SIZE: u32 = gen_core::flux3::MAX_SIDE;
+pub const MAX_SIZE: u32 = gen_core_flux3::MAX_SIDE;
 /// Images per request (rendered one after another, each from `seed + i`).
 pub const MAX_COUNT: u32 = 8;
 
@@ -155,7 +156,7 @@ pub struct Flux3Klein {
     residency: Residency<Flux3TextEncoder, Heavy>,
     prompt_upsampler_dir: Option<PathBuf>,
     prompt_upsampler:
-        gen_core::flux3::phase_resource::PhaseResourceSlot<crate::pup::Flux3PromptUpsampler>,
+        gen_core_flux3::phase_resource::PhaseResourceSlot<crate::pup::Flux3PromptUpsampler>,
     /// The spec this generator was loaded from: the tier and residency policy the shared
     /// memory-strategy seam checks a request selection against.
     spec: LoadSpec,
@@ -229,7 +230,7 @@ fn verify_native_package(
     config: &Flux3Config,
     resources: &GenerationResources,
 ) -> Result<()> {
-    let receipt = gen_core::flux3::conversion::open_conversion(package_dir)?;
+    let receipt = gen_core_flux3::conversion::open_conversion(package_dir)?;
     let (algorithm, bits, group_size) = storage.receipt_algorithm()?;
     if receipt.algorithm != algorithm || receipt.bits != bits || receipt.group_size != group_size {
         return Err(Error::Unsupported(format!(
@@ -314,7 +315,7 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
         .map(|adapter| {
             Ok(gen_core::AdapterApplyReport {
                 adapter_path: adapter.path.clone(),
-                applied: gen_core::flux3::adapters::inspect(adapter, &config.dit)?.len(),
+                applied: gen_core_flux3::adapters::inspect(adapter, &config.dit)?.len(),
                 skipped: Vec::new(),
             })
         })
@@ -333,7 +334,7 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
         crate::memory_strategy::generation_contract(id, spec, &resources, &config)?;
     // Resolve only the optional source path. No VLM/model/prefix cache is loaded
     // until an enabled request enters the exclusive prepare phase.
-    let prompt_upsampler_dir = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)?;
+    let prompt_upsampler_dir = gen_core_flux3::pup::UpsamplePackage::component_dir(spec)?;
     let device = candle_gen::default_device().map_err(|e| {
         Error::Unsupported(format!(
             "{id}: cannot initialize the selected native Candle device: {e}; use a supported \
@@ -483,7 +484,7 @@ impl Flux3Klein {
             encoder_materialization_boundary(||Ok(self.device.synchronize()?)),
             |heavy:&Heavy,(text,negative,params):(TextConditioning,Option<TextConditioning>,GenerationParams),progress| {
                 let reference_tokens=prepared.map(|p|crate::references::encode(&heavy.ae,p,&self.device,&req.cancel)).transpose()?;
-                gen_core::flux3::phase_resource::conditioning_complete(&req.cancel, || {
+                gen_core_flux3::phase_resource::conditioning_complete(&req.cancel, || {
                     self.device.synchronize().map_err(Error::from).map_err(gen_core::Error::from)
                 }, progress)?;
                 let total=params.steps*req.count;
@@ -607,7 +608,7 @@ impl Flux3Klein {
                     .as_ref()
                     .map(|p| crate::references::encode(&heavy.ae, p, &self.device, &req.cancel))
                     .transpose()?;
-                gen_core::flux3::phase_resource::conditioning_complete(&req.cancel, || {
+                gen_core_flux3::phase_resource::conditioning_complete(&req.cancel, || {
                     self.device.synchronize().map_err(Error::from).map_err(gen_core::Error::from)
                 }, on_progress)?;
                 let total = params.steps * req.count;
@@ -799,7 +800,7 @@ mod tests {
     #[test]
     #[ignore = "model inference; explicit model-proof workflow"]
     fn converted_ggml_package_loads_only_as_its_exact_tier_and_renders_close_to_dense() {
-        use gen_core::flux3::AUTOENCODER_COMPONENT;
+        use gen_core_flux3::AUTOENCODER_COMPONENT;
         let dir = tempfile::tempdir().unwrap();
         let source = crate::convert::tests::source_copy(dir.path());
         let dense = load_inner(
@@ -894,7 +895,7 @@ mod tests {
                 .with_offload_policy(policy);
             spec.precision = Precision::Fp32;
             spec.components.insert(
-                gen_core::flux3::pup::UPSAMPLER_COMPONENT.into(),
+                gen_core_flux3::pup::UPSAMPLER_COMPONENT.into(),
                 WeightsSource::Dir(fixtures.join("tiny-pup-snapshot")),
             );
             let model = load_inner(&spec, false).unwrap();
@@ -1348,7 +1349,7 @@ mod tests {
     /// running it only inside the residency's heavy loader.
     #[test]
     fn dense_inventory_is_preflighted_at_load_under_both_policies() {
-        use gen_core::flux3::AUTOENCODER_COMPONENT;
+        use gen_core_flux3::AUTOENCODER_COMPONENT;
         let package = fixtures().join("tiny-snapshot");
         let dir = tempfile::tempdir().unwrap();
         std::fs::copy(package.join("config.json"), dir.path().join("config.json")).unwrap();

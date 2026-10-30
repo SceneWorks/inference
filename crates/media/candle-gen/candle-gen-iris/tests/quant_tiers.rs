@@ -17,7 +17,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::iris::{GenerationParams, IrisTask, TEXT_ENCODER_COMPONENT};
 use candle_gen::gen_core::{
     CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, OffloadPolicy, PreviewSink, Quant,
     WeightsSource,
@@ -26,6 +25,7 @@ use candle_gen_iris::memory_strategy::generation_contract;
 use candle_gen_iris::{
     denoise, encode, load_backbone_quantized, noise, IrisDiT, IrisTextEncoder, MODEL_ID,
 };
+use gen_core_iris::{GenerationParams, IrisTask, TEXT_ENCODER_COMPONENT};
 
 use crate::common::{cpu, errors, rel_and_cos, tiny_backbone, tiny_config};
 

@@ -83,7 +83,7 @@ with `use_regex=false`; ByteLevel processor/decoder; and BPE with 151,643 vocab
 entries, 151,387 merges and 26 added tokens. Dropout, truncation and padding are
 absent. The Split regex includes negative lookahead.
 
-Iris uses `gen_core::tokenizer::TextTokenizer`, resolved to tokenizers 0.21.4
+Iris uses `gen_core_tokenizer::TextTokenizer`, resolved to tokenizers 0.21.4
 with Oniguruma. `IrisTextEncoder::assemble` loads the tokenizer and encodes the
 prefix/suffix; `encode_in` encodes each full caption before the final token
 window is truncated. A token-window bound alone therefore cannot bound cold

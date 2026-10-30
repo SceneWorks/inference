@@ -1,8 +1,9 @@
 //! Single-case terminal adapter acceptance driver. Compilation/preparation never admits GPU use.
 //! Run once per selected Base/SFT × LoRA/LoKr cell only after the coordinator admits device time
 //! and supplies an external RSS/time guard. No automatic campaign or guessed memory budget.
+use gen_core_moss_image::moss_image_training;
 use mlx_gen::{
-    gen_core::{moss_image::MossImageVariant, moss_image_training},
+    gen_core::moss_image::MossImageVariant,
     runtime::{AdapterKind, AdapterSpec},
     GenerationRequest, Generator, LoadSpec, NetworkType, TrainingConfig, TrainingRequest,
     WeightsSource,

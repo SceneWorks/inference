@@ -12,8 +12,8 @@
 //!   the f32-accumulate / round-to-bf16 emulation.
 
 use candle_gen::candle_core::{DType, Device};
-use candle_gen::gen_core::flux3::text_ids;
 use candle_gen_flux3::{load_dit, SampleTokens};
+use gen_core_flux3::text_ids;
 
 use crate::common::{
     assert_close, cpu, device, errors, fixture, host_f32, ids_of, scalar, tiny_config, tiny_package,
@@ -125,22 +125,17 @@ fn dit(compute: DType, device: &Device) -> candle_gen_flux3::Flux3Dit {
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn ordered_reference_edits_match_frozen_source() {
-    use candle_gen::gen_core::{
-        flux3::{
-            assemble_window,
-            references::{prepare, ReferenceOutputSize},
-        },
-        CancelFlag, Image,
-    };
+    use candle_gen::gen_core::{flux3::references::ReferenceOutputSize, CancelFlag, Image};
     use candle_gen_flux3::pipeline::{
         decode_tokens, denoise_cfg_with_references, denoise_flow_map_with_references,
     };
     use candle_gen_flux3::{load_autoencoder, TextConditioning};
+    use gen_core_flux3::{assemble_window, references::prepare};
     let dev = Device::Cpu;
     let golden = fixture("flux3_reference_edit_golden.safetensors");
     assert_eq!(
         golden.meta("upstream_code_revision"),
-        candle_gen::gen_core::flux3::UPSTREAM_CODE_REVISION
+        gen_core_flux3::UPSTREAM_CODE_REVISION
     );
     let ae = load_autoencoder(&tiny_package().join("ae.safetensors"), &dev).unwrap();
     let flow = dit(DType::F32, &dev);
@@ -219,8 +214,8 @@ fn ordered_reference_edits_match_frozen_source() {
                 .collect(),
             ..Default::default()
         };
-        let ae_input = candle_gen::gen_core::flux3::references::request_images(&mixed).unwrap();
-        let mixed_prepared = candle_gen::gen_core::flux3::references::prepare_borrowed(
+        let ae_input = gen_core_flux3::references::request_images(&mixed).unwrap();
+        let mixed_prepared = gen_core_flux3::references::prepare_borrowed(
             &ae_input.iter().map(|i| i.as_ref()).collect::<Vec<_>>(),
             ReferenceOutputSize::default(),
         )
@@ -229,7 +224,7 @@ fn ordered_reference_edits_match_frozen_source() {
             mixed_prepared.images, prepared.images,
             "source RGB-drop-alpha is exact, not white-premultiplied"
         );
-        let pup = candle_gen::gen_core::flux3::references::upsampler_input(&mixed).unwrap();
+        let pup = gen_core_flux3::references::upsampler_input(&mixed).unwrap();
         for (position, &i) in order.iter().enumerate() {
             if i % 2 == 0 {
                 let (_, _, rgb) = pup.references[position].to_rgb8().unwrap();
@@ -546,12 +541,10 @@ fn flow_map_inputs_and_config_are_checked() {
 fn base_cfg_and_explicit_adapter_identity_match_frozen_source() {
     use candle_gen::candle_core::safetensors;
     use candle_gen::candle_nn::VarBuilder;
-    use candle_gen::gen_core::{
-        flux3::{adapters, assemble_window},
-        AdapterKind, AdapterSpec, CancelFlag,
-    };
+    use candle_gen::gen_core::{AdapterKind, AdapterSpec, CancelFlag};
     use candle_gen_flux3::pipeline::denoise_cfg;
     use candle_gen_flux3::{Flux3Dit, TextConditioning};
+    use gen_core_flux3::{adapters, assemble_window};
     let device = Device::Cpu;
     let mut config = tiny_config();
     config.dit.flow_map = false;

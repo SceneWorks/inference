@@ -24,7 +24,7 @@ attribution obligations); the text encoder is Apache-2.0 (Qwen). See `NOTICE` an
 licence rows (`gen_core::license`).
 
 S6 registers the base checkpoint separately as `flux3_klein_base`; S3 adds ordered reference conditioning, while structured boxes remain sc-26237. The prompt upsampler is sc-26238 (the
-`pup` module here and `gen_core::flux3::pup`): an **optional** co-requisite, loaded only when the
+`pup` module here and `gen_core_flux3::pup`): an **optional** co-requisite, loaded only when the
 `prompt_upsampler` component names its package and accounted separately from the image model and
 its text encoder.
 
@@ -34,7 +34,7 @@ The executable source is the authority wherever it and the package's `config.jso
 source never reads `config.json` (its widths are module constants). The one known disagreement is
 the text window — `text_encoder.py` clamps the prompt at **4096** tokens, `config.json` says
 `max_tokens: 8192` — and the port applies the source's clamp
-(`gen_core::flux3::TextEncoderConfig::window_max_length`). The native graph reads its widths from
+(`gen_core_flux3::TextEncoderConfig::window_max_length`). The native graph reads its widths from
 `config.json` so the miniature fixtures load through the same code as the release; the release
 `config.json` is asserted against the source constants in `gen-core`.
 
@@ -66,7 +66,7 @@ the memory contract (`NativeDitStorage::check_backend`), never dequantized to de
 matched against a Candle artifact. The native formats are per backend and are not
 interchangeable: MLX loads only its affine q4/q8 tiers (group 32/64/128, `u32` codes plus bf16
 scales/biases) converted from the ORIGINAL dense checkpoint by
-`gen_core::flux3::native_convert::convert_affine`; Candle's GGML q4_1/q8_0 tiers are a different
+`gen_core_flux3::native_convert::convert_affine`; Candle's GGML q4_1/q8_0 tiers are a different
 artifact. A native package loads only with its conversion receipt, and its exact tensor
 inventory is checked from headers before any weight is read.
 
@@ -76,7 +76,7 @@ released packages carry the same `model` label (`flux-3-image-klein`), and the b
 has no `dit.flow_map` key at all. So the port reads the mode the same way. Config-only
 `Flux3MetadataConfig` leaves a missing flag unresolved and binds a mode only to an explicit
 catalog route, for planning (`for_model`). Every load, memory contract and training run calls
-`gen_core::flux3::resolve_checkpoint` first. It takes `flow_map` from the DiT headers' `ref_time_in`
+`gen_core_flux3::resolve_checkpoint` first. It takes `flow_map` from the DiT headers' `ref_time_in`
 pair (an explicit config flag must agree with it). Then the selected route is checked against the
 resolved mode (`validate_route`), and the full dense or packed header inventory is checked. All of
 this happens before any text-encoder, autoencoder, adapter or dataset work, so a `Sequential` load
@@ -86,12 +86,12 @@ refuses a malformed package at load time, not on the first request.
 
 | Upstream behaviour | Source | MLX (`mlx-gen-flux3`) | Status |
 | --- | --- | --- | --- |
-| Chat template (single user turn + generation prompt, no system turn) tokenized as one string; clamp 4096; right-pad with `<\|endoftext\|>` to a multiple of 80; mask; pad positions = 1 | `text_encoder.py` | `gen_core::flux3::assemble_window`, `text_encoder.rs` | S1 |
+| Chat template (single user turn + generation prompt, no system turn) tokenized as one string; clamp 4096; right-pad with `<\|endoftext\|>` to a multiple of 80; mask; pad positions = 1 | `text_encoder.py` | `gen_core_flux3::assemble_window`, `text_encoder.rs` | S1 |
 | Qwen3-VL language tower, bf16, padded forward with the pad keys masked for every query (pad queries attend the real keys at position 1) | transformers `Qwen3VLForConditionalGeneration` | shared `mlx_llm::CausalLm` (`qwen3_vl`), explicit positions + additive mask | S1 |
 | Conditioning = the 8 hidden states `[4, 8, …, 32]` (HF numbering) concatenated per token → `[L, 20480]` bf16; ids `(0, 0, 0, pos)` | `text_encoder.py` | `text_encoder.rs` | S1 |
 | Autoencoder: 8× KL VAE + 2×2 patchify + BatchNorm-stat latents, f32; decode = denorm → unpatchify → decoder | `autoencoder.py` | `autoencoder.rs` (delegated leaf) | S1 |
-| Image ids `(0, row·0.5, col·0.5, 0)` | `pipeline.scaled_ids` | `gen_core::flux3::scaled_image_ids` | S1 |
-| 4-axis RoPE tables in f64 → f32; adjacent-pair rotation after f32 RMSNorm of q/k | `dit.rope`, `dit.rmsnorm_rope` | `gen_core::flux3::rope_cos_sin`, `dit.rs` | S1 |
+| Image ids `(0, row·0.5, col·0.5, 0)` | `pipeline.scaled_ids` | `gen_core_flux3::scaled_image_ids` | S1 |
+| 4-axis RoPE tables in f64 → f32; adjacent-pair rotation after f32 RMSNorm of q/k | `dit.rope`, `dit.rmsnorm_rope` | `gen_core_flux3::rope_cos_sin`, `dit.rs` | S1 |
 | Timestep embedding (×1000 in the conditioning dtype, 256-d cos‖sin), `time_in` MLP, `ref_time_in` target-time MLP (flow map) | `dit.timestep_embedding`, `MLPEmbedder` | `dit.rs` | S1 |
 | Per-mode modulation (`early_stream_modulations`, `single_stream_modulations`): shift/scale/gate from `silu(vec)` | `ModeModulation` | `dit.rs` | S1 |
 | 5 per-mode blocks (image / image_cond / text), then 28 shared single-stream blocks over the per-sample `[image, image_cond, text]` concatenation; per-sample attention bounds; parallel attention + SwiGLU MLP with one gate | `Block`, `DiT.forward` | `dit.rs` | S1 (image_cond empty: the phantom token is never attended and never placed, so the stream is skipped — identical output) |
@@ -99,15 +99,15 @@ refuses a malformed package at load time, not on the first request.
 | Flow-map Euler: `x += dt · dit(x, t, t_ref = schedule[i+1])` over `timesteps(steps, 6.93)`; bf16-valued f32 noise, f32 state | `sampling.py`, `pipeline.generate` | `pipeline.rs` | S1 |
 | Noise `torch.randn(...).to(bf16).float()` | `pipeline.generate` | seeded MLX normal, rounded through bf16 (not bit-reproducible with torch; parity uses injected noise) | S1 |
 | Output `clamp(−1, 1)` → RGB8 | `pipeline.to_pil` | `mlx_gen::image::decoded_to_image` | S1 |
-| Default seed `int(sha256(caption).hexdigest(), 16) % 2**32` when the request carries none | `generate.py` | `gen_core::flux3::prompt_seed` | S1 |
+| Default seed `int(sha256(caption).hexdigest(), 16) % 2**32` when the request carries none | `generate.py` | `gen_core_flux3::prompt_seed` | S1 |
 | CFG sampling (base checkpoint): [unconditional, conditional], default 50/3.5, no target-time; explicit negative caption independently encoded | `sampling.denoise` | `pipeline::denoise_cfg`, shared request resolver | S6 |
-| Additive LoRA with explicit finite scale and base/revision/rank/alpha/target admission | frozen diffusers converter at `7ecb1e1b4fe500be7fb7381a7bb79a24d7fa3941` | `gen_core::flux3::adapters`, `adapters.rs`, existing native residual hosts | S6 |
-| Ordered 1–10 RGB/RGBA references: single ≤4 Mi-pixel padded canvas (Lanczos, centred reflect/symmetric), multi each ≤1 Mi-pixel with centred 16px crop; first-reference auto size and single auto output crop only when neither dimension was explicit | `pipeline.prepare_reference`, `prepare_multi_reference`, `default_size`, `generate.py` | `gen_core::flux3::references`, typed `GenerationRequest::flux3_reference_output`; scope verifies admission against resolved geometry before normalizing numeric defaults | S3 |
+| Additive LoRA with explicit finite scale and base/revision/rank/alpha/target admission | frozen diffusers converter at `7ecb1e1b4fe500be7fb7381a7bb79a24d7fa3941` | `gen_core_flux3::adapters`, `adapters.rs`, existing native residual hosts | S6 |
+| Ordered 1–10 RGB/RGBA references: single ≤4 Mi-pixel padded canvas (Lanczos, centred reflect/symmetric), multi each ≤1 Mi-pixel with centred 16px crop; first-reference auto size and single auto output crop only when neither dimension was explicit | `pipeline.prepare_reference`, `prepare_multi_reference`, `default_size`, `generate.py` | `gen_core_flux3::references`, typed `GenerationRequest::flux3_reference_output`; scope verifies admission against resolved geometry before normalizing numeric defaults | S3 |
 | Reference AE tokens cast bf16, ordered negative l-axis IDs, spatial axes ×0.5; identical image_cond in negative/positive base rows even CFG0/1 | `pipeline.encode_references`, `pack`, both samplers | `references.rs`, `pipeline::*_with_references`; generation Qwen text encoding remains text-only, not VLM/deepstack | S3 |
 | Original EXIF-oriented RGBA forks before AE RGB-drop-alpha versus existing PUP white-composite policy; invalid count/pixels/strength rejected before generation | `pipeline.prepare_reference`, `pup.policy_reference` | family-only authorized-file decoder, existing `ReferenceRgba`/ordered `Reference` carriers, existing `UpsamplerInput` modes | S3 |
 | Boxes, quantized variants | `bbox.py`, `fp8.py`/`nvfp4.py` | — | sc-26237, sc-26241 |
-| **Prompt upsampler (sc-26238)** — four modes by system prompt (`t2i`, `i2i`, `t2i_bbox`, `i2i_bbox`): `bbox.plan` (passed boxes → canvas rows; a table already in the prompt locks by itself), the `ORIGINAL PROMPT:` / `LOCKED BOUNDING-BOX ANNOTATIONS` input, the two `I2I_SCAFFOLD`s, the chat template with `enable_thinking=False`, greedy `top_p 0.95 / top_k 20 / max_tokens 3584`, presence penalty 1.5 (t2i) / 0.0 (i2i), `max_model_len 8192`, `bbox.reconcile` (IoU ≥ 0.9 rename, locked rows verbatim adopting the desc, valid cited rows appended), `generate.py`'s `--no-pup` caption and finished-answer skip | `pup.py`, `bbox.py` | `gen_core::flux3::pup` (tensor-neutral, byte-for-byte text), `pup.rs` (the engine) | S5 |
-| Upsampler reference policy: EXIF transpose, alpha over white, `reference_size` budget (1 MP / 724² / 512² by reference count, multiples of 32, aspect ≤ 200:1 else the prompt as typed), Pillow `LANCZOS`, JPEG q92 | `pup.policy_reference` | `gen_core::flux3::pup::policy_reference` (bit-exact Pillow RGB/alpha/LANCZOS and libjpeg's q92 integer 4:2:0 round trip, pixel-equality fixtures) | S5 |
+| **Prompt upsampler (sc-26238)** — four modes by system prompt (`t2i`, `i2i`, `t2i_bbox`, `i2i_bbox`): `bbox.plan` (passed boxes → canvas rows; a table already in the prompt locks by itself), the `ORIGINAL PROMPT:` / `LOCKED BOUNDING-BOX ANNOTATIONS` input, the two `I2I_SCAFFOLD`s, the chat template with `enable_thinking=False`, greedy `top_p 0.95 / top_k 20 / max_tokens 3584`, presence penalty 1.5 (t2i) / 0.0 (i2i), `max_model_len 8192`, `bbox.reconcile` (IoU ≥ 0.9 rename, locked rows verbatim adopting the desc, valid cited rows appended), `generate.py`'s `--no-pup` caption and finished-answer skip | `pup.py`, `bbox.py` | `gen_core_flux3::pup` (tensor-neutral, byte-for-byte text), `pup.rs` (the engine) | S5 |
+| Upsampler reference policy: EXIF transpose, alpha over white, `reference_size` budget (1 MP / 724² / 512² by reference count, multiples of 32, aspect ≤ 200:1 else the prompt as typed), Pillow `LANCZOS`, JPEG q92 | `pup.policy_reference` | `gen_core_flux3::pup::policy_reference` (bit-exact Pillow RGB/alpha/LANCZOS and libjpeg's q92 integer 4:2:0 round trip, pixel-equality fixtures) | S5 |
 | Qwen3.5 VLM serving (hybrid linear/full attention, Qwen3-VL ViT, `<\|image_pad\|>` expansion by the processor's `smart_resize`) | vLLM | shared `mlx_llm` provider (`mlx-llama`, `qwen3_5`) | S5 |
 
 ## Precision policy
@@ -148,7 +148,7 @@ release) with a WordLevel tokenizer carrying the PINNED `chat_template.jinja`, `
 and processor configs verbatim — and `flux3_pup_golden.safetensors` its greedy run over the four
 modes (expanded prompt ids, the reference pixels after upstream's policy, generated ids, top-2
 logit margins), produced by `../tools/dump_flux3_pup_golden.py`, which also writes the text
-goldens and the Pillow policy fixture read by `gen-core/tests/flux3_pup.rs`. The real-weight case
+goldens and the Pillow policy fixture read by `gen-core-flux3/tests/flux3_pup.rs`. The real-weight case
 `real_weights::real_prompt_upsampler_rewrites_the_readme_request` reads the pinned package from
 `FLUX3_PUP_DIR`.
 

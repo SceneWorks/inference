@@ -6,11 +6,11 @@
 //! missing resource and for the controls the flow map cannot honour. Mirrors the MLX twin's
 //! `generator_contract` case for case — the same request contract on both backends.
 
-use candle_gen::gen_core::flux3::{AUTOENCODER_COMPONENT, TEXT_ENCODER_COMPONENT};
 use candle_gen::gen_core::{
     CancelFlag, Error as CoreError, GenerationOutput, GenerationRequest, Generator, LoadSpec,
     OffloadPolicy, Progress, WeightsSource,
 };
+use gen_core_flux3::{AUTOENCODER_COMPONENT, TEXT_ENCODER_COMPONENT};
 
 use crate::common::{tiny_autoencoder, tiny_package, tiny_text_encoder};
 
@@ -132,9 +132,10 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
             (83, 67),
             "single-auto result removes only the source padding"
         );
-        let exif = candle_gen::gen_core::flux3::references::decode_reference_file(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../contracts/gen-core/tests/fixtures/flux3-references/exif6.png"),
+        let exif = gen_core_flux3::references::decode_reference_file(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../../contracts/gen-core-flux3/tests/fixtures/flux3-references/exif6.png",
+            ),
         )
         .unwrap();
         edit.conditioning = vec![exif.clone()];
@@ -166,7 +167,7 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
         narrow.flux3_reference_output = Some(ReferenceOutputSize::default());
         // The ordinary memory scope normalizes numeric geometry BEFORE model validation.
         // Its 48px canvas must not be re-rejected by the descriptor T2I minimum.
-        let plan = candle_gen::gen_core::flux3::references::normalize_request(&mut narrow)
+        let plan = gen_core_flux3::references::normalize_request(&mut narrow)
             .unwrap()
             .unwrap();
         assert_eq!(plan.output.canvas, (48, 64));
@@ -181,19 +182,18 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
             "legacy no-reference minimum is unchanged"
         );
         let formats = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../contracts/gen-core/tests/fixtures/flux3-image-input");
+            .join("../../../contracts/gen-core-flux3/tests/fixtures/flux3-image-input");
         for file in [
             "mode-luma16.png",
             "mode-rgb16.png",
             "mode-palette-alpha.png",
             "mode-rgb-trns.png",
         ] {
-            edit.conditioning = vec![
-                candle_gen::gen_core::flux3::references::decode_reference_file(&formats.join(file))
-                    .unwrap(),
-            ];
-            let normalized = candle_gen::gen_core::flux3::references::request_images(&edit)
-                .unwrap()[0]
+            edit.conditioning =
+                vec![
+                    gen_core_flux3::references::decode_reference_file(&formats.join(file)).unwrap(),
+                ];
+            let normalized = gen_core_flux3::references::request_images(&edit).unwrap()[0]
                 .as_ref()
                 .clone();
             let encoded = render(&edit);
@@ -440,7 +440,7 @@ fn an_unseeded_request_is_seeded_from_its_prompt() {
     let explicit = g
         .generate(
             &GenerationRequest {
-                seed: Some(candle_gen::gen_core::flux3::prompt_seed(&unseeded.prompt)),
+                seed: Some(gen_core_flux3::prompt_seed(&unseeded.prompt)),
                 ..request()
             },
             &mut |_| {},
@@ -449,7 +449,7 @@ fn an_unseeded_request_is_seeded_from_its_prompt() {
     let other = g
         .generate(
             &GenerationRequest {
-                seed: Some(candle_gen::gen_core::flux3::prompt_seed("another caption")),
+                seed: Some(gen_core_flux3::prompt_seed("another caption")),
                 ..request()
             },
             &mut |_| {},

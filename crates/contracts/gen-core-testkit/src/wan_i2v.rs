@@ -1,6 +1,6 @@
 //! Synthetic Wan2.2 I2V snapshots that pass `PreparedWanI2vMemory::prepare` (epic SC-22657).
 //!
-//! `gen_core::wan_i2v_memory` seals a receipt over a real converted snapshot: the repository /
+//! `gen_core_memory_wan` seals a receipt over a real converted snapshot: the repository /
 //! revision layout, the per-route component inventory, the safetensors headers and every file's
 //! digest. A backend crate that wants to test the contract a **loaded** generator publishes —
 //! `Generator::memory_strategy_contract()` returns the sealed `prepared.contract` — therefore needs
@@ -16,11 +16,11 @@
 
 use std::path::{Path, PathBuf};
 
-use gen_core::wan_i2v_memory::{
+use gen_core::{LoadSpec, WeightsSource};
+use gen_core_memory_wan::{
     ensure_wan_vace_fun_source_receipt, ensure_wan_vace_source_receipt, fixture_snapshot_root,
     prepare_load_spec, WanI2vBackend, WanI2vRoute,
 };
-use gen_core::{LoadSpec, WeightsSource};
 
 /// Write a minimal safetensors file whose header declares `tensors` as `(name, dtype, shape)`.
 ///
@@ -82,7 +82,7 @@ fn mlx_route_config(route: WanI2vRoute) -> &'static str {
 /// Write a dense (bf16-tier) MLX snapshot for `route` under `base` and return the prepared
 /// [`LoadSpec`] that [`PreparedWanI2vMemory::prepare`] accepts for it.
 ///
-/// [`PreparedWanI2vMemory::prepare`]: gen_core::wan_i2v_memory::PreparedWanI2vMemory::prepare
+/// [`PreparedWanI2vMemory::prepare`]: gen_core_memory_wan::PreparedWanI2vMemory::prepare
 pub fn write_mlx_snapshot(base: &Path, route: WanI2vRoute) -> LoadSpec {
     let root = fixture_snapshot_root(base, WanI2vBackend::Mlx, route);
     std::fs::create_dir_all(&root).unwrap();
@@ -146,7 +146,7 @@ pub fn write_mlx_snapshot(base: &Path, route: WanI2vRoute) -> LoadSpec {
 /// Write a dense (diffusers-layout) Candle snapshot for `route` under `base` and return the
 /// prepared [`LoadSpec`] that [`PreparedWanI2vMemory::prepare`] accepts for it.
 ///
-/// [`PreparedWanI2vMemory::prepare`]: gen_core::wan_i2v_memory::PreparedWanI2vMemory::prepare
+/// [`PreparedWanI2vMemory::prepare`]: gen_core_memory_wan::PreparedWanI2vMemory::prepare
 pub fn write_candle_snapshot(base: &Path, route: WanI2vRoute) -> LoadSpec {
     let root = fixture_snapshot_root(base, WanI2vBackend::Candle, route);
     std::fs::create_dir_all(root.join("tokenizer")).unwrap();
@@ -212,7 +212,7 @@ fn prepared_spec(root: PathBuf, backend: WanI2vBackend, route: WanI2vRoute) -> L
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gen_core::wan_i2v_memory::PreparedWanI2vMemory;
+    use gen_core_memory_wan::PreparedWanI2vMemory;
 
     /// Every route on both backends seals: the writers are only useful if `prepare` accepts them.
     #[test]

@@ -4,11 +4,11 @@
 
 use std::path::{Path, PathBuf};
 
-use gen_core::flux3::{
+use gen_core::GenerationReport;
+use gen_core_flux3::{
     validate_generation_request, Flux3Config, GenerationParams, GenerationResources, FAMILY,
     SAMPLERS,
 };
-use gen_core::GenerationReport;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     gen_core, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec,
@@ -21,19 +21,19 @@ use crate::autoencoder::Flux3AutoEncoder;
 use crate::dit::Flux3Dit;
 use crate::pipeline::{decode_tokens, denoise_one_with_references};
 use crate::text_encoder::{Flux3TextEncoder, TextConditioning};
-use gen_core::flux3::artifacts::{ArtifactBackend, NativeDitStorage};
-use gen_core::flux3::conversion::ComponentRole;
-use gen_core::flux3::quantization::DitFormat;
-use gen_core::flux3::references::{self, PreparedReferences};
+use gen_core_flux3::artifacts::{ArtifactBackend, NativeDitStorage};
+use gen_core_flux3::conversion::ComponentRole;
+use gen_core_flux3::quantization::DitFormat;
+use gen_core_flux3::{references, references::PreparedReferences};
 
 /// Registry id (the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = gen_core::flux3::DISTILLED_MODEL_ID;
 /// Output sides must be multiples of the token size.
-pub const SIZE_MULTIPLE: u32 = gen_core::flux3::DOWNSAMPLING_RATIO;
+pub const SIZE_MULTIPLE: u32 = gen_core_flux3::DOWNSAMPLING_RATIO;
 /// Smallest side (`pipeline.MIN_SIDE`).
-pub const MIN_SIZE: u32 = gen_core::flux3::MIN_SIDE;
+pub const MIN_SIZE: u32 = gen_core_flux3::MIN_SIDE;
 /// Largest side (`pipeline.MAX_SIDE`).
-pub const MAX_SIZE: u32 = gen_core::flux3::MAX_SIDE;
+pub const MAX_SIZE: u32 = gen_core_flux3::MAX_SIDE;
 /// Images per request (rendered one after another, each from `seed + i`).
 pub const MAX_COUNT: u32 = 8;
 
@@ -99,7 +99,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: MAX_COUNT,
             mac_only: true,
             // Native MLX tiers (sc-26241): q4/q8 = MLX affine packages converted from the ORIGINAL
-            // dense checkpoint (`gen_core::flux3::native_convert::convert_affine`), any of groups
+            // dense checkpoint (`gen_core_flux3::native_convert::convert_affine`), any of groups
             // 32/64/128 as the package declares. Distinct from Candle's GGML q4/q8 artifacts.
             supported_quants: &[gen_core::Quant::Q4, gen_core::Quant::Q8],
             supports_sequential_offload: true,
@@ -166,7 +166,7 @@ pub struct Flux3Klein {
     memory_strategy: gen_core::MemoryProviderContract,
     /// No VLM weights or prefix cache exist until an enabled prepare phase.
     upsampler_dir: Option<PathBuf>,
-    upsampler: gen_core::flux3::phase_resource::PhaseResourceSlot<crate::pup::Flux3PromptUpsampler>,
+    upsampler: gen_core_flux3::phase_resource::PhaseResourceSlot<crate::pup::Flux3PromptUpsampler>,
     image_execution_fence: gen_core::core_llm::text_llm::OwnedExecutionFence<mlx_rs::Stream>,
 }
 
@@ -281,7 +281,7 @@ fn verify_native_package(
     config: &Flux3Config,
     resources: &GenerationResources,
 ) -> Result<()> {
-    let receipt = gen_core::flux3::conversion::open_conversion(package_dir)?;
+    let receipt = gen_core_flux3::conversion::open_conversion(package_dir)?;
     let (algorithm, bits, group_size) = storage.receipt_algorithm()?;
     if receipt.algorithm != algorithm || receipt.bits != bits || receipt.group_size != group_size {
         return Err(Error::Unsupported(format!(
@@ -335,7 +335,7 @@ fn refuse_unsupported_spec(route_id: &str, spec: &LoadSpec) -> Result<()> {
                 "{route_id}: LoadSpec::{field} is not supported by the FLUX 3 route \
                  (quantized variants are sc-26241, LoRA is sc-26239; the text encoder is the \
                  '{}' component)",
-                gen_core::flux3::TEXT_ENCODER_COMPONENT
+                gen_core_flux3::TEXT_ENCODER_COMPONENT
             )));
         }
     }
@@ -362,7 +362,7 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Box<dyn Generator>> {
 
 /// The checkpoint authority every actual MLX boundary (load, memory contract, training) runs
 /// BEFORE any text-encoder, autoencoder, adapter, memory or dataset work: the strict header
-/// resolver ([`gen_core::flux3::resolve_checkpoint`], whose `ref_time_in` pair decides
+/// resolver ([`gen_core_flux3::resolve_checkpoint`], whose `ref_time_in` pair decides
 /// `flow_map`), the selected route against that resolved mode, the declared storage against the
 /// selection and this backend, then the FULL native inventory (dense and packed alike) from the
 /// package's own DiT file/index headers — so a `Sequential` load, whose DiT materializes only on
@@ -373,7 +373,7 @@ pub(crate) fn resolve_package(
     quantize: Option<gen_core::Quant>,
     precision: Precision,
 ) -> gen_core::Result<(Flux3Config, NativeDitStorage)> {
-    let config = gen_core::flux3::resolve_checkpoint(package_dir)?;
+    let config = gen_core_flux3::resolve_checkpoint(package_dir)?;
     config.validate_route(route_id)?;
     let storage = NativeDitStorage::from_package(package_dir)?;
     storage.validate_selection(quantize, precision)?;
@@ -385,7 +385,7 @@ pub(crate) fn resolve_package(
     }
     storage.validate_headers(
         &config.dit,
-        &gen_core::flux3::checkpoint_tensor_headers(package_dir)?,
+        &gen_core_flux3::checkpoint_tensor_headers(package_dir)?,
     )?;
     Ok((config, storage))
 }
@@ -415,7 +415,7 @@ fn load_model(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
         .map(|adapter| {
             Ok(gen_core::AdapterApplyReport {
                 adapter_path: adapter.path.clone(),
-                applied: gen_core::flux3::adapters::inspect(adapter, &config.dit)?.len(),
+                applied: gen_core_flux3::adapters::inspect(adapter, &config.dit)?.len(),
                 skipped: Vec::new(),
             })
         })
@@ -458,7 +458,7 @@ fn load_model(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
     )?;
     // Only an optional local source path is retained here. An enabled prepare
     // phase owns the VLM load and a bounded phase drops it before image encoding.
-    let upsampler_dir = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)?;
+    let upsampler_dir = gen_core_flux3::pup::UpsamplePackage::component_dir(spec)?;
     Ok(Flux3Klein {
         adapter_reports,
         descriptor: if base {
@@ -527,7 +527,7 @@ impl Flux3Klein {
             },
             |heavy:&Heavy,(text,negative,params):(TextConditioning,Option<TextConditioning>,GenerationParams),progress| {
                 let reference_tokens=prepared.map(|p|crate::references::encode(&heavy.ae,p,&req.cancel)).transpose()?;
-                gen_core::flux3::phase_resource::conditioning_complete(&req.cancel, || {
+                gen_core_flux3::phase_resource::conditioning_complete(&req.cancel, || {
                     (|| -> Result<()> {
                         text.tokens.eval()?;
                         if let Some(negative) = negative.as_ref() { negative.tokens.eval()?; }
@@ -674,7 +674,7 @@ impl Flux3Klein {
                     .as_ref()
                     .map(|p| crate::references::encode(&heavy.ae, p, &req.cancel))
                     .transpose()?;
-                gen_core::flux3::phase_resource::conditioning_complete(&req.cancel, || {
+                gen_core_flux3::phase_resource::conditioning_complete(&req.cancel, || {
                     (|| -> Result<()> {
                         text.tokens.eval()?;
                         if let Some(negative) = negative.as_ref() { negative.tokens.eval()?; }
@@ -849,8 +849,8 @@ mod tests {
     /// renders through `quantized_matmul` close to the dense package at the same settings.
     #[test]
     fn converted_affine_package_loads_only_as_its_exact_tier_and_renders_close_to_dense() {
-        use gen_core::flux3::native_convert::{convert_affine, ConversionSource};
-        use gen_core::flux3::{AUTOENCODER_COMPONENT, TEXT_ENCODER_COMPONENT};
+        use gen_core_flux3::native_convert::{convert_affine, ConversionSource};
+        use gen_core_flux3::{AUTOENCODER_COMPONENT, TEXT_ENCODER_COMPONENT};
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot");
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("source");
@@ -870,8 +870,8 @@ mod tests {
         std::fs::write(root.join("NOTICE.md"), b"notice").unwrap();
         let source = ConversionSource {
             root: root.clone(),
-            repository: gen_core::flux3::DISTILLED_WEIGHTS_REPO.into(),
-            revision: gen_core::flux3::DISTILLED_WEIGHTS_REVISION.into(),
+            repository: gen_core_flux3::DISTILLED_WEIGHTS_REPO.into(),
+            revision: gen_core_flux3::DISTILLED_WEIGHTS_REVISION.into(),
         };
         let render = |model: &Flux3Klein| -> Vec<u8> {
             let req = GenerationRequest {
@@ -941,7 +941,7 @@ mod tests {
                     .with_offload_policy(policy);
             spec.precision = Precision::Fp32;
             spec.components.insert(
-                gen_core::flux3::pup::UPSAMPLER_COMPONENT.into(),
+                gen_core_flux3::pup::UPSAMPLER_COMPONENT.into(),
                 gen_core::WeightsSource::Dir(fixtures.join("tiny-pup-snapshot")),
             );
             let model = load_model(&spec, false).unwrap();
@@ -1189,7 +1189,7 @@ mod tests {
             .unwrap();
             assert!(!dir.path().join("model.safetensors").exists());
 
-            let resolver = gen_core::flux3::resolve_checkpoint(dir.path())
+            let resolver = gen_core_flux3::resolve_checkpoint(dir.path())
                 .expect_err("an index-only native DiT is not a supported checkpoint layout");
             assert!(
                 matches!(resolver, gen_core::Error::Unsupported(_)),

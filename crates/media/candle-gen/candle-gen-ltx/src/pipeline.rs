@@ -710,10 +710,9 @@ pub fn denoise_tokens_rf_ancestral(
                 alat = Some(ad);
             }
         } else {
-            let coeffs = candle_gen::gen_core::ltx_dfr::RfAncestralCoeffs::new(
-                sigma, sigma_next, eta, s_noise,
-            )
-            .map_err(|e| candle_gen::CandleError::Msg(e.to_string()))?;
+            let coeffs =
+                gen_core_ltx::ltx_dfr::RfAncestralCoeffs::new(sigma, sigma_next, eta, s_noise)
+                    .map_err(|e| candle_gen::CandleError::Msg(e.to_string()))?;
             let ratio = coeffs.sigma_down_ratio as f64;
             let step_rf = |x: &Tensor, x0: &Tensor, modality: u64| -> Result<Tensor> {
                 let mut next = ((x * ratio)? + (x0 * (1.0 - ratio))?)?;

@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
@@ -26,6 +25,7 @@ use candle_gen::train::schedule::schedule_updates;
 use candle_gen::train::tae::TinyDecoderSpec;
 use candle_gen::{CandleError, Result};
 use candle_gen_perceptual::{AuxGeometry, AuxLossContext, DecoderSpec};
+use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
 
 use crate::conditioning::{aggregate, Sd3Conditioning};
 use crate::pipeline::{Pipeline, Variant};
@@ -186,12 +186,12 @@ impl Trainer for Sd3Trainer {
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core_train::validate_control_request(self.descriptor(), req)?;
+        gen_core_train::validate_full_finetune_request(self.descriptor(), req)?;
         // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_edit_request(self.descriptor(), req)?;
         validate_request(req)?;
         let want_bf16 = {
             let dtype = req.config.train_dtype.trim();
@@ -215,7 +215,7 @@ impl Trainer for Sd3Trainer {
     ) -> gen_core::Result<TrainingOutput> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
@@ -569,15 +569,13 @@ impl Sd3Trainer {
         // cropped like the image and resampled onto its decoded size.
         let mut perceptual = perceptual;
         if let Some(path) = perceptual.as_mut() {
-            path.attach_subject_masks(
-                candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::load(
-                    "sd3 trainer",
-                    &req.items,
-                    cfg,
-                    edges.len(),
-                    CropBox::center_square,
-                )?,
-            );
+            path.attach_subject_masks(gen_core_train::subject_mask::PerceptualSubjectMasks::load(
+                "sd3 trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?);
         }
         let mut aux_driver = match perceptual {
             Some(path) => Some(AuxDriver::prepare(

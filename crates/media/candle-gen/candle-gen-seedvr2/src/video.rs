@@ -2,12 +2,12 @@
 //! planner.
 //!
 //! Chunk planning, the overlap cross-fade, the budget-model selectors and spatial tiling are
-//! backend-neutral and live in [`candle_gen::gen_core::seedvr2_video`] (sc-27256), shared with the
+//! backend-neutral and live in [`gen_core_family::seedvr2_video`] (sc-27256), shared with the
 //! MLX twin; this module re-exports them so `video::*` paths stay stable and adds the device-VRAM
 //! budget. On CUDA the budget is the device's total VRAM (read from `nvidia-smi`, the SceneWorks
 //! worker convention), overridable via `SEEDVR2_BUDGET_GIB`.
 
-pub use candle_gen::gen_core::seedvr2_video::*;
+pub use gen_core_family::seedvr2_video::*;
 
 /// Fraction of the device VRAM treated as safe (matches the wan/ltx guard convention).
 const SAFE_FRAC: f64 = 0.85;

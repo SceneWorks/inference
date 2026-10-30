@@ -81,7 +81,7 @@ pub struct TrainingConfig {
     /// unaffected (the same additive shape as [`control_type`](Self::control_type)). Only a trainer that
     /// advertises [`TrainerDescriptor::supports_full_finetune`] (Mage-Flow-Base today) may honor it; an
     /// adapter-only trainer must **reject** the request via the shared
-    /// [`validate_full_finetune_request`] floor — it must never silently train a LoRA instead (F-006 /
+    /// `gen_core_train::validate_full_finetune_request` floor — it must never silently train a LoRA instead (F-006 /
     /// F-055). Because the dense retained-graph backward holds the whole model,
     /// a full fine-tune is memory-heavy: the platform/tier gate (SceneWorks) bounds it, and
     /// production-resolution runs additionally need gradient checkpointing (not yet ported, sc-14989).
@@ -144,7 +144,7 @@ pub struct TrainingConfig {
     /// [`crate::Error::Unsupported`]) by any trainer whose
     /// [`TrainerDescriptor::techniques`] does not declare
     /// [`weight_noise`](TrainingTechniques::weight_noise), and by every trainer for a
-    /// [`full_finetune`](Self::full_finetune) run — see [`validate_training_techniques`].
+    /// [`full_finetune`](Self::full_finetune) run — see `gen_core_train::validate_training_techniques`.
     pub weight_noise_sigma: f32,
     /// **Gradient noise** (epic 2123, sc-24827) — annealed Gaussian noise on the trainable adapter
     /// gradients, the `neelakantan` mode of ai-toolkit-perceptual (Neelakantan et al. 2015). On
@@ -161,7 +161,7 @@ pub struct TrainingConfig {
     /// [`TrainerDescriptor::techniques`] does not declare
     /// [`gradient_noise`](TrainingTechniques::gradient_noise), and for a
     /// [`full_finetune`](Self::full_finetune) run (it perturbs adapter gradients only) — see
-    /// [`validate_training_techniques`].
+    /// `gen_core_train::validate_training_techniques`.
     pub gradient_noise_eta: f32,
     /// Annealing exponent `γ` of [`gradient_noise_eta`](Self::gradient_noise_eta)'s schedule
     /// `σ_t = η / (1 + t)^γ`. Default `0.55` (the paper's / upstream's default). Must be finite and
@@ -183,7 +183,7 @@ pub struct TrainingConfig {
     /// [`resolution_buckets`](TrainingTechniques::resolution_buckets); a malformed list (a zero
     /// resolution or repeat count, a resolution off the [`RESOLUTION_BUCKET_STRIDE`], a duplicate
     /// resolution, more than [`MAX_RESOLUTION_BUCKETS`]) is
-    /// refused by [`validate_training_techniques`]. Memory pre-flights size for
+    /// refused by `gen_core_train::validate_training_techniques`. Memory pre-flights size for
     /// [`max_training_resolution`](Self::max_training_resolution) (E7).
     pub resolution_buckets: Vec<ResolutionBucket>,
     /// Aspect-assigned rectangular buckets. Mutually exclusive with the legacy square list.
@@ -208,7 +208,7 @@ pub struct TrainingConfig {
     /// once per image. Off by default ([`AuxLossSchedule::weight`] `0`); refused (typed
     /// [`crate::Error::Unsupported`]) by any trainer whose [`TrainerDescriptor::techniques`] does
     /// not declare [`depth_anchoring`](TrainingTechniques::depth_anchoring) — see
-    /// [`validate_training_techniques`].
+    /// `gen_core_train::validate_training_techniques`.
     pub depth_anchoring: DepthAnchoringConfig,
     /// Directory holding the family's **small differentiable x0 decoder** (TAEF1 for the Flux-VAE
     /// 16-channel families, TAESD/TAESDXL for SD/SDXL, …) — the decoder every decoded-x0
@@ -222,7 +222,7 @@ pub struct TrainingConfig {
     /// down to the latent grid (so a latent cell straddling the subject edge gets a fractional
     /// mask value `m`), and turned into the weight map
     /// `w = background_weight + (subject_weight − background_weight) · m`, which multiplies the
-    /// per-element loss **before** the mean reduction (see [`subject_mask`]).
+    /// per-element loss **before** the mean reduction (see `gen_core_train::subject_mask`).
     /// The divisor stays the full element count, so the gradient (and effective learning rate)
     /// scales by about `background_weight + (subject_weight − background_weight) · coverage`
     /// — with `background_weight = 0` and a small subject, proportionally lower.
@@ -231,7 +231,7 @@ pub struct TrainingConfig {
     /// mean it was before this field existed. `Some` is refused (typed
     /// [`crate::Error::Unsupported`]) by a trainer whose [`TrainerDescriptor::techniques`] does not
     /// declare [`subject_mask_loss`](TrainingTechniques::subject_mask_loss), and refused when any
-    /// item lacks a mask — see [`validate_training_techniques`].
+    /// item lacks a mask — see `gen_core_train::validate_training_techniques`.
     pub subject_mask_loss: Option<SubjectMaskLoss>,
     /// **Body losses** (epic 2123, sc-24832) — three decoded-x0 auxiliary perceptual losses on the
     /// shared path: ViTPose+ bone-length **proportions**, HybrIK SMPL-beta **shape**, and Sapiens
@@ -240,7 +240,7 @@ pub struct TrainingConfig {
     /// [`TrainerDescriptor::techniques`] does not declare its flag
     /// ([`body_proportion_loss`](TrainingTechniques::body_proportion_loss),
     /// [`body_shape_loss`](TrainingTechniques::body_shape_loss),
-    /// [`normal_loss`](TrainingTechniques::normal_loss)) — see [`validate_training_techniques`].
+    /// [`normal_loss`](TrainingTechniques::normal_loss)) — see `gen_core_train::validate_training_techniques`.
     /// An image with no detected person is skipped by all three.
     pub body_losses: BodyLossesConfig,
     /// **ArcFace identity loss** (epic 2123, sc-24831) — an auxiliary perceptual loss on the shared
@@ -281,7 +281,7 @@ pub struct TrainingConfig {
     /// (typed [`crate::Error::Unsupported`]) by any trainer whose
     /// [`TrainerDescriptor::techniques`] does not declare
     /// [`vae_anchor_loss`](TrainingTechniques::vae_anchor_loss) — see
-    /// [`validate_training_techniques`].
+    /// `gen_core_train::validate_training_techniques`.
     pub vae_anchor: VaeAnchorConfig,
     /// **E-LatentLPIPS** (epic 2123, sc-24833) — the learned latent-space perceptual metric of
     /// Kang et al. (ECCV 2024, `mingukkang/elatentlpips`) between the model's x0 prediction and the
@@ -306,7 +306,7 @@ pub struct TrainingConfig {
     /// [`crate::Error::Unsupported`]) by any trainer whose [`TrainerDescriptor::techniques`] does
     /// not declare [`training_adapter`](TrainingTechniques::training_adapter), and for a
     /// [`full_finetune`](Self::full_finetune) run (the adapter would be baked into the fine-tuned
-    /// weights) — see [`validate_training_techniques`]. A file that cannot be read fails the run
+    /// weights) — see `gen_core_train::validate_training_techniques`. A file that cannot be read fails the run
     /// when the trainer loads it, naming the path.
     pub training_adapter: Option<PathBuf>,
 }
@@ -450,7 +450,7 @@ pub struct AuxLossSchedule {
     pub t_min: f32,
     /// Inclusive upper bound of the noise-level window (see [`t_min`](Self::t_min)).
     pub t_max: f32,
-    /// Alternation period, counted in optimizer updates (see [`aux_schedule::AltKey::claims`]):
+    /// Alternation period, counted in optimizer updates (see `gen_core_train::aux_schedule::AltKey::claims`):
     /// - `1` — the weighted aux loss is **added** to the diffusion loss on every in-window step;
     /// - `n ≥ 2` — about every `n`-th optimizer update is an **aux-only** update on which the
     ///   diffusion loss contributes **zero** (never two in a row); the others are diffusion-only.
@@ -820,7 +820,8 @@ pub fn effective_memory_budget_with_fraction(
     effective_memory_budget(budget, Some(cap))
 }
 
-pub(super) fn validate_memory_limit_fraction(fraction: Option<f32>) -> crate::Result<()> {
+#[doc(hidden)]
+pub fn validate_memory_limit_fraction(fraction: Option<f32>) -> crate::Result<()> {
     if fraction.is_some_and(|f| !f.is_finite() || f <= 0.0 || f > 1.0) {
         return Err(crate::Error::Unsupported(
             "training memory fraction must be finite and 0 < fraction <= 1; None means off".into(),

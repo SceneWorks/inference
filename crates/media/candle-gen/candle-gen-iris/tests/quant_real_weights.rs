@@ -14,12 +14,12 @@
 use std::path::PathBuf;
 
 use candle_gen::candle_core::DType;
-use candle_gen::gen_core::iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, Quant, WeightsSource,
 };
 use candle_gen_iris::memory_strategy::generation_contract;
 use candle_gen_iris::{load_backbone_quantized, IrisTextEncoder, MODEL_ID};
+use gen_core_iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 
 fn env_dir(name: &str) -> PathBuf {
     PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name} is required")))

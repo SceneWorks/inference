@@ -9,7 +9,7 @@
 //! The LTX-2.5 fixtures reproduce the `__metadata__` layout of the shipped `Lightricks/LTX-2.5`
 //! folder structure. The weights are gated on Hugging Face, so the fixtures are written on disk —
 //! but their shape matches the real headers sc-18756 captured under
-//! `docs/reference/sc-18756-headers/`, which `gen_core::ltx_checkpoint`'s own tests parse directly.
+//! `docs/reference/sc-18756-headers/`, which `gen_core_ltx::ltx_checkpoint`'s own tests parse directly.
 //! Reference: `Lightricks/LTX-2` @ `d1511477` — `ltx_core/loader/sft_loader.py`, the per-component
 //! `model_configurator.py` files, and `encoder_configurator._check_gemma_version`.
 //!
@@ -17,15 +17,15 @@
 
 use std::path::Path;
 
-use candle_gen::gen_core::ltx_checkpoint::{
-    CaptionFeatureVersion, GemmaVersionCheck, LtxCheckpointLayout, LtxComponent,
-};
 use candle_gen::gen_core::{LoadSpec, WeightsSource};
 use candle_gen_ltx::bundle::{
     assert_gemma_version, declared_layout, declared_model_version, resolve_split_bundle,
 };
 use candle_gen_ltx::config::{
     AudioVaeConfig, AvConfig, ConnectorConfig, VideoVaeDeclaration, VocoderConfig,
+};
+use gen_core_ltx::ltx_checkpoint::{
+    CaptionFeatureVersion, GemmaVersionCheck, LtxCheckpointLayout, LtxComponent,
 };
 
 /// A minimal, valid safetensors file: 8-byte header length, header JSON (one tensor plus

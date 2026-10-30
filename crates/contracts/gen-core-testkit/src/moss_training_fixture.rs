@@ -344,7 +344,7 @@ fn validate_source_serialization(root: &Path) -> Result<()> {
 pub struct Fixture {
     pub root: PathBuf,
     pub dataset_dir: PathBuf,
-    pub config: gen_core::moss_image::MossImageConfig,
+    pub config: gen_core_moss_image::moss_image::MossImageConfig,
     pub files: BTreeMap<String, String>,
     pub source_identity: String,
     pub tensor_file_bytes: u64,
@@ -354,7 +354,7 @@ impl Fixture {
     pub fn create(root: &Path) -> Result<Self> {
         fs::create_dir(root)?;
         validate_source_serialization(root)?;
-        let config = gen_core::moss_image::MossImageConfig {
+        let config = gen_core_moss_image::moss_image::MossImageConfig {
             dim: 16,
             ffn_dim: 24,
             num_heads: 2,
@@ -580,8 +580,8 @@ pub fn assert_recoverable_case(
     mut trainer: impl FnMut() -> Result<Box<dyn gen_core::Trainer>>,
     mut generator: impl FnMut(Vec<gen_core::AdapterSpec>) -> Result<Box<dyn gen_core::Generator>>,
 ) -> Result<()> {
-    use gen_core::moss_image_training::recovery::{bundle, DataPlan};
     use gen_core::{CancelFlag, NetworkType, TrainingProgress, TrainingRequest};
+    use gen_core_moss_image::moss_image_training::recovery::{bundle, DataPlan};
     let config = case_config(case)?;
     let network = config.network_type;
     let optimizer = config.optimizer.clone();
@@ -887,7 +887,7 @@ pub fn assert_ragged_token_bounds(
         let limit = bound(request)?;
         let actual = encode(request)?;
         let expected_prompts =
-            gen_core::moss_image_training::recovery::conditioning_prompts(request);
+            gen_core_moss_image::moss_image_training::recovery::conditioning_prompts(request);
         assert_eq!(
             actual.len(),
             expected_prompts.len(),

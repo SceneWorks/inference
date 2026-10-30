@@ -5,7 +5,7 @@
 
 use mlx_rs::Array;
 
-pub use gen_core::tokenizer::*;
+pub use gen_core_tokenizer::*;
 
 /// Lift a gen-core [`TokenizerOutput`] (host vecs) into `(1, L)` int32 `(input_ids, attention_mask)`
 /// MLX arrays. An empty prompt yields `(1, 0)` arrays (the gen-core empty convention) — preserving

@@ -122,14 +122,14 @@ pub struct PackedSource {
     pub(crate) path: std::path::PathBuf,
     pub(crate) targets: std::collections::BTreeSet<String>,
     pub(crate) ggml: candle_gen::candle_core::quantized::GgmlDType,
-    pub(crate) storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+    pub(crate) storage: gen_core_flux3::artifacts::NativeDitStorage,
 }
 
 impl PackedSource {
     /// The GGML `storage` rows of `path`; `targets` is the storage's exact packed partition.
     pub fn new(
         path: &std::path::Path,
-        storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+        storage: gen_core_flux3::artifacts::NativeDitStorage,
         targets: std::collections::BTreeSet<String>,
     ) -> Result<Self> {
         Ok(Self {
@@ -160,9 +160,9 @@ impl PackedSource {
 /// path: on those builds construction is a typed refusal, never a dequantized substitute.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub struct PublisherSource {
-    pub(crate) reader: candle_gen::gen_core::flux3::safetensors_stream::SafetensorsSource,
+    pub(crate) reader: gen_core_flux3::safetensors_stream::SafetensorsSource,
     pub(crate) targets: std::collections::BTreeSet<String>,
-    pub(crate) storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+    pub(crate) storage: gen_core_flux3::artifacts::NativeDitStorage,
     pub(crate) device: Device,
     #[cfg(feature = "cuda")]
     pub(crate) lt: std::sync::Arc<candle_quant_kernels::cublaslt::CublasLt>,
@@ -172,15 +172,15 @@ impl PublisherSource {
     /// Validate the device for `storage` (CUDA with the format's compute floor) and open `path`.
     pub fn new(
         path: &std::path::Path,
-        storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+        storage: gen_core_flux3::artifacts::NativeDitStorage,
         targets: std::collections::BTreeSet<String>,
         device: &Device,
     ) -> Result<Self> {
-        let reader = candle_gen::gen_core::flux3::safetensors_stream::SafetensorsSource::open(path)
+        let reader = gen_core_flux3::safetensors_stream::SafetensorsSource::open(path)
             .map_err(|e| Error::Unsupported(e.to_string()))?;
         #[cfg(feature = "cuda")]
         {
-            use candle_gen::gen_core::flux3::quantization::DitFormat;
+            use gen_core_flux3::quantization::DitFormat;
             if !device.is_cuda() {
                 return Err(Error::Unsupported(
                     "flux3: publisher FP8R/NVFP4 kernels run on CUDA only".into(),
@@ -188,12 +188,12 @@ impl PublisherSource {
             }
             let lt = std::sync::Arc::new(candle_quant_kernels::cublaslt::CublasLt::new(device)?);
             let meets = match storage {
-                candle_gen::gen_core::flux3::artifacts::NativeDitStorage::Publisher(
-                    DitFormat::Fp8Rowwise,
-                ) => lt.meets_fp8_floor()?,
-                candle_gen::gen_core::flux3::artifacts::NativeDitStorage::Publisher(
-                    DitFormat::Nvfp4,
-                ) => lt.meets_nvfp4_floor()?,
+                gen_core_flux3::artifacts::NativeDitStorage::Publisher(DitFormat::Fp8Rowwise) => {
+                    lt.meets_fp8_floor()?
+                }
+                gen_core_flux3::artifacts::NativeDitStorage::Publisher(DitFormat::Nvfp4) => {
+                    lt.meets_nvfp4_floor()?
+                }
                 _ => false,
             };
             if !meets {
@@ -257,8 +257,8 @@ impl PublisherSource {
             .clone();
         let (out, input) = match (self.storage, shape.as_slice()) {
             (
-                candle_gen::gen_core::flux3::artifacts::NativeDitStorage::Publisher(
-                    candle_gen::gen_core::flux3::quantization::DitFormat::Nvfp4,
+                gen_core_flux3::artifacts::NativeDitStorage::Publisher(
+                    gen_core_flux3::quantization::DitFormat::Nvfp4,
                 ),
                 [n, half],
             ) => (*n, half * 2),
@@ -267,8 +267,8 @@ impl PublisherSource {
         };
         #[cfg(feature = "cuda")]
         {
-            use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
-            use candle_gen::gen_core::flux3::quantization::DitFormat;
+            use gen_core_flux3::artifacts::NativeDitStorage;
+            use gen_core_flux3::quantization::DitFormat;
             let kernel = match self.storage {
                 NativeDitStorage::Publisher(DitFormat::Fp8Rowwise) => {
                     let scales: Vec<f32> = self
@@ -320,7 +320,7 @@ impl PublisherSource {
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct PublisherBase {
     kernel: PublisherKernel,
-    storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+    storage: gen_core_flux3::artifacts::NativeDitStorage,
     out: usize,
     input: usize,
     device: Device,
@@ -418,7 +418,7 @@ enum Base {
     /// dense weight. Activations stay row-independent, so row chunking is exact.
     Ggml {
         matmul: QMatMul,
-        storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+        storage: gen_core_flux3::artifacts::NativeDitStorage,
         out: usize,
         input: usize,
         compute: DType,
@@ -477,7 +477,7 @@ impl Linear {
     /// A packed projection over an in-memory `QTensor` (tests and converters).
     pub fn from_packed_qtensor(
         qtensor: candle_gen::candle_core::quantized::QTensor,
-        storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+        storage: gen_core_flux3::artifacts::NativeDitStorage,
         compute: DType,
     ) -> Result<Self> {
         let (out, input) = qtensor.shape().dims2()?;
@@ -534,7 +534,7 @@ impl Linear {
                     &flat,
                     *out,
                     *compute,
-                    candle_gen::gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET,
+                    gen_core_flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET,
                 )?
             }
             Base::Publisher(publisher) => {
@@ -702,7 +702,7 @@ impl Linear {
 /// A publisher-format projection over BF16 rows, in the same exact row-chunk plan as the GGML path
 /// (each row's activation quantization is independent, so chunking changes no output bit).
 fn publisher_forward(publisher: &PublisherBase, flat: &Tensor) -> Result<Tensor> {
-    use candle_gen::gen_core::flux3::packed_gemm;
+    use gen_core_flux3::packed_gemm;
     let (rows, input) = flat.dims2()?;
     let per_row = packed_gemm::transient_bytes_per_row(publisher.storage, input, publisher.out, 2)
         .map_err(|e| Error::Unsupported(e.to_string()))?;
@@ -755,14 +755,14 @@ fn widened_chunk(flat: &Tensor, start: usize, len: usize) -> Result<Tensor> {
 /// input dtype), run in planned row chunks, and rounded ONCE to the compute dtype.
 fn packed_forward(
     matmul: &QMatMul,
-    storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+    storage: gen_core_flux3::artifacts::NativeDitStorage,
     flat: &Tensor,
     out: usize,
     compute: DType,
     budget: u64,
 ) -> Result<Tensor> {
     use candle_gen::candle_core::Module;
-    use candle_gen::gen_core::flux3::packed_gemm;
+    use gen_core_flux3::packed_gemm;
     let (rows, input) = flat.dims2()?;
     let per_row =
         packed_gemm::transient_bytes_per_row(storage, input, out, compute.size_in_bytes() as u64)
@@ -803,9 +803,9 @@ pub fn layernorm_modulation(x: &Tensor, scale: &Tensor, shift: &Tensor) -> Resul
 }
 
 /// Rotation tables `(cos, sin)`, `[n, pairs]` f32, for [`rmsnorm_rope`] — the
-/// [`gen_core::flux3::rope_cos_sin`] tables of the tokens, in token order.
+/// [`gen_core_flux3::rope_cos_sin`] tables of the tokens, in token order.
 ///
-/// [`gen_core::flux3::rope_cos_sin`]: candle_gen::gen_core::flux3::rope_cos_sin
+/// [`gen_core_flux3::rope_cos_sin`]: gen_core_flux3::rope_cos_sin
 pub struct Rope {
     pub cos: Tensor,
     pub sin: Tensor,
@@ -814,7 +814,7 @@ pub struct Rope {
 impl Rope {
     /// The tables of `ids` under the DiT's `axes_dim` / `theta`, on `device`.
     pub fn new(ids: &[[f32; 4]], axes_dim: &[usize], theta: f64, device: &Device) -> Result<Self> {
-        let (cos, sin) = candle_gen::gen_core::flux3::rope_cos_sin(ids, axes_dim, theta);
+        let (cos, sin) = gen_core_flux3::rope_cos_sin(ids, axes_dim, theta);
         let pairs: usize = axes_dim.iter().map(|d| d / 2).sum();
         let n = ids.len();
         Ok(Self {
@@ -971,7 +971,7 @@ pub fn expect_shape(name: &str, a: &Tensor, want: &[usize]) -> Result<()> {
 mod tests {
     use super::*;
     use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
-    use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
+    use gen_core_flux3::artifacts::NativeDitStorage;
 
     fn seeded(n: usize, k: usize, salt: f32) -> Tensor {
         let data: Vec<f32> = (0..n * k)
@@ -1138,10 +1138,8 @@ mod tests {
             let Base::Ggml { matmul, .. } = &linear.base else {
                 panic!("packed base")
             };
-            let per_row = candle_gen::gen_core::flux3::packed_gemm::transient_bytes_per_row(
-                storage, 64, 32, 4,
-            )
-            .unwrap();
+            let per_row =
+                gen_core_flux3::packed_gemm::transient_bytes_per_row(storage, 64, 32, 4).unwrap();
             let whole = packed_forward(matmul, storage, &x, 32, DType::F32, u64::MAX).unwrap();
             let chunked = packed_forward(matmul, storage, &x, 32, DType::F32, per_row * 3).unwrap();
             let a = whole.flatten_all().unwrap().to_vec1::<f32>().unwrap();

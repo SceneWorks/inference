@@ -102,7 +102,7 @@ fn tiny_dit_rejects_extra_or_misshapen_tensors() {
     let mut missing = weights.clone();
     missing.remove("final.linear.bias");
     assert!(SupraDit::from_tensors(&missing, &tiny()).is_err());
-    let wider = candle_gen::gen_core::supra2::Supra2Config {
+    let wider = gen_core_checkpoint::supra2::Supra2Config {
         d_model: 64,
         ..tiny()
     };

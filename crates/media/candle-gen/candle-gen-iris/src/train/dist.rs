@@ -1,5 +1,5 @@
 //! **Distributed** execution of the Candle Iris trainer (story sc-25689): the replicated and
-//! sharded strategies over the backend-neutral [`gen_core::iris::train::dist::Collective`].
+//! sharded strategies over the backend-neutral [`gen_core_iris::train::dist::Collective`].
 //!
 //! Transport: the host-staged [`TcpCollective`] — NCCL does not exist on Windows (the repo's CUDA
 //! runners) and the repo had no distributed layer, so ranks exchange host copies of their tensors
@@ -9,11 +9,11 @@ use std::collections::HashMap;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core;
-use candle_gen::gen_core::iris::train::dist::{
-    chunk_rows, Collective, DistError, DistPlan, Partition, ReduceOp, World,
-};
 use candle_gen::{CandleError as Error, Result};
 use gen_core_dist::TcpCollective;
+use gen_core_iris::train::dist::{
+    chunk_rows, Collective, DistError, DistPlan, Partition, ReduceOp, World,
+};
 
 use super::optim::Tensors;
 
@@ -29,7 +29,7 @@ pub fn make_collective(
     cancel: &gen_core::CancelFlag,
 ) -> gen_core::Result<Box<dyn Collective>> {
     if world.world_size == 1 {
-        return Ok(Box::new(gen_core::iris::train::dist::LocalCollective::new()));
+        return Ok(Box::new(gen_core_iris::train::dist::LocalCollective::new()));
     }
     match world.transport.as_str() {
         "tcp" => Ok(Box::new(TcpCollective::connect(world, cancel)?)),

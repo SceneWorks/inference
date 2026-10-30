@@ -19,8 +19,6 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::DType;
-use candle_gen::gen_core::iris::train::{AdapterMetadata, Prediction, OPTIONS_KEY};
-use candle_gen::gen_core::iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 use candle_gen::gen_core::{
     AdapterKind, AdapterSpec, CancelFlag, Image, LoadSpec, TrainingConfig, TrainingItem,
     TrainingProgress, TrainingRequest, WeightsSource,
@@ -29,6 +27,8 @@ use candle_gen::testkit::save_image_png;
 use candle_gen::testkit::{probe_gpu, used_mib, VramProbe};
 use candle_gen_iris::train::render_preview_with;
 use candle_gen_iris::{load_backbone_with_adapters, IrisTextEncoder};
+use gen_core_iris::train::{AdapterMetadata, Prediction, OPTIONS_KEY};
+use gen_core_iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 
 const CAPTION: &str = "a photo of a dog sitting on grass";
 const PROMPT: &str = "a photo of a dog sitting on grass in the snow";

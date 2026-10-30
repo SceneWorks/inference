@@ -44,10 +44,10 @@
 //! the withheld hosted **H3-Context-IR** component, not by these weights. This module tokenizes
 //! `<d>` *correctly* — it does not claim the model understands it.
 //!
-//! # Why `tokenizers` directly instead of `gen_core::tokenizer::TextTokenizer`
+//! # Why `tokenizers` directly instead of `gen_core_tokenizer::TextTokenizer`
 //!
 //! Same reason as the MLX sibling: hazard 1 above is only avoidable by *registering* the seven
-//! specials as added tokens, and [`candle_gen::gen_core::tokenizer::TextTokenizer`] exposes no way
+//! specials as added tokens, and [`gen_core_tokenizer::TextTokenizer`] exposes no way
 //! to do that — it holds its `tokenizers::Tokenizer` privately, and its public surface carries
 //! **no `add_special_tokens` and no `token_to_id`** (only construction, `tokenize*`, `encode*_ids`,
 //! `decode`, `config` and `constraint_decode_table`). So neither the registration nor

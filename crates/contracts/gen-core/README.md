@@ -29,16 +29,36 @@ contract is backend-independent.
   methods and weights-free conformance sweeps. Memory-strategy registrations publish both their
   contract constructor and real admission `safety_check`; PiD-capable contracts declare exact
   native/PiD decode domains so catalog tests can exercise route safety without loading weights.
-- **Pure host-side policy** — tokenizer text↔ids, PIL-compatible image resize (`imageops`),
-  VAE tiling, guidance/sampling policy, and the LR schedule — the math that must match the
-  reference exactly and has no reason to live in a tensor backend.
+- **Pure host-side policy** — PIL-compatible image resize (`imageops`), VAE tiling,
+  guidance/sampling policy, and the LR schedule — the math that must match the reference
+  exactly and has no reason to live in a tensor backend.
+- **The request-surface halves of family contracts** — the types a `GenerationRequest`,
+  `MemoryPhaseFacts` or the `Generator` trait carries for one family (the MOSS-Image options and
+  execution receipts, the FLUX 3 layout/reference output size, the Veda request/report and
+  workspace bound, the H3 native allocation data, the HDR colour space, the LTX auto-duration
+  range) stay here because the contract names them.
 
-Two host-side pieces that only some consumers need live in sibling crates rather than here
-(sc-27316): the Iris trainers' TCP collective transport
-([`gen-core-dist`](../gen-core-dist/README.md); the `Collective` trait, `World` and the rest of
-the distributed contract stay in `gen_core::iris::train::dist`) and the opt-in MiniMax-H3 host
-telemetry collector ([`gen-core-telemetry`](../gen-core-telemetry/README.md); the
-`h3_terminal_telemetry` request flag stays here).
+## What lives beside it
+
+Family- and feature-specific host code lives in sibling crates under `crates/contracts/`, each
+depending on gen-core and never the reverse, so a family's change no longer rebuilds gen-core and
+everything above it (sc-27316). Each is tensor-free like gen-core.
+
+| Crate | Holds | Consumers |
+| --- | --- | --- |
+| [`gen-core-train`](../gen-core-train/README.md) | trainer request validation, aspect-ratio assignment, subject-mask decode, aux-loss scheduling, resume identity, body/face loss geometry | every family trainer |
+| [`gen-core-tokenizer`](../gen-core-tokenizer/README.md) | the HF `tokenizers` wrapper (`TextTokenizer`, chat templating, padding) | text-encoder providers |
+| [`gen-core-iris`](../gen-core-iris/README.md) | the Iris inference and training contracts (incl. the distributed contract) | Iris providers |
+| [`gen-core-flux3`](../gen-core-flux3/README.md) | FLUX 3 resources, conversion, prompt upsampler, references, training | FLUX 3 providers |
+| [`gen-core-moss-image`](../gen-core-moss-image/README.md) | MOSS-Image schedule/DMD/package helpers, edit helpers, training recovery | MOSS providers |
+| [`gen-core-memory-wan`](../gen-core-memory-wan/README.md) | the Wan I2V memory planner | Wan, Qwen-Image 2.1, SCAIL2 providers |
+| [`gen-core-h3`](../gen-core-h3/README.md) | MiniMax-H3 memory planners, Veda predictor/workspace pricing, reference/schedule policy | MiniMax-H3 providers |
+| [`gen-core-ltx`](../gen-core-ltx/README.md) | LTX split-checkpoint resolution, Gemma assets, DFR keyframes, duration head | LTX providers |
+| [`gen-core-checkpoint`](../gen-core-checkpoint/README.md) | the torch `.pth` zip/pickle reader and the Supra2 converter | mlx-gen, Supra2 providers |
+| [`gen-core-image`](../gen-core-image/README.md) | OpenEXR read/write and the HDR conversions | HDR lane |
+| [`gen-core-family`](../gen-core-family/README.md) | small single-family policy (schedulers, resolution, keypoints, Qwen-Image 2.1, SD3) | those families' providers |
+| [`gen-core-dist`](../gen-core-dist/README.md) | the Iris TCP collective transport | Iris trainers |
+| [`gen-core-telemetry`](../gen-core-telemetry/README.md) | the opt-in MiniMax-H3 host telemetry collector (the request flag stays here) | MiniMax-H3 providers |
 
 ## Registry model
 

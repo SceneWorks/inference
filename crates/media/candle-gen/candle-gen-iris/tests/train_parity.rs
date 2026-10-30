@@ -8,10 +8,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use candle_gen::candle_core::{DType, Tensor, TensorId, Var};
-use candle_gen::gen_core::iris::train::{
-    adapter_param_route, full_param_route, FlowObjective, MuonAdjustLr, OptimizerKind,
-    OptimizerPlan, Prediction, TimestepSampler, TrainSchedule,
-};
 use candle_gen_iris::train::model::{
     flow_loss, loss_and_grads, AdapterKind, AdapterTarget, StepBatch, TrainModel, Trainable,
 };
@@ -19,6 +15,10 @@ use candle_gen_iris::train::optim::{
     clip_grads, detached_copy, newton_schulz, snapshot, IrisOptimizer, Params, Tensors,
 };
 use candle_gen_iris::train::Window;
+use gen_core_iris::train::{
+    adapter_param_route, full_param_route, FlowObjective, MuonAdjustLr, OptimizerKind,
+    OptimizerPlan, Prediction, TimestepSampler, TrainSchedule,
+};
 
 use crate::common::{
     assert_close, cpu, fixture, host_f32, host_i32, tiny_backbone, tiny_config, Fixture,

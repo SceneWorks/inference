@@ -1,8 +1,8 @@
 //! Headless Qwen3.5: fresh unpadded per-prompt hidden-state forwards.
 use crate::loader::{read_weights, Sources};
+use gen_core_moss_image::moss_image::MOSS_TEXT_ENCODER_PREFIX;
 use mlx_gen::gen_core::moss_image::{
     MossImageConditioningInputReceipt, MossImageConditioningSource, MossImageEmbeddings,
-    MOSS_TEXT_ENCODER_PREFIX,
 };
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::{CancelFlag, Error, Result};
@@ -28,14 +28,15 @@ pub(crate) fn token_bound(
     req: &mlx_gen::TrainingRequest,
     host_budget: u64,
 ) -> Result<u64> {
-    mlx_gen::gen_core::moss_image_training::recovery::admit_conditioning_preprocess(
+    gen_core_moss_image::moss_image_training::recovery::admit_conditioning_preprocess(
         req,
         host_budget,
         0,
     )?;
     let tokenizer = tokenizer(sources)?;
     let mut bound = 0usize;
-    for prompt in mlx_gen::gen_core::moss_image_training::recovery::conditioning_prompts_iter(req) {
+    for prompt in gen_core_moss_image::moss_image_training::recovery::conditioning_prompts_iter(req)
+    {
         crate::transformer::check(&req.cancel)?;
         bound = bound.max(tokenizer.encode_chat_ids(&prompt, false)?.len().min(4096));
     }

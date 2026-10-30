@@ -4,7 +4,7 @@
 //! * The chat-template prefix, the caption and the suffix are tokenized **separately**
 //!   (`add_special_tokens=False`) and concatenated; the caption alone is cut to
 //!   `max_length − len(suffix)` so the assistant-turn marker always survives
-//!   ([`gen_core::iris::assemble_window`]).
+//!   ([`gen_core_iris::assemble_window`]).
 //! * The language tower is the shared generic decoder [`candle_llm::CausalLm`] (the `qwen3_vl`
 //!   architecture: GQA, per-head q/k RMSNorm, SwiGLU, θ = 5e6; interleaved mRoPE collapses to 1-D
 //!   for a text-only prompt). On a GPU it runs in the dtype the backbone's `text_encoder.dtype`
@@ -19,27 +19,25 @@
 //! so this port runs only the real tokens and writes zeros — the same conditioning without the pad
 //! compute.
 //!
-//! [`gen_core::iris::assemble_window`]: candle_gen::gen_core::iris::assemble_window
+//! [`gen_core_iris::assemble_window`]: gen_core_iris::assemble_window
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::iris::apply_caption_overflow_policy;
-pub use candle_gen::gen_core::iris::caption_overflow_warning;
-use candle_gen::gen_core::iris::{
-    assemble_window, TextEncoderConfig, TextWindow, PROMPT_PREFIX, PROMPT_SUFFIX,
-};
 use candle_gen::gen_core::safetensors_shards::{
     resolve_indexed_safetensors_shards, snapshot_shard_roots,
 };
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{CaptionOverflowPolicy, Quant};
 use candle_gen::{CandleError as Error, Result};
 use candle_llm::models::CausalLm;
 use candle_llm::primitives::projection::QuantSpec;
 use candle_llm::primitives::weights::Weights as LlmWeights;
 use candle_llm::ModelConfig;
+use gen_core_iris::apply_caption_overflow_policy;
+pub use gen_core_iris::caption_overflow_warning;
+use gen_core_iris::{assemble_window, TextEncoderConfig, TextWindow, PROMPT_PREFIX, PROMPT_SUFFIX};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 
 /// One prompt's conditioning, as `TextEncoding` upstream.
 pub struct TextConditioning {

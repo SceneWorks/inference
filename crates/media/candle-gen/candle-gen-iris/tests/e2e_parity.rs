@@ -11,9 +11,9 @@
 //! held to 1e-4 / 1e-5 by `dit_parity` / `solver_parity`.
 
 use candle_gen::candle_core::DType;
-use candle_gen::gen_core::iris::GenerationParams;
 use candle_gen::gen_core::{CancelFlag, GenerationRequest, PreviewSink};
 use candle_gen_iris::{denoise, encode, load_backbone, IrisTextEncoder};
+use gen_core_iris::GenerationParams;
 
 use crate::common::{assert_close, cpu, fixture, tiny_backbone, tiny_config, tiny_text_encoder};
 

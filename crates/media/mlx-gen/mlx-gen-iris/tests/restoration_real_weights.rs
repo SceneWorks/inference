@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mlx_gen::gen_core::iris::restoration::{plan_request, restore_detailed, TileGeometry};
+use gen_core_iris::restoration::{plan_request, restore_detailed, TileGeometry};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Image, InputSizing, LoadSpec, Precision, Progress, TargetSize, TransformRequest, WeightsSource,

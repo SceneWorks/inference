@@ -27,8 +27,8 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_gen::gen_core::iris::restoration_train::{ConvNextConfig, CriticHeadConfig, VGG16_WIDTHS};
-use mlx_gen::gen_core::iris::train::{OptimizerKind, OptimizerPlan, ParamRoute};
+use gen_core_iris::restoration_train::{ConvNextConfig, CriticHeadConfig, VGG16_WIDTHS};
+use gen_core_iris::train::{OptimizerKind, OptimizerPlan, ParamRoute};
 use mlx_gen::weights::Weights;
 use mlx_gen_iris::train::critic::{
     head_from_arrays, multilevel_loss, power_iteration, ConvNextTrunk, Critic,
@@ -344,7 +344,7 @@ fn the_critic_step_matches_power_iterations_losses_grads_and_adamw_body() {
             weight_decay: 0.01,
             muon_momentum: 0.95,
             muon_nesterov: true,
-            muon_adjust_lr: mlx_gen::gen_core::iris::train::MuonAdjustLr::None,
+            muon_adjust_lr: gen_core_iris::train::MuonAdjustLr::None,
             auto_lr: "none".into(),
             base_batch_size: 1,
         };

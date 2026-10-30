@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::gen_core::iris::{GenerationParams, IrisConfig, TEXT_ENCODER_COMPONENT};
+use gen_core_iris::{GenerationParams, IrisConfig, TEXT_ENCODER_COMPONENT};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, PreviewSink, Progress, WeightsSource,
@@ -55,7 +55,7 @@ fn real_tokenizer_matches_the_pinned_ids() {
             .map(|x| x.as_i64().unwrap() as i32)
             .collect()
     };
-    use mlx_gen::gen_core::iris::{PROMPT_PREFIX, PROMPT_SUFFIX};
+    use gen_core_iris::{PROMPT_PREFIX, PROMPT_SUFFIX};
     assert_eq!(
         tokenizer.encode_ids(PROMPT_PREFIX, false).unwrap(),
         ids(&pinned["prefix_ids"])
@@ -338,7 +338,7 @@ fn provider_renders_a_real_image() {
 #[test]
 #[ignore = "needs the real weights (IRIS_WEIGHTS_DIR, IRIS_TEXT_ENCODER_DIR), IRIS_TRAIN_DATA and IRIS_OUT"]
 fn real_lora_trains_exports_and_renders() {
-    use mlx_gen::gen_core::iris::train::{AdapterMetadata, OPTIONS_KEY};
+    use gen_core_iris::train::{AdapterMetadata, OPTIONS_KEY};
     use mlx_gen::gen_core::{TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest};
     use mlx_gen_iris::train::render_preview_with;
 
@@ -441,7 +441,7 @@ fn real_lora_trains_exports_and_renders() {
             &cfg,
             Dtype::Bfloat16,
             adapters,
-            mlx_gen::gen_core::iris::IrisTask::Generation,
+            gen_core_iris::IrisTask::Generation,
             "iris_3b",
         )
         .unwrap();
@@ -451,7 +451,7 @@ fn real_lora_trains_exports_and_renders() {
             3.0,
             cfg.flow.shift,
             1000,
-            mlx_gen::gen_core::iris::train::Prediction::Velocity,
+            gen_core_iris::train::Prediction::Velocity,
             256,
             (&c.states, &c.mask),
             Some((&u.states, &u.mask)),

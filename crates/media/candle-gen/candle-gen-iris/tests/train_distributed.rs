@@ -23,15 +23,15 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use candle_gen::candle_core::DType;
-use candle_gen::gen_core::iris::train::dist::{dist_error, DistError};
-use candle_gen::gen_core::iris::train::{
-    checkpoint_root, latest_checkpoint, read_checkpoint_state, OPTIONS_KEY,
-};
-use candle_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
 use candle_gen::gen_core::{
     LoadSpec, LrSchedule, Trainer, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
     WeightsSource,
 };
+use gen_core_iris::train::dist::{dist_error, DistError};
+use gen_core_iris::train::{
+    checkpoint_root, latest_checkpoint, read_checkpoint_state, OPTIONS_KEY,
+};
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 use serde_json::{json, Value as Json};
 
 use crate::common::{cpu, tiny_backbone, tiny_text_encoder};
@@ -160,7 +160,7 @@ fn run_job(j: &Json) -> Json {
     };
     if let Some(ms) = j["writer_delay_ms"].as_u64() {
         std::env::set_var(
-            candle_gen::gen_core::iris::train::dist::WRITER_TEST_DELAY_ENV,
+            gen_core_iris::train::dist::WRITER_TEST_DELAY_ENV,
             ms.to_string(),
         );
     }

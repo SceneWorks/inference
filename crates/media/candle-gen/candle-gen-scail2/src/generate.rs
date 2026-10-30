@@ -16,13 +16,13 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{GenerationOutput, Image, Progress};
 use candle_gen::{CandleError, Result as CResult};
 use candle_gen_wan::config::TextEncoderConfig;
 use candle_gen_wan::pipeline::frames_to_images;
 use candle_gen_wan::scheduler::{FlowScheduler, Sampler};
 use candle_gen_wan::text_encoder::Umt5Encoder;
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 
 use crate::clip::ScailClip;
 use crate::model::{Scail2Dit, Scail2Inputs};

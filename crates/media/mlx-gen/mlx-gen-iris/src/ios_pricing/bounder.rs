@@ -377,11 +377,9 @@ impl AnchorIdentity {
                     ))
                 }
             };
-            let resources = mlx_gen::gen_core::iris::GenerationResources::from_spec(
-                req.spec,
-                crate::model::MODEL_ID,
-            )
-            .map_err(Error::from)?;
+            let resources =
+                gen_core_iris::GenerationResources::from_spec(req.spec, crate::model::MODEL_ID)
+                    .map_err(Error::from)?;
             // The SAME side resolution as the anchor's pricing (actual request or token alone).
             let work = super::generation_work(
                 req,
@@ -412,11 +410,9 @@ impl AnchorIdentity {
                     ))
                 }
             };
-            let resources = mlx_gen::gen_core::iris::restoration::RestorationResources::from_spec(
-                req.spec,
-                req.provider,
-            )
-            .map_err(Error::from)?;
+            let resources =
+                gen_core_iris::restoration::RestorationResources::from_spec(req.spec, req.provider)
+                    .map_err(Error::from)?;
             // The SAME plan the anchor's pricing priced (actual request or token alone).
             let plan = super::restoration_priced_plan(req, &resources, token)?;
             Ok(Self::Restoration {

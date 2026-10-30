@@ -2,14 +2,14 @@
 //! (`source_hidden_states`), and the T5 SentencePiece tokenizer's token ids are the conditioner's
 //! learned query tokens (`target_input_ids`). Both are the **same** vendored `tokenizer.json`
 //! fast-tokenizers as `mlx-gen-anima` (`assets/`), loaded through the backend-neutral
-//! `gen_core::tokenizer::TextTokenizer`, so tokenization is **byte-identical** to the MLX lane.
+//! `gen_core_tokenizer::TextTokenizer`, so tokenization is **byte-identical** to the MLX lane.
 //!
 //! **Qwen2 settings are load-bearing** (`Qwen2Tokenizer(padding="longest")`): **no BOS, no EOS**, pad
 //! token **151643**. We encode with `add_special_tokens=false` and, batch-1, build an all-ones mask.
 //! The **T5** tokenizer keeps its EOS (`add_special_tokens=true`).
 
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::{CandleError, Result};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 
 use crate::config::QWEN_PAD_TOKEN_ID;
 

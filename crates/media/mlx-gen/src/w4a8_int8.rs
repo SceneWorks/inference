@@ -3,9 +3,9 @@
 //!
 //! What is resident is the published packed form and nothing else: `I8 [out, in/2]` two-int4 codes,
 //! `F8_E4M3 [out, in/16]` group scales, `F32 [out]` channel scales and one `F32 [16]` codebook, plus
-//! the optional dense bias. The int4→int8 expansion happens **inside** [`W4A8Linear::forward`] on a
-//! bounded `[TILE_COLS, in_features]` scratch that is a transient kernel output, so a projection
-//! never holds a dense `[out, in]` int8 (or float) shadow of its weight.
+//! the optional dense bias. The int4→int8 expansion happens **inside** the tiled GEMM's weight-tile
+//! load ([`crate::int8_gemm`], sc-26691), so a projection never holds a dense `[out, in]` int8 (or
+//! float) shadow of its weight — nor, any more, even a decoded column-tile scratch.
 //!
 //! # The arithmetic is the pinned Kitchen chain, in three pieces
 //!
@@ -22,10 +22,10 @@
 //!    must not be conflated with the S4 ConvRot codec's kernel, which is fed an already-rounded
 //!    rotation.
 //! 2. **Weight** — `int8 = round_ties_even(codebook[q] · fp8_e4m3(s_rel))`, clamp `[-127, 127]` (a
-//!    different clamp from the activation side), decoded one output-column tile at a time
-//!    ([`TILE_COLS`]). The even column is the **low** nibble of the stored byte, exactly as
+//!    different clamp from the activation side), decoded as each 16-code group is staged into the
+//!    GEMM's threadgroup tile. The even column is the **low** nibble of the stored byte, exactly as
 //!    [`gen_core::w4a8_int8::dequant_packed_to_int8`] reads it on the host.
-//! 3. **Epilogue** — the S4 `PROJECT` kernel verbatim: `((acc · xs) · s_channel) + bias`, int32
+//! 3. **Epilogue** — the S4 epilogue verbatim: `((acc · xs) · s_channel) + bias`, exact int32
 //!    accumulation, one rounding to the activation dtype at the store.
 //!
 //! The expected fixture comes from the pinned external comfy-kitchen executable (see the epic
@@ -42,33 +42,37 @@
 use crate::{attention::slice_axis, weights::Weights, Result};
 use gen_core::w4a8_int8::{W4A8Int8, MAX_DESCRIPTOR_BYTES};
 use mlx_rs::{
-    fast::MetalKernel,
     ops::{add, concatenate_axis, multiply, negative, subtract},
     transforms::eval,
     Array, Dtype,
 };
-use std::cell::RefCell;
+#[cfg(any(test, feature = "test-support"))]
+use {mlx_rs::fast::MetalKernel, std::cell::RefCell};
 
-/// Output-column width of one weight tile. The dequant kernel expands exactly `TILE_COLS ·
-/// in_features` packed codes into a transient int8 scratch of that many bytes, so the decoded weight
-/// is bounded no matter how wide the projection is.
+/// Output-column width of the decoded weight tile the H3 memory model still charges
+/// (`gen_core::h3_memory::NativeBackend::Mlx { tile_columns }`).
 ///
-/// The arithmetic is tile-invariant — every output column accumulates its whole `in_features` in one
-/// pass and takes its own `s_channel`/bias in the epilogue — so this is a memory/dispatch trade-off,
-/// never a numerics knob. Chunking is over **output columns** only: the activation codes and scales
-/// are computed once for the full row and reused by every tile (see the module docs).
+/// Since sc-26691 the forward decodes inside the tiled GEMM's threadgroup loads and materializes no
+/// decoded weight scratch at all, so this is now a conservative **upper bound** in that structural
+/// model, not an allocation [`W4A8Linear::forward`] performs. It is kept rather than zeroed so the
+/// published working-set accounting (and the artifacts generated from it) does not move in a kernel
+/// change; the arithmetic never depended on it.
 pub const TILE_COLS: usize = 256;
 
+/// The ORIGINAL serial W4A8 kernels (sc-26685), kept only as the parity reference for the tiled
+/// path in [`crate::int8_gemm`] (sc-26691); never on a production route.
+///
 /// The pinned activation quantizer of `int8_linear.cu::quantize_int8_rowwise_convrot_kernel`, fed
 /// [`convrot_fht_f32`]'s F32 rotated row. `x` is F32 by construction; `T` is the *activation* dtype,
 /// so the abmax/scale are computed on the unrounded F32 values and only
 /// `quant_div_float_to_float<T>`'s three casts see the dtype: the numerator `T(rot)`, the divisor
 /// `T(scale)`, and the quotient `T(rot / divisor)`.
 ///
-/// This is NOT `convrot_int8.rs::QUANT` (S4): that codec's authority rotates in the source-dtype
+/// This is NOT the S4 ConvRot quantizer: that codec's authority rotates in the source-dtype
 /// dense path, so its input is already dtype-rounded and its kernel has no numerator cast. Sharing a
 /// kernel name across two different sources would let whichever library compiled first define both.
-const QUANT: &str = r#"
+#[cfg(any(test, feature = "test-support"))]
+const REFERENCE_QUANT: &str = r#"
 uint row = thread_position_in_grid.x;
 if (row >= M) return;
 float peak = 0.0f;
@@ -83,24 +87,10 @@ for (uint j=0; j<K; ++j) {
     q[row*K+j] = char(isnan(z) ? -128.0f : clamp(rint(z), -128.0f, 127.0f));
 }
 "#;
-/// Identical to `convrot_int8.rs::PROJECT` (same kernel name and source — see [`QUANT`]). Run once
-/// per output-column tile, with `N`/`sw`/`b` scoped to that tile, which is exactly one row of the
-/// pinned `((acc · xs) · s_channel) + bias` epilogue.
-const PROJECT: &str = r#"
-uint lane = thread_position_in_threadgroup.x;
-uint out = thread_position_in_grid.y;
-uint row = thread_position_in_grid.z;
-int acc = 0;
-for (uint j=lane; j<K; j+=32) acc += int(q[row*K+j]) * int(w[out*K+j]);
-acc = simd_sum(acc);
-if (lane == 0) {
-    float value = (float(acc) * sx[row]) * sw[out];
-    y[row*N+out] = T(value + b[out]);
-}
-"#;
 /// Packed `I8 [out, in/2]` → int8 `[tile, in]`, the `w4a8_gemm.cu` `dequant_int4_grouped_to_int8`
 /// arithmetic: `int8 = round_ties_even(codebook[q] · fp8_e4m3fn(s_rel))`, clamp `[-127, 127]`.
-const DEQUANT: &str = r#"
+#[cfg(any(test, feature = "test-support"))]
+const REFERENCE_DEQUANT: &str = r#"
 uint idx = thread_position_in_grid.x;
 if (idx >= uint(WORK)) return;
 uint k = uint(K);
@@ -128,30 +118,39 @@ if (exponent == 0x0Fu && mantissa == 0x07u) {
 w[col * k + c] = char(clamp(rint(codebook[nibble] * scale), -127.0f, 127.0f));
 "#;
 
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     // MetalKernel is thread-affine; never place one in a Send provider/model base.
     // These handles capture no arrays and share MLX's existing compiled-pipeline cache.
-    static KERNELS: RefCell<Option<(MetalKernel, MetalKernel, MetalKernel)>> = const { RefCell::new(None) };
+    static REFERENCE_KERNELS: RefCell<Option<(MetalKernel, MetalKernel, MetalKernel)>> = const { RefCell::new(None) };
 }
 
-fn kernels<T>(f: impl FnOnce(&MetalKernel, &MetalKernel, &MetalKernel) -> Result<T>) -> Result<T> {
+#[cfg(any(test, feature = "test-support"))]
+fn reference_kernels<T>(
+    f: impl FnOnce(&MetalKernel, &MetalKernel, &MetalKernel) -> Result<T>,
+) -> Result<T> {
     crate::nn::prepare_retained_compilation_thread();
-    KERNELS.with(|cache| {
+    REFERENCE_KERNELS.with(|cache| {
         let mut cache = cache.borrow_mut();
         if cache.is_none() {
             *cache = Some((
-                MetalKernel::new("sc_w4a8_int8_quant_v1", &["x"], &["q", "s"], QUANT)?,
+                MetalKernel::new(
+                    "sc_w4a8_int8_quant_v1",
+                    &["x"],
+                    &["q", "s"],
+                    REFERENCE_QUANT,
+                )?,
                 MetalKernel::new(
                     "sc_convrot_int8_project_v1",
                     &["q", "w", "sx", "sw", "b"],
                     &["y"],
-                    PROJECT,
+                    crate::convrot_int8::REFERENCE_PROJECT,
                 )?,
                 MetalKernel::new(
                     "sc_w4a8_int8_dequant_v1",
                     &["packed", "srel", "codebook"],
                     &["w"],
-                    DEQUANT,
+                    REFERENCE_DEQUANT,
                 )?,
             ));
         }
@@ -347,19 +346,15 @@ impl W4A8Linear {
         }))
     }
 
-    /// Packed W4A8 integer dot: one full-row ConvRot + int8 activation quantization, then a bounded
-    /// packed→int8 weight decode per output-column tile and the S4 int8 epilogue
-    /// `((acc · xs) · s_channel) + bias` on that tile.
-    pub fn forward(&self, x: &Array) -> Result<Array> {
+    /// Validated activation geometry, the pinned F32 butterfly and the F32 epilogue bias, shared by
+    /// [`Self::forward`] and the test-only reference.
+    fn prepare(&self, x: &Array) -> Result<(Array, Array, usize)> {
         let d = self.descriptor;
         if x.shape().last() != Some(&(d.in_features as i32))
             || !matches!(x.dtype(), Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16)
         {
             return Err("W4A8 INT8 activation shape/dtype mismatch".into());
         }
-        let k = d.in_features as i32;
-        let n = d.out_features as i32;
-        let g = d.rotation_group as i32;
         let rows = x.size() / d.in_features;
         if rows == 0
             || rows > i32::MAX as usize
@@ -374,20 +369,75 @@ impl W4A8Linear {
         {
             return Err("W4A8 INT8 activation exceeds native index geometry".into());
         }
-        let m = rows as i32;
         // The pinned F32 butterfly, not a dense rotation and not a source-dtype one: the row
-        // absmax/scale below must come from these unrounded values (see [`convrot_fht_f32`]).
-        let rotated = convrot_fht_f32(x, m, k, g)?;
+        // absmax/scale must come from these unrounded values (see [`convrot_fht_f32`]).
+        let rotated = convrot_fht_f32(
+            x,
+            rows as i32,
+            d.in_features as i32,
+            d.rotation_group as i32,
+        )?;
         // The reference adds `bias.float()` in the F32 epilogue: convert the stored bias STRAIGHT to
         // F32. A `b.as_dtype(x.dtype())` hop would round a BF16/F16-stored bias first and lose
         // precision the reference keeps (a BF16 `-0.999` would become `-1.0`).
         let bias = match &self.bias {
             Some(b) => b.as_dtype(Dtype::Float32)?,
-            None => mlx_rs::ops::zeros::<f32>(&[n])?,
+            None => mlx_rs::ops::zeros::<f32>(&[d.out_features as i32])?,
         };
-        kernels(|quant, project, dequant| {
-            // Quantize ONCE for the full row, before any weight tile is touched: the pinned chunked
-            // GEMM computes xq/xs outside its chunk loop and every tile reuses these two arrays.
+        Ok((rotated, bias, rows))
+    }
+
+    fn output_shape(&self, x: &Array) -> Vec<i32> {
+        let mut shape = x.shape().to_vec();
+        *shape.last_mut().unwrap() = self.descriptor.out_features as i32;
+        shape
+    }
+
+    /// Packed W4A8 integer dot: one full-row ConvRot + int8 activation quantization, then ONE tiled
+    /// GEMM ([`crate::int8_gemm`]) that decodes the packed weight inside its tile loads and applies
+    /// the S4 int8 epilogue `((acc · xs) · s_channel) + bias`.
+    ///
+    /// The activation codes and scales are computed once for the full row before any weight code is
+    /// decoded, as the pinned `launch_w4a8_gemm` does; accumulation is exact int32.
+    pub fn forward(&self, x: &Array) -> Result<Array> {
+        let d = self.descriptor;
+        let (rotated, bias, rows) = self.prepare(x)?;
+        let (codes, scales) = crate::int8_gemm::quantize_rows(
+            &rotated,
+            rows,
+            d.in_features,
+            x.dtype(),
+            crate::int8_gemm::Numerator::W4A8,
+        )?;
+        let y = crate::int8_gemm::project(
+            &codes,
+            &scales,
+            crate::int8_gemm::Weight::W4A8 {
+                packed: &self.packed,
+                s_rel: &self.s_rel,
+                codebook: &self.codebook,
+            },
+            &self.s_channel,
+            &bias,
+            rows,
+            d.out_features,
+            d.in_features,
+            x.dtype(),
+        )?;
+        Ok(y.reshape(&self.output_shape(x))?)
+    }
+
+    /// The original serial sc-26685 kernels (per-row quantizer, `[TILE_COLS, in]` decode scratch,
+    /// one SIMD group per output element): the parity reference for [`Self::forward`]. Test support
+    /// only; never on a production route.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn forward_reference(&self, x: &Array) -> Result<Array> {
+        let d = self.descriptor;
+        let k = d.in_features as i32;
+        let n = d.out_features as i32;
+        let (rotated, bias, rows) = self.prepare(x)?;
+        let m = rows as i32;
+        reference_kernels(|quant, project, dequant| {
             let mut q = quant
                 .apply()
                 .inputs([&rotated])
@@ -414,7 +464,6 @@ impl W4A8Linear {
             let mut out0 = 0i32;
             while out0 < n {
                 let cols = TILE_COLS.min((n - out0) as usize) as i32;
-                // Transient [cols, in] int8 weight scratch — the ONLY decoded weight that exists.
                 let scratch = dequant
                     .apply()
                     .inputs([&self.packed, &self.s_rel, &self.codebook])
@@ -439,22 +488,16 @@ impl W4A8Linear {
                     .thread_group(32, 1, 1)
                     .run()?;
                 let tile = tile.remove(0);
-                // MetalKernel::run builds a lazy graph. Force this tile before the next decode
-                // so evaluated outputs, not every decoded weight scratch, are retained by `cat`.
-                // This bounds working storage without changing any activation/epilogue arithmetic.
                 eval([&tile])?;
                 tiles.push(tile);
                 out0 += cols;
             }
-            // Each tile is already its own `[m, cols]` output; only the final join is a copy.
             let flat = if tiles.len() == 1 {
                 tiles.pop().expect("one tile above")
             } else {
-                mlx_rs::ops::concatenate_axis(&tiles, 1)?
+                concatenate_axis(&tiles, 1)?
             };
-            let mut shape = x.shape().to_vec();
-            *shape.last_mut().unwrap() = n;
-            Ok(flat.reshape(&shape)?)
+            Ok(flat.reshape(&self.output_shape(x))?)
         })
     }
 
@@ -474,11 +517,10 @@ impl W4A8Linear {
         self.descriptor.resident_bytes() + self.bias.as_ref().map_or(0, Array::nbytes)
     }
 
-    /// The transient a single [`Self::forward`] holds at once: one `[TILE_COLS, in_features]` int8
-    /// weight scratch. Not resident — it is a kernel output freed with the turn — but a peak or
-    /// residency budget that ignores it under-counts what a forward actually allocates, so it is
-    /// reported rather than left implicit.
+    /// Decoded-weight scratch a single [`Self::forward`] allocates: none since sc-26691 — the packed
+    /// codes are decoded into the GEMM's threadgroup tiles. ([`TILE_COLS`] stays the memory model's
+    /// conservative upper bound.)
     pub fn tile_scratch_bytes(&self) -> usize {
-        TILE_COLS.min(self.descriptor.out_features) * self.descriptor.in_features
+        0
     }
 }

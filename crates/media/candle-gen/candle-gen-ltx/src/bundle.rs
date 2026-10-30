@@ -1,7 +1,7 @@
 //! LTX **checkpoint-layout selection and per-component resolution** for the candle engine
 //! (sc-18757) — the mirror of `mlx-gen-ltx::bundle`.
 //!
-//! The shared, tensor-free machinery lives in [`gen_core::ltx_checkpoint`]: version parsing,
+//! The shared, tensor-free machinery lives in [`gen_core_ltx::ltx_checkpoint`]: version parsing,
 //! component classification, per-component config isolation, and the `gemma_source_checkpoint` ⇄
 //! text-encoder `gemma_version` assertion. Both engines resolve a bundle through it, so a checkpoint
 //! that loads on MLX resolves identically on candle and a version mismatch is refused on both.
@@ -17,23 +17,23 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use candle_gen::gen_core::ltx_checkpoint::{
+use candle_gen::gen_core::{self, LoadSpec, WeightsSource};
+use gen_core_ltx::ltx_checkpoint::{
     GemmaEncoderIdentity, GemmaVersionCheck, LtxBundle, LtxBundleBuilder, LtxCheckpointLayout,
     LtxComponent,
 };
-use candle_gen::gen_core::{self, LoadSpec, WeightsSource};
 
 /// The `model_version` a checkpoint location declares — the `split_model.json` manifest of a packed
 /// MLX tier first, then any component file's `__metadata__`. `None` when nothing declares one.
 pub fn declared_model_version(root: &Path) -> gen_core::Result<Option<String>> {
-    gen_core::ltx_checkpoint::declared_model_version(root)
+    gen_core_ltx::ltx_checkpoint::declared_model_version(root)
 }
 
 /// The layout a checkpoint location declares. An undeclared version is
 /// [`LtxCheckpointLayout::AllInOne`] — the oldest layout, matching upstream's fallback — so every
 /// pre-`model_version` LTX-2.3 checkpoint stays on exactly the path it has always taken.
 pub fn declared_layout(root: &Path) -> gen_core::Result<LtxCheckpointLayout> {
-    gen_core::ltx_checkpoint::declared_layout(root)
+    gen_core_ltx::ltx_checkpoint::declared_layout(root)
 }
 
 /// The [`LoadSpec::components`] ids an LTX-2.5 load recognizes: one per split component. The text
@@ -78,7 +78,7 @@ pub fn resolve_split_bundle(spec: &LoadSpec) -> gen_core::Result<LtxBundle> {
     }
     let skip: Vec<LtxComponent> = explicit.iter().map(|(c, _)| *c).collect();
 
-    let discovered = gen_core::ltx_checkpoint::discover_split_bundle_skipping(&root, &skip)?;
+    let discovered = gen_core_ltx::ltx_checkpoint::discover_split_bundle_skipping(&root, &skip)?;
     let mut builder = LtxBundleBuilder::new();
     for resolved in discovered.components() {
         builder = builder.with_component(resolved.component(), resolved.path());

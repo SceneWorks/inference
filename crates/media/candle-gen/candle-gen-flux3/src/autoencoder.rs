@@ -1,5 +1,5 @@
 //! The FLUX 3 image autoencoder — the port of upstream `src/flux3/autoencoder.py` @
-//! [`gen_core::flux3::UPSTREAM_CODE_REVISION`], the Candle twin of
+//! [`gen_core_flux3::UPSTREAM_CODE_REVISION`], the Candle twin of
 //! `mlx_gen_flux3::autoencoder`: an 8× KL VAE (GroupNorm(32, eps 1e-6) resnets, single-head mid
 //! attention, asymmetric-pad stride-2 downsample, nearest-2× upsample) followed by a **2×2
 //! patchify** into `4·EMBED_DIM` packed token channels and a **BatchNorm-stats** normalization of
@@ -35,7 +35,7 @@
 //!   `latent_ids` order. `decode`: the inverse — `z·√(var + eps) + mean`, then
 //!   `reshape(1, E, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3)`, then the decoder.
 //!
-//! [`gen_core::flux3::UPSTREAM_CODE_REVISION`]: candle_gen::gen_core::flux3::UPSTREAM_CODE_REVISION
+//! [`gen_core_flux3::UPSTREAM_CODE_REVISION`]: gen_core_flux3::UPSTREAM_CODE_REVISION
 
 use std::path::Path;
 
@@ -48,7 +48,7 @@ use bounded::{BoundedConv2d as Conv2d, BoundedGroupNorm as GroupNorm};
 use candle_gen::{CandleError as Error, Result};
 
 /// Pixels per packed token on each side (`DOWNSAMPLING_RATIO`): 8× VAE × 2×2 patchify.
-pub const DOWNSAMPLING_RATIO: usize = candle_gen::gen_core::flux3::DOWNSAMPLING_RATIO as usize;
+pub const DOWNSAMPLING_RATIO: usize = gen_core_flux3::DOWNSAMPLING_RATIO as usize;
 /// GroupNorm groups of every norm in the autoencoder.
 pub const GN_GROUPS: usize = 32;
 /// GroupNorm eps.
@@ -611,11 +611,11 @@ impl Flux3AutoEncoder {
 
     /// `AutoEncoder.encode`: `image` `[1, 3, H, W]` f32 in `[−1, 1]` (H, W multiples of
     /// [`DOWNSAMPLING_RATIO`]) → `(tokens [h·w, 4·EMBED_DIM] f32, (h, w))`, tokens in the
-    /// row-major order of [`gen_core::flux3::latent_ids`]: the encoder's mean half, 2×2
+    /// row-major order of [`gen_core_flux3::latent_ids`]: the encoder's mean half, 2×2
     /// patchified (`reshape(1, E, h, 2, w, 2).permute(0, 1, 3, 5, 2, 4)` — packed channel
     /// `c·4 + ph·2 + pw`), BatchNorm-normalized with the running statistics.
     ///
-    /// [`gen_core::flux3::latent_ids`]: candle_gen::gen_core::flux3::latent_ids
+    /// [`gen_core_flux3::latent_ids`]: gen_core_flux3::latent_ids
     pub fn encode(&self, image: &Tensor) -> Result<(Tensor, (usize, usize))> {
         let dims = image.dims().to_vec();
         if dims.len() != 4 || dims[0] != 1 || dims[1] != 3 {

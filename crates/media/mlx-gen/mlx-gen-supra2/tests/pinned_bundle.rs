@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use mlx_gen::gen_core::supra2::{
+use gen_core_checkpoint::supra2::{
     convert_checkpoint, ConvertOptions, Supra2Config, TEXT_ENCODER_COMPONENT, VAE_COMPONENT,
 };
 use mlx_gen::{LoadSpec, WeightsSource};

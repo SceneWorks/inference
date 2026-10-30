@@ -33,9 +33,10 @@ image = { workspace = true, optional = true }
 serde_json = { workspace = true }
 # Stable correspondence digest for complete source histories; same existing locked binding.
 sha2 = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [features]
-model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-pid/model-inference-proof", "mlx-gen-depth?/model-inference-proof", "mlx-gen-perceptual?/model-inference-proof"]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-pid/model-inference-proof", "mlx-gen-depth?/model-inference-proof", "mlx-gen-perceptual?/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 # Explicit HOST dev-dependency fixture bridge; never enabled by default or an SDK feature.
 test-support = []
 # The LoRA trainer (`training`) and its training-only deps (depth/perceptual aux losses, dataset

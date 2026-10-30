@@ -3,7 +3,7 @@
 //! Reproduces `LensPipeline._build_chat_inputs`: wrap the prompt in the harmony chat format (a fixed
 //! `system` preamble + the `developer` instruction + the `user` prompt + an `assistant`/`analysis`
 //! thinking turn + the `assistant`/`final` scaffold), then tokenize the rendered text via the model's
-//! `tokenizer.json` (through the shared `gen_core::tokenizer` seam — the same HF `tokenizers` core
+//! `tokenizer.json` (through the shared `gen_core_tokenizer` seam — the same HF `tokenizers` core
 //! `transformers` wraps, so the ids are byte-identical). Backend-neutral; ported verbatim from
 //! `mlx-gen-lens/src/text.rs` (epic 3164).
 //!
@@ -15,8 +15,8 @@
 
 use std::path::Path;
 
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::{CandleError, Result as CResult};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 
 /// Number of fixed harmony-preamble tokens the DiT conditioning skips (`DEFAULT_TXT_OFFSET`).
 pub const TXT_OFFSET: usize = 97;

@@ -2,18 +2,18 @@
 //! (`TextEncoder.encode`), the Candle twin of `mlx_gen_flux3::text_encoder`.
 //!
 //! * The prompt is wrapped in the chat template (single user turn + generation prompt, no system
-//!   turn: [`gen_core::flux3::chat_text`]) and tokenized **as one string** with the pinned
+//!   turn: [`gen_core_flux3::chat_text`]) and tokenized **as one string** with the pinned
 //!   tokenizer (`tokenizer(text, truncation=True, max_length=4096)`).
 //! * The window is right-padded with `<|endoftext|>` to the next multiple of 80 (never beyond
 //!   4096); the pads carry `attention_mask = 0` and position id **1**
-//!   ([`gen_core::flux3::assemble_window`]).
+//!   ([`gen_core_flux3::assemble_window`]).
 //! * The language tower is the shared generic decoder [`candle_llm::CausalLm`] (the `qwen3_vl`
 //!   architecture: GQA 32/8, per-head q/k RMSNorm, SwiGLU, θ = 5e6; interleaved mRoPE collapses to
 //!   1-D for a text-only prompt). On a GPU it runs in the package's `text_encoder.dtype` (bf16 in
 //!   the release); on the Candle CPU backend, which has no half-precision GEMM, in f32 (the same
 //!   CPU policy every `candle_llm` decoder follows — [`tower_dtype`]).
 //! * Upstream runs the **padded** sequence: every query (the pads included) attends the real keys
-//!   causally and no pad key ([`gen_core::flux3::padded_causal_additive`]), at the explicit
+//!   causally and no pad key ([`gen_core_flux3::padded_causal_additive`]), at the explicit
 //!   positions `0..real` for the real tokens and `1` for every pad
 //!   (`CausalLm::hidden_states_with_mask_at`). The pad rows are therefore NOT zero — they are the
 //!   pad token's state at position 1 over the real keys — and the DiT attends them as ordinary
@@ -24,26 +24,26 @@
 //!   `[L, 8 · 2560]` bf16 (upstream's `.to(torch.bfloat16)`, whatever the tower computed in) —
 //!   with ids `(0, 0, 0, position)`.
 //!
-//! [`gen_core::flux3::chat_text`]: candle_gen::gen_core::flux3::chat_text
-//! [`gen_core::flux3::assemble_window`]: candle_gen::gen_core::flux3::assemble_window
-//! [`gen_core::flux3::padded_causal_additive`]: candle_gen::gen_core::flux3::padded_causal_additive
+//! [`gen_core_flux3::chat_text`]: gen_core_flux3::chat_text
+//! [`gen_core_flux3::assemble_window`]: gen_core_flux3::assemble_window
+//! [`gen_core_flux3::padded_causal_additive`]: gen_core_flux3::padded_causal_additive
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::flux3::{
-    assemble_window, chat_text, padded_causal_additive, text_ids, TextEncoderConfig, TextWindow,
-    PAD_TOKEN, TEXT_ENCODER_UPSTREAM_REPO,
-};
 use candle_gen::gen_core::safetensors_shards::{
     resolve_indexed_safetensors_shards, snapshot_shard_roots,
 };
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::{CandleError as Error, Result};
 use candle_llm::primitives::attention::AttnMask;
 use candle_llm::primitives::weights::Weights as LlmWeights;
 use candle_llm::{CausalLm, ModelConfig};
+use gen_core_flux3::{
+    assemble_window, chat_text, padded_causal_additive, text_ids, TextEncoderConfig, TextWindow,
+    PAD_TOKEN, TEXT_ENCODER_UPSTREAM_REPO,
+};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 
 /// One prompt's conditioning, as `TextEncoder.encode` returns it.
 pub struct TextConditioning {

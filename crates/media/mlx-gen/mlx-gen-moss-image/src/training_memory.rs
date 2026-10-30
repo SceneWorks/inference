@@ -7,11 +7,11 @@
 //! there is deliberately no new field on the generic training request. These are structural
 //! operator bounds, not measured calibration, an allocator prediction, or a runtime RSS limit.
 use crate::loader::Sources;
-use mlx_gen::gen_core::moss_image_training::admission as shared;
+use gen_core_moss_image::moss_image_training::admission as shared;
+use gen_core_moss_image::{moss_image::MossImageConfig, moss_image_training::target_paths};
 use mlx_gen::gen_core::{
     self,
-    moss_image::{MossImageAssetRole, MossImageConfig},
-    moss_image_training::target_paths,
+    moss_image::MossImageAssetRole,
     weightsmeta::{safetensors_path_tensor_headers, SafetensorsTensorHeader},
 };
 use mlx_gen::{NetworkType, TrainingConfig, TrainingRequest};
@@ -356,24 +356,24 @@ impl EstimateRequest {
     /// Decode/crop source pixels can exceed the target bucket; inspect only image headers here.
     #[cfg(test)]
     pub fn with_image_headers(self, req: &TrainingRequest) -> Result<Self> {
-        let plan =
-            gen_core::moss_image_training::recovery::DataPlan::from_request(req).map_err(source)?;
+        let plan = gen_core_moss_image::moss_image_training::recovery::DataPlan::from_request(req)
+            .map_err(source)?;
         self.with_plan(req, &plan)
     }
     pub fn with_plan(
         mut self,
         req: &TrainingRequest,
-        plan: &gen_core::moss_image_training::recovery::DataPlan,
+        plan: &gen_core_moss_image::moss_image_training::recovery::DataPlan,
     ) -> Result<Self> {
         self.decode_bytes = self
             .decode_bytes
             .max(plan.decode_buffer_bound().map_err(source)?);
         self.dataset_metadata_bytes =
-            gen_core::moss_image_training::recovery::DataPlan::metadata_bound(req)
+            gen_core_moss_image::moss_image_training::recovery::DataPlan::metadata_bound(req)
                 .and_then(|metadata| {
                     metadata
                         .checked_add(
-                            gen_core::moss_image_training::recovery::conditioning_preprocess_bytes(
+                            gen_core_moss_image::moss_image_training::recovery::conditioning_preprocess_bytes(
                                 req,
                             )?,
                         )
@@ -1448,11 +1448,12 @@ pub(crate) mod tests {
         };
         let source_bytes = image_decode_bytes(&path).unwrap();
         r = r.with_image_headers(&request).unwrap();
-        let pinned = gen_core::moss_image_training::recovery::DataPlan::from_request_budget(
-            &request,
-            2 * 1024 * 1024 * 1024,
-        )
-        .unwrap();
+        let pinned =
+            gen_core_moss_image::moss_image_training::recovery::DataPlan::from_request_budget(
+                &request,
+                2 * 1024 * 1024 * 1024,
+            )
+            .unwrap();
         assert_eq!(r.decode_bytes, pinned.decode_buffer_bound().unwrap());
         assert!(r.decode_bytes>=source_bytes,"encoded/decoded buffers must include the captured source and library decoder allowance");
         assert_eq!(

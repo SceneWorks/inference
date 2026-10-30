@@ -1,13 +1,7 @@
 //! Native additive LoRA installation after tensor-neutral identity/key/rank admission.
 use crate::dit::Flux3Dit;
-use candle_gen::{
-    candle_core::DType,
-    gen_core::{
-        flux3::{adapters, DitConfig},
-        AdapterSpec,
-    },
-    CandleError as Error, Result,
-};
+use candle_gen::{candle_core::DType, gen_core::AdapterSpec, CandleError as Error, Result};
+use gen_core_flux3::{adapters, DitConfig};
 
 pub fn validate(specs: &[AdapterSpec], config: &DitConfig) -> Result<()> {
     for spec in specs {
@@ -70,7 +64,8 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
     use candle_gen::candle_nn::VarBuilder;
-    use candle_gen::gen_core::{flux3::resolve_checkpoint, AdapterKind};
+    use candle_gen::gen_core::AdapterKind;
+    use gen_core_flux3::resolve_checkpoint;
 
     fn fixtures() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

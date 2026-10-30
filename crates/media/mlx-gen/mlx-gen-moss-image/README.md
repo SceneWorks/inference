@@ -1,6 +1,6 @@
 # Native MOSS-Image on MLX (sc-26323)
 
-Base and SFT use the exact frozen asset/control contracts in `gen_core::moss_image`.
+Base and SFT use the exact frozen asset/control contracts in `gen_core_moss_image::moss_image`.
 `MossImage::load` returns the concrete advanced generator for supplied embeddings,
 masks, FP32 noise and latent output. Registry loads return ordinary `Generator`s.
 Acceleration is explicit per request and defaults OFF. Optional component presence

@@ -10,26 +10,26 @@
 //! typed refusal.
 //!
 //! The source preprocessing, the resize back and the result/metadata types are the backend-neutral
-//! [`gen_core::iris::depth`]; this module is the tensor forward.
+//! [`gen_core_iris::depth`]; this module is the tensor forward.
 //!
-//! [`gen_core::iris::depth`]: candle_gen::gen_core::iris::depth
+//! [`gen_core_iris::depth`]: gen_core_iris::depth
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::iris::depth::{
+use candle_gen::gen_core::{self, LoadSpec, Progress};
+use candle_gen::{CandleError as Error, Result};
+use gen_core_iris::depth::{
     estimate_with, DepthMetadata, DepthOutput, DepthRequest, IrisDepthEstimator,
     DEPTH_EXTRA_INPUT_CHANNELS,
 };
-use candle_gen::gen_core::iris::downstream::{EmptyPrompt, TaskExport};
-use candle_gen::gen_core::iris::IrisTask;
-use candle_gen::gen_core::{self, LoadSpec, Progress};
-use candle_gen::{CandleError as Error, Result};
+use gen_core_iris::downstream::{EmptyPrompt, TaskExport};
+use gen_core_iris::IrisTask;
 
 use crate::dit::{ForwardHooks, IrisDiT, NoHooks, TextBatch};
 use crate::model::compute_dtype;
 use crate::nn::{expect_shape, safetensors_keys, Checkpoint, Linear};
 
 /// Model id of the depth task.
-pub const DEPTH_MODEL_ID: &str = gen_core::iris::DEPTH_MODEL_ID;
+pub const DEPTH_MODEL_ID: &str = gen_core_iris::DEPTH_MODEL_ID;
 
 /// The export's key prefix of the widened backbone (`IrisDepth.pixel`).
 const BACKBONE_PREFIX: &str = "pixel.";

@@ -49,7 +49,7 @@ use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
 use mlx_rs::ops::{mean, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::gen_core::ltx_checkpoint::{
+use gen_core_ltx::ltx_checkpoint::{
     discover_split_bundle, LatentUpsamplerMode, LtxBundle, LtxBundleBuilder, LtxCheckpointLayout,
     LtxComponent,
 };
@@ -575,7 +575,7 @@ fn a_tier_tree_resolves_through_the_split_resolver() {
         assert!(
             matches!(
                 mlx_gen_ltx::assert_gemma_version(&bundle).unwrap(),
-                mlx_gen::gen_core::ltx_checkpoint::GemmaVersionCheck::Matched(_)
+                gen_core_ltx::ltx_checkpoint::GemmaVersionCheck::Matched(_)
             ),
             "{tier}: the packed text encoder must satisfy the transformer's gemma_source_checkpoint"
         );
@@ -1083,7 +1083,7 @@ fn the_gemma_4_checkpoint_shapes_survive_at_every_tier() {
             "{tier}: the v_proj population must not change"
         );
         // The packed HF assets pass through untouched — a cast here corrupts the tokenizer.
-        let assets = mlx_gen::gen_core::gemma_assets::GemmaAssets::from_single_file(
+        let assets = gen_core_ltx::gemma_assets::GemmaAssets::from_single_file(
             root.join(tier.id()).join("text_encoder.safetensors"),
         )
         .unwrap_or_else(|e| panic!("{tier}: unpack the tier's Gemma assets: {e}"));

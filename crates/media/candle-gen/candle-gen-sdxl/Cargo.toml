@@ -44,9 +44,11 @@ safetensors = "0.7"
 # Parse the packed MLX tier's `unet/config.json` `quantization` block (sc-9416 packed-load detect).
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+sceneworks-gen-core-family = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen-perceptual/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof", "candle-core/model-inference-proof"]
+model-inference-proof = ["candle-gen-perceptual/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof", "candle-core/model-inference-proof", "sceneworks-gen-core-family/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 # Pass the backend selection through to the core crate AND candle-transformers so a downstream
 # `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.
 default = []

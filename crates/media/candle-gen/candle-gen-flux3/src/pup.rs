@@ -1,17 +1,20 @@
 //! Native Candle adapter for the shared FLUX 3 prompt-upsampling stage.
 //!
 //! Templates, reference preprocessing, annotations and generated-only sampling belong to
-//! `gen_core::flux3::pup`; this module only provisions the optional native Qwen3.5 VLM.
+//! `gen_core_flux3::pup`; this module only provisions the optional native Qwen3.5 VLM.
 
 use std::path::Path;
 
 use candle_gen::gen_core::core_llm::{self, ModelRequirements, TextLlm};
-use candle_gen::gen_core::flux3::pup::{
-    self, run_text_llm, PromptUpsampler, UpsampleMode, UpsampleOptions, UpsampleOutcome,
-    UpsamplePackage, UpsamplePlan, UpsamplerInput, UPSAMPLER_COMPONENT,
-};
 use candle_gen::gen_core::{self, CancelFlag, GenerationRequest, LoadSpec, Progress};
 use candle_gen::{CandleError, Result};
+use gen_core_flux3::{
+    pup,
+    pup::{
+        run_text_llm, PromptUpsampler, UpsampleMode, UpsampleOptions, UpsampleOutcome,
+        UpsamplePackage, UpsamplePlan, UpsamplerInput, UPSAMPLER_COMPONENT,
+    },
+};
 
 /// The optional separately loaded Qwen3.5 prompt-upscaling component.
 pub struct Flux3PromptUpsampler {
@@ -127,7 +130,7 @@ pub fn effective_prompt(
 ) -> Result<UpsampleOutcome> {
     let outcome = pup::upsample(
         upsampler.map(|u| u as &dyn PromptUpsampler),
-        &gen_core::flux3::references::upsampler_input(req)?,
+        &gen_core_flux3::references::upsampler_input(req)?,
         &UpsampleOptions {
             temperature: req.enhance_temperature,
             max_tokens: req.enhance_max_tokens,
@@ -205,7 +208,7 @@ mod tests {
     #[test]
     fn near_limit_native_layout_caption_reaches_final_parameters_once() {
         // Config-only planning bind: this test reads no checkpoint.
-        let config = gen_core::flux3::Flux3MetadataConfig::from_dir(
+        let config = gen_core_flux3::Flux3MetadataConfig::from_dir(
             &Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures/tiny-snapshot"),
         )
@@ -218,7 +221,7 @@ mod tests {
             flux3_layout: Some(layout.clone()),
             ..Default::default()
         };
-        gen_core::flux3::validate_generation_request(
+        gen_core_flux3::validate_generation_request(
             gen_core::flux3::DISTILLED_MODEL_ID,
             &req,
             &config,
@@ -230,10 +233,10 @@ mod tests {
             format!("{} {}", "enhanced ".repeat(300), bypass.caption),
         ] {
             let params =
-                gen_core::flux3::GenerationParams::resolve_caption(&req, caption.clone(), &config)
+                gen_core_flux3::GenerationParams::resolve_caption(&req, caption.clone(), &config)
                     .unwrap();
             assert_eq!(params.prompt, caption);
-            assert_eq!(params.seed, gen_core::flux3::prompt_seed(&caption));
+            assert_eq!(params.seed, gen_core_flux3::prompt_seed(&caption));
             assert_eq!(req.flux3_layout.as_ref(), Some(&layout));
         }
     }

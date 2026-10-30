@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 pub mod metal_guard;
 
-use mlx_gen::gen_core::flux3::{resolve_checkpoint, Flux3Config};
+use gen_core_flux3::{resolve_checkpoint, Flux3Config};
 use mlx_gen::weights::Weights;
 use mlx_rs::{Array, Dtype};
 

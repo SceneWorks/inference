@@ -28,9 +28,10 @@ safetensors = "0.7"
 image = { workspace = true }
 # The Bernini ChatML template (`BerniniTemplate::encode_messages`) runs over the Qwen2.5-VL tokenizer.
 tokenizers = { workspace = true }
+sceneworks-gen-core-tokenizer = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen-wan/model-inference-proof", "candle-gen/model-inference-proof"]
+model-inference-proof = ["candle-gen-wan/model-inference-proof", "candle-gen/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal", "candle-gen-wan/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-wan/cuda"]

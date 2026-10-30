@@ -5,8 +5,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use gen_core_iris::{adapter_provenance, IrisTask};
 use mlx_gen::adapters::facts::AdapterFacts;
-use mlx_gen::gen_core::iris::{adapter_provenance, IrisTask};
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterKind, AdapterSpec, Quant};
 use mlx_rs::{transforms::eval, Array, Dtype};
@@ -660,7 +660,7 @@ fn generation_semantic_export_is_normalized_and_path_value_free() {
         };
         let fixtures=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot");
         let mut spec=mlx_gen::LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(fixtures.join("iris")));
-        spec.components.insert(mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT.to_owned(),
+        spec.components.insert(gen_core_iris::TEXT_ENCODER_COMPONENT.to_owned(),
             mlx_gen::gen_core::WeightsSource::Dir(fixtures.join("text_encoder")));
         spec.adapters=vec![AdapterSpec::new(write("alpha-one.safetensors",1.0),0.25,AdapterKind::Lora)];
         let first=super::generation_adapter_semantic_facts(&spec).unwrap();
@@ -812,7 +812,7 @@ fn actual_parent_embed_guard_prices_installed_projection() {
             let spec = AdapterSpec::new(path, 0.25, AdapterKind::Lora);
             let backbone = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/tiny-snapshot/iris");
-            let config = mlx_gen::gen_core::iris::IrisConfig::from_dir(&backbone).unwrap();
+            let config = gen_core_iris::IrisConfig::from_dir(&backbone).unwrap();
             let (dit, _) = crate::model::load_backbone_with_adapters(
                 &backbone,
                 &config,

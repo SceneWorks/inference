@@ -14,9 +14,9 @@
 //! `controls_parity`, case for case.
 
 use candle_gen::candle_core::DType;
-use candle_gen::gen_core::iris::{GenerationParams, IrisConfig};
 use candle_gen::gen_core::{CancelFlag, GenerationRequest, PreviewSink};
 use candle_gen_iris::{denoise, encode, load_backbone, IrisTextEncoder};
+use gen_core_iris::{GenerationParams, IrisConfig};
 use serde_json::Value;
 
 use crate::common::{
@@ -118,8 +118,7 @@ fn every_control_matches_upstream_on_the_miniature() {
             config.flow.prediction = case["prediction"].as_str().unwrap().to_owned();
             config.validate_supported().unwrap();
             let req = case_request(case, &config);
-            candle_gen::gen_core::iris::validate_generation_request("iris_3b", &req, &config)
-                .unwrap();
+            gen_core_iris::validate_generation_request("iris_3b", &req, &config).unwrap();
             let params = GenerationParams::resolve(&req, 0, &config).unwrap();
             assert_eq!(
                 (

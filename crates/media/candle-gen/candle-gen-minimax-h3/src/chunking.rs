@@ -1,11 +1,11 @@
 //! Temporal chunk bookkeeping for the video VAE decode (`klvae.py::decode_temporal`).
 //!
 //! The pure-integer plan is backend-neutral and lives in
-//! [`candle_gen::gen_core::h3_chunking`] (sc-27256), shared with the MLX twin so the two backends
+//! [`gen_core_h3::h3_chunking`] (sc-27256), shared with the MLX twin so the two backends
 //! cannot disagree about the frame plan; this module re-exports it so `chunking::*` paths stay
 //! stable, and binds this crate's [`MiniMaxH3VaeConfig`] to it.
 
-pub use candle_gen::gen_core::h3_chunking::*;
+pub use gen_core_h3::h3_chunking::*;
 
 use crate::config::MiniMaxH3VaeConfig;
 

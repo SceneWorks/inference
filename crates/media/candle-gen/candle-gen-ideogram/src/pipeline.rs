@@ -26,13 +26,13 @@ use std::path::Path;
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::imageops::{resize_lanczos_u8, resize_nearest_u8};
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
     self, AdapterSpec, Conditioning, GenerationRequest, Image, PidWeights, Progress,
 };
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_flux2::vae::Flux2Vae;
 use candle_gen_pid::{PidDecoder, PidEngine};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 

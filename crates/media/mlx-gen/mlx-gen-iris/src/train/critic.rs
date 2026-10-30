@@ -19,12 +19,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use gen_core::iris::restoration_train::{
+use gen_core_iris::restoration_train::{
     sn_keys, ConvNextConfig, CriticHeadConfig, HostTensor, BLUR_TAPS, CLIP_MEAN, CLIP_STD,
     CRITIC_LEAKY_SLOPE, SPECTRAL_EPS,
 };
 use mlx_gen::array::contiguous;
-use mlx_gen::gen_core;
 use mlx_gen::nn::conv2d_general;
 use mlx_gen::{Error, Result};
 use mlx_rs::ops::{abs, erf, exp, log1p, matmul, maximum, pad, sqrt};

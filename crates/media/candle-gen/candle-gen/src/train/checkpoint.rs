@@ -140,7 +140,7 @@ pub fn load_resume(
             "resume: unsupported snapshot format".into(),
         ));
     }
-    crate::gen_core::train::resume::check_resume_fingerprints(&meta, cfg, request_fingerprint)?;
+    gen_core_train::resume::check_resume_fingerprints(&meta, cfg, request_fingerprint)?;
     let tensors = candle_core::safetensors::load(path, &Device::Cpu)?;
     let factors: HashMap<String, Tensor> = tensors
         .iter()
@@ -158,7 +158,7 @@ pub fn load_resume(
 }
 
 fn training_fingerprint(cfg: &TrainingConfig) -> String {
-    crate::gen_core::train::resume::training_config_fingerprint(cfg)
+    gen_core_train::resume::training_config_fingerprint(cfg)
 }
 
 #[cfg(test)]

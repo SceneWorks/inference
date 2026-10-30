@@ -7,22 +7,25 @@
 //!
 //! The pixel path around the forward (input budget, bicubic upsample, small-image enlargement,
 //! padding, 50 %-overlap tiling with upstream's Gaussian fusion, wavelet colour fix, quantization)
-//! is the backend-neutral [`gen_core::iris::restoration`] driver shared with the MLX twin; this crate
+//! is the backend-neutral [`gen_core_iris::restoration`] driver shared with the MLX twin; this crate
 //! supplies only each tile's one-step velocity.
 //!
-//! [`gen_core::iris::restoration`]: candle_gen::gen_core::iris::restoration
+//! [`gen_core_iris::restoration`]: gen_core_iris::restoration
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::iris::restoration::{
-    self as contract, plan_request, restore, RestorationPlan, RestorationResources,
-    RestorationSettings, TileGeometry, DEFAULT_SCALE, INPUT_BUDGET,
-};
-use candle_gen::gen_core::iris::{IrisConfig, FAMILY};
 use candle_gen::gen_core::{
     self, Image, LoadSpec, Progress, Transform, TransformCapabilities, TransformDescriptor,
     TransformRegistration, TransformRequest,
 };
 use candle_gen::{CandleError as Error, Result};
+use gen_core_iris::{
+    restoration as contract,
+    restoration::{
+        plan_request, restore, RestorationPlan, RestorationResources, RestorationSettings,
+        TileGeometry, DEFAULT_SCALE, INPUT_BUDGET,
+    },
+};
+use gen_core_iris::{IrisConfig, FAMILY};
 
 use crate::dit::{IrisDiT, TextBatch};
 use crate::model::{compute_dtype, load_backbone};

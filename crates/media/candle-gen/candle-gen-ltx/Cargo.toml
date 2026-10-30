@@ -39,9 +39,12 @@ safetensors = "0.7"
 # I2V conditioning-image CRF re-compression (sc-18759 `image_crf`) — JPEG encode/decode as the
 # lossy re-compression step (see `image_crf` module docs for the H.264-parity caveat).
 image = { workspace = true }
+sceneworks-gen-core-ltx = { workspace = true }
+sceneworks-gen-core-tokenizer = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen-depth/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen/model-inference-proof", "candle-llm/model-inference-proof"]
+model-inference-proof = ["candle-gen-depth/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen/model-inference-proof", "candle-llm/model-inference-proof", "sceneworks-gen-core-ltx/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 default = []
 # The LLM crate's backend features must move in lock-step with candle-gen's, or the Gemma 4 decoder
 # would be built for a different device than the rest of the pipeline.

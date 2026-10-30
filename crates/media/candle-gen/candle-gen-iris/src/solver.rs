@@ -1,14 +1,14 @@
 //! FlowDPM-Solver++ (`iris3b/flow/solver.py`) applied to Candle tensors. The schedule and every
-//! scalar coefficient come from the backend-neutral plan ([`gen_core::iris::dpm_solver_plan`]); this
+//! scalar coefficient come from the backend-neutral plan ([`gen_core_iris::dpm_solver_plan`]); this
 //! module only applies them, exactly as `mlx_gen_iris::solver` does. The integration state (`x`, the
 //! `x0` history) is **f32** throughout, as upstream keeps it (`z.to(float32)`, `out.x.float()`).
 //!
-//! [`gen_core::iris::dpm_solver_plan`]: candle_gen::gen_core::iris::dpm_solver_plan
+//! [`gen_core_iris::dpm_solver_plan`]: gen_core_iris::dpm_solver_plan
 
 use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::gen_core::iris::{DpmStep, DpmUpdate, Prediction};
 use candle_gen::gen_core::CancelFlag;
 use candle_gen::{CandleError as Error, Result};
+use gen_core_iris::{DpmStep, DpmUpdate, Prediction};
 
 /// `x · c` with `c` an f32 scalar tensor — an elementwise f32 multiply, the same rounding as the
 /// tensor-by-scalar products upstream and MLX perform.

@@ -1,7 +1,7 @@
 # Supra2-IMG component licence evidence (sc-24213)
 
 Read on 2026-10-20 from the model cards at the exact revisions the provider pins
-(`gen_core::supra2::{SUPRA2_SOURCE, FLAN_T5_BASE, SD_VAE}`). None of the
+(`gen_core_checkpoint::supra2::{SUPRA2_SOURCE, FLAN_T5_BASE, SD_VAE}`). None of the
 repositories is gated and none ships a separate LICENSE file; each card's front
 matter is the declaration.
 

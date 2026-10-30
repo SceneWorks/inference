@@ -9,15 +9,15 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_gen::gen_core::iris::train::ac::AcPolicy;
-use mlx_gen::gen_core::iris::train::holdout::{grid_noise, grid_timestep};
-use mlx_gen::gen_core::iris::train::repa::{
+use gen_core_iris::train::ac::AcPolicy;
+use gen_core_iris::train::holdout::{grid_noise, grid_timestep};
+use gen_core_iris::train::repa::{
     RepaPlan, RepaVariant, TeacherArch, TeacherFfn, PROJECTOR_PREFIX,
 };
-use mlx_gen::gen_core::iris::train::shapes::{
+use gen_core_iris::train::shapes::{
     preprocess_to_shape, RangedSampler, ShapeBatchSampler, ShapePolicy,
 };
-use mlx_gen::gen_core::iris::train::{FlowObjective, Prediction, TimestepSampler, TrainSchedule};
+use gen_core_iris::train::{FlowObjective, Prediction, TimestepSampler, TrainSchedule};
 use mlx_gen::weights::Weights;
 use mlx_gen_iris::train::model::{
     checkpointed_regions, flow_loss_per_sample, loss_and_grads_ext, RepaTargets, StepBatch,

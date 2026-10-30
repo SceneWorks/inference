@@ -1,5 +1,5 @@
 //! The FLUX 3 image autoencoder — the port of upstream `src/flux3/autoencoder.py` @
-//! [`gen_core::flux3::UPSTREAM_CODE_REVISION`]: an 8× KL VAE (GroupNorm(32, eps 1e-6) resnets,
+//! [`gen_core_flux3::UPSTREAM_CODE_REVISION`]: an 8× KL VAE (GroupNorm(32, eps 1e-6) resnets,
 //! single-head mid attention, asymmetric-pad stride-2 downsample, nearest-2× upsample) followed by
 //! a **2×2 patchify** into `4·EMBED_DIM` packed token channels and a **BatchNorm-stats**
 //! normalization of that packed space (`bn.running_mean/var`, eps 1e-4). 16× pixels per token.
@@ -36,7 +36,7 @@
 //!   `latent_ids` order. `decode`: the inverse — `z·√(var + eps) + mean`, then
 //!   `reshape(1, E, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3)`, then the decoder.
 //!
-//! [`gen_core::flux3::UPSTREAM_CODE_REVISION`]: mlx_gen::gen_core::flux3::UPSTREAM_CODE_REVISION
+//! [`gen_core_flux3::UPSTREAM_CODE_REVISION`]: gen_core_flux3::UPSTREAM_CODE_REVISION
 
 use mlx_rs::fast::scaled_dot_product_attention;
 use mlx_rs::ops::{add, divide, multiply, pad, sqrt, subtract};
@@ -48,7 +48,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 /// Pixels per packed token on each side (`DOWNSAMPLING_RATIO`): 8× VAE × 2×2 patchify.
-pub const DOWNSAMPLING_RATIO: i32 = mlx_gen::gen_core::flux3::DOWNSAMPLING_RATIO as i32;
+pub const DOWNSAMPLING_RATIO: i32 = gen_core_flux3::DOWNSAMPLING_RATIO as i32;
 /// GroupNorm groups of every norm in the autoencoder.
 pub const GN_GROUPS: i32 = 32;
 /// GroupNorm eps.
@@ -633,11 +633,11 @@ impl Flux3AutoEncoder {
 
     /// `AutoEncoder.encode`: `image` `[1, H, W, 3]` f32 in `[−1, 1]` (H, W multiples of
     /// [`DOWNSAMPLING_RATIO`]) → `(tokens [h·w, 4·EMBED_DIM] f32, (h, w))`, tokens in the
-    /// row-major order of [`gen_core::flux3::latent_ids`]: the encoder's mean half, 2×2
+    /// row-major order of [`gen_core_flux3::latent_ids`]: the encoder's mean half, 2×2
     /// patchified (`reshape(1, E, h, 2, w, 2).permute(0, 1, 3, 5, 2, 4)` — packed channel
     /// `c·4 + ph·2 + pw`), BatchNorm-normalized with the running statistics.
     ///
-    /// [`gen_core::flux3::latent_ids`]: mlx_gen::gen_core::flux3::latent_ids
+    /// [`gen_core_flux3::latent_ids`]: gen_core_flux3::latent_ids
     pub fn encode(&self, image: &Array) -> Result<(Array, (i32, i32))> {
         let sh = image.shape();
         if sh.len() != 4 || sh[0] != 1 || sh[3] != 3 {

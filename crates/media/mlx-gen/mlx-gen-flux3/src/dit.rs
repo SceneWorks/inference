@@ -18,10 +18,9 @@
 //! empty) and never placed in the single stream, so the stream's output never reaches the image
 //! velocity — skipping it is the same forward with less work.
 
-use gen_core::flux3::{
+use gen_core_flux3::{
     rope_cos_sin, timestep_freqs, DitConfig, MODES, TIMESTEP_EMBED_DIM, TIMESTEP_MAX_PERIOD,
 };
-use mlx_gen::gen_core;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::{Array, Dtype};
@@ -786,7 +785,7 @@ mod tests {
         } else {
             "tests/fixtures/tiny-base-snapshot"
         });
-        let config = gen_core::flux3::resolve_checkpoint(&dir).unwrap();
+        let config = gen_core_flux3::resolve_checkpoint(&dir).unwrap();
         assert_eq!(config.dit.flow_map, flow_map, "{}", dir.display());
         config.dit
     }

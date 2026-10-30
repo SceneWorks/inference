@@ -6,7 +6,11 @@ use super::{
 };
 use crate::SampleTokens;
 use candle_gen::candle_core::{backprop::GradStore, DType, Device, Tensor};
-use candle_gen::gen_core::flux3::{
+use candle_gen::gen_core::train::TrainingRequest;
+use candle_gen::gen_core::{self, AdapterKind, AdapterSpec, CancelFlag};
+use candle_gen::train::optim::{accumulate_grads, scale_grads, TrainOptimizer};
+use candle_gen::{CandleError as Error, Result};
+use gen_core_flux3::{
     latent_ids, scaled_image_ids,
     training::{
         caption_choice,
@@ -20,10 +24,6 @@ use candle_gen::gen_core::flux3::{
     },
     IMAGE_ROPE_SCALE,
 };
-use candle_gen::gen_core::train::TrainingRequest;
-use candle_gen::gen_core::{self, AdapterKind, AdapterSpec, CancelFlag};
-use candle_gen::train::optim::{accumulate_grads, scale_grads, TrainOptimizer};
-use candle_gen::{CandleError as Error, Result};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -193,7 +193,7 @@ impl CandleSession {
     }
     fn existing_export_matches(&self, path: &Path, identity: &ResumeIdentity) -> Result<()> {
         let spec = AdapterSpec::new(path.to_path_buf(), 1.0, AdapterKind::Lora);
-        let plan = gen_core::flux3::adapters::inspect(&spec, self.graph.dit.config())
+        let plan = gen_core_flux3::adapters::inspect(&spec, self.graph.dit.config())
             .map_err(Error::from)?;
         if plan.len() != self.graph.factors.len()
             || plan
@@ -320,13 +320,12 @@ impl SourceTrainingSession for CandleSession {
                     .ok_or_else(|| invalid("RNG stream index overflow"))?;
                 let mut density = NativeRng::keyed(self.seed, "timestep-density", stream);
                 let uniform = density.uniform();
-                let normal = if self.options.weighting
-                    == gen_core::flux3::training::Weighting::LogitNormal
-                {
-                    density.normal()
-                } else {
-                    0.0
-                };
+                let normal =
+                    if self.options.weighting == gen_core_flux3::training::Weighting::LogitNormal {
+                        density.normal()
+                    } else {
+                        0.0
+                    };
                 let u = self
                     .options
                     .weighting
@@ -392,7 +391,7 @@ impl SourceTrainingSession for CandleSession {
                 let loss = self.graph.loss(&samples, &target, weight as f64)?;
                 // Source Accelerator.backward: divide by CONFIGURED N, including short tails.
                 let scale =
-                    gen_core::flux3::training::policy::accumulation_loss_scale(self.accumulation)
+                    gen_core_flux3::training::policy::accumulation_loss_scale(self.accumulation)
                         .map_err(Error::from)?
                         / indices.len() as f32;
                 let gradients = (&loss * scale as f64)?.backward()?;
@@ -531,14 +530,14 @@ mod tests {
     //! interrupted pending-gradient checkpoint, strict resume and generation reload.
     use super::*;
     use crate::Flux3Dit;
-    use candle_gen::gen_core::flux3::training::{
+    use candle_gen::gen_core::train::{TrainingConfig, TrainingItem, TrainingProgress};
+    use gen_core_flux3::training::{
         controller::{run, RunPlan},
         options::TrainingPrecision,
         policy::SourceLrKind,
         sampler::BatchSampler,
         Weighting,
     };
-    use candle_gen::gen_core::train::{TrainingConfig, TrainingItem, TrainingProgress};
     use std::path::PathBuf;
     fn fixtures() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mlx-gen/mlx-gen-flux3/tests/fixtures")
@@ -570,12 +569,12 @@ mod tests {
             power: 1.0,
         }
     }
-    fn session() -> (CandleSession, gen_core::flux3::Flux3Config) {
+    fn session() -> (CandleSession, gen_core_flux3::Flux3Config) {
         session_for(Workflow::PairedEdit)
     }
-    fn session_for(workflow: Workflow) -> (CandleSession, gen_core::flux3::Flux3Config) {
+    fn session_for(workflow: Workflow) -> (CandleSession, gen_core_flux3::Flux3Config) {
         let config =
-            gen_core::flux3::resolve_checkpoint(&fixtures().join("tiny-base-snapshot")).unwrap();
+            gen_core_flux3::resolve_checkpoint(&fixtures().join("tiny-base-snapshot")).unwrap();
         let dit = Flux3Dit::load(
             &fixtures().join("tiny-base-snapshot/model.safetensors"),
             &config.dit,
@@ -588,7 +587,7 @@ mod tests {
             &Device::Cpu,
         )
         .unwrap();
-        let targets = gen_core::flux3::training::lora_targets(&config.dit, &[]).unwrap();
+        let targets = gen_core_flux3::training::lora_targets(&config.dit, &[]).unwrap();
         let initial = targets
             .iter()
             .map(|t| {
@@ -637,8 +636,8 @@ mod tests {
             );
         }
         let identity = ResumeIdentity {
-            base_repo: gen_core::flux3::BASE_WEIGHTS_REPO.into(),
-            base_revision: gen_core::flux3::BASE_WEIGHTS_REVISION.into(),
+            base_repo: gen_core_flux3::BASE_WEIGHTS_REPO.into(),
+            base_revision: gen_core_flux3::BASE_WEIGHTS_REVISION.into(),
             artifacts: BTreeMap::from([("synthetic-tiny-base".into(), "a".repeat(64))]),
             dataset: "b".repeat(64),
             preprocessing: "c".repeat(64),
@@ -655,7 +654,7 @@ mod tests {
                 ("accumulation".into(), "2".into()),
                 (
                     "rng".into(),
-                    gen_core::flux3::training::rng::RNG_ALGORITHM.into(),
+                    gen_core_flux3::training::rng::RNG_ALGORITHM.into(),
                 ),
                 (
                     "fixture".into(),
@@ -783,7 +782,7 @@ mod tests {
             gen_core::AdapterKind::Lora,
         );
         assert_eq!(
-            gen_core::flux3::adapters::inspect(&spec, &config.dit)
+            gen_core_flux3::adapters::inspect(&spec, &config.dit)
                 .unwrap()
                 .len(),
             54
@@ -845,7 +844,7 @@ mod tests {
         );
         let req = request(continuous_dir.path(), false);
         assert!(
-            gen_core::flux3::training::controller::ensure_new_output(&req).is_err(),
+            gen_core_flux3::training::controller::ensure_new_output(&req).is_err(),
             "a completed run must not be silently overwritten"
         );
         #[cfg(feature = "model-inference-proof")]
@@ -929,10 +928,10 @@ mod tests {
     #[test]
     #[ignore = "model inference; explicit model-proof workflow"]
     fn trained_export_loads_through_the_public_base_provider_and_changes_generation() {
-        use gen_core::flux3::{AUTOENCODER_COMPONENT, TEXT_ENCODER_COMPONENT};
         use gen_core::{
             GenerationOutput, GenerationRequest, Generator, LoadSpec, Precision, WeightsSource,
         };
+        use gen_core_flux3::{AUTOENCODER_COMPONENT, TEXT_ENCODER_COMPONENT};
         let dir = tempfile::tempdir().unwrap();
         let (mut session, _) = session();
         let req = request(dir.path(), false);

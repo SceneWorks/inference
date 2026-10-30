@@ -106,12 +106,12 @@ impl Trainer for StubTrainer {
             return Ok(());
         }
         // Route through the shared capability floors (F-006), like a real family trainer.
-        gen_core::train::validate_control_request(&self.desc, req)?;
-        gen_core::train::validate_full_finetune_request(&self.desc, req)?;
+        gen_core_train::validate_control_request(&self.desc, req)?;
+        gen_core_train::validate_full_finetune_request(&self.desc, req)?;
         if self.behavior.honor_techniques {
-            gen_core::train::validate_training_techniques(&self.desc, req)?;
+            gen_core_train::validate_training_techniques(&self.desc, req)?;
         }
-        gen_core::train::validate_edit_request(&self.desc, req).map_err(|e| {
+        gen_core_train::validate_edit_request(&self.desc, req).map_err(|e| {
             match self.behavior.edit_refusal_override {
                 Some(text) => Error::Msg(text.to_owned()),
                 None => e,

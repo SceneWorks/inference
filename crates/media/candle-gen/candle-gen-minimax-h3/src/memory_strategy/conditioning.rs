@@ -35,7 +35,7 @@ pub(super) fn complete(root: &Path, facts: &mut NativeAllocationFacts) -> Result
     let width = 2;
     let video_bytes = weightsmeta::materialized_path_bytes(&video, width)?
         .saturating_add(cfg.latent_channels as u64 * width * 2);
-    let audio_bytes = candle_gen::gen_core::h3_memory::audio_allocation(
+    let audio_bytes = gen_core_h3::h3_memory::audio_allocation(
         &audio,
         &crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder::tensor_names(&a),
         &crate::audio_vae::MiniMaxH3AudioVae::tensor_names(&a),
@@ -45,11 +45,8 @@ pub(super) fn complete(root: &Path, facts: &mut NativeAllocationFacts) -> Result
     )?;
     facts.conditioning_resident_bytes = video_bytes.saturating_add(audio_bytes.encoder_resident);
     let video_headers = weightsmeta::safetensors_path_tensor_headers(&video)?;
-    let video_allocation = candle_gen::gen_core::h3_memory::video_allocation(
-        &video_headers,
-        weightsmeta::Dtype::BF16,
-        false,
-    )?;
+    let video_allocation =
+        gen_core_h3::h3_memory::video_allocation(&video_headers, weightsmeta::Dtype::BF16, false)?;
     let stats_cast = cfg.latent_channels as u64 * 4;
     let video_load = video_bytes.saturating_add(video_allocation.load_extra_bytes.max(stats_cast));
     facts.conditioning_load_bytes =
@@ -63,11 +60,8 @@ pub(super) fn complete(root: &Path, facts: &mut NativeAllocationFacts) -> Result
     facts.video_decode_resident_bytes =
         weightsmeta::materialized_header_bytes(&decode_headers, width, &video)?
             .saturating_add(cfg.latent_channels as u64 * width * 2);
-    let decode_allocation = candle_gen::gen_core::h3_memory::video_allocation(
-        &decode_headers,
-        weightsmeta::Dtype::BF16,
-        false,
-    )?;
+    let decode_allocation =
+        gen_core_h3::h3_memory::video_allocation(&decode_headers, weightsmeta::Dtype::BF16, false)?;
     facts.video_decode_load_bytes = facts
         .video_decode_resident_bytes
         .saturating_add(decode_allocation.load_extra_bytes.max(stats_cast));

@@ -5,9 +5,9 @@
 //! to a square map and L2-normalizes. Every op has a candle backward.
 
 use candle_gen::candle_core::{Device, Tensor, D};
-use candle_gen::gen_core::train::body::{Letterbox, SapiensConfig, IMAGENET_MEAN, IMAGENET_STD};
 use candle_gen::weights::Weights;
 use candle_gen::Result;
+use gen_core_train::body::{Letterbox, SapiensConfig, IMAGENET_MEAN, IMAGENET_STD};
 
 use super::{conv2d, layer_norm, linear, normalize, resample_nhwc, sdpa, w32, AxisMatrix};
 

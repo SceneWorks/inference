@@ -1,7 +1,7 @@
 //! **Distributed** execution of the MLX Iris trainer (story sc-25689): MLX's own distributed layer
 //! (`mlx::core::distributed` — the `ring` TCP backend, `jaccl` RDMA over Thunderbolt, `mpi`; bound
 //! through the pinned mlx-rs fork's `mlx-sys`) behind the backend-neutral
-//! [`gen_core::iris::train::dist::Collective`], plus the parameter / gradient / state movement the
+//! [`gen_core_iris::train::dist::Collective`], plus the parameter / gradient / state movement the
 //! replicated and sharded strategies need on MLX arrays.
 //!
 //! MLX's collectives run on the CPU stream (Metal has no implementation of them in the pinned
@@ -24,10 +24,10 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use gen_core::iris::train::dist::{
+use gen_core_dist::TcpCollective;
+use gen_core_iris::train::dist::{
     reduce_in_rank_order, Collective, DistError, DistPlan, Partition, Precision, ReduceOp, World,
 };
-use gen_core_dist::TcpCollective;
 use mlx_gen::gen_core;
 use mlx_gen::gen_core::CancelFlag;
 use mlx_gen::{Error, Result};
@@ -497,7 +497,7 @@ pub fn make_collective(
     cancel: &CancelFlag,
 ) -> gen_core::Result<Box<dyn Collective>> {
     if world.world_size == 1 {
-        return Ok(Box::new(gen_core::iris::train::dist::LocalCollective::new()));
+        return Ok(Box::new(gen_core_iris::train::dist::LocalCollective::new()));
     }
     Ok(match world.transport.as_str() {
         "tcp" => Box::new(TcpCollective::connect(world, cancel)?),
@@ -527,7 +527,7 @@ pub struct Topology {
 
 fn rows_of(shape: &[i32], n: usize, index: usize) -> std::ops::Range<usize> {
     let rows = shape.first().copied().unwrap_or(1) as usize;
-    gen_core::iris::train::dist::chunk_rows(rows, n, index)
+    gen_core_iris::train::dist::chunk_rows(rows, n, index)
 }
 
 impl Topology {

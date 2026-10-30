@@ -1,9 +1,10 @@
 //! Source-selected adapter facts; reads headers/config only, never factors.
 use std::path::Path;
 
-use candle_gen::gen_core::h3_adapter_memory::{self, H3AdapterMemoryProfile};
+use candle_gen::gen_core::h3_adapter_memory::H3AdapterMemoryProfile;
 use candle_gen::gen_core::h3_memory::NativeProjection;
 use candle_gen::gen_core::{weightsmeta, AdapterSpec, Error, Result};
+use gen_core_h3::h3_adapter_memory;
 
 pub(super) fn profile(
     directory: &Path,

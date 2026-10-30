@@ -7,7 +7,7 @@
 //! ([`sapiens::SapiensNormal`] unit normals, optionally subject-masked). Every loss builds its
 //! reference with the same ViTPose pass ([`VitPose::detect`]); an image with **no detected person**
 //! returns `Ok(None)` and the shared path skips the loss for it. The backend-neutral half — configs,
-//! parameter counts, footprints, all host geometry — is [`candle_gen::gen_core::train::body`], so
+//! parameter counts, footprints, all host geometry — is [`gen_core_train::body`], so
 //! both backends compute the same thing.
 //!
 //! Candle autograd: LayerNorm is composable (the fused op has no backward), strided convs pad and
@@ -39,13 +39,15 @@ use candle_gen::train::perceptual::{
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
 
-pub use candle_gen::gen_core::train::body::{
-    body_arm_footprint, BodyArm, BodyLossesConfig, BodyModelFootprint, HybrikConfig, SapiensConfig,
-    TwoTap, VitPoseConfig,
+pub use candle_gen::gen_core::train::body::BodyLossesConfig;
+use candle_gen::gen_core::train::body::{NUM_BODY_RATIOS, NUM_HEAD_RATIOS};
+pub use gen_core_train::body::{
+    body_arm_footprint, BodyArm, BodyModelFootprint, HybrikConfig, SapiensConfig, TwoTap,
+    VitPoseConfig,
 };
-use candle_gen::gen_core::train::body::{
+use gen_core_train::body::{
     keypoint_box, VitPoseWarp, MIN_MEAN_RATIO_VISIBILITY, MISSING_REFERENCE_VISIBILITY,
-    NUM_BODY_RATIOS, NUM_HEAD_RATIOS, RATIO_VISIBILITY_KEYPOINTS, VIS_THRESHOLD,
+    RATIO_VISIBILITY_KEYPOINTS, VIS_THRESHOLD,
 };
 
 pub use hybrik::HybrikEncoder;
@@ -207,7 +209,7 @@ impl AxisMatrix {
         Self::from_weights(
             out,
             input,
-            candle_gen::gen_core::train::body::resize_weights(input, out, align_corners),
+            gen_core_train::body::resize_weights(input, out, align_corners),
             dev,
         )
     }
@@ -216,7 +218,7 @@ impl AxisMatrix {
         Self::from_weights(
             out,
             input,
-            candle_gen::gen_core::train::body::affine_sample_weights(input, out, scale, offset),
+            gen_core_train::body::affine_sample_weights(input, out, scale, offset),
             dev,
         )
     }
@@ -414,9 +416,9 @@ impl PerceptualLoss for BodyProportionLoss {
         "body-proportion"
     }
 
-    /// Upstream's `t_ratio` weighting ([`candle_gen::gen_core::train::body::body_loss_timestep_weight`]).
+    /// Upstream's `t_ratio` weighting ([`gen_core_train::body::body_loss_timestep_weight`]).
     fn timestep_weight(&self, noise_level: f32) -> f32 {
-        candle_gen::gen_core::train::body::body_loss_timestep_weight(noise_level)
+        gen_core_train::body::body_loss_timestep_weight(noise_level)
     }
 
     fn reference(&self, clean: &Tensor) -> Result<Option<LossReference>> {
@@ -477,9 +479,9 @@ impl PerceptualLoss for BodyShapeLoss {
         "body-shape"
     }
 
-    /// Upstream's `t_ratio` weighting ([`candle_gen::gen_core::train::body::body_loss_timestep_weight`]).
+    /// Upstream's `t_ratio` weighting ([`gen_core_train::body::body_loss_timestep_weight`]).
     fn timestep_weight(&self, noise_level: f32) -> f32 {
-        candle_gen::gen_core::train::body::body_loss_timestep_weight(noise_level)
+        gen_core_train::body::body_loss_timestep_weight(noise_level)
     }
 
     fn reference(&self, clean: &Tensor) -> Result<Option<LossReference>> {
@@ -538,9 +540,9 @@ impl PerceptualLoss for NormalLoss {
         "normal"
     }
 
-    /// Upstream's `t_ratio` weighting ([`candle_gen::gen_core::train::body::body_loss_timestep_weight`]).
+    /// Upstream's `t_ratio` weighting ([`gen_core_train::body::body_loss_timestep_weight`]).
     fn timestep_weight(&self, noise_level: f32) -> f32 {
-        candle_gen::gen_core::train::body::body_loss_timestep_weight(noise_level)
+        gen_core_train::body::body_loss_timestep_weight(noise_level)
     }
 
     fn reference(&self, clean: &Tensor) -> Result<Option<LossReference>> {

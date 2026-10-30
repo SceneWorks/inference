@@ -15,17 +15,12 @@
 //!   a temp dir).
 //!
 //! Inputs: `IRIS_UPSCALER_DIR`, the pinned snapshot directories `IRIS_LPIPS_VGG16_DIR`,
-//! `IRIS_LPIPS_LIN_DIR`, `IRIS_CRITIC_TRUNK_DIR` (`gen_core::iris::restoration_train`'s
+//! `IRIS_LPIPS_LIN_DIR`, `IRIS_CRITIC_TRUNK_DIR` (`gen_core_iris::restoration_train`'s
 //! `TRAINING_RESOURCES`), `IRIS_OUT`.
 
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::DType;
-use candle_gen::gen_core::iris::restoration_train::{
-    recipe_training_config, ConvNextConfig, TrainingResource, CRITIC_TRUNK_COMPONENT,
-    CRITIC_TRUNK_RESOURCE, LPIPS_LIN_COMPONENT, LPIPS_LIN_RESOURCE, OPTIONS_KEY, VGG16_COMPONENT,
-    VGG16_RESOURCE,
-};
 use candle_gen::gen_core::{
     CancelFlag, Image, InputSizing, LoadSpec, TargetSize, TrainingConfig, TrainingItem,
     TrainingProgress, TrainingRequest, Transform, TransformRequest, WeightsSource,
@@ -34,6 +29,11 @@ use candle_gen::testkit::{probe_gpu, used_mib, VramProbe};
 use candle_gen_iris::train::critic::ConvNextTrunk;
 use candle_gen_iris::train::lpips::Lpips;
 use candle_gen_iris::IrisRestorer;
+use gen_core_iris::restoration_train::{
+    recipe_training_config, ConvNextConfig, TrainingResource, CRITIC_TRUNK_COMPONENT,
+    CRITIC_TRUNK_RESOURCE, LPIPS_LIN_COMPONENT, LPIPS_LIN_RESOURCE, OPTIONS_KEY, VGG16_COMPONENT,
+    VGG16_RESOURCE,
+};
 
 use crate::common::{fixture, host_f32};
 use candle_gen::testkit::save_image_png;

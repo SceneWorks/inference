@@ -1088,7 +1088,7 @@ mod tests {
         // `iris_3b_depth`, a trainer whose id is no generator id and so carries its own row;
         // sc-25688 adds the `iris_3b_restore` trainer, which reuses the iris_3b_restore TRANSFORM
         // row (its training-only resources — VGG16, LPIPS, OpenCLIP ConvNeXt-XXL — carry their
-        // licences on `gen_core::iris::restoration_train::TRAINING_RESOURCES` and never ship in an
+        // licences on `gen_core_iris::restoration_train::TRAINING_RESOURCES` and never ship in an
         // export). sc-26240 adds the `flux3_klein_base` trainer, which reuses the sc-26239
         // generator row. The epic's MOSS trainers (`moss_image_base`, `moss_image_sft`) reuse
         // their generator rows, so they add two registrations without adding two rows.
@@ -1296,7 +1296,7 @@ mod tests {
         assert_eq!(pup.family, "apache-2-0");
         assert!(!pup.gated);
         assert_eq!(
-            gen_core::flux3::pup::UPSAMPLER_REVISION,
+            gen_core_flux3::pup::UPSAMPLER_REVISION,
             "8b069751eb5dcab23829d9c5eccb470eb8b8a4ed"
         );
         assert!(!json.contains("commercial_use"));

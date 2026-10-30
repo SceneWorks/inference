@@ -16,7 +16,8 @@ use crate::{
     text_encoder::Encoder,
     transformer::Transformer,
 };
-use mlx_gen::gen_core::{self, moss_image::*, moss_image_training as contract};
+use gen_core_moss_image::{moss_image::*, moss_image_training as contract};
+use mlx_gen::gen_core::{self};
 use mlx_gen::train::{
     checkpoint,
     dataset::center_crop_square,
@@ -427,10 +428,10 @@ fn load_weights(
     })
 }
 fn validate_floors(d: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
-    gen_core::train::validate_control_request(d, req)?;
-    gen_core::train::validate_full_finetune_request(d, req)?;
-    gen_core::train::validate_training_techniques(d, req)?;
-    gen_core::train::validate_edit_request(d, req)?;
+    gen_core_train::validate_control_request(d, req)?;
+    gen_core_train::validate_full_finetune_request(d, req)?;
+    gen_core_train::validate_training_techniques(d, req)?;
+    gen_core_train::validate_edit_request(d, req)?;
     let c = &req.config;
     if !req.file_name.ends_with(".safetensors") {
         return Err(gen_core::Error::Unsupported(
@@ -757,7 +758,7 @@ fn encode_entry(
             height: geometry.height,
             repeats: 1,
         };
-        let pixels = gen_core::train::aspect_ratio::resize_rgb(&source, row)?;
+        let pixels = gen_core_train::aspect_ratio::resize_rgb(&source, row)?;
         let pixels = Array::from_slice(
             &pixels,
             &[1, geometry.height as i32, geometry.width as i32, 3],

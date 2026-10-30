@@ -14,8 +14,8 @@ use crate::{
 };
 use candle_gen::candle_core::{backprop::GradStore, DType, Device, Tensor};
 use candle_gen::gen_core::{
-    self, moss_image::*, moss_image_training as contract, CancelFlag, LoadSpec, Modality, Trainer,
-    TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
+    self, CancelFlag, LoadSpec, Modality, Trainer, TrainerDescriptor, TrainingConfig,
+    TrainingOutput, TrainingProgress, TrainingRequest,
 };
 use candle_gen::train::{
     checkpoint,
@@ -26,6 +26,7 @@ use candle_gen::train::{
     schedule::{lr_multiplier, schedule_updates},
 };
 use candle_gen::{CandleError, Result};
+use gen_core_moss_image::{moss_image::*, moss_image_training as contract};
 use std::{collections::HashMap, path::Path};
 
 fn descriptor(variant: MossImageVariant) -> TrainerDescriptor {
@@ -304,10 +305,10 @@ fn validate_request(
     req: &TrainingRequest,
     layers: usize,
 ) -> gen_core::Result<()> {
-    gen_core::train::validate_control_request(d, req)?;
-    gen_core::train::validate_full_finetune_request(d, req)?;
-    gen_core::train::validate_training_techniques(d, req)?;
-    gen_core::train::validate_edit_request(d, req)?;
+    gen_core_train::validate_control_request(d, req)?;
+    gen_core_train::validate_full_finetune_request(d, req)?;
+    gen_core_train::validate_training_techniques(d, req)?;
+    gen_core_train::validate_edit_request(d, req)?;
     let c = &req.config;
     if !req.file_name.ends_with(".safetensors") {
         return Err(gen_core::Error::Unsupported(
@@ -506,7 +507,7 @@ fn encode_entry(
             height: geometry.height,
             repeats: 1,
         };
-        let rgb = gen_core::train::aspect_ratio::resize_rgb(&source, row)?;
+        let rgb = gen_core_train::aspect_ratio::resize_rgb(&source, row)?;
         Tensor::from_vec(
             rgb,
             (1, geometry.height as usize, geometry.width as usize, 3),

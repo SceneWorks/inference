@@ -7,8 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
-use mlx_gen::gen_core::iris::downstream::TaskExport;
-use mlx_gen::gen_core::iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
+use gen_core_iris::downstream::TaskExport;
+use gen_core_iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 use mlx_gen::{AdapterKind, AdapterSpec, LoadSpec, Quant, WeightsSource};
 use mlx_rs::{random, Array, Dtype};
 
@@ -115,7 +115,7 @@ fn converter_body() {
         assert!(mlx_rs::Device::try_default().unwrap() == mlx_rs::Device::gpu());
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
         // The tier is the layout's; the dense release reads as dense.
-        let file = dst.join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
+        let file = dst.join(gen_core_iris::BACKBONE_WEIGHTS_FILE);
         assert_eq!(artifact_tier(&file).unwrap(), Some(quant));
         let recorded = mlx_gen::gen_core::weightsmeta::safetensors_file_metadata(&file).unwrap();
         assert_eq!(
@@ -534,7 +534,7 @@ fn group_128_body() {
         root.path(),
         Quant::Q4,
     );
-    let weights = packed.join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
+    let weights = packed.join(gen_core_iris::BACKBONE_WEIGHTS_FILE);
     rewrite(&weights, |_, meta| {
         meta.insert(crate::packed::GROUP_SIZE_METADATA.into(), "128".into());
     });
@@ -559,7 +559,7 @@ fn partial_pack_body() {
         root.path(),
         Quant::Q8,
     );
-    let weights = packed.join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
+    let weights = packed.join(gen_core_iris::BACKBONE_WEIGHTS_FILE);
     // One target projection (64 wide, quantized by `ProjectionLayout::of`) stored dense.
     let target = "blocks.0.attn.q_proj_x";
     let dense = mlx_gen::weights::Weights::from_file(backbone_dir().join("model.safetensors"))
@@ -671,7 +671,7 @@ fn missing_metadata_body() {
         root.path(),
         Quant::Q4,
     );
-    let weights = packed.join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
+    let weights = packed.join(gen_core_iris::BACKBONE_WEIGHTS_FILE);
     rewrite(&weights, |_, meta| meta.clear());
     unsupported(artifact_tier(&weights), crate::packed::BITS_METADATA);
     unsupported(load(&packed, None, &[]), crate::packed::BITS_METADATA);

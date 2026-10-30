@@ -25,7 +25,7 @@ use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::ltx_checkpoint::{
+use gen_core_ltx::ltx_checkpoint::{
     upsampled_latent_frames, LatentUpsamplerConfig, LatentUpsamplerMode, LtxCheckpointMetadata,
 };
 

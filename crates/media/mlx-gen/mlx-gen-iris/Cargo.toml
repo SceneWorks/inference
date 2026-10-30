@@ -32,9 +32,12 @@ image = { workspace = true, optional = true }
 # The host TCP side channel of MLX distributed training (rendezvous + bounded barriers), moved out
 # of gen-core with its socket FFI (sc-27316). Training-only, like mlx-sys.
 sceneworks-gen-core-dist = { workspace = true, optional = true }
+sceneworks-gen-core-iris = { workspace = true }
+sceneworks-gen-core-tokenizer = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [features]
-model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-llm/model-inference-proof"]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-llm/model-inference-proof", "sceneworks-gen-core-iris/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 # The three trainers (`training`: generation, depth, restoration) and their training-only deps —
 # MLX distributed + the JACCL link (`build.rs`), dataset image validation, checkpoint state.
 # Default-on, so every existing consumer is unchanged; an inference-only graph (the iOS bundle)

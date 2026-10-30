@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::pruned_adaln::{PrunedAdaLn, PruningIdentity, TABLE_KEY};
 use candle_gen::Weights;
 use candle_gen_minimax_h3::dit::{
     AdaLayerNormOut, CurveAdaLn, DitBlock, LinearBias, MmRope, TimestepSchedule,
 };
 use candle_gen_minimax_h3::MiniMaxH3DitConfig;
+use gen_core_h3::pruned_adaln::{PrunedAdaLn, PruningIdentity, TABLE_KEY};
 use serde_json::Value;
 
 /// The shared pinned oracle, generated from the reference sources and committed at the repository

@@ -52,7 +52,7 @@ use std::rc::Rc;
 
 use mlx_rs::{random, Array, Dtype};
 
-use mlx_gen::gen_core::ltx_checkpoint::{
+use gen_core_ltx::ltx_checkpoint::{
     layout_for_declared_version, LtxBundle, LtxCheckpointLayout, LtxComponent,
 };
 use mlx_gen::gen_core::{reject_unknown_components, ArtifactSeal};

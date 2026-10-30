@@ -1,6 +1,6 @@
 //! Native MLX **Iris-3B generation training** (stories sc-25685, sc-25689): full training from
 //! random init or from weights, and LoRA / LoKr adapter training, on the frozen upstream objective —
-//! `iris3b/train/trainer.py` semantics over the backend-neutral contract [`gen_core::iris::train`],
+//! `iris3b/train/trainer.py` semantics over the backend-neutral contract [`gen_core_iris::train`],
 //! single-device or data-parallel.
 //!
 //! Per micro-batch (positional draws keyed on `mix_seed(seed, rank, epoch, position)`): walk this
@@ -17,13 +17,13 @@
 //! Muon/AdamW hybrid at `lr · LambdaLR(step)`, advance the scheduler. Non-finite steps drop the
 //! window (`nan_loss_tolerance`), collectively.
 //!
-//! Durability: checkpoints are published atomically (`gen_core::iris::train::publish_checkpoint`)
+//! Durability: checkpoints are published atomically (`gen_core_iris::train::publish_checkpoint`)
 //! with the trainable tensors (consolidated, or per-rank shards under `checkpoint_io: dcp`), the
 //! EMA, the optimizer slots, the REPA projector and the scheduler / data-cursor / loss-scaler
 //! position, so cancel + resume reproduces the uninterrupted run exactly and a consolidated
 //! checkpoint reshards to another rank count; retention keeps the newest `keep_last_checkpoints`
 //! plus milestones. Holdout validation appends to `<checkpoints>/metrics.jsonl`. The run ends by
-//! exporting a full model directory or an adapter file (schemas in `gen_core::iris::train`).
+//! exporting a full model directory or an adapter file (schemas in `gen_core_iris::train`).
 
 pub mod critic;
 pub mod depth;
@@ -39,33 +39,38 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use gen_core::iris::train::dist::{
+use gen_core::train::{
+    Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
+};
+use gen_core_iris::train::dist::{
     dist_error, Collective, DistError, Partition, Precision, ReduceOp, World,
 };
-use gen_core::iris::train::holdout::{self as holdout_contract, ValSums};
-use gen_core::iris::train::lineage::{
+use gen_core_iris::train::lineage::{
     agree_resume, elect_checkpoint_writer, publish_export_dir, retire_foreign_checkpoints,
 };
-use gen_core::iris::train::pipeline::DataPipeline;
-use gen_core::iris::train::repa::{
+use gen_core_iris::train::pipeline::DataPipeline;
+use gen_core_iris::train::repa::{
     resolve_teacher_path, RepaPlan, PROJECTOR_PREFIX, TEACHER_COMPONENT,
 };
-use gen_core::iris::train::shapes::preprocess_file_to_shape;
-use gen_core::iris::train::{
-    self as contract, adapter_param_route, backbone_identity, batch_seed_rank, caption_seed,
-    check_resume, checkpoint_root, checkpoint_staging_dir, dataset_fingerprint, dcp_shards,
-    draw_batch, export_config_yaml, file_stem, full_model_metadata, full_param_route, grad_group,
-    latest_checkpoint, linear_paths_from_keys, prune_checkpoints, publish_checkpoint,
-    read_checkpoint_state, select_caption, AdapterMetadata, ArtifactPlan, CheckpointState,
-    GradScaler, HostRng, InitMode, IrisTrainPlan, MixedPrecision, ParamRoute, Prediction,
-    ResumeDataPolicy, TextConditioningMode, TrainFlowDefaults, TrainSchedule, WeightsSelect,
-    CKPT_EMA, CKPT_OPTIMIZER, CKPT_STATE, CKPT_TRAINABLE, TRAINER_ID,
+use gen_core_iris::train::shapes::preprocess_file_to_shape;
+use gen_core_iris::train::{holdout as holdout_contract, holdout::ValSums};
+use gen_core_iris::{
+    train as contract,
+    train::{
+        adapter_param_route, backbone_identity, batch_seed_rank, caption_seed, check_resume,
+        checkpoint_root, checkpoint_staging_dir, dataset_fingerprint, dcp_shards, draw_batch,
+        export_config_yaml, file_stem, full_model_metadata, full_param_route, grad_group,
+        latest_checkpoint, linear_paths_from_keys, prune_checkpoints, publish_checkpoint,
+        read_checkpoint_state, select_caption, AdapterMetadata, ArtifactPlan, CheckpointState,
+        GradScaler, HostRng, InitMode, IrisTrainPlan, MixedPrecision, ParamRoute, Prediction,
+        ResumeDataPolicy, TextConditioningMode, TrainFlowDefaults, TrainSchedule, WeightsSelect,
+        CKPT_EMA, CKPT_OPTIMIZER, CKPT_STATE, CKPT_TRAINABLE, TRAINER_ID,
+    },
 };
-use gen_core::iris::{IrisConfig, TextEncoderConfig, TEXT_ENCODER_COMPONENT};
-use gen_core::train::{
+use gen_core_iris::{IrisConfig, TextEncoderConfig, TEXT_ENCODER_COMPONENT};
+use gen_core_train::{
     refuse_reference_control_model_options, refuse_trainer_load_overlays, validate_control_request,
-    validate_edit_request, validate_full_finetune_request, validate_training_techniques, Trainer,
-    TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
+    validate_edit_request, validate_full_finetune_request, validate_training_techniques,
 };
 use mlx_gen::gen_core;
 use mlx_gen::weights::Weights;
@@ -94,11 +99,11 @@ use model::{
 use optim::{clip_grads, ema_update, IrisOptimizer, MuonShards, Params};
 use teacher::{spatial_normalize, Teacher};
 
-pub use mlx_gen::gen_core::iris::train::CKPT_REPA;
+pub use gen_core_iris::train::CKPT_REPA;
 
 /// Identity + capabilities of the MLX Iris generation trainer.
 pub fn trainer_descriptor() -> TrainerDescriptor {
-    mlx_gen::gen_core::iris::train::trainer_descriptor_for("mlx")
+    gen_core_iris::train::trainer_descriptor_for("mlx")
 }
 
 /// The resolved resources of a training load: the backbone directory (its `config.yaml` always;
@@ -161,11 +166,11 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
         Some(WeightsSource::Dir(d)) => Some(d.clone()),
         Some(WeightsSource::File(f)) => Some(f.clone()),
     };
-    gen_core::iris::downstream::refuse_task_export(&backbone_dir, TRAINER_ID)?;
+    gen_core_iris::downstream::refuse_task_export(&backbone_dir, TRAINER_ID)?;
     let config = IrisConfig::from_dir(&backbone_dir)?;
     config.validate_supported()?;
     let flow_defaults = TrainFlowDefaults::from_dir(&backbone_dir)?;
-    for name in gen_core::iris::TEXT_ENCODER_REQUIRED_FILES {
+    for name in gen_core_iris::TEXT_ENCODER_REQUIRED_FILES {
         let p = text_encoder_dir.join(name);
         if !p.is_file() {
             return Err(Error::Msg(format!(
@@ -226,9 +231,7 @@ impl IrisTrainer {
     /// The resources the plan reads exist (weights for a weights start; the REPA teacher).
     fn check_resources(&self, plan: &IrisTrainPlan) -> Result<()> {
         if plan.init == InitMode::Weights {
-            let w = self
-                .backbone_dir
-                .join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
+            let w = self.backbone_dir.join(gen_core_iris::BACKBONE_WEIGHTS_FILE);
             if !w.is_file() {
                 return Err(Error::Msg(format!(
                     "{TRAINER_ID} trainer: weights init needs {} (or init: random for a full run)",
@@ -384,7 +387,7 @@ impl TextSource {
                     )))
                 }
                 "warn" => {
-                    if let Some(m) = gen_core::iris::caption_overflow_warning(
+                    if let Some(m) = gen_core_iris::caption_overflow_warning(
                         &window,
                         self.max_length,
                         te.suffix_ids().len(),
@@ -487,7 +490,7 @@ fn load_source(path: &Path, adapter_compute: Option<Dtype>) -> Result<HashMap<St
 
 /// Every key of `got` must be exactly the architecture's, with the architecture's shapes.
 fn check_backbone_keys(
-    cfg: &gen_core::iris::ModelConfig,
+    cfg: &gen_core_iris::ModelConfig,
     got: &HashMap<String, Array>,
     what: &str,
 ) -> Result<()> {
@@ -660,7 +663,7 @@ fn load_init_source(
 ) -> Result<Option<HashMap<String, Array>>> {
     let weights_path = trainer
         .backbone_dir
-        .join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
+        .join(gen_core_iris::BACKBONE_WEIGHTS_FILE);
     Ok(match init {
         InitMode::Weights => Some(load_source(&weights_path, adapter_compute)?),
         InitMode::Random => None,
@@ -668,7 +671,7 @@ fn load_init_source(
             let file = if p.join(CKPT_STATE).is_file() {
                 p.join(CKPT_TRAINABLE)
             } else if p.is_dir() {
-                p.join(gen_core::iris::BACKBONE_WEIGHTS_FILE)
+                p.join(gen_core_iris::BACKBONE_WEIGHTS_FILE)
             } else {
                 p.clone()
             };
@@ -680,7 +683,7 @@ fn load_init_source(
 /// The trained model and its fresh parameters: the whole backbone (from `source`, else a random
 /// init) or an adapter over the plan's targets on the frozen `source` backbone.
 fn build_model(
-    cfg: &gen_core::iris::ModelConfig,
+    cfg: &gen_core_iris::ModelConfig,
     compute: Dtype,
     plan: &IrisTrainPlan,
     source: Option<HashMap<String, Array>>,
@@ -734,7 +737,7 @@ fn build_model(
 /// An adapter run: the targets' shapes from the backbone, the frozen backbone at its provider
 /// dtype (materialized one tensor at a time) and the adapter's fresh factors.
 fn adapter_model(
-    cfg: &gen_core::iris::ModelConfig,
+    cfg: &gen_core_iris::ModelConfig,
     compute: Dtype,
     kind: AdapterKind,
     targets_paths: &[String],
@@ -775,7 +778,7 @@ fn adapter_model(
 /// Muon / AdamW group) and the EMA of the core rows.
 fn build_optimizer(
     plan: &IrisTrainPlan,
-    cfg: &gen_core::iris::ModelConfig,
+    cfg: &gen_core_iris::ModelConfig,
     model: &TrainModel,
     params: &Params,
     topo: &Topology,
@@ -1394,9 +1397,9 @@ impl Run {
     fn gather_forward(&mut self) -> Result<Params> {
         let full = self.topo.gather_map(&self.params)?;
         let dtype = match self.plan.dist.param_dtype {
-            gen_core::iris::train::dist::Precision::Fp32 => return Ok(full),
-            gen_core::iris::train::dist::Precision::Bf16 => Dtype::Bfloat16,
-            gen_core::iris::train::dist::Precision::Fp16 => Dtype::Float16,
+            gen_core_iris::train::dist::Precision::Fp32 => return Ok(full),
+            gen_core_iris::train::dist::Precision::Bf16 => Dtype::Bfloat16,
+            gen_core_iris::train::dist::Precision::Fp16 => Dtype::Float16,
         };
         full.into_iter()
             .map(|(k, v)| Ok((k, v.as_dtype(dtype)?.as_dtype(Dtype::Float32)?)))
@@ -1505,7 +1508,7 @@ impl Run {
         let student_grid = (size.0 / p, size.1 / p);
         let teacher_grid = plan.teacher_grid(student_grid);
         let mut t = teacher.tokens(x0, teacher_grid)?;
-        if plan.variant == gen_core::iris::train::repa::RepaVariant::Irepa {
+        if plan.variant == gen_core_iris::train::repa::RepaVariant::Irepa {
             t = spatial_normalize(&t, plan.spatial_norm_gamma)?;
         }
         eval([&t])?;
@@ -2012,7 +2015,7 @@ impl Run {
             data_identity: self.plan.data_identity(),
             dataset_fingerprint: self.dataset_fingerprint.clone(),
             base_identity: self.base_identity.clone(),
-            task: gen_core::iris::IrisTask::Generation,
+            task: gen_core_iris::IrisTask::Generation,
             stage: self.plan.stage.clone(),
             parent_stage: self.plan.parent_stage.clone(),
             data_position: Some(position),
@@ -2044,7 +2047,7 @@ impl Run {
         position: JsonValue,
     ) -> Result<()> {
         if self.topo.is_main() {
-            gen_core::iris::train::dist::writer_test_delay();
+            gen_core_iris::train::dist::writer_test_delay();
         }
         let state = self.state(position, (b.0, b.1));
         let io = self.plan.dist.checkpoint_io;
@@ -2053,10 +2056,10 @@ impl Run {
             std::fs::create_dir_all(p)
                 .map_err(|e| Error::Msg(format!("iris checkpoint: create {}: {e}", p.display())))
         };
-        if io == gen_core::iris::train::dist::CheckpointIo::Dcp {
+        if io == gen_core_iris::train::dist::CheckpointIo::Dcp {
             let staging = self.ckpt_root.join(format!(
                 ".{}.dcp",
-                gen_core::iris::train::checkpoint_dir_name(self.step)
+                gen_core_iris::train::checkpoint_dir_name(self.step)
             ));
             if world.rank == 0 {
                 mkdir(&self.ckpt_root)?;
@@ -2129,7 +2132,7 @@ impl Run {
         if self.writes_checkpoints {
             mkdir(&self.ckpt_root)?;
             let mut staging = checkpoint_staging_dir(&self.ckpt_root, self.step);
-            if io == gen_core::iris::train::dist::CheckpointIo::PerNode {
+            if io == gen_core_iris::train::dist::CheckpointIo::PerNode {
                 staging = staging.with_extension(format!("n{}", world.node_rank));
             }
             if staging.exists() {
@@ -2212,14 +2215,14 @@ impl Run {
             Trainable::Full => req
                 .output_dir
                 .join(file_stem(&req.file_name))
-                .join(gen_core::iris::BACKBONE_WEIGHTS_FILE),
+                .join(gen_core_iris::BACKBONE_WEIGHTS_FILE),
             Trainable::Adapter { .. } => req.output_dir.join(&req.file_name),
         };
         if !self.topo.is_main() {
             self.topo.coll.barrier("export")?;
             return Ok(path);
         }
-        gen_core::iris::train::dist::writer_test_delay();
+        gen_core_iris::train::dist::writer_test_delay();
         std::fs::create_dir_all(&req.output_dir)
             .map_err(|e| Error::Msg(format!("iris export: {}: {e}", req.output_dir.display())))?;
         match &self.model.trainable {
@@ -2240,11 +2243,11 @@ impl Run {
                 // sc-25690: config + weights appear together or not at all.
                 publish_export_dir(&dir, |stage: &Path| -> Result<()> {
                     contract::atomic_write(
-                        &stage.join(gen_core::iris::BACKBONE_CONFIG_FILE),
+                        &stage.join(gen_core_iris::BACKBONE_CONFIG_FILE),
                         yaml.as_bytes(),
                     )?;
                     save_safetensors_atomic(
-                        &stage.join(gen_core::iris::BACKBONE_WEIGHTS_FILE),
+                        &stage.join(gen_core_iris::BACKBONE_WEIGHTS_FILE),
                         &list,
                         &meta,
                     )
@@ -2489,7 +2492,7 @@ pub fn render_preview_with(
     render_preview_with_order(
         dit,
         steps,
-        gen_core::iris::DEFAULT_SOLVER_ORDER,
+        gen_core_iris::DEFAULT_SOLVER_ORDER,
         cfg_scale,
         shift,
         num_timesteps,
@@ -2516,7 +2519,7 @@ pub fn render_preview_with_order(
     uncond: Option<(&Array, &[i32])>,
     seed: u64,
 ) -> Result<mlx_gen::Image> {
-    let plan = gen_core::iris::dpm_solver_plan(steps, order.min(2), shift)?;
+    let plan = gen_core_iris::dpm_solver_plan(steps, order.min(2), shift)?;
     let channels = dit.config().in_channels;
     let z = crate::pipeline::noise(seed, channels, size as u32, size as u32)?;
     let cond_mask = vec![cond.1.to_vec()];
@@ -2547,10 +2550,10 @@ pub fn render_preview_with_order(
             let t = step.model_time(num_timesteps);
             match &cfg_batch {
                 Some(batch)
-                    if gen_core::iris::cfg_active(
+                    if gen_core_iris::cfg_active(
                         cfg_scale,
                         step.s,
-                        gen_core::iris::DEFAULT_CFG_INTERVAL,
+                        gen_core_iris::DEFAULT_CFG_INTERVAL,
                     ) =>
                 {
                     let xb = concatenate_axis(&[x, x], 0)?;

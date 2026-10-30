@@ -19,16 +19,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor, TensorId, Var, D};
-use candle_gen::gen_core::iris::train::ac::AcPolicy;
-use candle_gen::gen_core::iris::train::repa::{
-    bilinear_matrix, RepaPlan, RepaVariant, PROJECTOR_PREFIX,
-};
-use candle_gen::gen_core::iris::train::{
-    backbone_tensor_shapes, init_kind, mix_seed, FlowObjective, HostRng, InitKind, Prediction,
-};
-use candle_gen::gen_core::iris::ModelConfig;
 use candle_gen::train::lora::factorization;
 use candle_gen::{CandleError as Error, Result};
+use gen_core_iris::train::ac::AcPolicy;
+use gen_core_iris::train::repa::{bilinear_matrix, RepaPlan, RepaVariant, PROJECTOR_PREFIX};
+use gen_core_iris::train::{
+    backbone_tensor_shapes, init_kind, mix_seed, FlowObjective, HostRng, InitKind, Prediction,
+};
+use gen_core_iris::ModelConfig;
 
 use super::optim::{mul_s, Params, Tensors};
 use crate::adapters::{lokr_residual, lora_residual};
@@ -1184,9 +1182,7 @@ mod tests {
         // The miniature model supplies the replay context; no checkpoint weights are downloaded.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../mlx-gen/mlx-gen-iris/tests/fixtures/tiny-snapshot/iris");
-        let cfg = candle_gen::gen_core::iris::IrisConfig::from_dir(&dir)
-            .unwrap()
-            .model;
+        let cfg = gen_core_iris::IrisConfig::from_dir(&dir).unwrap().model;
         let weights = random_init(&cfg, 0, false, &Device::Cpu).unwrap();
         let model = TrainModel {
             geometry: Default::default(),

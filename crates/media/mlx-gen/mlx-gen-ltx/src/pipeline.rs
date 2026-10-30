@@ -1346,9 +1346,8 @@ pub fn denoise_tokens_rf_ancestral(
                 alat = Some(ad);
             }
         } else {
-            let coeffs = mlx_gen::gen_core::ltx_dfr::RfAncestralCoeffs::new(
-                sigma, sigma_next, eta, s_noise,
-            )?;
+            let coeffs =
+                gen_core_ltx::ltx_dfr::RfAncestralCoeffs::new(sigma, sigma_next, eta, s_noise)?;
             let ratio = scalar(coeffs.sigma_down_ratio).as_dtype(dt)?;
             let one_minus = scalar(1.0 - coeffs.sigma_down_ratio).as_dtype(dt)?;
             let step_rf =

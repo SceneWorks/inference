@@ -280,7 +280,7 @@ fn body_shape_footprint(cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootp
 fn normal_footprint(cfg: &TrainingConfig, h: u32, w: u32) -> AuxModelFootprint {
     let mut f = mlx_gen_body::arm_footprint(&cfg.body_losses, mlx_gen_body::BodyArm::Normal);
     f.reference_bytes_per_image +=
-        gen_core::train::subject_mask::PerceptualSubjectMasks::bytes_per_entry(cfg, h, w);
+        gen_core_train::subject_mask::PerceptualSubjectMasks::bytes_per_entry(cfg, h, w);
     f
 }
 

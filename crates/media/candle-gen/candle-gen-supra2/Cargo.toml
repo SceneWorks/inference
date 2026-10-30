@@ -15,6 +15,7 @@ candle-gen-sdxl = { path = "../candle-gen-sdxl" }
 candle-transformers = { workspace = true }
 # Flan-T5 `config.json` → candle's T5 `Config`.
 serde_json = { workspace = true }
+sceneworks-gen-core-checkpoint = { workspace = true }
 
 [features]
 default = []

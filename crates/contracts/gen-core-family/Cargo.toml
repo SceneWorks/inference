@@ -1,0 +1,28 @@
+[package]
+name = "sceneworks-gen-core-family"
+version = "0.1.0"
+edition = "2021"
+description = "Tensor-free per-family host policy (schedulers, resolution and keypoint math, request mapping) for single model families on top of gen-core."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["diffusion", "scheduler", "generative"]
+categories = ["science"]
+
+[lib]
+# Neutral import path: `use gen_core_family::…`, mirroring the `gen_core` lib-name convention.
+name = "gen_core_family"
+
+[features]
+# Manual source-bound model input receipts on the reader sites this crate owns; no ordinary
+# runtime/read behavior changes.
+model-inference-proof = ["sceneworks-gen-core/model-inference-proof"]
+
+[dependencies]
+# The backend-neutral contract this crate builds on. Sibling crates depend on gen-core; gen-core
+# never depends on them (sc-27316). Tensor-free, like gen-core.
+sceneworks-gen-core = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

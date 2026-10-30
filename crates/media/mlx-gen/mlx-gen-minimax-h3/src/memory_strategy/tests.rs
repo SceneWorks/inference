@@ -534,8 +534,7 @@ fn native_vae_facts_follow_selected_config_readsets_and_actual_compute_dtypes() 
         frames: Some(124),
         ..Default::default()
     };
-    let workspace =
-        mlx_gen::gen_core::h3_conditioning_memory::workspace(&(&req).into(), vae).unwrap();
+    let workspace = gen_core_h3::h3_conditioning_memory::workspace(&(&req).into(), vae).unwrap();
     assert!(workspace.decode_bytes > 0);
     assert!(
         vae.video_forward_extra_bytes > 0,
@@ -548,8 +547,7 @@ fn native_vae_facts_follow_selected_config_readsets_and_actual_compute_dtypes() 
     let mut without_cast = vae.clone();
     without_cast.video_forward_extra_bytes = 0;
     let no_cast =
-        mlx_gen::gen_core::h3_conditioning_memory::workspace(&(&req).into(), &without_cast)
-            .unwrap();
+        gen_core_h3::h3_conditioning_memory::workspace(&(&req).into(), &without_cast).unwrap();
     assert_eq!(
         workspace.video_decode_bytes - no_cast.video_decode_bytes,
         vae.video_forward_extra_bytes,

@@ -1,0 +1,28 @@
+[package]
+name = "sceneworks-gen-core-flux3"
+version = "0.1.0"
+edition = "2021"
+description = "Tensor-free FLUX 3 [klein] resources, conversion, prompt upsampler, references and training contracts on top of gen-core."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["flux3", "diffusion", "generative"]
+categories = ["science"]
+
+[lib]
+# Neutral import path: `use gen_core_flux3::…`, mirroring the `gen_core` lib-name convention.
+name = "gen_core_flux3"
+
+[dependencies]
+# The backend-neutral contract this crate builds on. Sibling crates depend on gen-core; gen-core
+# never depends on them (sc-27316). Tensor-free, like gen-core.
+sceneworks-gen-core = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
+# Reference-image decode (`image_input`).
+image = { workspace = true, features = ["bmp", "gif", "tiff", "webp"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+safetensors = { workspace = true }
+tempfile = { workspace = true }

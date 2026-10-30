@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 use mlx_gen::gen_core::{CaptionOverflowPolicy, Error as CoreError};
 use mlx_gen::{
     AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,

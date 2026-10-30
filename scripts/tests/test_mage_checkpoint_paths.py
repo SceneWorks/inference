@@ -29,6 +29,17 @@ except ImportError:
     torch = None
 
 
+def require_mage_loader_dependencies():
+    # Importing mage_flow eagerly imports its pipeline and text encoder as well.
+    # Check external prerequisites only; errors inside the vendor must still fail.
+    modules = ("accelerate", "diffusers", "einops", "huggingface_hub", "loguru",
+               "numpy", "PIL", "pydantic", "safetensors", "torch", "torchvision",
+               "transformers", "typing_extensions")
+    missing = [name for name in modules if importlib.util.find_spec(name) is None]
+    if missing:
+        raise unittest.SkipTest("Mage loader dependencies missing: " + ", ".join(missing))
+
+
 class _MageCheckpointFixture:
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -94,6 +105,10 @@ class MageCheckpointPathTests(_MageCheckpointFixture, unittest.TestCase):
 
 @unittest.skipUnless(torch is not None, "torch and safetensors are required")
 class MageCheckpointLoaderTests(_MageCheckpointFixture, unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        require_mage_loader_dependencies()
+
     def test_mage_index_loader_preserves_tensor_values_and_preflights_all_shards(self):
         sys.path.insert(0, str(VENDOR))
         self.addCleanup(lambda: sys.path.remove(str(VENDOR)))
@@ -228,6 +243,17 @@ class MageCheckpointLoaderTests(_MageCheckpointFixture, unittest.TestCase):
 
 
 class MageDependencyTests(unittest.TestCase):
+    def test_partial_loader_environment_names_missing_dependencies(self):
+        with mock.patch.object(importlib.util, "find_spec",
+                               side_effect=lambda name: None if name in
+                               ("loguru", "transformers") else object()):
+            with self.assertRaisesRegex(unittest.SkipTest, "loguru, transformers"):
+                require_mage_loader_dependencies()
+
+    def test_complete_loader_environment_is_not_skipped(self):
+        with mock.patch.object(importlib.util, "find_spec", return_value=object()):
+            require_mage_loader_dependencies()
+
     def test_direct_pins_and_package_metadata_agree(self):
         vendor = VENDOR / "mage_flow"
         reference_spec = importlib.util.spec_from_file_location(

@@ -1,7 +1,8 @@
 //! Test-only bidirectional adapter exchange. The exporting test executes real native CPU
 //! autograd and serializer code; an output hook is never itself a claim that export ran.
 use crate::transformer::{Geometry, Transformer};
-use mlx_gen::gen_core::{moss_image::*, GenerationRequest};
+use gen_core_moss_image::moss_image::*;
+use mlx_gen::gen_core::GenerationRequest;
 use mlx_gen::{CancelFlag, NetworkType};
 use mlx_rs::{Array, Dtype};
 use serde_json::Value;
@@ -17,7 +18,7 @@ fn fixture_lineage(path: &Path) -> Value {
         ("Cargo.lock", include_bytes!("../../../../../Cargo.lock")),
         (
             "moss-contract",
-            include_bytes!("../../../../contracts/gen-core/src/moss_image_training.rs"),
+            include_bytes!("../../../../contracts/gen-core-moss-image/src/moss_image_training.rs"),
         ),
         (
             "author-fixture",
@@ -204,7 +205,7 @@ fn cpu_train_export_and_import_portable_adapters() {
             mlx_rs::Stream::task_local_or_default().get_index().unwrap(),
             cpu_stream_index
         );
-        use mlx_gen::gen_core::moss_image_training as contract;
+        use gen_core_moss_image::moss_image_training as contract;
         use mlx_gen::train::lora::{build_lokr_targets, build_lora_targets, TrainAdapter};
         let f = fixture();
         let x = mlx_gen::attention::slice_axis(&from_json(&f["inputs"]["hidden_states"]), 0, 0, 1)
@@ -459,9 +460,9 @@ fn strict_application_rejects_unscaled_intermediate_overflow_before_success() {
                 let lokr = case.starts_with("lokr");
                 let scaled = case == "lora-scaled";
                 let alpha = if scaled { 32f32 } else { 0.25 };
-                let mut metadata = mlx_gen::gen_core::moss_image_training::metadata(
+                let mut metadata = gen_core_moss_image::moss_image_training::metadata(
                     variant,
-                    mlx_gen::gen_core::moss_image_training::SAMPLER,
+                    gen_core_moss_image::moss_image_training::SAMPLER,
                 );
                 metadata.extend([
                     (

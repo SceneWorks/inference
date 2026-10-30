@@ -28,5 +28,5 @@ pub mod schedule {
 // `TrainOptimizer` wraps an mlx-rs `AdamW` — it stays in mlx-gen. The contract types (Trainer,
 // TrainingConfig, LrSchedule, …) come from gen-core. The local `schedule` module above shadows the
 // `schedule` name the glob would otherwise pull in (explicit-wins; not an error).
-pub use gen_core::train::*;
+pub use gen_core_train::*;
 pub use optim::TrainOptimizer;

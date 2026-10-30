@@ -1,5 +1,5 @@
 //! Explicitly admitted terminal acceptance only; never acquires or discovers model assets.
-use mlx_gen::gen_core::moss_image::*;
+use gen_core_moss_image::moss_image::*;
 use mlx_gen::{GenerationRequest, Generator, LoadSpec, Progress, WeightsSource};
 use mlx_gen_moss_image::MossImage;
 use std::path::PathBuf;

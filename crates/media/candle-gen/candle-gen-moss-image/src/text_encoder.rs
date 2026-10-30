@@ -4,13 +4,11 @@ use crate::{
     transformer::check_cancel,
 };
 use candle_gen::candle_core::{Device, Tensor};
-use candle_gen::gen_core::{
-    moss_image::*,
-    tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig},
-    CancelFlag,
-};
+use candle_gen::gen_core::CancelFlag;
 use candle_gen::Result;
 use candle_llm::models::qwen35::Qwen35Model;
+use gen_core_moss_image::moss_image::*;
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use sha2::{Digest, Sha256};
 
 pub(crate) struct Conditioning {
@@ -53,15 +51,14 @@ pub(crate) fn token_bound(
     req: &candle_gen::gen_core::TrainingRequest,
     host_budget: u64,
 ) -> Result<u64> {
-    candle_gen::gen_core::moss_image_training::recovery::admit_conditioning_preprocess(
+    gen_core_moss_image::moss_image_training::recovery::admit_conditioning_preprocess(
         req,
         host_budget,
         0,
     )?;
     let tokenizer = tokenizer(sources, 4096)?;
     let mut bound = 0usize;
-    for prompt in
-        candle_gen::gen_core::moss_image_training::recovery::conditioning_prompts_iter(req)
+    for prompt in gen_core_moss_image::moss_image_training::recovery::conditioning_prompts_iter(req)
     {
         check_cancel(&req.cancel)?;
         bound = bound.max(tokenizer.encode_chat_ids(&prompt, true)?.len().min(4096));

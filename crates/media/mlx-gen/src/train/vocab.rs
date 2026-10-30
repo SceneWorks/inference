@@ -117,10 +117,10 @@ pub fn validate_shared_floors(
     descriptor: &TrainerDescriptor,
     req: &TrainingRequest,
 ) -> gen_core::Result<()> {
-    gen_core::train::validate_control_request(descriptor, req)?;
-    gen_core::train::validate_full_finetune_request(descriptor, req)?;
-    gen_core::train::validate_training_techniques(descriptor, req)?;
-    gen_core::train::validate_edit_request(descriptor, req)
+    gen_core_train::validate_control_request(descriptor, req)?;
+    gen_core_train::validate_full_finetune_request(descriptor, req)?;
+    gen_core_train::validate_training_techniques(descriptor, req)?;
+    gen_core_train::validate_edit_request(descriptor, req)
 }
 
 /// Apply a `timestep_bias` to a unit timestep: `high` → `√t`, `low` → `t²`, anything else neutral.

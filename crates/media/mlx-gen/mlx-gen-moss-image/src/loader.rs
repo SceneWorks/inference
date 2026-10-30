@@ -1,6 +1,6 @@
 //! Exact caller-provisioned assets, authenticated before graph construction.
 use crate::transformer::{Geometry, Transformer};
-use mlx_gen::gen_core::moss_image::*;
+use gen_core_moss_image::moss_image::*;
 use mlx_gen::gen_core::weightsmeta::{
     safetensors_reader_tensor_locations, CheckpointMeta, SafetensorsTensorHeader,
 };

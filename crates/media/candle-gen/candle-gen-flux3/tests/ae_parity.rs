@@ -7,9 +7,9 @@
 //! `[C, H, W]` / `[h·w, C]` layouts, which are this crate's own (NCHW) up to the batch axis.
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::flux3::latent_ids;
 use candle_gen_flux3::autoencoder::DOWNSAMPLING_RATIO;
 use candle_gen_flux3::Flux3AutoEncoder;
+use gen_core_flux3::latent_ids;
 
 use crate::common::{
     assert_close, batched_nchw, cpu, device, errors, fixture, host_f32, host_i32, tiny_autoencoder,
@@ -65,7 +65,7 @@ fn encode_matches_upstream() {
 }
 
 /// The oracle's ids are `latent_ids(h, w)`; the port emits tokens in that order (proven by the
-/// value parity above) and `gen_core::flux3::latent_ids` reproduces the same table, so the DiT's
+/// value parity above) and `gen_core_flux3::latent_ids` reproduces the same table, so the DiT's
 /// positional ids and the autoencoder's token order agree.
 #[test]
 fn token_order_is_row_major_latent_ids() {

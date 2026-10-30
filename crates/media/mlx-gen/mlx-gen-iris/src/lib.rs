@@ -9,7 +9,7 @@
 //! ## Tasks and resources (E4)
 //!
 //! The backend-neutral task identity, resource layout, `config.yaml` reader, conditioning window
-//! and solver plan live in [`gen_core::iris`] (shared with a Candle twin and the SceneWorks
+//! and solver plan live in [`gen_core_iris`] (shared with a Candle twin and the SceneWorks
 //! worker). The generation task is **backbone + text encoder**: `LoadSpec::weights` is the backbone
 //! directory and `LoadSpec::components["text_encoder"]` the Qwen3-VL snapshot. [`IrisDiT`] and
 //! [`load_backbone`] never touch the text encoder, so the depth and restoration tasks reuse them
@@ -18,7 +18,7 @@
 //! The monocular-depth task ([`depth`], [`depth::DEPTH_MODEL_ID`] = `iris_3b_depth`, sc-25682) is a
 //! provider-specific API (like the catalog's other depth estimator), not a registry generator: it
 //! returns a float32 relative-log-depth map, not an image. [`depth::load`] resolves only the
-//! `depth/` export and returns a `gen_core::iris::depth::IrisDepthEstimator`.
+//! `depth/` export and returns a `gen_core_iris::depth::IrisDepthEstimator`.
 //!
 //! ## Quantized tiers (sc-26266)
 //!
@@ -36,7 +36,7 @@
 //! tolerances). The committed fixtures under `tests/fixtures/` were produced by
 //! `tools/dump_iris_*.py` from the pinned revisions on miniature configs.
 //!
-//! [`gen_core::iris`]: mlx_gen::gen_core::iris
+//! [`gen_core_iris`]: gen_core_iris
 
 pub mod adapters;
 pub mod depth;
@@ -72,7 +72,7 @@ mod stream_tests;
 pub(crate) mod test_metal_guard;
 
 pub use dit::{Execution, IrisDiT, TextBatch};
-pub use mlx_gen::gen_core::iris::{
+pub use gen_core_iris::{
     IrisTask, TEXT_ENCODER_COMPONENT, TEXT_ENCODER_REPO, TEXT_ENCODER_REVISION,
     UPSTREAM_CODE_REVISION, UPSTREAM_WEIGHTS_REPO, UPSTREAM_WEIGHTS_REVISION,
 };

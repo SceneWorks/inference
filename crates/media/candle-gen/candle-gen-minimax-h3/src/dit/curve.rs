@@ -13,7 +13,7 @@
 //! plausible-looking model with nothing behind it. This module therefore:
 //!
 //! * never reconstructs a basis, never substitutes stock weights, and never builds the curve from
-//!   the timestep MLP — [`candle_gen::gen_core::pruned_adaln::PrunedAdaLn::inspect`] refuses every incomplete
+//!   the timestep MLP — [`gen_core_h3::pruned_adaln::PrunedAdaLn::inspect`] refuses every incomplete
 //!   or inconsistent topology *before* any tensor is executed;
 //! * hashes every operand at its **source precision** (F32 table, BF16 reduced weights, F16
 //!   folded biases in the frozen artifact), then retains one losslessly widened F32 compute
@@ -23,16 +23,16 @@
 //! * interpolates with the pinned addressing — `t` clamped to `[0, 1]` (t is already `1 − σ`, and
 //!   there is deliberately **no ×1000 rescale**), `position = t · (grid − 1)`, `lower` clamped to
 //!   `grid − 2` so `t = 1` selects the last interval with `fraction = 1` — reproduced elementwise
-//!   from [`candle_gen::gen_core::pruned_adaln::interpolation_position`].
+//!   from [`gen_core_h3::pruned_adaln::interpolation_position`].
 //!
 //! # Identity is content, not metadata
 //!
-//! [`CurveAdaLn::identity`] is the [`candle_gen::gen_core::pruned_adaln::PruningIdentity`] hashed over **every**
+//! [`CurveAdaLn::identity`] is the [`gen_core_h3::pruned_adaln::PruningIdentity`] hashed over **every**
 //! operand's stored values at load — the table *and* every reduced projection *and* every folded
 //! bias, in contract order, each with its stored dtype in the digest. Two checkpoints with the same
 //! shapes but different bases therefore hash differently, and a cache or compatibility check keyed
 //! on the identity cannot serve one checkpoint's modulation to the other. A table alone cannot
-//! identify the model: [`candle_gen::gen_core::pruned_adaln::PruningIdentityBuilder::finish`] refuses a partial
+//! identify the model: [`gen_core_h3::pruned_adaln::PruningIdentityBuilder::finish`] refuses a partial
 //! hash.
 //!
 //! # Memory
@@ -48,9 +48,12 @@
 use std::collections::HashMap;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::pruned_adaln::{self, PrunedAdaLn, PruningIdentity, TABLE_KEY};
 use candle_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, Dtype as MetaDtype};
 use candle_gen::{CandleError, Result, Weights};
+use gen_core_h3::{
+    pruned_adaln,
+    pruned_adaln::{PrunedAdaLn, PruningIdentity, TABLE_KEY},
+};
 
 use crate::dit::adaln::{AdaLnCache, TimestepSchedule};
 use crate::dit::block::AdaLnModulation;
@@ -395,7 +398,7 @@ impl CurveAdaLn {
     /// The pinned addressing, per row: `position = clamp(t, 0, 1) · (grid − 1)`,
     /// `lower = min(floor(position), grid − 2)`, `fraction = position − lower` — the tiny host
     /// index/fraction arrays come from
-    /// [`interpolation_position`](candle_gen::gen_core::pruned_adaln::interpolation_position) —
+    /// [`interpolation_position`](gen_core_h3::pruned_adaln::interpolation_position) —
     /// and then the table gather and the lerp run **on the device**: `table.index_select` at
     /// `lower` and `lower + 1`, combined as `start + weight · (end − start)` in f32, torch's own
     /// `torch.lerp` formula. No SiLU, no ×1000. The table is never copied to the host to do this —

@@ -32,7 +32,7 @@
 //! device, or the CPU test fixture). A capture never changes admission: its output is a candidate
 //! row a human reviews into the table.
 
-use mlx_gen::gen_core::iris::depth::DepthRequest;
+use gen_core_iris::depth::DepthRequest;
 use mlx_gen::gen_core::{
     standard_memory_behavior_context, CfgBatching, Conditioning, ConditioningKind, Error,
     GenerationMemory, GenerationRequest, LoadSpec, MemoryBehaviorRoute, MemoryBudget,
@@ -696,7 +696,7 @@ pub fn validate_actual(
                     format!("{provider} is not the registered iOS depth task"),
                 ));
             }
-            mlx_gen::gen_core::iris::depth::validate_depth_request(req)?;
+            gen_core_iris::depth::validate_depth_request(req)?;
         }
     }
     Ok(())

@@ -1,8 +1,8 @@
 //! Frozen training teacher precision against actual tiny HF5.20 CPU reference.
 use crate::common::{fixture, host_f32, tiny_config, tiny_package};
 use candle_gen::candle_core::{DType, Device};
-use candle_gen::gen_core::flux3::{assemble_window, TextWindow};
 use candle_gen_flux3::Flux3TextEncoder;
+use gen_core_flux3::{assemble_window, TextWindow};
 fn prompt(name: &str) -> &'static str {
     match name {
     "short"=>"a red fox in the snow", "exact"=>"a red fox in the snow , a cat on a roof",
