@@ -20,18 +20,11 @@
 //!
 //! # fp8 files and MLX's loader
 //!
-//! MLX has no fp8/e8m0 storage dtype, so its own safetensors parser rejects any file carrying
-//! `F8_E4M3` / `F8_E5M2` / `F8_E8M0` tensors. Those files load through a **header-rewriting custom
-//! reader** (`load_planned_file`): the on-disk header is re-presented to MLX with each fp8 dtype
-//! renamed to `U8` at identical byte length (element size is 1 in both readings, so every offset is
-//! unchanged and the payload is byte-identical), and MLX's normal lazy `load` primitive then serves
-//! the raw bytes file-backed. Laziness is preserved deliberately — the deferred mode's bounded
-//! block-window consumers reopen the file per window and must not copy the whole checkpoint into
-//! host RAM per reopen. The codec then decodes the `U8` view on device: E4M3 through MLX's own
-//! byte-accurate `from_fp8`, E5M2 as the top byte of an IEEE binary16 (`u16 << 8` viewed as f16),
-//! E8M0 as `2^(byte − 127)` (`u32 << 23` viewed as f32), each multiplied by its planned scale in
-//! f32 and cast once to the codec's resident bf16 — the same reference math as
-//! `gen_core::comfy_quant`, which the goldens pin.
+//! MLX represents `F8_E4M3`, `F8_E5M2`, and `F8_E8M0` storage as lazy `U8` arrays.
+//! The shared native safetensors reader preserves every payload bit and offset while retaining
+//! bounded, deferred loading. The planned codec decodes that byte view on device: E4M3 through
+//! MLX's `from_fp8`, E5M2 as the high byte of binary16, and E8M0 as `2^(byte - 127)`.
+//! Scale application and the final bf16 cast remain the plan's codec responsibility.
 //!
 //! Residency is priced **per layer** by the plan ([`gen_core::PlannedResidency`]): MLX has no
 //! packed fp8/int8 matmul on this seam, so its policy is [`DenseResidencyPolicy`] — every
@@ -51,7 +44,6 @@ use gen_core::checkpoint_codec::{
     FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
 use gen_core::checkpoint_facts::ExecutionRepresentation;
-use gen_core::weightsmeta::Dtype as HeaderDtype;
 use gen_core::ProviderRegistryBuilder;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{Array, Dtype};
@@ -658,283 +650,26 @@ pub fn encoding_is_supported(encoding: WeightEncoding) -> bool {
     baseline_codec_registry().for_encoding(encoding).is_some()
 }
 
-// =================================================================================================
-// Loading — MLX's lazy safetensors loader, with a header-rewriting reader for fp8 files.
-// =================================================================================================
-
-/// Load every tensor of `path` as lazy MLX arrays. Files without fp8/e8m0 tensors go through the
-/// ordinary `Weights::from_file` seam; files with them go through the custom reader that
-/// re-presents those dtypes as `U8` (see the module docs) so MLX's lazy `load` primitive can serve
-/// them file-backed.
+/// All storage dtypes use the same lazy native reader, including FP8 raw-byte views.
 fn load_planned_file(path: &Path) -> Result<HashMap<String, Array>> {
+    // Keep the shared contiguous/full-coverage validation: native MLX alone accepts overlapping
+    // or gapped ranges. This is a header read, never crediting the untouched tensor payload.
+    let check = gen_core::LoadActivityScope::file(
+        gen_core::LoadActivityPhase::Checking,
+        path,
+        Some(std::fs::metadata(path)?.len()),
+    );
     let layout = gen_core::safetensors_file_tensor_locations(path)?;
-    let needs_rewrite = layout.tensors.iter().any(|location| {
-        matches!(
-            location.header.dtype,
-            HeaderDtype::F8_E4M3 | HeaderDtype::F8_E5M2 | HeaderDtype::F8_E8M0
-        )
-    });
-    if !needs_rewrite {
-        return Ok(Weights::from_file(path)?.into_tensors());
-    }
-    let header = rewrite_fp8_header_as_u8(&layout.header_json).map_err(|error| {
-        Error::Msg(format!(
-            "loading {}: cannot re-present fp8 header to MLX: {error}",
-            path.display()
-        ))
-    })?;
-    fp8_view::load_with_rewritten_header(path, header, layout.file_len)
-}
-
-/// Rewrite a safetensors header JSON so every `F8_E4M3` / `F8_E5M2` / `F8_E8M0` dtype reads `U8`,
-/// preserving the exact byte length (the JSON shrinks — those names are longer than `U8` — and is
-/// space-padded back; whitespace between JSON tokens is insignificant). Element size is 1 byte in
-/// both readings, so every declared offset stays valid.
-fn rewrite_fp8_header_as_u8(header_json: &[u8]) -> std::result::Result<Vec<u8>, String> {
-    let mut json: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_slice(header_json).map_err(|error| error.to_string())?;
-    for (name, value) in json.iter_mut() {
-        if name == "__metadata__" {
-            continue;
-        }
-        let Some(object) = value.as_object_mut() else {
-            continue;
-        };
-        let Some(dtype) = object.get("dtype").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        if matches!(dtype, "F8_E4M3" | "F8_E5M2" | "F8_E8M0") {
-            object.insert(
-                "dtype".to_owned(),
-                serde_json::Value::String("U8".to_owned()),
-            );
-        }
-    }
-    let mut rewritten = serde_json::to_vec(&json).map_err(|error| error.to_string())?;
-    if rewritten.len() > header_json.len() {
-        return Err(format!(
-            "rewritten header is {} bytes but the original held {}",
-            rewritten.len(),
-            header_json.len()
-        ));
-    }
-    rewritten.resize(header_json.len(), b' ');
-    Ok(rewritten)
-}
-
-/// The custom `mlx_io_reader` presenting a byte-identical file whose header names fp8 dtypes `U8`.
-mod fp8_view {
-    use std::collections::HashMap;
-    use std::ffi::CString;
-    use std::os::raw::{c_char, c_int, c_void};
-    use std::os::unix::fs::FileExt;
-    use std::path::Path;
-
-    use mlx_rs::{Array, Stream};
-
-    use crate::{Error, Result};
-
-    struct RewrittenFile {
-        file: std::fs::File,
-        /// The full re-presented prefix: 8-byte little-endian header length + patched header JSON.
-        prefix: Vec<u8>,
-        file_len: u64,
-        position: u64,
-        good: bool,
-        label: CString,
-    }
-
-    impl RewrittenFile {
-        fn read_at(&mut self, data: *mut c_char, n: usize, offset: u64) {
-            // SAFETY: mlx-c hands us the destination buffer it allocated for exactly `n` bytes.
-            let out = unsafe { std::slice::from_raw_parts_mut(data.cast::<u8>(), n) };
-            let mut filled = 0_usize;
-            // Prefix region first (patched header), then the untouched file bytes.
-            if offset < self.prefix.len() as u64 {
-                let start = offset as usize;
-                let take = (self.prefix.len() - start).min(n);
-                out[..take].copy_from_slice(&self.prefix[start..start + take]);
-                filled = take;
-            }
-            if filled < n {
-                let file_offset = offset + filled as u64;
-                if self
-                    .file
-                    .read_exact_at(&mut out[filled..], file_offset)
-                    .is_err()
-                {
-                    // The vtable read cannot return an error; poison the stream so `good()`
-                    // reports the failure and zero the buffer rather than leaking uninitialized
-                    // memory.
-                    out[filled..].fill(0);
-                    self.good = false;
-                }
-            }
-        }
-    }
-
-    unsafe extern "C" fn is_open(_ctx: *mut c_void) -> bool {
-        true
-    }
-
-    unsafe extern "C" fn good(ctx: *mut c_void) -> bool {
-        (*ctx.cast::<RewrittenFile>()).good
-    }
-
-    unsafe extern "C" fn tell(ctx: *mut c_void) -> usize {
-        (*ctx.cast::<RewrittenFile>()).position as usize
-    }
-
-    unsafe extern "C" fn seek(ctx: *mut c_void, off: i64, whence: c_int) {
-        let this = &mut *ctx.cast::<RewrittenFile>();
-        let base = match whence {
-            seek_whence::SEEK_SET => 0_i64,
-            seek_whence::SEEK_CUR => this.position as i64,
-            seek_whence::SEEK_END => this.file_len as i64,
-            _ => {
-                this.good = false;
-                return;
-            }
-        };
-        let target = base.saturating_add(off);
-        if target < 0 {
-            this.good = false;
-            return;
-        }
-        this.position = target as u64;
-    }
-
-    unsafe extern "C" fn read(ctx: *mut c_void, data: *mut c_char, n: usize) {
-        let this = &mut *ctx.cast::<RewrittenFile>();
-        let position = this.position;
-        this.read_at(data, n, position);
-        this.position += n as u64;
-    }
-
-    unsafe extern "C" fn read_at_offset(ctx: *mut c_void, data: *mut c_char, n: usize, off: usize) {
-        let this = &mut *ctx.cast::<RewrittenFile>();
-        this.read_at(data, n, off as u64);
-    }
-
-    unsafe extern "C" fn write(ctx: *mut c_void, _data: *const c_char, _n: usize) {
-        (*ctx.cast::<RewrittenFile>()).good = false;
-    }
-
-    unsafe extern "C" fn label(ctx: *mut c_void) -> *const c_char {
-        (*ctx.cast::<RewrittenFile>()).label.as_ptr()
-    }
-
-    unsafe extern "C" fn free(ctx: *mut c_void) {
-        drop(Box::from_raw(ctx.cast::<RewrittenFile>()));
-    }
-
-    /// `SEEK_*` as mlx-c passes them (`stdio.h` values; identical on every unix libc).
-    mod seek_whence {
-        use std::os::raw::c_int;
-        pub const SEEK_SET: c_int = 0;
-        pub const SEEK_CUR: c_int = 1;
-        pub const SEEK_END: c_int = 2;
-    }
-
-    /// Load a safetensors file through MLX's lazy loader, serving `patched_header` in place of the
-    /// on-disk header JSON (identical byte length; see the module docs). The reader object lives
-    /// until MLX frees the last lazy array that references it.
-    pub(super) fn load_with_rewritten_header(
-        path: &Path,
-        patched_header: Vec<u8>,
-        file_len: u64,
-    ) -> Result<HashMap<String, Array>> {
-        let file = std::fs::File::open(path)?;
-        let mut prefix = Vec::with_capacity(8 + patched_header.len());
-        prefix.extend_from_slice(&(patched_header.len() as u64).to_le_bytes());
-        prefix.extend_from_slice(&patched_header);
-        let state = Box::new(RewrittenFile {
-            file,
-            prefix,
-            file_len,
-            position: 0,
-            good: true,
-            label: CString::new(format!("fp8-as-u8 view of {}", path.display()))
-                .unwrap_or_else(|_| CString::new("fp8-as-u8 view").expect("static string")),
-        });
-        let vtable = mlx_sys::mlx_io_vtable {
-            is_open: Some(is_open),
-            good: Some(good),
-            tell: Some(tell),
-            seek: Some(seek),
-            read: Some(read),
-            read_at_offset: Some(read_at_offset),
-            write: Some(write),
-            label: Some(label),
-            free: Some(free),
-        };
-        // Matches mlx-rs `Array::load_safetensors` (which routes file loads to the CPU stream).
-        let stream = Stream::cpu();
-        let mut arrays = HashMap::new();
-        // SAFETY: the vtable functions match mlx-c's contract; `state` ownership transfers to the
-        // reader, whose `free` callback reclaims the Box when MLX drops the last reference.
-        unsafe {
-            let reader = mlx_sys::mlx_io_reader_new(Box::into_raw(state).cast(), vtable);
-            let mut map = mlx_sys::mlx_map_string_to_array_new();
-            let mut metadata = mlx_sys::mlx_map_string_to_string_new();
-            let status = mlx_sys::mlx_load_safetensors_reader(
-                &mut map,
-                &mut metadata,
-                reader,
-                stream.as_ptr(),
-            );
-            mlx_sys::mlx_map_string_to_string_free(metadata);
-            if status != 0 {
-                mlx_sys::mlx_map_string_to_array_free(map);
-                mlx_sys::mlx_io_reader_free(reader);
-                return Err(Error::Msg(format!(
-                    "loading {} through the fp8-as-u8 MLX view failed",
-                    path.display()
-                )));
-            }
-            let iterator = mlx_sys::mlx_map_string_to_array_iterator_new(map);
-            loop {
-                let mut key: *const c_char = std::ptr::null();
-                let mut value = mlx_sys::mlx_array_new();
-                let status = mlx_sys::mlx_map_string_to_array_iterator_next(
-                    &mut key as *mut *const _,
-                    &mut value,
-                    iterator,
-                );
-                match status {
-                    0 => {
-                        let key = std::ffi::CStr::from_ptr(key).to_string_lossy().into_owned();
-                        arrays.insert(key, Array::from_ptr(value));
-                    }
-                    2 => {
-                        mlx_sys::mlx_array_free(value);
-                        break;
-                    }
-                    _ => {
-                        mlx_sys::mlx_array_free(value);
-                        mlx_sys::mlx_map_string_to_array_iterator_free(iterator);
-                        mlx_sys::mlx_map_string_to_array_free(map);
-                        mlx_sys::mlx_io_reader_free(reader);
-                        return Err(Error::Msg(format!(
-                            "loading {} through the fp8-as-u8 MLX view: array map iteration failed",
-                            path.display()
-                        )));
-                    }
-                }
-            }
-            mlx_sys::mlx_map_string_to_array_iterator_free(iterator);
-            mlx_sys::mlx_map_string_to_array_free(map);
-            // The lazy Load primitives hold their own shared reference; this handle is done.
-            mlx_sys::mlx_io_reader_free(reader);
-        }
-        #[cfg(feature = "model-inference-proof")]
-        gen_core::model_input_proof::record_reader_paths(
-            "mlx-gen::logical_weights::load_with_rewritten_header",
-            gen_core::model_input_proof::InputRole::ModelWeights,
-            &[path],
-        );
-        Ok(arrays)
-    }
+    check.update(layout.data_start);
+    check.finish();
+    let arrays = Weights::from_file(path)?.into_tensors();
+    #[cfg(feature = "model-inference-proof")]
+    gen_core::model_input_proof::record_reader_paths(
+        "mlx-gen::logical_weights::load_planned_file",
+        gen_core::model_input_proof::InputRole::ModelWeights,
+        &[path],
+    );
+    Ok(arrays)
 }
 
 #[cfg(test)]
@@ -980,6 +715,46 @@ mod tests {
     use gen_core::checkpoint_codec::{
         CompanionRole, CompanionTensorPlan, PlannedResidency, ResidencyMode,
     };
+
+    /// File I/O only: preserve all FP8 storage bits and ordinary tensors without decoding.
+    #[test]
+    fn shared_lazy_reader_preserves_fp8_storage_bytes_and_mixed_dtypes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.safetensors");
+        write_safetensors(
+            &path,
+            &[
+                ("e4m3", "F8_E4M3", &[4], vec![0, 128, 127, 255]),
+                ("e5m2", "F8_E5M2", &[4], vec![1, 129, 126, 254]),
+                ("e8m0", "F8_E8M0", &[4], vec![2, 130, 125, 253]),
+                ("ordinary", "U16", &[2], vec![1, 0, 255, 0]),
+            ],
+        );
+        let arrays = load_planned_file(&path).unwrap();
+        mlx_rs::transforms::eval_pending_loads(arrays.values()).unwrap();
+        for (key, expected) in [
+            ("e4m3", [0, 128, 127, 255]),
+            ("e5m2", [1, 129, 126, 254]),
+            ("e8m0", [2, 130, 125, 253]),
+        ] {
+            let array = &arrays[key];
+            assert_eq!(array.dtype(), Dtype::Uint8);
+            assert_eq!(array.shape(), &[4]);
+            assert_eq!(array.as_slice::<u8>(), &expected);
+        }
+        assert_eq!(arrays["ordinary"].dtype(), Dtype::Uint16);
+        assert_eq!(arrays["ordinary"].shape(), &[2]);
+        assert_eq!(arrays["ordinary"].as_slice::<u16>(), &[1, 255]);
+        // Preserve the old logical-reader refusal even though native MLX accepts these ranges.
+        let invalid = dir.path().join("overlap.safetensors");
+        let header = br#"{"a":{"dtype":"F8_E5M2","shape":[1],"data_offsets":[0,1]},"b":{"dtype":"F8_E5M2","shape":[1],"data_offsets":[0,1]}}"#;
+        let mut file = Vec::new();
+        file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        file.extend_from_slice(header);
+        file.extend_from_slice(&[1, 2]);
+        std::fs::write(&invalid, file).unwrap();
+        assert!(load_planned_file(&invalid).is_err());
+    }
 
     struct StripModel;
 
@@ -1428,8 +1203,7 @@ mod tests {
     ///
     /// The fixture is 16-padded on both axes (`[32, 64]` stored, `[20, 50]` declared logical), so
     /// the unpad is on the path and blocks that cover only padding carry NaN poison. It also
-    /// exercises MLX's header-rewriting reader: the block scales are stored `F8_E4M3`, a dtype MLX
-    /// has no array type for and re-presents as `U8`.
+    /// exercises MLX's shared raw-byte loader: block scales stored `F8_E4M3` arrive as `U8`.
     #[test]
     fn nvfp4_golden_unswizzles_unpads_and_decodes_to_a_hand_derived_table() {
         struct DeclaredShape;

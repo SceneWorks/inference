@@ -1947,7 +1947,7 @@
         "reader-binding"
       ]
     },
-    "mlx-gen::logical_weights::load_with_rewritten_header": {
+    "mlx-gen::logical_weights::load_planned_file": {
       "role": "model-weights",
       "grades": [
         "reader-binding"

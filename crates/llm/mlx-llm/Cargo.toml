@@ -32,6 +32,7 @@ mlx-rs = { workspace = true }
 mlx-sys = { workspace = true }
 # The backend-neutral contract this crate implements.
 core-llm = { workspace = true }
+sceneworks-load-progress = { workspace = true }
 # Error plumbing for the engine surface.
 thiserror = { workspace = true }
 # Config and receipt parsing. Exact float round-tripping is required because the SC-20671
