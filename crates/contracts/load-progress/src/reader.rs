@@ -231,6 +231,39 @@ impl<R: Seek> Seek for ProgressReader<R> {
     }
 }
 
+/// Open an observed file, retaining its activity until the reader is finished or dropped.
+/// Metadata and bytes come from the same handle. Callers keep their own integrity/cancellation
+/// guards around this generic reader; it neither reopens a path nor authenticates model content.
+pub fn open(path: impl AsRef<Path>) -> io::Result<ProgressReader<std::fs::File>> {
+    let path = path.as_ref();
+    let file = std::fs::File::open(path)?;
+    let source = SourceProgress::new(path, Some(file.metadata()?.len()));
+    let mut reader = source.reader(file)?;
+    reader.begin();
+    Ok(reader)
+}
+
+/// Read one file into an owned buffer, reporting successful reads in bounded chunks.
+/// The returned bytes are the same buffer callers can authenticate and parse without reopening.
+pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+    let reader = open(path)?;
+    let len = usize::try_from(reader.get_ref().metadata()?.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "file exceeds address space"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+    struct Chunked<R>(R);
+    impl<R: Read> Read for Chunked<R> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let len = out.len().min(32 * 1024 * 1024);
+            self.0.read(&mut out[..len])
+        }
+    }
+    Chunked(reader).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

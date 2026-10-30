@@ -95,7 +95,7 @@ impl Asset {
     }
     pub(crate) fn bytes(&self) -> Result<Vec<u8>> {
         self.pin.read_unchanged(|path| {
-            let bytes = std::fs::read(path)?;
+            let bytes = mlx_gen::gen_core::load_activity::reader::read(path)?;
             #[cfg(feature = "test-support")]
             if let Some(expected) = self.fixture_digest {
                 let actual = Sha256::digest(&bytes);
@@ -232,7 +232,7 @@ fn pinned_headers_with_check(
     check: &mut dyn FnMut() -> mlx_gen::gen_core::Result<()>,
 ) -> mlx_gen::gen_core::Result<Vec<SafetensorsTensorHeader>> {
     check_pin(pin, check)?;
-    let file = std::fs::File::open(pin.loader_path())?;
+    let file = mlx_gen::gen_core::load_activity::reader::open(pin.loader_path())?;
     let parsed = checked_headers(
         file,
         pin.target_fingerprint().size,
@@ -913,6 +913,72 @@ mod cpu_tests {
         bytes.extend_from_slice(header.as_bytes());
         bytes.extend_from_slice(&[0, 0, 128, 63, 0, 0, 0, 128]);
         bytes
+    }
+
+    /// File I/O and owned-buffer authentication only; never constructs a model or MLX array.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn authenticated_owned_bytes_and_bounded_headers_report_shared_source_progress() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weights.safetensors");
+        let bytes = header_fixture();
+        std::fs::write(&path, &bytes).unwrap();
+        let asset = Asset {
+            role: MossImageAssetRole::Transformer,
+            repo: SFT_REPO,
+            revision: SFT_REVISION,
+            relative: "fixture.safetensors".into(),
+            pin: PinnedWeightsFile::pin(&path).unwrap(),
+            fixture_digest: Some(Sha256::digest(&bytes).into()),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let _observer = mlx_gen::gen_core::LoadActivityObserver::new(move |event| {
+            output.lock().unwrap().push(event)
+        });
+        let context = mlx_gen::gen_core::LoadActivityContext::capture()
+            .with_components([(path.clone(), "transformer".to_owned())]);
+        let _scope = context.install();
+        assert_eq!(asset.bytes().unwrap(), bytes);
+        {
+            let events = events.lock().unwrap();
+            let reports: Vec<_> = events
+                .iter()
+                .flatten()
+                .filter(|event| event.phase == mlx_gen::gen_core::LoadActivityPhase::Loading)
+                .collect();
+            assert!(!reports.is_empty());
+            assert!(reports.iter().all(|event| event.component == "transformer"
+                && event.file == path
+                && event.total_bytes == Some(bytes.len() as u64)));
+            assert_eq!(
+                reports.iter().map(|event| event.bytes_read).max(),
+                Some(bytes.len() as u64)
+            );
+            assert_eq!(events.last(), Some(&None));
+        }
+        events.lock().unwrap().clear();
+        let headers = pinned_headers_with_check(&asset.pin, &mut || Ok(())).unwrap();
+        assert_eq!(headers.len(), 1);
+        {
+            let events = events.lock().unwrap();
+            let reports: Vec<_> = events
+                .iter()
+                .flatten()
+                .filter(|event| event.phase == mlx_gen::gen_core::LoadActivityPhase::Loading)
+                .collect();
+            assert_eq!(
+                reports.iter().map(|event| event.bytes_read).max(),
+                Some(bytes.len() as u64 - 8)
+            );
+            assert_eq!(events.last(), Some(&None));
+        }
+        std::fs::write(&path, b"changed").unwrap();
+        assert!(
+            asset.bytes().is_err(),
+            "the shared reader must retain pinned identity checks"
+        );
     }
 
     #[test]
