@@ -716,6 +716,14 @@ def owned_output(path: Path, temporary: Path) -> Path:
 def validate_generated_adapter_spec(spec: dict) -> None:
     """Source-owned export shape contract, never caller/environment permission."""
     fields = {'kind', 'rank', 'dtype', 'per_target_alpha', 'max_bytes', 'targets'}
+    if isinstance(spec, dict) and 'metadata_format' in spec:
+        # Native FLUX3 export_adapter has its own established PEFT metadata.
+        # This is an explicit dialect, not a global set of interchangeable aliases.
+        fields |= {'metadata_format', 'alpha'}
+        if (spec.get('metadata_format') != 'flux3' or spec.get('per_target_alpha') is not False
+                or type(spec.get('alpha')) not in (int, float)
+                or not math.isfinite(spec['alpha']) or spec['alpha'] <= 0):
+            raise ValueError('native FLUX3 adapter needs its explicit format and positive expected alpha')
     if (not isinstance(spec, dict) or set(spec) != fields or spec['kind'] != 'lora'
             or type(spec['rank']) is not int or not 1 <= spec['rank'] <= 1024
             or spec['dtype'] not in ('F32', 'F16', 'BF16')
@@ -776,14 +784,39 @@ def validate_generated_lora_bytes(raw: bytes, spec: dict) -> None:
     if not isinstance(header, dict):
         raise ValueError('generated adapter safetensors header must be an object')
     metadata = header.pop('__metadata__', {})
-    if (not isinstance(metadata, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in metadata.items())
-            or metadata.get('networkType') != 'lora' or metadata.get('rank') != str(spec['rank'])):
-        raise ValueError('generated adapter metadata differs from its LoRA rank contract')
-    try:
-        if not math.isfinite(float(metadata['alpha'])):
-            raise ValueError('nonfinite generated adapter alpha')
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError('generated adapter needs finite alpha metadata') from error
+    if not isinstance(metadata, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in metadata.items()):
+        raise ValueError('generated adapter metadata must contain only string values')
+    if spec.get('metadata_format') == 'flux3':
+        # candle-gen-flux3/src/training/checkpoint.rs::export_adapter. Base identity
+        # strings are exporter metadata, not attestation of checkpoint bytes/revision.
+        required = {'base_model', 'base_revision', 'network_type', 'rank', 'lora_alpha',
+                    'scaling_convention', 'training_identity', 'lora_adapter_metadata'}
+        if (not required <= set(metadata) or set(metadata) - required - {'fixture'}
+                or metadata['network_type'] != 'lora' or metadata['rank'] != str(spec['rank'])
+                or metadata['scaling_convention'] != 'alpha/rank'
+                or any(not metadata[key] for key in required)):
+            raise ValueError('native FLUX3 adapter metadata differs from its exporter contract')
+        try:
+            alpha = float(metadata['lora_alpha'])
+            peft = json.loads(metadata['lora_adapter_metadata'], object_pairs_hook=unique,
+                              parse_constant=reject_constant)
+        except (ValueError, TypeError) as error:
+            raise ValueError('native FLUX3 adapter has invalid alpha/PEFT metadata') from error
+        expected_peft = {'peft_type': 'LORA', 'r': spec['rank'], 'lora_alpha': spec['alpha'],
+                         'use_rslora': False, 'use_dora': False, 'rank_pattern': {}, 'alpha_pattern': {}}
+        if (not math.isfinite(alpha) or alpha != spec['alpha'] or not isinstance(peft, dict)
+                or peft != expected_peft or type(peft.get('r')) is not int
+                or type(peft.get('lora_alpha')) not in (int, float)
+                or peft.get('use_rslora') is not False or peft.get('use_dora') is not False):
+            raise ValueError('native FLUX3 adapter alpha/rank/PEFT metadata conflicts with source contract')
+    else:
+        if metadata.get('networkType') != 'lora' or metadata.get('rank') != str(spec['rank']):
+            raise ValueError('generated adapter metadata differs from its LoRA rank contract')
+        try:
+            if not math.isfinite(float(metadata['alpha'])):
+                raise ValueError('nonfinite generated adapter alpha')
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError('generated adapter needs finite alpha metadata') from error
     expected = {}
     for name, (out_features, in_features) in spec['targets'].items():
         expected[name + '.lora_A.weight'] = (spec['dtype'], [spec['rank'], in_features])

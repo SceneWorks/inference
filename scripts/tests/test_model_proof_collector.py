@@ -63,11 +63,26 @@ def adapter_spec():
             'max_bytes': 4096, 'targets': {'blocks.0.to_q': [3, 4]}}
 
 
-def adapter_bytes(mutate=None):
+def flux3_adapter_spec():
+    return {**adapter_spec(), 'metadata_format': 'flux3', 'alpha': 2.0, 'per_target_alpha': False}
+
+
+def adapter_bytes(mutate=None, *, flux3=False):
     # Format-only fixture: zero bytes, no tensor library or learned execution.
     header = {'__metadata__': {'networkType': 'lora', 'rank': '2', 'alpha': '2'}}
+    factors = [('lora_A.weight', [2, 4]), ('lora_B.weight', [3, 2])]
+    if flux3:
+        # Native export_adapter metadata, without product changes or invented aliases.
+        header['__metadata__'] = {
+            'base_model': 'MOCK model identity; not attested', 'base_revision': 'MOCK revision',
+            'network_type': 'lora', 'rank': '2', 'lora_alpha': '2', 'scaling_convention': 'alpha/rank',
+            'training_identity': '{}', 'lora_adapter_metadata': json.dumps({
+                'peft_type': 'LORA', 'r': 2, 'lora_alpha': 2.0, 'use_rslora': False,
+                'use_dora': False, 'rank_pattern': {}, 'alpha_pattern': {}})}
+    else:
+        factors.append(('alpha', [1]))
     end = 0
-    for name, shape in [('lora_A.weight', [2, 4]), ('lora_B.weight', [3, 2]), ('alpha', [1])]:
+    for name, shape in factors:
         count = 1
         for dim in shape:
             count *= dim
@@ -81,6 +96,60 @@ def adapter_bytes(mutate=None):
 
 
 class Collector(unittest.TestCase):
+    def test_native_flux3_metadata_requires_explicit_typed_source_contract(self):
+        proof.validate_generated_lora_bytes(adapter_bytes(flux3=True), flux3_adapter_spec())
+        for changes in ({'metadata_format': 'unknown'}, {'per_target_alpha': True},
+                        {'alpha': None}, {'alpha': True}, {'alpha': float('inf')}, {'alpha': 0}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                proof.validate_generated_adapter_spec({**flux3_adapter_spec(), **changes})
+        for spec, raw in ((adapter_spec(), adapter_bytes(flux3=True)),
+                          (flux3_adapter_spec(), adapter_bytes())):
+            with self.assertRaises(ValueError):
+                proof.validate_generated_lora_bytes(raw, spec)
+
+    def test_native_flux3_rejects_conflicting_metadata_and_wrong_factors(self):
+        def peft_change(header, **changes):
+            metadata = header['__metadata__']
+            peft = json.loads(metadata['lora_adapter_metadata'])
+            metadata['lora_adapter_metadata'] = json.dumps({**peft, **changes})
+        mutations = [
+            lambda h: h['__metadata__'].pop('rank'),
+            lambda h: h['__metadata__'].pop('lora_adapter_metadata'),
+            lambda h: h['__metadata__'].update(network_type='checkpoint'),
+            lambda h: h['__metadata__'].update(networkType='lora'),
+            lambda h: h['__metadata__'].update(alpha='2'),
+            lambda h: h['__metadata__'].update(lora_alpha='nan'),
+            lambda h: h['__metadata__'].update(lora_alpha='3'),
+            lambda h: h['__metadata__'].update(rank='3'),
+            lambda h: h['__metadata__'].update(scaling_convention='alpha/sqrt(rank)'),
+            lambda h: h['__metadata__'].update(lora_adapter_metadata='{"r":2,"r":2}'),
+            lambda h: peft_change(h, lora_alpha=3),
+            lambda h: peft_change(h, use_dora=True),
+            lambda h: peft_change(h, rank_pattern={'blocks.0.to_q': 3}),
+            lambda h: h.update({'model.weight': h.pop('blocks.0.to_q.lora_A.weight')}),
+            lambda h: h['blocks.0.to_q.lora_A.weight'].update(shape=[4, 2]),
+            lambda h: h['blocks.0.to_q.lora_B.weight'].update(data_offsets=[0, 24]),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                proof.validate_generated_lora_bytes(adapter_bytes(mutate, flux3=True), flux3_adapter_spec())
+
+    def test_native_flux3_survives_collector_without_relaxing_generic_safetensors_ban(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            row = case()
+            name = 'trained/adapter.safetensors'
+            row['output_artifacts'] = [name]
+            row['generated_adapter_artifacts'] = {name: flux3_adapter_spec()}
+            raw = adapter_bytes(flux3=True)
+            status, _, verified, _, output = self._mock_run(root, row_override=row, generated_outputs={name: raw})
+            self.assertEqual(status, 0)
+            self.assertTrue(verified['accepted_model_run'])  # MOCK ONLY.
+            artifact = output / '00000/generated' / name
+            self.assertEqual(artifact.read_bytes(), raw)
+            with self.assertRaisesRegex(ValueError, 'checkpoint/model payload'):
+                proof.publish_file(artifact, output / 'undeclared.safetensors', output, 4096)
+
     def test_generated_adapter_requires_exact_declared_output_contract(self):
         row = case()
         row['output_artifacts'] = ['trained/adapter.safetensors']
