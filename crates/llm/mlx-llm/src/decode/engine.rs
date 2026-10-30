@@ -1249,6 +1249,7 @@ where
     let (cache, logits, prompt_hidden, mut history, position_delta) = match prompt {
         SpeculativePrompt::Tokens(ids) => {
             let cache = owned_cache.insert(target.new_cache());
+            core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
             let out = target.forward(cache, &input_ids(ids), 0, LogitsScope::Last, wants_hidden)?;
             (cache, out.logits, out.hidden, ids.to_vec(), 0)
         }
@@ -1278,6 +1279,7 @@ where
         arrays.extend(prompt_hidden.as_ref());
         arrays.extend(warm.as_ref());
         timer.finish_prefill(arrays)?;
+        core_llm::report_generation_phase(core_llm::GenerationPhase::Generating);
     }
     let mut rollback = target.rollback(width);
 
@@ -1356,6 +1358,7 @@ where
     if let Some(c) = constraint.as_mut() {
         c.accept(first);
     }
+    core_llm::report_generation_phase(core_llm::GenerationPhase::Generating);
     on_event(StreamEvent::Token { id: first, step: 0 });
     generated.push(first);
     history.push(first);
@@ -1569,6 +1572,7 @@ where
             if let Some(c) = constraint.as_mut() {
                 c.accept(token);
             }
+            core_llm::report_generation_phase(core_llm::GenerationPhase::Generating);
             on_event(StreamEvent::Token {
                 id: token,
                 step: generated.len(),
@@ -1802,6 +1806,7 @@ fn pipelined_steps<T: SpeculativeTarget + ?Sized>(
         let end = if config.stop_tokens.contains(&token) {
             Some(FinishReason::StopToken)
         } else {
+            core_llm::report_generation_phase(core_llm::GenerationPhase::Generating);
             on_event(StreamEvent::Token {
                 id: token,
                 step: generated.len(),

@@ -72,6 +72,7 @@ pub mod paging;
 pub mod prefix;
 pub mod prepare;
 pub mod prism;
+pub mod progress;
 pub mod registry;
 pub mod report;
 pub mod request;
@@ -137,6 +138,11 @@ pub use prism::{
     PrismHadamardMetadata, PrismPackedKind, PrismPackedMatrixRef, PrismTransformRole,
     PrismWeightTransform, PRISM_AFFINE_WORDS_PER_BLOCK, PRISM_GROUP_SIZE, PRISM_PQ2_0_GGML_TYPE,
     PRISM_PTQ1_0_GGML_TYPE,
+};
+pub use progress::{
+    install_generation_batch_progress, report_generation_phase, report_generation_phase_for,
+    GenerationBatchProgressGuard, GenerationPhase, GenerationProgressGuard,
+    GenerationProgressObserver, GenerationProgressScope,
 };
 pub use registry::{
     ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,

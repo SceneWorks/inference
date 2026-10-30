@@ -104,6 +104,13 @@ pub trait TextLlm {
     /// Generate, streaming a [`StreamEvent`] per token through `on_event`, and returning the final
     /// [`TextLlmOutput`]. The terminal [`StreamEvent::Done`] carries the same finish reason + usage
     /// as the returned output.
+    ///
+    /// When [`TextLlmRequest::progress`] is present, install it with
+    /// [`TextLlmRequest::install_progress`] while synchronous generation executes. Shared seams
+    /// report actual tokenization, uncached prefill and continuation work; reused/precomputed
+    /// conditioning must not synthesize a prefill phase. The guard clears the sink on every exit.
+    /// Never retain a thread-bound installation across an asynchronous suspension; carry the
+    /// request-owned observer to the execution thread and install it only there.
     fn generate(
         &self,
         req: &TextLlmRequest,

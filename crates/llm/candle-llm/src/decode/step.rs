@@ -579,6 +579,78 @@ mod tests {
     }
 
     #[test]
+    fn progress_clears_failed_prefill_and_skips_pre_cancelled_work() {
+        use core_llm::{GenerationPhase, GenerationProgressObserver, TextLlmRequest};
+        use std::sync::{Arc, Mutex};
+        // Control mock: fail before allocating a tensor or executing any kernel/model operation.
+        struct RefusePrefill;
+        impl StepModel for RefusePrefill {
+            type Cache = CounterCache;
+            fn new_cache(&self) -> CounterCache {
+                CounterCache(0)
+            }
+            fn device(&self) -> &Device {
+                &Device::Cpu
+            }
+            fn vocab_size(&self) -> usize {
+                4
+            }
+            fn forward_step(
+                &self,
+                _: &mut CounterCache,
+                request: StepRequest<'_>,
+            ) -> Result<StepOutput> {
+                assert!(request.prefill);
+                Err(Error::Msg("control mock: prefill refused".into()))
+            }
+        }
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let observed = phases.clone();
+        let req = TextLlmRequest {
+            progress: Some(GenerationProgressObserver::new(move |phase| {
+                observed.lock().unwrap().push(phase)
+            })),
+            ..Default::default()
+        };
+        let config = GenerationConfig {
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+        {
+            let _progress = req.install_progress();
+            assert!(generate_step(
+                &RefusePrefill,
+                &[1, 2],
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None
+            )
+            .is_err());
+        }
+        assert_eq!(
+            *phases.lock().unwrap(),
+            vec![Some(GenerationPhase::Prefilling), None]
+        );
+        phases.lock().unwrap().clear();
+        {
+            let _progress = req.install_progress();
+            let cancelled = CancelFlag::new();
+            cancelled.cancel();
+            assert!(generate_step(
+                &RefusePrefill,
+                &[1, 2],
+                &config,
+                &cancelled,
+                &mut |_| {},
+                None
+            )
+            .is_err());
+        }
+        assert_eq!(*phases.lock().unwrap(), vec![None]);
+    }
+
+    #[test]
     fn stop_token_and_cancel_follow_the_reference_contract() {
         let model = counter();
         let cfg = GenerationConfig {

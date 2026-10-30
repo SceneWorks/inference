@@ -562,6 +562,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
             let cache = owned.insert(model.new_cache_for(capacity, drafts)?);
             // A prompt prefill: no position inside it is ever rolled back to (sc-24446).
+            core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
             let out = model.forward_step(
                 cache,
                 StepRequest::last(prompt_ids)
@@ -614,6 +615,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     }
     if let Some(boundary) = on_prefill_complete.as_mut() {
         boundary()?;
+        core_llm::report_generation_phase(core_llm::GenerationPhase::Generating);
     }
 
     let mut rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
@@ -697,6 +699,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     if let Some(c) = constraint.as_mut() {
         c.accept(first);
     }
+    core_llm::report_generation_phase(core_llm::GenerationPhase::Generating);
     on_event(StreamEvent::Token { id: first, step: 0 });
     generated.push(first);
     history.push(first);
@@ -921,6 +924,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             if let Some(c) = constraint.as_mut() {
                 c.accept(token);
             }
+            core_llm::report_generation_phase(core_llm::GenerationPhase::Generating);
             on_event(StreamEvent::Token {
                 id: token,
                 step: generated.len(),

@@ -169,6 +169,8 @@ impl Tokenizer {
     /// Encode `text` to token ids. `add_special_tokens` controls auto BOS/EOS per the tokenizer's
     /// post-processor; special-token *strings* already present in `text` always map regardless.
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+        let _progress =
+            crate::GenerationProgressScope::enter(crate::GenerationPhase::EncodingPrompt);
         let enc = self
             .inner
             .encode(text, add_special_tokens)
@@ -339,6 +341,30 @@ mod tests {
 
     fn tiny() -> Tokenizer {
         Tokenizer::from_json(TINY_JSON).unwrap()
+    }
+
+    #[test]
+    fn prompt_progress_is_scoped_to_actual_tokenization() {
+        use crate::{GenerationPhase, GenerationProgressObserver, TextLlmRequest};
+        use std::sync::{Arc, Mutex};
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let req = TextLlmRequest {
+            progress: Some(GenerationProgressObserver::new(move |phase| {
+                sink.lock().unwrap().push(phase)
+            })),
+            ..Default::default()
+        };
+        let tokenizer = tiny();
+        let _request = req.install_progress();
+        assert_eq!(tokenizer.encode("hello world", false).unwrap(), vec![1, 2]);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![Some(GenerationPhase::EncodingPrompt), None]
+        );
+        // Detokenizing continuation text must not re-label it as prompt encoding.
+        assert_eq!(tokenizer.decode(&[1, 2], false).unwrap(), "hello world");
+        assert_eq!(events.lock().unwrap().len(), 2);
     }
 
     #[test]
