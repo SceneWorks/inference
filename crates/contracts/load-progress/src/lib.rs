@@ -41,6 +41,30 @@ struct Request {
     consumed: HashMap<(LoadActivityPhase, PathBuf), u64>,
 }
 
+impl Request {
+    fn aggregate(&self, activity: &mut LoadActivity) {
+        if self.files.contains_key(&activity.file) {
+            let (bytes, total) = self
+                .files
+                .iter()
+                .filter(|(_, (component, _))| *component == activity.component)
+                .fold((0u64, 0u64), |(b, t), (path, (_, size))| {
+                    (
+                        b.saturating_add(
+                            self.consumed
+                                .get(&(activity.phase, path.clone()))
+                                .copied()
+                                .unwrap_or(0),
+                        ),
+                        t.saturating_add(*size),
+                    )
+                });
+            activity.component_bytes_read = bytes;
+            activity.component_total_bytes = Some(total);
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct LoadActivityContext {
     request: Arc<Mutex<Request>>,
@@ -186,6 +210,16 @@ impl LoadActivityContext {
         path: impl AsRef<Path>,
         total_bytes: Option<u64>,
     ) -> LoadActivityFile {
+        self.file_with_bytes(phase, path, total_bytes, 0)
+    }
+    /// Resume an interval of an existing reader without briefly publishing a false zero.
+    pub fn file_with_bytes(
+        &self,
+        phase: LoadActivityPhase,
+        path: impl AsRef<Path>,
+        total_bytes: Option<u64>,
+        bytes_read: u64,
+    ) -> LoadActivityFile {
         let file = absolute(path.as_ref());
         let id = {
             let mut r = self.request.lock().unwrap_or_else(|e| e.into_inner());
@@ -196,7 +230,7 @@ impl LoadActivityContext {
             phase,
             component: self.component(&file),
             file,
-            bytes_read: 0,
+            bytes_read,
             total_bytes,
             component_bytes_read: 0,
             component_total_bytes: None,
@@ -210,7 +244,7 @@ impl LoadActivityContext {
                 state: Mutex::new(Some(activity)),
             }),
         };
-        handle.update(0);
+        handle.update(bytes_read);
         handle
     }
 }
@@ -276,11 +310,14 @@ impl FileState {
             if r.active != self.id {
                 return;
             }
-            let next = r
+            let mut next = r
                 .activities
                 .iter()
                 .max_by_key(|(_, (order, _))| order)
                 .map(|(id, (_, activity))| (*id, activity.clone()));
+            if let Some((_, activity)) = &mut next {
+                r.aggregate(activity);
+            }
             r.active = next.as_ref().map(|(id, _)| *id).unwrap_or(0);
             (r.observer.clone(), next.map(|(_, activity)| activity))
         };
@@ -341,24 +378,7 @@ impl LoadActivityFile {
                 .entry((activity.phase, activity.file.clone()))
                 .or_default();
             *consumed = (*consumed).max(activity.bytes_read);
-            if r.files.contains_key(&activity.file) {
-                let selected = r
-                    .files
-                    .iter()
-                    .filter(|(_, (component, _))| *component == activity.component);
-                let (bytes, total) = selected.fold((0u64, 0u64), |(b, t), (path, (_, size))| {
-                    (
-                        b + r
-                            .consumed
-                            .get(&(activity.phase, path.clone()))
-                            .copied()
-                            .unwrap_or(0),
-                        t + size,
-                    )
-                });
-                activity.component_bytes_read = bytes;
-                activity.component_total_bytes = Some(total);
-            }
+            r.aggregate(&mut activity);
             r.next += 1;
             let order = r.next;
             r.activities
@@ -389,6 +409,32 @@ impl LoadActivityFile {
 mod tests {
     use super::*;
     #[test]
+    fn panic_ends_file_activity_and_restores_the_enclosing_request() {
+        let outer = Arc::new(Mutex::new(Vec::new()));
+        let out = outer.clone();
+        let _observer = LoadActivityObserver::new(move |v| out.lock().unwrap().push(v));
+        let inner = Arc::new(Mutex::new(Vec::new()));
+        let out = inner.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _observer = LoadActivityObserver::new(move |v| out.lock().unwrap().push(v));
+            let _file = LoadActivityScope::file(LoadActivityPhase::Verifying, "inner", Some(10));
+            panic!("source reader failed");
+        });
+        assert!(result.is_err());
+        assert_eq!(inner.lock().unwrap().last(), Some(&None));
+        let file = LoadActivityScope::file(LoadActivityPhase::Loading, "outer", Some(10));
+        file.update(10);
+        file.finish();
+        let events = outer.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(events
+            .iter()
+            .flatten()
+            .all(|v| v.phase == LoadActivityPhase::Loading));
+        assert_eq!(events.last(), Some(&None));
+    }
+
+    #[test]
     fn captured_context_isolated_from_other_requests_and_unwinds() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let out = events.clone();
@@ -413,6 +459,35 @@ mod tests {
         assert_eq!(events[1].as_ref().unwrap().bytes_read, 100);
         assert_eq!(events.last(), Some(&None));
     }
+    #[test]
+    fn restoring_a_shard_uses_the_latest_component_total_and_request_ids_are_stable() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let out = events.clone();
+        let _observer = LoadActivityObserver::new(move |v| out.lock().unwrap().push(v));
+        let context = LoadActivityContext::capture()
+            .with_components([(PathBuf::from("component"), "tower".into())]);
+        assert_eq!(context.request_id(), context.clone().request_id());
+        assert_ne!(
+            context.request_id(),
+            LoadActivityContext::default().request_id()
+        );
+        context.register_files([
+            (PathBuf::from("component/a"), 100),
+            (PathBuf::from("component/b"), 100),
+        ]);
+        let a = context.file(LoadActivityPhase::Loading, "component/a", Some(100));
+        a.update(27);
+        let b = context.file(LoadActivityPhase::Loading, "component/b", Some(100));
+        b.update(50);
+        b.finish();
+        let events = events.lock().unwrap();
+        let restored = events.last().unwrap().as_ref().unwrap();
+        assert_eq!(restored.component_bytes_read, 77);
+        assert_eq!(restored.component_total_bytes, Some(200));
+        drop(events);
+        a.finish();
+    }
+
     #[test]
     fn ending_latest_parallel_read_restores_still_running_source() {
         let events = Arc::new(Mutex::new(Vec::new()));

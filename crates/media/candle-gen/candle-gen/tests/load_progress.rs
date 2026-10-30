@@ -112,3 +112,52 @@ fn explicit_shards_aggregate_and_repeated_views_do_not_count_twice() {
         .all(|v| v.component_total_bytes == Some(size)));
     assert!(LoadActivityContext::capture().is_observed());
 }
+
+#[test]
+fn cached_mapped_reader_routes_consumption_to_the_evaluating_request_and_retains_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("selected.safetensors");
+    let size = fixture(&path);
+    let a = Arc::new(Mutex::new(Vec::new()));
+    let out = a.clone();
+    let mapped = {
+        let _observer = LoadActivityObserver::new(move |v| out.lock().unwrap().push(v));
+        let context = LoadActivityContext::capture()
+            .with_components([(path.clone(), "auxiliary tower".into())]);
+        let _attribution = context.install();
+        // SAFETY: fixture is immutable while any mapping or view exists.
+        unsafe { MmapedSafetensors::new(&path) }.unwrap()
+    };
+    let header = max_bytes(&a.lock().unwrap());
+    let prior_a = a.lock().unwrap().len();
+    let b = Arc::new(Mutex::new(Vec::new()));
+    let out = b.clone();
+    let context = {
+        let _observer = LoadActivityObserver::new(move |v| out.lock().unwrap().push(v));
+        LoadActivityContext::capture()
+    };
+    std::thread::spawn(move || {
+        let _observer = context.install();
+        for (_, view) in mapped.tensors() {
+            view.load(&Device::Cpu).unwrap();
+        }
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        a.lock().unwrap().len(),
+        prior_a,
+        "B's evaluation cannot post into A"
+    );
+    let reports = b.lock().unwrap();
+    assert_eq!(
+        max_bytes(&reports),
+        size - header,
+        "B only consumed payload; A already parsed the header"
+    );
+    assert!(reports
+        .iter()
+        .flatten()
+        .all(|v| v.component == "auxiliary tower"));
+    assert_eq!(reports.last(), Some(&None));
+}

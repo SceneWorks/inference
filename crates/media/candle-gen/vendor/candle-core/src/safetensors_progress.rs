@@ -72,9 +72,13 @@ impl MappedRead {
         } else {
             self.context.clone()
         };
-        let activity = context.file(phase, &self.path, Some(self.len as u64));
         let request = context.request_id();
-        activity.update(self.consumed(request, phase));
+        let activity = context.file_with_bytes(
+            phase,
+            &self.path,
+            Some(self.len as u64),
+            self.consumed(request, phase),
+        );
         Consumption {
             request,
             phase,
