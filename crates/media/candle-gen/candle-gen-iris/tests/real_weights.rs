@@ -19,10 +19,6 @@
 use std::path::PathBuf;
 
 use candle_gen::candle_core::{DType, Device};
-use candle_gen::gen_core::iris::{
-    GenerationParams, IrisConfig, PROMPT_PREFIX, PROMPT_SUFFIX, TEXT_ENCODER_COMPONENT,
-};
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
     CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, PreviewSink, Progress, WeightsSource,
 };
@@ -30,6 +26,10 @@ use candle_gen::testkit::{probe_gpu, used_mib, VramProbe};
 use candle_gen_iris::{
     denoise, encode, load_backbone, Conditioning, IrisTextEncoder, TextBatch, TextConditioning,
 };
+use gen_core_iris::{
+    GenerationParams, IrisConfig, PROMPT_PREFIX, PROMPT_SUFFIX, TEXT_ENCODER_COMPONENT,
+};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 
 use crate::common::{assert_close, errors, fixture, fixtures, host_i32, Fixture};
 

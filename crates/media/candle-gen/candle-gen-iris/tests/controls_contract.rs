@@ -6,11 +6,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use candle_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
 use candle_gen::gen_core::{
     AdapterKind, AdapterSpec, CaptionOverflowPolicy, Error as CoreError, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Precision, PreviewSink, WeightsSource,
 };
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 
 use crate::common::{fixtures, tiny_backbone, tiny_text_encoder};
 

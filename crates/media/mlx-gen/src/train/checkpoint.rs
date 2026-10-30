@@ -30,7 +30,7 @@ use std::rc::Rc;
 
 use mlx_rs::Array;
 
-pub use gen_core::train::resume::{
+pub use gen_core_train::resume::{
     check_resume_fingerprints, request_fingerprint, training_config_fingerprint,
     REQUEST_FINGERPRINT_KEY, TRAINING_CONFIG_KEY,
 };

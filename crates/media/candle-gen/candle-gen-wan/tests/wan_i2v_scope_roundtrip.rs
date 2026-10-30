@@ -21,7 +21,8 @@ use candle_gen::gen_core::{
     MemoryStrategyParameters, WeightsSource,
 };
 use candle_gen_wan::i2v_memory_strategy as wan_memory;
-use gen_core::wan_i2v_memory::{self, WanI2vBackend};
+use gen_core_memory_wan as wan_i2v_memory;
+use gen_core_memory_wan::WanI2vBackend;
 
 const WIDTH: u32 = 832;
 const HEIGHT: u32 = 480;

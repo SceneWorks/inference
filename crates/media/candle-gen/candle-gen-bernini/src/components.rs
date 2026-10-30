@@ -6,12 +6,12 @@ use std::path::Path;
 use crate::ProviderVae;
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{AdapterSpec, MoeExpert};
 use candle_gen::{CandleError, Result as CResult};
 use candle_gen_wan::config::{TextEncoderConfig, TransformerConfig, Vae16Config};
 use candle_gen_wan::text_encoder::Umt5Encoder;
 use candle_gen_wan::transformer::WanTransformer;
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 
 const COMPONENT_PLAN: [(&str, DType); 4] = [
     ("text_encoder", DType::F32),

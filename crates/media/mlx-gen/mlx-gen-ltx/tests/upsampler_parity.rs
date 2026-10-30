@@ -29,7 +29,7 @@
 use mlx_rs::ops::{abs, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::gen_core::ltx_checkpoint::{LatentUpsamplerConfig, LatentUpsamplerMode};
+use gen_core_ltx::ltx_checkpoint::{LatentUpsamplerConfig, LatentUpsamplerMode};
 use mlx_gen::testing::peak_rel;
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::upsampler::{upsample_latents, LatentUpsampler};

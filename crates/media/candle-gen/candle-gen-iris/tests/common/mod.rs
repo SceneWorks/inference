@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::iris::IrisConfig;
+use gen_core_iris::IrisConfig;
 
 /// The MLX twin's `tests/fixtures/` — produced once by `crates/media/mlx-gen/tools/dump_iris_*.py`
 /// from the pinned upstream and read by both backends.

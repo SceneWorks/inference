@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mlx_gen::gen_core::iris::depth::{
+use gen_core_iris::depth::{
     colorize_inferno, near_bright_control_image, plan_depth_input, prepare_depth_input, DepthMap,
     DepthOutput, DepthRequest, DepthResolution, IrisDepthEstimator,
 };
@@ -191,7 +191,7 @@ fn real_depth_matches_upstream_full_resolution() {
         image.width,
         image.height,
         DepthResolution::default(),
-        mlx_gen::gen_core::iris::IrisConfig::from_dir(&env_dir("IRIS_WEIGHTS_DIR").join("depth"))
+        gen_core_iris::IrisConfig::from_dir(&env_dir("IRIS_WEIGHTS_DIR").join("depth"))
             .unwrap()
             .model
             .patch_size,

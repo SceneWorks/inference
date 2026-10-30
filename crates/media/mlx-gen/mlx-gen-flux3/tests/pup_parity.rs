@@ -13,11 +13,14 @@
 
 use std::sync::{Arc, Mutex};
 
-use mlx_gen::gen_core::core_llm::{Channel, StreamEvent};
-use mlx_gen::gen_core::flux3::pup::{
-    self, plan_text, PromptUpsampler, UpsampleMode, UpsampleOptions, UpsamplePlan,
-    UPSAMPLER_COMPONENT,
+use gen_core_flux3::{
+    pup,
+    pup::{
+        plan_text, PromptUpsampler, UpsampleMode, UpsampleOptions, UpsamplePlan,
+        UPSAMPLER_COMPONENT,
+    },
 };
+use mlx_gen::gen_core::core_llm::{Channel, StreamEvent};
 use mlx_gen::gen_core::{
     core_llm, Error as CoreError, Progress, PromptEnhancementOutcome, PromptEnhancementReport,
     PromptEnhancementSink,
@@ -276,7 +279,7 @@ fn the_golden_was_dumped_from_the_pinned_upsampler() {
     }
     assert_eq!(
         meta(&g, "code_commit"),
-        mlx_gen::gen_core::flux3::UPSTREAM_CODE_REVISION
+        gen_core_flux3::UPSTREAM_CODE_REVISION
     );
     // The miniature snapshot is the package layout: every required file, the Qwen3.5 config.
     pup::UpsamplePackage::check(&tiny_snapshot()).unwrap();

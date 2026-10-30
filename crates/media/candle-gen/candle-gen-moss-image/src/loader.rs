@@ -2,12 +2,13 @@
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
-    self, moss_image::*, weightsmeta, CancelFlag, LoadSpec, PinnedWeightsFile, WeightsSource,
+    self, weightsmeta, CancelFlag, LoadSpec, PinnedWeightsFile, WeightsSource,
 };
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
 use candle_gen_flux2::vae::{Flux2Vae, Flux2VaeDecoderConfig};
 use candle_llm::models::qwen35::{Qwen35Config, Qwen35Model};
+use gen_core_moss_image::moss_image::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;

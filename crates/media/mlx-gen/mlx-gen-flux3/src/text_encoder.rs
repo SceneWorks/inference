@@ -2,16 +2,16 @@
 //! (`TextEncoder.encode`).
 //!
 //! * The prompt is wrapped in the chat template (single user turn + generation prompt, no system
-//!   turn: [`gen_core::flux3::chat_text`]) and tokenized **as one string** with the pinned
+//!   turn: [`gen_core_flux3::chat_text`]) and tokenized **as one string** with the pinned
 //!   tokenizer (`tokenizer(text, truncation=True, max_length=4096)`).
 //! * The window is right-padded with `<|endoftext|>` to the next multiple of 80 (never beyond
 //!   4096); the pads carry `attention_mask = 0` and position id **1**
-//!   ([`gen_core::flux3::assemble_window`]).
+//!   ([`gen_core_flux3::assemble_window`]).
 //! * The language tower is the shared generic decoder [`mlx_llm::CausalLm`] (the `qwen3_vl`
 //!   architecture: GQA 32/8, per-head q/k RMSNorm, SwiGLU, θ = 5e6; interleaved mRoPE collapses
 //!   to 1-D for a text-only prompt). It runs in bf16, the release's `text_encoder.dtype`.
 //! * Upstream runs the **padded** sequence: every query (the pads included) attends the real
-//!   keys causally and no pad key ([`gen_core::flux3::padded_causal_additive`]). The pad rows are
+//!   keys causally and no pad key ([`gen_core_flux3::padded_causal_additive`]). The pad rows are
 //!   therefore NOT zero — they are the pad token's state at position 1 over the real keys — and
 //!   the DiT attends them as ordinary text tokens, so the port computes them exactly the same
 //!   way rather than zeroing or dropping them.
@@ -22,12 +22,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use gen_core::flux3::{
+use gen_core::safetensors_shards::{resolve_indexed_safetensors_shards, snapshot_shard_roots};
+use gen_core_flux3::{
     assemble_window, chat_text, padded_causal_additive, text_ids, TextEncoderConfig, TextWindow,
     PAD_TOKEN,
 };
-use gen_core::safetensors_shards::{resolve_indexed_safetensors_shards, snapshot_shard_roots};
-use gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::gen_core;
 use mlx_gen::{Error, Result};
 use mlx_llm::primitives::attention::AttnMask;
@@ -128,7 +128,7 @@ impl Flux3TextEncoder {
             return Err(Error::Unsupported(format!(
                 "flux3: {} is not a Qwen3-VL checkpoint (the DiT was trained on {})",
                 dir.display(),
-                gen_core::flux3::TEXT_ENCODER_UPSTREAM_REPO
+                gen_core_flux3::TEXT_ENCODER_UPSTREAM_REPO
             )));
         }
         let hidden = model_cfg.hidden_size as usize;

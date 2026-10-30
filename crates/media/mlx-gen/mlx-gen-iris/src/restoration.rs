@@ -7,16 +7,19 @@
 //!
 //! Everything around the forward — the input budget, the bicubic upsample, small-image enlargement,
 //! padding, 50 %-overlap tiling with upstream's Gaussian fusion, the wavelet colour fix and the 8-bit
-//! quantization — is the backend-neutral [`gen_core::iris::restoration`] driver, shared with the
+//! quantization — is the backend-neutral [`gen_core_iris::restoration`] driver, shared with the
 //! Candle twin. This crate supplies only the one-step velocity of each tile.
 //!
-//! [`gen_core::iris::restoration`]: mlx_gen::gen_core::iris::restoration
+//! [`gen_core_iris::restoration`]: gen_core_iris::restoration
 
-use gen_core::iris::restoration::{
-    self as contract, plan_request_metadata, restore, RestorationPlan, RestorationPlanMetadata,
-    RestorationResources, RestorationSettings, TileGeometry, DEFAULT_SCALE, INPUT_BUDGET,
+use gen_core_iris::{
+    restoration as contract,
+    restoration::{
+        plan_request_metadata, restore, RestorationPlan, RestorationPlanMetadata,
+        RestorationResources, RestorationSettings, TileGeometry, DEFAULT_SCALE, INPUT_BUDGET,
+    },
 };
-use gen_core::iris::{IrisConfig, FAMILY};
+use gen_core_iris::{IrisConfig, FAMILY};
 use mlx_gen::{
     gen_core, Error, Image, LoadSpec, Progress, Result, Transform, TransformCapabilities,
     TransformDescriptor, TransformRegistration, TransformRequest,
@@ -180,7 +183,7 @@ impl IrisRestorer {
         let states = Array::from_slice(&prompt.embeddings, &shape);
         eval([&states])?;
         let memory_strategy = crate::memory_strategy::export_contract(
-            gen_core::iris::IrisTask::Restoration,
+            gen_core_iris::IrisTask::Restoration,
             spec.precision,
             tier,
             &resources.export,
@@ -357,7 +360,7 @@ pub(crate) fn tile_scratch(elements: u64) -> u64 {
     mlx_gen::ios_quantum::tensor_bytes(4, &[3, elements])
 }
 
-/// The restoration driver's host planes ([`gen_core::iris::restoration`]'s `run_restoration`),
+/// The restoration driver's host planes ([`gen_core_iris::restoration`]'s `run_restoration`),
 /// counted from its allocations. Every plane is f32 (4 B) over `O` output, `R` processing and `P`
 /// padded pixels (three channels: `3·O` …); a tile is `t²` pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -408,7 +411,7 @@ pub(crate) fn host_plane_bytes(plan: &RestorationPlan) -> Result<HostPlanes> {
 /// Count source-owned payloads at their actual coincident stages. This is not an allocator/driver
 /// physical lower bound: CPU MLX counters cannot observe these Rust host planes.
 pub fn host_plane_bytes_metadata(plan: &RestorationPlanMetadata) -> Result<HostPlanes> {
-    let px = |d: gen_core::iris::restoration::Dims| u128::from(d.width) * u128::from(d.height);
+    let px = |d: gen_core_iris::restoration::Dims| u128::from(d.width) * u128::from(d.height);
     let (i, o, r, p) = (
         px(plan.input),
         px(plan.output),
@@ -571,7 +574,7 @@ mod tests {
     /// worker planes, the padded input, or the single pass's restored canvas).
     #[test]
     fn host_planes_are_counted_from_the_drivers_allocations() {
-        use gen_core::iris::restoration::{plan, Dims, RestorationOptions};
+        use gen_core_iris::restoration::{plan, Dims, RestorationOptions};
         use mlx_gen::InputSizing;
         let options = |scale: f64, color_fix: bool| RestorationOptions {
             scale,

@@ -7,8 +7,8 @@ pub mod trainer;
 use std::collections::BTreeMap;
 
 use candle_gen::candle_core::{DType, Tensor, Var};
-use candle_gen::gen_core::flux3::training::{lora_targets, LoraTarget};
 use candle_gen::{CandleError, Result};
+use gen_core_flux3::training::{lora_targets, LoraTarget};
 
 use crate::{Flux3Dit, SampleTokens};
 

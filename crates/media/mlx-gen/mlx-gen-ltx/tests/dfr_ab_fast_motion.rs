@@ -169,7 +169,7 @@ fn dfr_ab_fast_motion_records_detail_retention() {
     // --- Text phase (encoder loads, encodes, drops before the DiT materializes) -----------------
     let te_path = dir.join("text_encoder.safetensors");
     let connector_w = Weights::from_file(dir.join("connector.safetensors")).expect("connector");
-    let checkpoint = mlx_gen::gen_core::ltx_checkpoint::LtxCheckpointMetadata::from_file(
+    let checkpoint = gen_core_ltx::ltx_checkpoint::LtxCheckpointMetadata::from_file(
         dir.join("transformer.safetensors"),
     )
     .expect("transformer metadata");
@@ -272,7 +272,7 @@ fn dfr_ab_fast_motion_records_detail_retention() {
 
     // --- Arm B: DFR (canvas slots + detailing re-denoise + temporal rounds) ---------------------
     let (canvas_frames, _segment, keyframe_positions) =
-        mlx_gen::gen_core::ltx_dfr::resolve_canvas(FRAMES, 8).expect("canvas");
+        gen_core_ltx::ltx_dfr::resolve_canvas(FRAMES, 8).expect("canvas");
     assert_eq!(canvas_frames, FRAMES, "121 frames needs no canvas padding");
     let parts = DfrComponents {
         dit: &dit,

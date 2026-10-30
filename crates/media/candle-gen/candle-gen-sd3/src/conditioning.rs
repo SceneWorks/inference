@@ -272,7 +272,7 @@ impl Sd3TextEncoders {
     ) -> CandleResult<Self> {
         // Resolve checkpoint identity before tokenizer/config parsing so every route fails at the
         // same trust boundary and both tensor backends consume the exact same master family.
-        let artifacts = candle_gen::gen_core::resolve_sd3_text_encoder_artifacts(root)
+        let artifacts = gen_core_family::resolve_sd3_text_encoder_artifacts(root)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
         let cfg_l = clip::Config::sdxl(); // CLIP-L (openai/clip-vit-large-patch14, embed 768)
         let cfg_g = clip::Config::sdxl2(); // OpenCLIP bigG (embed 1280)

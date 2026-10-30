@@ -10,7 +10,7 @@
 //!
 //! [`Ltx25Tokenizer`] is the **2.5** path (Gemma 4), built from the tokenizer packed **inside** the
 //! single-file text encoder — no separate Gemma snapshot at all (sc-18762). Both run the same
-//! `gen_core::tokenizer::ensure_single_leading_bos` policy, because the two generations break
+//! `gen_core_tokenizer::ensure_single_leading_bos` policy, because the two generations break
 //! differently: Gemma 4's `tokenizer.json` post-processor emits no `<bos>` (measured), while
 //! Gemma 3's emits one and would be double-BOSed by an unconditional prepend.
 
@@ -18,8 +18,8 @@ use std::path::Path;
 
 use mlx_rs::Array;
 
-pub use mlx_gen::gen_core::gemma_assets::GemmaAssets;
-use mlx_gen::gen_core::gemma_assets::LtxGemmaTokenizer;
+pub use gen_core_ltx::gemma_assets::GemmaAssets;
+use gen_core_ltx::gemma_assets::LtxGemmaTokenizer;
 use mlx_gen::tokenizer::{
     ensure_single_leading_bos, to_arrays, ChatTemplate, TextTokenizer, TokenizerConfig,
 };
@@ -30,7 +30,7 @@ use mlx_gen::{Error, Result};
 /// re-deriving them. [`GemmaTeKeyMap`] accepts the ComfyUI-flattened and the legacy HF tower
 /// spellings and turns every missed lookup into an error — the strict counterpart to the non-strict
 /// load that once left 11 tower tensors at random init.
-pub use mlx_gen::gen_core::gemma_assets::{
+pub use gen_core_ltx::gemma_assets::{
     flatten_gemma4_unified_key, is_gemma_asset_key, GemmaTeKeyMap,
 };
 

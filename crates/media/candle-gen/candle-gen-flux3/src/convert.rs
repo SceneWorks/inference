@@ -2,18 +2,18 @@
 //!
 //! The source rules, streamed deterministic layout, atomic publication, full-checksum receipt and
 //! EXTERNAL encoder/autoencoder placement are the backend-neutral
-//! [`gen_core::flux3::native_convert`]. The one Candle-specific step is the pack: each source FP8
+//! [`gen_core_flux3::native_convert`]. The one Candle-specific step is the pack: each source FP8
 //! target projection is quantized from its stored dense values by Candle's own GGML quantizer, so
 //! the bytes are exactly what [`crate::nn::Loader`] reads back into a `QTensor`.
 use std::path::Path;
 
 use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
-use candle_gen::gen_core::flux3::conversion::ConversionReceipt;
-pub use candle_gen::gen_core::flux3::native_convert::ConversionSource;
-use candle_gen::gen_core::flux3::native_convert::{convert_native, Packed};
 use candle_gen::gen_core::{self, CancelFlag};
+use gen_core_flux3::artifacts::NativeDitStorage;
+use gen_core_flux3::conversion::ConversionReceipt;
+pub use gen_core_flux3::native_convert::ConversionSource;
+use gen_core_flux3::native_convert::{convert_native, Packed};
 
 type CoreResult<T> = gen_core::Result<T>;
 
@@ -79,9 +79,9 @@ pub fn convert_ggml(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use candle_gen::gen_core::flux3::conversion::ComponentRole;
-    use candle_gen::gen_core::flux3::DIT_WEIGHTS_FILE;
     use candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
+    use gen_core_flux3::conversion::ComponentRole;
+    use gen_core_flux3::DIT_WEIGHTS_FILE;
     use std::path::PathBuf;
 
     fn fixture_root() -> PathBuf {
@@ -108,8 +108,8 @@ pub(crate) mod tests {
         std::fs::write(root.join("NOTICE.md"), b"notice").unwrap();
         ConversionSource {
             root,
-            repository: gen_core::flux3::DISTILLED_WEIGHTS_REPO.into(),
-            revision: gen_core::flux3::DISTILLED_WEIGHTS_REVISION.into(),
+            repository: gen_core_flux3::DISTILLED_WEIGHTS_REPO.into(),
+            revision: gen_core_flux3::DISTILLED_WEIGHTS_REVISION.into(),
         }
     }
 
@@ -122,7 +122,7 @@ pub(crate) mod tests {
     fn ggml_conversion_writes_candles_exact_blocks_deterministically() {
         let dir = tempfile::tempdir().unwrap();
         let source = source_copy(dir.path());
-        let src = gen_core::flux3::safetensors_stream::SafetensorsSource::open(
+        let src = gen_core_flux3::safetensors_stream::SafetensorsSource::open(
             &source.root.join(DIT_WEIGHTS_FILE),
         )
         .unwrap();
@@ -138,13 +138,13 @@ pub(crate) mod tests {
                 std::fs::read(two.join(DIT_WEIGHTS_FILE)).unwrap()
             );
             assert_eq!(
-                gen_core::flux3::conversion::open_conversion(&one).unwrap(),
+                gen_core_flux3::conversion::open_conversion(&one).unwrap(),
                 r1
             );
             r1.verify_external(&source.root).unwrap();
             assert!(!one.join("ae.safetensors").exists());
             assert_eq!(NativeDitStorage::from_package(&one).unwrap(), storage);
-            let cfg = gen_core::flux3::resolve_checkpoint(&one).unwrap();
+            let cfg = gen_core_flux3::resolve_checkpoint(&one).unwrap();
             storage
                 .validate_headers(
                     &cfg.dit,
@@ -160,7 +160,7 @@ pub(crate) mod tests {
                 dit.quantized_targets.len(),
                 storage.packed_targets(&cfg.dit).unwrap().len()
             );
-            let out = gen_core::flux3::safetensors_stream::SafetensorsSource::open(
+            let out = gen_core_flux3::safetensors_stream::SafetensorsSource::open(
                 &one.join(DIT_WEIGHTS_FILE),
             )
             .unwrap();

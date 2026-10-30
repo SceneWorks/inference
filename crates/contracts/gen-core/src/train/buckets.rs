@@ -81,7 +81,8 @@ type ShuffledEpoch = (usize, Vec<(usize, usize)>);
 impl BucketSchedule {
     /// Shared Fisher–Yates engine for versioned, domain-separated rectangular schedules.
     /// The legacy square shuffle keeps its historical seed construction unchanged.
-    pub(crate) fn shuffle_items<T>(items: &mut [T], seed: u64, epoch: u64, domain: u64) {
+    #[doc(hidden)]
+    pub fn shuffle_items<T>(items: &mut [T], seed: u64, epoch: u64, domain: u64) {
         let mut state = seed
             .wrapping_add(epoch.wrapping_mul(0xD6E8_FEB8_6659_FD93))
             .wrapping_add(domain.wrapping_mul(0xA076_1D64_78BD_642F));

@@ -7,19 +7,19 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device};
-use candle_gen::gen_core::iris::depth::{DepthRequest, DepthResolution};
-use candle_gen::gen_core::iris::downstream::{weights_metadata, EmptyPrompt, TaskExport};
-use candle_gen::gen_core::iris::train::depth::{
-    load_depth_sample, normalize_log_depth, DepthLossPlan, EMPTY_PROMPT_COMPONENT, ITEM_DEPTH_KEY,
-};
-use candle_gen::gen_core::iris::train::{
-    checkpoint_root, latest_checkpoint, read_checkpoint_state, OPTIONS_KEY,
-};
-use candle_gen::gen_core::iris::{IrisTask, TEXT_ENCODER_COMPONENT};
 use candle_gen::gen_core::{
     Error as CoreError, Image, LoadSpec, Precision, Trainer, TrainingConfig, TrainingItem,
     TrainingProgress, TrainingRequest, WeightsSource,
 };
+use gen_core_iris::depth::{DepthRequest, DepthResolution};
+use gen_core_iris::downstream::{weights_metadata, EmptyPrompt, TaskExport};
+use gen_core_iris::train::depth::{
+    load_depth_sample, normalize_log_depth, DepthLossPlan, EMPTY_PROMPT_COMPONENT, ITEM_DEPTH_KEY,
+};
+use gen_core_iris::train::{
+    checkpoint_root, latest_checkpoint, read_checkpoint_state, OPTIONS_KEY,
+};
+use gen_core_iris::{IrisTask, TEXT_ENCODER_COMPONENT};
 use serde_json::json;
 
 use crate::common::{fixtures, tiny_backbone, tiny_text_encoder};

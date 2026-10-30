@@ -1,0 +1,24 @@
+[package]
+name = "sceneworks-gen-core-image"
+version = "0.1.0"
+edition = "2021"
+description = "Tensor-free HDR image I/O (OpenEXR read/write, HLG master, 10-bit YUV packing) on top of the gen-core HDR colour policy."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["hdr", "exr", "image", "generative"]
+categories = ["science"]
+
+[lib]
+# Neutral import path: `use gen_core_image::…`, mirroring the `gen_core` lib-name convention.
+name = "gen_core_image"
+
+[dependencies]
+# The backend-neutral contract this crate builds on. Sibling crates depend on gen-core; gen-core
+# never depends on them (sc-27316). Tensor-free, like gen-core.
+sceneworks-gen-core = { workspace = true }
+# OpenEXR read/write for the HDR lane (sc-18790). Pure Rust; moves `f32` sample buffers and header
+# attributes only.
+exr = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

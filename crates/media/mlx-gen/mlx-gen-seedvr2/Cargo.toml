@@ -17,6 +17,7 @@ mlx-rs = { workspace = true }
 serde_json = { workspace = true }
 # Parallel host-only color correction; all MLX operations remain at the I/O boundary.
 rayon = "1"
+sceneworks-gen-core-family = { workspace = true }
 
 [dev-dependencies]
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
@@ -36,4 +37,4 @@ name = "integration"
 path = "tests/main.rs"
 
 [features]
-model-inference-proof = ["mlx-gen/model-inference-proof"]
+model-inference-proof = ["mlx-gen/model-inference-proof", "sceneworks-gen-core-family/model-inference-proof"]

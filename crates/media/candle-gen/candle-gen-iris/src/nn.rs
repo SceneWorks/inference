@@ -25,10 +25,10 @@ use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::{softmax, softmax_last_dim};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::iris;
 use candle_gen::gen_core::{CancelFlag, Quant};
 use candle_gen::quant::{LokrFactors, QLinear};
 use candle_gen::{CandleError as Error, Result};
+use gen_core_iris as iris;
 
 /// The dtype two operands meet at: themselves when they agree, f32 otherwise (the only two dtypes
 /// this graph carries are f32 and the compute dtype).
@@ -884,7 +884,7 @@ impl Rope {
     }
 
     /// [`Self::grid_2d`] under `model.rope_aspect` (`square = true`: each axis normalized to
-    /// `[0, scale]` on its own — `gen_core::iris::rope_2d_angles_aspect`).
+    /// `[0, scale]` on its own — `gen_core_iris::rope_2d_angles_aspect`).
     pub fn grid_2d_aspect(
         head_dim: usize,
         height: usize,

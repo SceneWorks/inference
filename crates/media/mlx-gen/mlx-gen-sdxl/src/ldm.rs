@@ -5,7 +5,7 @@ pub(crate) mod pricing;
 use std::collections::HashMap;
 use std::path::Path;
 
-use mlx_gen::gen_core::sdxl_ldm::{remap_sdxl_ldm_key, SdxlComponent, TensorRemap};
+use gen_core_family::sdxl_ldm::{remap_sdxl_ldm_key, SdxlComponent, TensorRemap};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::ops::split;

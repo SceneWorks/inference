@@ -7,8 +7,9 @@
 use crate::{loader::tensor_f32, transformer::Transformer};
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::candle_nn::{Linear, Module};
-use candle_gen::gen_core::{self, moss_image::MossImageVariant, moss_image_training as contract};
+use candle_gen::gen_core::{self, moss_image::MossImageVariant};
 use candle_gen::{CandleError, Result};
+use gen_core_moss_image::moss_image_training as contract;
 use std::collections::BTreeMap;
 
 fn invalid(message: impl Into<String>) -> CandleError {

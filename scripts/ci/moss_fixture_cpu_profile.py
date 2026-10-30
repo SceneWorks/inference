@@ -85,7 +85,8 @@ FRACTION_TESTS = tuple("train::config::memory_budget_tests::" + name for name in
     "fraction_uses_selected_total_not_free_or_safety_and_intersects_bytes",
     "fraction_invalid_values_and_sub_byte_caps_refuse_without_fallback",
     "fraction_cap_rounds_down_exactly_even_at_u64_max"))
-MASK_TESTS = tuple("train::subject_mask::tests::" + name for name in (
+# The subject-mask decode moved to `gen-core-train` with its tests (sc-27316).
+MASK_TESTS = tuple("subject_mask::tests::" + name for name in (
     "area_average_preserves_nonbinary_constants_and_convex_range",
     "area_average_partial_crop_matches_independent_integer_overlap_oracle",
     "area_average_f64_taps_keep_supported_host_scratch_layout"))
@@ -292,8 +293,13 @@ def compiled_core_controls(directory: Path, package: str, lib_name: str, names: 
 
 
 def contract_fraction_tests(directory: Path) -> dict:
-    return compiled_core_controls(directory, "sceneworks-gen-core", "gen_core", [*FRACTION_TESTS, *MASK_TESTS],
-                                  "contract", {"fraction": list(FRACTION_TESTS), "mask": list(MASK_TESTS)})
+    return compiled_core_controls(directory, "sceneworks-gen-core", "gen_core", list(FRACTION_TESTS),
+                                  "contract", {"fraction": list(FRACTION_TESTS)})
+
+
+def subject_mask_tests(directory: Path) -> dict:
+    return compiled_core_controls(directory, "sceneworks-gen-core-train", "gen_core_train", list(MASK_TESTS),
+                                  "mask", {"mask": list(MASK_TESTS)})
 
 
 def snapshot_reader_tests(directory: Path) -> dict:
@@ -373,6 +379,7 @@ def run(backend: str, directory: Path) -> dict:
         validate_batch(batch, result.returncode, baseline)
         evidence["actual_demand"] = batch["actual_demand"]
         evidence["fraction_contract"] = contract_fraction_tests(directory)
+        evidence["subject_mask_controls"] = subject_mask_tests(directory)
         evidence["snapshot_reader_controls"] = snapshot_reader_tests(directory)
         evidence["review_baselines"] = independent_tests(binary, evidence["expected_review_tests"], directory, "review-baseline")
         green_baselines = {r["test"] for r in evidence["review_baselines"] if r["status"] == "passed"}
@@ -407,6 +414,7 @@ def run(backend: str, directory: Path) -> dict:
                                            "red_compiler": red_record, "green_compiler": green_record,
                                            "red_resources": red_resources})
         evidence["passed"] = (batch["passed"] and evidence["fraction_contract"]["passed"]
+                              and evidence["subject_mask_controls"]["passed"]
                               and evidence["snapshot_reader_controls"]["passed"]
                               and all(r["status"] == "passed" for r in evidence["review_baselines"])
                               and all(m["status"] == "killed_and_restored" for m in evidence["mutations"]))

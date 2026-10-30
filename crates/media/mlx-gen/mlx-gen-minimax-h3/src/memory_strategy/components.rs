@@ -86,14 +86,14 @@ pub(super) fn dit_allocation(
     path: &std::path::Path,
     precision: mlx_gen::Precision,
     pruned: bool,
-) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::h3_memory::NativeComponentAllocation> {
+) -> mlx_gen::gen_core::Result<gen_core_h3::h3_memory::NativeComponentAllocation> {
     let width = if precision == mlx_gen::Precision::Fp32 {
         4
     } else {
         2
     };
     let mut allocation =
-        mlx_gen::gen_core::h3_memory::component_allocation(path, native_backend(), width, |h| {
+        gen_core_h3::h3_memory::component_allocation(path, native_backend(), width, |h| {
             if pruned
                 && (h.name == TABLE_KEY
                     || h.name.contains(".adaln_proj.linear.")

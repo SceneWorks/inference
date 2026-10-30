@@ -12,8 +12,8 @@
 use std::path::Path;
 
 use candle_gen::candle_core::Tensor;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::{CandleError, Result};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 
 use crate::gemma2::Gemma2;
 

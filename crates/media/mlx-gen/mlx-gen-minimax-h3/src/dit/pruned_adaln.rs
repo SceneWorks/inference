@@ -21,16 +21,14 @@
 //! Without those activation casts a BF16 stream is promoted before the next ConvRot quantizer.
 //!
 //! The complete reduced topology — and nothing else — is what
-//! [`mlx_gen::gen_core::pruned_adaln`] validates and hashes. Body weights and quantization codes are
+//! [`gen_core_h3::pruned_adaln`] validates and hashes. Body weights and quantization codes are
 //! deliberately **not** read or hashed here: the source-binding/ConvRot layers own those, and a
 //! second basis with identical shapes must still produce a different identity.
 
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::gen_core::pruned_adaln::{
-    interpolation_position, PrunedAdaLn, PruningIdentity, TABLE_KEY,
-};
+use gen_core_h3::pruned_adaln::{interpolation_position, PrunedAdaLn, PruningIdentity, TABLE_KEY};
 use mlx_gen::gen_core::weightsmeta::Dtype as GenDtype;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};

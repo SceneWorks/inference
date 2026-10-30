@@ -320,6 +320,14 @@ Future inference work should preserve these rules:
   `sceneworks-gen-core-dist` and the opt-in H3 host telemetry is
   `sceneworks-gen-core-telemetry` (sc-27316), each depending on `gen-core`, never
   the reverse;
+- family- and feature-specific host code lives in the same kind of sibling crate,
+  grouped by its consumers so a family's change rebuilds only that family:
+  `gen-core-train` (trainer helpers), `gen-core-tokenizer`, `gen-core-iris`,
+  `gen-core-flux3`, `gen-core-moss-image`, `gen-core-memory-wan`, `gen-core-h3`,
+  `gen-core-ltx`, `gen-core-checkpoint` (`.pth` reader, Supra2 converter),
+  `gen-core-image` (EXR/HDR I/O) and `gen-core-family` (small single-family
+  policy) (sc-27316). gen-core keeps only what the contract names — a request
+  field's type, a `Generator` method's argument — and the sibling re-exports it;
 - internal SceneWorks dependencies use workspace paths, not repository SHA pins;
 - provider registration is explicit—do not add `inventory` submissions or
   `force_link` anchors as a shortcut;

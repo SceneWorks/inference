@@ -6,11 +6,11 @@
 //! missing/incomplete task resources (the control surface itself is `controls_contract`). Mirrors the MLX
 //! twin's `generator_contract` case for case.
 
-use candle_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
 use candle_gen::gen_core::{
     CancelFlag, Error as CoreError, GenerationOutput, GenerationRequest, Generator, LoadSpec,
     OffloadPolicy, Progress, WeightsSource,
 };
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 
 use crate::common::{tiny_backbone, tiny_text_encoder};
 

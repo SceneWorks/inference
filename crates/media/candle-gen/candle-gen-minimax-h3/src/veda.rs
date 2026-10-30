@@ -1,6 +1,5 @@
 //! Request-local native Candle Veda. Default/off never constructs this runtime.
 use crate::denoise::PackedLayout;
-pub use candle_gen::gen_core::veda::contract;
 use candle_gen::{
     candle_core::{DType, Device, Tensor},
     gen_core::{VedaBudget, VedaExecutionReport, VedaRequest},
@@ -8,11 +7,16 @@ use candle_gen::{
     CandleError, Result,
 };
 use contract::{Budget, Bundle, Layout, Plan, TileShape, TILE};
+pub use gen_core_h3::veda::contract;
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 pub const COMPONENT: &str = "veda_predictor";
 pub use candle_gen::quant::veda_int8::KERNEL;
 pub type ReportSink = Rc<RefCell<VedaExecutionReport>>;
-use candle_gen::gen_core::veda::workspace::{self, Backend, LayoutSize, Limits};
+use candle_gen::gen_core::veda::workspace::Backend;
+use gen_core_h3::veda::{
+    workspace,
+    workspace::{LayoutSize, Limits},
+};
 struct Prepared {
     bundle: Bundle,
     plan: Plan,

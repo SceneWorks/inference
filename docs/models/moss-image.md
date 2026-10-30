@@ -1,7 +1,7 @@
 # MOSS-Image native contract (sc-26322)
 
 This foundation prepares native MLX and Candle providers; it does not register an executor.
-`gen_core::moss_image` is the backend-neutral authority for model identity, request resolution,
+`gen_core_moss_image::moss_image` is the backend-neutral authority for model identity, request resolution,
 precision policy, advanced inputs, tensor coverage and author sampling. Python is not a
 production dependency. Backend providers must call `MossImageResolved::resolve` before
 allocation and implement `MossImageAdvancedGenerator` beside the ordinary `Generator` API.

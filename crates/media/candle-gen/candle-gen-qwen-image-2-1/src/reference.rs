@@ -45,7 +45,7 @@ use candle_gen::gen_core::RgbaImage;
 use candle_gen::{CandleError as Error, Result};
 use candle_llm::image::Qwen35Preprocess;
 
-pub use candle_gen::gen_core::qwen_image_2_1::reference::*;
+pub use gen_core_family::qwen_image_2_1::reference::*;
 
 use crate::config::{VisionConfig, IMAGE_TOKENS_PER_SLOT, VAE_SCALE_FACTOR};
 

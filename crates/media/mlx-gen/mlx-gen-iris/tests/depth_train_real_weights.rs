@@ -14,11 +14,11 @@
 
 use std::path::{Path, PathBuf};
 
-use mlx_gen::gen_core::iris::depth::{colorize_inferno, DepthMap, DepthRequest, DepthResolution};
-use mlx_gen::gen_core::iris::train::depth::{
+use gen_core_iris::depth::{colorize_inferno, DepthMap, DepthRequest, DepthResolution};
+use gen_core_iris::train::depth::{
     load_depth_sample, normalize_log_depth, DepthLossPlan, ITEM_DEPTH_KEY,
 };
-use mlx_gen::gen_core::iris::train::OPTIONS_KEY;
+use gen_core_iris::train::OPTIONS_KEY;
 use mlx_gen::gen_core::{
     CancelFlag, Image, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
 };

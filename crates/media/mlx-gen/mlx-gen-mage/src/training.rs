@@ -527,16 +527,16 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
 fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
     // Shared control-training floor: a LoRA-only trainer must reject a control-branch request
     // (typed `Unsupported`) rather than silently training a plain adapter.
-    gen_core::train::validate_control_request(descriptor, req)?;
+    gen_core_train::validate_control_request(descriptor, req)?;
     // Shared full-base-fine-tune floor (sc-14056). This trainer advertises
     // `supports_full_finetune`, so the floor is a pass-through here — it is routed through
     // anyway so the capability claim and the acceptance stay one fact (and the conformance
     // suite's validate-honesty check exercises the same seam for every family).
-    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    gen_core_train::validate_full_finetune_request(descriptor, req)?;
     // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
     // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-    gen_core::train::validate_training_techniques(descriptor, req)?;
-    gen_core::train::validate_edit_request(descriptor, req)?;
+    gen_core_train::validate_training_techniques(descriptor, req)?;
+    gen_core_train::validate_edit_request(descriptor, req)?;
     validate_request(req)?;
     Ok(())
 }
@@ -583,7 +583,7 @@ impl Trainer for MageFlowTrainer {
     ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         let mut warnings = Vec::new();
         let output = self.train_impl(req, on_progress, &mut warnings)?;
         Ok(TrainingReport { output, warnings })
@@ -2155,13 +2155,13 @@ mod tests {
             },
         );
         assert!(
-            gen_core::train::validate_full_finetune_request(&desc, &req).is_ok(),
+            gen_core_train::validate_full_finetune_request(&desc, &req).is_ok(),
             "the Mage trainer advertises the full path, so the floor must admit it"
         );
 
         let mut adapter_only = desc;
         adapter_only.supports_full_finetune = false;
-        let err = gen_core::train::validate_full_finetune_request(&adapter_only, &req).unwrap_err();
+        let err = gen_core_train::validate_full_finetune_request(&adapter_only, &req).unwrap_err();
         assert!(
             matches!(err, gen_core::Error::Unsupported(_)),
             "a trainer without the full path must reject, not silently train an adapter, got {err:?}"
@@ -2881,7 +2881,7 @@ mod depth_anchoring_tests {
         req.config.depth_anchoring.model_dir = Some(tmp.path().join("da2"));
         req.config.perceptual_decoder_dir = None;
         let floor = |r: &TrainingRequest| {
-            gen_core::train::validate_training_techniques(&trainer_descriptor(), r)
+            gen_core_train::validate_training_techniques(&trainer_descriptor(), r)
         };
         assert!(floor(&req).is_ok(), "{:?}", floor(&req));
         req.config.full_finetune = true;

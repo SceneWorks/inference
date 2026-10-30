@@ -16,6 +16,9 @@ autotests = false
 candle-gen = { path = "../candle-gen" }
 # The host TCP collective transport of the distributed trainer (moved out of gen-core, sc-27316).
 sceneworks-gen-core-dist = { workspace = true }
+sceneworks-gen-core-iris = { workspace = true }
+sceneworks-gen-core-tokenizer = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 # The Qwen3-VL-4B language tower is the shared generic decoder (`candle_llm::CausalLm`, which already
 # reads the `qwen3_vl` VLM-nested layout and returns HF-ordered hidden states) — the same reuse the
 # MLX twin makes of `mlx_llm::CausalLm`. The `candle-gen-* -> candle-llm` direction is the
@@ -35,7 +38,7 @@ safetensors = "0.7"
 image = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen/model-inference-proof", "candle-llm/model-inference-proof"]
+model-inference-proof = ["candle-gen/model-inference-proof", "candle-llm/model-inference-proof", "sceneworks-gen-core-iris/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 # Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda` on
 # this provider crate selects the matching candle backend everywhere.
 default = []

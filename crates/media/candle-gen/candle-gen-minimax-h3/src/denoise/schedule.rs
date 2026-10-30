@@ -2,11 +2,11 @@
 //! in lockstep.
 //!
 //! The grids, the shifts and the Euler coefficients are backend-neutral and live in
-//! [`candle_gen::gen_core::h3_schedule`] (sc-27256), shared with the MLX twin; this module
+//! [`gen_core_h3::h3_schedule`] (sc-27256), shared with the MLX twin; this module
 //! re-exports them so `schedule::*` paths stay stable and adds [`SigmaScheduleStep`], the update
 //! on this crate's tensors.
 
-pub use candle_gen::gen_core::h3_schedule::*;
+pub use gen_core_h3::h3_schedule::*;
 
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::{CandleError, Result};

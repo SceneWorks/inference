@@ -41,9 +41,10 @@ rand_distr = { workspace = true }
 # MLX q4/q8 tier (sc-10819) — the same `PackedConfig::from_config` probe the SDXL packed load uses.
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen-perceptual/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen-sdxl/model-inference-proof", "candle-gen/model-inference-proof"]
+model-inference-proof = ["candle-gen-perceptual/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen-sdxl/model-inference-proof", "candle-gen/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 # Pass the backend selection through to the core crate AND candle-transformers so a downstream
 # `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.
 default = []

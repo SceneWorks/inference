@@ -718,7 +718,7 @@ const PROVIDER_CRATES: &[ProviderCrate] = &[
         ProviderCrate {
             dir: "candle-gen-flux3",
             register: candle_gen_flux3::register_providers,
-            // sc-26235: the flow-map Euler loop is written against `gen_core::flux3` (its
+            // sc-26235: the flow-map Euler loop is written against `gen_core_flux3` (its
             // `(t, t_ref)` target-time conditioning has no shared-driver expression), so there is no
             // hooked site; it emits nothing (`supports_preview: false`, no fitted RGB projection
             // for the packed 16× latent) and is carried in PREVIEW_DEFERRED_ROUTE_IDS rather than

@@ -63,11 +63,8 @@ impl TransformerVariant {
 /// Read the one authoritative identity from the resolved transformer component.  A bundle whose
 /// components disagree is rejected by the split resolver; this still refuses an absent or unknown
 /// transformer tag instead of turning a dev checkpoint into distilled generation.
-pub fn from_bundle(
-    bundle: &mlx_gen::gen_core::ltx_checkpoint::LtxBundle,
-) -> Result<TransformerVariant> {
-    let transformer =
-        bundle.require(mlx_gen::gen_core::ltx_checkpoint::LtxComponent::Transformer)?;
+pub fn from_bundle(bundle: &gen_core_ltx::ltx_checkpoint::LtxBundle) -> Result<TransformerVariant> {
+    let transformer = bundle.require(gen_core_ltx::ltx_checkpoint::LtxComponent::Transformer)?;
     let mut metadata = BTreeMap::new();
     if let Some(value) = transformer
         .metadata()

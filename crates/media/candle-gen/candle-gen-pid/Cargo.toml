@@ -20,6 +20,7 @@ candle-gen = { path = "../candle-gen" }
 rand = { workspace = true }
 # Encode the e2e real-weight smoke output to PNG (mirrors mlx-gen-pid / candle-gen-krea test IO).
 image = { workspace = true }
+sceneworks-gen-core-tokenizer = { workspace = true }
 
 [dev-dependencies]
 # Backend-neutral gen-core contract conformance floor (sc-4481); weight-gated (#[ignore]).
@@ -28,7 +29,7 @@ sceneworks-gen-core-testkit = { workspace = true }
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
 
 [features]
-model-inference-proof = ["candle-gen/model-inference-proof"]
+model-inference-proof = ["candle-gen/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof"]
 default = []
 # Apple Metal GPU backend (Mac) — forwarded to the candle backend. Not in `default`.
 metal = ["candle-gen/metal"]

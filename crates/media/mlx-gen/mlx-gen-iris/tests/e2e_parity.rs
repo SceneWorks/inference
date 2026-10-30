@@ -9,7 +9,7 @@
 //! |Δ| 3.1e-2 (mean 2.6e-3) on the [−1, 1] image; bound 6e-2. The FP32 backbone and solver alone are
 //! held to 1e-4 / 1e-5 by `dit_parity` / `solver_parity`.
 
-use mlx_gen::gen_core::iris::GenerationParams;
+use gen_core_iris::GenerationParams;
 use mlx_gen::{CancelFlag, GenerationRequest, PreviewSink};
 use mlx_gen_iris::{denoise, encode, load_backbone, IrisTextEncoder};
 use mlx_rs::Dtype;

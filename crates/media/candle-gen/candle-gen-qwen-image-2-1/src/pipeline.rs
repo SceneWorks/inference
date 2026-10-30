@@ -9,10 +9,10 @@
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tiling::TilingConfig;
-use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{CancelFlag, GenerationRequest, Image, Progress, RgbaImage};
 use candle_gen::run_flow_sampler;
 use candle_gen::{CandleError as Error, Result};
+use gen_core_tokenizer::TextTokenizer;
 
 use crate::config::VAE_SCALE_FACTOR;
 use crate::reference::{prepare_references, PreparedReference};

@@ -23,10 +23,8 @@ use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::flux3::{
-    timestep_freqs, DitConfig, MODES, TIMESTEP_EMBED_DIM, TIMESTEP_MAX_PERIOD,
-};
 use candle_gen::{CandleError as Error, Result};
+use gen_core_flux3::{timestep_freqs, DitConfig, MODES, TIMESTEP_EMBED_DIM, TIMESTEP_MAX_PERIOD};
 
 use crate::nn::{
     cat, chunk_last, expect_shape, layernorm_modulation, mul, packed_attention,
@@ -317,7 +315,7 @@ pub fn check_ref_time_pair(cfg: &DitConfig, contains: impl Fn(&str) -> bool) -> 
 /// caller runs it before any text-encoder, autoencoder, adapter or memory work.
 pub fn validate_checkpoint_headers(
     cfg: &DitConfig,
-    storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+    storage: gen_core_flux3::artifacts::NativeDitStorage,
     headers: &[candle_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
 ) -> Result<()> {
     check_ref_time_pair(cfg, |key| headers.iter().any(|h| h.name == key))?;
@@ -409,8 +407,8 @@ impl Flux3Dit {
             cfg,
             compute,
             device,
-            candle_gen::gen_core::flux3::artifacts::NativeDitStorage::Publisher(
-                candle_gen::gen_core::flux3::quantization::DitFormat::Dense,
+            gen_core_flux3::artifacts::NativeDitStorage::Publisher(
+                gen_core_flux3::quantization::DitFormat::Dense,
             ),
         )
     }
@@ -426,9 +424,9 @@ impl Flux3Dit {
         cfg: &DitConfig,
         compute: DType,
         device: &Device,
-        storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+        storage: gen_core_flux3::artifacts::NativeDitStorage,
     ) -> Result<Self> {
-        use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
+        use gen_core_flux3::artifacts::NativeDitStorage;
         if !path.is_file() {
             return Err(Error::Msg(format!(
                 "flux3: the DiT weights file {} does not exist",
@@ -440,7 +438,7 @@ impl Flux3Dit {
         let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
             .map_err(|e| Error::Msg(format!("flux3: {}: {e}", path.display())))?;
         validate_checkpoint_headers(cfg, storage, &headers)?;
-        use candle_gen::gen_core::flux3::quantization::DitFormat;
+        use gen_core_flux3::quantization::DitFormat;
         let targets = || {
             storage
                 .packed_targets(cfg)
@@ -847,7 +845,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn tiny_dit_config() -> DitConfig {
-        candle_gen::gen_core::flux3::resolve_checkpoint(
+        gen_core_flux3::resolve_checkpoint(
             &Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures/tiny-snapshot"),
         )
@@ -895,8 +893,8 @@ mod tests {
     /// The header preflight covers the dense storage too, with the same pair check first.
     #[test]
     fn dense_header_preflight_checks_the_pair_then_the_inventory() {
-        use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
-        use candle_gen::gen_core::flux3::quantization::DitFormat;
+        use gen_core_flux3::artifacts::NativeDitStorage;
+        use gen_core_flux3::quantization::DitFormat;
         let cfg = tiny_dit_config();
         let dense = NativeDitStorage::Publisher(DitFormat::Dense);
         let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(

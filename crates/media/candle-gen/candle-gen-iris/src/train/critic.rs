@@ -13,11 +13,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor, Var, D};
-use candle_gen::gen_core::iris::restoration_train::{
+use candle_gen::{CandleError as Error, Result};
+use gen_core_iris::restoration_train::{
     sn_keys, ConvNextConfig, CriticHeadConfig, HostTensor, BLUR_TAPS, CLIP_MEAN, CLIP_STD,
     CRITIC_LEAKY_SLOPE, SPECTRAL_EPS,
 };
-use candle_gen::{CandleError as Error, Result};
 
 use super::optim::{Params, Tensors};
 

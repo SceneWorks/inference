@@ -152,7 +152,7 @@ fn load_clip_g(file: &Path) -> Result<ClipTextEncoder> {
 /// T5-XXL via the FLUX encoder at the empty prefix (sharded `text_encoder_3/` loaded as a dir). Loaded
 /// dense at f32 (the CLIP path runs f32; the T5 promotes internally) — `quantize` is applied after.
 pub fn load_text_encoders(root: &Path) -> Result<Sd3TextEncoders> {
-    let artifacts = mlx_gen::gen_core::resolve_sd3_text_encoder_artifacts(root)
+    let artifacts = gen_core_family::resolve_sd3_text_encoder_artifacts(root)
         .map_err(|error| Error::Msg(error.to_string()))?;
     let clip_l = load_clip_l(&artifacts.clip_l)?;
     let clip_g = load_clip_g(&artifacts.clip_g)?;

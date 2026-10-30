@@ -4,9 +4,10 @@
 //! the same FP32 residual stack. Base- and SFT-trained adapters load on either checkpoint
 //! (2026-10-29). The supplied DMD stack is independent.
 use crate::{precision::linear_fp32, transformer::Transformer};
+use gen_core_moss_image::moss_image_training as contract;
 use mlx_gen::{
     adapters::{AdaptableHost, Adapter},
-    gen_core::{self, moss_image::MossImageVariant, moss_image_training as contract},
+    gen_core::{self, moss_image::MossImageVariant},
     runtime::{AdapterKind, AdapterSpec},
     Error, Result,
 };
@@ -515,7 +516,7 @@ pub(crate) fn apply(
 /// Header alpha scalars are conservatively included, although the executable stack stores scalars.
 pub(crate) fn estimated_bytes(
     specs: &[AdapterSpec],
-    _config: &gen_core::moss_image::MossImageConfig,
+    _config: &gen_core_moss_image::moss_image::MossImageConfig,
 ) -> Result<u64> {
     specs.iter().try_fold(0u64, |bytes, spec| {
         gen_core::weightsmeta::safetensors_path_tensor_headers(&spec.path)?

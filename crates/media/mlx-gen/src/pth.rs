@@ -2,7 +2,7 @@
 //! (sc-3237 / sc-3224), shared from mlx-gen since sc-24833 (the E-LatentLPIPS checkpoints ship as
 //! `torch.save` state dicts too, BatchNorm `num_batches_tracked` int64 counters included).
 //!
-//! Since sc-24213 the pickle VM and archive access are the tensor-free [`gen_core::pth`] reader,
+//! Since sc-24213 the pickle VM and archive access are the tensor-free [`gen_core_checkpoint::pth`] reader,
 //! shared with the Candle backend (Supra2-IMG converts its `.pt` on both install paths). This module
 //! is the MLX adapter: the reference Python loads these with `torch.load(...).float()` (every tensor
 //! → f32), so [`load_pth_f32`] mirrors that exactly and returns each tensor as an **f32** MLX
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::Result;
-use gen_core::pth::PthArchive;
+use gen_core_checkpoint::pth::PthArchive;
 use mlx_rs::Array;
 
 /// Load a torch `.pth` checkpoint, returning every tensor as an f32 MLX [`Array`] in PyTorch layout

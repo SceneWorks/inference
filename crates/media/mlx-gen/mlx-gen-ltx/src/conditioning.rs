@@ -321,7 +321,7 @@ pub struct VideoTokenState {
     pub keyframes_mask: Option<Array>,
     /// Where the single contiguous run of generated-keyframe slot tokens sits (`None` = no slots).
     /// At most one [`append_generated_keyframe_slots`] per state, like the reference item.
-    pub generated_keyframe_layout: Option<mlx_gen::gen_core::ltx_dfr::GeneratedKeyframeLayout>,
+    pub generated_keyframe_layout: Option<gen_core_ltx::ltx_dfr::GeneratedKeyframeLayout>,
 }
 
 /// Patchify a latent grid `(B, C, F, H, W)` → tokens `(B, F·H·W, C)` (patch size 1, the reference
@@ -500,7 +500,7 @@ pub fn append_keyframe_clip(
 // DFR generated-keyframe slots + single-frame keyframe / reference-latent conditioning (sc-18789).
 // ===================================================================================================
 
-use mlx_gen::gen_core::ltx_dfr::GeneratedKeyframeLayout;
+use gen_core_ltx::ltx_dfr::GeneratedKeyframeLayout;
 
 /// Extend the state's keyframe marker for `num_new` appended tokens (reference
 /// `mask_utils.extend_keyframes_mask`): `marked = false` keeps an absent mask absent (the common,

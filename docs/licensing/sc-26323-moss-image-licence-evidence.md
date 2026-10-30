@@ -1,7 +1,7 @@
 # MOSS checkpoint licence evidence (sc-26323)
 
 Read on 2026-10-18 from the exact locally acquired frozen snapshots. The approved
-acquisition manifest records full SHA-256 and file sizes; `gen_core::moss_image`
+acquisition manifest records full SHA-256 and file sizes; `gen_core_moss_image::moss_image`
 now exposes the same path-free frozen byte authority for both providers.
 
 | Component | Primary evidence | Declaration |

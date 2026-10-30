@@ -106,7 +106,7 @@ fn mesh_program(f: &Value) -> Program {
         })
         .collect();
     Program::new(
-        candle_gen::gen_core::fx_program::ProgramSpec::from_value(&m["program"]).unwrap(),
+        gen_core_family::fx_program::ProgramSpec::from_value(&m["program"]).unwrap(),
         map,
         &dev(),
     )
@@ -163,7 +163,7 @@ fn expect(v: &Value) -> f32 {
 
 fn noise_px(key: &str, h: usize, w: usize) -> Tensor {
     Tensor::from_vec(
-        candle_gen::gen_core::train::face_loss::synth::noise_image(IDENTITY_NOISE_SEED, key, h, w),
+        gen_core_train::face_loss::synth::noise_image(IDENTITY_NOISE_SEED, key, h, w),
         (1, h, w, 3),
         &dev(),
     )
@@ -718,7 +718,7 @@ fn testing_checkpoints_load_through_the_real_loaders() {
     let want: std::collections::BTreeMap<_, _> =
         shapes(&f["arcface"]["keys"]).into_iter().collect();
     let got: std::collections::BTreeMap<_, _> =
-        candle_gen::gen_core::train::face_loss::synth::tiny_arcface_shapes()
+        gen_core_train::face_loss::synth::tiny_arcface_shapes()
             .into_iter()
             .collect();
     assert_eq!(got, want);
@@ -749,7 +749,7 @@ fn testing_checkpoints_load_through_the_real_loaders() {
 /// Mutation: drop the size check in `max_pool` ⇒ the subtraction underflows ⇒ panic ⇒ red.
 #[test]
 fn a_max_pool_kernel_larger_than_its_input_is_refused() {
-    let spec = candle_gen::gen_core::fx_program::ProgramSpec::parse(
+    let spec = gen_core_family::fx_program::ProgramSpec::parse(
         r#"{"inputs":["x"],"outputs":["y"],"nodes":[{"op":"maxpool2d","out":"y","inputs":["x"],
             "kernel":[9,9],"stride":[1,1],"padding":[1,1]}]}"#,
     )

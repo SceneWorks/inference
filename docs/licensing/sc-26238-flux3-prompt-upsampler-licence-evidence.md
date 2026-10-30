@@ -27,7 +27,7 @@ as the sibling notes.
 * Distribution: the Hub API reported `gated: false`, `private: false` on 2026-10-15; the files
   were read with the configured HF credential after an unauthenticated IP rate-limit response. `model.safetensors` is 18,819,722,392 bytes, Hub linked-object
   sha256 `f5062a1fba3e63afe5c88349a311903fec06c959b362f1247127e63d5c860ed4`
-  (`gen_core::flux3::pup::UPSAMPLER_WEIGHTS_SHA256`); `system_prompts.json` sha256
+  (`gen_core_flux3::pup::UPSAMPLER_WEIGHTS_SHA256`); `system_prompts.json` sha256
   `b5da3ed8bc04ab59dbdb747930f7dbff847e868903fed8028f85ee1a4ac82fb4`, byte-identical to the
   inference repository's `src/flux3/pup_prompts.json` at the pinned commit, and embedded in the
   contract crate (`gen-core/src/flux3/pup_system_prompts.json`) under the same licence.

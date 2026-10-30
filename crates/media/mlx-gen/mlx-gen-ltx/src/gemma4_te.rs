@@ -90,12 +90,12 @@ use std::path::Path;
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::gen_core::gemma_assets::GemmaAssets;
-use mlx_gen::gen_core::ltx_checkpoint::{
+use gen_core_ltx::gemma_assets::GemmaAssets;
+use gen_core_ltx::ltx_checkpoint::{
     check_gemma_version, GemmaEncoderIdentity, GemmaVersionCheck, LtxCheckpointMetadata,
     LtxComponent,
 };
-use mlx_gen::gen_core::LtxBundle;
+use gen_core_ltx::LtxBundle;
 use mlx_gen::gen_core::OffloadPolicy;
 use mlx_gen::weights::Weights as GenWeights;
 use mlx_gen::{Error, Result};
@@ -464,7 +464,7 @@ fn gemma_config_value(te_path: &Path) -> Result<serde_json::Value> {
 
 /// R4: assert the packed encoder is the one this checkpoint declares, failing loudly on mismatch.
 ///
-/// Delegates the comparison to `gen_core::ltx_checkpoint::check_gemma_version` — upstream's
+/// Delegates the comparison to `gen_core_ltx::ltx_checkpoint::check_gemma_version` — upstream's
 /// `encoder_configurator._check_gemma_version` — rather than re-implementing the rules. The returned
 /// [`GemmaVersionCheck`] is deliberately **not** discarded. Both non-`Matched` outcomes are
 /// legitimate answers for *some* pair and so cannot be rejected by gen-core, but neither is
@@ -913,7 +913,7 @@ mod version_assertion_tests {
     /// of the transformer's (or to pass the transformer's path as `te_path`) makes this fail.
     #[test]
     fn from_bundle_av_reaches_the_version_assertion_through_the_bundle() {
-        use mlx_gen::gen_core::ltx_checkpoint::LtxBundleBuilder;
+        use gen_core_ltx::ltx_checkpoint::LtxBundleBuilder;
 
         let dir = tempfile::tempdir().expect("tempdir");
         // The encoder declares a DIFFERENT Gemma 4 build than the transformer was trained against.
@@ -931,7 +931,7 @@ mod version_assertion_tests {
             .expect("synthetic 2.5 bundle");
 
         let mut cfg = LtxConfig::video_only_defaults();
-        cfg.caption_feature_version = mlx_gen::gen_core::ltx_checkpoint::CaptionFeatureVersion::V2;
+        cfg.caption_feature_version = gen_core_ltx::ltx_checkpoint::CaptionFeatureVersion::V2;
 
         let msg = match Ltx25TextEncoder::from_bundle_av(
             &bundle,
@@ -1044,7 +1044,7 @@ mod version_assertion_tests {
         let ckpt = checkpoint("2.5.0", Some(GEMMA4_VERSION));
 
         let mut cfg = LtxConfig::video_only_defaults();
-        cfg.caption_feature_version = mlx_gen::gen_core::ltx_checkpoint::CaptionFeatureVersion::V2;
+        cfg.caption_feature_version = gen_core_ltx::ltx_checkpoint::CaptionFeatureVersion::V2;
 
         let (resident, _) = load_backbone(&ckpt, &te, &cfg, OffloadPolicy::Resident)
             .expect("the resident backbone loads");

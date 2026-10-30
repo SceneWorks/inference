@@ -19,7 +19,7 @@
 //!    ([`PerceptualLoss::loss`]) — differentiable in the live input, frozen in its own weights
 //!    (captured constants, never trainable params, so autograd only produces adapter gradients).
 //! 5. **Schedule**: the backend-neutral step policy lives in gen-core
-//!    ([`gen_core::train::aux_schedule`], re-exported here): [`AuxAlternation`] keys alternation
+//!    ([`gen_core_train::aux_schedule`], re-exported here): [`AuxAlternation`] keys alternation
 //!    per optimizer window (interleaved, phase drifting per pass), [`plan_step`] builds the
 //!    [`StepPlan`], and
 //!    [`PerceptualPath::plan`] applies the per-image skips (an aux-only step whose claiming losses
@@ -57,11 +57,11 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::ops::{abs, add, divide, maximum, multiply, subtract};
 use mlx_rs::Array;
 
-pub use gen_core::train::aux_schedule::{
+pub use gen_core::train::AuxLossSchedule;
+pub use gen_core_train::aux_schedule::{
     combine_step_terms, perceptual_footprint_bytes, plan_step, AltKey, AuxAlternation,
     AuxModelFootprint, StepPlan,
 };
-pub use gen_core::train::AuxLossSchedule;
 
 use super::tae::TinyDecoder;
 use crate::{Error, Result};
@@ -243,7 +243,7 @@ pub struct PerceptualPath {
     reference_computations: usize,
     /// The job's subject masks for the losses that read one (sc-24832), see
     /// [`attach_subject_masks`](Self::attach_subject_masks).
-    subject_masks: Option<gen_core::train::subject_mask::PerceptualSubjectMasks>,
+    subject_masks: Option<gen_core_train::subject_mask::PerceptualSubjectMasks>,
 }
 
 impl PerceptualPath {
@@ -315,11 +315,11 @@ impl PerceptualPath {
     /// [`ensure_reference`](Self::ensure_reference) passes its reference key's item mask — cropped
     /// with the trainer's crop rule and area-averaged onto that reference's decoded pixel grid — to
     /// each loss's [`PerceptualLoss::reference_with_mask`]. `None` (no loss reads masks) is a no-op.
-    /// Every trainer calls this once with [`PerceptualSubjectMasks::load`](gen_core::train::subject_mask::PerceptualSubjectMasks::load)
+    /// Every trainer calls this once with [`PerceptualSubjectMasks::load`](gen_core_train::subject_mask::PerceptualSubjectMasks::load)
     /// before preparing references.
     pub fn attach_subject_masks(
         &mut self,
-        masks: Option<gen_core::train::subject_mask::PerceptualSubjectMasks>,
+        masks: Option<gen_core_train::subject_mask::PerceptualSubjectMasks>,
     ) {
         self.subject_masks = masks;
     }

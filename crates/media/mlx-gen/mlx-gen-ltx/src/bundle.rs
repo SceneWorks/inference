@@ -2,7 +2,7 @@
 //!
 //! The shared, tensor-free machinery — version parsing, component classification, per-component
 //! config isolation, and the `gemma_source_checkpoint` ⇄ text-encoder `gemma_version` assertion —
-//! lives in [`mlx_gen::gen_core::ltx_checkpoint`] so mlx-gen-ltx and candle-gen-ltx behave
+//! lives in [`gen_core_ltx::ltx_checkpoint`] so mlx-gen-ltx and candle-gen-ltx behave
 //! identically. This module is the MLX-side adapter: it turns a [`LoadSpec`] into a resolved bundle
 //! and answers "which layout is this model directory?" **from `model_version`**, never from a file
 //! name.
@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mlx_gen::gen_core::ltx_checkpoint::{
+use gen_core_ltx::ltx_checkpoint::{
     GemmaEncoderIdentity, GemmaVersionCheck, LtxBundle, LtxBundleBuilder, LtxCheckpointLayout,
     LtxComponent,
 };
@@ -35,16 +35,14 @@ use mlx_gen::Result;
 /// `split_model.json` manifest first, then any component file's `__metadata__`. `None` when nothing
 /// there declares one.
 pub fn declared_model_version(root: &Path) -> Result<Option<String>> {
-    Ok(mlx_gen::gen_core::ltx_checkpoint::declared_model_version(
-        root,
-    )?)
+    Ok(gen_core_ltx::ltx_checkpoint::declared_model_version(root)?)
 }
 
 /// The layout a model directory declares. An undeclared version is
 /// [`LtxCheckpointLayout::AllInOne`] — the oldest layout, matching upstream's fallback — which keeps
 /// every pre-`model_version` LTX-2.3 tree on exactly the path it has always taken.
 pub fn declared_layout(root: &Path) -> Result<LtxCheckpointLayout> {
-    Ok(mlx_gen::gen_core::ltx_checkpoint::declared_layout(root)?)
+    Ok(gen_core_ltx::ltx_checkpoint::declared_layout(root)?)
 }
 
 /// The [`LoadSpec::components`] ids an LTX-2.5 load recognizes: one per split component, plus the
@@ -93,8 +91,7 @@ pub fn resolve_split_bundle(spec: &LoadSpec) -> Result<LtxBundle> {
     }
     let skip: Vec<LtxComponent> = explicit.iter().map(|(c, _)| *c).collect();
 
-    let discovered =
-        mlx_gen::gen_core::ltx_checkpoint::discover_split_bundle_skipping(&root, &skip)?;
+    let discovered = gen_core_ltx::ltx_checkpoint::discover_split_bundle_skipping(&root, &skip)?;
     let mut builder = LtxBundleBuilder::new();
     for resolved in discovered.components() {
         builder = builder.with_component(resolved.component(), resolved.path());
@@ -151,7 +148,7 @@ mod tests {
     fn write_converted_2_3(root: &Path) {
         std::fs::create_dir_all(root).unwrap();
         std::fs::write(
-            root.join(mlx_gen::gen_core::ltx_checkpoint::SPLIT_MANIFEST_FILE),
+            root.join(gen_core_ltx::ltx_checkpoint::SPLIT_MANIFEST_FILE),
             r#"{"format":"split","model_version":"2.3.0","variant":"distilled","quantized":true,
                 "quantization_bits":4,"quantization_group_size":64}"#,
         )

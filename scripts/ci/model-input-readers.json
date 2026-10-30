@@ -1555,16 +1555,16 @@
       "physical_api": "image::open",
       "function": "decode_image",
       "source": "crates/media/mlx-gen/src/train/dataset.rs",
-      "source_sha256": "9e101161654de7a3675effc7614e0a3febc7858411ff8e369b922605a6d6f885",
+      "source_sha256": "14872f02c3fac9a77bbe3bbc4a350b17115b9fcfbadef2b09bc1ab1789104caf",
       "function_byte_span": [
         889,
-        1251
+        1554
       ],
       "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "function_sha256": "7ec5a79173222eb6590ff83ef52846830cf861487fa8e18fd3fc9912b58755c6",
+      "function_sha256": "aa044411c5b30d36c79652b3c909c39399718bb2cdd7a08b08481db8c3f5e3ad",
       "function_lines": [
         17,
-        26
+        34
       ],
       "hook_byte_span": [
         958,
@@ -1983,7 +1983,7 @@
         "reader-binding"
       ]
     },
-    "crates/contracts/gen-core/src/train/subject_mask.rs::SubjectMask::load/image::open": {
+    "crates/contracts/gen-core-train/src/subject_mask.rs::SubjectMask::load/image::open": {
       "role": "reference",
       "grades": [
         "reader-binding"
@@ -1991,23 +1991,23 @@
       "grade_ceiling": "reader-binding",
       "physical_api": "image::open",
       "function": "SubjectMask::load",
-      "source": "crates/contracts/gen-core/src/train/subject_mask.rs",
-      "source_sha256": "f1a47876916cdf55fd9bd47b04135059a142513472f9c717aef99422798f4b47",
+      "source": "crates/contracts/gen-core-train/src/subject_mask.rs",
+      "source_sha256": "aaf169a2195c4a720345cbc04849edb13e980cbf7d40c66e5c7701f7adc33c73",
       "function_byte_span": [
-        5607,
-        6285
+        5613,
+        6300
       ],
       "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "function_sha256": "ac789eff5f8e9df2e55833730d112ea6d095b0b6e155d0e88b6e37a36040fd86",
+      "function_sha256": "de5a30bc2be80712c7de1b5c752dbcef155dfc8d20d6a9f5e63724ccc1b53aab",
       "function_lines": [
         128,
         147
       ],
       "hook_byte_span": [
-        5676,
-        5887
+        5685,
+        5899
       ],
-      "hook_sha256": "5f210942ff18fef83c9c7bb176e800e10dede102c4eb94e622965b01fb403c92",
+      "hook_sha256": "a110871f2ef7b2a9a36a9fe549a1a9b591cdcad34f076daea97fae70f273aa19",
       "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
       "registered_identity": {
         "package": "mlx-gen-qwen-image-2-1",
@@ -2019,7 +2019,7 @@
       "additional_registered_identities": [],
       "source_scope_note": "The named function performs this physical read"
     },
-    "crates/contracts/gen-core/src/iris/restoration_train.rs::decode/image::open": {
+    "crates/contracts/gen-core-iris/src/restoration_train.rs::decode/image::open": {
       "role": "reference",
       "grades": [
         "reader-binding"
@@ -2027,23 +2027,23 @@
       "grade_ceiling": "reader-binding",
       "physical_api": "image::open",
       "function": "decode",
-      "source": "crates/contracts/gen-core/src/iris/restoration_train.rs",
-      "source_sha256": "bb59dd6d55d38ff4ed63188889f357a3fb53da844cb6a049a33fd7d393000c86",
+      "source": "crates/contracts/gen-core-iris/src/restoration_train.rs",
+      "source_sha256": "37454360994fccc989741d996390f77c437937f3a106b01bccce703e930fdea2",
       "function_byte_span": [
-        65777,
-        66294
+        65839,
+        66359
       ],
       "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "function_sha256": "575e0e8739ddafb7fdd3d74b50c514a7284d3e4192b6d8fc8714dd8aaff93939",
+      "function_sha256": "ed658182bf7d6ee950a0e7d37f8d62c3923b4230b14ff0fdd704fb5c8ac03a30",
       "function_lines": [
-        1607,
-        1626
+        1610,
+        1629
       ],
       "hook_byte_span": [
-        65831,
-        66015
+        65893,
+        66080
       ],
-      "hook_sha256": "cde4c40311f3de0a3da0e1b0cfc11c49942774a3eb4b1a7061b5ae4f597b6c70",
+      "hook_sha256": "a53393d07462bd9747131ed200c93682233663714b88e0969a8957cd5864df74",
       "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
       "registered_identity": {
         "package": "mlx-gen-iris",
@@ -2055,7 +2055,7 @@
       "additional_registered_identities": [],
       "source_scope_note": "The named function performs this physical read"
     },
-    "crates/contracts/gen-core/src/iris/train/depth.rs::load_depth_sample/image::open": {
+    "crates/contracts/gen-core-iris/src/train/depth.rs::load_depth_sample/image::open": {
       "role": "reference",
       "grades": [
         "reader-binding"
@@ -2063,7 +2063,7 @@
       "grade_ceiling": "reader-binding",
       "physical_api": "image::open",
       "function": "load_depth_sample",
-      "source": "crates/contracts/gen-core/src/iris/train/depth.rs",
+      "source": "crates/contracts/gen-core-iris/src/train/depth.rs",
       "source_sha256": "c279285ba962435731e70342899c35a5a0e96dbf61a041fee723d4deb48dcd3c",
       "function_byte_span": [
         47282,
@@ -2091,7 +2091,7 @@
       "additional_registered_identities": [],
       "source_scope_note": "The named function performs this physical read"
     },
-    "crates/contracts/gen-core/src/iris/train/shapes.rs::preprocess_file_to_shape/image::open": {
+    "crates/contracts/gen-core-iris/src/train/shapes.rs::preprocess_file_to_shape/image::open": {
       "role": "reference",
       "grades": [
         "reader-binding"
@@ -2099,23 +2099,23 @@
       "grade_ceiling": "reader-binding",
       "physical_api": "image::open",
       "function": "preprocess_file_to_shape",
-      "source": "crates/contracts/gen-core/src/iris/train/shapes.rs",
-      "source_sha256": "c4f088d3ca97be9840af858ecf2916b86e664825b465dee4d66060f54907fbd7",
+      "source": "crates/contracts/gen-core-iris/src/train/shapes.rs",
+      "source_sha256": "0f3589f4a6f8c23efdb67ec0832c8dc92bbc1eba90fe9448911b1c3e9cc13061",
       "function_byte_span": [
-        12566,
-        13260
+        12572,
+        13272
       ],
       "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "function_sha256": "1fd103014ca1c140a2cc90b45f179c4785216b95524dbd585a782b04f6890d20",
+      "function_sha256": "99b79964764662c39708e7c8843ec1b3593c8f4089f2e9fd524b91a9dea1bfb3",
       "function_lines": [
         362,
         381
       ],
       "hook_byte_span": [
-        12694,
-        12891
+        12700,
+        12900
       ],
-      "hook_sha256": "df735d21732d3184402c01a0b2f32e4b57ef0a459db71a3d336304282aad5078",
+      "hook_sha256": "e6ad52a0fa8ac36feafff6ada4c463504008cdc1bc22032362dc7f99d3e31139",
       "claim_limit": "Successful image decoder return at this source-bound case-execution site only; no checkpoint-byte, named-revision, weights-integrity, or image-content integrity attestation. No origin inferred; generated/external origin belongs in case DATA.",
       "registered_identity": {
         "package": "mlx-gen-iris",
@@ -2810,24 +2810,24 @@
       ],
       "grade_ceiling": "reader-binding",
       "function": "indexed_shard_names",
-      "source": "crates/contracts/gen-core/src/sd3_encoder_artifacts.rs",
-      "source_sha256": "14cd0fbaf174a220e4ee226e6e0a6700783c65c5e0a2c237602bbc2324672577",
+      "source": "crates/contracts/gen-core-family/src/sd3_encoder_artifacts.rs",
+      "source_sha256": "f3e03740118d0cc8edf5021f5c2d6ffe42a655d31075e0fece2882e559fa539d",
       "function_byte_span": [
         7160,
-        10418
+        10430
       ],
-      "function_sha256": "dd9f59e9f752351897a5f12776e285368ede1668c2107dc1eaa16b3a83e2719b",
+      "function_sha256": "544e3b7185eddb9eecaac2202ff2140efe39fa4b8b98352f6744e0c2426c7b14",
       "function_lines": [
         219,
         302
       ],
       "hook_byte_span": [
         9836,
-        10416
+        10428
       ],
-      "hook_sha256": "a88e14919347e37ab634c0a817a4f59b30ca7f25888351fcabf0cb79904211fd",
+      "hook_sha256": "74ccf2cc0557ca710e6cc12a70726df259f8fdff82b1944c7b4b560133df2cfc",
       "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "physical_read_site": "crates/contracts/gen-core/src/sd3_encoder_artifacts.rs::indexed_shard_names",
+      "physical_read_site": "crates/contracts/gen-core-family/src/sd3_encoder_artifacts.rs::indexed_shard_names",
       "read_kind": "T5 shard-index text/JSON plus original shard-family validation",
       "selector": "master",
       "claim_limit": "Source-bound case-execution binding only to successfully read+parsed T5 shard-index text/JSON plus original shard-family validation. Not tensor payload consumption, full checkpoint/image byte integrity, named revision, or weights integrity; no content hash or new read.",
@@ -2840,24 +2840,24 @@
       ],
       "grade_ceiling": "reader-binding",
       "function": "indexed_shard_names",
-      "source": "crates/contracts/gen-core/src/sd3_encoder_artifacts.rs",
-      "source_sha256": "14cd0fbaf174a220e4ee226e6e0a6700783c65c5e0a2c237602bbc2324672577",
+      "source": "crates/contracts/gen-core-family/src/sd3_encoder_artifacts.rs",
+      "source_sha256": "f3e03740118d0cc8edf5021f5c2d6ffe42a655d31075e0fece2882e559fa539d",
       "function_byte_span": [
         7160,
-        10418
+        10430
       ],
-      "function_sha256": "dd9f59e9f752351897a5f12776e285368ede1668c2107dc1eaa16b3a83e2719b",
+      "function_sha256": "544e3b7185eddb9eecaac2202ff2140efe39fa4b8b98352f6744e0c2426c7b14",
       "function_lines": [
         219,
         302
       ],
       "hook_byte_span": [
         9836,
-        10416
+        10428
       ],
-      "hook_sha256": "a88e14919347e37ab634c0a817a4f59b30ca7f25888351fcabf0cb79904211fd",
+      "hook_sha256": "74ccf2cc0557ca710e6cc12a70726df259f8fdff82b1944c7b4b560133df2cfc",
       "span_convention": "zero-based UTF-8 byte offsets, end exclusive",
-      "physical_read_site": "crates/contracts/gen-core/src/sd3_encoder_artifacts.rs::indexed_shard_names",
+      "physical_read_site": "crates/contracts/gen-core-family/src/sd3_encoder_artifacts.rs::indexed_shard_names",
       "read_kind": "T5 shard-index text/JSON plus original shard-family validation",
       "selector": "fp16",
       "claim_limit": "Source-bound case-execution binding only to successfully read+parsed T5 shard-index text/JSON plus original shard-family validation. Not tensor payload consumption, full checkpoint/image byte integrity, named revision, or weights integrity; no content hash or new read.",
@@ -2988,7 +2988,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "SafetensorsHeader::read",
       "selector": "gemma_config",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3021,7 +3021,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "SafetensorsHeader::read",
       "selector": "tokenizer_config.json",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3054,7 +3054,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "SafetensorsHeader::read",
       "selector": "processor_config.json",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3087,7 +3087,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "SafetensorsHeader::read",
       "selector": "chat_template.jinja",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3120,7 +3120,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "SafetensorsHeader::read",
       "selector": "generation_config.json",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3153,7 +3153,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "SafetensorsHeader::read_asset",
       "selector": "tokenizer_json",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3186,7 +3186,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "SafetensorsHeader::read_asset",
       "selector": "hf_asset__tokenizer_config.json",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3219,7 +3219,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "SafetensorsHeader::read_asset",
       "selector": "hf_asset__processor_config.json",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3252,7 +3252,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "SafetensorsHeader::read_asset",
       "selector": "hf_asset__chat_template.jinja",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3285,7 +3285,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "SafetensorsHeader::read_asset",
       "selector": "hf_asset__generation_config.json",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3318,7 +3318,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "GemmaAssets::from_root",
       "selector": "config.json",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3365,7 +3365,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "GemmaAssets::from_root",
       "selector": "tokenizer.json",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3412,7 +3412,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "GemmaAssets::from_root",
       "selector": "tokenizer_config.json",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3459,7 +3459,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "GemmaAssets::from_root",
       "selector": "processor_config.json",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3506,7 +3506,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "GemmaAssets::from_root",
       "selector": "chat_template.jinja",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",
@@ -3553,7 +3553,7 @@
         "reader-binding"
       ],
       "grade_ceiling": "reader-binding",
-      "source": "crates/contracts/gen-core/src/gemma_assets.rs",
+      "source": "crates/contracts/gen-core-ltx/src/gemma_assets.rs",
       "function": "GemmaAssets::from_root",
       "selector": "generation_config.json",
       "source_sha256": "3d12103fc76ba90e8d6e4353ac4edd059091d17da952f842ece4ea776cd4d197",

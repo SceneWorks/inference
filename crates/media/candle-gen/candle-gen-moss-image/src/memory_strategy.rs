@@ -1,6 +1,7 @@
 //! Structural costs only; no native calibration or optimized-fit measurement is claimed.
 use crate::loader::Sources;
-use candle_gen::gen_core::{self, moss_image::*, *};
+use candle_gen::gen_core::{self, *};
+use gen_core_moss_image::moss_image::*;
 
 pub(crate) fn footprint_sources(s: &Sources) -> gen_core::Result<PerComponentBytes> {
     let facts = selected_facts(s, MossImageAcceleration::Off)?;
@@ -374,7 +375,7 @@ pub fn edit_request_peak(
     inputs: gen_core::moss_image_edit::MossImageEditInputs<'_>,
 ) -> gen_core::Result<u64> {
     inputs.validate()?;
-    let request = gen_core::moss_image_edit::edit_request(request)?;
+    let request = gen_core_moss_image::moss_image_edit::edit_request(request)?;
     let resolved = MossImageResolved::resolve(variant, &request)?;
     let images = inputs.advanced.validate(&request, &resolved)?;
     crate::checked_host_elements(&request, images)?;

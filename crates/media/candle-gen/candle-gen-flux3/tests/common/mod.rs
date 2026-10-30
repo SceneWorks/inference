@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::flux3::{resolve_checkpoint, Flux3Config};
+use gen_core_flux3::{resolve_checkpoint, Flux3Config};
 
 /// The MLX twin's `tests/fixtures/` — produced once by `crates/media/mlx-gen/tools/dump_flux3_*.py`
 /// from the frozen upstream and read by both backends.

@@ -68,7 +68,7 @@ struct Components {
     vae: Arc<ProviderVae>,
     /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across encodes (sc-8991 /
     /// F-011) instead of re-parsing `tokenizer.json` per prompt/branch.
-    tok: Arc<candle_gen::gen_core::tokenizer::TextTokenizer>,
+    tok: Arc<gen_core_tokenizer::TextTokenizer>,
 }
 
 struct Pipeline {

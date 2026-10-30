@@ -40,11 +40,11 @@ use std::io::Seek;
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::pruned_adaln::PrunedAdaLn;
 use candle_gen::gen_core::weightsmeta::{safetensors_reader_tensor_locations, Dtype as MetaDtype};
 use candle_gen::Weights;
 use candle_gen_minimax_h3::dit::CurveAdaLn;
 use candle_gen_minimax_h3::{quant, MiniMaxH3DitConfig};
+use gen_core_h3::pruned_adaln::PrunedAdaLn;
 use support::TABLE_KEY;
 use support::{
     receipt_file_name, run_probe, run_probe_at, Case, DeviceInfo, HeaderIndex, IndexedTensor,

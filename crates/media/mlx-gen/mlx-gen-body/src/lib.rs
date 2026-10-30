@@ -12,7 +12,7 @@
 //! Every loss builds its reference with the same ViTPose pass ([`VitPose::detect`]): an image with
 //! **no detected person** returns `Ok(None)` and the shared path skips the loss for it (zero
 //! contribution, the step falls back to diffusion). The backend-neutral half — configs, parameter
-//! counts, footprints and all host-side geometry — is [`mlx_gen::gen_core::train::body`].
+//! counts, footprints and all host-side geometry — is [`gen_core_train::body`].
 
 pub mod hybrik;
 pub mod sapiens;
@@ -29,14 +29,16 @@ use mlx_rs::ops::{
 };
 use mlx_rs::Array;
 
-pub use mlx_gen::gen_core::train::body::{
-    body_arm_footprint, BodyArm, BodyLossesConfig, BodyModelFootprint, HybrikConfig, SapiensConfig,
-    TwoTap, VitPoseConfig,
+pub use gen_core_train::body::{
+    body_arm_footprint, BodyArm, BodyModelFootprint, HybrikConfig, SapiensConfig, TwoTap,
+    VitPoseConfig,
 };
-use mlx_gen::gen_core::train::body::{
+use gen_core_train::body::{
     keypoint_box, VitPoseWarp, MIN_MEAN_RATIO_VISIBILITY, MISSING_REFERENCE_VISIBILITY,
-    NUM_BODY_RATIOS, NUM_HEAD_RATIOS, RATIO_VISIBILITY_KEYPOINTS, VIS_THRESHOLD,
+    RATIO_VISIBILITY_KEYPOINTS, VIS_THRESHOLD,
 };
+pub use mlx_gen::gen_core::train::body::BodyLossesConfig;
+use mlx_gen::gen_core::train::body::{NUM_BODY_RATIOS, NUM_HEAD_RATIOS};
 
 use mlx_gen::train::perceptual::{reference_as, AuxModelFootprint, LossReference, PerceptualLoss};
 use mlx_gen::weights::{join, to_f32, Weights};
@@ -78,7 +80,7 @@ pub(crate) fn normalize(x: &Array, mean: [f32; 3], std: [f32; 3]) -> Result<Arra
     Ok(divide(&subtract(x, &m)?, &s)?)
 }
 
-/// One axis of a separable resample (see [`mlx_gen::gen_core::train::body::resize_weights`]), in
+/// One axis of a separable resample (see [`gen_core_train::body::resize_weights`]), in
 /// the exact two-tap gather form ([`TwoTap`]) — a dense matmul here ran on a reduced-precision
 /// GEMM and missed torch by ~1e-3.
 pub struct AxisMatrix {
@@ -107,7 +109,7 @@ impl AxisMatrix {
         Self::from_weights(
             out,
             input,
-            mlx_gen::gen_core::train::body::resize_weights(input, out, align_corners),
+            gen_core_train::body::resize_weights(input, out, align_corners),
         )
     }
     /// torch `grid_sample` (bilinear, zeros, `align_corners=True`) of `source = o·scale + offset`.
@@ -115,7 +117,7 @@ impl AxisMatrix {
         Self::from_weights(
             out,
             input,
-            mlx_gen::gen_core::train::body::affine_sample_weights(input, out, scale, offset),
+            gen_core_train::body::affine_sample_weights(input, out, scale, offset),
         )
     }
 
@@ -331,9 +333,9 @@ impl PerceptualLoss for BodyProportionLoss {
         "body-proportion"
     }
 
-    /// Upstream's `t_ratio` weighting ([`mlx_gen::gen_core::train::body::body_loss_timestep_weight`]).
+    /// Upstream's `t_ratio` weighting ([`gen_core_train::body::body_loss_timestep_weight`]).
     fn timestep_weight(&self, noise_level: f32) -> f32 {
-        mlx_gen::gen_core::train::body::body_loss_timestep_weight(noise_level)
+        gen_core_train::body::body_loss_timestep_weight(noise_level)
     }
 
     fn reference(&self, clean: &Array) -> Result<Option<LossReference>> {
@@ -399,9 +401,9 @@ impl PerceptualLoss for BodyShapeLoss {
         "body-shape"
     }
 
-    /// Upstream's `t_ratio` weighting ([`mlx_gen::gen_core::train::body::body_loss_timestep_weight`]).
+    /// Upstream's `t_ratio` weighting ([`gen_core_train::body::body_loss_timestep_weight`]).
     fn timestep_weight(&self, noise_level: f32) -> f32 {
-        mlx_gen::gen_core::train::body::body_loss_timestep_weight(noise_level)
+        gen_core_train::body::body_loss_timestep_weight(noise_level)
     }
 
     fn reference(&self, clean: &Array) -> Result<Option<LossReference>> {
@@ -461,9 +463,9 @@ impl PerceptualLoss for NormalLoss {
         "normal"
     }
 
-    /// Upstream's `t_ratio` weighting ([`mlx_gen::gen_core::train::body::body_loss_timestep_weight`]).
+    /// Upstream's `t_ratio` weighting ([`gen_core_train::body::body_loss_timestep_weight`]).
     fn timestep_weight(&self, noise_level: f32) -> f32 {
-        mlx_gen::gen_core::train::body::body_loss_timestep_weight(noise_level)
+        gen_core_train::body::body_loss_timestep_weight(noise_level)
     }
 
     fn reference(&self, clean: &Array) -> Result<Option<LossReference>> {

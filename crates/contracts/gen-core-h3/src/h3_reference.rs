@@ -1,0 +1,1614 @@
+//! **MiniMax-H3 `ref2va` reference preprocessing shared by both backends** (sc-26691).
+//!
+//! The candle and MLX ports, and the gen-core admission pricers ([`crate::veda::workspace`] and
+//! [`crate::h3_conditioning_memory`]), all have to agree on two facts about a reference *before* it
+//! is encoded: the size an **image** reference is resized to, and how many samples of a reference
+//! **soundtrack** survive. Both are pure arithmetic, so they live here once rather than as four
+//! copies that drift.
+//!
+//! # Upstream sources
+//!
+//! * sglang `multimodal_gen/.../minimax_h3/reference_encoding.py`
+//!   (`minimax_h3_resolve_reference_image_shape`, `_nearest_multiple`) and `constants.py`
+//!   (`MINIMAX_H3_REFERENCE_RESIZE_MODES`) @ `e0df901d` — the three resize modes.
+//! * diffusers `modular_pipelines/minimax_h3/before_encoder.py` @ `cda991a6` — the `diffusers` mode
+//!   (force the short edge to 2048, upscaling included) and `_normalize_audio_condition`'s
+//!   `waveform[:, : int(max_duration * sample_rate)]` with `max_duration = num_frames / fps`.
+//! * ComfyUI `comfy_extras/nodes_minimax_h3.py` @ `79cf64c2` defaults to `match`, and ModelTC
+//!   distilled the Ref2VA Turbo LoRA with `match`, which is why [`ReferenceImageResizeMode`]'s
+//!   default is [`Match`](ReferenceImageResizeMode::Match) here (sglang keeps `diffusers` as its own
+//!   compatibility default).
+//!
+//! Only `image.reference_preserve` materials are resized by the mode. First/last-frame keyframes
+//! (`image.target_canvas` upstream) are stretched onto the target canvas and video references keep
+//! the shared canvas rule; neither reads the mode.
+//!
+//! # The ref2va reference list (sc-27256)
+//!
+//! **`ref2va` multi-modal references** (sc-17149 mlx, sc-17157 candle): the ordered, heterogeneous condition list that
+//! selects the `transformer_ref` checkpoint.
+//!
+//! ```text
+//! references (ordered) ─┬─ image ─► video VAE ─► condition rows          ─┐
+//!                       ├─ video ─► video VAE ─► condition rows           ├─► packed sequence
+//!                       │        └► audio VAE ─► reference audio rows    ─┤
+//!                       └─ audio ──► audio VAE ─► reference audio rows   ─┘
+//! ```
+//!
+//! Every rule here is a property of the **model**, not of a backend, so it lives once in gen-core
+//! and both `mlx-gen-minimax-h3` and `candle-gen-minimax-h3` re-export it as their `reference`
+//! module (hoisted from their mirrored copies, sc-27256). The MLX copy had drifted: it lacked the
+//! [`MIN_REFERENCE_CLIP_FRAMES`] floor and the pixel-free [`normalized_clip_frame_count`] that lets
+//! `Generator::validate` refuse what `generate` would. Before the hoist, a source-text
+//! cross-backend test was the only thing holding the two lanes' caps together.
+//!
+//! # `ref2va` is the task that serves image-edit, and `fl2va` is not
+//!
+//! The single most consequential fact, established by the sc-17242 spike against the reference
+//! implementation:
+//!
+//! > **References do not bind the generated geometry.** They are encoded at their *own* resolution
+//! > and the target canvas defaults to MiniMax-H3's 16:9.
+//!
+//! That is the exact opposite of [`crate::h3_keyframe`], where a keyframe is stretched onto the canvas,
+//! **binds** the canvas to its own aspect ratio, and becomes literal frame 0. So the same image
+//! passed as a keyframe and as a reference produces two different canvases *and* two different
+//! tasks, and there is no parameter anywhere that reconciles them. `ref2va` is the subject / edit
+//! task; `fl2va` is the "start from this exact frame" task.
+//!
+//! # Order is semantic twice over — a reference list is not a set
+//!
+//! The order fixes the `"<Picture i>"` / `"<Audio j>"` / `"<Video k>"` labels of the prompt
+//! presentation **and** advances the shared audio/video rotary clock
+//! (each engine's `dit::positions::reference_block_position_ids`). **Reordering the same references is a
+//! different request.** Any surface that models the reference list as an unordered set is wrong.
+//!
+//! # A waveform never reaches the conditioner
+//!
+//! An audio reference contributes only its `"<Audio j>: "` **text label** to the text encoder; its
+//! content goes through the audio VAE alone. That asymmetry is why [`Ref2VaReference::Audio`]
+//! carries no vision-token count and why [`ReferencePresentation`] has a variant with no vision
+//! block: an implementation that "helpfully" ran a tower over a waveform would be conditioning on
+//! something the released model never saw.
+//!
+//! A **video** reference that carries a soundtrack is labelled `"<Audio j>: "` *before*
+//! `"<Video k>: "`, mirroring the order its rows are packed in, and its soundtrack is conditioned on
+//! as *its own* rather than as a reference of its own — so it consumes an `<Audio j>` label but not
+//! an audio-reference cap slot.
+//!
+//! # Rates are load-bearing and are not defaulted silently
+//!
+//! MiniMax-H3 resamples every video reference onto its own 24 fps ([`normalize_reference_clip`]).
+//! It does **not** resample audio: this crate ships no resampler at all, so a soundtrack that is
+//! not already at the audio VAE's [`crate::h3_audio_config::AUDIO_SAMPLE_RATE`] is **rejected** by
+//! [`Ref2VaReferences::new`], at the engine boundary and before any weight is read. The caller
+//! resamples.
+//!
+//! A reference built from frames whose real rate was lost is conditioned on **at the wrong speed,
+//! and nothing raises**. So [`VideoReference`] carries its `fps` and the waveform its `sample_rate`
+//! as required data rather than as an optional hint with a plausible default.
+//!
+//! The **request surface must carry the rate too**, or the guarantee stops at this type's boundary.
+//! It does: `gen_core::Conditioning::ReferenceVideo` has its own `fps`, distinct from the
+//! request-level `GenerationRequest::fps` (the *output* rate, which this model pins to 24). See
+//! `model::request_references` for that decision in full.
+
+use crate::h3_audio_config::AUDIO_SAMPLE_RATE;
+pub use gen_core::h3_reference::{effective_reference_image_resize_mode, ReferenceImageResizeMode};
+use gen_core::{AudioTrack, Error, Image, Result};
+
+/// The short edge `diffusers` forces and `max` caps an image reference at — upstream's
+/// `MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE` / `reference_image_short_edge` default.
+pub const REFERENCE_IMAGE_BASE_SHORT_EDGE: u32 = 2048;
+
+/// The lattice every resolved reference side is rounded onto (upstream
+/// `MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE`): the video VAE's 16x stride times the DiT's 2x2 patch.
+pub const REFERENCE_IMAGE_MULTIPLE: u32 = 32;
+
+/// The widest admitted reference aspect, inclusive on both sides (1:4 to 4:1).
+pub const REFERENCE_IMAGE_MAX_ASPECT: f64 = 4.0;
+
+/// Upstream `_nearest_multiple`: `max(multiple, int(round(value / multiple)) * multiple)`.
+fn nearest_multiple(value: f64, multiple: f64) -> f64 {
+    ((value / multiple).round_ties_even() * multiple).max(multiple)
+}
+
+/// **The `(width, height)` an image reference is resized to** — upstream
+/// `minimax_h3_resolve_reference_image_shape`, bit for bit.
+///
+/// `target_width` x `target_height` is the request's resolved canvas (only
+/// [`Match`](ReferenceImageResizeMode::Match) reads it); `short_edge` is the effective
+/// [`reference_image_short_edge`](gen_core::GenerationRequest::reference_image_short_edge) (only `max`
+/// and `diffusers` read it); `multiple` is the lattice, [`REFERENCE_IMAGE_MULTIPLE`] for the
+/// released checkpoint.
+///
+/// Refuses a zero extent, a zero canvas, a zero `short_edge` / `multiple`, and an aspect outside
+/// 1:4..=4:1 — the same refusals upstream raises before any pixel is touched.
+pub fn resolve_reference_image_size(
+    width: u32,
+    height: u32,
+    target_width: u32,
+    target_height: u32,
+    mode: ReferenceImageResizeMode,
+    short_edge: u32,
+    multiple: u32,
+) -> Result<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 ref2va: a reference image must have a positive size, got {width}x{height}"
+        )));
+    }
+    if target_width == 0 || target_height == 0 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 ref2va: the target canvas must have a positive size, got \
+             {target_width}x{target_height}"
+        )));
+    }
+    if short_edge == 0 || multiple == 0 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 ref2va: reference short edge ({short_edge}) and lattice ({multiple}) \
+             must be positive"
+        )));
+    }
+    let (w, h) = (f64::from(width), f64::from(height));
+    if w > REFERENCE_IMAGE_MAX_ASPECT * h || h > REFERENCE_IMAGE_MAX_ASPECT * w {
+        return Err(Error::Msg(format!(
+            "minimax-h3 ref2va: reference image ratio must be within the inclusive range 1:4 to \
+             4:1, got {width}x{height}"
+        )));
+    }
+    let short = w.min(h);
+    let scale = match mode {
+        ReferenceImageResizeMode::Match => {
+            let (cw, ch) = (f64::from(target_width), f64::from(target_height));
+            1.0f64.min(((cw * ch) / (w * h)).sqrt())
+        }
+        ReferenceImageResizeMode::Max => 1.0f64.min(f64::from(short_edge) / short),
+        ReferenceImageResizeMode::Diffusers => f64::from(short_edge) / short,
+    };
+    let m = f64::from(multiple);
+    let side = |v: f64| -> Result<u32> {
+        let r = nearest_multiple(v * scale, m);
+        if !r.is_finite() || r > f64::from(u32::MAX) {
+            return Err(Error::Msg(format!(
+                "minimax-h3 ref2va: reference image {width}x{height} resolves out of range"
+            )));
+        }
+        Ok(r as u32)
+    };
+    Ok((side(w)?, side(h)?))
+}
+
+/// **Samples per channel a reference soundtrack keeps** — diffusers'
+/// `int(max_duration * sample_rate)` with `max_duration = num_frames / fps`, the same bound sglang
+/// hands `ffmpeg -t` (`audio_encoding.py`: `frame_count / fps`).
+///
+/// Applies to a standalone audio reference *and* a video reference's own soundtrack.
+pub fn reference_audio_max_samples_per_channel(
+    num_frames: usize,
+    fps: f64,
+    sample_rate: u32,
+) -> usize {
+    let max_duration = num_frames as f64 / fps;
+    let kept = max_duration * f64::from(sample_rate);
+    if kept.is_finite() && kept > 0.0 {
+        kept as usize
+    } else {
+        0
+    }
+}
+
+/// Truncate a reference soundtrack to the generated duration (see
+/// [`reference_audio_max_samples_per_channel`]). Interleaved PCM is cut on a whole sample frame;
+/// a track already within the bound is returned unchanged, and stems are cut the same way.
+pub fn truncate_reference_audio(track: &AudioTrack, num_frames: usize, fps: f64) -> AudioTrack {
+    let per_channel = reference_audio_max_samples_per_channel(num_frames, fps, track.sample_rate);
+    let keep = per_channel.saturating_mul(usize::from(track.channels.max(1)));
+    let mut out = track.clone();
+    out.samples.truncate(keep);
+    for stem in &mut out.stems {
+        stem.samples.truncate(keep);
+    }
+    out
+}
+
+/// **The shortest normalized reference clip the video VAE can encode on its own lattice**: one
+/// whole chunk, `17 · 1 + 5`.
+///
+/// Each engine's `conditioning::snap_reference_frames_down` floors at this count, and
+/// `model::generate_ref2va` pairs it with `.min(frames.len())` so a clip is never over-read
+/// — which together mean a *shorter* clip reaches the encoder **off** the `17n + 5` lattice.
+/// [`normalize_reference_clip`] therefore refuses one. The window that mattered is 13..=21:
+/// [`sample_video_condition_frames`] already refuses anything under 13.
+pub const MIN_REFERENCE_CLIP_FRAMES: usize = 22;
+
+/// Image references a `ref2va` request may carry.
+pub const MAX_IMAGE_REFERENCES: usize = 9;
+
+/// Video-clip references a `ref2va` request may carry.
+pub const MAX_VIDEO_REFERENCES: usize = 3;
+
+/// Audio references a `ref2va` request may carry.
+///
+/// A **video** reference's own soundtrack does *not* consume one of these: it is conditioned on as
+/// that reference's own, which is why [`Ref2VaReferences::audio_count`] counts only standalone
+/// audio references.
+pub const MAX_AUDIO_REFERENCES: usize = 3;
+
+/// References of **any** modality a `ref2va` request may carry in total.
+///
+/// Deliberately smaller than `9 + 3 + 3 = 15`: the per-modality caps and this one are independent
+/// gates, and a request may saturate at most one of them.
+pub const MAX_TOTAL_REFERENCES: usize = 12;
+
+/// The short edge an **image** reference is encoded at — its own, not the canvas's.
+///
+/// Images are encoded at high detail, upscaling included and with **no** area cap, unlike video
+/// references and the generated canvas which share the one canvas rule. This is the concrete form
+/// of "references do not bind the generated geometry": a 2048-short-edge image reference conditions
+/// a 768-short-edge render.
+///
+/// Since sc-26691 this is the `diffusers` / `max` short edge only: the render applies the request's
+/// [`ReferenceImageResizeMode`] (default `match`) through [`resize_reference_image`].
+pub const REFERENCE_IMAGE_SHORT_EDGE: u32 = 2048;
+
+/// The rate the **conditioner** reads a video reference at — every `24 / 2 = 12`th frame of the
+/// normalized clip.
+///
+/// This is not the rate the *VAE* sees. A video reference takes two paths, exactly as a keyframe
+/// does: the vision tower reads it sparsely at 2 fps for semantic context, and the video VAE encodes
+/// it densely at the full 24 fps for the pixel-space anchor. Conflating the two would either flood
+/// the conditioner or starve the anchor.
+pub const VIDEO_SAMPLE_FPS: f64 = 2.0;
+
+/// Qwen3-VL's temporal patch: the conditioner merges sampled frames in groups of this many, and one
+/// merged group is one vision block with one `"<t seconds>"` label.
+pub const VISION_TEMPORAL_PATCH: usize = 2;
+
+/// Which frames of a normalized video reference the conditioner reads, and the timestamp label of
+/// every vision block they merge into.
+///
+/// Returns `(frame_indices, block_timestamps)`. `frame_indices` indexes the *normalized* clip (the
+/// one already resampled onto MiniMax-H3's 24 fps); `block_timestamps` has one entry per merged
+/// group of [`VISION_TEMPORAL_PATCH`] sampled frames, which is one `<|video_pad|>` block.
+///
+/// # Three details that are each individually easy to get wrong
+///
+/// * **The cursor is fractional and deduplicated.** `stride = fps / sample_fps` is stepped in
+///   floating point and each rounded index is kept only if it advanced, so a clip whose rate is
+///   below the sample rate contributes each frame once rather than repeating it.
+/// * **Rounding is half-to-even**, Python's `round`, not half-away-from-zero. At the shipped
+///   24 / 2 the stride is an exact 12 and the two agree; they diverge the moment a fine-tune moves
+///   either rate, which is precisely when nothing would notice.
+/// * **The trailing partial group repeats the last timestamp** rather than being dropped or
+///   averaged short, and a block's label is the mean of its group's first and last timestamps.
+///   That is why the first block of a 2 fps pair renders `"<0.2 seconds>"`: `(0.0 + 0.5) / 2 =
+///   0.25`, which `{:.1}` rounds half to even down to `0.2`.
+///
+/// A clip too short to fill one group is **rejected**, because a merged group repeating a single
+/// frame is not something the released model was conditioned on.
+pub fn sample_video_condition_frames(
+    num_frames: usize,
+    fps: f64,
+    sample_fps: f64,
+    temporal_patch: usize,
+) -> Result<(Vec<usize>, Vec<f64>)> {
+    if num_frames == 0 {
+        return Err(Error::Msg(
+            "minimax-h3 ref2va: cannot sample a clip with no frames".into(),
+        ));
+    }
+    if !fps.is_finite() || fps <= 0.0 || !sample_fps.is_finite() || sample_fps <= 0.0 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 ref2va: sampling needs positive finite rates, got {fps} and {sample_fps}"
+        )));
+    }
+    if temporal_patch == 0 {
+        return Err(Error::Msg(
+            "minimax-h3 ref2va: the vision temporal patch must be positive".into(),
+        ));
+    }
+
+    let stride = fps / sample_fps;
+    let mut indices: Vec<usize> = Vec::new();
+    let mut cursor = 0.0f64;
+    loop {
+        let at = crate::h3_keyframe::round_half_to_even(cursor);
+        if at >= num_frames as f64 {
+            break;
+        }
+        let at = at as usize;
+        if indices.last().is_none_or(|&prev| at > prev) {
+            indices.push(at);
+        }
+        cursor += stride;
+    }
+    if indices.len() < temporal_patch {
+        let minimum =
+            crate::h3_keyframe::round_half_to_even((temporal_patch - 1) as f64 * stride) + 1.0;
+        return Err(Error::Msg(format!(
+            "minimax-h3 ref2va: a reference clip is read at {sample_fps} fps and its sampled \
+             frames merge in groups of {temporal_patch}, so it must run at least {minimum} frames \
+             at {fps} fps, got {num_frames}"
+        )));
+    }
+
+    // One timestamp per sampled frame, then the trailing partial group is padded by repeating the
+    // last one, so every group is full before the means are taken.
+    let mut timestamps: Vec<f64> = (0..indices.len()).map(|i| i as f64 / sample_fps).collect();
+    let pad = (temporal_patch - timestamps.len() % temporal_patch) % temporal_patch;
+    if let Some(&last) = timestamps.last() {
+        timestamps.extend(std::iter::repeat_n(last, pad));
+    }
+    let block_timestamps = timestamps
+        .chunks(temporal_patch)
+        .map(|c| (c[0] + c[c.len() - 1]) / 2.0)
+        .collect();
+
+    Ok((indices, block_timestamps))
+}
+
+/// The vision-tower inputs for a clip's sampled frames: one `(first, last)` frame pair per merged
+/// group of `temporal_patch`, chunked exactly as [`sample_video_condition_frames`] chunks its block
+/// timestamps — the trailing partial group repeats its last frame, as its timestamp does. One pair
+/// per presented block, so the tower's grids and the tokenizer's blocks always agree.
+pub fn condition_frame_groups(indices: &[usize], temporal_patch: usize) -> Vec<(usize, usize)> {
+    if temporal_patch == 0 {
+        return Vec::new();
+    }
+    indices
+        .chunks(temporal_patch)
+        .map(|group| (group[0], group[group.len() - 1]))
+        .collect()
+}
+
+/// Resize an **image** reference onto `short_edge`, on the stride-32 lattice — the `diffusers`
+/// [resize mode](resize_reference_image) (sc-26691), no longer the render default.
+///
+/// **No area cap and upscaling included** — an image reference is encoded at high detail, unlike a
+/// video reference and the generated canvas which share the one canvas rule. This is the concrete
+/// mechanism behind "references do not bind the generated geometry": the returned size depends only
+/// on the image and `short_edge`, never on the request's canvas.
+///
+/// `short_edge` is the request's effective
+/// [`reference_image_short_edge`](gen_core::GenerationRequest::reference_image_short_edge)
+/// — [`REFERENCE_IMAGE_SHORT_EDGE`] unless the caller lowered it, admitted over 1024..=2048
+/// (sc-23402). It buys **reference token count**, roughly quadratic in it, and does not change the
+/// rendered clip's size. The caller passes an already-validated value; a non-positive one is refused
+/// here as a defect rather than silently producing a degenerate plate.
+pub fn normalize_reference_image(
+    image: &Image,
+    canvas_multiple: i32,
+    short_edge: i32,
+) -> Result<Image> {
+    // The `diffusers` mode never reads the target canvas, so any positive one will do.
+    resize_reference_image(
+        image,
+        canvas_multiple,
+        1,
+        1,
+        ReferenceImageResizeMode::Diffusers,
+        short_edge,
+    )
+}
+
+/// **Resize an image reference under the request's resize mode** (sc-26691) — what each engine's
+/// `generate_ref2va` calls.
+///
+/// The size is [`resolve_reference_image_size`]'s, shared with the gen-core admission pricers:
+/// upstream sglang's `minimax_h3_resolve_reference_image_shape` (`match` / `max` / `diffusers`),
+/// every side rounded half-to-even onto `canvas_multiple`, and an aspect outside 1:4..=4:1 refused.
+/// `target_width` x `target_height` is the resolved render canvas (read by `match` only);
+/// `short_edge` is the effective
+/// [`reference_image_short_edge`](gen_core::GenerationRequest::reference_image_short_edge) (read by
+/// `max` / `diffusers` only). [`normalize_reference_image`] is the `diffusers` special case.
+pub fn resize_reference_image(
+    image: &Image,
+    canvas_multiple: i32,
+    target_width: u32,
+    target_height: u32,
+    mode: ReferenceImageResizeMode,
+    short_edge: i32,
+) -> Result<Image> {
+    if image.width == 0 || image.height == 0 {
+        return Err(Error::Msg(
+            "minimax-h3 ref2va: cannot normalize a zero-extent reference image".into(),
+        ));
+    }
+    if canvas_multiple <= 0 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 ref2va: canvas multiple must be positive, got {canvas_multiple}"
+        )));
+    }
+    if short_edge <= 0 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 ref2va: reference_image_short_edge must be positive, got {short_edge}"
+        )));
+    }
+    let (tw, th) = resolve_reference_image_size(
+        image.width,
+        image.height,
+        target_width,
+        target_height,
+        mode,
+        short_edge as u32,
+        canvas_multiple as u32,
+    )?;
+    if (tw, th) == (image.width, image.height) {
+        return Ok(image.clone());
+    }
+    // `Stretch` — the target size was derived from this image's own aspect ratio, so there is
+    // nothing to crop and a cover-crop would discard the edges the reference is meant to supply.
+    crate::h3_keyframe::fit_keyframe(image, tw, th, crate::h3_keyframe::KeyframeFit::Stretch)
+}
+
+/// How many output frames each source frame is held for — `ffmpeg`'s `fps` filter schedule.
+///
+/// Pixel-free and shared: [`normalized_clip_frame_count`] sums it and [`normalize_reference_clip`]
+/// expands it, so the count the engine boundary admits and the count the render produces are the
+/// same arithmetic rather than two copies of it.
+fn resample_repeats(source_len: usize, fps: f64, target_fps: f64) -> Vec<usize> {
+    if (fps - target_fps).abs() < f64::EPSILON {
+        return vec![1; source_len];
+    }
+    let scale = target_fps / fps;
+    let slot = |i: usize| (i as f64 * scale + 0.5).floor() as i64;
+    let end = (source_len as f64 * scale + 0.5).floor() as i64;
+    (0..source_len)
+        .map(|i| {
+            let next = if i + 1 < source_len { slot(i + 1) } else { end };
+            (next - slot(i)).max(0) as usize
+        })
+        .collect()
+}
+
+/// **The frame count [`normalize_reference_clip`] will produce, decided without a pixel.**
+///
+/// Steps 1 and 2 of the normalization — resample onto `target_fps`, truncate to `num_frames` — plus
+/// every refusal that depends only on counts: an empty clip, a non-positive rate, a resample that
+/// leaves nothing, and the [`MIN_REFERENCE_CLIP_FRAMES`] floor.
+///
+/// # Why this is a separate function
+///
+/// The floor used to be enforced only inside `normalize_reference_clip`, whose sole production
+/// caller is `model::generate_ref2va`. So `Generator::validate` **admitted** a short clip
+/// that `generate` then refused — the late-failure shape the rest of sc-17157 removes, and one the
+/// crate's own tests had frozen in place by building 4-frame clips and asserting they validate.
+///
+/// The surviving count depends on the request's `num_frames`, which is why `Ref2VaReferences::new`
+/// cannot check it: the reference list is built before the geometry is resolved. `validate` has
+/// both, so it calls this; see `MiniMaxH3::validate` for why it lands there rather than inside
+/// `resolve_task`.
+///
+/// Splitting the decision out is what keeps the two callers from drifting: `normalize_reference_clip`
+/// does not re-derive the count, it *consumes* the one this returns.
+pub fn normalized_clip_frame_count(
+    source_len: usize,
+    fps: f64,
+    num_frames: usize,
+    target_fps: f64,
+) -> Result<usize> {
+    if source_len == 0 {
+        return Err(Error::Msg(
+            "minimax-h3 ref2va: cannot normalize a clip with no frames".into(),
+        ));
+    }
+    if !fps.is_finite() || fps <= 0.0 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 ref2va: a reference clip must carry a positive frame rate, got {fps}"
+        )));
+    }
+    // 1. onto the 24 fps grid, and 2. truncate to the generated duration.
+    let total: usize = resample_repeats(source_len, fps, target_fps).iter().sum();
+    let kept = total.min(num_frames);
+    if kept == 0 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 ref2va: resampling a {source_len}-frame clip from {fps} onto \
+             {target_fps} fps left no frames"
+        )));
+    }
+    // 2b. **One whole VAE chunk, or nothing.** `model::generate_ref2va` snaps the kept count
+    // DOWN to the `17n + 5` lattice and then takes `.min(frames.len())`, so a normalized clip
+    // between `sample_video_condition_frames`' own 13-frame minimum and 21 would reach the encoder
+    // OFF the lattice — a regime nothing in this crate specifies, tests or bounds. Refused here,
+    // where the caller can still be told, rather than composed into an untested encode.
+    if kept < MIN_REFERENCE_CLIP_FRAMES {
+        return Err(Error::Msg(format!(
+            "minimax-h3 ref2va: a {source_len}-frame clip at {fps} fps normalizes to {kept} frames \
+             at {target_fps} fps, below the {MIN_REFERENCE_CLIP_FRAMES}-frame floor — the video \
+             VAE encodes on a `17n + 5` lattice whose smallest chunk is \
+             {MIN_REFERENCE_CLIP_FRAMES} frames, and a shorter clip would be encoded off it"
+        )));
+    }
+    Ok(kept)
+}
+
+/// Resample a **video** reference's frames onto MiniMax-H3's own 24 fps, truncate to the generated
+/// frame count, and put them on the canvas their own aspect ratio resolves to.
+///
+/// # Resampling is whole frames held into slots, not interpolation
+///
+/// `slot[i] = floor(i · target/source + 0.5)`, and frame `i` is repeated for `slot[i+1] - slot[i]`
+/// output frames — `ffmpeg`'s `fps` filter, which is what the released model was conditioned
+/// through. Nothing is blended: a reference at 30 fps has frames **dropped**, one at 12 fps has
+/// frames **duplicated**. Interpolating instead would invent motion the model never saw.
+///
+/// Steps 1-2 and every count-only refusal live in [`normalized_clip_frame_count`], which
+/// `Generator::validate` calls on the same inputs — so this function cannot admit a clip the
+/// boundary refused, or refuse one it admitted.
+///
+/// The canvas here is the *shared* canvas rule (short edge and area cap), unlike
+/// [`normalize_reference_image`] — a clip is put on a canvas, a still is not.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_reference_clip(
+    frames: &[Image],
+    fps: f64,
+    num_frames: usize,
+    canvas_multiple: i32,
+    canvas_short_edge: i32,
+    canvas_max_pixels: i64,
+    target_fps: f64,
+) -> Result<Vec<Image>> {
+    // Steps 1-2 and every count-only refusal, decided once. The count is CONSUMED rather than
+    // re-derived, so this function and `Generator::validate` cannot disagree about a clip.
+    let keep = normalized_clip_frame_count(frames.len(), fps, num_frames, target_fps)?;
+    let kept: Vec<&Image> = frames
+        .iter()
+        .zip(resample_repeats(frames.len(), fps, target_fps))
+        .flat_map(|(f, repeat)| std::iter::repeat_n(f, repeat))
+        .take(keep)
+        .collect();
+    // 3. onto the canvas its OWN aspect ratio resolves to.
+    let (h, w) = crate::h3_keyframe::resolve_canvas_size(
+        f64::from(kept[0].width),
+        f64::from(kept[0].height),
+        canvas_multiple,
+        canvas_short_edge,
+        canvas_max_pixels,
+    )?;
+    kept.into_iter()
+        .map(|f| {
+            if f.width == w as u32 && f.height == h as u32 {
+                Ok(f.clone())
+            } else {
+                crate::h3_keyframe::fit_keyframe(
+                    f,
+                    w as u32,
+                    h as u32,
+                    crate::h3_keyframe::KeyframeFit::Stretch,
+                )
+            }
+        })
+        .collect()
+}
+
+/// The kind discriminant of a [`Ref2VaReference`] — what the caps count and what the presentation
+/// labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceKind {
+    /// A subject / style / scene reference.
+    Image,
+    /// A motion and camera reference, conditioned on together with its own soundtrack.
+    Video,
+    /// A voice or music reference. Never reaches the conditioner.
+    Audio,
+}
+
+impl ReferenceKind {
+    /// The per-modality cap this kind is counted against.
+    pub fn cap(self) -> usize {
+        match self {
+            Self::Image => MAX_IMAGE_REFERENCES,
+            Self::Video => MAX_VIDEO_REFERENCES,
+            Self::Audio => MAX_AUDIO_REFERENCES,
+        }
+    }
+
+    /// The noun used in a rejection message.
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Video => "video",
+            Self::Audio => "audio",
+        }
+    }
+}
+
+/// A motion / camera reference: its frames, the rate they carry, and optionally its soundtrack.
+#[derive(Debug, Clone)]
+pub struct VideoReference {
+    /// The reference frames, in order.
+    pub frames: Vec<Image>,
+    /// **The rate `frames` actually carry.** Not a hint: MiniMax-H3 resamples onto its own 24 fps
+    /// by dropping and duplicating whole frames, so a wrong value here is a reference conditioned
+    /// on at the wrong speed with nothing to raise about it.
+    pub fps: f64,
+    /// This video's own soundtrack, conditioned on as the reference's own rather than as a
+    /// reference of its own. `None` conditions on motion alone.
+    pub audio: Option<AudioTrack>,
+}
+
+/// A voice or music reference. It never reaches the conditioner and is encoded by the audio VAE
+/// alone — see the module docs.
+#[derive(Debug, Clone)]
+pub struct AudioReference {
+    /// The reference waveform.
+    pub audio: AudioTrack,
+}
+
+/// One `ref2va` reference. The list of these is **ordered**, and the order is semantic — see the
+/// module docs.
+#[derive(Debug, Clone)]
+pub enum Ref2VaReference {
+    /// A subject, style or scene reference, encoded at [`REFERENCE_IMAGE_SHORT_EDGE`].
+    Image(Image),
+    /// A motion and camera reference, with its own frame rate and optional soundtrack.
+    Video(VideoReference),
+    /// A voice or music reference.
+    Audio(AudioReference),
+}
+
+impl Ref2VaReference {
+    /// Which modality this reference is counted as.
+    pub fn kind(&self) -> ReferenceKind {
+        match self {
+            Self::Image(_) => ReferenceKind::Image,
+            Self::Video(_) => ReferenceKind::Video,
+            Self::Audio(_) => ReferenceKind::Audio,
+        }
+    }
+
+    /// Whether this reference contributes **audio** rows — a standalone audio reference always, a
+    /// video reference only when it carries a soundtrack.
+    ///
+    /// This is what orders the presentation: a reference with audio emits its `"<Audio j>: "` label
+    /// **before** its visual label, mirroring the order its rows are packed in.
+    pub fn has_audio(&self) -> bool {
+        match self {
+            Self::Image(_) => false,
+            Self::Video(v) => v.audio.is_some(),
+            Self::Audio(_) => true,
+        }
+    }
+
+    /// This reference's soundtrack, whichever variant carries it.
+    pub fn audio(&self) -> Option<&AudioTrack> {
+        match self {
+            Self::Image(_) => None,
+            Self::Video(v) => v.audio.as_ref(),
+            Self::Audio(a) => Some(&a.audio),
+        }
+    }
+}
+
+/// A **validated**, ordered `ref2va` reference list.
+///
+/// The only constructor is [`Ref2VaReferences::new`], so a value of this type has already passed
+/// every cap and every structural rule. That is deliberate: it makes "the caps were checked" a
+/// property of the type rather than a discipline every call site has to remember, and it is why the
+/// engine boundary cannot be bypassed by a caller that assembles rows directly.
+#[derive(Debug, Clone)]
+pub struct Ref2VaReferences {
+    references: Vec<Ref2VaReference>,
+}
+
+impl Ref2VaReferences {
+    /// Validate an ordered reference list against every `ref2va` rule, at the **engine boundary**.
+    ///
+    /// This is the gate the story requires to exist here and not only at the API: a request that
+    /// reaches the engine over-cap must be refused with a message that names the cap, rather than
+    /// rendering a plausible clip that silently ignored the twelfth reference.
+    ///
+    /// The rules, in the order they are checked:
+    ///
+    /// 1. **At least one reference.** An empty list is `t2va`, a different task on a different
+    ///    checkpoint — routing it here would load the wrong 66 GB partition.
+    /// 2. **Each per-modality cap** — [`MAX_IMAGE_REFERENCES`], [`MAX_VIDEO_REFERENCES`],
+    ///    [`MAX_AUDIO_REFERENCES`].
+    /// 3. **The combined cap** — [`MAX_TOTAL_REFERENCES`]. Checked separately because
+    ///    `9 + 3 + 3 = 15 > 12`: a request can satisfy all three per-modality caps and still be
+    ///    over budget, which is exactly the 15-file case the epic's R2 calls out.
+    /// 4. **Audio references are never alone.** An audio reference has to be paired with at least
+    ///    one image or video reference. A waveform never reaches the conditioner, so an
+    ///    audio-only request would leave the text encoder with nothing but labels and the visual
+    ///    stream wholly unconditioned — the model was not trained on that shape.
+    /// 5. **Non-degenerate media** — an empty video reference, an empty waveform, a zero-extent
+    ///    image and a non-finite or non-positive frame rate are all refused rather than
+    ///    propagated into a shape error 50 layers deep.
+    pub fn new(references: Vec<Ref2VaReference>) -> Result<Self> {
+        if references.is_empty() {
+            return Err(Error::Msg(
+                "minimax-h3 ref2va: needs at least one reference; a text-only request is t2va, \
+                 which runs a different checkpoint"
+                    .into(),
+            ));
+        }
+
+        for kind in [
+            ReferenceKind::Image,
+            ReferenceKind::Video,
+            ReferenceKind::Audio,
+        ] {
+            let n = references.iter().filter(|r| r.kind() == kind).count();
+            if n > kind.cap() {
+                return Err(Error::Msg(format!(
+                    "minimax-h3 ref2va: at most {} {} references, got {n}",
+                    kind.cap(),
+                    kind.noun()
+                )));
+            }
+        }
+
+        if references.len() > MAX_TOTAL_REFERENCES {
+            return Err(Error::Msg(format!(
+                "minimax-h3 ref2va: at most {MAX_TOTAL_REFERENCES} references in total, got {}",
+                references.len()
+            )));
+        }
+
+        if references.iter().all(|r| r.kind() == ReferenceKind::Audio) {
+            return Err(Error::Msg(
+                "minimax-h3 ref2va: an audio reference must be paired with at least one image or \
+                 video reference and cannot be used on its own — a waveform never reaches the \
+                 conditioner, so an audio-only request leaves the visual stream unconditioned"
+                    .into(),
+            ));
+        }
+
+        for (i, r) in references.iter().enumerate() {
+            match r {
+                Ref2VaReference::Image(img) => Self::check_image(i, img)?,
+                Ref2VaReference::Video(v) => {
+                    if v.frames.is_empty() {
+                        return Err(Error::Msg(format!(
+                            "minimax-h3 ref2va: reference {i} is a video with no frames"
+                        )));
+                    }
+                    if !v.fps.is_finite() || v.fps <= 0.0 {
+                        return Err(Error::Msg(format!(
+                            "minimax-h3 ref2va: reference {i} declares a frame rate of {}; a \
+                             reference is resampled onto 24 fps from the rate it carries, so the \
+                             rate must be a positive finite number",
+                            v.fps
+                        )));
+                    }
+                    for f in &v.frames {
+                        Self::check_image(i, f)?;
+                    }
+                    if let Some(a) = &v.audio {
+                        Self::check_audio(i, a)?;
+                    }
+                }
+                Ref2VaReference::Audio(a) => Self::check_audio(i, &a.audio)?,
+            }
+        }
+
+        Ok(Self { references })
+    }
+
+    fn check_image(index: usize, image: &Image) -> Result<()> {
+        if image.width == 0 || image.height == 0 {
+            return Err(Error::Msg(format!(
+                "minimax-h3 ref2va: reference {index} has a zero extent ({}x{})",
+                image.width, image.height
+            )));
+        }
+        let (w, h) = (f64::from(image.width), f64::from(image.height));
+        if w > crate::h3_keyframe::MAX_ASPECT_RATIO * h
+            || h > crate::h3_keyframe::MAX_ASPECT_RATIO * w
+        {
+            return Err(Error::Msg(format!(
+                "minimax-h3 ref2va: reference {index} is {}x{}, outside the 1:4 to 4:1 the model \
+                 accepts",
+                image.width, image.height
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_audio(index: usize, audio: &AudioTrack) -> Result<()> {
+        if audio.samples.is_empty() {
+            return Err(Error::Msg(format!(
+                "minimax-h3 ref2va: reference {index} carries an empty waveform"
+            )));
+        }
+        if audio.channels == 0 {
+            return Err(Error::Msg(format!(
+                "minimax-h3 ref2va: reference {index} declares zero audio channels"
+            )));
+        }
+        // **The rate gate, at the engine boundary.** This crate has NO audio resampler: the encode
+        // path (`pipeline::audio_track_to_encoder_input`) rejects anything that is not
+        // already at the audio VAE's rate. Checking it only there meant a 44.1 kHz reference passed
+        // `Generator::validate` and died deep inside `generate_ref2va`, after the video VAE and the
+        // audio encoder had been mapped — the exact late failure this constructor exists to
+        // prevent. `sample_rate == 0` is subsumed: zero is not 32 000.
+        if audio.sample_rate != AUDIO_SAMPLE_RATE {
+            return Err(Error::Msg(format!(
+                "minimax-h3 ref2va: reference {index} carries a {} Hz soundtrack, but this engine \
+                 has no resampler — a reference soundtrack must already be at the audio VAE's \
+                 {AUDIO_SAMPLE_RATE} Hz. Resample it before sending it.",
+                audio.sample_rate
+            )));
+        }
+        Ok(())
+    }
+
+    /// The references, in packed order.
+    pub fn as_slice(&self) -> &[Ref2VaReference] {
+        &self.references
+    }
+
+    /// How many references of every kind, for the presentation's per-modality numbering.
+    pub fn counts(&self) -> ReferenceCounts {
+        ReferenceCounts {
+            images: self.kind_count(ReferenceKind::Image),
+            videos: self.kind_count(ReferenceKind::Video),
+            audios: self.kind_count(ReferenceKind::Audio),
+        }
+    }
+
+    fn kind_count(&self, kind: ReferenceKind) -> usize {
+        self.references.iter().filter(|r| r.kind() == kind).count()
+    }
+
+    /// Standalone audio references — **not** the number of `<Audio j>` labels, which also counts
+    /// every video reference that carries a soundtrack.
+    pub fn audio_count(&self) -> usize {
+        self.kind_count(ReferenceKind::Audio)
+    }
+
+    /// How many `"<Audio j>: "` labels the presentation emits: every reference that contributes
+    /// audio rows, standalone or a video's own soundtrack.
+    pub fn audio_label_count(&self) -> usize {
+        self.references.iter().filter(|r| r.has_audio()).count()
+    }
+
+    /// Total references.
+    pub fn len(&self) -> usize {
+        self.references.len()
+    }
+
+    /// Whether the list is empty. Never true for a constructed value — [`Self::new`] refuses an
+    /// empty list — but required by the lint that pairs it with [`Self::len`].
+    pub fn is_empty(&self) -> bool {
+        self.references.is_empty()
+    }
+}
+
+/// Per-modality reference counts, for the presentation's `1`-based per-modality numbering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceCounts {
+    /// Image references.
+    pub images: usize,
+    /// Video-clip references.
+    pub videos: usize,
+    /// Standalone audio references.
+    pub audios: usize,
+}
+
+/// What one reference contributes to the **prompt presentation** — the labels and the vision block,
+/// with the vision-token count the tower produced for it.
+///
+/// Separate from [`Ref2VaReference`] because the presentation is built from the *encoded* reference
+/// (the tower's merged token count is not knowable from the pixels alone), and because an audio
+/// reference contributes a label and **no** vision block at all.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReferencePresentation {
+    /// `"<Picture i>: "` plus one `<|image_pad|>` vision block.
+    Image {
+        /// Merged vision-token count of this image's block.
+        num_tokens: usize,
+    },
+    /// `"<Audio j>: "` alone — a waveform never reaches the conditioner.
+    Audio,
+    /// `"<Video k>: "` plus one timestamped `<|video_pad|>` vision block per merged frame pair,
+    /// optionally preceded by its own `"<Audio j>: "` label.
+    Video {
+        /// Merged vision-token count **per block** of this video reference.
+        num_tokens: usize,
+        /// The timestamp of every vision block, in seconds.
+        timestamps: Vec<f64>,
+        /// Whether this reference carries a soundtrack, i.e. whether an `"<Audio j>: "` label
+        /// precedes its `"<Video k>: "` label.
+        has_audio: bool,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ReferenceImageResizeMode::{Diffusers, Match, Max};
+
+    fn resolve(w: u32, h: u32, tw: u32, th: u32, mode: ReferenceImageResizeMode) -> (u32, u32) {
+        resolve_reference_image_size(
+            w,
+            h,
+            tw,
+            th,
+            mode,
+            REFERENCE_IMAGE_BASE_SHORT_EDGE,
+            REFERENCE_IMAGE_MULTIPLE,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn default_mode_is_match_and_serde_uses_upstream_spelling() {
+        assert_eq!(ReferenceImageResizeMode::default(), Match);
+        assert_eq!(
+            effective_reference_image_resize_mode(&gen_core::GenerationRequest::default()),
+            Match
+        );
+        for mode in ReferenceImageResizeMode::ALL {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(json, format!("\"{}\"", mode.as_str()));
+            assert_eq!(
+                serde_json::from_str::<ReferenceImageResizeMode>(&json).unwrap(),
+                mode
+            );
+            assert_eq!(
+                format!(" {} ", mode.as_str().to_uppercase())
+                    .parse::<ReferenceImageResizeMode>()
+                    .unwrap(),
+                mode
+            );
+        }
+        assert!("stretch".parse::<ReferenceImageResizeMode>().is_err());
+    }
+
+    /// The mode arithmetic table, against values computed from upstream's formula by hand.
+    #[test]
+    fn mode_arithmetic_table() {
+        // (ref w, ref h, target w, target h, mode) -> resolved (w, h)
+        type Row = (u32, u32, u32, u32, ReferenceImageResizeMode, (u32, u32));
+        let table: &[Row] = &[
+            // The film-harness plate against a 1088x544 render: area 184_320 < 591_872, so neither
+            // match nor max upscales; diffusers forces 2048 on the short edge (576 * 6.4 = 3686.4
+            // -> 115.2 multiples -> 3680).
+            (576, 320, 1088, 544, Match, (576, 320)),
+            (576, 320, 1088, 544, Max, (576, 320)),
+            (576, 320, 1088, 544, Diffusers, (3680, 2048)),
+            // A 4K still against the same render: match lands on the target area
+            // (sqrt(591_872 / 8_294_400) = 0.26713 -> 1025.8 / 577.0 -> 1024 / 576), max caps the
+            // short edge at 2048 (3840 * 0.9481 = 3640.9 -> 3648), diffusers equals max here.
+            (3840, 2160, 1088, 544, Match, (1024, 576)),
+            (3840, 2160, 1088, 544, Max, (3648, 2048)),
+            (3840, 2160, 1088, 544, Diffusers, (3648, 2048)),
+            // Portrait 1024x1536 against 1376x768: area ratio 0.672 -> scale 0.8198 -> 839.5 /
+            // 1259.2 -> 832 / 1248. Below the 2048 cap so max keeps it; diffusers upscales x2.
+            (1024, 1536, 1376, 768, Match, (832, 1248)),
+            (1024, 1536, 1376, 768, Max, (1024, 1536)),
+            (1024, 1536, 1376, 768, Diffusers, (2048, 3072)),
+        ];
+        for &(w, h, tw, th, mode, want) in table {
+            assert_eq!(
+                resolve(w, h, tw, th, mode),
+                want,
+                "{w}x{h} -> {tw}x{th} {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn rounding_is_nearest_half_to_even_with_a_one_multiple_floor() {
+        // 48 / 32 = 1.5 -> 2 (even), 80 / 32 = 2.5 -> 2 (even), 112 / 32 = 3.5 -> 4 (even).
+        assert_eq!(resolve(48, 80, 4096, 4096, Max), (64, 64));
+        assert_eq!(resolve(112, 112, 4096, 4096, Match), (128, 128));
+        // 47 / 32 = 1.47 -> 1; anything under half a multiple still floors at one multiple.
+        assert_eq!(resolve(47, 47, 4096, 4096, Match), (32, 32));
+        assert_eq!(resolve(10, 10, 4096, 4096, Max), (32, 32));
+        // Every resolved side is on the lattice.
+        for mode in ReferenceImageResizeMode::ALL {
+            let (w, h) = resolve(1001, 777, 1088, 544, mode);
+            assert_eq!((w % 32, h % 32), (0, 0), "{mode}");
+        }
+        // A lowered short edge feeds max and diffusers, never match.
+        let lowered =
+            |mode| resolve_reference_image_size(3840, 2160, 1088, 544, mode, 1024, 32).unwrap();
+        assert_eq!(lowered(Diffusers), (1824, 1024));
+        assert_eq!(lowered(Max), (1824, 1024));
+        assert_eq!(lowered(Match), resolve(3840, 2160, 1088, 544, Match));
+    }
+
+    #[test]
+    fn aspect_beyond_four_to_one_is_refused_inclusive_boundary_admitted() {
+        for mode in ReferenceImageResizeMode::ALL {
+            assert!(resolve_reference_image_size(400, 100, 1088, 544, mode, 2048, 32).is_ok());
+            assert!(resolve_reference_image_size(100, 400, 1088, 544, mode, 2048, 32).is_ok());
+            for (w, h) in [(401, 100), (100, 401)] {
+                let e = resolve_reference_image_size(w, h, 1088, 544, mode, 2048, 32)
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("1:4 to 4:1"), "{e}");
+            }
+        }
+        assert!(resolve_reference_image_size(0, 10, 1088, 544, Match, 2048, 32).is_err());
+        assert!(resolve_reference_image_size(10, 10, 0, 544, Match, 2048, 32).is_err());
+        assert!(resolve_reference_image_size(10, 10, 1088, 544, Max, 0, 32).is_err());
+    }
+
+    #[test]
+    fn audio_is_truncated_to_the_generated_duration() {
+        // 124 frames at 24 fps = 5.1666.. s; int(5.1666.. * 32000) = 165_333.
+        assert_eq!(
+            reference_audio_max_samples_per_channel(124, 24.0, 32_000),
+            165_333
+        );
+        // 241 frames = 10.041666.. s -> 321_333.33 -> 321_333.
+        assert_eq!(
+            reference_audio_max_samples_per_channel(241, 24.0, 32_000),
+            321_333
+        );
+        // Interleaved stereo: a 30 s track keeps 165_333 sample frames = 330_666 samples.
+        let long = AudioTrack {
+            samples: vec![0.5; 30 * 32_000 * 2],
+            sample_rate: 32_000,
+            channels: 2,
+            stems: Vec::new(),
+        };
+        let cut = truncate_reference_audio(&long, 124, 24.0);
+        assert_eq!(cut.samples.len(), 165_333 * 2);
+        assert_eq!((cut.sample_rate, cut.channels), (32_000, 2));
+        // Mono, and a track already shorter than the bound, pass through untouched.
+        let short = AudioTrack {
+            samples: vec![0.25; 32_000],
+            sample_rate: 32_000,
+            channels: 1,
+            stems: Vec::new(),
+        };
+        assert_eq!(
+            truncate_reference_audio(&short, 124, 24.0).samples.len(),
+            32_000
+        );
+        let mono_long = AudioTrack {
+            channels: 1,
+            samples: vec![0.0; 10 * 32_000],
+            ..short
+        };
+        assert_eq!(
+            truncate_reference_audio(&mono_long, 124, 24.0)
+                .samples
+                .len(),
+            165_333
+        );
+    }
+}
+
+#[cfg(test)]
+mod ref2va_tests {
+
+    #[test]
+    fn a_clip_presents_one_frame_pair_per_block_timestamp() {
+        // 11 sampled frames at 2 fps in pairs: 6 blocks, the last repeating frame 120.
+        let (indices, timestamps) = sample_video_condition_frames(121, 24.0, 2.0, 2).unwrap();
+        assert_eq!(indices.len(), 11);
+        let groups = condition_frame_groups(&indices, 2);
+        assert_eq!(groups.len(), timestamps.len());
+        assert_eq!(groups[0], (indices[0], indices[1]));
+        assert_eq!(groups[5], (indices[10], indices[10]));
+        // An even count has no repeated frame.
+        let (indices, timestamps) = sample_video_condition_frames(13, 24.0, 2.0, 2).unwrap();
+        let groups = condition_frame_groups(&indices, 2);
+        assert_eq!(groups.len(), timestamps.len());
+        assert!(groups.iter().all(|(first, second)| first < second));
+    }
+
+    use super::*;
+
+    /// MiniMax-H3's output clock (`modular_pipeline.py:31`). Each engine declares it as
+    /// `denoise::MINIMAX_H3_FPS`, which `check-workspace.py` pins against the released reference.
+    const MINIMAX_H3_FPS: f64 = 24.0;
+
+    fn image(w: u32, h: u32) -> Image {
+        Image {
+            width: w,
+            height: h,
+            pixels: vec![0u8; (w * h * 3) as usize],
+        }
+    }
+
+    fn track() -> AudioTrack {
+        AudioTrack {
+            samples: vec![0.0; 128],
+            sample_rate: AUDIO_SAMPLE_RATE,
+            channels: 1,
+            stems: Vec::new(),
+        }
+    }
+
+    fn img_ref() -> Ref2VaReference {
+        Ref2VaReference::Image(image(64, 64))
+    }
+
+    /// A solid-colour frame tagged with `marker`. Solid is the point: the canvas step may stretch
+    /// these, and a stretch of a constant image is that same constant, so the tag survives resizing
+    /// and the test can assert *which* source frames came out rather than only how many.
+    fn tagged(marker: u8) -> Image {
+        Image {
+            width: 64,
+            height: 64,
+            pixels: vec![marker; 64 * 64 * 3],
+        }
+    }
+
+    fn markers(frames: &[Image]) -> Vec<u8> {
+        frames.iter().map(|f| f.pixels[0]).collect()
+    }
+
+    fn normalize_at(fps: f64, frames: &[Image]) -> Vec<Image> {
+        normalize_reference_clip(
+            frames,
+            fps,
+            64, // well above every output length here, so truncation never confounds the resample
+            crate::h3_memory::SPATIAL_STRIDE as i32,
+            crate::h3_memory::CANVAS_SHORT_EDGE as i32,
+            i64::from(crate::h3_memory::CANVAS_MAX_PIXELS),
+            MINIMAX_H3_FPS,
+        )
+        .expect("a well-formed clip normalizes")
+    }
+
+    /// A reference clip is resampled **from the rate it declares**, and declaring the wrong rate
+    /// silently changes which frames the model sees (sc-17157).
+    #[test]
+    fn a_clip_is_resampled_from_the_rate_it_declares() {
+        // Long enough that every case below clears MIN_REFERENCE_CLIP_FRAMES — the resample and the
+        // lattice floor are separate gates and this test must exercise the first, not trip the
+        // second. The markers are the frame indices, so an expectation is a list of source frames.
+        let thirty: Vec<Image> = (0u8..30).map(tagged).collect();
+
+        // 24 fps — the identity case.
+        assert_eq!(
+            markers(&normalize_at(24.0, &thirty)),
+            (0u8..30).collect::<Vec<_>>()
+        );
+
+        // 30 fps — frames are DROPPED (ffmpeg `fps` slotting: 30 · 24/30 keeps 24). Every fifth
+        // source frame goes, starting at index 2. Declaring this clip at 24 fps instead would have
+        // played it 25% fast with nothing raised — the exact defect the carrier's `fps` field
+        // exists to prevent.
+        assert_eq!(
+            markers(&normalize_at(30.0, &thirty)),
+            (0u8..30).filter(|i| i % 5 != 2).collect::<Vec<_>>()
+        );
+
+        // 12 fps — frames are DUPLICATED, each held for two output slots.
+        let eleven: Vec<Image> = (0u8..11).map(tagged).collect();
+        assert_eq!(
+            markers(&normalize_at(12.0, &eleven)),
+            (0u8..11).flat_map(|i| [i, i]).collect::<Vec<_>>()
+        );
+
+        // Nothing is blended: every output frame is one of the inputs, verbatim.
+        for f in normalize_at(30.0, &thirty) {
+            assert!(
+                f.pixels.iter().all(|p| *p == f.pixels[0]),
+                "a resampled frame must be a held source frame, never an interpolation"
+            );
+        }
+    }
+
+    /// **A clip that normalizes below one whole VAE chunk is REFUSED**, not encoded off the
+    /// `17n + 5` lattice.
+    ///
+    /// `snap_reference_frames_down` floors at 22 and its caller pairs it with `.min(frames.len())`,
+    /// so a 13..=21-frame normalized clip would reach `reference_clip_to_vae_pixels` at a count the
+    /// VAE has no chunk for — a composition nothing in this crate specifies or tests. The window is
+    /// real: `sample_video_condition_frames` admits from 13 frames up.
+    ///
+    /// The boundary is asserted from both sides, because a gate written with `<=` would refuse
+    /// every legal one-chunk clip and the refusal half would still pass.
+    #[test]
+    fn a_clip_shorter_than_one_vae_chunk_is_refused() {
+        assert_eq!(MIN_REFERENCE_CLIP_FRAMES, 22);
+        let at_floor: Vec<Image> = (0u8..MIN_REFERENCE_CLIP_FRAMES as u8).map(tagged).collect();
+        assert_eq!(
+            markers(&normalize_at(24.0, &at_floor)).len(),
+            MIN_REFERENCE_CLIP_FRAMES,
+            "exactly one chunk must be ADMITTED"
+        );
+
+        for short in [1usize, 13, 21] {
+            let frames: Vec<Image> = (0..short as u8).map(tagged).collect();
+            let e = normalize_reference_clip(
+                &frames,
+                MINIMAX_H3_FPS,
+                64,
+                crate::h3_memory::SPATIAL_STRIDE as i32,
+                crate::h3_memory::CANVAS_SHORT_EDGE as i32,
+                i64::from(crate::h3_memory::CANVAS_MAX_PIXELS),
+                MINIMAX_H3_FPS,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                e.contains(&format!("{MIN_REFERENCE_CLIP_FRAMES}-frame floor")),
+                "{short} frames: {e}"
+            );
+        }
+
+        // ...and the floor is on the NORMALIZED count, not the source count: 12 source frames at
+        // 12 fps double to 24 and are admitted, while 12 at 24 fps stay 12 and are not.
+        let twelve: Vec<Image> = (0u8..12).map(tagged).collect();
+        assert_eq!(markers(&normalize_at(12.0, &twelve)).len(), 24);
+    }
+
+    fn vid_ref(with_audio: bool) -> Ref2VaReference {
+        Ref2VaReference::Video(VideoReference {
+            frames: vec![image(64, 64)],
+            fps: 24.0,
+            audio: with_audio.then(track),
+        })
+    }
+
+    fn aud_ref() -> Ref2VaReference {
+        Ref2VaReference::Audio(AudioReference { audio: track() })
+    }
+
+    /// The caps are the documented ones, and the combined cap is **not** their sum — which is the
+    /// whole reason it is a separate gate.
+    #[test]
+    fn the_caps_are_the_documented_ones_and_the_total_is_not_their_sum() {
+        assert_eq!(MAX_IMAGE_REFERENCES, 9);
+        assert_eq!(MAX_VIDEO_REFERENCES, 3);
+        assert_eq!(MAX_AUDIO_REFERENCES, 3);
+        assert_eq!(MAX_TOTAL_REFERENCES, 12);
+        const {
+            assert!(
+                MAX_TOTAL_REFERENCES
+                    < MAX_IMAGE_REFERENCES + MAX_VIDEO_REFERENCES + MAX_AUDIO_REFERENCES,
+                "the combined cap must bind something the per-modality caps do not"
+            )
+        };
+    }
+
+    /// **Each cap boundary, one over and one at.** The at-cap arms matter as much as the over-cap
+    /// ones: a gate written with `>=` instead of `>` would reject every legal saturated request and
+    /// every rejection test in the suite would still pass.
+    #[test]
+    fn each_cap_admits_its_boundary_and_refuses_one_more() {
+        // 9 images is legal, 10 is not.
+        assert!(Ref2VaReferences::new(vec![img_ref(); 9]).is_ok());
+        let e = Ref2VaReferences::new(vec![img_ref(); 10])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("at most 9 image"), "{e}");
+
+        // 3 clips is legal, 4 is not.
+        assert!(Ref2VaReferences::new(vec![vid_ref(false); 3]).is_ok());
+        let e = Ref2VaReferences::new(vec![vid_ref(false); 4])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("at most 3 video"), "{e}");
+
+        // 3 audio (paired with an image) is legal, 4 is not.
+        let mut ok = vec![img_ref()];
+        ok.extend(vec![aud_ref(); 3]);
+        assert!(Ref2VaReferences::new(ok).is_ok());
+        let mut bad = vec![img_ref()];
+        bad.extend(vec![aud_ref(); 4]);
+        let e = Ref2VaReferences::new(bad).unwrap_err().to_string();
+        assert!(e.contains("at most 3 audio"), "{e}");
+    }
+
+    /// The combined cap is reachable **without** tripping any per-modality cap — the 15-file case
+    /// the epic calls out — and 12 itself is accepted.
+    #[test]
+    fn the_combined_cap_refuses_a_request_every_per_modality_cap_admits() {
+        // 9 + 3 + 3 = 15: every per-modality cap is satisfied, the total is not.
+        let mut fifteen = vec![img_ref(); 9];
+        fifteen.extend(vec![vid_ref(false); 3]);
+        fifteen.extend(vec![aud_ref(); 3]);
+        assert_eq!(fifteen.len(), 15);
+        let e = Ref2VaReferences::new(fifteen).unwrap_err().to_string();
+        assert!(e.contains("at most 12 references in total"), "{e}");
+
+        // 13 trips it too — the story's fourth over-cap case.
+        let mut thirteen = vec![img_ref(); 9];
+        thirteen.extend(vec![vid_ref(false); 3]);
+        thirteen.push(aud_ref());
+        assert_eq!(thirteen.len(), 13);
+        assert!(Ref2VaReferences::new(thirteen).is_err());
+
+        // …and exactly 12 is accepted, so the gate is not off by one.
+        let mut twelve = vec![img_ref(); 9];
+        twelve.extend(vec![vid_ref(false); 2]);
+        twelve.push(aud_ref());
+        assert_eq!(twelve.len(), 12);
+        assert!(Ref2VaReferences::new(twelve).is_ok());
+    }
+
+    /// An audio reference is never alone, and an empty list is `t2va` rather than a degenerate
+    /// `ref2va`.
+    #[test]
+    fn audio_is_never_the_only_modality_and_empty_is_not_ref2va() {
+        let e = Ref2VaReferences::new(Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("at least one reference"), "{e}");
+
+        let e = Ref2VaReferences::new(vec![aud_ref()])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("cannot be used on its own"), "{e}");
+        assert!(Ref2VaReferences::new(vec![aud_ref(); 3]).is_err());
+
+        // Paired with either visual modality it is fine.
+        assert!(Ref2VaReferences::new(vec![img_ref(), aud_ref()]).is_ok());
+        assert!(Ref2VaReferences::new(vec![vid_ref(false), aud_ref()]).is_ok());
+        // A video reference carrying its OWN soundtrack is not an audio reference, so it does not
+        // rescue an otherwise audio-only request — but it is also not audio-only itself.
+        assert!(Ref2VaReferences::new(vec![vid_ref(true)]).is_ok());
+    }
+
+    /// A video reference's own soundtrack consumes an `<Audio j>` **label** but not an
+    /// audio-reference **cap slot**. Conflating the two would refuse a legal 3-clip-with-sound
+    /// request, or admit six soundtracks.
+    #[test]
+    fn a_videos_own_soundtrack_is_a_label_not_a_cap_slot() {
+        // Three clips that all carry sound, plus three standalone audio references: legal, because
+        // only the three standalone ones count against MAX_AUDIO_REFERENCES.
+        let mut refs = vec![vid_ref(true); 3];
+        refs.extend(vec![aud_ref(); 3]);
+        let r = Ref2VaReferences::new(refs).unwrap();
+        assert_eq!(
+            r.audio_count(),
+            3,
+            "only standalone audio counts to the cap"
+        );
+        assert_eq!(
+            r.audio_label_count(),
+            6,
+            "every soundtrack takes an <Audio j> label"
+        );
+        assert_eq!(r.counts().videos, 3);
+        assert_eq!(r.counts().audios, 3);
+    }
+
+    /// Degenerate media is refused at the boundary rather than propagated into a shape error deep
+    /// inside the DiT.
+    #[test]
+    fn degenerate_media_is_refused_with_a_message_naming_the_reference() {
+        let zero = Ref2VaReference::Image(Image {
+            width: 0,
+            height: 8,
+            pixels: Vec::new(),
+        });
+        let e = Ref2VaReferences::new(vec![zero]).unwrap_err().to_string();
+        assert!(e.contains("zero extent"), "{e}");
+
+        // Outside 1:4 .. 4:1.
+        let wide = Ref2VaReference::Image(image(500, 100));
+        let e = Ref2VaReferences::new(vec![wide]).unwrap_err().to_string();
+        assert!(e.contains("1:4"), "{e}");
+        // …and exactly 4:1 is legal, so the bound is inclusive.
+        assert!(Ref2VaReferences::new(vec![Ref2VaReference::Image(image(400, 100))]).is_ok());
+
+        let no_frames = Ref2VaReference::Video(VideoReference {
+            frames: Vec::new(),
+            fps: 24.0,
+            audio: None,
+        });
+        let e = Ref2VaReferences::new(vec![no_frames])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no frames"), "{e}");
+
+        // A frame rate that is zero, negative or NaN is refused — silently defaulting it to 24
+        // would resample at the wrong speed with nothing to raise.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let r = Ref2VaReference::Video(VideoReference {
+                frames: vec![image(32, 32)],
+                fps: bad,
+                audio: None,
+            });
+            assert!(
+                Ref2VaReferences::new(vec![r]).is_err(),
+                "fps {bad} must be refused"
+            );
+        }
+
+        let empty_wave = Ref2VaReference::Audio(AudioReference {
+            audio: AudioTrack {
+                samples: Vec::new(),
+                sample_rate: AUDIO_SAMPLE_RATE,
+                channels: 1,
+                stems: Vec::new(),
+            },
+        });
+        let e = Ref2VaReferences::new(vec![img_ref(), empty_wave])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("empty waveform"), "{e}");
+    }
+
+    /// **A soundtrack at any rate but the audio VAE's is refused HERE**, at the engine boundary.
+    ///
+    /// There is no resampler in this crate — `pipeline::audio_track_to_encoder_input` rejects the
+    /// same thing — so before this check a 44.1 kHz reference passed `Generator::validate` and died
+    /// inside `generate_ref2va` *after* the video VAE and the audio encoder had been mapped. The
+    /// module docs claimed the soundtrack "is resampled onto the audio VAE's rate", which no code
+    /// anywhere did.
+    ///
+    /// Both carriers are covered: a standalone audio reference and a **clip's own** soundtrack.
+    #[test]
+    fn a_soundtrack_at_the_wrong_rate_is_refused_at_the_boundary() {
+        let at = |rate: u32| AudioTrack {
+            samples: vec![0.0; 128],
+            sample_rate: rate,
+            channels: 1,
+            stems: Vec::new(),
+        };
+        // Control: the VAE's own rate is admitted through both carriers.
+        Ref2VaReferences::new(vec![
+            img_ref(),
+            Ref2VaReference::Audio(AudioReference {
+                audio: at(AUDIO_SAMPLE_RATE),
+            }),
+        ])
+        .expect("32 kHz is the rate the encoder reads");
+
+        for rate in [0u32, 16_000, 24_000, 44_100, 48_000] {
+            let standalone = Ref2VaReference::Audio(AudioReference { audio: at(rate) });
+            let e = Ref2VaReferences::new(vec![img_ref(), standalone])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains(&format!("{rate} Hz")) && e.contains("no resampler"),
+                "{rate}: {e}"
+            );
+
+            // ...and the same rate carried by a clip's own soundtrack, which reaches exactly the
+            // same encoder.
+            let sounded = Ref2VaReference::Video(VideoReference {
+                frames: vec![image(64, 64)],
+                fps: 24.0,
+                audio: Some(at(rate)),
+            });
+            let e = Ref2VaReferences::new(vec![sounded])
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("no resampler"), "{rate} on a clip: {e}");
+        }
+    }
+
+    /// `has_audio` is what orders the presentation, so it is pinned per variant rather than left
+    /// to the call site.
+    #[test]
+    fn has_audio_distinguishes_the_three_variants() {
+        assert!(!img_ref().has_audio());
+        assert!(!vid_ref(false).has_audio());
+        assert!(vid_ref(true).has_audio());
+        assert!(aud_ref().has_audio());
+
+        assert_eq!(img_ref().kind(), ReferenceKind::Image);
+        assert_eq!(vid_ref(true).kind(), ReferenceKind::Video);
+        assert_eq!(aud_ref().kind(), ReferenceKind::Audio);
+    }
+
+    /// An image reference is encoded at **its own** 2048 short edge with **no area cap** — the
+    /// concrete mechanism behind "references do not bind the generated geometry".
+    ///
+    /// The upscale arm is the one that separates this from the canvas rule: a 64x64 source comes
+    /// back at 2048x2048, which `resolve_canvas_size` would have refused (it clamps to the
+    /// `CANVAS_MAX_PIXELS` area and never upscales past the short edge).
+    #[test]
+    fn an_image_reference_is_normalized_to_its_own_short_edge_with_no_area_cap() {
+        let stride = crate::h3_memory::SPATIAL_STRIDE as i32;
+        let up =
+            normalize_reference_image(&image(64, 64), stride, REFERENCE_IMAGE_SHORT_EDGE as i32)
+                .unwrap();
+        assert_eq!((up.width, up.height), (2048, 2048));
+        assert!(
+            u64::from(up.width) * u64::from(up.height)
+                > u64::from(crate::h3_memory::CANVAS_MAX_PIXELS),
+            "an image reference is NOT area-capped; a port that reused the canvas rule would be"
+        );
+
+        // Aspect is preserved and both edges land on the 32 lattice.
+        let wide =
+            normalize_reference_image(&image(400, 200), stride, REFERENCE_IMAGE_SHORT_EDGE as i32)
+                .unwrap();
+        assert_eq!((wide.width, wide.height), (4096, 2048));
+        assert_eq!(wide.width % crate::h3_memory::SPATIAL_STRIDE, 0);
+        assert_eq!(wide.height % crate::h3_memory::SPATIAL_STRIDE, 0);
+
+        assert!(normalize_reference_image(&image(0, 8), 32, 2048).is_err());
+        assert!(normalize_reference_image(&image(8, 8), 0, 2048).is_err());
+        assert!(normalize_reference_image(&image(8, 8), 32, 0).is_err());
+    }
+
+    /// sc-23402 — the requested short edge really drives the normalized geometry, and 1024 costs
+    /// about a quarter the reference tokens 2048 does.
+    ///
+    /// A 576x320 plate (the film harness's working aspect) is asserted at its **scaled dimensions**
+    /// rather than against the constant, so a caller-supplied value that was ignored, clamped back to
+    /// the default, or applied to the wrong edge all red here.
+    #[test]
+    fn the_requested_short_edge_scales_the_reference_and_quarters_its_token_count() {
+        let stride = crate::h3_memory::SPATIAL_STRIDE as i32;
+        let plate = image(576, 320);
+
+        let at_2048 = normalize_reference_image(&plate, stride, 2048).unwrap();
+        let at_1024 = normalize_reference_image(&plate, stride, 1024).unwrap();
+
+        assert_eq!((at_2048.width, at_2048.height), (3680, 2048));
+        assert_eq!((at_1024.width, at_1024.height), (1856, 1024));
+        for edge in [at_2048.width, at_2048.height, at_1024.width, at_1024.height] {
+            assert_eq!(
+                edge % crate::h3_memory::SPATIAL_STRIDE,
+                0,
+                "off the 32 lattice"
+            );
+        }
+
+        // Tokens are proportional to area; 1024 is one quarter of 2048's, up to lattice rounding.
+        let area = |i: &Image| u64::from(i.width) * u64::from(i.height);
+        let ratio = area(&at_2048) as f64 / area(&at_1024) as f64;
+        assert!(
+            (3.9..=4.1).contains(&ratio),
+            "halving the short edge must quarter the reference token count, got {ratio}x"
+        );
+
+        // The default is upstream's 2048 — the same geometry, reached without naming a value.
+        let default_edge =
+            gen_core::effective_reference_image_short_edge(&gen_core::GenerationRequest::default())
+                as i32;
+        let at_default = normalize_reference_image(&plate, stride, default_edge).unwrap();
+        assert_eq!(
+            (at_default.width, at_default.height),
+            (at_2048.width, at_2048.height)
+        );
+    }
+
+    /// A clip too short to fill one merged vision group is rejected rather than padded, and the
+    /// sampled indices / timestamps are the reference's.
+    #[test]
+    fn condition_frame_sampling_merges_pairs_and_refuses_a_short_clip() {
+        // 24 fps read at 2 fps: every 12th frame. 25 frames -> indices 0, 12, 24.
+        let (idx, ts) = sample_video_condition_frames(25, 24.0, 2.0, 2).unwrap();
+        assert_eq!(idx, vec![0, 12, 24]);
+        // Three sampled frames pad to four, then merge in pairs: (0.0+0.5)/2 and (1.0+1.0)/2.
+        assert_eq!(ts.len(), 2);
+        assert!((ts[0] - 0.25).abs() < 1e-12);
+        assert!((ts[1] - 1.0).abs() < 1e-12);
+
+        // One sampled frame cannot fill a group of two.
+        let e = sample_video_condition_frames(12, 24.0, 2.0, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("at least 13 frames"), "{e}");
+
+        // A clip slower than the sample rate contributes each frame ONCE, not repeated.
+        let (idx, _) = sample_video_condition_frames(4, 1.0, 2.0, 2).unwrap();
+        assert_eq!(idx, vec![0, 1, 2, 3]);
+
+        assert!(sample_video_condition_frames(0, 24.0, 2.0, 2).is_err());
+        assert!(sample_video_condition_frames(25, 0.0, 2.0, 2).is_err());
+        assert!(sample_video_condition_frames(25, 24.0, 2.0, 0).is_err());
+    }
+
+    /// sc-26691 — the render path resizes under the request's mode: the film-harness 576x320
+    /// plate against a 1088x544 render stays put under `match` (the default) and `max`, and only
+    /// `diffusers` upscales it to the 2048 short edge.
+    #[test]
+    fn the_resize_mode_decides_whether_a_small_plate_is_upscaled() {
+        use gen_core::ReferenceImageResizeMode as Mode;
+        let stride = crate::h3_memory::SPATIAL_STRIDE as i32;
+        let plate = image(576, 320);
+        let at = |mode| {
+            let out = resize_reference_image(&plate, stride, 1088, 544, mode, 2048).unwrap();
+            (out.width, out.height)
+        };
+        assert_eq!(at(Mode::default()), (576, 320));
+        assert_eq!(at(Mode::Match), (576, 320));
+        assert_eq!(at(Mode::Max), (576, 320));
+        assert_eq!(at(Mode::Diffusers), (3680, 2048));
+        // `normalize_reference_image` is the `diffusers` case.
+        let stock = normalize_reference_image(&plate, stride, 2048).unwrap();
+        assert_eq!((stock.width, stock.height), at(Mode::Diffusers));
+        // Aspect beyond 4:1 is refused under every mode.
+        assert!(
+            resize_reference_image(&image(401, 100), stride, 1088, 544, Mode::Match, 2048).is_err()
+        );
+    }
+}

@@ -18,16 +18,19 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use mlx_gen::gen_core::iris::downstream::{TaskExport, EMPTY_PROMPT_FILE};
-use mlx_gen::gen_core::iris::restoration::RestorationResources;
-use mlx_gen::gen_core::iris::restoration_train::{
-    self as contract, ConvNextConfig, RestoreTrainPlan, RestoreTrainResources, CKPT_CRITIC,
-    CKPT_CRITIC_OPTIMIZER, ITEM_DEGRADED_KEY, OPTIONS_KEY,
-};
-use mlx_gen::gen_core::iris::train::{
+use gen_core_iris::downstream::{TaskExport, EMPTY_PROMPT_FILE};
+use gen_core_iris::restoration::RestorationResources;
+use gen_core_iris::train::{
     checkpoint_root, latest_checkpoint, CKPT_EMA, CKPT_OPTIMIZER, CKPT_TRAINABLE,
 };
-use mlx_gen::gen_core::iris::{GenerationResources, IrisTask, TEXT_ENCODER_COMPONENT};
+use gen_core_iris::{
+    restoration_train as contract,
+    restoration_train::{
+        ConvNextConfig, RestoreTrainPlan, RestoreTrainResources, CKPT_CRITIC,
+        CKPT_CRITIC_OPTIMIZER, ITEM_DEGRADED_KEY, OPTIONS_KEY,
+    },
+};
+use gen_core_iris::{GenerationResources, IrisTask, TEXT_ENCODER_COMPONENT};
 use mlx_gen::gen_core::{
     LrSchedule, NetworkType, Trainer, TrainingConfig, TrainingItem, TrainingProgress,
     TrainingRequest,
@@ -544,8 +547,8 @@ fn activation_checkpointing_adapter_gradients_equal_the_plain_graph() {
 }
 
 fn activation_checkpointing_adapter_gradients_equal_the_plain_graph_body() {
-    use mlx_gen::gen_core::iris::restoration_train::RestoreArtifact;
-    use mlx_gen::gen_core::iris::train::{backbone_tensor_shapes, linear_paths_from_keys};
+    use gen_core_iris::restoration_train::RestoreArtifact;
+    use gen_core_iris::train::{backbone_tensor_shapes, linear_paths_from_keys};
     use mlx_gen_iris::train::model::{
         checkpointed_regions, init_adapter, provider_dtype, AdapterKind, AdapterTarget, TrainModel,
         Trainable,

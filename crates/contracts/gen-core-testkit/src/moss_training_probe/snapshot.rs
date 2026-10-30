@@ -1,6 +1,7 @@
 //! Bounded, header-only/streamed diagnostics over files written by the real native exporters.
 //! Never loads a backbone, optimizer moment population, or whole adapter data into memory.
-use gen_core::{moss_image_training::recovery::RunState, Error, Result};
+use gen_core::{Error, Result};
+use gen_core_moss_image::moss_image_training::recovery::RunState;
 use serde::{
     de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
     Deserialize, Serialize,

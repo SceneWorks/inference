@@ -3,10 +3,10 @@
 //! preview of the predicted clean image. The Candle twin of `mlx_gen_iris::pipeline`.
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
-use candle_gen::gen_core::iris::{FlowConfig, GenerationParams};
 use candle_gen::gen_core::{CancelFlag, Image, PreviewSink};
 use candle_gen::preview::{emit_preview_at, project_latents, PreviewCounter};
 use candle_gen::{CandleError as Error, Result};
+use gen_core_iris::{FlowConfig, GenerationParams};
 use rand::SeedableRng;
 
 use crate::dit::{IrisDiT, TextBatch};

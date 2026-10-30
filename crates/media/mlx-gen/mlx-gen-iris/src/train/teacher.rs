@@ -1,6 +1,6 @@
 //! The frozen **REPA teacher**, native MLX (story sc-25689): the `facebookresearch/dinov2`
 //! hub ViT (`DinoVisionTransformer.forward_features()["x_norm_patchtokens"]` @
-//! [`gen_core::iris::train::repa::DINOV2_CODE_REVISION`]) and `repa.py`'s input path, in fp32 and
+//! [`gen_core_iris::train::repa::DINOV2_CODE_REVISION`]) and `repa.py`'s input path, in fp32 and
 //! outside every gradient trace.
 //!
 //! Input: the clean `[B, 3, H, W]` training images in `[−1, 1]` → `(x + 1)/2` → bicubic
@@ -14,11 +14,13 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use gen_core::iris::train::repa::{
-    self as contract, hf_sources, TeacherArch, TeacherFfn, TeacherNaming, IMAGENET_MEAN,
-    IMAGENET_STD, SPATIAL_NORM_EPS, TEACHER_LN_EPS,
+use gen_core_iris::train::{
+    repa as contract,
+    repa::{
+        hf_sources, TeacherArch, TeacherFfn, TeacherNaming, IMAGENET_MEAN, IMAGENET_STD,
+        SPATIAL_NORM_EPS, TEACHER_LN_EPS,
+    },
 };
-use mlx_gen::gen_core;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
@@ -41,7 +43,7 @@ pub struct Teacher {
     w: HashMap<String, Array>,
 }
 
-pub use mlx_gen::gen_core::iris::train::repa::teacher_file;
+pub use gen_core_iris::train::repa::teacher_file;
 
 impl Teacher {
     /// Load `arch`'s tensors from a hub `state_dict` or a Hugging Face `Dinov2Model` safetensors,

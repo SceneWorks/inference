@@ -5,7 +5,7 @@
 //! admitted guard but has no successor. Packing uses the same rule: assignments failing at point
 //! p are eligible through p, never after p. Symbolic accounting terms after an invalid pack are
 //! used only to compute independent deltas; the exact world pricer emits only native prefixes.
-use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as C;
+use gen_core_family::sdxl_ldm::SdxlComponent as C;
 use mlx_gen::Result;
 use mlx_rs::Dtype;
 

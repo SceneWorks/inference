@@ -90,7 +90,7 @@ impl EvaluationManifest {
     }
     pub fn verify_snapshot(
         &self,
-        plan: &gen_core::moss_image_training::recovery::DataPlan,
+        plan: &gen_core_moss_image::moss_image_training::recovery::DataPlan,
         masked: bool,
     ) -> Result<()> {
         if plan.image_digest(0)? != self.image_digest
@@ -228,7 +228,7 @@ pub struct RunReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_evaluation: Option<PreparedEvaluationReceipt>,
     #[serde(default)]
-    pub request_identity: Option<gen_core::moss_image_training::recovery::RunIdentity>,
+    pub request_identity: Option<gen_core_moss_image::moss_image_training::recovery::RunIdentity>,
     #[serde(default)]
     pub resolved_seed: Option<u64>,
     #[serde(default)]
@@ -576,7 +576,7 @@ impl RunProbe {
         let metadata: BTreeMap<_, _> = info.export_identity.iter().cloned().collect();
         // Loading accepts either parent, but an EXPORT must name the checkpoint it was
         // actually trained on — that exactness is asserted here, not in validate_metadata.
-        if gen_core::moss_image_training::validate_metadata(&metadata)? != variant {
+        if gen_core_moss_image::moss_image_training::validate_metadata(&metadata)? != variant {
             return Err(Error::Unsupported(
                 "native export must name its actual trained parent checkpoint".into(),
             ));
@@ -631,7 +631,7 @@ impl RunProbe {
                 "checkpoint observations exceed admitted audit workspace".into(),
             ));
         }
-        let state = gen_core::moss_image_training::recovery::bundle::read(bundle)?;
+        let state = gen_core_moss_image::moss_image_training::recovery::bundle::read(bundle)?;
         let reader_budget = AUDIT_WORKSPACE_BYTES
             .checked_sub(state_workspace)
             .ok_or_else(|| {
@@ -720,11 +720,12 @@ impl RunProbe {
     pub fn bind_request(
         &self,
         request: &TrainingRequest,
-        plan: &gen_core::moss_image_training::recovery::DataPlan,
+        plan: &gen_core_moss_image::moss_image_training::recovery::DataPlan,
         source: &str,
     ) -> Result<()> {
-        let identity =
-            gen_core::moss_image_training::recovery::effective_identity(request, source, plan)?;
+        let identity = gen_core_moss_image::moss_image_training::recovery::effective_identity(
+            request, source, plan,
+        )?;
         self.update(|r| {
             r.request_identity = Some(identity);
             r.resolved_seed = Some(request.config.seed);

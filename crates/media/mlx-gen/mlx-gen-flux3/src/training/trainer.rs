@@ -8,29 +8,30 @@ use super::{
 };
 use crate::autoencoder::FrozenTrainingEncoder;
 use crate::{Flux3TextEncoder, SampleTokens};
-use gen_core::flux3::artifacts::NativeDitStorage;
-use gen_core::flux3::quantization::DitFormat;
-use gen_core::flux3::training::{
+use gen_core::flux3::BASE_MODEL_ID;
+use gen_core::train::{
+    Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
+    TrainingTechniques,
+};
+use gen_core_flux3::artifacts::NativeDitStorage;
+use gen_core_flux3::quantization::DitFormat;
+use gen_core_flux3::training::{
     caption_choice,
     checkpoint::{ResumePolicy, TrainingCursor},
-    controller::{
-        self, checkpoint_name, output_stem, ExportReceipt, RunPlan, SourceTrainingSession,
-    },
+    controller,
+    controller::{checkpoint_name, output_stem, ExportReceipt, RunPlan, SourceTrainingSession},
     density_index, identity, lora_targets,
     options::{TrainingOptions, TrainingPrecision, Workflow},
     policy::{accumulation_loss_scale, source_clip_multiplier},
-    preprocess::{self, PixelOptions},
+    preprocess,
+    preprocess::PixelOptions,
     rng::NativeRng,
     sampler::BatchSampler,
     training_condition_ids, training_sigma, CaptionChoice, ResumeIdentity, Weighting,
 };
-use gen_core::flux3::{
+use gen_core_flux3::{
     assemble_window, latent_ids, scaled_image_ids, GenerationResources, AUTOENCODER_COMPONENT,
-    BASE_MODEL_ID, DIT_WEIGHTS_FILE, FAMILY, IMAGE_ROPE_SCALE, TEXT_ENCODER_COMPONENT,
-};
-use gen_core::train::{
-    Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
-    TrainingTechniques,
+    DIT_WEIGHTS_FILE, FAMILY, IMAGE_ROPE_SCALE, TEXT_ENCODER_COMPONENT,
 };
 use mlx_gen::gen_core::{
     self, AdapterKind, AdapterSpec, CancelFlag, LoadSpec, Modality, Precision, WeightsSource,
@@ -67,7 +68,7 @@ pub struct Flux3Trainer {
     descriptor: TrainerDescriptor,
 }
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    gen_core::train::refuse_trainer_load_overlays(BASE_MODEL_ID, spec).map_err(Error::from)?;
+    gen_core_train::refuse_trainer_load_overlays(BASE_MODEL_ID, spec).map_err(Error::from)?;
     if spec.load_shape != gen_core::LoadShape::EagerMaterialization
         || !matches!(spec.weights, WeightsSource::Dir(_))
         || spec.quantize.is_some()
@@ -94,10 +95,10 @@ impl Trainer for Flux3Trainer {
         &self.descriptor
     }
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
+        gen_core_train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core_train::validate_control_request(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_edit_request(self.descriptor(), req)?;
         let opts = TrainingOptions::parse(req)?;
         controller::ensure_new_output(req)?;
         if self.spec.precision == Precision::Fp32 && opts.precision != TrainingPrecision::F32 {
@@ -445,7 +446,7 @@ impl SourceTrainingSession for MlxSession {
             let identity = self.export_identity(cursor);
             if path.exists() {
                 let spec = AdapterSpec::new(path.clone(), 1.0, AdapterKind::Lora);
-                gen_core::flux3::adapters::inspect(&spec, self.graph.dit.config())
+                gen_core_flux3::adapters::inspect(&spec, self.graph.dit.config())
                     .map_err(Error::from)?;
                 let saved = Weights::from_file(&path)?;
                 let metadata =
@@ -507,7 +508,7 @@ fn host_pixels(image: &gen_core::Image) -> Result<Array> {
 
 /// The pinned base a run trains against, admitted by [`admit_base`].
 struct AdmittedBase {
-    cfg: gen_core::flux3::Flux3Config,
+    cfg: gen_core_flux3::Flux3Config,
     resources: GenerationResources,
     /// The pinned resources' observed digests at admission.
     artifacts: BTreeMap<String, String>,
@@ -541,7 +542,7 @@ fn execute(
     let examples = cache_examples(req, &opts, &base, dtype, &pixels, on_progress)?;
     drop(pixels);
     check(&req.cancel)?;
-    if gen_core::train::resume::request_fingerprint(req).map_err(Error::from)? != identity.dataset
+    if gen_core_train::resume::request_fingerprint(req).map_err(Error::from)? != identity.dataset
         || identity::observe_pinned_resources(&base.resources, &req.cancel).map_err(Error::from)?
             != identity.artifacts
     {
@@ -585,7 +586,7 @@ fn admit_base(spec: &LoadSpec, req: &TrainingRequest) -> Result<AdmittedBase> {
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(invalid("base directory required"));
     };
-    let cfg = gen_core::flux3::resolve_checkpoint(root).map_err(Error::from)?;
+    let cfg = gen_core_flux3::resolve_checkpoint(root).map_err(Error::from)?;
     cfg.validate_route(BASE_MODEL_ID).map_err(Error::from)?;
     let storage = NativeDitStorage::from_package(root).map_err(Error::from)?;
     if storage != NativeDitStorage::Publisher(DitFormat::Dense) {
@@ -597,7 +598,7 @@ fn admit_base(spec: &LoadSpec, req: &TrainingRequest) -> Result<AdmittedBase> {
     storage
         .validate_headers(
             &cfg.dit,
-            &gen_core::flux3::checkpoint_tensor_headers(root).map_err(Error::from)?,
+            &gen_core_flux3::checkpoint_tensor_headers(root).map_err(Error::from)?,
         )
         .map_err(Error::from)?;
     identity::validate_release_config(&cfg).map_err(Error::from)?;
@@ -644,7 +645,7 @@ fn plan_run(
     req: &TrainingRequest,
     opts: &TrainingOptions,
     base: &AdmittedBase,
-    targets: &[gen_core::flux3::training::LoraTarget],
+    targets: &[gen_core_flux3::training::LoraTarget],
     pixels: &[preprocess::PreparedPair],
 ) -> Result<(RunPlan, ResumeIdentity)> {
     let geometry = pixels
@@ -778,7 +779,7 @@ fn cache_examples(
         examples.push(CachedExample {
             latent,
             text,
-            text_ids: gen_core::flux3::text_ids(window.length()),
+            text_ids: gen_core_flux3::text_ids(window.length()),
             empty_text,
             reference,
             grid,
@@ -800,7 +801,7 @@ fn caption_windows(
     req: &TrainingRequest,
     opts: &TrainingOptions,
     teacher: &Flux3TextEncoder,
-) -> Result<Vec<gen_core::flux3::TextWindow>> {
+) -> Result<Vec<gen_core_flux3::TextWindow>> {
     let mut windows = req
         .items
         .iter()
@@ -855,9 +856,9 @@ mod tests {
     //! Supported-host only (MLX cannot build on Windows): the same real interrupted
     //! pending-gradient resume / bit-identical continuation / reload contract as Candle.
     use super::*;
-    use gen_core::flux3::training::policy::SourceLrKind;
-    use gen_core::flux3::Flux3Config;
     use gen_core::train::{TrainingConfig, TrainingItem};
+    use gen_core_flux3::training::policy::SourceLrKind;
+    use gen_core_flux3::Flux3Config;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     fn fixtures() -> PathBuf {
@@ -894,7 +895,7 @@ mod tests {
     }
     fn session_for(workflow: Workflow) -> (MlxSession, Flux3Config) {
         let config =
-            gen_core::flux3::resolve_checkpoint(&fixtures().join("tiny-base-snapshot")).unwrap();
+            gen_core_flux3::resolve_checkpoint(&fixtures().join("tiny-base-snapshot")).unwrap();
         let dit = crate::model::load_dit(
             &fixtures().join("tiny-base-snapshot/model.safetensors"),
             &config,
@@ -937,8 +938,8 @@ mod tests {
             })
             .collect();
         let identity = ResumeIdentity {
-            base_repo: gen_core::flux3::BASE_WEIGHTS_REPO.into(),
-            base_revision: gen_core::flux3::BASE_WEIGHTS_REVISION.into(),
+            base_repo: gen_core_flux3::BASE_WEIGHTS_REPO.into(),
+            base_revision: gen_core_flux3::BASE_WEIGHTS_REVISION.into(),
             artifacts: BTreeMap::from([("synthetic-tiny-base".into(), "a".repeat(64))]),
             dataset: "b".repeat(64),
             preprocessing: "c".repeat(64),
@@ -955,7 +956,7 @@ mod tests {
                 ("accumulation".into(), "2".into()),
                 (
                     "rng".into(),
-                    gen_core::flux3::training::rng::RNG_ALGORITHM.into(),
+                    gen_core_flux3::training::rng::RNG_ALGORITHM.into(),
                 ),
                 (
                     "fixture".into(),
@@ -1055,7 +1056,7 @@ mod tests {
         );
         let spec = AdapterSpec::new(output.adapter_path.clone(), 1.0, AdapterKind::Lora);
         assert_eq!(
-            gen_core::flux3::adapters::inspect(&spec, &config.dit)
+            gen_core_flux3::adapters::inspect(&spec, &config.dit)
                 .unwrap()
                 .len(),
             54

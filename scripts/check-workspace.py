@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 118
+EXPECTED_MEMBER_COUNT = 129
 INTERNAL_PACKAGES = {
     "candle-audio",
     "candle-audio-catalog",
@@ -29,8 +29,19 @@ INTERNAL_PACKAGES = {
     "mlx-llm",
     "candle-llm",
     "sceneworks-gen-core",
+    "sceneworks-gen-core-checkpoint",
     "sceneworks-gen-core-dist",
+    "sceneworks-gen-core-family",
+    "sceneworks-gen-core-flux3",
+    "sceneworks-gen-core-h3",
+    "sceneworks-gen-core-image",
+    "sceneworks-gen-core-iris",
+    "sceneworks-gen-core-ltx",
+    "sceneworks-gen-core-memory-wan",
+    "sceneworks-gen-core-moss-image",
     "sceneworks-gen-core-telemetry",
+    "sceneworks-gen-core-tokenizer",
+    "sceneworks-gen-core-train",
     "sceneworks-gen-core-testkit",
     "runtime-catalog",
     "runtime-macos",

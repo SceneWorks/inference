@@ -168,7 +168,6 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::{CancelFlag, LoadPhase};
-use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
@@ -178,6 +177,7 @@ use candle_gen::{
     check_cancel as product_check_cancel, run_three_stage_sequential, CandleError,
     Result as CResult,
 };
+use gen_core_tokenizer::TextTokenizer;
 
 use candle_gen::gen_core::sampling::TimestepConvention;
 use config::{
@@ -242,7 +242,7 @@ struct Components {
     vae_has_encoder: bool,
     /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across every prompt/branch
     /// encode (sc-8991 / F-011) rather than re-parsing `tokenizer.json` per request.
-    tok: Arc<candle_gen::gen_core::tokenizer::TextTokenizer>,
+    tok: Arc<gen_core_tokenizer::TextTokenizer>,
 }
 
 struct Ti2vConditioning {

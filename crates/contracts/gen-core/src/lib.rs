@@ -3,9 +3,12 @@
 //! The **backend-neutral contract layer** for SceneWorks generative inference. gen-core has
 //! **zero tensor dependencies**: it owns the `Generator` / `Trainer` / `Captioner` / `Transform`
 //! contracts, the request/output/conditioning/progress/cancel/error types, the explicit provider
-//! registry, and the pure host-side policy math (tokenization, PIL-compatible resize, tiling,
-//! LR schedule, audio mixdown + BS.1770-4 loudness/true-peak). The tensor backends — `mlx-gen` (Apple MLX) and the forthcoming `candle-gen`
+//! registry, and the pure host-side policy math (PIL-compatible resize, tiling, LR schedule,
+//! audio mixdown + BS.1770-4 loudness/true-peak). The tensor backends — `mlx-gen` (Apple MLX) and the forthcoming `candle-gen`
 //! (Windows/CUDA) — implement these contracts and re-export this crate at their own paths.
+//! Family- and feature-specific host code (trainer helpers, tokenization, per-family planners,
+//! checkpoint readers, EXR/HDR I/O) lives in the sibling `gen-core-*` crates, which depend on this
+//! one (sc-27316).
 //!
 //! Numeric types here are restricted to `f32`/`f64`/`Vec<f32>`/`Vec<i32>`/`&[u8]` — never an
 //! `mlx_rs::Array` or candle tensor. See epic 3720 (the unified-contract roadmap, Phase 0).
@@ -50,37 +53,21 @@ pub mod encoder_contract;
 pub mod env_flag;
 pub mod error;
 pub mod execution_domains;
-pub mod exr_io;
 pub mod face;
-pub mod face_align;
 pub mod flux3;
-pub mod fx_program;
-pub mod gemma_assets;
 pub mod generator;
 pub mod guidance;
 pub mod h3_adapter_memory;
-pub mod h3_audio_config;
-pub mod h3_chunking;
 pub mod h3_conditioning_memory;
-pub mod h3_keyframe;
 pub mod h3_memory;
 pub mod h3_reference;
-pub mod h3_schedule;
 pub mod hdr;
-pub mod ideogram_scheduler;
 pub mod image_embed;
 pub mod imageops;
-pub mod instantid_kps;
-pub mod iris;
 pub mod json_constraint;
-pub mod krea_multiphase;
-pub mod krea_schedule;
 pub mod latent;
-pub mod lens_resolution;
 pub mod license;
 pub mod load_activity;
-pub mod ltx_checkpoint;
-pub mod ltx_dfr;
 mod macros;
 pub mod media;
 pub mod memory_phases;
@@ -88,33 +75,22 @@ pub mod memory_strategy;
 pub mod moss_image;
 mod moss_image_assets;
 pub mod moss_image_edit;
-pub mod moss_image_training;
 pub mod numeric;
-pub mod pruned_adaln;
-pub mod pth;
-pub mod qwen_image_2_1;
 pub mod registry;
 pub mod residency;
 pub mod runtime;
 pub use load_activity::{LoadActivity, LoadActivityObserver, LoadActivityScope};
 pub mod safetensors_shards;
 pub mod sampling;
-pub mod sd3_encoder_artifacts;
-pub mod sd3_request;
-pub mod sdxl_ldm;
-pub mod seedvr2_video;
-pub mod supra2;
 pub mod text_embed;
 pub mod tier_integrity;
 pub mod tiling;
-pub mod tokenizer;
 pub mod train;
 pub mod transcribe;
 pub mod transform;
 pub mod vision_encoder_contract;
 pub mod voice_embed;
 pub mod w4a8_int8;
-pub mod wan_i2v_memory;
 pub mod weightsmeta;
 
 pub use approximation::{
@@ -185,7 +161,6 @@ pub use execution_domains::{
     GraphEvalCadence, PrefixKvCacheDomain, PrefixKvCacheMode, PrefixKvCacheOverflow,
     PrefixKvCacheReport,
 };
-pub use exr_io::{read_rgb_exr, write_rgb_exr, ExrImage, EXR_COLOR_SPACE_ATTRIBUTE};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
     default_seed, effective_component_quant, effective_reference_image_short_edge,
@@ -201,16 +176,8 @@ pub use generator::{
     REFERENCE_IMAGE_SHORT_EDGE_DEFAULT, REFERENCE_IMAGE_SHORT_EDGE_MAX,
     REFERENCE_IMAGE_SHORT_EDGE_MIN,
 };
-pub use h3_reference::{
-    effective_reference_image_resize_mode, resolve_reference_image_size, truncate_reference_audio,
-    ReferenceImageResizeMode,
-};
-pub use hdr::{
-    exr_conditioning_to_vae_range, from_vae_range, hlg_inverse_oetf, hlg_oetf,
-    rgb_signal_to_yuv420p10, to_vae_range, working_frame_to_exr_payload,
-    working_frame_to_hlg_linear, HdrColorSpace, HdrTransfer, HlgConverter, HlgMasterTags,
-    Primaries, Yuv420p10, HLG_MASTER_TAGS,
-};
+pub use h3_reference::{effective_reference_image_resize_mode, ReferenceImageResizeMode};
+pub use hdr::{HdrColorSpace, HdrTransfer, Primaries};
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
 pub use latent::{
@@ -308,10 +275,6 @@ pub use runtime::{
     COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT, LTX_SPATIAL_UPSCALER_COMPONENT,
     VAE_COMPONENT,
 };
-pub use sd3_encoder_artifacts::{
-    resolve_sd3_text_encoder_artifacts, Sd3TextEncoderArtifactError, Sd3TextEncoderArtifacts,
-};
-pub use sd3_request::map_sd3_seeded_outputs;
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};
 pub use tiling::{TilingConfig, VaeTiling};
@@ -324,18 +287,6 @@ pub use weightsmeta::{
     safetensors_path_tensor_headers, SafetensorsFileLayout, SafetensorsTensorHeader,
     SafetensorsTensorLocation, CANDLE_DEVICE_FORMAT_CACHE_DIR,
 };
-// The LTX split-checkpoint component resolver (sc-18757), shared verbatim by mlx-gen-ltx and
-// candle-gen-ltx: layout selection keyed on `model_version`, per-component config isolation, and the
-// `gemma_source_checkpoint` ⇄ text-encoder `gemma_version` assertion. Pure paths + JSON, so it keeps
-// gen-core's zero-tensor invariant.
-pub use ltx_checkpoint::{
-    caption_feature_version, check_gemma_version, declared_layout, declared_model_version,
-    discover_split_bundle, discover_split_bundle_skipping, layout_for_declared_version,
-    layout_for_version, parse_model_version, CaptionFeatureVersion, GemmaEncoderIdentity,
-    GemmaSourceCheckpoint, GemmaVersionCheck, LtxBundle, LtxBundleBuilder, LtxCheckpointLayout,
-    LtxCheckpointMetadata, LtxComponent, LtxConfigRoot, LtxResolvedComponent,
-};
-
 // The independent LLM-serving library, re-exported at `gen_core::core_llm` (epic 7153, sc-7189). The
 // dependency is INVERTED: gen-core CONSUMES `core-llm` — the same way mlx-gen re-exports gen-core via
 // `pub use ::gen_core` — so a consumer that already pins gen-core reaches the unified

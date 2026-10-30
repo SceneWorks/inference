@@ -13,8 +13,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use mlx_gen::gen_core::iris::train::{AdapterMetadata, OPTIONS_KEY};
-use mlx_gen::gen_core::iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
+use gen_core_iris::train::{AdapterMetadata, OPTIONS_KEY};
+use gen_core_iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 use mlx_gen::gen_core::{NetworkType, TrainingConfig, TrainingItem, TrainingRequest};
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterKind, AdapterSpec, LoadSpec, WeightsSource};

@@ -273,7 +273,8 @@ fn frozen_edit_oracle_on_metal() {
 // Reached only through the existing ignored Metal edit oracle. Exercise actual learning,
 // portable export and the production custom-before-edit installation order for both methods.
 fn trained_custom_adapters_compose_with_edit() {
-    use mlx_gen::gen_core::{moss_image::MossImageVariant, moss_image_training as contract};
+    use gen_core_moss_image::moss_image_training as contract;
+    use mlx_gen::gen_core::moss_image::MossImageVariant;
     use mlx_gen::train::lora::{build_lokr_targets, build_lora_targets, TrainAdapter};
     use mlx_gen::{NetworkType, TrainingConfig};
     let f: Value = serde_json::from_str(include_str!(
@@ -600,7 +601,7 @@ fn sampler_precision(f: &Value) {
             let negative = [masked(&input["negative"], &input["negative_mask"])];
             let resolved = mlx_gen::gen_core::moss_image::MossImageResolved::resolve(
                 mlx_gen::gen_core::moss_image::MossImageVariant::Sft,
-                &mlx_gen::gen_core::moss_image_edit::edit_request(&mlx_gen::GenerationRequest {
+                &gen_core_moss_image::moss_image_edit::edit_request(&mlx_gen::GenerationRequest {
                     steps: Some(2),
                     guidance: Some(4.0),
                     width: 48,
@@ -816,7 +817,7 @@ fn request_local_lifecycle(f: &Value) {
             }];
             let mut resolved = mlx_gen::gen_core::moss_image::MossImageResolved::resolve(
                 mlx_gen::gen_core::moss_image::MossImageVariant::Sft,
-                &mlx_gen::gen_core::moss_image_edit::edit_request(&mlx_gen::GenerationRequest {
+                &gen_core_moss_image::moss_image_edit::edit_request(&mlx_gen::GenerationRequest {
                     width: 48,
                     height: 32,
                     steps: Some(2),
@@ -896,7 +897,7 @@ fn request_local_lifecycle(f: &Value) {
         eprintln!("request-local lifecycle fp32={fp32}: 25 changed/reentry requests, each cached/fresh-uncached/cancel/network-error/recovered; 4 reference counts");
         let resolved = mlx_gen::gen_core::moss_image::MossImageResolved::resolve(
             mlx_gen::gen_core::moss_image::MossImageVariant::Sft,
-            &mlx_gen::gen_core::moss_image_edit::edit_request(&mlx_gen::GenerationRequest {
+            &gen_core_moss_image::moss_image_edit::edit_request(&mlx_gen::GenerationRequest {
                 width: 48,
                 height: 32,
                 steps: Some(2),
@@ -1143,7 +1144,7 @@ fn run_oracle(cpu_only: bool) {
         );
         let resolved = mlx_gen::gen_core::moss_image::MossImageResolved::resolve(
             mlx_gen::gen_core::moss_image::MossImageVariant::Sft,
-            &mlx_gen::gen_core::moss_image_edit::edit_request(&mlx_gen::GenerationRequest {
+            &gen_core_moss_image::moss_image_edit::edit_request(&mlx_gen::GenerationRequest {
                 steps: Some(2),
                 guidance: Some(4.0),
                 width: 48,

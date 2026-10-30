@@ -2220,7 +2220,7 @@ impl NativeLedger {
 
 type LrHeader = mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader;
 type LrTensor = mlx_gen::adapters::facts::TensorFacts;
-type LrComponent = mlx_gen::gen_core::sdxl_ldm::SdxlComponent;
+type LrComponent = gen_core_family::sdxl_ldm::SdxlComponent;
 
 fn lr_error(message: &str) -> Error {
     Error::Msg(format!("sdxl native load: {message}"))
@@ -3678,7 +3678,7 @@ impl NativeLedger {
         Ok((penultimate, pooled))
     }
     fn text_recipe(&mut self, inputs: &Inputs, regime: &Regime) -> Result<(Dtype, Dtype)> {
-        use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as C;
+        use gen_core_family::sdxl_ldm::SdxlComponent as C;
         let headers = |path: &Path, component| -> Result<Vec<Header>> {
             match &inputs.fused {
                 Some(f) => Ok(f.source.headers_with(component, &f.world)),

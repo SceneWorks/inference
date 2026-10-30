@@ -2,7 +2,7 @@
 //! `iris3b/train/optim.py` (`microsoft/dion@58d38adb` `Muon`, `use_triton=True,
 //! use_polar_express=False` ⇒ the quintic Newton–Schulz of `newton_schulz_triton`, identical math to
 //! `zeropower_via_newtonschulz5`), with the backend-neutral routing of
-//! [`gen_core::iris::train::full_param_route`] / [`adapter_param_route`].
+//! [`gen_core_iris::train::full_param_route`] / [`adapter_param_route`].
 //!
 //! * **AdamW** (both the plain optimizer and Muon's AdamW groups — Dion's fused AdamW is the same
 //!   update): `p ← p·(1 − lr·wd)`; `m ← β₁m + (1−β₁)g`; `v ← β₂v + (1−β₂)g²`;
@@ -12,17 +12,16 @@
 //!   whole matrix's); `p ← p·(1 − lr·wd)`; `p ← p − (lr · adjust(shape)) · U` (the product rounded
 //!   to bf16 as torch's `_foreach_mul(U_bf16, lr)` is, then subtracted from the f32 parameter).
 //!
-//! [`adapter_param_route`]: gen_core::iris::train::adapter_param_route
+//! [`adapter_param_route`]: gen_core_iris::train::adapter_param_route
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use gen_core::iris::train::{
+use gen_core_iris::train::{
     muon_split_scales, MuonAdjustLr, OptimizerKind, OptimizerPlan, ParamRoute, ADAMW_EPSILON,
     MUON_EPSILON, NEWTON_SCHULZ_COEFFS,
 };
-use mlx_gen::gen_core;
 use mlx_gen::{Error, Result};
 use mlx_rs::ops::{concatenate_axis, matmul, sqrt, sum_axes};
 use mlx_rs::transforms::eval;
@@ -395,7 +394,7 @@ pub fn clip_grads(grads: Params, max_norm: f64) -> Result<(f64, Params)> {
         total = total.add(&sum_axes(&g.square()?, &axes[..], false)?)?;
     }
     let total = super::scalar_f32(&sqrt(&total)?)? as f64;
-    let coef = gen_core::iris::train::clip_coefficient(max_norm, total);
+    let coef = gen_core_iris::train::clip_coefficient(max_norm, total);
     let c = s(coef);
     let mut out = HashMap::with_capacity(grads.len());
     for (k, g) in grads {

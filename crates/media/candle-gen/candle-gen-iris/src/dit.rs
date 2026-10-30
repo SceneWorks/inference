@@ -12,8 +12,9 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::ops::sigmoid;
-use candle_gen::gen_core::iris::{self, ModelConfig};
 use candle_gen::{CandleError as Error, Result};
+use gen_core_iris as iris;
+use gen_core_iris::ModelConfig;
 
 use crate::nn::{
     add, attention, cat, chunk_last, key_padding_mask, modulate, mul, split_at, BackboneQuant,

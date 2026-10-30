@@ -17,6 +17,7 @@ mlx-gen = { path = ".." }
 mlx-gen-boogu = { path = "../mlx-gen-boogu" }
 # Opt-in H3 terminal telemetry (host RSS sampling), moved out of gen-core with its FFI (sc-27316).
 sceneworks-gen-core-telemetry = { workspace = true }
+sceneworks-gen-core-h3 = { workspace = true }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # `RgbImage` for the vision-reference hand-off to `boogu::vision::preprocess::preprocess_image`.
@@ -65,4 +66,4 @@ name = "integration"
 path = "tests/main.rs"
 
 [features]
-model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-boogu/model-inference-proof"]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-boogu/model-inference-proof", "sceneworks-gen-core-h3/model-inference-proof"]

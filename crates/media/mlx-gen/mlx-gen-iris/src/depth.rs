@@ -9,14 +9,14 @@
 //! typed refusal.
 //!
 //! The source preprocessing, the resize back and the result/metadata types are the backend-neutral
-//! [`gen_core::iris::depth`]; this module is the tensor forward.
+//! [`gen_core_iris::depth`]; this module is the tensor forward.
 
-use gen_core::iris::depth::{
+use gen_core_iris::depth::{
     estimate_with, DepthMetadata, DepthOutput, DepthRequest, IrisDepthEstimator,
     DEPTH_EXTRA_INPUT_CHANNELS,
 };
-use gen_core::iris::downstream::{EmptyPrompt, TaskExport};
-use gen_core::iris::IrisTask;
+use gen_core_iris::downstream::{EmptyPrompt, TaskExport};
+use gen_core_iris::IrisTask;
 use mlx_gen::weights::Weights;
 use mlx_gen::{gen_core, Error, LoadSpec, Progress, Result};
 use mlx_rs::ops::{addmm, concatenate_axis, zeros};
@@ -27,7 +27,7 @@ use crate::dit::{ForwardHooks, IrisDiT, TextBatch};
 use crate::model::compute_dtype;
 
 /// Model id of the depth task.
-pub const DEPTH_MODEL_ID: &str = gen_core::iris::DEPTH_MODEL_ID;
+pub const DEPTH_MODEL_ID: &str = gen_core_iris::DEPTH_MODEL_ID;
 
 /// The export's key prefix of the widened backbone (`IrisDepth.pixel`).
 const BACKBONE_PREFIX: &str = "pixel.";
@@ -60,7 +60,7 @@ pub struct DepthHostBytes {
     pub postprocess_new: u64,
 }
 
-pub fn depth_host_bytes(plan: &gen_core::iris::depth::DepthInputPlan) -> Result<DepthHostBytes> {
+pub fn depth_host_bytes(plan: &gen_core_iris::depth::DepthInputPlan) -> Result<DepthHostBytes> {
     let overflow = || Error::Msg("Iris depth host-payload accounting overflow".into());
     let model = u64::from(plan.model_width)
         .checked_mul(u64::from(plan.model_height))
@@ -533,8 +533,8 @@ impl IrisDepth {
         };
         let _quantum_scope =
             mlx_gen::ios_quantum::Scope::try_new().map_err(gen_core::Error::from)?;
-        gen_core::iris::depth::validate_depth_request(req)?;
-        let input_plan = gen_core::iris::depth::plan_depth_input(
+        gen_core_iris::depth::validate_depth_request(req)?;
+        let input_plan = gen_core_iris::depth::plan_depth_input(
             req.image.width,
             req.image.height,
             req.resolution,

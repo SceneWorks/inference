@@ -323,14 +323,14 @@ mlx_gen::register_trainer! {
 fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
     // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
     // request (typed `Unsupported`) rather than silently training a plain adapter.
-    gen_core::train::validate_control_request(descriptor, req)?;
+    gen_core_train::validate_control_request(descriptor, req)?;
     // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
     // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    gen_core_train::validate_full_finetune_request(descriptor, req)?;
     // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
     // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-    gen_core::train::validate_training_techniques(descriptor, req)?;
-    gen_core::train::validate_edit_request(descriptor, req)?;
+    gen_core_train::validate_training_techniques(descriptor, req)?;
+    gen_core_train::validate_edit_request(descriptor, req)?;
     if req.items.is_empty() {
         return Err("kolors trainer: dataset is empty".into());
     }
@@ -380,7 +380,7 @@ impl Trainer for KolorsTrainer {
     ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
         let mut warnings = Vec::new();
         let output = train_family(

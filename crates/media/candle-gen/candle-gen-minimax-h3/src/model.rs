@@ -905,7 +905,7 @@ impl MiniMaxH3 {
     /// Resolve the request's geometry: `frames` wins over `duration`, and the canvas falls back to
     /// the checkpoint's own 16:9 default when the caller names none.
     fn request_geometry(&self, req: &GenerationRequest) -> Result<RequestGeometry> {
-        // The shared resolver allocation admission (`gen_core::veda::workspace`) prices with.
+        // The shared resolver allocation admission (`gen_core_h3::veda::workspace`) prices with.
         let frames =
             candle_gen::gen_core::h3_memory::resolve_request_frames(req.frames, req.duration)?
                 as usize;
@@ -1301,7 +1301,7 @@ impl MiniMaxH3 {
         let resize_mode = candle_gen::gen_core::effective_reference_image_resize_mode(req);
         let num_frames = geometry.joint.num_frames;
         let truncate = |a: &candle_gen::gen_core::AudioTrack| {
-            candle_gen::gen_core::truncate_reference_audio(a, num_frames, MINIMAX_H3_FPS)
+            gen_core_h3::truncate_reference_audio(a, num_frames, MINIMAX_H3_FPS)
         };
         let mut normalized: Vec<Ref2VaReference> = Vec::with_capacity(references.len());
         for r in references.as_slice() {

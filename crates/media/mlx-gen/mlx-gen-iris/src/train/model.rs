@@ -14,12 +14,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::rc::Rc;
 
-use gen_core::iris::train::{
+use gen_core_iris::train::{
     backbone_tensor_shapes, init_kind, mix_seed, FlowObjective, InitKind, Prediction,
 };
-use gen_core::iris::ModelConfig;
+use gen_core_iris::ModelConfig;
 use mlx_gen::adapters::{reconstruct_lokr_delta, AdaptableLinear, Adapter};
-use mlx_gen::gen_core;
 use mlx_gen::train::lora::factorization;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -31,8 +30,8 @@ use mlx_rs::{random, Array, Dtype};
 use super::optim::Params;
 use crate::dit::{ForwardHooks, IrisDiT, PixelCtx, TextBatch, TrunkCtx};
 use crate::nn::AdaptedLinears;
-use gen_core::iris::train::ac::AcPolicy;
-use gen_core::iris::train::repa::{bilinear_matrix, RepaPlan, RepaVariant, PROJECTOR_PREFIX};
+use gen_core_iris::train::ac::AcPolicy;
+use gen_core_iris::train::repa::{bilinear_matrix, RepaPlan, RepaVariant, PROJECTOR_PREFIX};
 use mlx_rs::nn::silu;
 use mlx_rs::ops::{matmul, sqrt, sum_axes};
 use mlx_rs::transforms::checkpoint;

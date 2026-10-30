@@ -1,7 +1,7 @@
 //! Restoration (`iris_3b_restore`, sc-25683) vs upstream `iris3b/downstream/restoration.py` on the
 //! committed fixtures (`tools/dump_iris_restoration.py`):
 //!
-//! * the host-side pixel path (shared with the Candle twin through `gen_core::iris::restoration`):
+//! * the host-side pixel path (shared with the Candle twin through `gen_core_iris::restoration`):
 //!   torch's `scale_factor` bicubic (fractional scale on odd sides, a downscale, a non-dyadic 1.3),
 //!   the antialiased bicubic enlarge/shrink, the Gaussian fusion window (32 and the release 1024),
 //!   the wavelet colour fix on an image smaller than its largest dilation, tile positions, and
@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::gen_core::iris::restoration::{
+use gen_core_iris::restoration::{
     bicubic_aa_resize, bicubic_scale_factor, fit_budget_dims, fit_budget_image, gaussian_window,
     plan_request, restore_detailed, tile_positions, wavelet_color_fix, Dims, Planes, TileGeometry,
     INPUT_BUDGET,
@@ -424,7 +424,7 @@ fn cancel_between_tiles_is_typed_and_yields_no_image_body() {
 /// sc-25690 I11: a cancel that arrives after the last tile — at the post-processing marker — is
 /// honoured by the resize back / colour fix and yields no image, on the enlarge branch with the
 /// colour fix (the longest post-processing) and without either.
-/// MUTATION: drop the post-processing cancel checks in `gen_core::iris::restoration` — RED.
+/// MUTATION: drop the post-processing cancel checks in `gen_core_iris::restoration` — RED.
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn cancel_after_the_last_tile_is_typed_and_yields_no_image() {

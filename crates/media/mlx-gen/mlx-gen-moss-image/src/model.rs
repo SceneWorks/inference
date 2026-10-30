@@ -6,8 +6,8 @@ use crate::{
     text_encoder::{supplied, Encoder},
     transformer::Transformer,
 };
-use gen_core::moss_image::*;
-use gen_core::moss_image_edit::*;
+use gen_core_moss_image::moss_image::*;
+use gen_core_moss_image::moss_image_edit::*;
 use mlx_gen::gen_core::{
     self, LoadShape, MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, Modality,
     PerComponentBytes, SizeFloor,

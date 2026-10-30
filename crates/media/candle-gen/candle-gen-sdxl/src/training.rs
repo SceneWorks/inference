@@ -50,7 +50,6 @@ use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::{
     schedule_sigmas, DiscreteModelSampling, Scheduler as SamplingScheduler,
 };
-use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
     TrainingReport, TrainingRequest,
@@ -75,6 +74,7 @@ use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
 use candle_gen::train::tae::TinyDecoderSpec;
 use candle_gen::{CandleError, Result};
 use candle_gen_perceptual::{AuxGeometry, AuxLossContext, DecoderSpec};
+use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
 
 use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
 use candle_transformers::models::stable_diffusion::schedulers::{Scheduler, SchedulerConfig};
@@ -818,14 +818,14 @@ impl Trainer for SdxlTrainer {
         // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA
         // adapter the caller did not ask for (F-006/F-055).
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core_train::validate_full_finetune_request(self.descriptor(), req)?;
         // Shared control-training floor (F-006/F-055): no control branch, so a `control_type`
         // request is a typed reject, never silently trained as a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
+        gen_core_train::validate_control_request(self.descriptor(), req)?;
         // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_edit_request(self.descriptor(), req)?;
         self.validate_impl(req).map_err(Into::into)
     }
 
@@ -847,7 +847,7 @@ impl Trainer for SdxlTrainer {
     ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         // Every other `validate` floor too (control / full fine-tune / edit), so a caller that
         // skips `validate` cannot train a request it would refuse.
         self.validate(req)?;
@@ -1066,15 +1066,13 @@ impl SdxlTrainer {
         // cropped like the image and resampled onto its decoded size.
         let mut perceptual = perceptual;
         if let Some(path) = perceptual.as_mut() {
-            path.attach_subject_masks(
-                candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::load(
-                    "sdxl trainer",
-                    &req.items,
-                    cfg,
-                    edges.len(),
-                    CropBox::center_square,
-                )?,
-            );
+            path.attach_subject_masks(gen_core_train::subject_mask::PerceptualSubjectMasks::load(
+                "sdxl trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?);
         }
         let mut aux_driver = match perceptual {
             Some(path) => Some(AuxDriver::prepare(

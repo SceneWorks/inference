@@ -3,9 +3,9 @@
 use crate::loader::{Asset, Sources};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, moss_image::*, AdapterSpec, Generator, LoadSpec, PinnedWeightsFile, Trainer,
-    WeightsSource,
+    self, AdapterSpec, Generator, LoadSpec, PinnedWeightsFile, Trainer, WeightsSource,
 };
+use gen_core_moss_image::moss_image::*;
 use std::{collections::BTreeMap, path::Path};
 pub const HOST_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub use gen_core_testkit::moss_training_fixture::Fixture as HostFixture;
@@ -344,7 +344,8 @@ mod tests {
                 crate::text_encoder::token_bound(&sources, req, HOST_CAP_BYTES).map_err(Into::into)
             },
             |req| {
-                let prompts = gen_core::moss_image_training::recovery::conditioning_prompts(req);
+                let prompts =
+                    gen_core_moss_image::moss_image_training::recovery::conditioning_prompts(req);
                 let rows = crate::text_encoder::strings(
                     &sources,
                     &encoder,

@@ -12,7 +12,7 @@
 //! [`LtxTextEncoder::new`] and [`LtxTextEncoder::new_av`], via `require_v2` below) validates
 //! against [`AvConfig::ltx_2_3`](crate::config::AvConfig::ltx_2_3)'s `caption_feature_version` —
 //! the same production-canonical LTX-2.3 constant the AvDiT build path uses, itself validated
-//! through `gen_core::ltx_checkpoint::caption_feature_version` (sc-18757's shared, upstream-
+//! through `gen_core_ltx::ltx_checkpoint::caption_feature_version` (sc-18757's shared, upstream-
 //! mirroring detector both backends fold onto as of the 2026-08-19 coordinator review — this
 //! crate previously carried its own duplicate detection logic here).
 //!
@@ -25,7 +25,7 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::ltx_checkpoint::CaptionFeatureVersion;
+use gen_core_ltx::ltx_checkpoint::CaptionFeatureVersion;
 
 use crate::config::{AvConfig, ConnectorConfig, GemmaConfig};
 use crate::connector::Connector;

@@ -4,7 +4,7 @@
 //! execution — everything but seed and cancellation), live capacity and the sealed source pins
 //! BEFORE reaching the provider, and preserves the caller's real cancellation handle.
 use crate::ios_admission::{work_binding, IosWork};
-use mlx_gen::gen_core::iris::depth::{DepthOutput, DepthRequest, IrisDepthEstimator};
+use gen_core_iris::depth::{DepthOutput, DepthRequest, IrisDepthEstimator};
 use mlx_gen::gen_core::*;
 
 fn generation_binding(req: &GenerationRequest) -> [u8; 32] {

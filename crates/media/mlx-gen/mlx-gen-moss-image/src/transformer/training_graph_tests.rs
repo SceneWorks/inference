@@ -1,6 +1,7 @@
 use super::author_fixture_tests::*;
 use super::*;
-use mlx_gen::gen_core::{moss_image::MossImageVariant, moss_image_training as contract};
+use gen_core_moss_image::moss_image_training as contract;
+use mlx_gen::gen_core::moss_image::MossImageVariant;
 use mlx_gen::train::lora::{build_lokr_targets, build_lora_targets, TrainAdapter};
 use mlx_gen::{NetworkType, TrainingConfig};
 fn read(a: &Array) -> Vec<f32> {
