@@ -261,6 +261,7 @@ def evaluate_policy(
     head_repository: str,
     repository: str = "SceneWorks/inference",
     dispatch_lanes: str = "all",
+    raw_training_math_only: bool = False,
 ) -> bool:
     values = {
         "needs.changes.outputs.windows_cuda": str(lanes_include_cuda).lower(),
@@ -268,11 +269,13 @@ def evaluate_policy(
         "github.event.pull_request.head.repo.full_name": head_repository,
         "github.repository": repository,
         "inputs.lanes": dispatch_lanes,
+        "inputs.raw_training_math_only": raw_training_math_only,
     }
     rendered = expression
     for name in sorted(values, key=len, reverse=True):
         rendered = rendered.replace(name, repr(values[name]))
     rendered = rendered.replace("&&", " and ").replace("||", " or ")
+    rendered = re.sub(r"!(?!=)", " not ", rendered)
     if re.search(r"[A-Za-z_]\w*(?:\.\w+)+", rendered):
         raise AssertionError(f"unrecognized workflow context in policy: {rendered}")
     return bool(eval(rendered, {"__builtins__": {}}, {}))
@@ -4735,7 +4738,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             changes.get("if"),
-            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')",
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic' || inputs.raw_training_math_only)",
             "topology remains unconditional except explicitly isolated manual dispatches",
         )
         for event in ("pull_request", "push", "merge_group", "workflow_dispatch"):
@@ -4790,7 +4793,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # check -- so the gate would report green on exactly the runs it exists to block.
         self.assertEqual(
             gate["if"],
-            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (always())",
+            "(github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic' || inputs.raw_training_math_only) && (always())",
         )
 
         ungated = sorted(set(jobs) - {"gate"} - set(gate["needs"]))

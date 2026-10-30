@@ -226,5 +226,128 @@ class ModelWorkflowRoutes(unittest.TestCase):
         self.assertTrue(ci['defaults']['run']['shell'].endswith('/bin/bash -e {0}'))
 
 
+class RawCudaProofAggregation(unittest.TestCase):
+    PROOFS = {
+        'raw_streaming': 'training_attention::tests::streaming_forward_backward_matches_composable',
+        'raw_reference': 'reference_training_attention::tests::dense_reference_forward_backward_matches_composable',
+        'raw_rms': 'train::norm::ownership_tests::shared_rms_contracts_match_composable',
+        'raw_rope': 'train::krea_ops::tests::rms_rope_forward_backward_matches_composable',
+        'raw_graph': 'train::norm::ownership_tests::graph_retaining_norm_rope_attention_fallbacks',
+        'raw_half': 'train::projection::tests::half_precision_keeps_output_scale_rounding',
+    }
+
+    def assert_contract(self, job):
+        steps = {step.get('id'): step for step in job['steps'] if step.get('id')}
+        gate = steps['raw_proofs_gate']
+        self.assertEqual(gate['if'], 'always()')
+        self.assertFalse(gate.get('continue-on-error', False))
+        self.assertEqual(gate['shell'], 'bash')
+        self.assertEqual(set(gate['env'].values()),
+                         {f'${{{{ steps.{key}.outcome }}}}' for key in self.PROOFS})
+        for key, selector in self.PROOFS.items():
+            step = steps[key]
+            self.assertIs(step['continue-on-error'], True)
+            self.assertNotIn('if', step)  # failure is normalized only until the final outcome gate
+            self.assertIn(selector + ' -- --exact --ignored --nocapture', step['run'])
+            self.assertIn('test result: ok. 1 passed; 0 failed; 0 ignored;', step['run'])
+            self.assertLess(job['steps'].index(step), job['steps'].index(gate))
+        self.assertEqual(steps['raw_graph']['env']['CANDLE_GRAD_DO_NOT_DETACH'], '1')
+        self.assertNotIn('CANDLE_GRAD_DO_NOT_DETACH', job.get('env', {}))
+        self.assertFalse(job.get('continue-on-error', False))
+
+    def test_six_independent_exact_proofs_have_a_non_suppressed_outcome_gate(self):
+        workflow = document('ci.yml')
+        job = workflow['jobs']['windows-cuda']
+        self.assert_contract(job)
+        for field, value in [('if', 'success()'), ('continue-on-error', True)]:
+            mutated = copy.deepcopy(job)
+            gate = next(step for step in mutated['steps'] if step.get('id') == 'raw_proofs_gate')
+            gate[field] = value
+            with self.assertRaises(AssertionError):
+                self.assert_contract(mutated)
+        mutated = copy.deepcopy(job)
+        gate = next(step for step in mutated['steps'] if step.get('id') == 'raw_proofs_gate')
+        gate['env'] = {key: value.replace('.outcome', '.conclusion') for key, value in gate['env'].items()}
+        with self.assertRaises(AssertionError):
+            self.assert_contract(mutated)
+        self.assertIn('windows-cuda', workflow['jobs']['gate']['needs'])
+        self.assertIn('always()', workflow['jobs']['gate']['if'])
+
+    def test_raw_only_dispatch_is_explicit_validated_and_preserves_default_full_suite(self):
+        from scripts.tests.test_ci_workflow_policy import evaluate_policy, posix_shell
+        workflow = document('ci.yml')
+        flag = workflow[True]['workflow_dispatch']['inputs']['raw_training_math_only']
+        self.assertEqual(flag['type'], 'boolean')
+        self.assertIs(flag['default'], False)
+        job = workflow['jobs']['windows-cuda']
+        broad = {'Build Candle CUDA packages', 'Test Candle CUDA packages',
+                 'Test LLM-only CUDA bundle', 'Test LLM+audio CUDA bundle'}
+        skipped = {step['name'] for step in job['steps']
+                   if step.get('if') == '${{ !inputs.raw_training_math_only }}'}
+        self.assertEqual(skipped, broad)
+        for raw_only in [False, True]:
+            for step in job['steps']:
+                if step.get('name') in broad:
+                    expression = step['if'].removeprefix('${{').removesuffix('}}').strip()
+                    self.assertEqual(evaluate_policy(expression, lanes_include_cuda=True,
+                                                     event_name='workflow_dispatch', head_repository='',
+                                                     dispatch_lanes='windows-cuda', raw_training_math_only=raw_only),
+                                     not raw_only)
+        self.assert_contract(job)  # all six exact proofs still run in either mode
+        self.assertNotIn('raw_training_math_only', str(workflow['jobs']['windows-cuda-check']))
+        validation = next(step for step in workflow['jobs']['changes']['steps']
+                          if step.get('name') == 'Validate manual raw-only selection')
+        self.assertNotIn('if', validation)
+        self.assertFalse(validation.get('continue-on-error', False))
+        shell = posix_shell()
+        if shell is None:
+            self.skipTest('POSIX shell unavailable')
+        for lane in ['all', 'windows-cuda', 'windows-gpu-diagnostic']:
+            for raw_only in [False, True]:
+                result = subprocess.run([shell, '-e', '-c', validation['run']],
+                                        env={**os.environ, 'EVENT_NAME': 'workflow_dispatch',
+                                             'DISPATCH_LANES': lane, 'RAW_ONLY': str(raw_only).lower()},
+                                        capture_output=True, text=True, encoding='utf-8', timeout=10)
+                self.assertEqual(result.returncode == 0, not raw_only or lane == 'windows-cuda')
+                # Invalid diagnostic+raw-only still creates the validation job;
+                # the normal diagnostic does not start the CI lane fan-out.
+                changes = evaluate_policy(workflow['jobs']['changes']['if'], lanes_include_cuda=False,
+                                          event_name='workflow_dispatch', head_repository='',
+                                          dispatch_lanes=lane, raw_training_math_only=raw_only)
+                self.assertEqual(changes, lane != 'windows-gpu-diagnostic' or raw_only)
+        self.assertIn('inputs.raw_training_math_only', workflow['jobs']['gate']['if'])
+        self.assertIn('!inputs.raw_training_math_only', workflow['jobs']['windows-gpu-diagnostic']['if'])
+
+    def test_real_aggregate_script_rejects_each_failed_skipped_or_missing_proof(self):
+        # Execute only the tiny gate over mocked status strings, never a cargo,
+        # tensor, GPU, or model command. Use the existing cross-platform shell finder.
+        from scripts.tests.test_ci_workflow_policy import posix_shell
+        shell = posix_shell()
+        if shell is None:
+            self.skipTest('POSIX shell unavailable')
+        workflow = document('ci.yml')
+        gate = next(step for step in workflow['jobs']['windows-cuda']['steps']
+                    if step.get('id') == 'raw_proofs_gate')
+        names = list(gate['env'])
+        def run(outcomes):
+            return subprocess.run([shell, '-e', '-o', 'pipefail', '-c', gate['run']],
+                                  env={**os.environ, **outcomes}, capture_output=True,
+                                  text=True, encoding='utf-8', timeout=10)
+        success = dict.fromkeys(names, 'success')
+        self.assertEqual(run(success).returncode, 0)
+        for name in names:
+            for outcome in ['failure', 'cancelled', 'skipped', '']:
+                with self.subTest(name=name, outcome=outcome):
+                    result = run({**success, name: outcome})
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn(f'::error::{name}', result.stdout)
+        # An unsuppressed failure in windows-cuda must also fail the top CI gate.
+        ci_gate = workflow['jobs']['gate']['steps'][0]
+        result = subprocess.run([shell, '-e', '-o', 'pipefail', '-c', ci_gate['run']],
+                                env={**os.environ, 'RESULTS': 'success failure skipped'},
+                                capture_output=True, text=True, encoding='utf-8', timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+
+
 if __name__ == '__main__':
     unittest.main()

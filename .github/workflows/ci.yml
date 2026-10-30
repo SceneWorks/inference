@@ -32,6 +32,10 @@ on:
         type: choice
         options: [all, windows-cuda, windows-gpu-diagnostic]
         default: all
+      raw_training_math_only:
+        description: "Manual windows-cuda raw proofs only; reuse full-suite evidence only when its production closure is unchanged"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -65,7 +69,7 @@ concurrency:
 
 jobs:
   changes:
-    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic')
+    if: (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic' || inputs.raw_training_math_only)
     name: select affected lanes
     runs-on: ubuntu-latest
     outputs:
@@ -87,6 +91,16 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+      - name: Validate manual raw-only selection
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_LANES: ${{ inputs.lanes }}
+          RAW_ONLY: ${{ inputs.raw_training_math_only }}
+        run: |
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$RAW_ONLY" == true && "$DISPATCH_LANES" != windows-cuda ]]; then
+            echo "::error::raw_training_math_only requires lanes=windows-cuda"
+            exit 1
+          fi
       # Feature-epic refs form a protected branch train. Keep this in `changes`, which is
       # unconditional for every verification event and is required by the aggregate `CI gate`.
       # Only the explicit metadata-only diagnostic dispatch skips both jobs.
@@ -1538,12 +1552,14 @@ jobs:
           'HF_HUB_OFFLINE=1' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "Synthetic offline cache root: $cacheRoot"
       - name: Build Candle CUDA packages
+        if: ${{ !inputs.raw_training_math_only }}
         shell: cmd
         run: |
           call "%VCVARS%"
           cargo build --locked -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
       # Learned bodies stay compiled and ignored here; explicit model validation lives in real-weights.yml.
       - name: Test Candle CUDA packages
+        if: ${{ !inputs.raw_training_math_only }}
         shell: cmd
         # The runner is sm_120: an sm_120 test (NVFP4, the indexed NVFP4 MoE kernel) must run
         # here, so `skip_without_sm120` fails instead of skipping silently (sc-24440 review).
@@ -1560,6 +1576,8 @@ jobs:
       # sc-26856: raw QKV/adapter arithmetic only, explicitly selected in this
       # dispatch-only lane. Never override ignored learned bodies in ordinary CI.
       - name: Prove streaming training attention raw CUDA arithmetic
+        id: raw_streaming
+        continue-on-error: true
         shell: cmd
         run: |
           call "%VCVARS%"
@@ -1569,6 +1587,8 @@ jobs:
           findstr /c:"test result: ok. 1 passed; 0 failed; 0 ignored;" "%RUNNER_TEMP%\training-attention-proof.log" >nul
           if errorlevel 1 exit /b 1
       - name: Prove dense Reference attention ownership and gradients
+        id: raw_reference
+        continue-on-error: true
         shell: cmd
         run: |
           call "%VCVARS%"
@@ -1578,6 +1598,8 @@ jobs:
           findstr /c:"test result: ok. 1 passed; 0 failed; 0 ignored;" "%RUNNER_TEMP%\reference-attention-proof.log" >nul
           if errorlevel 1 exit /b 1
       - name: Prove shared RMS ownership and rounding contracts raw CUDA arithmetic
+        id: raw_rms
+        continue-on-error: true
         shell: cmd
         run: |
           call "%VCVARS%"
@@ -1587,6 +1609,8 @@ jobs:
           findstr /c:"test result: ok. 1 passed; 0 failed; 0 ignored;" "%RUNNER_TEMP%\shared-rms-proof.log" >nul
           if errorlevel 1 exit /b 1
       - name: Prove Krea Raw and Control rotary ownership raw CUDA arithmetic
+        id: raw_rope
+        continue-on-error: true
         shell: cmd
         run: |
           call "%VCVARS%"
@@ -1596,6 +1620,8 @@ jobs:
           findstr /c:"test result: ok. 1 passed; 0 failed; 0 ignored;" "%RUNNER_TEMP%\krea-ops-proof.log" >nul
           if errorlevel 1 exit /b 1
       - name: Prove graph-retaining norm rotary and Reference fallbacks
+        id: raw_graph
+        continue-on-error: true
         shell: cmd
         env:
           CANDLE_GRAD_DO_NOT_DETACH: "1"
@@ -1607,6 +1633,8 @@ jobs:
           findstr /c:"test result: ok. 1 passed; 0 failed; 0 ignored;" "%RUNNER_TEMP%\graph-retaining-proof.log" >nul
           if errorlevel 1 exit /b 1
       - name: Prove half precision adapter rounding raw CUDA arithmetic
+        id: raw_half
+        continue-on-error: true
         shell: cmd
         run: |
           call "%VCVARS%"
@@ -1615,7 +1643,32 @@ jobs:
           type "%RUNNER_TEMP%\adapter-rounding-proof.log"
           findstr /c:"test result: ok. 1 passed; 0 failed; 0 ignored;" "%RUNNER_TEMP%\adapter-rounding-proof.log" >nul
           if errorlevel 1 exit /b 1
+      # Independent proofs collect all failures; only this gate determines raw
+      # proof success. Use outcome (before continue-on-error), never conclusion.
+      - name: Require all six raw CUDA proofs to pass
+        id: raw_proofs_gate
+        if: always()
+        shell: bash
+        env:
+          STREAMING: ${{ steps.raw_streaming.outcome }}
+          REFERENCE: ${{ steps.raw_reference.outcome }}
+          RMS: ${{ steps.raw_rms.outcome }}
+          ROPE: ${{ steps.raw_rope.outcome }}
+          GRAPH: ${{ steps.raw_graph.outcome }}
+          HALF: ${{ steps.raw_half.outcome }}
+        run: |
+          failed=0
+          for name in STREAMING REFERENCE RMS ROPE GRAPH HALF; do
+            outcome="${!name}"
+            echo "$name raw proof outcome: $outcome"
+            if [[ "$outcome" != success ]]; then
+              echo "::error::$name raw CUDA proof did not pass ($outcome)"
+              failed=1
+            fi
+          done
+          exit "$failed"
       - name: Test LLM-only CUDA bundle
+        if: ${{ !inputs.raw_training_math_only }}
         shell: cmd
         run: |
           call "%VCVARS%"
@@ -1623,6 +1676,7 @@ jobs:
       # The decided sc-12835 feature wiring: audio is its own additive bundle feature, so the
       # LLM+audio composition (ChatWorks TTS without the media graph) is a supported profile.
       - name: Test LLM+audio CUDA bundle
+        if: ${{ !inputs.raw_training_math_only }}
         shell: cmd
         run: |
           call "%VCVARS%"
@@ -1753,7 +1807,7 @@ jobs:
       - release-metadata
       - release-artifacts
     if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic') && (always())
+      (github.event_name != 'workflow_dispatch' || inputs.lanes != 'windows-gpu-diagnostic' || inputs.raw_training_math_only) && (always())
     runs-on: ubuntu-latest
     steps:
       - name: Require every lane to have succeeded or been skipped
@@ -1774,7 +1828,7 @@ jobs:
   # Diagnostic completion is evidence capture, never GPU ownership or allocation admission.
   windows-gpu-diagnostic:
     name: Physical GPU1 read-only diagnostic (Windows, manual)
-    if: github.event_name == 'workflow_dispatch' && inputs.lanes == 'windows-gpu-diagnostic'
+    if: github.event_name == 'workflow_dispatch' && inputs.lanes == 'windows-gpu-diagnostic' && !inputs.raw_training_math_only
     runs-on: [self-hosted, windows, cuda]
     timeout-minutes: 5
     env:

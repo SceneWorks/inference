@@ -273,27 +273,77 @@ mod tests {
                     Reference::new(legacy(&qview, &kr, &vr, scale, budget)?, scale, plan).is_err()
                 );
 
-                let mask = Tensor::zeros((sq, sk), dtype, &dev)?;
-                assert!(try_forward(&qview, &kr, &vr, scale, Some(&mask), plan)?.is_none());
-                let masked =
-                    with_training_attention_mode(TrainingAttentionMode::Reference, || {
-                        crate::fused_attention::training_sdpa_standard_bhsd(
-                            &qview,
-                            &kr,
-                            &vr,
-                            scale,
-                            Some(&mask),
-                            plan,
-                        )
-                    })?;
-                let expected = legacy(&qview, &kr, &vr, scale, budget)?;
-                assert_eq!(
-                    (masked.to_dtype(DType::F32)? - expected.to_dtype(DType::F32)?)?
-                        .abs()?
-                        .max_all()?
-                        .to_scalar::<f32>()?,
-                    0.
-                );
+                // BHSD's chunked fallback accepts a broadcast or per-query
+                // 4-D additive mask. A rank-2 [Sq,Sk] mask only happens to
+                // broadcast on its unchunked branch and is not that contract.
+                for mask_rows in [1, sq] {
+                    let mask = Tensor::zeros((b, 1, mask_rows, sk), dtype, &dev)?;
+                    assert!(try_forward(&qview, &kr, &vr, scale, Some(&mask), plan)?.is_none());
+                    let masked =
+                        with_training_attention_mode(TrainingAttentionMode::Reference, || {
+                            crate::fused_attention::training_sdpa_standard_bhsd(
+                                &qview,
+                                &kr,
+                                &vr,
+                                scale,
+                                Some(&mask),
+                                plan,
+                            )
+                        })?;
+                    let expected = legacy(&qview, &kr, &vr, scale, budget)?;
+                    assert_eq!(
+                        (masked.to_dtype(DType::F32)? - expected.to_dtype(DType::F32)?)?
+                            .abs()?
+                            .max_all()?
+                            .to_scalar::<f32>()?,
+                        0.
+                    );
+                }
+                // Unsupported mask rank must preserve the legacy error rather
+                // than pretend the optimized owner accepts it. This is the
+                // [5,3] fixture mistake caught by the first manual proof.
+                if plan.budget.query_block_rows((b * h * sk) as u64, sq as u64) < sq as u64 {
+                    let mask = Tensor::zeros((sq, sk), dtype, &dev)?;
+                    let legacy_error = crate::attention::sdpa_planned_bhsd(
+                        &qview,
+                        &kr,
+                        &vr,
+                        scale,
+                        Some(&mask),
+                        |scores| candle_nn::ops::softmax(scores, D::Minus1),
+                        plan,
+                    )
+                    .unwrap_err();
+                    let actual_error =
+                        with_training_attention_mode(TrainingAttentionMode::Reference, || {
+                            crate::fused_attention::training_sdpa_standard_bhsd(
+                                &qview,
+                                &kr,
+                                &vr,
+                                scale,
+                                Some(&mask),
+                                plan,
+                            )
+                        })
+                        .unwrap_err();
+                    for error in [actual_error, legacy_error] {
+                        let crate::CandleError::Candle(error) = error else {
+                            panic!("expected the legacy Candle mask-dimension error");
+                        };
+                        let mut cause = &error;
+                        while let candle_core::Error::WithBacktrace { inner, .. } = cause {
+                            cause = inner;
+                        }
+                        match cause {
+                            candle_core::Error::DimOutOfRange { shape, dim, op } => {
+                                assert_eq!(shape.dims(), &[sq, sk]);
+                                assert_eq!(*dim, 2);
+                                assert_eq!(*op, "dim");
+                            }
+                            _ => panic!("wrong mask error: {cause}"),
+                        }
+                    }
+                }
                 assert!(try_forward(&qview, &kr, &vr, f64::INFINITY, None, plan)?.is_none());
                 assert!(try_forward(&qview.flatten_all()?, &kr, &vr, scale, None, plan)?.is_none());
                 assert!(
