@@ -351,7 +351,17 @@ pub(crate) fn apply(
                     "MOSS adapter target {path} is not a transformer projection"
                 )));
             }
-            stored_keys.insert(format!("{path}.{factor}"), header.name.clone());
+            // Two spellings of one logical factor (prefixed and unprefixed) must not silently
+            // shadow each other: the maps key by the logical name, so an unchecked insert would
+            // drop one supplied tensor and still report successful application.
+            if let Some(previous) =
+                stored_keys.insert(format!("{path}.{factor}"), header.name.clone())
+            {
+                return Err(Error::Unsupported(format!(
+                    "MOSS adapter tensors {previous} and {} name the same factor {path}.{factor}",
+                    header.name
+                )));
+            }
             groups
                 .entry(path.to_owned())
                 .or_default()

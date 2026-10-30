@@ -806,6 +806,24 @@ fn external_prefixed_bf16_lora_loads_as_is_on_both_checkpoints() {
             AdapterKind::Lora,
             "not a transformer projection",
         );
+        // Prefixed and unprefixed spellings of ONE factor collapse to the same logical key
+        // after normalization; silently shadowing one would apply half the supplied tensors.
+        let collision: Vec<(&str, Array)> = vec![
+            ("layers.0.proj.q.lora_A.weight", full(0.125, [2, 16])),
+            (
+                "diffusion_model.layers.0.proj.q.lora_A.weight",
+                full(0.125, [2, 16]),
+            ),
+            (
+                "diffusion_model.layers.0.proj.q.lora_B.weight",
+                full(0.25, [16, 2]),
+            ),
+        ];
+        refusal(
+            save("collision.safetensors", &collision, &kohya),
+            AdapterKind::Lora,
+            "name the same factor",
+        );
         let native_bf16: Vec<(&str, Array)> = native_q
             .iter()
             .map(|(k, v)| (*k, v.as_dtype(Dtype::Bfloat16).unwrap()))

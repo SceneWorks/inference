@@ -388,7 +388,17 @@ pub(crate) fn apply(
             if !shapes.contains_key(path) {
                 return Err(invalid(format!("unknown transformer projection {path}")));
             }
-            stored_keys.insert(format!("{path}.{factor}"), header.name.clone());
+            // Two spellings of one logical factor (prefixed and unprefixed) must not silently
+            // shadow each other: the maps key by the logical name, so an unchecked insert would
+            // drop one supplied tensor and still report successful application.
+            if let Some(previous) =
+                stored_keys.insert(format!("{path}.{factor}"), header.name.clone())
+            {
+                return Err(invalid(format!(
+                    "tensors {previous} and {} name the same factor {path}.{factor}",
+                    header.name
+                )));
+            }
             groups
                 .entry(path.into())
                 .or_default()

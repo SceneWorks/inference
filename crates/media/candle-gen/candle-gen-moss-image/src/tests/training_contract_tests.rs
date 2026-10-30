@@ -1302,10 +1302,29 @@ fn external_prefixed_bf16_lora_loads_as_is_on_both_checkpoints() {
     ]);
     let stray_path = temp.path().join("stray.safetensors");
     write_adapter_file(&stray_path, &stray, &kohya);
+    // Prefixed and unprefixed spellings of ONE factor collapse to the same logical key after
+    // normalization; silently shadowing one would apply half the supplied tensors.
+    let collision = BTreeMap::from([
+        (
+            "layers.0.proj.q.lora_A.weight".to_owned(),
+            bf(0.125, (2, 16)),
+        ),
+        (
+            "diffusion_model.layers.0.proj.q.lora_A.weight".to_owned(),
+            bf(0.125, (2, 16)),
+        ),
+        (
+            "diffusion_model.layers.0.proj.q.lora_B.weight".to_owned(),
+            bf(0.25, (16, 2)),
+        ),
+    ]);
+    let collision_path = temp.path().join("collision.safetensors");
+    write_adapter_file(&collision_path, &collision, &kohya);
     for (path, lokr, needle) in [
         (&external_path, true, "PEFT LoRA only"),
         (&no_alpha_path, false, "no alpha"),
         (&stray_path, false, "unknown transformer projection"),
+        (&collision_path, false, "name the same factor"),
     ] {
         let (host, x, context, result) = apply_one(path, lokr, MossImageVariant::Base);
         assert!(
