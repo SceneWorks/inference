@@ -946,10 +946,8 @@ impl MiniMaxH3 {
         )?;
         let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
         drop(w);
-        on_progress(Progress::Loading(
-            candle_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let context = te.forward(&ids, &mask)?;
+        let context =
+            candle_gen::gen_core::with_prompt_encoding(on_progress, || te.forward(&ids, &mask))?;
         // candle is eager, so `context` is already materialized here and dropping the encoder
         // genuinely frees its weights — there is no lazy graph holding them alive.
         drop(te);
@@ -999,16 +997,15 @@ impl MiniMaxH3 {
         )?;
         let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
         drop(w);
-        on_progress(Progress::Loading(
-            candle_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let context = te.forward_with_images(
-            &ids,
-            &mask,
-            &grounded.embeds,
-            &grounded.deepstack,
-            &grounded.grids,
-        )?;
+        let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+            te.forward_with_images(
+                &ids,
+                &mask,
+                &grounded.embeds,
+                &grounded.deepstack,
+                &grounded.grids,
+            )
+        })?;
         drop(te);
         drop(grounded);
         crate::dit::release_device_memory(&self.device)?;
@@ -1740,21 +1737,19 @@ impl MiniMaxH3 {
         )?;
         let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
         drop(w);
-        on_progress(Progress::Loading(
-            candle_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let context = te.forward_with_references(
-            &ids,
-            &mask,
-            &grounded.embeds,
-            &grounded.deepstack,
-            &grounded.grids,
-        )?;
+        let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+            te.forward_with_references(
+                &ids,
+                &mask,
+                &grounded.embeds,
+                &grounded.deepstack,
+                &grounded.grids,
+            )
+        })?;
         drop(te);
         drop(grounded);
         crate::dit::release_device_memory(&self.device)?;
         phase.done();
-
         if context.dims()[1] != tags.len() {
             return Err(CandleError::Msg(format!(
                 "{MODEL_ID}: the ref2va context has {} rows but {} modality tags",

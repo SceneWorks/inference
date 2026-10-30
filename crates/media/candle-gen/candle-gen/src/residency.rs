@@ -185,7 +185,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, 3);
-        assert_eq!(phases, vec![LoadPhase::TextEncoder, LoadPhase::Renderer]);
+        assert_eq!(
+            phases,
+            vec![
+                LoadPhase::TextEncoder,
+                LoadPhase::EncodingPrompt,
+                LoadPhase::Renderer
+            ]
+        );
         assert_eq!(
             *log.borrow(),
             vec!["encode", "drop-text", "load-heavy", "render"]

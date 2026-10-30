@@ -58,10 +58,8 @@ impl MiniMaxH3 {
         };
         let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
         let te = self.build_te(w.as_ref(), &cfg, window, cancel)?;
-        on_progress(Progress::Loading(
-            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let context = te.forward(&ids, &mask)?;
+        let context =
+            mlx_gen::gen_core::with_prompt_encoding(on_progress, || te.forward(&ids, &mask))?;
         // Force it BEFORE the encoder is dropped: under lazy evaluation the context is a graph node
         // holding every weight it was computed from, so dropping first would free nothing and the
         // first denoise step would re-materialize 66.7 GB.
@@ -123,16 +121,15 @@ impl MiniMaxH3 {
             }
         };
         let te = self.build_te(w.as_ref(), &cfg, window, cancel)?;
-        on_progress(Progress::Loading(
-            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let context = te.forward_with_images(
-            &ids,
-            &mask,
-            &grounded.embeds,
-            &grounded.deepstack,
-            &grounded.grids,
-        )?;
+        let context = mlx_gen::gen_core::with_prompt_encoding(on_progress, || {
+            te.forward_with_images(
+                &ids,
+                &mask,
+                &grounded.embeds,
+                &grounded.deepstack,
+                &grounded.grids,
+            )
+        })?;
         mlx_rs::transforms::eval([&context])?;
         release((te, w, grounded));
 
@@ -275,16 +272,15 @@ impl MiniMaxH3 {
             }
         };
         let te = self.build_te(w.as_ref(), &cfg, window, cancel)?;
-        on_progress(Progress::Loading(
-            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let context = te.forward_with_references(
-            &ids,
-            &mask,
-            &grounded.embeds,
-            &grounded.deepstack,
-            &grounded.grids,
-        )?;
+        let context = mlx_gen::gen_core::with_prompt_encoding(on_progress, || {
+            te.forward_with_references(
+                &ids,
+                &mask,
+                &grounded.embeds,
+                &grounded.deepstack,
+                &grounded.grids,
+            )
+        })?;
         mlx_rs::transforms::eval([&context])?;
         release((te, w, grounded));
 

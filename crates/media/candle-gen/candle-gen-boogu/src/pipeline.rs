@@ -341,21 +341,28 @@ pub(crate) fn stage_encode_base(
         _ => None,
     };
     let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
-    let cond = text
-        .te
-        .last_hidden(&text.tok.text_ids_to_tensor(&preflight.positive)?)?;
-    let uncond = if guidance > 1.0 {
-        let negative = preflight.negative.as_ref().ok_or_else(|| {
-            CandleError::Msg("boogu base: CFG-negative conditioning was not admitted".into())
-        })?;
-        Some(
-            text.te
-                .last_hidden(&text.tok.text_ids_to_tensor(negative)?)?,
-        )
-    } else {
-        None
-    };
+    let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
+        on_progress,
+        || -> std::result::Result<_, candle_gen::CandleError> {
+            let cond = text
+                .te
+                .last_hidden(&text.tok.text_ids_to_tensor(&preflight.positive)?)?;
+            let uncond = if guidance > 1.0 {
+                let negative = preflight.negative.as_ref().ok_or_else(|| {
+                    CandleError::Msg(
+                        "boogu base: CFG-negative conditioning was not admitted".into(),
+                    )
+                })?;
+                Some(
+                    text.te
+                        .last_hidden(&text.tok.text_ids_to_tensor(negative)?)?,
+                )
+            } else {
+                None
+            };
+            Ok((cond, uncond))
+        },
+    )?;
     Ok(StagedCondition::Base {
         cond,
         uncond,
@@ -389,10 +396,11 @@ pub(crate) fn stage_encode_turbo(
         )?),
         _ => None,
     };
-    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
-    let cond = text
-        .te
-        .last_hidden(&text.tok.text_ids_to_tensor(&preflight.positive)?)?;
+    let cond = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+        text.te
+            .last_hidden(&text.tok.text_ids_to_tensor(&preflight.positive)?)
+            .map_err(candle_gen::CandleError::from)
+    })?;
     Ok(StagedCondition::Turbo {
         cond,
         clean,
@@ -414,20 +422,28 @@ pub(crate) fn stage_encode_edit(
         .iter()
         .map(|reference| vae_encode(&edit.vae_encoder, reference, device))
         .collect::<Result<Vec<_>>>()?;
-    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
-    let cond =
-        encode_image_instruction_parts(&text.tok, &text.te, edit, references, preflight, device)?;
-    let uncond = if req.guidance.unwrap_or(DEFAULT_GUIDANCE) > 1.0 {
-        let negative = preflight.negative.as_ref().ok_or_else(|| {
-            CandleError::Msg("boogu edit: CFG-negative conditioning was not admitted".into())
-        })?;
-        Some(
-            text.te
-                .last_hidden(&text.tok.text_ids_to_tensor(negative)?)?,
-        )
-    } else {
-        None
-    };
+    let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
+        on_progress,
+        || -> std::result::Result<_, candle_gen::CandleError> {
+            let cond = encode_image_instruction_parts(
+                &text.tok, &text.te, edit, references, preflight, device,
+            )?;
+            let uncond = if req.guidance.unwrap_or(DEFAULT_GUIDANCE) > 1.0 {
+                let negative = preflight.negative.as_ref().ok_or_else(|| {
+                    CandleError::Msg(
+                        "boogu edit: CFG-negative conditioning was not admitted".into(),
+                    )
+                })?;
+                Some(
+                    text.te
+                        .last_hidden(&text.tok.text_ids_to_tensor(negative)?)?,
+                )
+            } else {
+                None
+            };
+            Ok((cond, uncond))
+        },
+    )?;
     Ok(StagedCondition::Edit {
         cond,
         uncond,
@@ -686,26 +702,30 @@ pub(crate) fn render_base(
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
     // Condition encoding (seed-independent): positive instruction + CFG-negative (empty) instruction.
-    on_progress(Progress::Loading(
-        candle_gen::gen_core::LoadPhase::EncodingPrompt,
-    ));
-    let cond = comps
-        .te
-        .last_hidden(&comps.tok.text_ids_to_tensor(&preflight.positive)?)?;
-    let do_cfg = guidance > 1.0;
-    let uncond = if do_cfg {
-        let negative = preflight.negative.as_ref().ok_or_else(|| {
-            CandleError::Msg("boogu base: CFG-negative conditioning was not admitted".into())
-        })?;
-        Some(
-            comps
+    let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
+        on_progress,
+        || -> std::result::Result<_, candle_gen::CandleError> {
+            let cond = comps
                 .te
-                .last_hidden(&comps.tok.text_ids_to_tensor(negative)?)?,
-        )
-    } else {
-        None
-    };
-
+                .last_hidden(&comps.tok.text_ids_to_tensor(&preflight.positive)?)?;
+            let do_cfg = guidance > 1.0;
+            let uncond = if do_cfg {
+                let negative = preflight.negative.as_ref().ok_or_else(|| {
+                    CandleError::Msg(
+                        "boogu base: CFG-negative conditioning was not admitted".into(),
+                    )
+                })?;
+                Some(
+                    comps
+                        .te
+                        .last_hidden(&comps.tok.text_ids_to_tensor(negative)?)?,
+                )
+            } else {
+                None
+            };
+            Ok((cond, uncond))
+        },
+    )?;
     let native = base_native_sigmas(steps);
     let sigmas = candle_gen::resolve_flow_schedule(
         req.scheduler.as_deref(),
@@ -794,12 +814,12 @@ pub(crate) fn render_turbo(
 ) -> Result<Vec<Image>> {
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-    on_progress(Progress::Loading(
-        candle_gen::gen_core::LoadPhase::EncodingPrompt,
-    ));
-    let cond = comps
-        .te
-        .last_hidden(&comps.tok.text_ids_to_tensor(&preflight.positive)?)?;
+    let cond = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+        comps
+            .te
+            .last_hidden(&comps.tok.text_ids_to_tensor(&preflight.positive)?)
+            .map_err(candle_gen::CandleError::from)
+    })?;
     // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
     // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
     // `None` → the native VAE decode. Shared by both the curated and native DMD decode sites below.
@@ -969,24 +989,28 @@ pub(crate) fn render_edit(
     // Condition encoding (seed-independent): image-conditioned edit instruction (the MLLM sees every
     // reference) + text-only CFG-negative (empty/drop instruction). Both DiT passes carry the same
     // reference latents.
-    on_progress(Progress::Loading(
-        candle_gen::gen_core::LoadPhase::EncodingPrompt,
-    ));
-    let cond = encode_image_instruction(comps, edit, references, preflight, device)?;
-    let do_cfg = guidance > 1.0;
-    let uncond = if do_cfg {
-        let negative = preflight.negative.as_ref().ok_or_else(|| {
-            CandleError::Msg("boogu edit: CFG-negative conditioning was not admitted".into())
-        })?;
-        Some(
-            comps
-                .te
-                .last_hidden(&comps.tok.text_ids_to_tensor(negative)?)?,
-        )
-    } else {
-        None
-    };
-
+    let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
+        on_progress,
+        || -> std::result::Result<_, candle_gen::CandleError> {
+            let cond = encode_image_instruction(comps, edit, references, preflight, device)?;
+            let do_cfg = guidance > 1.0;
+            let uncond = if do_cfg {
+                let negative = preflight.negative.as_ref().ok_or_else(|| {
+                    CandleError::Msg(
+                        "boogu edit: CFG-negative conditioning was not admitted".into(),
+                    )
+                })?;
+                Some(
+                    comps
+                        .te
+                        .last_hidden(&comps.tok.text_ids_to_tensor(negative)?)?,
+                )
+            } else {
+                None
+            };
+            Ok((cond, uncond))
+        },
+    )?;
     let native = base_native_sigmas(steps);
     let sigmas = candle_gen::resolve_flow_schedule(
         req.scheduler.as_deref(),

@@ -704,11 +704,9 @@ impl SenseNova {
             // The request's two phase boundaries are opened once each — by the first image's loop
             // and the last image's loop — not once per image (sc-22738).
             let (opens_denoise, opens_decode) = request_phase_bounds(i, req.count);
-            on_progress(Progress::Loading(
-                mlx_gen::gen_core::LoadPhase::EncodingPrompt,
-            ));
             let reporter = StepReporter::new(&req.cancel, on_progress)
-                .with_phase_bounds(opens_denoise, opens_decode);
+                .with_phase_bounds(opens_denoise, opens_decode)
+                .with_prompt_encoding();
             let out = if references.is_empty() {
                 self.model.generate(
                     &self.tokenizer,

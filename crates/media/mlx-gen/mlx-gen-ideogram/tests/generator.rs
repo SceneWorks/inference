@@ -84,6 +84,7 @@ fn generates_via_registry() {
             // never fires — a no-op arm keeps the match exhaustive over the additive `Progress` variant.
             Progress::Loading(_)
             | Progress::PromptUpsamplingComplete
+            | Progress::PromptEncodingComplete
             | Progress::ConditioningComplete
             | Progress::Upsampling { .. } => {}
         })

@@ -717,10 +717,7 @@ fn encode_prompt(
             Some(q) => Umt5Encoder::from_weights_quantized(&mut w, &cfg.wan, q)?,
             None => Umt5Encoder::from_weights(&w, &cfg.wan)?,
         };
-        on_progress(Progress::Loading(
-            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        enc.encode(&tokenizer, prompt)
+        mlx_gen::gen_core::with_prompt_encoding(on_progress, || enc.encode(&tokenizer, prompt))
     })
 }
 

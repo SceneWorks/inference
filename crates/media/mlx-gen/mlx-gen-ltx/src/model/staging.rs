@@ -140,35 +140,49 @@ impl Ltx {
             // turn an enhancement request into ordinary conditioning.
             StagedTextEncoder::Gemma4(_) => (self.maybe_enhance_gemma4(req)?, None),
         };
-        on_progress(Progress::Loading(
-            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let prompt = enhanced.as_deref().unwrap_or(req.prompt.as_str());
-        let (ids, mask) = self.tokenizer.encode(prompt, MAX_PROMPT_TOKENS)?;
-        let (video_ctx, audio_ctx) = te.encode_av(&ids, &mask)?;
-        let negative = if self.transformer_variant().is_dev() {
-            let prompt = req
-                .negative_prompt
-                .as_deref()
-                .unwrap_or(DEFAULT_NEGATIVE_PROMPT);
-            let (ids, mask) = self.tokenizer.encode(prompt, MAX_PROMPT_TOKENS)?;
-            let (video, audio) = te.encode_av(&ids, &mask)?;
-            Some((video, audio))
-        } else {
-            None
-        };
-        // Force the encode to complete before `te` (the ~24 GB Gemma) drops at end of scope — otherwise
-        // the lazy graph would keep the TE weights alive into the DiT phase, defeating the staging.
-        match &negative {
-            Some((negative_video, negative_audio)) => {
-                mlx_rs::transforms::eval([&video_ctx, &audio_ctx, negative_video, negative_audio])?
-            }
-            None => mlx_rs::transforms::eval([&video_ctx, &audio_ctx])?,
-        }
-        let (negative_video, negative_audio) = match negative {
-            Some((video, audio)) => (Some(video), Some(audio)),
-            None => (None, None),
-        };
+        let (enhanced, enhancer_fallback, video_ctx, audio_ctx, negative_video, negative_audio) =
+            mlx_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, mlx_gen::Error> {
+                    let prompt = enhanced.as_deref().unwrap_or(req.prompt.as_str());
+                    let (ids, mask) = self.tokenizer.encode(prompt, MAX_PROMPT_TOKENS)?;
+                    let (video_ctx, audio_ctx) = te.encode_av(&ids, &mask)?;
+                    let negative = if self.transformer_variant().is_dev() {
+                        let prompt = req
+                            .negative_prompt
+                            .as_deref()
+                            .unwrap_or(DEFAULT_NEGATIVE_PROMPT);
+                        let (ids, mask) = self.tokenizer.encode(prompt, MAX_PROMPT_TOKENS)?;
+                        let (video, audio) = te.encode_av(&ids, &mask)?;
+                        Some((video, audio))
+                    } else {
+                        None
+                    };
+                    // Force the encode to complete before `te` (the ~24 GB Gemma) drops at end of scope — otherwise
+                    // the lazy graph would keep the TE weights alive into the DiT phase, defeating the staging.
+                    match &negative {
+                        Some((negative_video, negative_audio)) => mlx_rs::transforms::eval([
+                            &video_ctx,
+                            &audio_ctx,
+                            negative_video,
+                            negative_audio,
+                        ])?,
+                        None => mlx_rs::transforms::eval([&video_ctx, &audio_ctx])?,
+                    }
+                    let (negative_video, negative_audio) = match negative {
+                        Some((video, audio)) => (Some(video), Some(audio)),
+                        None => (None, None),
+                    };
+                    Ok((
+                        enhanced,
+                        enhancer_fallback,
+                        video_ctx,
+                        audio_ctx,
+                        negative_video,
+                        negative_audio,
+                    ))
+                },
+            )?;
         Ok(StagedTextConditioning {
             enhanced_prompt: enhanced,
             enhancer_fallback,

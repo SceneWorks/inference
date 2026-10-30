@@ -243,18 +243,20 @@ impl Mochi {
 
         // T5-XXL masked encode (`_get_t5_prompt_embeds`), positive + the CFG-unconditional branch (the
         // reference encodes the negative prompt, or "" when unset, with `do_classifier_free_guidance`).
-        on_progress(Progress::Loading(
-            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let pos = encode_prompt(&self.tokenizer, &self.t5, &req.prompt)?;
-        let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
-        let neg = encode_prompt(&self.tokenizer, &self.t5, neg_prompt)?;
-        // CFG batch order [neg, pos] — matches `scheduler::cfg_combine` (uncond = half 0, cond = half 1)
-        // and the reference `torch.cat([negative_prompt_embeds, prompt_embeds])`.
-        let enc = concatenate_axis(&[&neg.prompt_embeds, &pos.prompt_embeds], 0)?;
-        let enc_mask =
-            concatenate_axis(&[&neg.prompt_attention_mask, &pos.prompt_attention_mask], 0)?;
-
+        let (_pos, _neg, enc, enc_mask) = mlx_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, mlx_gen::Error> {
+                let pos = encode_prompt(&self.tokenizer, &self.t5, &req.prompt)?;
+                let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
+                let neg = encode_prompt(&self.tokenizer, &self.t5, neg_prompt)?;
+                // CFG batch order [neg, pos] — matches `scheduler::cfg_combine` (uncond = half 0, cond = half 1)
+                // and the reference `torch.cat([negative_prompt_embeds, prompt_embeds])`.
+                let enc = concatenate_axis(&[&neg.prompt_embeds, &pos.prompt_embeds], 0)?;
+                let enc_mask =
+                    concatenate_axis(&[&neg.prompt_attention_mask, &pos.prompt_attention_mask], 0)?;
+                Ok((pos, neg, enc, enc_mask))
+            },
+        )?;
         // Geometry: AsymmVAE 6× temporal / 8× spatial; the DiT sees the `[1, 12, F_lat, H/8, W/8]`
         // latent (frames already gated to `1 + 6·k`, size to multiple-of-16 by `validate`).
         let t_ratio = self.vae_config.temporal_compression_ratio() as u32;

@@ -696,10 +696,9 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         let text_model = self.load_text_model(which)?;
-        on_progress(Progress::Loading(
-            candle_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let result = self.encode_loaded(&text_model, tokenizer, plan, prompt, uncond, chunks);
+        let result = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+            self.encode_loaded(&text_model, tokenizer, plan, prompt, uncond, chunks)
+        });
         candle_gen::residency::synchronize_result(&self.device, result)
     }
 

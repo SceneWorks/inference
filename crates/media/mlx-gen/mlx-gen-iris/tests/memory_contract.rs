@@ -44,7 +44,13 @@ const STEPS: [&str; 4] = [
     "Step { current: 3, total: 3 }",
     "Decoding",
 ];
-const STAGED_LOADS: [&str; 2] = ["Loading(TextEncoder)", "Loading(Renderer)"];
+const ENCODING: [&str; 2] = ["Loading(EncodingPrompt)", "PromptEncodingComplete"];
+const STAGED_PHASES: [&str; 4] = [
+    "Loading(TextEncoder)",
+    "Loading(EncodingPrompt)",
+    "PromptEncodingComplete",
+    "Loading(Renderer)",
+];
 
 fn render(generator: &dyn mlx_gen::Generator, req: &GenerationRequest) -> (Vec<String>, Vec<u8>) {
     let mut events = Vec::new();
@@ -69,7 +75,7 @@ fn render(generator: &dyn mlx_gen::Generator, req: &GenerationRequest) -> (Vec<S
 ///
 /// *Mutation that reds this:* `Iris3b::generate_impl` calling `Residency::run` (the load policy's
 /// default) instead of `run_request_scoped(stage_residency_for(..))` — the staged request then
-/// loads nothing and reports only its steps.
+/// loads nothing and reports encoding followed by its steps.
 #[test]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image() {
@@ -98,7 +104,11 @@ fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body() 
     assert!(contract.asset_facts.transformer_bytes > 0);
 
     let (warm_events, warm) = render(generator.as_ref(), &request());
-    assert_eq!(warm_events, STEPS, "a warm request loads nothing");
+    assert_eq!(
+        warm_events,
+        [&ENCODING[..], &STEPS[..]].concat(),
+        "a warm request loads nothing"
+    );
 
     let mut context = gen_core::standard_memory_behavior_context(
         &contract,
@@ -135,7 +145,7 @@ fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body() 
     drop(scope);
     assert_eq!(
         staged_events,
-        [&STAGED_LOADS[..1], &STAGED_LOADS[1..], &STEPS[..]].concat(),
+        [&STAGED_PHASES[..], &STEPS[..]].concat(),
         "a staged request loads the encoder, encodes, then loads the backbone"
     );
     assert_eq!(staged_pixels, warm, "staging must not change the render");
@@ -168,10 +178,14 @@ fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body() 
 
     // The staged request evicted the warm pair; the next unstaged request rebuilds it.
     let (rebuild_events, rebuilt) = render(generator.as_ref(), &request());
-    assert_eq!(&rebuild_events[..2], &STAGED_LOADS);
+    assert_eq!(&rebuild_events[..4], &STAGED_PHASES);
     assert_eq!(rebuilt, warm);
     let (again_events, again) = render(generator.as_ref(), &request());
-    assert_eq!(again_events, STEPS, "the warm pair is back");
+    assert_eq!(
+        again_events,
+        [&ENCODING[..], &STEPS[..]].concat(),
+        "the warm pair is back"
+    );
     assert_eq!(again, warm);
 
     // A control the route has no mechanism for is refused at validation, not accepted and ignored;
@@ -212,7 +226,7 @@ fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body() 
         .load("iris_3b", &generation_spec(OffloadPolicy::Sequential))
         .unwrap();
     let (sequential_events, sequential_pixels) = render(sequential.as_ref(), &request());
-    assert_eq!(&sequential_events[..2], &STAGED_LOADS);
+    assert_eq!(&sequential_events[..4], &STAGED_PHASES);
     assert_eq!(sequential_pixels, warm);
 }
 

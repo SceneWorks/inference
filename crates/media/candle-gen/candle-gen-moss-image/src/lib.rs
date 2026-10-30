@@ -335,43 +335,51 @@ impl MossImageGenerator {
             transformer::check_cancel(&req.cancel)?;
             state.text = Some(self.sources.text(&self.device)?);
         }
-        if need_text {
-            on_progress(Progress::Loading(LoadPhase::EncodingPrompt));
-        }
-        let positive = if let Some(e) = inputs.positive {
-            text_encoder::supplied(e, &self.device)?
-        } else {
-            text_encoder::strings(
-                &self.sources,
-                state.text.as_ref().expect("text loaded"),
-                &prompts,
-                r.max_sequence_length,
-                &self.device,
-                &req.cancel,
-            )?
-        };
-        let negative = if matches!(r.acceleration, MossImageAcceleration::Off) && r.guidance != 1.0
-        {
-            Some(if let Some(e) = inputs.negative {
+        let encode = || -> candle_gen::Result<_> {
+            let positive = if let Some(e) = inputs.positive {
                 text_encoder::supplied(e, &self.device)?
             } else {
-                let texts = inputs
-                    .negative_prompts
-                    .map(<[String]>::to_vec)
-                    .unwrap_or_else(|| {
-                        vec![req.negative_prompt.clone().unwrap_or_default(); positive.rows.len()]
-                    });
                 text_encoder::strings(
                     &self.sources,
                     state.text.as_ref().expect("text loaded"),
-                    &texts,
+                    &prompts,
                     r.max_sequence_length,
                     &self.device,
                     &req.cancel,
                 )?
-            })
+            };
+            let negative =
+                if matches!(r.acceleration, MossImageAcceleration::Off) && r.guidance != 1.0 {
+                    Some(if let Some(e) = inputs.negative {
+                        text_encoder::supplied(e, &self.device)?
+                    } else {
+                        let texts = inputs
+                            .negative_prompts
+                            .map(<[String]>::to_vec)
+                            .unwrap_or_else(|| {
+                                vec![
+                                    req.negative_prompt.clone().unwrap_or_default();
+                                    positive.rows.len()
+                                ]
+                            });
+                        text_encoder::strings(
+                            &self.sources,
+                            state.text.as_ref().expect("text loaded"),
+                            &texts,
+                            r.max_sequence_length,
+                            &self.device,
+                            &req.cancel,
+                        )?
+                    })
+                } else {
+                    None
+                };
+            Ok((positive, negative))
+        };
+        let (positive, negative) = if need_text {
+            candle_gen::gen_core::with_prompt_encoding(on_progress, encode)?
         } else {
-            None
+            encode()?
         };
         transformer::check_cancel(&req.cancel)?;
         if staged {

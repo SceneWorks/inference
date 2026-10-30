@@ -77,6 +77,7 @@ fn run(g: &dyn mlx_gen::Generator, req: &GenerationRequest) -> (GenerationOutput
             // fires — a no-op arm keeps the match exhaustive over the additive `Progress` variant.
             Progress::Loading(_)
             | Progress::PromptUpsamplingComplete
+            | Progress::PromptEncodingComplete
             | Progress::ConditioningComplete
             | Progress::Upsampling { .. } => {}
         })

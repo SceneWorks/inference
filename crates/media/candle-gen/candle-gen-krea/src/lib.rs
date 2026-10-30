@@ -971,6 +971,7 @@ impl Generator for KreaGenerator {
             if !matches!(
                 event,
                 Progress::Loading(gen_core::LoadPhase::EncodingPrompt)
+                    | Progress::PromptEncodingComplete
             ) || !deferred_encoding.get()
             {
                 on_progress(event);
@@ -1045,9 +1046,9 @@ impl Generator for KreaGenerator {
                         .expect("mp_resolved is Some in this arm");
                     deferred_encoding.set(false);
                     let comps = &resident.components;
-                    on_progress(Progress::Loading(gen_core::LoadPhase::EncodingPrompt));
-                    let (context, negative) =
-                        pipeline::encode_multiphase_contexts(comps.text(), req, mp_need_neg)?;
+                    let (context, negative) = gen_core::with_prompt_encoding(on_progress, || {
+                        pipeline::encode_multiphase_contexts(comps.text(), req, mp_need_neg)
+                    })?;
                     self.file_pin_spec.read_files_unchanged(
                         self.file_pin_spec.file_source_paths(),
                         || {
@@ -7218,7 +7219,13 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
             let repeat_started = std::time::Instant::now();
             let output = g
                 .generate(&req, &mut |progress| {
-                    if matches!(progress, Progress::Loading(_)) {
+                    if matches!(
+                        progress,
+                        Progress::Loading(
+                            candle_gen::gen_core::LoadPhase::TextEncoder
+                                | candle_gen::gen_core::LoadPhase::Renderer
+                        )
+                    ) {
                         if let Some((name, phase)) = observed.take() {
                             phase_peaks.push((repeat, name, probe.end_observed(phase)));
                         }

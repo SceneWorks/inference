@@ -729,6 +729,7 @@ pub fn observe_progress(progress: &Progress) {
         // The optional prompt-upsampling stage (sc-26238) precedes the encode and rewrites the
         // prompt; it is part of the conditioning window, not a phase of its own here.
         Progress::PromptUpsamplingComplete
+        | Progress::PromptEncodingComplete
         | Progress::ConditioningComplete
         | Progress::Upsampling { .. } => {}
     });

@@ -943,18 +943,21 @@ impl Bernini {
         let enc = Umt5Encoder::from_weights(&w, &self.config)?;
         // `encode` returns `[T, 4096]` (no batch); the planner streams are `[1, S, 4096]`, so add
         // the batch axis for the `concat_with_zero_init` sequence-axis concat.
-        on_progress(Progress::Loading(
-            mlx_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let pos = enc
-            .encode(tokenizer, &req.prompt)?
-            .expand_dims(0)?
-            .as_dtype(Dtype::Bfloat16)?;
-        let neg = enc
-            .encode(tokenizer, neg)?
-            .expand_dims(0)?
-            .as_dtype(Dtype::Bfloat16)?;
-        eval([&pos, &neg])?;
+        let (pos, neg) = mlx_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, mlx_gen::Error> {
+                let pos = enc
+                    .encode(tokenizer, &req.prompt)?
+                    .expand_dims(0)?
+                    .as_dtype(Dtype::Bfloat16)?;
+                let neg = enc
+                    .encode(tokenizer, neg)?
+                    .expand_dims(0)?
+                    .as_dtype(Dtype::Bfloat16)?;
+                eval([&pos, &neg])?;
+                Ok((pos, neg))
+            },
+        )?;
         Ok((pos, neg))
     }
 

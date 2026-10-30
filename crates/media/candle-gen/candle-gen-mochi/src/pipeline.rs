@@ -112,16 +112,19 @@ impl Pipeline {
         }
 
         // T5-XXL masked encode (`_get_t5_prompt_embeds`), positive + the CFG-unconditional branch.
-        on_progress(Progress::Loading(
-            candle_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let pos = encode_prompt(&comps.tokenizer, &comps.t5, &req.prompt, &self.device)?;
-        let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
-        let neg = encode_prompt(&comps.tokenizer, &comps.t5, neg_prompt, &self.device)?;
-        // CFG batch order [neg, pos] — matches `scheduler::cfg_combine` (uncond = half 0, cond = half 1).
-        let enc = Tensor::cat(&[&neg.prompt_embeds, &pos.prompt_embeds], 0)?;
-        let enc_mask = Tensor::cat(&[&neg.prompt_attention_mask, &pos.prompt_attention_mask], 0)?;
-
+        let (_pos, _neg, enc, enc_mask) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let pos = encode_prompt(&comps.tokenizer, &comps.t5, &req.prompt, &self.device)?;
+                let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
+                let neg = encode_prompt(&comps.tokenizer, &comps.t5, neg_prompt, &self.device)?;
+                // CFG batch order [neg, pos] — matches `scheduler::cfg_combine` (uncond = half 0, cond = half 1).
+                let enc = Tensor::cat(&[&neg.prompt_embeds, &pos.prompt_embeds], 0)?;
+                let enc_mask =
+                    Tensor::cat(&[&neg.prompt_attention_mask, &pos.prompt_attention_mask], 0)?;
+                Ok((pos, neg, enc, enc_mask))
+            },
+        )?;
         // Geometry: AsymmVAE 6× temporal / 8× spatial; the DiT sees the `[1, 12, F_lat, H/8, W/8]`
         // latent (frames already gated to `1 + 6·k`, size to multiple-of-16 by `validate`).
         let t_ratio = comps.vae_cfg.temporal_compression_ratio() as u32;

@@ -561,11 +561,10 @@ impl Generator for SdxlGenerator {
                     .components(&pipe)
                     .map_err(candle_gen::CandleError::from)?;
                 let result = (|| {
-                    on_progress(Progress::Loading(
-                        candle_gen::gen_core::LoadPhase::EncodingPrompt,
-                    ));
                     let embeddings =
-                        pipe.text_embeddings_resident(&tokenizers, &text, &req.prompt, negative)?;
+                        candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+                            pipe.text_embeddings_resident(&tokenizers, &text, &req.prompt, negative)
+                        })?;
                     pipe.render(
                         req,
                         &embeddings,

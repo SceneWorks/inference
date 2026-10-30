@@ -570,20 +570,23 @@ impl Flux2Edit {
                 references,
             )?;
             candle_gen::check_cancel(&req.cancel)?;
-            on_progress(Progress::Loading(
-                candle_gen::gen_core::LoadPhase::EncodingPrompt,
-            ));
-            let prompt = self.pipe.encode(te, &self.tokenizer, &effective)?;
-            let negative = if cfg_on {
-                let neg = if req.negative.trim().is_empty() {
-                    " "
-                } else {
-                    req.negative.as_str()
-                };
-                Some(self.pipe.encode(te, &self.tokenizer, neg)?)
-            } else {
-                None
-            };
+            let (prompt, negative) = candle_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, candle_gen::CandleError> {
+                    let prompt = self.pipe.encode(te, &self.tokenizer, &effective)?;
+                    let negative = if cfg_on {
+                        let neg = if req.negative.trim().is_empty() {
+                            " "
+                        } else {
+                            req.negative.as_str()
+                        };
+                        Some(self.pipe.encode(te, &self.tokenizer, neg)?)
+                    } else {
+                        None
+                    };
+                    Ok((prompt, negative))
+                },
+            )?;
             Ok((prompt, negative))
         };
         let (prompt_embeds, negative) = if let Some(te) = self.te.as_ref() {

@@ -111,6 +111,7 @@ fn main() -> Result<()> {
         Progress::Decoding => println!("\n[smoke] decoding"),
         Progress::Loading(phase) => println!("[smoke] loading {phase:?}"),
         Progress::PromptUpsamplingComplete
+        | Progress::PromptEncodingComplete
         | Progress::ConditioningComplete
         | Progress::Upsampling { .. } => {}
     };

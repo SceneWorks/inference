@@ -309,12 +309,15 @@ impl IpAdapterSdxl {
 
         // Everything that borrows `&self`, computed into owned values BEFORE the `&mut self.unet`
         // `set_ip_context` (so the disjoint-field borrows don't overlap — the InstantID pattern).
-        on_progress(Progress::Loading(
-            candle_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let (conditioning, pooled) = self
-            .conditioner
-            .encode(&req.prompt, &req.negative, cfg_on)?;
+        let (conditioning, pooled) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let (conditioning, pooled) =
+                    self.conditioner
+                        .encode(&req.prompt, &req.negative, cfg_on)?;
+                Ok((conditioning, pooled))
+            },
+        )?;
         let batch = conditioning.dim(0)?;
         let time_ids = text_time_ids(batch, &self.device, DTYPE)?;
         let ip_tokens = self.ip_tokens(reference, cfg_on)?;

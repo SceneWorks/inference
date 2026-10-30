@@ -589,19 +589,22 @@ fn encode_text_staged(
         Some(q) => Umt5Encoder::from_weights_quantized(&mut w, cfg, q)?,
         None => Umt5Encoder::from_weights(&w, cfg)?,
     };
-    on_progress(mlx_gen::Progress::Loading(
-        mlx_gen::LoadPhase::EncodingPrompt,
-    ));
-    let context = enc.encode(&tokenizer, prompt)?;
-    let context_null = if skip_neg {
-        None
-    } else {
-        Some(enc.encode(&tokenizer, neg_prompt)?)
-    };
-    match &context_null {
-        Some(cn) => mlx_rs::transforms::eval([&context, cn])?,
-        None => mlx_rs::transforms::eval([&context])?,
-    }
+    let (context, context_null) = mlx_gen::gen_core::with_prompt_encoding(
+        on_progress,
+        || -> std::result::Result<_, mlx_gen::Error> {
+            let context = enc.encode(&tokenizer, prompt)?;
+            let context_null = if skip_neg {
+                None
+            } else {
+                Some(enc.encode(&tokenizer, neg_prompt)?)
+            };
+            match &context_null {
+                Some(cn) => mlx_rs::transforms::eval([&context, cn])?,
+                None => mlx_rs::transforms::eval([&context])?,
+            }
+            Ok((context, context_null))
+        },
+    )?;
     Ok((context, context_null))
 }
 

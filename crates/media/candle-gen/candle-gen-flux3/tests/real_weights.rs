@@ -354,7 +354,9 @@ fn real_distilled_text_to_image_renders() {
         .unwrap();
     let render_seconds = t_render.elapsed().as_secs_f64();
     let peak_gb = probe.map(|p| p.report().peak_gb);
-    let expected: Vec<String> = std::iter::once("ConditioningComplete".to_owned())
+    let expected: Vec<String> = std::iter::once("Loading(EncodingPrompt)".to_owned())
+        .chain(std::iter::once("PromptEncodingComplete".to_owned()))
+        .chain(std::iter::once("ConditioningComplete".to_owned()))
         .chain((1..=steps).map(|i| format!("Step {{ current: {i}, total: {steps} }}")))
         .chain(std::iter::once("Decoding".to_owned()))
         .collect();

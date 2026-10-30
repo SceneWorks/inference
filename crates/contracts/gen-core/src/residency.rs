@@ -318,10 +318,8 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
     /// Whether the next [`Self::ensure_warm_locked`] on this pair will actually load components.
     ///
     /// The warm arms consult this **before** calling it so the phase boundaries they emit precede
-    /// the load they describe, and so a request that hits a populated warm pair keeps reporting no
-    /// load at all — `Progress::Loading(_)` stays a load event, which is what every consumer of it
-    /// (the desktop UI's "loading" state, the real-weight residency instrumentation that counts
-    /// loads per request) reads it as.
+    /// the load they describe. A populated warm pair reports no component-loading phases;
+    /// `Loading(EncodingPrompt)` still reports the per-request prompt computation.
     fn warm_needs_load(warm: &Option<ResidentPair<Text, Heavy>>, streamable: bool) -> bool {
         match warm {
             None => true,
@@ -481,8 +479,8 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
             // ahead of the encode and left the conditioning/denoise boundary the memory contract
             // declares unobservable (sc-22738). The renderer boundary now falls where the renderer
             // phase begins — after the encode — matching the staged arm below and
-            // `run_two_phase`. A request that hits a populated warm pair loads nothing and so
-            // still reports nothing.
+            // `run_two_phase`. A populated warm pair reports no component load; it still brackets
+            // the logical prompt-encoding call without changing materialization policy.
             let loading = Self::warm_needs_load(&warm, streamable);
             if loading {
                 on_progress(Progress::Loading(LoadPhase::TextEncoder));
@@ -492,14 +490,14 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 .as_ref()
                 .ok_or_else(|| Error::Msg("warm residency was not populated".into()))
                 .map_err(Into::<R::Error>::into)?;
-            on_progress(Progress::Loading(LoadPhase::EncodingPrompt));
-            let encoded = match encode(&pair.text, prepared) {
-                Ok(encoded) => encoded,
-                Err(error) => {
-                    let _ = materialize_before_text_drop(None);
-                    return Err(error);
-                }
-            };
+            let encoded =
+                match crate::with_prompt_encoding(on_progress, || encode(&pair.text, prepared)) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        let _ = materialize_before_text_drop(None);
+                        return Err(error);
+                    }
+                };
             check_cancel::<R>(cancel)?;
             if loading {
                 on_progress(Progress::Loading(LoadPhase::Renderer));
@@ -672,14 +670,14 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 .as_ref()
                 .ok_or_else(|| Error::Msg("warm residency was not populated".into()))
                 .map_err(Into::<R::Error>::into)?;
-            on_progress(Progress::Loading(LoadPhase::EncodingPrompt));
-            let encoded = match encode(&pair.text, prepared) {
-                Ok(encoded) => encoded,
-                Err(primary) => {
-                    let _ = materialize_encoded(None);
-                    return Err(primary);
-                }
-            };
+            let encoded =
+                match crate::with_prompt_encoding(on_progress, || encode(&pair.text, prepared)) {
+                    Ok(encoded) => encoded,
+                    Err(primary) => {
+                        let _ = materialize_encoded(None);
+                        return Err(primary);
+                    }
+                };
             check_cancel::<R>(cancel)?;
             if loading {
                 on_progress(Progress::Loading(LoadPhase::Renderer));
@@ -704,8 +702,7 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 return Err(error);
             }
         };
-        on_progress(Progress::Loading(LoadPhase::EncodingPrompt));
-        let encoded = match encode(&text, prepared) {
+        let encoded = match crate::with_prompt_encoding(on_progress, || encode(&text, prepared)) {
             Ok(encoded) => materialize_encoded(Some(&encoded)).map(|()| encoded),
             Err(primary) => {
                 let _ = materialize_encoded(None);
@@ -775,8 +772,7 @@ where
             return Err(error);
         }
     };
-    on_progress(Progress::Loading(LoadPhase::EncodingPrompt));
-    let encoded = match encode(&text) {
+    let encoded = match crate::with_prompt_encoding(on_progress, || encode(&text)) {
         Ok(encoded) => materialize_before_text_drop(Some(&encoded)).map(|()| encoded),
         Err(error) => {
             let _ = materialize_before_text_drop(None);
@@ -1340,15 +1336,14 @@ mod tests {
     fn resident_only_rejects_eviction_before_losing_its_warm_pair() {
         let residency = Residency::<u8, u8, Runtime>::resident(2, 3);
         let callbacks = AtomicUsize::new(0);
+        let progress = Mutex::new(Vec::new());
         let run = |stage_residency, streamable| {
             residency.run_request_scoped(
                 stage_residency,
                 streamable,
                 &CancelFlag::new(),
                 false,
-                &mut |_| {
-                    callbacks.fetch_add(1, Ordering::SeqCst);
-                },
+                &mut |event| progress.lock().unwrap().push(event),
                 |text| {
                     callbacks.fetch_add(1, Ordering::SeqCst);
                     Ok(*text)
@@ -1370,6 +1365,7 @@ mod tests {
                 matches!(error, Error::Unsupported(message) if message.contains("resident-only"))
             );
             assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+            assert!(progress.lock().unwrap().is_empty());
         }
         let error: Error = residency.evict_warm().unwrap_err();
         assert!(matches!(error, Error::Unsupported(message) if message.contains("resident-only")));
@@ -1384,7 +1380,15 @@ mod tests {
         assert_eq!(body_calls.load(Ordering::SeqCst), 0);
 
         assert_eq!(run(false, false).unwrap(), 5);
-        assert_eq!(callbacks.load(Ordering::SeqCst), 3);
+        // Only encode/render execute: the warm path must not acquire a materialization fence.
+        assert_eq!(callbacks.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *progress.lock().unwrap(),
+            [
+                Progress::Loading(LoadPhase::EncodingPrompt),
+                Progress::PromptEncodingComplete
+            ]
+        );
         assert_eq!(
             residency
                 .with_resident_parts(|text, heavy| *text + *heavy)
@@ -1607,6 +1611,12 @@ mod tests {
                 Progress::Loading(LoadPhase::TextEncoder) => {
                     R::trace().lock().unwrap().push("load-text")
                 }
+                Progress::Loading(LoadPhase::EncodingPrompt) => {
+                    R::trace().lock().unwrap().push("open-encoding")
+                }
+                Progress::PromptEncodingComplete => {
+                    R::trace().lock().unwrap().push("close-encoding")
+                }
                 Progress::Loading(LoadPhase::Renderer) => {
                     R::trace().lock().unwrap().push("load-heavy")
                 }
@@ -1650,7 +1660,9 @@ mod tests {
             candle,
             vec![
                 "load-text",
+                "open-encoding",
                 "encode",
+                "close-encoding",
                 "materialize",
                 "drop-text",
                 "release",
@@ -1687,6 +1699,12 @@ mod tests {
                     Progress::Loading(LoadPhase::TextEncoder) => {
                         sink_log.lock().unwrap().push("open-conditioning")
                     }
+                    Progress::Loading(LoadPhase::EncodingPrompt) => {
+                        sink_log.lock().unwrap().push("open-encoding")
+                    }
+                    Progress::PromptEncodingComplete => {
+                        sink_log.lock().unwrap().push("close-encoding")
+                    }
                     Progress::Loading(LoadPhase::Renderer) => {
                         sink_log.lock().unwrap().push("open-renderer")
                     }
@@ -1713,14 +1731,13 @@ mod tests {
         warm_arm_boundary_log(&residency, &log);
         assert_eq!(
             *log.lock().unwrap(),
-            vec!["open-conditioning", "encode", "open-renderer", "render"],
+            vec!["open-conditioning", "open-encoding", "encode", "close-encoding", "open-renderer", "render"],
             "the renderer boundary must not be paired with the text-encoder one ahead of the encode"
         );
     }
 
-    /// `Progress::Loading(_)` stays a **load** event: a request that reuses the warm pair loads
-    /// nothing and reports nothing, exactly as before sc-22738. Only the placement of the renderer
-    /// boundary on the loading request changed.
+    /// A request that reuses the warm pair reports prompt encoding without a component load.
+    /// Physical-load observers must distinguish encoding from TextEncoder/Renderer loading.
     #[test]
     fn a_warm_cache_hit_reports_no_load_boundary() {
         let residency = Residency::<u8, u8, Runtime>::request_scoped(|_| Ok(2), |_, _| Ok(3));
@@ -1728,11 +1745,21 @@ mod tests {
         warm_arm_boundary_log(&residency, &first);
         assert_eq!(
             *first.lock().unwrap(),
-            vec!["open-conditioning", "encode", "open-renderer", "render"]
+            vec![
+                "open-conditioning",
+                "open-encoding",
+                "encode",
+                "close-encoding",
+                "open-renderer",
+                "render"
+            ]
         );
         let second = Arc::new(Mutex::new(Vec::new()));
         warm_arm_boundary_log(&residency, &second);
-        assert_eq!(*second.lock().unwrap(), vec!["encode", "render"]);
+        assert_eq!(
+            *second.lock().unwrap(),
+            vec!["open-encoding", "encode", "close-encoding", "render"]
+        );
     }
 
     /// A minimal [`StagedHeavy`] so the three-phase driver can be exercised without a backend.
@@ -1774,6 +1801,12 @@ mod tests {
                         Progress::Loading(LoadPhase::TextEncoder) => {
                             sink_log.lock().unwrap().push("open-conditioning")
                         }
+                        Progress::Loading(LoadPhase::EncodingPrompt) => {
+                            sink_log.lock().unwrap().push("open-encoding")
+                        }
+                        Progress::PromptEncodingComplete => {
+                            sink_log.lock().unwrap().push("close-encoding")
+                        }
                         Progress::Loading(LoadPhase::Renderer) => {
                             sink_log.lock().unwrap().push("open-renderer")
                         }
@@ -1800,7 +1833,9 @@ mod tests {
         };
         let expected = vec![
             "open-conditioning",
+            "open-encoding",
             "encode",
+            "close-encoding",
             "open-renderer",
             "denoise",
             "decode",

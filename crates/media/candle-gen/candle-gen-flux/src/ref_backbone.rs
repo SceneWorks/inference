@@ -182,20 +182,18 @@ impl FluxRefBackbone {
     ) -> Result<(Tensor, Tensor)> {
         candle_gen::check_cancel(cancel)?;
         if let Some(components) = &self.components {
-            on_progress(candle_gen::gen_core::Progress::Loading(
-                candle_gen::gen_core::LoadPhase::EncodingPrompt,
-            ));
-            let encoded = self.pipeline.text_embeddings(components, prompt)?;
+            let encoded = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+                self.pipeline.text_embeddings(components, prompt)
+            })?;
             candle_gen::check_cancel(cancel)?;
             return Ok(encoded);
         }
         let encoders = self.pipeline.load_text_residency()?;
         let encoded = (|| {
             candle_gen::check_cancel(cancel)?;
-            on_progress(candle_gen::gen_core::Progress::Loading(
-                candle_gen::gen_core::LoadPhase::EncodingPrompt,
-            ));
-            let encoded = self.pipeline.encode_residency(&encoders, prompt)?;
+            let encoded = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+                self.pipeline.encode_residency(&encoders, prompt)
+            })?;
             candle_gen::check_cancel(cancel)?;
             Ok(encoded)
         })();

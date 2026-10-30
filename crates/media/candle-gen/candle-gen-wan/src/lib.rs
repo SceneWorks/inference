@@ -702,19 +702,21 @@ impl Pipeline {
         let knobs = self.resolve_knobs(req);
 
         // Text encode (pos + optional neg for CFG), then project to the DiT context once.
-        on_progress(Progress::Loading(
-            candle_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let pos_embeds = self.encode(comps, &req.prompt)?;
-        crate::sc20686_observer::observe("weights-loaded", 0, 0, 0);
-        let ctx_pos = comps.dit.embed_text(&pos_embeds)?;
-        let ctx_neg = if knobs.guidance > 1.0 {
-            let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
-            Some(comps.dit.embed_text(&self.encode(comps, neg)?)?)
-        } else {
-            None
-        };
-
+        let (_pos_embeds, ctx_pos, ctx_neg) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let pos_embeds = self.encode(comps, &req.prompt)?;
+                crate::sc20686_observer::observe("weights-loaded", 0, 0, 0);
+                let ctx_pos = comps.dit.embed_text(&pos_embeds)?;
+                let ctx_neg = if knobs.guidance > 1.0 {
+                    let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
+                    Some(comps.dit.embed_text(&self.encode(comps, neg)?)?)
+                } else {
+                    None
+                };
+                Ok((pos_embeds, ctx_pos, ctx_neg))
+            },
+        )?;
         let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
         let noise = pipeline::create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
         let (latents0, ti2v) = self.prepare_ti2v(req, &comps.vae, &noise, t_lat, h_lat, w_lat)?;
@@ -818,16 +820,17 @@ impl Pipeline {
                 self.load_te()
             },
             |te, st| {
-                (st.on_progress)(Progress::Loading(
-                    candle_gen::gen_core::LoadPhase::EncodingPrompt,
-                ));
-                st.pos = Some(self.encode_raw(&tok, te, &req.prompt)?);
-                st.neg = if knobs.guidance > 1.0 {
-                    let neg_prompt = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
-                    Some(self.encode_raw(&tok, te, neg_prompt)?)
-                } else {
-                    None
-                };
+                candle_gen::gen_core::with_prompt_encoding(st.on_progress, || {
+                    st.pos = Some(self.encode_raw(&tok, te, &req.prompt)?);
+                    st.neg = if knobs.guidance > 1.0 {
+                        let neg_prompt =
+                            req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
+                        Some(self.encode_raw(&tok, te, neg_prompt)?)
+                    } else {
+                        None
+                    };
+                    Ok::<_, CandleError>(())
+                })?;
                 Ok(())
             },
             // ── Stage 2: load the DiT → project + denoise. DROP the DiT before the VAE loads. ──

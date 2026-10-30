@@ -634,26 +634,29 @@ impl Pipeline {
         // guidance — so UMT5-encode + project the negative for an expert only when its own guidance
         // enables CFG. At guidance <= 1.0 the denoise loop never touches `*_neg`, so the 24-layer UMT5
         // forward over the negative and its projection are pure waste (sc-8993).
-        on_progress(Progress::Loading(
-            candle_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let pos = self.encode(comps, &req.prompt)?;
-        let high_pos = comps.high.embed_text(&pos)?;
-        let low_pos = comps.low.embed_text(&pos)?;
-        // Shared UMT5 negative encode, computed once if either expert has CFG active.
-        let neg = match self.negative_prompt(req, &knobs) {
-            Some(neg_prompt) => Some(self.encode(comps, neg_prompt)?),
-            None => None,
-        };
-        let high_neg = match &neg {
-            Some(neg) if cfg_active(knobs.g_high) => Some(comps.high.embed_text(neg)?),
-            _ => None,
-        };
-        let low_neg = match &neg {
-            Some(neg) if cfg_active(knobs.g_low) => Some(comps.low.embed_text(neg)?),
-            _ => None,
-        };
-
+        let (_pos, _neg, high_pos, low_pos, high_neg, low_neg) =
+            candle_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, candle_gen::CandleError> {
+                    let pos = self.encode(comps, &req.prompt)?;
+                    let high_pos = comps.high.embed_text(&pos)?;
+                    let low_pos = comps.low.embed_text(&pos)?;
+                    // Shared UMT5 negative encode, computed once if either expert has CFG active.
+                    let neg = match self.negative_prompt(req, &knobs) {
+                        Some(neg_prompt) => Some(self.encode(comps, neg_prompt)?),
+                        None => None,
+                    };
+                    let high_neg = match &neg {
+                        Some(neg) if cfg_active(knobs.g_high) => Some(comps.high.embed_text(neg)?),
+                        _ => None,
+                    };
+                    let low_neg = match &neg {
+                        Some(neg) if cfg_active(knobs.g_low) => Some(comps.low.embed_text(neg)?),
+                        _ => None,
+                    };
+                    Ok((pos, neg, high_pos, low_pos, high_neg, low_neg))
+                },
+            )?;
         let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
 
         // I2V: build the constant channel-concat conditioning `y` (needs the VAE encoder).
@@ -759,14 +762,17 @@ impl Pipeline {
         let (pos, neg) = {
             on_progress(Progress::Loading(LoadPhase::TextEncoder));
             let te = self.load_te()?;
-            on_progress(Progress::Loading(
-                candle_gen::gen_core::LoadPhase::EncodingPrompt,
-            ));
-            let pos = self.encode_raw(&tok, &te, &req.prompt)?;
-            let neg = match self.negative_prompt(req, &knobs) {
-                Some(neg_prompt) => Some(self.encode_raw(&tok, &te, neg_prompt)?),
-                None => None,
-            };
+            let (pos, neg) = candle_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, candle_gen::CandleError> {
+                    let pos = self.encode_raw(&tok, &te, &req.prompt)?;
+                    let neg = match self.negative_prompt(req, &knobs) {
+                        Some(neg_prompt) => Some(self.encode_raw(&tok, &te, neg_prompt)?),
+                        None => None,
+                    };
+                    Ok((pos, neg))
+                },
+            )?;
             // sc-12195: the encode kernels are async — drain before `te` frees at the brace below, or
             // the next heavy load reuses the freed allocator pool under in-flight kernels.
             self.device.synchronize()?;

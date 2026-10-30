@@ -446,13 +446,13 @@ impl MossImage {
         if state.release_for_request(resolved.acceleration, edit.is_some()) {
             self.sources.drain_cache()?;
         }
-        if needs_prompt_encoding(inputs, resolved.acceleration, resolved.guidance) {
-            progress(Progress::Loading(
-                mlx_gen::gen_core::LoadPhase::EncodingPrompt,
-            ));
-        }
+        let encode = || self.encode_conditioning(request, inputs, &resolved);
         let (positive, negative, conditioning) =
-            self.encode_conditioning(request, inputs, &resolved)?;
+            if needs_prompt_encoding(inputs, resolved.acceleration, resolved.guidance) {
+                mlx_gen::gen_core::with_prompt_encoding(progress, encode)?
+            } else {
+                encode()?
+            };
         check(&request.cancel)?;
         let (edit_renderer, edit_references) = self.prepare_renderer(
             state,

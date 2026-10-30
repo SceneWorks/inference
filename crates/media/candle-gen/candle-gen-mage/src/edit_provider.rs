@@ -208,21 +208,20 @@ impl MageEdit {
         cancel: &candle_gen::gen_core::runtime::CancelFlag,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> Result<candle_gen::gen_core::Image> {
-        on_progress(candle_gen::gen_core::Progress::Loading(
-            candle_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let encoded = Self::encode_with(
-            &self.text,
-            &self.vae,
-            &self.device,
-            instruction,
-            negative_instruction,
-            references,
-            width,
-            height,
-            guidance,
-            seed,
-        )?;
+        let encoded = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+            Self::encode_with(
+                &self.text,
+                &self.vae,
+                &self.device,
+                instruction,
+                negative_instruction,
+                references,
+                width,
+                height,
+                guidance,
+                seed,
+            )
+        })?;
         Self::sample_encoded(
             &self.transformer,
             &self.vae,

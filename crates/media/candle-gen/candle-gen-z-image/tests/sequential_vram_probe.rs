@@ -194,7 +194,13 @@ fn measure_z_image_tier() {
         let mut phase_index = 0usize;
         let output = generator
             .generate(&request, &mut |progress| {
-                if matches!(progress, Progress::Loading(_)) {
+                if matches!(
+                    progress,
+                    Progress::Loading(
+                        candle_gen::gen_core::LoadPhase::TextEncoder
+                            | candle_gen::gen_core::LoadPhase::Renderer
+                    )
+                ) {
                     if let Some((name, phase)) = observed.take() {
                         phase_peaks.push((repeat, name, probe.end_observed(phase)));
                     }

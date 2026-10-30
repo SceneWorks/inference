@@ -296,24 +296,27 @@ impl Pipeline {
         let (pt, ph, pw) = self.vace_cfg.base.patch;
         let (cos, sin) =
             WanRope::new(&self.vace_cfg.base).cos_sin(t / pt, h / ph, w / pw, &self.device)?;
-        on_progress(Progress::Loading(
-            candle_gen::gen_core::LoadPhase::EncodingPrompt,
-        ));
-        let pos = self.encode_text(shared, &req.prompt)?;
-        // VACE-Fun inherits the Wan2.2 T2V-A14B MoE defaults: low/high CFG 3/4. A scalar request
-        // override applies to both experts, matching mlx-gen-wan.
-        let (guidance_low, guidance_high) = match req.guidance {
-            Some(guidance) => (guidance as f64, guidance as f64),
-            None => (T2V_14B_GUIDANCE_LOW as f64, T2V_14B_GUIDANCE_HIGH as f64),
-        };
-        let neg = if guidance_low > 1.0 || guidance_high > 1.0 {
-            Some(self.encode_text(
-                shared,
-                req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK),
-            )?)
-        } else {
-            None
-        };
+        let (pos, neg, guidance_low, guidance_high) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let pos = self.encode_text(shared, &req.prompt)?;
+                // VACE-Fun inherits the Wan2.2 T2V-A14B MoE defaults: low/high CFG 3/4. A scalar request
+                // override applies to both experts, matching mlx-gen-wan.
+                let (guidance_low, guidance_high) = match req.guidance {
+                    Some(guidance) => (guidance as f64, guidance as f64),
+                    None => (T2V_14B_GUIDANCE_LOW as f64, T2V_14B_GUIDANCE_HIGH as f64),
+                };
+                let neg = if guidance_low > 1.0 || guidance_high > 1.0 {
+                    Some(self.encode_text(
+                        shared,
+                        req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK),
+                    )?)
+                } else {
+                    None
+                };
+                Ok((pos, neg, guidance_low, guidance_high))
+            },
+        )?;
         let steps = req.steps.unwrap_or(DEFAULT_STEPS_14B) as usize;
         let shift = req
             .scheduler_shift
