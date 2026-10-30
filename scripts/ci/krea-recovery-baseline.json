@@ -1,0 +1,155 @@
+{
+  "source": "69c25a1d87f761464cb200802dfbb04125e9f54c",
+  "run": 41127490702,
+  "attempt": 1,
+  "artifact_id": 13013732335,
+  "accepted_model_run": false,
+  "completed_updates": 12,
+  "last_started_update": 13,
+  "total_conservative_upper_charge": 14,
+  "user_hard_cap": 20,
+  "remaining_max_updates": 6,
+  "reference_segments": [
+    {
+      "segment": 0,
+      "completed": 6,
+      "steady_mean_rounded_seconds": 8.907143,
+      "steps": [
+        {
+          "physical_update": "1/18",
+          "segment": "0",
+          "logical_step": "1",
+          "warmup": "true",
+          "seconds": "9.821620",
+          "loss": "0.0020464251",
+          "attention_candidate": "0",
+          "attention_reference": "28"
+        },
+        {
+          "physical_update": "2/18",
+          "segment": "0",
+          "logical_step": "2",
+          "warmup": "true",
+          "seconds": "8.829594",
+          "loss": "0.0003835333",
+          "attention_candidate": "0",
+          "attention_reference": "28"
+        },
+        {
+          "physical_update": "3/18",
+          "segment": "0",
+          "logical_step": "3",
+          "warmup": "false",
+          "seconds": "8.772177",
+          "loss": "0.00025650306",
+          "attention_candidate": "0",
+          "attention_reference": "28"
+        },
+        {
+          "physical_update": "4/18",
+          "segment": "0",
+          "logical_step": "4",
+          "warmup": "false",
+          "seconds": "8.902526",
+          "loss": "0.00025431448",
+          "attention_candidate": "0",
+          "attention_reference": "28"
+        },
+        {
+          "physical_update": "5/18",
+          "segment": "0",
+          "logical_step": "5",
+          "warmup": "false",
+          "seconds": "8.958154",
+          "loss": "0.00075272407",
+          "attention_candidate": "0",
+          "attention_reference": "28"
+        },
+        {
+          "physical_update": "6/18",
+          "segment": "0",
+          "logical_step": "6",
+          "warmup": "false",
+          "seconds": "8.995715",
+          "loss": "0.00017617237",
+          "attention_candidate": "0",
+          "attention_reference": "28"
+        }
+      ]
+    },
+    {
+      "segment": 1,
+      "completed": 6,
+      "steady_mean_rounded_seconds": 9.09337525,
+      "steps": [
+        {
+          "physical_update": "7/18",
+          "segment": "1",
+          "logical_step": "1",
+          "warmup": "true",
+          "seconds": "9.846521",
+          "loss": "0.002046858",
+          "attention_candidate": "0",
+          "attention_reference": "28"
+        },
+        {
+          "physical_update": "8/18",
+          "segment": "1",
+          "logical_step": "2",
+          "warmup": "true",
+          "seconds": "9.057064",
+          "loss": "0.000379925",
+          "attention_candidate": "0",
+          "attention_reference": "28"
+        },
+        {
+          "physical_update": "9/18",
+          "segment": "1",
+          "logical_step": "3",
+          "warmup": "false",
+          "seconds": "9.094958",
+          "loss": "0.0002583849",
+          "attention_candidate": "0",
+          "attention_reference": "28"
+        },
+        {
+          "physical_update": "10/18",
+          "segment": "1",
+          "logical_step": "4",
+          "warmup": "false",
+          "seconds": "9.101885",
+          "loss": "0.00025162753",
+          "attention_candidate": "0",
+          "attention_reference": "28"
+        },
+        {
+          "physical_update": "11/18",
+          "segment": "1",
+          "logical_step": "5",
+          "warmup": "false",
+          "seconds": "9.086318",
+          "loss": "0.0007861631",
+          "attention_candidate": "0",
+          "attention_reference": "28"
+        },
+        {
+          "physical_update": "12/18",
+          "segment": "1",
+          "logical_step": "6",
+          "warmup": "false",
+          "seconds": "9.090340",
+          "loss": "0.00017962267",
+          "attention_candidate": "0",
+          "attention_reference": "28"
+        }
+      ]
+    }
+  ],
+  "schema_version": 1,
+  "body_stderr_sha256": "5bb020a304f514c890c3139efdf456f6955d1f26b6a54346052172d8f6b8e0e8",
+  "timing_decimal_places": 6,
+  "timing_mean_rounding_uncertainty_seconds": 5e-07,
+  "claim_limit": "Audited partial reference observations from failed original run, not an accepted model proof. Scalar timings retain original printed precision. Recovery requires separately qualified unchanged reference/source/input closure; provisioned paths and reader bindings do not attest named weight bytes.",
+  "source_fixture_sha256": "b942105e68557c03d1ed009721971ff42ac9fc517c5dac04fcd46fa77911b70d",
+  "original_receipt_sha256": "f485d241e1b7e82b8b348c74097cb13dd081a40912723f5cd16cd372877eaac6"
+}

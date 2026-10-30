@@ -201,6 +201,14 @@ fn krea_bounded_acceleration_profile() {
     panic!("requires explicit model-inference-proof feature and registered CUDA lane");
     #[cfg(feature = "model-inference-proof")]
     {
+        // Only the exact registered recovery recipe can set this fixed selector.
+        // An inherited selector is explicitly unset by the default proof recipe.
+        let recovery = match std::env::var("KREA_PROFILE_CANDIDATE_RECOVERY").as_deref() {
+            Ok("1") => true,
+            Err(std::env::VarError::NotPresent) => false,
+            _ => panic!("Krea recovery selector must be the exact registered literal1 or UNSET"),
+        };
+        let expected_updates = if recovery { 6 } else { 18 };
         let graph_retaining_backward = candle_gen::candle_core::backprop::grad_do_not_detach();
         assert!(
             !graph_retaining_backward,
@@ -214,7 +222,7 @@ fn krea_bounded_acceleration_profile() {
             .expect("existing model-proof executor must bind its owned generated output directory")
             .join("krea_bounded_acceleration");
         let items = make_dataset(&tmp.join("data"));
-        let mut cfg = config(NetworkType::Lora, 18, false);
+        let mut cfg = config(NetworkType::Lora, expected_updates, false);
         cfg.rank = 16;
         cfg.alpha = 16.;
         cfg.resolution = 1024;
@@ -239,22 +247,35 @@ fn krea_bounded_acceleration_profile() {
             )
             .unwrap();
         let mut losses = Vec::new();
-        let out = candle_gen::train::profile::with_bounded_krea_profile(|| {
+        let mut train = || {
             trainer.train(&req, &mut |p| {
                 if let TrainingProgress::Training { loss, .. } = p {
                     losses.push(loss);
                 }
             })
-        })
-        .expect("bounded matched profile succeeds");
+        };
+        let (result, recovery_report) = if recovery {
+            candle_gen::train::profile::with_bounded_krea_recovery(&mut train)
+        } else {
+            (
+                candle_gen::train::profile::with_bounded_krea_profile(&mut train),
+                None,
+            )
+        };
+        let out = result.expect("bounded matched profile or explicit candidate recovery succeeds");
+        assert_eq!(
+            recovery_report.is_some(),
+            recovery,
+            "complete recovery report required"
+        );
         drop(trainer);
         let peak_mib = sampler.stop();
         assert!(
             peak_mib > 0,
             "peak sampler must observe the selected physical GPU"
         );
-        assert_eq!(out.steps, 18);
-        assert_eq!(losses.len(), 18);
+        assert_eq!(out.steps, expected_updates);
+        assert_eq!(losses.len(), expected_updates as usize);
         assert!(losses.iter().all(|l| l.is_finite()));
         assert_eq!(
             read_meta(&out.adapter_path).get("rank").map(String::as_str),
@@ -303,7 +324,7 @@ fn krea_bounded_acceleration_profile() {
         // Keep the scalar run evidence beside the selected adapter/sample; the
         // complete per-step timings, attribution and go/no-go remain in the
         // independently retained body.stderr.log, where the driver emits them.
-        let metrics = serde_json::json!({
+        let mut metrics = serde_json::json!({
             "schema_version": 1,
             "completed_optimizer_updates": out.steps,
             "graph_retaining_backward": graph_retaining_backward,
@@ -331,6 +352,31 @@ fn krea_bounded_acceleration_profile() {
             "profile_records": ["KREA_PROFILE_BOUNDARY", "KREA_PROFILE_STEP", "KREA_PROFILE_ATTRIBUTION", "KREA_PROFILE_OPTIMIZER", "KREA_PROFILE_RESULT"],
             "claim_limit": "Bounded smoke and throughput only; four steady updates per segment. Device peak includes preparation and is not a per-process allocation measurement. Provisioned snapshot path/layout does not attest weight integrity; actual input receipts and learned-device witnesses are separate."
         });
+        if let Some(report) = recovery_report {
+            metrics["recovery"] = report;
+            metrics["candidate_execution"] = serde_json::json!({
+                "source": std::env::var("GITHUB_SHA").expect("manual workflow source identity"),
+                "run": std::env::var("GITHUB_RUN_ID").expect("manual workflow run identity"),
+                "attempt": std::env::var("GITHUB_RUN_ATTEMPT").expect("manual workflow attempt identity")
+            });
+            eprintln!(
+                "KREA_PROFILE_RECOVERY_EXECUTION {}",
+                metrics["candidate_execution"]
+            );
+            metrics["saved_adapter_role"] =
+                serde_json::json!("actual-six-update-candidate-even-on-no-go");
+            metrics["profile_records"] = serde_json::json!([
+                "KREA_PROFILE_BOUNDARY",
+                "KREA_PROFILE_STEP",
+                "KREA_PROFILE_GRADIENTS",
+                "KREA_PROFILE_ATTRIBUTION",
+                "KREA_PROFILE_OPTIMIZER",
+                "KREA_PROFILE_RECOVERY_ADAPTER",
+                "KREA_PROFILE_RECOVERY_RESULT",
+                "KREA_PROFILE_RECOVERY_EXECUTION"
+            ]);
+            metrics["claim_limit"] = serde_json::json!("Six NEW candidate updates only. Baselines retain original source 69c25a1/run 41127490702/1 identity; this is cross-run recovery, not 18 new updates or same-run matched proof. The actual candidate is saved/reloaded/applied even on NO-GO; there is no recovered shared adapter. Source/input closure qualification is separately mandatory. Smoke success does not imply adoption, 25 percent acceptance, convergence or named weight byte attestation.");
+        }
         std::fs::write(
             tmp.join("metrics.json"),
             serde_json::to_vec_pretty(&metrics).unwrap(),
