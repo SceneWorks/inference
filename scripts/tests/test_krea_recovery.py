@@ -82,7 +82,7 @@ class KreaRecoveryProtocol(unittest.TestCase):
     def test_source_loop_caps_before_work_and_replays_same_logical_schedule(self):
         # Model-free source reachability guard: removing/moving this admission guard
         # must not turn a metadata-only budget check into six followed by more work.
-        source = (ROOT / 'crates/media/candle-gen/candle-gen/src/train/flow_match.rs').read_text()
+        source = (ROOT / 'crates/media/candle-gen/candle-gen/src/train/flow_match.rs').read_text(encoding='utf-8')
         guard = source.index('|| cfg.steps != profile_update_limit')
         self.assertLess(source.index('let profile_update_limit = if recovery_profile { 6 } else { 18 };'), guard)
         self.assertLess(guard, source.index('model.cache(req, device, on_progress)?'))
@@ -91,7 +91,7 @@ class KreaRecoveryProtocol(unittest.TestCase):
         self.assertIn('step_sample(aux_driver.as_mut(), logical_step, &schedule)', source)
         self.assertIn('if segment == 1 || recovery_profile', source)
         self.assertIn('profile_losses[..2].iter().any(|steps| !steps.is_empty())', source)
-        profile = (ROOT / 'crates/media/candle-gen/candle-gen/src/train/profile.rs').read_text()
+        profile = (ROOT / 'crates/media/candle-gen/candle-gen/src/train/profile.rs').read_text(encoding='utf-8')
         scope = profile[profile.index('pub fn with_bounded_krea_recovery'):profile.index('pub(crate) fn finish_krea_recovery')]
         self.assertIn('RECOVERY.set(true)', scope)
         self.assertNotIn('SEGMENT.set(2)', scope)  # cache/build use original segment0 math
