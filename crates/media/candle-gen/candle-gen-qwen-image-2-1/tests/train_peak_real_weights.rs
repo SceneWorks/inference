@@ -283,3 +283,148 @@ fn training_peak_is_within_the_preflight_estimate() {
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED train_peak_real_weights::training_peak_is_within_the_preflight_estimate");
 }
+
+/// sc-26857: one source-owned invocation, four total updates and one saved-adapter sample.
+/// This sibling preserves the historical peak matrix and its admission recipe.
+#[cfg(feature = "model-inference-proof")]
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn qwen21_bounded_acceleration_acceptance() {
+    use candle_gen::gen_core::{AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest};
+    use candle_gen::testkit::PeakSampler;
+    use candle_gen::train::profile::with_bounded_cohort_for;
+    use candle_gen_qwen_image_2_1::{adapters, quant::Tier};
+
+    let root =
+        PathBuf::from(std::env::var("MODEL_PROOF_OUTPUT_DIR").expect("executor-owned output"))
+            .join("cohort_acceptance");
+    std::fs::create_dir(&root).expect("fresh acceptance directory");
+    let data = root.join("data");
+    std::fs::create_dir(&data).unwrap();
+    let target = data.join("target.png");
+    write_image(&target, 7, [250, 220, 30]);
+    let req = TrainingRequest {
+        items: vec![TrainingItem::captioned(
+            target,
+            "zxq style, teal and orange rings".into(),
+        )],
+        config: TrainingConfig {
+            rank: 4,
+            alpha: 4.,
+            learning_rate: 1e-3,
+            steps: 4,
+            batch_size: 1,
+            gradient_accumulation: 1,
+            gradient_checkpointing: true,
+            train_dtype: "bf16".into(),
+            resolution: 64,
+            save_every: 0,
+            sample_every: 0,
+            sample_prompts: vec![],
+            seed: 7,
+            optimizer: "adamw".into(),
+            weight_decay: 0.,
+            lr_warmup_steps: 0,
+            network_type: NetworkType::Lora,
+            ..Default::default()
+        },
+        output_dir: root.join("out"),
+        file_name: "adapter.safetensors".into(),
+        trigger_words: vec![],
+        cancel: CancelFlag::new(),
+    };
+    let sampler = PeakSampler::start_rendered();
+    let output = with_bounded_cohort_for(
+        &root.join("metrics.json"),
+        &[
+            "qwen21_frozen_initial_text",
+            "qwen21_joint_geometry",
+            "qwen21_frozen_qkv_pack",
+            "qwen21_shared_rms",
+        ],
+        || {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
+            spec.precision = Precision::Bf16;
+            let mut trainer = QwenImage21Trainer::load(&spec).expect("admitted real Qwen trainer");
+            let mut observed = Vec::new();
+            let output = trainer
+                .train(&req, &mut |progress| {
+                    if let TrainingProgress::Training { step, loss, .. } = progress {
+                        assert!(loss.is_finite());
+                        observed.push(step);
+                    }
+                })
+                .expect("four real updates complete under native admission");
+            assert_eq!(observed, [1, 2, 3, 4]);
+            assert_eq!(output.steps, 4);
+            output
+        },
+    );
+    // Reopen the exact native export and validate its production target/shape contract.
+    let bytes = std::fs::read(&output.adapter_path).unwrap();
+    let parsed = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+    assert_eq!(
+        parsed.len(),
+        32 * 7 * 3,
+        "two factors plus alpha per default target"
+    );
+    let mut nonzero = false;
+    for (name, view) in parsed.tensors() {
+        assert_eq!(view.dtype(), safetensors::Dtype::F32, "{name}");
+        for value in view
+            .data()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        {
+            assert!(value.is_finite(), "{name}");
+            if name.ends_with(".lora_B.weight") {
+                nonzero |= value != 0.;
+            }
+        }
+    }
+    assert!(
+        nonzero,
+        "saved trained up factors must carry an actual update"
+    );
+    let adapter = AdapterSpec::new(output.adapter_path.clone(), 1., AdapterKind::Lora);
+    adapters::preflight(&snapshot(), std::slice::from_ref(&adapter), Tier::Bf16).unwrap();
+    let spec = LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![adapter]);
+    let generator =
+        candle_gen_qwen_image_2_1::load(&spec).expect("strict native adapter reload/apply");
+    let request = GenerationRequest {
+        prompt: "zxq style, teal and orange rings".into(),
+        width: 64,
+        height: 64,
+        steps: Some(2),
+        seed: Some(7),
+        ..Default::default()
+    };
+    let GenerationOutput::Images(images) = generator
+        .generate(&request, &mut |_| {})
+        .expect("one adapted generated sample")
+    else {
+        panic!("RGB image expected")
+    };
+    assert_eq!(images.len(), 1);
+    let image = &images[0];
+    assert_eq!(
+        (image.width, image.height, image.pixels.len()),
+        (64, 64, 64 * 64 * 3)
+    );
+    image::save_buffer(
+        root.join("adapter_sample.png"),
+        &image.pixels,
+        image.width,
+        image.height,
+        image::ColorType::Rgb8,
+    )
+    .unwrap();
+    let peak = sampler.stop();
+    assert!(peak > 0, "physical device sampler must observe usage");
+    std::fs::write(
+        root.join("peak_device_bytes.txt"),
+        (peak * 1024 * 1024).to_string(),
+    )
+    .unwrap();
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED train_peak_real_weights::qwen21_bounded_acceleration_acceptance");
+}

@@ -79309,6 +79309,1018 @@
     "package": "candle-gen-qwen-image-2-1",
     "target": "integration",
     "target_kind": "test",
+    "fqn": "train_peak_real_weights::qwen21_bounded_acceleration_acceptance",
+    "source": "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/train_peak_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Pinned Qwen/Qwen-Image-2.1 native BF16 trainer; one deterministic source-generated swatch, 4 total optimizer updates seed7 rank4 batch1 checkpoint ON at64px; one strict saved-adapter reload/apply and one64px2step generated sample. Installed paths and reader receipts do not attest all tensor bytes.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/train_peak_real_weights.rs::train_peak_real_weights::qwen21_bounded_acceleration_acceptance",
+    "required_environment": [
+      "CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT",
+      "MODEL_PROOF_OUTPUT_DIR"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Four completed real optimizer updates, finite losses/every reached gradient and nonzero aggregate gradient/factor delta; source-required repeated normalization/cache/geometry/packing consumption, synchronized warmup/steady timings, selected physical-device peak, native save/reopen/preflight/reload/apply and exactly one generated adapter sample. Exact late BODY and actual learned CUDA DEVICE required. This short smoke is not convergence or per-model speedup certification.",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cuda",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/train_peak_real_weights.rs::train_peak_real_weights::qwen21_bounded_acceleration_acceptance/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "One four-update native trainer invocation, rank4 alpha4 BF16 checkpointON64px batch1 accumulation1 seed7 AdamW constant schedule, no resume/intermediate save/previews; one64px two-step adapted generated sample after native save/reload/apply.",
+        "required_work": [
+          "Four actual optimizer updates including one warmup; finite loss/every reached factor gradient and actual aggregate factor changes; no convergence claim.",
+          "Repeated actual shared RMS, frozen initial caption, exact geometry and frozen QKV pack consumption; original block-causal text masks, reference spans and target span remain.",
+          "Preparation and synchronized step durations, actual device peak, strict native adapter save/reopen/reload/apply and one generated sample."
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/train_peak_real_weights.rs::train_peak_real_weights::qwen21_bounded_acceleration_acceptance",
+      "requirements": [
+        {
+          "slot": "qwen21-trainer-model-components",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "qwen21-trainer-component-configs",
+          "role": "artifact-input",
+          "readers": [
+            "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/config.rs::read_json::std::fs::read@4341"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "qwen21-trainer-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::tokenizer::TextTokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "required_cuda_physical_index": 1,
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+    "output_artifacts": [
+      "cohort_acceptance/metrics.json",
+      "cohort_acceptance/peak_device_bytes.txt",
+      "cohort_acceptance/out/adapter.safetensors",
+      "cohort_acceptance/adapter_sample.png"
+    ],
+    "generated_adapter_artifacts": {
+      "cohort_acceptance/out/adapter.safetensors": {
+        "kind": "lora",
+        "rank": 4,
+        "dtype": "F32",
+        "per_target_alpha": true,
+        "max_bytes": 46137344,
+        "targets": {
+          "transformer_blocks.0.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.0.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.0.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.0.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.0.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.0.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.0.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.1.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.1.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.1.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.1.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.1.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.1.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.1.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.10.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.10.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.10.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.10.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.10.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.10.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.10.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.11.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.11.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.11.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.11.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.11.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.11.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.11.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.12.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.12.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.12.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.12.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.12.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.12.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.12.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.13.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.13.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.13.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.13.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.13.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.13.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.13.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.14.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.14.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.14.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.14.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.14.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.14.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.14.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.15.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.15.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.15.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.15.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.15.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.15.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.15.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.16.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.16.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.16.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.16.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.16.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.16.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.16.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.17.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.17.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.17.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.17.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.17.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.17.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.17.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.18.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.18.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.18.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.18.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.18.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.18.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.18.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.19.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.19.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.19.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.19.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.19.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.19.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.19.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.2.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.2.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.2.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.2.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.2.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.2.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.2.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.20.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.20.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.20.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.20.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.20.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.20.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.20.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.21.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.21.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.21.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.21.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.21.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.21.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.21.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.22.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.22.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.22.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.22.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.22.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.22.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.22.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.23.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.23.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.23.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.23.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.23.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.23.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.23.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.24.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.24.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.24.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.24.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.24.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.24.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.24.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.25.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.25.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.25.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.25.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.25.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.25.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.25.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.26.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.26.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.26.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.26.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.26.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.26.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.26.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.27.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.27.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.27.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.27.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.27.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.27.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.27.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.28.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.28.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.28.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.28.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.28.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.28.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.28.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.29.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.29.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.29.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.29.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.29.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.29.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.29.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.3.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.3.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.3.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.3.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.3.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.3.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.3.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.30.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.30.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.30.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.30.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.30.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.30.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.30.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.31.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.31.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.31.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.31.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.31.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.31.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.31.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.4.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.4.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.4.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.4.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.4.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.4.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.4.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.5.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.5.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.5.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.5.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.5.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.5.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.5.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.6.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.6.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.6.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.6.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.6.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.6.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.6.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.7.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.7.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.7.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.7.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.7.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.7.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.7.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.8.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.8.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.8.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.8.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.8.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.8.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.8.img_mlp.proj": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.9.attn.to_k": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.9.attn.to_out.0": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.9.attn.to_q": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.9.attn.to_v": [
+            4096,
+            4096
+          ],
+          "transformer_blocks.9.img_mlp.gate_layer": [
+            12288,
+            4096
+          ],
+          "transformer_blocks.9.img_mlp.out": [
+            4096,
+            12288
+          ],
+          "transformer_blocks.9.img_mlp.proj": [
+            12288,
+            4096
+          ]
+        }
+      }
+    }
+  },
+  {
+    "package": "candle-gen-qwen-image-2-1",
+    "target": "integration",
+    "target_kind": "test",
     "fqn": "trainer_conformance::qwen_image_2_1_edit_trainer_satisfies_gen_core_contract",
     "source": "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/trainer_conformance.rs",
     "cargo_target_metadata": {
