@@ -324,6 +324,11 @@ pub enum Progress {
     /// Resident owners may remain cached. This Rust callback event is not a wire message,
     /// denoising step, or terminal generation result; consumers not pricing phases may ignore it.
     PromptUpsamplingComplete,
+    /// The preceding `Loading(EncodingPrompt)` computation completed successfully, including
+    /// materialization required by a lazy backend. Paired only with actual encoding work; reused
+    /// supplied conditioning emits neither boundary. Further reference conditioning may follow,
+    /// so this does not imply [`Self::ConditioningComplete`] or a denoising step.
+    PromptEncodingComplete,
     /// Optional exact phase boundary: all text and reference conditioning has been materialized
     /// and its device work successfully synchronized, before the first denoiser forward. Emitted
     /// once per request by adopting providers, on resident and staged paths. This is not a step,
@@ -333,11 +338,9 @@ pub enum Progress {
     Step { current: u32, total: u32 },
     /// VAE decode underway (post-denoise).
     Decoding,
-    /// A heavy model component is (re)loading (epic 10765, sc-11126). Emitted only under
-    /// [`OffloadPolicy::Sequential`], where the residency seam load→use→drops each component *inside*
-    /// `generate` — a multi-second, multi-GB step during which no `Step`/`Decoding` event fires, so
-    /// without this the UI would freeze silently while a component streams from disk (F-179). The
-    /// [`Resident`](OffloadPolicy::Resident) path loads everything before `generate` and never emits it.
+    /// A component load or prompt-encoding phase is starting. Component phases describe actual
+    /// construction; `EncodingPrompt` is computation and is paired with `PromptEncodingComplete`
+    /// even when a request reuses resident model components.
     Loading(LoadPhase),
     /// The optional prompt-upsampling stage is decoding (sc-26238): `tokens` content tokens of
     /// at most `max_tokens` generated so far, emitted once at `0` when the stage starts and once
