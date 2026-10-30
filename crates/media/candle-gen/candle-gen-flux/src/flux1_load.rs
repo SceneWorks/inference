@@ -81,22 +81,28 @@ pub(crate) fn text_encoders(
 
     // T5-XXL under `text_encoder_2/` (sharded; config.json alongside).
     let t5_dir = root.join("text_encoder_2");
-    let t5_cfg: T5Config = {
-        #[cfg(feature = "model-inference-proof")]
-        let t5_config_path = t5_dir.join("config.json");
-        let cfg = candle_gen::gen_core::__model_input_choose!(
-            std::fs::read_to_string(t5_dir.join("config.json")),
-            std::fs::read_to_string(&t5_config_path)
-        )
-        .map_err(|e| CandleError::Msg(format!("{label}: read text_encoder_2/config.json: {e}")))?;
-        candle_gen::gen_core::__model_input_result!(
+    let t5_cfg: T5Config = candle_gen::gen_core::__model_input_choose!(
+        {
+            let cfg = std::fs::read_to_string(t5_dir.join("config.json")).map_err(|e| {
+                CandleError::Msg(format!("{label}: read text_encoder_2/config.json: {e}"))
+            })?;
             serde_json::from_str(&cfg)
-                .map_err(|e| CandleError::Msg(format!("{label}: parse T5 config.json: {e}"))),
-            "candle-gen-flux::flux1_load::text_encoders/configuration",
-            Configuration,
-            &[&t5_config_path]
-        )?
-    };
+                .map_err(|e| CandleError::Msg(format!("{label}: parse T5 config.json: {e}")))?
+        },
+        {
+            let t5_config_path = t5_dir.join("config.json");
+            let cfg = std::fs::read_to_string(&t5_config_path).map_err(|e| {
+                CandleError::Msg(format!("{label}: read text_encoder_2/config.json: {e}"))
+            })?;
+            candle_gen::gen_core::__model_input_result!(
+                serde_json::from_str(&cfg)
+                    .map_err(|e| CandleError::Msg(format!("{label}: parse T5 config.json: {e}"))),
+                "candle-gen-flux::flux1_load::text_encoders/configuration",
+                Configuration,
+                &[&t5_config_path]
+            )?
+        }
+    );
     let t5_vb = mmap_vb(&safetensors_in(&t5_dir, label)?, dtype, device, label)?;
     let t5 = T5EncoderModel::load(t5_vb, &t5_cfg)?;
 

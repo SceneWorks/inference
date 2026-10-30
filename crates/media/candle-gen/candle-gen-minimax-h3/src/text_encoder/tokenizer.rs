@@ -223,29 +223,34 @@ impl MiniMaxH3Tokenizer {
     /// map from `tokenizer/tokenizer_config.json`.
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let dir = root.as_ref().join("tokenizer");
-        #[cfg(feature = "model-inference-proof")]
-        let tokenizer_config_path = dir.join("tokenizer_config.json");
-        #[cfg(feature = "model-inference-proof")]
-        let tokenizer_path = dir.join("tokenizer.json");
-        let cfg = candle_gen::gen_core::__model_input_choose!(
-            std::fs::read_to_string(dir.join("tokenizer_config.json")),
-            std::fs::read_to_string(&tokenizer_config_path)
-        )
-        .map_err(|e| {
-            CandleError::Msg(format!(
-                "minimax-h3 tokenizer: read {}: {e}",
-                dir.join("tokenizer_config.json").display()
-            ))
-        })?;
         candle_gen::gen_core::__model_input_choose!(
-            Self::from_files(dir.join("tokenizer.json"), &cfg),
-            Self::from_files(&tokenizer_path, &cfg).inspect(|_| {
-                candle_gen::gen_core::model_input_proof::record_reader_paths(
-                    "candle-gen-minimax-h3::text_encoder::MiniMaxH3Tokenizer::from_snapshot/tokenizer-pair",
-                    candle_gen::gen_core::model_input_proof::InputRole::Tokenizer,
-                    &[&tokenizer_config_path, &tokenizer_path],
-                );
-            })
+            {
+                let cfg =
+                    std::fs::read_to_string(dir.join("tokenizer_config.json")).map_err(|e| {
+                        CandleError::Msg(format!(
+                            "minimax-h3 tokenizer: read {}: {e}",
+                            dir.join("tokenizer_config.json").display()
+                        ))
+                    })?;
+                Self::from_files(dir.join("tokenizer.json"), &cfg)
+            },
+            {
+                let tokenizer_config_path = dir.join("tokenizer_config.json");
+                let tokenizer_path = dir.join("tokenizer.json");
+                let cfg = std::fs::read_to_string(&tokenizer_config_path).map_err(|e| {
+                    CandleError::Msg(format!(
+                        "minimax-h3 tokenizer: read {}: {e}",
+                        dir.join("tokenizer_config.json").display()
+                    ))
+                })?;
+                Self::from_files(&tokenizer_path, &cfg).inspect(|_| {
+                    candle_gen::gen_core::model_input_proof::record_reader_paths(
+                        "candle-gen-minimax-h3::text_encoder::MiniMaxH3Tokenizer::from_snapshot/tokenizer-pair",
+                        candle_gen::gen_core::model_input_proof::InputRole::Tokenizer,
+                        &[&tokenizer_config_path, &tokenizer_path],
+                    );
+                })
+            }
         )
     }
 
