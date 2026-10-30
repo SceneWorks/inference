@@ -49875,7 +49875,8 @@
           "Save the selected optimized adapter, reopen/apply it through the production Raw loader and generate exactly one 1024px, 28-step sample with seed7.",
           "Publish declared adapter, sample and scalar metrics alongside full body logs; report candidate go/no-go and >=25% target honestly without interpreting smoke success as convergence or speed acceptance."
         ],
-        "required_cuda_physical_index": 1
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
       }
     },
     "configuration_kind": "feature-only",
@@ -50394,7 +50395,8 @@
           ]
         }
       }
-    }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
   },
   {
     "package": "candle-gen-krea",
@@ -284813,7 +284815,9 @@
         "scope": "one complete bounded trainer invocation and one saved-adapter sample",
         "required_work": [
           "Exactly four actual optimizer updates total (dual Wan alternates two per expert); finite loss/every adapter gradient and actual factor update; prepared mechanism consumption; synchronized preparation/warmup/steady timing and selected device peak; save/reload/apply and one generated sample"
-        ]
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
       }
     },
     "configuration_kind": "feature-only",
@@ -287123,7 +287127,8 @@
           ]
         }
       }
-    }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
   },
   {
     "package": "candle-gen-lens",
@@ -287168,7 +287173,9 @@
         "scope": "one complete bounded trainer invocation and one saved-adapter sample",
         "required_work": [
           "Exactly four actual optimizer updates total (dual Wan alternates two per expert); finite loss/every adapter gradient and actual factor update; prepared mechanism consumption; synchronized preparation/warmup/steady timing and selected device peak; save/reload/apply and one generated sample"
-        ]
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
       }
     },
     "configuration_kind": "feature-only",
@@ -288006,7 +288013,8 @@
           ]
         }
       }
-    }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
   },
   {
     "package": "candle-gen-ltx",
@@ -288052,7 +288060,9 @@
         "scope": "one complete bounded trainer invocation and one saved-adapter sample",
         "required_work": [
           "Exactly four actual optimizer updates total (dual Wan alternates two per expert); finite loss/every adapter gradient and actual factor update; prepared mechanism consumption; synchronized preparation/warmup/steady timing and selected device peak; save/reload/apply and one generated sample"
-        ]
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
       }
     },
     "configuration_kind": "feature-only",
@@ -289658,7 +289668,8 @@
           ]
         }
       }
-    }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
   },
   {
     "package": "candle-gen-ltx",
@@ -289703,7 +289714,9 @@
         "scope": "one complete bounded trainer invocation and one saved-adapter sample",
         "required_work": [
           "Exactly four actual optimizer updates total (dual Wan alternates two per expert); finite loss/every adapter gradient and actual factor update; prepared mechanism consumption; synchronized preparation/warmup/steady timing and selected device peak; save/reload/apply and one generated sample"
-        ]
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
       }
     },
     "configuration_kind": "feature-only",
@@ -295191,7 +295204,8 @@
           ]
         }
       }
-    }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
   },
   {
     "package": "candle-gen-sd3",
@@ -295236,7 +295250,9 @@
         "scope": "one complete bounded trainer invocation and one saved-adapter sample",
         "required_work": [
           "Exactly four actual optimizer updates total (dual Wan alternates two per expert); finite loss/every adapter gradient and actual factor update; prepared mechanism consumption; synchronized preparation/warmup/steady timing and selected device peak; save/reload/apply and one generated sample"
-        ]
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
       }
     },
     "configuration_kind": "feature-only",
@@ -296312,7 +296328,8 @@
           ]
         }
       }
-    }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
   },
   {
     "package": "candle-gen-sdxl",
@@ -296360,7 +296377,9 @@
         "scope": "one complete bounded trainer invocation and one saved-adapter sample",
         "required_work": [
           "Exactly four actual optimizer updates total (dual Wan alternates two per expert); finite loss/every adapter gradient and actual factor update; prepared mechanism consumption; synchronized preparation/warmup/steady timing and selected device peak; save/reload/apply and one generated sample"
-        ]
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
       }
     },
     "configuration_kind": "feature-only",
@@ -298681,7 +298700,8 @@
           ]
         }
       }
-    }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
   },
   {
     "package": "candle-gen-wan",
@@ -298726,7 +298746,9 @@
         "scope": "one complete bounded trainer invocation and one saved-adapter sample",
         "required_work": [
           "Exactly four actual optimizer updates total (dual Wan alternates two per expert); finite loss/every adapter gradient and actual factor update; prepared mechanism consumption; synchronized preparation/warmup/steady timing and selected device peak; save/reload/apply and one generated sample"
-        ]
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
       }
     },
     "configuration_kind": "feature-only",
@@ -301366,7 +301388,8 @@
           ]
         }
       }
-    }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
   },
   {
     "package": "candle-gen-wan",
@@ -301411,7 +301434,9 @@
         "scope": "one complete bounded trainer invocation and one saved-adapter sample",
         "required_work": [
           "Exactly four actual optimizer updates total (dual Wan alternates two per expert); finite loss/every adapter gradient and actual factor update; prepared mechanism consumption; synchronized preparation/warmup/steady timing and selected device peak; save/reload/apply and one generated sample"
-        ]
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
       }
     },
     "configuration_kind": "feature-only",
@@ -302441,7 +302466,8 @@
           ]
         }
       }
-    }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
   },
   {
     "package": "candle-gen-z-image",
@@ -302486,7 +302512,9 @@
         "scope": "one complete bounded trainer invocation and one saved-adapter sample",
         "required_work": [
           "Exactly four actual optimizer updates total (dual Wan alternates two per expert); finite loss/every adapter gradient and actual factor update; prepared mechanism consumption; synchronized preparation/warmup/steady timing and selected device peak; save/reload/apply and one generated sample"
-        ]
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom"
       }
     },
     "configuration_kind": "feature-only",
@@ -303089,7 +303117,8 @@
           ]
         }
       }
-    }
+    },
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
   },
   {
     "package": "candle-gen-anima",

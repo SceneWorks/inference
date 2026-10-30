@@ -1061,7 +1061,6 @@ fn apply_modality_conditioning(
 /// Their zero loss mask preserves the references as context without training the model to recreate
 /// them; concatenating their own RoPE positions is the bit that prevents a reference from merely
 /// replacing arbitrary target tokens.
-#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn append_active_reference(
@@ -1089,6 +1088,7 @@ fn append_active_reference(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_active_reference_with_positions(
     plan: &ModalityConditioningPlan,
     condition_tensors: &HashMap<String, Tensor>,
@@ -3551,7 +3551,7 @@ impl FlowMatchTrainer for LtxTrainer {
                     "candle-gen-ltx::training::LtxTrainer::cache/ltx25-tokenizer",
                     Tokenizer,
                     tokenizer_path,
-                    |actual_path| Ltx25Tokenizer::from_packed_te_file(actual_path)
+                    Ltx25Tokenizer::from_packed_te_file
                 )?;
                 let tokenizer = TrainingTokenizer::Gemma4(tokenizer);
                 let encoder = TrainingTextEncoder::Gemma4(Box::new(encoder));

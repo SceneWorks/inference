@@ -651,7 +651,7 @@ impl KolorsTrainer {
                 &unet,
                 &schedule,
                 x0,
-                &projected,
+                projected,
                 pooled,
                 step_time_ids,
                 timestep,

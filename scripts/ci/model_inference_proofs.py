@@ -444,9 +444,14 @@ def load_registry(path: Path = REGISTRY_PATH, *, root: Path = ROOT) -> tuple[dic
         required_index = row.get('required_cuda_physical_index')
         if required_index is not None and (type(required_index) is not int or required_index < 0):
             raise ValueError('fixed physical CUDA index must be a nonnegative integer')
-        if (required_uuid is not None or required_index is not None) and lane(row) != 'candle-cuda':
-            raise ValueError('physical CUDA restrictions require the CUDA execution route')
         validate_configurations(row, root=root)
+        if required_uuid is not None or required_index is not None:
+            routes = (
+                (lane(configured_case(row, name)) for name in row['configurations'])
+                if 'configurations' in row else (lane(row),)
+            )
+            if any(route != 'candle-cuda' for route in routes):
+                raise ValueError('physical CUDA restrictions require the CUDA execution route')
         validate_child_visibility(row)
         validate_contract(row)
         validate_generated_adapter_artifacts(row)

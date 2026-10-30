@@ -1426,8 +1426,12 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(unet.training_preparation_bytes(&[cond.clone()]).unwrap() > 0);
-        unet.prepare_training(&[cond.clone()]).unwrap();
+        assert!(
+            unet.training_preparation_bytes(std::slice::from_ref(&cond))
+                .unwrap()
+                > 0
+        );
+        unet.prepare_training(std::slice::from_ref(&cond)).unwrap();
         let (loss_d, g_d) = compute_loss_grads(
             &unet,
             scheduler.as_ref(),

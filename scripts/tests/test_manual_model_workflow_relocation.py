@@ -5,6 +5,8 @@ No Cargo, model, kernel, GPU, or platform process is executed by these tests.
 import copy
 import hashlib
 import json
+import os
+import shutil
 import re
 from pathlib import Path
 import subprocess
@@ -174,7 +176,10 @@ class ManualModelWorkflowRelocationTests(unittest.TestCase):
             body = path.read_text(encoding='utf-8')
             self.assertTrue(body.endswith('\n') and not body.endswith('\n\n'), name)
             if name.split('/')[-2] in (*MOVED, 'h3-pruned-hosted-metal') and path.suffix == '.sh':
-                subprocess.run(['/bin/bash', '-n', str(path)], check=True, capture_output=True)
+                git_bash = Path(os.environ.get('ProgramFiles', 'C:/Program Files')) / 'Git/bin/bash.exe'
+                bash = str(git_bash) if os.name == 'nt' and git_bash.is_file() else shutil.which('bash')
+                self.assertIsNotNone(bash, 'Bash is required to validate relocated workflow scripts')
+                subprocess.run([bash, '-n', str(path)], check=True, capture_output=True)
         self.assertLess((ROOT / '.github/workflows/real-weights.yml').stat().st_size, 450000)
 
     def test_manual_cuda_membership_and_override_include_each_ignored_case(self):

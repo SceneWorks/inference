@@ -167,6 +167,19 @@ class SharedHeadroom(unittest.TestCase):
             with self.assertRaises(ValueError):
                 proof.validate_configurations(row)
 
+    def test_all_bounded_cases_bind_source_owned_gpu1_headroom_without_implicit_selection(self):
+        rows = [row for row in proof.load_registry() if 'bounded_acceleration' in row['fqn']]
+        self.assertTrue(rows)
+        for row in rows:
+            with self.subTest(case=proof.identity(row)):
+                configured = proof.configured_case(row, 'fixed_cuda')
+                self.assertEqual(configured['required_cuda_device_uuid'], UUID)
+                self.assertEqual(configured['required_cuda_physical_index'], 1)
+                self.assertEqual(resources.bound_cuda_activity_profile(configured), PROFILE)
+                if row['default_configuration'] is None:
+                    with self.assertRaisesRegex(ValueError, 'explicit configuration required'):
+                        proof.configured_case(row)
+
     def test_request_cannot_inject_profile_and_profiles_keep_distinct_activity_rules(self):
         request = {'selection': 'candle-gen/candle_gen/' + FQN, 'policy': {'backend': 'windows-cuda'},
                    'cuda_activity_profile': PROFILE}

@@ -746,7 +746,7 @@ mod parity_tests {
         let feat = randn_seeded(&mut rng, 1.0, &[1, 3, cfg.enc_hidden_dim], &dev);
 
         let (_, reference_encoder, reference_ctx) = model
-            .forward_pre_main(&hs, &[feat.clone()], None, 0.3, frame, h, w)
+            .forward_pre_main(&hs, std::slice::from_ref(&feat), None, 0.3, frame, h, w)
             .unwrap();
         let prepared = model.prepare_training_features(&[feat]).unwrap();
         model.prepare_training_geometry(3, frame, h, w).unwrap();

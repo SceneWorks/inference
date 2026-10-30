@@ -152,7 +152,10 @@ jobs:
       - name: Bind pinned installed bespoke bounded training inputs
         if: matrix.asset_setup == 'bespoke-training' && runner.os == 'Windows'
         shell: cmd
-        run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_bespoke_training_proof_assets.py --plan "%RUNNER_TEMP%\model-proof-plan.json"'
+        run: |
+          "%REVIEWED_PYTHON%" -I scripts\ci\model_inference_proofs.py --plan --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" > "%RUNNER_TEMP%\model-proof-plan.json"
+          if errorlevel 1 exit /b %ERRORLEVEL%
+          "%REVIEWED_PYTHON%" -I scripts\ci\prepare_bespoke_training_proof_assets.py --plan "%RUNNER_TEMP%\model-proof-plan.json"
       - name: Bind provisioned Raw snapshot for bounded Krea training
         if: matrix.asset_setup == 'krea-training' && runner.os == 'Windows'
         shell: powershell

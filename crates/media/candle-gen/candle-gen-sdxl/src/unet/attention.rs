@@ -344,21 +344,7 @@ impl CrossAttention {
 
     pub fn forward(&self, xs: &Tensor, context: Option<&Tensor>) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let (query, key, value) = if context.is_none() {
-            match &self.training_pack {
-                Some(pack) if self.self_attention => {
-                    let values = pack.forward_lora(xs, &[&self.to_q, &self.to_k, &self.to_v])?;
-                    candle_gen::train::profile::cohort_reuse("sdxl:actual-frozen-projection-pack");
-                    (values[0].clone(), values[1].clone(), values[2].clone())
-                }
-                _ => (
-                    self.to_q.forward(xs)?,
-                    self.to_k.forward(xs)?,
-                    self.to_v.forward(xs)?,
-                ),
-            }
-        } else {
-            let context = context.unwrap();
+        let (query, key, value) = if let Some(context) = context {
             let key = self
                 .training_kv
                 .iter()
@@ -393,6 +379,19 @@ impl CrossAttention {
                 },
             };
             (self.to_q.forward(xs)?, key, value)
+        } else {
+            match &self.training_pack {
+                Some(pack) if self.self_attention => {
+                    let values = pack.forward_lora(xs, &[&self.to_q, &self.to_k, &self.to_v])?;
+                    candle_gen::train::profile::cohort_reuse("sdxl:actual-frozen-projection-pack");
+                    (values[0].clone(), values[1].clone(), values[2].clone())
+                }
+                _ => (
+                    self.to_q.forward(xs)?,
+                    self.to_k.forward(xs)?,
+                    self.to_v.forward(xs)?,
+                ),
+            }
         };
         let query = self.reshape_heads_to_batch_dim(&query)?;
         let key = self.reshape_heads_to_batch_dim(&key)?;

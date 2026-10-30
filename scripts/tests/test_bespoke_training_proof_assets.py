@@ -2,6 +2,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+import yaml
 from unittest.mock import patch
 from scripts.ci import prepare_bespoke_training_proof_assets as assets
 
@@ -32,6 +33,19 @@ class BespokeTrainingAssets(unittest.TestCase):
                 with self.assertRaises(ValueError): assets.validate_paths({"TEST_ASSET":root})
                 (root/"config.json").write_text("{}")
                 assets.validate_paths({"TEST_ASSET":root})
+    def test_workflow_rebuilds_the_plan_on_the_actual_worker_before_asset_setup(self):
+        root = Path(__file__).resolve().parents[2]
+        workflow = yaml.safe_load((root / '.github/workflows/model-inference-proofs.yml').read_text(encoding='utf-8'))
+        steps = next(job['steps'] for job in workflow['jobs'].values()
+                     if any('prepare_bespoke_training_proof_assets.py' in step.get('run', '')
+                            for step in job.get('steps', [])))
+        step = next(step for step in steps if 'prepare_bespoke_training_proof_assets.py' in step.get('run', ''))
+        command = step['run']
+        self.assertIn("matrix.asset_setup == 'bespoke-training'", step['if'])
+        self.assertIn('--request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%"', command)
+        self.assertLess(command.index('model_inference_proofs.py --plan'), command.index('if errorlevel 1 exit'))
+        self.assertLess(command.index('if errorlevel 1 exit'), command.index('prepare_bespoke_training_proof_assets.py'))
+
     def test_base_sources_are_exact_installed_revisions(self):
         for bindings in assets.BESPOKE_TRAINING_PROOFS.values():
             for name,path in bindings.items():
