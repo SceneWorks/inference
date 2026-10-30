@@ -49935,7 +49935,466 @@
       "krea_bounded_acceleration/adapter_sample.png",
       "krea_bounded_acceleration/metrics.json"
     ],
-    "required_cuda_physical_index": 1
+    "required_cuda_physical_index": 1,
+    "generated_adapter_artifacts": {
+      "krea_bounded_acceleration/out/krea_bounded.safetensors": {
+        "kind": "lora",
+        "rank": 16,
+        "dtype": "F32",
+        "per_target_alpha": true,
+        "max_bytes": 100663296,
+        "targets": {
+          "transformer_blocks.0.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.0.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.0.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.0.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.1.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.1.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.1.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.1.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.2.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.2.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.2.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.2.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.3.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.3.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.3.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.3.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.4.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.4.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.4.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.4.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.5.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.5.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.5.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.5.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.6.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.6.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.6.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.6.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.7.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.7.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.7.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.7.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.8.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.8.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.8.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.8.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.9.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.9.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.9.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.9.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.10.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.10.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.10.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.10.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.11.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.11.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.11.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.11.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.12.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.12.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.12.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.12.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.13.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.13.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.13.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.13.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.14.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.14.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.14.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.14.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.15.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.15.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.15.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.15.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.16.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.16.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.16.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.16.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.17.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.17.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.17.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.17.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.18.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.18.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.18.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.18.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.19.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.19.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.19.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.19.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.20.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.20.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.20.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.20.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.21.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.21.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.21.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.21.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.22.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.22.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.22.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.22.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.23.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.23.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.23.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.23.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.24.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.24.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.24.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.24.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.25.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.25.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.25.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.25.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.26.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.26.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.26.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.26.attn.to_out.0": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.27.attn.to_q": [
+            6144,
+            6144
+          ],
+          "transformer_blocks.27.attn.to_k": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.27.attn.to_v": [
+            1536,
+            6144
+          ],
+          "transformer_blocks.27.attn.to_out.0": [
+            6144,
+            6144
+          ]
+        }
+      }
+    }
   },
   {
     "package": "candle-gen-krea",
