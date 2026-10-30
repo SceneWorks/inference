@@ -101,7 +101,7 @@ enum Qkv {
         q: Linear,
         k: Linear,
         v: Linear,
-        pack: Option<candle_gen::train::projection::FrozenProjectionPack>,
+        pack: Option<Box<candle_gen::train::projection::FrozenProjectionPack>>,
     },
 }
 
@@ -324,6 +324,7 @@ impl IrisDiT {
         self
     }
 
+    #[allow(clippy::too_many_arguments)] // Exact stage plus source RoPE geometry/frequency signature.
     fn cached_rope(
         &self,
         slot: usize,
@@ -393,7 +394,7 @@ impl IrisDiT {
     ) {
         let set = |qkv: &mut Qkv, key: &str| {
             if let Qkv::Split { pack, .. } = qkv {
-                *pack = packs.get(key).cloned();
+                *pack = packs.get(key).cloned().map(Box::new);
             }
         };
         for (i, block) in self.blocks.iter_mut().enumerate() {
