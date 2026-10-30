@@ -1,0 +1,374 @@
+//! Request-local observations from file readers. Callbacks enqueue work; they must not block I/O.
+//! Captured contexts travel with lazy reads, never through a process-global current request.
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LoadActivityPhase {
+    Checking,
+    Verifying,
+    Loading,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadActivity {
+    pub phase: LoadActivityPhase,
+    pub component: String,
+    pub file: PathBuf,
+    /// Logical source bytes consumed, including headers; mapping an address range is not a read.
+    pub bytes_read: u64,
+    pub total_bytes: Option<u64>,
+    /// Present only when the caller supplied the complete selected component file inventory.
+    pub component_bytes_read: u64,
+    pub component_total_bytes: Option<u64>,
+    pub files_checked: usize,
+    pub total_files: Option<usize>,
+}
+
+type Observer = Arc<dyn Fn(Option<LoadActivity>) + Send + Sync>;
+#[derive(Default)]
+struct Request {
+    observer: Option<Observer>,
+    next: u64,
+    active: u64,
+    files: HashMap<PathBuf, (String, u64)>,
+    consumed: HashMap<(LoadActivityPhase, PathBuf), u64>,
+}
+
+#[derive(Clone, Default)]
+pub struct LoadActivityContext {
+    request: Arc<Mutex<Request>>,
+    components: Arc<Vec<(PathBuf, String)>>,
+}
+thread_local! { static CONTEXT: RefCell<LoadActivityContext> = RefCell::default(); }
+
+impl LoadActivityContext {
+    pub fn capture() -> Self {
+        CONTEXT.with(|v| v.borrow().clone())
+    }
+    pub fn is_observed(&self) -> bool {
+        self.request
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observer
+            .is_some()
+    }
+    pub fn install(&self) -> LoadActivityObserver {
+        let previous = CONTEXT.with(|v| v.replace(self.clone()));
+        LoadActivityObserver {
+            previous,
+            _thread_bound: PhantomData,
+        }
+    }
+    /// Bind exact file paths or directory roots to neutral LoadSpec slots. Longest match wins.
+    pub fn with_components(&self, components: impl IntoIterator<Item = (PathBuf, String)>) -> Self {
+        let mut roots = self.components.as_ref().clone();
+        roots.extend(components.into_iter().map(|(p, c)| (absolute(&p), c)));
+        Self {
+            request: self.request.clone(),
+            components: Arc::new(roots),
+        }
+    }
+    pub fn component(&self, path: &Path) -> String {
+        let path = absolute(path);
+        if let Some((_, component)) = self
+            .components
+            .iter()
+            .filter(|(root, _)| path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+        {
+            return component.replace('_', " ");
+        }
+        let parts: Vec<_> = path
+            .components()
+            .map(|v| v.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if let Some(i) = parts.iter().rposition(|v| v == "snapshots") {
+            if parts.len() > i + 3 {
+                return parts[i + 2].replace('_', " ");
+            }
+        }
+        // Diffusers component directories, including numbered/novel component names, need no
+        // provider table. Arbitrary standalone checkpoints fall back to the filename.
+        let parent = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|v| v.to_str());
+        if let Some(p) = parent.filter(|v| {
+            *v == "vae"
+                || *v == "transformer"
+                || v.contains("encoder")
+                || v.contains("decoder")
+                || *v == "unet"
+        }) {
+            return p.replace('_', " ");
+        }
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    }
+    /// Register a complete selected file set, not an unfiltered directory listing.
+    pub fn register_files(&self, files: impl IntoIterator<Item = (PathBuf, u64)>) {
+        let files = files
+            .into_iter()
+            .map(|(p, size)| {
+                let p = absolute(&p);
+                let component = self.component(&p);
+                (p, (component, size))
+            })
+            .collect::<Vec<_>>();
+        self.request
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .files
+            .extend(files);
+    }
+    /// Begin a new read lifetime of a path (interval updates in a lazy reader stay cumulative).
+    pub fn reset_file(&self, path: impl AsRef<Path>) {
+        let path = absolute(path.as_ref());
+        self.request
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .consumed
+            .retain(|(_, p), _| p != &path);
+    }
+    pub fn report(&self, activity: Option<LoadActivity>) {
+        let observer = self
+            .request
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observer
+            .clone();
+        if let Some(observe) = observer {
+            observe(activity);
+        }
+    }
+    pub fn file(
+        &self,
+        phase: LoadActivityPhase,
+        path: impl AsRef<Path>,
+        total_bytes: Option<u64>,
+    ) -> LoadActivityFile {
+        let file = absolute(path.as_ref());
+        let id = {
+            let mut r = self.request.lock().unwrap_or_else(|e| e.into_inner());
+            r.next += 1;
+            r.next
+        };
+        let activity = LoadActivity {
+            phase,
+            component: self.component(&file),
+            file,
+            bytes_read: 0,
+            total_bytes,
+            component_bytes_read: 0,
+            component_total_bytes: None,
+            files_checked: 0,
+            total_files: None,
+        };
+        let handle = LoadActivityFile {
+            inner: Arc::new(FileState {
+                context: self.clone(),
+                id,
+                state: Mutex::new(Some(activity)),
+            }),
+        };
+        handle.update(0);
+        handle
+    }
+}
+fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Thread-bound installation. Drop restores the enclosing request, including during unwinding.
+#[must_use]
+pub struct LoadActivityObserver {
+    previous: LoadActivityContext,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+impl LoadActivityObserver {
+    pub fn new(observe: impl Fn(Option<LoadActivity>) + Send + Sync + 'static) -> Self {
+        LoadActivityContext {
+            request: Arc::new(Mutex::new(Request {
+                observer: Some(Arc::new(observe)),
+                ..Request::default()
+            })),
+            components: Arc::default(),
+        }
+        .install()
+    }
+}
+impl Drop for LoadActivityObserver {
+    fn drop(&mut self) {
+        CONTEXT.with(|v| {
+            v.replace(std::mem::take(&mut self.previous));
+        });
+    }
+}
+
+struct FileState {
+    context: LoadActivityContext,
+    id: u64,
+    state: Mutex<Option<LoadActivity>>,
+}
+impl FileState {
+    fn finish(&self) {
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .is_none()
+        {
+            return;
+        }
+        let observer = {
+            let mut r = self
+                .context
+                .request
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if r.active != self.id {
+                return;
+            }
+            r.active = 0;
+            r.observer.clone()
+        };
+        if let Some(observe) = observer {
+            observe(None);
+        }
+    }
+}
+impl Drop for FileState {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+/// Share with lazy/background callbacks. Last-drop and explicit finish both end the phase.
+#[derive(Clone)]
+pub struct LoadActivityFile {
+    inner: Arc<FileState>,
+}
+impl LoadActivityFile {
+    pub fn update(&self, bytes_read: u64) {
+        self.change(|v| v.bytes_read = bytes_read);
+    }
+    pub fn add_bytes(&self, bytes: u64) {
+        self.change(|v| v.bytes_read = v.bytes_read.saturating_add(bytes));
+    }
+    pub fn checked(&self, completed: usize, total: Option<usize>) {
+        self.change(|v| {
+            v.files_checked = completed;
+            v.total_files = total;
+        });
+    }
+    fn change(&self, change: impl FnOnce(&mut LoadActivity)) {
+        let activity = {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(activity) = state.as_mut() else {
+                return;
+            };
+            change(activity);
+            activity.clone()
+        };
+        let mut activity = activity;
+        let observer = {
+            let mut r = self
+                .inner
+                .context
+                .request
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            r.active = self.inner.id;
+            let consumed = r
+                .consumed
+                .entry((activity.phase, activity.file.clone()))
+                .or_default();
+            *consumed = (*consumed).max(activity.bytes_read);
+            if r.files.contains_key(&activity.file) {
+                let selected = r
+                    .files
+                    .iter()
+                    .filter(|(_, (component, _))| *component == activity.component);
+                let (bytes, total) = selected.fold((0u64, 0u64), |(b, t), (path, (_, size))| {
+                    (
+                        b + r
+                            .consumed
+                            .get(&(activity.phase, path.clone()))
+                            .copied()
+                            .unwrap_or(0),
+                        t + size,
+                    )
+                });
+                activity.component_bytes_read = bytes;
+                activity.component_total_bytes = Some(total);
+            }
+            r.observer.clone()
+        };
+        if let Some(observe) = observer {
+            observe(Some(activity));
+        }
+    }
+    pub fn finish(&self) {
+        self.inner.finish();
+    }
+}
+/// Synchronous file-read scope; use a cloned LoadActivityFile for asynchronous/lazy work.
+pub type LoadActivityScope = LoadActivityFile;
+impl LoadActivityFile {
+    pub fn file(
+        phase: LoadActivityPhase,
+        path: impl AsRef<Path>,
+        total_bytes: Option<u64>,
+    ) -> Self {
+        LoadActivityContext::capture().file(phase, path, total_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn captured_context_isolated_from_other_requests_and_unwinds() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let out = events.clone();
+        let context = {
+            let _observer = LoadActivityObserver::new(move |v| out.lock().unwrap().push(v));
+            LoadActivityContext::capture()
+        };
+        let _other = LoadActivityObserver::new(|_| panic!("request leaked"));
+        std::thread::spawn(move || {
+            let _installed = context.install();
+            let file = LoadActivityScope::file(
+                LoadActivityPhase::Loading,
+                "text_encoder/model.safetensors",
+                Some(100),
+            );
+            file.update(100);
+        })
+        .join()
+        .unwrap();
+        let events = events.lock().unwrap();
+        assert_eq!(events[0].as_ref().unwrap().component, "text encoder");
+        assert_eq!(events[1].as_ref().unwrap().bytes_read, 100);
+        assert_eq!(events.last(), Some(&None));
+    }
+    #[test]
+    fn completed_older_read_cannot_clear_newer_activity() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let out = events.clone();
+        let _observer = LoadActivityObserver::new(move |v| out.lock().unwrap().push(v));
+        let a = LoadActivityScope::file(LoadActivityPhase::Loading, "a", None);
+        let b = LoadActivityScope::file(LoadActivityPhase::Loading, "b", None);
+        a.finish();
+        assert!(events.lock().unwrap().last().unwrap().is_some());
+        b.finish();
+        assert_eq!(events.lock().unwrap().last(), Some(&None));
+    }
+}

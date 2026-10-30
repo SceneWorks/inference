@@ -469,6 +469,7 @@ dependencies = [
  "rand_distr",
  "rayon",
  "safetensors 0.7.0",
+ "sceneworks-load-progress",
  "sha2",
  "thiserror 2.0.18",
  "tokenizers 0.22.2",
@@ -3959,6 +3960,7 @@ dependencies = [
  "core-llm",
  "libc",
  "safetensors 0.4.5",
+ "sceneworks-load-progress",
  "serde",
  "serde_json",
  "sha2",
@@ -4133,6 +4135,10 @@ dependencies = [
  "sha2",
  "tempfile",
 ]
+
+[[package]]
+name = "sceneworks-load-progress"
+version = "0.1.0"
 
 [[package]]
 name = "scopeguard"

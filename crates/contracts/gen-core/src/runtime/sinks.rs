@@ -352,6 +352,8 @@ pub enum Progress {
 /// heavy render bundle (transformer/U-Net + VAE + any control/PiD overlay).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadPhase {
+    /// Prompt/reference encoding is executing; emitted by the shared residency driver after I/O.
+    EncodingPrompt,
     /// The phase-A prompt encoder (text or vision-language), loaded first and dropped before the
     /// render bundle materializes.
     TextEncoder,

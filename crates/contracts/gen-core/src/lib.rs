@@ -79,7 +79,10 @@ pub mod numeric;
 pub mod registry;
 pub mod residency;
 pub mod runtime;
-pub use load_activity::{LoadActivity, LoadActivityObserver, LoadActivityScope};
+pub use load_activity::{
+    LoadActivity, LoadActivityContext, LoadActivityFile, LoadActivityObserver, LoadActivityPhase,
+    LoadActivityScope,
+};
 pub mod safetensors_shards;
 pub mod sampling;
 pub mod text_embed;

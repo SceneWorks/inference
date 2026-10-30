@@ -492,6 +492,7 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 .as_ref()
                 .ok_or_else(|| Error::Msg("warm residency was not populated".into()))
                 .map_err(Into::<R::Error>::into)?;
+            on_progress(Progress::Loading(LoadPhase::EncodingPrompt));
             let encoded = match encode(&pair.text, prepared) {
                 Ok(encoded) => encoded,
                 Err(error) => {
@@ -671,6 +672,7 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 .as_ref()
                 .ok_or_else(|| Error::Msg("warm residency was not populated".into()))
                 .map_err(Into::<R::Error>::into)?;
+            on_progress(Progress::Loading(LoadPhase::EncodingPrompt));
             let encoded = match encode(&pair.text, prepared) {
                 Ok(encoded) => encoded,
                 Err(primary) => {
@@ -702,6 +704,7 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 return Err(error);
             }
         };
+        on_progress(Progress::Loading(LoadPhase::EncodingPrompt));
         let encoded = match encode(&text, prepared) {
             Ok(encoded) => materialize_encoded(Some(&encoded)).map(|()| encoded),
             Err(primary) => {
@@ -772,6 +775,7 @@ where
             return Err(error);
         }
     };
+    on_progress(Progress::Loading(LoadPhase::EncodingPrompt));
     let encoded = match encode(&text) {
         Ok(encoded) => materialize_before_text_drop(Some(&encoded)).map(|()| encoded),
         Err(error) => {
@@ -1380,7 +1384,7 @@ mod tests {
         assert_eq!(body_calls.load(Ordering::SeqCst), 0);
 
         assert_eq!(run(false, false).unwrap(), 5);
-        assert_eq!(callbacks.load(Ordering::SeqCst), 2);
+        assert_eq!(callbacks.load(Ordering::SeqCst), 3);
         assert_eq!(
             residency
                 .with_resident_parts(|text, heavy| *text + *heavy)
