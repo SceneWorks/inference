@@ -11,7 +11,7 @@ with tiny or synthetic inputs.
 The former open-ended routine partition was insufficient: an unregistered learned
 test could run automatically. The small safe-control table is closed. Each entry
 binds package, target kind/name, exact case, source, libtest protocol, platform and
-source-review rationale. Every other backend target is **compiled only**, never
+source-review rationale and any required compiled features. Every other backend target is **compiled only**, never
 reported as a passed test. No Rust assertions, ignore attributes or test bodies
 are changed by this separation.
 
@@ -20,8 +20,12 @@ are changed by this separation.
 `audited-safe` compiles the complete selected graph with
 `--no-run --message-format=json`. Before listing any approved executable, it binds
 its target/source to Cargo metadata and checks the package manifest for the
-standard libtest harness. Unknown targets, including custom harnesses, are never
-probed with a guessed `--list`. Approved cases must exist, be non-ignored and run
+standard libtest harness. Feature-gated controls are selected only when their required
+features appear in the compiled package artifacts. This keeps the exact Metal raw
+reduction regression automatic on the existing hosted Metal lane: 312 primitive
+sum/mean/min/max/argmin/argmax comparisons over synthetic rank-5/6 tensor views.
+It performs no learned/model execution; reference-latent encoding stays manual.
+Unknown targets, including custom harnesses, are never probed with a guessed `--list`. Approved cases must exist, be non-ignored and run
 with `--exact`; the runner checks one passing case, zero failures/ignores and the
 expected filtered count. Missing or renamed controls, wrong package binding,
 custom harnesses and zero-case executions fail. Cargo working directory, manifest

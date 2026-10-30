@@ -1073,15 +1073,12 @@ jobs:
           python3 scripts/ci/run_ci_collection.py -- python3.12 -I scripts/ci/compile_model_proof_targets.py --lane metal -- cargo clippy --locked --keep-going
           -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*'
           --all-targets --features metal -- -D warnings
-      # Ordinary CI compiles these targets; the separate baseline executes the two
-      # modules and preserves their original assertions. The vendored candle-metal-kernels
-      # carries upstream's rank > 4 strided-reduce fix (huggingface/candle#3873; its VENDORED.md);
-      # these two weights-free pins are what reds a re-vendor that drops it: the 312-case kernel
-      # sweep (Metal vs CPU, every reduce op, ranks 5 and 6) and the Qwen-Image 2.1 reference
-      # latents it corrupted. Lane selection: both crates and the vendored kernels live under
-      # `crates/media/candle-gen`, which `scripts/ci/select_lanes.py` maps to `macos_metal`.
-      # The filters are pinned to existing integration modules by test_ci_workflow_policy, so a
-      # renamed module cannot turn this into a step that runs zero tests.
+      # The exact audited raw-arithmetic reduction case runs automatically: 312 rank-5/6
+      # sum/mean/min/max/argmin/argmax comparisons guard the vendored strided-index fix.
+      # Its safe-control entry requires the compiled metal feature and a nonzero exact pass.
+      # Qwen reference-latent encoding remains manual model validation; the separate
+      # baseline retains both original module selectors. Both crates and the vendored
+      # kernels map to macos_metal through scripts/ci/select_lanes.py.
       - name: Test Candle Metal reduce pins
         if: >-
           ${{ !cancelled() && steps.mlx_checkout.outcome == 'success'

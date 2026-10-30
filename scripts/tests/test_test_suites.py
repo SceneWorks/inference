@@ -98,6 +98,29 @@ class TestSuites(unittest.TestCase):
         self.assertEqual(execution, [["fixture-binary", "--exact", "contract::shape", "--test-threads=1"]])
         self.assertTrue(any("--no-run" in call for call in calls))
 
+    def test_safe_feature_control_is_compile_only_until_its_feature_is_compiled(self):
+        raw = 'metal_strided_reduce::rank_5_and_6_reductions_on_metal_match_the_cpu'
+        control = self.case(test=raw, features=['metal'])
+        calls = self.safe_execute(controls=[control])
+        self.assertFalse(any(call[0] == 'fixture-binary' for call in calls))
+        reference = 'metal_reference_latents::reference_vae_latents_on_metal_match_cpu_after_the_text_encoder'
+        calls = self.safe_execute(controls=[control], artifact=self.artifact(features=['metal']),
+                                  names={raw, reference, 'learned::forward'}, ignored={reference})
+        execution = [call for call in calls if call[0] == 'fixture-binary' and '--list' not in call]
+        self.assertEqual(execution, [['fixture-binary', '--exact', raw, '--test-threads=1']])
+
+    def test_active_safe_feature_control_cannot_disappear_or_become_ignored(self):
+        raw = 'metal_strided_reduce::rank_5_and_6_reductions_on_metal_match_the_cpu'
+        control = self.case(test=raw, features=['metal'])
+        for fake in (
+            {'names': {'learned::forward'}, 'ignored': set()},
+            {'names': {raw}, 'ignored': {raw}},
+            {'artifact': self.artifact(target='renamed', features=['metal'])},
+        ):
+            options = {'artifact': self.artifact(features=['metal']), **fake}
+            with self.subTest(fake=fake), self.assertRaises(ValueError):
+                self.safe_execute(controls=[control], **options)
+
     def test_unknown_custom_harness_is_compiled_without_listing_or_execution(self):
         calls = self.safe_execute(controls=[self.case(package="other")])
         self.assertFalse(any(call[0] == "fixture-binary" for call in calls))
@@ -138,7 +161,7 @@ class TestSuites(unittest.TestCase):
 
     def test_safe_table_is_nonempty_and_source_bound(self):
         controls = suites.safe_controls()
-        self.assertEqual(len(controls), 21)
+        self.assertEqual(len(controls), 22)
         self.assertTrue(all(control['protocol'] == 'libtest' for control in controls))
         self.assertTrue(any('cancellation' in control['test'] for control in controls))
         import tempfile

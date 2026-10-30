@@ -196,6 +196,8 @@ def safe_controls(path: Path = SAFE_MANIFEST) -> list[dict]:
         if (key in seen or control["kind"] not in ("lib", "test")
                 or control.get("protocol") != "libtest" or not control["test"]
                 or not control.get("platforms") or set(control["platforms"]) - {"darwin", "linux", "win32"}
+                or not isinstance(control.get("features", []), list)
+                or any(not isinstance(feature, str) or not feature for feature in control.get("features", []))
                 or len(control.get("reason", "")) < 30 or not source.is_file()
                 or not re.search(r"\bfn\s+" + re.escape(control["test"].split("::")[-1]) + r"\s*\(", source.read_text(encoding="utf-8"))):
             raise ValueError(f"invalid/stale safe control: {key}")
@@ -243,10 +245,15 @@ def execute_safe(command: list[str], controls: list[dict], deadline_seconds: int
     built = artifacts(output)
     built_keys = {target_key(artifact, packages) for artifact in built}
     built_packages = {key[0] for key in built_keys}
+    package_features = {}
+    for artifact in built:
+        package_features.setdefault(packages[artifact["package_id"]], set()).update(artifact.get("features", []))
     named = {command[i + 1] for i, arg in enumerate(command[:-1]) if arg == "--test"}
     expected = {}
     for control in controls:
         if sys.platform not in control["platforms"]:
+            continue
+        if not set(control.get("features", [])) <= package_features.get(control["package"], set()):
             continue
         if control["kind"] == "test" and ("--lib" in command and "--tests" not in command or named and control["target"] not in named):
             continue

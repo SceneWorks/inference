@@ -274,6 +274,21 @@
         "win32"
       ],
       "reason": "Catalog descriptors, memory-contract surface matrices and nonexistent-source decode-geometry refusals only; registers constructors without invoking model loading or inference."
+    },
+    {
+      "package": "candle-gen",
+      "kind": "test",
+      "target": "integration",
+      "test": "metal_strided_reduce::rank_5_and_6_reductions_on_metal_match_the_cpu",
+      "source": "crates/media/candle-gen/candle-gen/tests/metal_strided_reduce.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "features": [
+        "metal"
+      ],
+      "reason": "312 raw rank-5/6 sum/mean/min/max/argmin/argmax and strided-index comparisons on synthetic f32 values; tensor views, scalar scaling and readback only. No learned model/module/layer, inference path, backward or optimizer executes."
     }
   ]
 }

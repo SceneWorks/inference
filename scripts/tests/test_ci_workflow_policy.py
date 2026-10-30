@@ -1401,6 +1401,27 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             self.assertIn('#![cfg(feature = "metal")]', source, name)
             self.assertIn("#[test]", source, name)
 
+    def test_raw_metal_reduction_remains_an_exact_automatic_feature_control(self) -> None:
+        root = WORKFLOW.parents[2]
+        controls = json.loads((root / 'scripts/ci/safe_controls.json').read_text(encoding='utf-8'))['controls']
+        raw = 'metal_strided_reduce::rank_5_and_6_reductions_on_metal_match_the_cpu'
+        entries = [control for control in controls if control['test'].startswith('metal_strided_reduce::')]
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual((entry['package'], entry['kind'], entry['target'], entry['test']),
+                         ('candle-gen', 'test', 'integration', raw))
+        self.assertEqual(entry['features'], ['metal'])
+        self.assertEqual(entry['platforms'], ['darwin'])
+        self.assertEqual(entry['protocol'], 'libtest')
+        self.assertEqual(entry['source'], 'crates/media/candle-gen/candle-gen/tests/metal_strided_reduce.rs')
+        self.assertFalse(any(control['test'].startswith('metal_reference_latents::') for control in controls))
+        job = yaml.safe_load(WORKFLOW.read_text(encoding='utf-8'))['jobs']['macos-metal']
+        run = next(step['run'] for step in job['steps'] if step.get('name') == 'Test Candle Metal reduce pins')
+        self.assertIn('test_suites.py audited-safe -- cargo test', run)
+        self.assertIn('-p candle-gen -p candle-gen-qwen-image-2-1 --features metal', run)
+        self.assertIn('--test integration', run)
+        self.assertNotIn('--ignored', run)
+
     def test_macos_metal_builds_one_target_generation_without_cargo_clean(self) -> None:
         # Until 2026-08-23 this lane ran `cargo clean` twice mid-job because the full-debuginfo test
         # graph grew `target/` to 35 GB. Each clean discarded the cache-restored `pmetal-mlx-sys`
