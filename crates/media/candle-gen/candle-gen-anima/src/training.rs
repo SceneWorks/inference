@@ -461,6 +461,38 @@ impl AnimaTrainer {
                 )?,
             }
         };
+        let latent_inputs = cache.iter().map(|entry| &entry.0).collect::<Vec<_>>();
+        let conditioner_inputs = cache
+            .iter()
+            .map(|entry| (&entry.1, &entry.2))
+            .collect::<Vec<_>>();
+        let geometry_bytes = dit.training_geometry_bytes(&latent_inputs)?
+            + conditioner.training_geometry_bytes(&conditioner_inputs)?;
+        let base = std::fs::metadata(
+            root.join("diffusion_models")
+                .join(Variant::Base.dit_filename()),
+        )
+        .map_err(|error| CandleError::Msg(format!("{LABEL}: geometry admission: {error}")))?
+        .len();
+        let edge = edges.iter().copied().max().unwrap_or(0);
+        let aux = candle_gen_perceptual::perceptual_footprint(
+            cfg,
+            &anima_decoder(),
+            candle_gen_perceptual::AuxGeometry::image(edge, cache.len()),
+        );
+        flow_match::check_aux_memory(
+            LABEL,
+            base,
+            aux.saturating_add(geometry_bytes),
+            flow_match::device_training_budget_bytes(device, LABEL),
+        )?;
+        dit.prepare_training(&cache.iter().map(|entry| &entry.0).collect::<Vec<_>>())?;
+        conditioner.prepare_training(
+            &cache
+                .iter()
+                .map(|entry| (&entry.1, &entry.2))
+                .collect::<Vec<_>>(),
+        )?;
         let accum = cfg.gradient_accumulation.max(1);
         let weight_decay = flow_match::effective_weight_decay(cfg);
         let mut opt = TrainOptimizer::from_config(
@@ -1066,7 +1098,7 @@ mod depth_anchoring_tests {
                 .unwrap()
                 .is_none()
         );
-        let f = fixture();
+        let mut f = fixture();
         for (i, v) in f.set.vars.iter().enumerate() {
             v.set(
                 &splitmix_uniform(
@@ -1079,6 +1111,50 @@ mod depth_anchoring_tests {
                 .unwrap(),
             )
             .unwrap();
+        }
+        let (raw, raw_grads) = step(&f, 0.5, None);
+        f.dit.prepare_training(&[&f.x0]).unwrap();
+        f.cond.prepare_training(&[(&f.source, &f.ids)]).unwrap();
+        let (prepared, prepared_grads) = step(&f, 0.5, None);
+        assert!((raw.total - prepared.total).abs() <= 1e-5);
+        for (name, var) in f.set.named_vars() {
+            let raw = raw_grads.get(var.as_tensor()).expect("raw factor gradient");
+            let actual = prepared_grads
+                .get(var.as_tensor())
+                .expect("prepared factor gradient");
+            let error = raw
+                .sub(actual)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let magnitude = raw
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                error <= 2e-5 * magnitude + 1e-7,
+                "{name}: {error}/{magnitude}"
+            );
+            if name.contains("self_attn.q_proj") || name.contains("cross_attn.k_proj") {
+                assert!(
+                    actual
+                        .abs()
+                        .unwrap()
+                        .sum_all()
+                        .unwrap()
+                        .to_scalar::<f32>()
+                        .unwrap()
+                        > 0.0,
+                    "{name} was severed by fused softmax"
+                );
+            }
         }
         let (off, g_off) = step(&f, 0.5, None);
         let (x_t, target) = flow_match::build_batch(&f.x0, &f.noise, 0.5).unwrap();
@@ -1111,6 +1187,30 @@ mod depth_anchoring_tests {
             grad_bits(&g_off, &f.set.vars)
         );
 
+        let before = f.cond.forward(&f.source, &f.ids, DType::F32).unwrap();
+        let (_, factor) = f
+            .set
+            .named_vars()
+            .into_iter()
+            .find(|(name, _)| {
+                name.starts_with("llm_adapter.out_proj") && name.ends_with("lora_B.weight")
+            })
+            .expect("live conditioner output factor");
+        factor.set(&(factor.as_tensor() + 0.1).unwrap()).unwrap();
+        let after = f.cond.forward(&f.source, &f.ids, DType::F32).unwrap();
+        assert!(
+            before
+                .sub(&after)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+                > 0.0,
+            "trainable conditioner outputs must never be cached"
+        );
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED training::depth_anchoring_tests::depth_off_is_bit_identical_to_the_legacy_step");
     }

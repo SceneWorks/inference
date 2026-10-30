@@ -26,12 +26,11 @@ pub fn lin_bias(vb: &VarBuilder, name: &str) -> Result<Linear> {
 
 /// Plain RMSNorm `w · x / sqrt(mean(x²) + eps)` over the last dim (matches `mlx_rs::fast::rms_norm`).
 /// `w` broadcasts over the leading dims — used both for the per-head q/k norm (over `head_dim`) and
-/// the feature-axis norms. Computed in the input dtype (upcast the caller's tensor to f32 first if
-/// bf16 precision matters).
+/// the feature-axis norms. Reductions use f32; normalized values round before the weight.
 pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
-    let mean = x.sqr()?.mean_keepdim(D::Minus1)?; // [.., 1]
-    let denom = (mean + eps)?.sqrt()?;
-    Ok(x.broadcast_div(&denom)?.broadcast_mul(w)?)
+    Ok(candle_gen::train::norm::rms_norm_cast_before_weight(
+        x, w, eps,
+    )?)
 }
 
 /// LayerNorm with **no** affine params (`elementwise_affine=false`) over the last dim:
@@ -102,13 +101,19 @@ pub fn sdpa(
     scale: f64,
     mask: Option<&Tensor>,
 ) -> Result<Tensor> {
-    Ok(candle_gen::sdpa_budgeted_bhsd(
+    Ok(candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
         q,
         k,
         v,
         scale,
         mask,
-        candle_gen::candle_nn::ops::softmax_last_dim,
+        |scores| {
+            if scores.track_op() {
+                candle_gen::candle_nn::ops::softmax(scores, D::Minus1)
+            } else {
+                candle_gen::candle_nn::ops::softmax_last_dim(scores)
+            }
+        },
         candle_gen::ATTN_SCORES_BUDGET,
     )?)
 }
