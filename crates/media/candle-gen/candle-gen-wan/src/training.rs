@@ -1217,6 +1217,7 @@ impl WanMoeTrainer {
                 .seed
                 .wrapping_add((idx as u64).wrapping_mul(0x9E37_79B9));
             let set = flow_match::install_adapters(&mut dit, cfg, &suffixes, seed, device)?;
+            dit.prepare_training()?;
             let opt = TrainOptimizer::from_config(
                 &cfg.optimizer,
                 set.vars.clone(),
@@ -1240,6 +1241,30 @@ impl WanMoeTrainer {
             });
         }
 
+        // Prepare the initial text projection independently in every expert, then release
+        // the original UMT5 cache. Bucket entries share each expert's projected caption storage.
+        let mut contexts = Vec::with_capacity(experts.len());
+        for expert in &mut experts {
+            let mut captions = std::collections::HashMap::<_, Tensor>::new();
+            let mut projected = Vec::with_capacity(cache.len());
+            for (_, caption, _) in &cache {
+                let context = match captions.get(&caption.id()) {
+                    Some(context) => context.clone(),
+                    None => {
+                        let context = expert.dit.prepare_training_context(caption)?;
+                        captions.insert(caption.id(), context.clone());
+                        context
+                    }
+                };
+                projected.push(context);
+            }
+            contexts.push(projected);
+        }
+        let cache: Vec<_> = cache
+            .into_iter()
+            .map(|(x0, _, weight)| (x0, weight))
+            .collect();
+
         // --- train loop (alternating experts) ---
         // Checkpointing is strictly request-controlled. Production 14B runs should opt in because
         // Candle's dense backward materializes frozen-base gradients, but a false flag must retain
@@ -1255,7 +1280,8 @@ impl WanMoeTrainer {
                                                // Index by the expert's own visit count, not the raw step — else on an even-sized
                                                // dataset each expert stays parity-locked to a disjoint half (sc-11157 / F-082).
             let ci = expert_cache_index(step, dual, &schedule);
-            let (x0, cap, mask_weight) = &cache[ci];
+            let (x0, mask_weight) = &cache[ci];
+            let cap = &contexts[ei][ci];
             let (cos, sin) = &ropes[ci % edges.len()];
             let band = experts[ei].band;
             let mut t = sample_band_timestep(
@@ -1993,8 +2019,18 @@ mod tests {
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-        let mut dit = WanTransformerTrain::new(&cfg, vb).unwrap();
+        let _fixture = WanTransformerTrain::new(&cfg, vb).unwrap();
         randomize_base(&vm, &dev);
+        let weights = vm
+            .data()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_tensor().detach()))
+            .collect();
+        let mut dit =
+            WanTransformerTrain::new(&cfg, VarBuilder::from_tensors(weights, DType::F32, &dev))
+                .unwrap();
         let suffixes: Vec<String> = WAN_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
         for v in &set.vars {
@@ -2002,6 +2038,29 @@ mod tests {
                 .unwrap();
         }
         let (x0, umt5, noise, cos, sin) = tiny_inputs(&cfg, &dev);
+        let (loss_ref, g_ref) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &umt5,
+            0.5,
+            &noise,
+            &cos,
+            &sin,
+            false,
+            None,
+            DType::F32,
+            false,
+            0,
+        )
+        .unwrap();
+        dit.prepare_training().unwrap();
+        let umt5 = dit.prepare_training_context(&umt5).unwrap();
+        assert_eq!(
+            dit.embed_text(&umt5).unwrap().id(),
+            umt5.id(),
+            "expert-local context reuse"
+        );
         let (loss_d, g_d) = compute_loss_grads(
             &dit,
             &set.vars,
@@ -2035,6 +2094,10 @@ mod tests {
         )
         .unwrap();
         assert!(
+            (loss_ref - loss_d).abs() < 1e-4,
+            "prepared/fused Wan loss {loss_ref} vs {loss_d}"
+        );
+        assert!(
             (loss_d - loss_c).abs() < 1e-4,
             "loss: dense {loss_d} vs checkpoint {loss_c}"
         );
@@ -2055,6 +2118,19 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap();
             assert_eq!(a.len(), b.len());
+            let reference = g_ref
+                .get(v.as_tensor())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            for (reference, packed) in reference.iter().zip(&a) {
+                assert!(
+                    (reference - packed).abs() < 1e-4,
+                    "prepared/fused Wan grad {i}: {reference} vs {packed}"
+                );
+            }
             for (x, y) in a.iter().zip(b.iter()) {
                 assert!(
                     (x - y).abs() < 1e-4,
