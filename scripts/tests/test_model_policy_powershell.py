@@ -207,6 +207,15 @@ $path=Join-Path ([IO.Path]::GetTempPath()) 'arbitrary.ps1'
 Start-Process -FilePath powershell -ArgumentList @('-NoProfile','-File',$path)
 ''', kind='proof')
 
+    def test_generated_path_separators_preserve_exact_source_identity(self):
+        source = r'''
+[IO.File]::WriteAllText('C:/fixture/child.ps1','Write-Output metadata')
+& powershell -File 'C:\fixture\child.ps1'
+'''
+        self.assert_safe(source)
+        self.assert_rejected(source.replace('Write-Output metadata', 'python model_inference_proofs.py'), kind='proof')
+        self.assert_rejected(source.replace("-File 'C:\\fixture\\", "-File 'C:\\different\\"), kind='unknown')
+
     def test_source_generated_grandchild_is_traced(self):
         source = '''
 $root=Join-Path ([IO.Path]::GetTempPath()) 'chain'

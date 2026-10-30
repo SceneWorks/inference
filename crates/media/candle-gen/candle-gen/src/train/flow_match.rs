@@ -849,6 +849,21 @@ pub trait FlowMatchTrainer {
     /// host).
     fn build_dit(&self, req: &TrainingRequest, device: &Device) -> Result<Self::Dit>;
 
+    /// Prepare run-owned invariant state after adapter installation and resume restoration.
+    /// Implementations may replace raw cache entries to release their source buffers. Never
+    /// detach a dependency owned by the optimizer; changing a target, weight, caption, mask,
+    /// layout, dtype or device must invalidate the corresponding preparation.
+    fn prepare_training(
+        &self,
+        _dit: &mut Self::Dit,
+        _cache: &mut [Self::Cached],
+        _aux: &mut Self::Aux,
+        _req: &TrainingRequest,
+        _device: &Device,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// One micro-step's forward+backward: build the noised latent for `cached` at the sampled timestep,
     /// predict + regress the velocity through `dit` (the per-model sign / timestep / checkpoint
     /// convention lives here), and return `(loss, grads)` keyed by `vars`. `sample` is the step's
@@ -963,7 +978,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
 
     // --- cache (latents + conditioning); the encoders load and drop inside the hook ---
     on_progress(TrainingProgress::LoadingModel);
-    let (cache, aux, sample_plan) = model.cache(req, device, on_progress)?;
+    let (mut cache, mut aux, sample_plan) = model.cache(req, device, on_progress)?;
     if req.cancel.is_cancelled() {
         return Err(CandleError::Canceled);
     }
@@ -1004,6 +1019,8 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             update_idx = restored.update_idx;
         }
     }
+
+    model.prepare_training(&mut dit, &mut cache, &mut aux, req, device)?;
 
     // --- train loop ---
     let mut accumulated: Option<GradStore> = None;

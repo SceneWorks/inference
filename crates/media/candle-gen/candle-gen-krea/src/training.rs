@@ -81,7 +81,7 @@ use crate::pipeline::krea_cfg_combine;
 use crate::schedule::{dynamic_mu, krea_sigmas};
 use crate::text_encoder::{KreaTeConfig, KreaTextEncoder};
 use crate::tokenizer::KreaTokenizer;
-use crate::train_dit::{KreaTrainDit, KREA_ATTN_TARGETS};
+use crate::train_dit::{KreaTrainDit, PreparedCaption, KREA_ATTN_TARGETS};
 
 /// VAE spatial downscale (the latent is image/8 per side) and latent channel count — the Turbo
 /// inference constants ([`crate::pipeline`]) the preview-sample render mirrors.
@@ -192,6 +192,7 @@ fn step_loss(
 /// rides in the final checkpoint segment, after the velocity head) carry it. `aux = None` ⇒ the
 /// legacy graph.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn compute_step_loss_grads(
     dit: &KreaTrainDit,
     lora_vars: &[Var],
@@ -205,16 +206,47 @@ fn compute_step_loss_grads(
     use_checkpoint: bool,
     aux: Option<&AuxStep<'_>>,
 ) -> Result<(StepLosses, GradStore)> {
+    compute_conditioned_step_loss_grads(
+        dit,
+        lora_vars,
+        x0,
+        &TrainingConditioning::Raw(cap.clone()),
+        sigma,
+        noise,
+        mae,
+        mask_weight,
+        compute_dtype,
+        use_checkpoint,
+        aux,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_conditioned_step_loss_grads(
+    dit: &KreaTrainDit,
+    lora_vars: &[Var],
+    x0: &Tensor,
+    conditioning: &TrainingConditioning,
+    sigma: f32,
+    noise: &Tensor,
+    mae: bool,
+    mask_weight: Option<&Tensor>,
+    compute_dtype: DType,
+    use_checkpoint: bool,
+    aux: Option<&AuxStep<'_>>,
+) -> Result<(StepLosses, GradStore)> {
     let device = x0.device();
     let (x_t_f32, target, timestep) = build_batch(x0, noise, sigma)?;
     let x_t = x_t_f32.to_dtype(compute_dtype)?;
-    let context = cap.unsqueeze(0)?; // (L, n, d) -> (1, L, n, d)
     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
 
+    let (combined, ctx) = match conditioning {
+        TrainingConditioning::Raw(cap) => dit.forward_pre_main(&x_t, &t, &cap.unsqueeze(0)?)?,
+        TrainingConditioning::Prepared(cap) => dit.forward_pre_main_caption(&x_t, &t, cap)?,
+    };
     if use_checkpoint {
         // The breakdown of the final segment's last evaluation, kept for reporting.
         let breakdown = std::cell::Cell::new(None);
-        let (combined, ctx) = dit.forward_pre_main(&x_t, &t, &context)?;
         let mut segs = dit.main_layer_segments(&ctx);
         // Final segment: the post-main head + the (raw-velocity) flow-match regression (and the
         // step's aux term) -> [loss].
@@ -247,7 +279,7 @@ fn compute_step_loss_grads(
         ))
     } else {
         // Dense backward: one monolithic `loss.backward()`. Raw DiT velocity (no negation).
-        let v = dit.forward(&x_t, &t, &context)?;
+        let v = dit.forward_main(combined, &ctx)?;
         let (loss, losses) = step_loss(&v, &target, &x_t_f32, sigma, mask_weight, mae, aux)?;
         let grads = loss.backward()?;
         Ok((losses, grads))
@@ -502,12 +534,57 @@ impl Trainer for KreaTrainer {
     }
 }
 
+// Subject masks affect the loss only, never caption fusion or RoPE. Each bucket
+// owns its loss mask and latent, while a frozen projected caption shares storage.
+enum TrainingConditioning {
+    Raw(Tensor),
+    Prepared(PreparedCaption),
+}
+
+pub struct KreaTrainingCached {
+    latent: Tensor,
+    conditioning: TrainingConditioning,
+    mask_weight: Option<Tensor>,
+}
+
+/// Replace caption stacks after target/resume installation; item clones across buckets
+/// share one projection. The raw tensors drop as each entry is replaced.
+fn prepare_training_cache(
+    dit: &KreaTrainDit,
+    cache: &mut [KreaTrainingCached],
+    cancel: &CancelFlag,
+) -> Result<usize> {
+    let mut prepared = HashMap::new();
+    for entry in cache {
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        if let TrainingConditioning::Raw(cap) = &entry.conditioning {
+            // Same item across buckets carries a Tensor clone (same identity).
+            // A changed caption has a new identity and cannot reuse stale output.
+            let id = cap.id();
+            if let std::collections::hash_map::Entry::Vacant(slot) = prepared.entry(id) {
+                slot.insert(dit.prepare_caption(&cap.unsqueeze(0)?)?);
+            }
+            if let Some(caption) = &prepared[&id] {
+                entry.conditioning = TrainingConditioning::Prepared(caption.clone());
+            }
+        }
+    }
+    let bytes: usize = prepared
+        .values()
+        .flatten()
+        .map(PreparedCaption::resident_bytes)
+        .sum();
+    eprintln!("krea training: {bytes} resident projected caption bytes (unique item storage)");
+    Ok(prepared.values().filter(|value| value.is_some()).count())
+}
+
 impl FlowMatchTrainer for KreaTrainer {
     type Dit = KreaTrainDit;
-    /// `(x0 latent [1,16,h,w], caption stack (L, num_text_layers, text_hidden), subject-mask loss
-    /// weight)`, all f32; the weight (broadcast to the latent shape) is `None` unless subject-masked
-    /// loss is on (sc-24828).
-    type Cached = (Tensor, Tensor, Option<Tensor>);
+    /// Run/item/bucket latent, caption and loss mask. Preparation replaces frozen raw
+    /// caption stacks with shared projected captions after adapter/resume installation.
+    type Cached = KreaTrainingCached;
     type Aux = ();
     /// Preview-sample render state: per-prompt pre-encoded conditioning + resident VAE decoder + the
     /// training-resolution edge (sc-8650).
@@ -546,7 +623,7 @@ impl FlowMatchTrainer for KreaTrainer {
 
     /// The cached clean latent is already the decoder's NCHW `[1, 16, h, w]` (f32).
     fn reference_latent(&self, cached: &Self::Cached, _aux: &()) -> Result<Tensor> {
-        Ok(cached.0.clone())
+        Ok(cached.latent.clone())
     }
 
     fn cache(
@@ -604,7 +681,11 @@ impl FlowMatchTrainer for KreaTrainer {
                     x0.dims(),
                     device,
                 )?;
-                cache.push((x0, cap.clone(), mask_weight));
+                cache.push(KreaTrainingCached {
+                    latent: x0,
+                    conditioning: TrainingConditioning::Raw(cap.clone()),
+                    mask_weight,
+                });
             }
         }
 
@@ -655,6 +736,21 @@ impl FlowMatchTrainer for KreaTrainer {
         Ok(KreaTrainDit::load(&dit_w, &dit_cfg)?)
     }
 
+    fn prepare_training(
+        &self,
+        dit: &mut KreaTrainDit,
+        cache: &mut [Self::Cached],
+        _aux: &mut (),
+        req: &TrainingRequest,
+        _device: &Device,
+    ) -> Result<()> {
+        dit.prepare_training_projections()?;
+        let started = std::time::Instant::now();
+        let captions = prepare_training_cache(dit, cache, &req.cancel)?;
+        eprintln!("krea training: prepared {captions} unique captions in {:?}; raw caption stacks released when frozen", started.elapsed());
+        Ok(())
+    }
+
     fn micro_step(
         &self,
         dit: &KreaTrainDit,
@@ -666,7 +762,8 @@ impl FlowMatchTrainer for KreaTrainer {
         sample: flow_match::StepSample<'_>,
         device: &Device,
     ) -> Result<(f32, GradStore)> {
-        let (x0, cap, mask_weight) = cached;
+        let x0 = &cached.latent;
+        let mask_weight = &cached.mask_weight;
         let mut sigma = flow_match::sample_unit_timestep(
             &cfg.timestep_type,
             &cfg.timestep_bias,
@@ -679,11 +776,11 @@ impl FlowMatchTrainer for KreaTrainer {
         }
         let noise =
             flow_match::sample_noise(x0.dims(), flow_match::noise_seed(cfg.seed, step), device)?;
-        let (losses, grads) = compute_step_loss_grads(
+        let (losses, grads) = compute_conditioned_step_loss_grads(
             dit,
             vars,
             x0,
-            cap,
+            &cached.conditioning,
             sigma,
             &noise,
             flow_match::is_mae(cfg),
@@ -880,6 +977,55 @@ mod tests {
             false,
         )
         .unwrap();
+        dit.prepare_training_projections().unwrap();
+        let mut cache: Vec<_> = (0..2)
+            .map(|_| KreaTrainingCached {
+                latent: x0.clone(),
+                conditioning: TrainingConditioning::Raw(cap.clone()),
+                mask_weight: None,
+            })
+            .collect();
+        assert_eq!(
+            prepare_training_cache(&dit, &mut cache, &CancelFlag::new()).unwrap(),
+            1,
+            "one frozen caption projection shared across buckets"
+        );
+        let conditioning = &cache[0].conditioning;
+        for checkpoint in [false, true] {
+            let (loss, gradients) = compute_conditioned_step_loss_grads(
+                &dit,
+                &set.vars,
+                &x0,
+                conditioning,
+                0.5,
+                &noise,
+                false,
+                None,
+                DType::F32,
+                checkpoint,
+                None,
+            )
+            .unwrap();
+            assert!(
+                (loss_d - loss.total).abs() < 1e-4,
+                "optimized loss parity checkpoint={checkpoint}"
+            );
+            for (idx, var) in set.vars.iter().enumerate() {
+                let difference = (g_d.get(var.as_tensor()).unwrap()
+                    - gradients.get(var.as_tensor()).unwrap())
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_vec0::<f32>()
+                .unwrap();
+                assert!(
+                    difference < 1e-4,
+                    "optimized var {idx} gradient parity checkpoint={checkpoint}: {difference}"
+                );
+            }
+        }
         let (loss_c, g_c) = compute_loss_grads(
             &dit,
             &set.vars,

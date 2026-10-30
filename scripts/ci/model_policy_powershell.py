@@ -12,6 +12,13 @@ import re
 UNKNOWN = '<unresolved-powershell>'
 
 
+def _generated_path(path):
+    # Join-Path uses '/', while pathlib renders $PSScriptRoot with '\\' on
+    # Windows. Both spellings identify the same source-written artifact. Keep
+    # its full path (never just the basename) when following generated children.
+    return str(path).replace('\\', '/')
+
+
 @dataclass(frozen=True)
 class Token:
     kind: str
@@ -633,14 +640,15 @@ class Analyzer:
                 for i, token in enumerate(args[:-1]):
                     if _is(token, '-outputassembly'): output = self.value(args[i + 1:i + 2])
                     if _is(token, '-typedefinition'): source = self.value(args[i + 1:i + 2])
-                if self.csharp(source): self.generated[str(output)] = ('native', source)
+                if self.csharp(source): self.generated[_generated_path(output)] = ('native', source)
                 continue
             if word in ('copy-item',):
                 args = list(pipeline[1:]); src, dst = UNKNOWN, UNKNOWN
                 for i, token in enumerate(args[:-1]):
                     if _is(token, '-literalpath') or _is(token, '-path'): src = self.value(args[i + 1:i + 2])
                     if _is(token, '-destination'): dst = self.value(args[i + 1:i + 2])
-                if str(src) in self.generated: self.generated[str(dst)] = self.generated[str(src)]
+                if _generated_path(src) in self.generated:
+                    self.generated[_generated_path(dst)] = self.generated[_generated_path(src)]
             if word in self.CMDLETS:
                 self.graph.finding('ordinary', self.chain, 'PowerShell metadata cmdlet ' + word); continue
             if head.adjacent_call and re.match(r'\$[\w:]+(?:\.[\w]+)+$', word) and len(pipeline) > 1 and isinstance(pipeline[1], Group):
@@ -669,7 +677,8 @@ class Analyzer:
             else: self.finding('unresolved executable method Start')
             return
         if name == 'writealltext' and owner in ('io.file', 'system.io.file') and len(args) >= 2:
-            if isinstance(args[0], str) and isinstance(args[1], str): self.generated[args[0]] = ('text', args[1])
+            if isinstance(args[0], str) and isinstance(args[1], str):
+                self.generated[_generated_path(args[0])] = ('text', args[1])
         if isinstance(owner, str) and owner.startswith('['): owner = owner.strip('[]').lower()
         if name == 'new' and isinstance(owner, str) and owner in self.TYPES: return
         if name not in self.METHODS or static and isinstance(owner, str) and owner not in self.TYPES:
@@ -687,14 +696,15 @@ class Analyzer:
             self.finding('unresolved invocation target'); return
         args = [str(part) for arg in args for part in (arg if isinstance(arg, list) else [arg])]
         exe = exe.strip('"'); leaf = exe.replace('\\', '/').rsplit('/', 1)[-1].lower()
-        generated = self.generated.get(exe)
+        generated_key = _generated_path(exe)
+        generated = self.generated.get(generated_key)
         if isinstance(generated, Alternatives):
             for variant in generated.values:
                 if isinstance(variant, tuple):
-                    self.generated[exe] = variant
+                    self.generated[generated_key] = variant
                     self.native(exe, args)
                 else: self.finding('conditionally unresolved generated source ' + exe)
-            self.generated[exe] = generated
+            self.generated[generated_key] = generated
             return
         if generated:
             if generated[0] == 'native':
@@ -722,7 +732,7 @@ class Analyzer:
         if leaf in ('cargo', 'cargo.exe') and args:
             candidate = 'cargo-' + args[0] + '.exe'
             prefix = str(self.env.get('$env:path', '')).split(';')[0]
-            source = self.generated.get(prefix.rstrip('/\\') + '/' + candidate)
+            source = self.generated.get(_generated_path(prefix.rstrip('/\\') + '/' + candidate))
             if isinstance(source, tuple) and source[0] == 'native':
                 self.graph.finding('ordinary', self.chain, 'Cargo external subcommand with source-inspected generated executable'); return
         if UNKNOWN in exe or exe.startswith('__PS_'):
@@ -734,6 +744,7 @@ class Analyzer:
         self.graph.command([exe, *args], self.chain, self.base)
 
     def generated_script(self, path, text, args):
+        path = _generated_path(path)
         key = (path, tuple(args))
         if key in self.active:
             self.finding('recursive generated script ' + path); return
@@ -750,8 +761,8 @@ class Analyzer:
         for path, entry in self.generated.items():
             if not isinstance(entry, tuple): continue
             kind, text = entry
-            if kind == 'text' and path in source and path.lower().endswith(('.bat', '.cmd')):
-                residue = source.replace(path, '').replace('"', '').strip()
+            if kind == 'text' and path in _generated_path(source) and path.lower().endswith(('.bat', '.cmd')):
+                residue = _generated_path(source).replace(path, '').replace('"', '').strip()
                 if re.fullmatch(r'(?:>nul)?\s*(?:&&\s*set)?', residue, re.I):
                     self.cmd(text); return
         lines, current, quoted = [], '', False

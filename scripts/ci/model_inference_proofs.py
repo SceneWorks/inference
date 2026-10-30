@@ -54,6 +54,7 @@ IRIS_CUDA_CORRECTNESS_PROOFS = frozenset(
     binding for binding in IRIS_QUANT_PROOFS if binding.startswith('candle-gen-iris/')
 )
 IRIS_CUDA_CORRECTNESS_PROFILE = 'non-isolated-correctness-low-activity'
+SHARED_CUDA_HEADROOM_PROFILE = 'non-isolated-correctness-headroom'
 
 
 def identity(row: dict) -> str:
@@ -287,7 +288,15 @@ def validate_configurations(row: dict, *, root: Path | None = None) -> None:
                                      if all(key in row for key in ('package', 'target', 'fqn'))
                                      and identity(row) in IRIS_CUDA_CORRECTNESS_PROOFS
                                      and name in ('source_selected_cuda', 'source_selected_cuda_gpu0') else None)
-        if (('cuda_activity_profile' in recipe) != (expected_activity_profile is not None)
+        shared_headroom = recipe.get('cuda_activity_profile') == SHARED_CUDA_HEADROOM_PROFILE
+        if shared_headroom and (expected_activity_profile is not None or route != 'candle-cuda'
+                                or recipe.get('required_cuda_physical_index') != 1
+                                or type(recipe.get('required_cuda_physical_index')) is not int
+                                or not isinstance(row.get('required_cuda_device_uuid'), str)
+                                or not re.fullmatch(r'GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}',
+                                                    row['required_cuda_device_uuid'])):
+            raise ValueError('shared CUDA headroom profile requires an explicit GPU1 UUID/index source binding')
+        if not shared_headroom and (('cuda_activity_profile' in recipe) != (expected_activity_profile is not None)
                 or recipe.get('cuda_activity_profile') != expected_activity_profile
                 or (expected_activity_profile is not None and route != 'candle-cuda')):
             raise ValueError('CUDA low-activity profile is limited to the exact Iris correctness recipes')

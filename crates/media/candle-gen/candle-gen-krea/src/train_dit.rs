@@ -45,6 +45,8 @@ use candle_gen::candle_nn::ops::{sigmoid, softmax};
 use candle_gen::candle_nn::Module;
 use candle_gen::train::gradient_checkpoint::Segment;
 use candle_gen::train::lora::{LoraHost, LoraLinear};
+use candle_gen::train::projection::FrozenProjectionPack;
+use std::sync::Arc;
 
 use crate::config::Krea2Config;
 use candle_gen::quant::QLinear as SharedQLinear;
@@ -66,12 +68,7 @@ pub const KREA_ATTN_TARGETS: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
 /// runs in f32 (the reference upcasts) and the result is cast back to `x`'s dtype, so it is numerically
 /// the same op the inference path applies — just one the autograd can traverse.
 pub(crate) fn rms_scale_diff(x: &Tensor, weight_f32: &Tensor, eps: f64) -> Result<Tensor> {
-    let dt = x.dtype();
-    let xf = x.to_dtype(DType::F32)?;
-    let hidden = xf.dim(D::Minus1)? as f64;
-    let norm = (xf.sqr()?.sum_keepdim(D::Minus1)? / hidden)?;
-    let y = xf.broadcast_div(&(norm + eps)?.sqrt()?)?;
-    y.broadcast_mul(weight_f32)?.to_dtype(dt)
+    candle_gen::train::norm::rms_norm_diff(x, weight_f32, eps)
 }
 
 /// The sequence-major GQA kv broadcast (`[b,s,hkv,hd] → [b,s,hkv·groups,hd]`) matching the inference
@@ -137,6 +134,12 @@ pub(crate) enum ComposableLinear {
 }
 
 impl ComposableLinear {
+    fn lora(&self) -> Option<&LoraLinear> {
+        match self {
+            Self::Adapt(linear) => Some(linear),
+            Self::ConvRot(_) => None,
+        }
+    }
     fn lora_mut(&mut self) -> Option<&mut LoraLinear> {
         match self {
             Self::Adapt(linear) => Some(linear),
@@ -239,6 +242,7 @@ fn proj_loader(packed: bool) -> ProjLoader {
 /// frozen `to_gate` / per-head `+1` RMSNorm — the trainable twin of [`crate::transformer::block`]'s
 /// `GatedAttention`.
 struct TrainAttention {
+    projections: Option<FrozenProjectionPack>,
     q: ComposableLinear,
     k: ComposableLinear,
     v: ComposableLinear,
@@ -269,6 +273,7 @@ impl TrainAttention {
     ) -> Result<Self> {
         let proj = proj_loader(packed);
         Ok(Self {
+            projections: None,
             q: proj(w, &format!("{prefix}.to_q"), false)?,
             k: proj(w, &format!("{prefix}.to_k"), false)?,
             v: proj(w, &format!("{prefix}.to_v"), false)?,
@@ -298,14 +303,48 @@ impl TrainAttention {
         Ok(())
     }
 
+    fn prepare_projections(&mut self) -> Result<()> {
+        // All four inputs are the same pre-attention state. Keep actual widths: Q/gate
+        // are H*D, K/V are KV*D. Packed and ConvRot weights keep their native paths.
+        self.projections = match (
+            self.q.lora_mut(),
+            self.k.lora_mut(),
+            self.v.lora_mut(),
+            self.gate.lora_mut(),
+        ) {
+            (Some(q), Some(k), Some(v), Some(gate)) => {
+                FrozenProjectionPack::prepare_lora(&mut [q, k, v, gate])?
+            }
+            _ => None,
+        };
+        Ok(())
+    }
+
     fn forward(&self, x: &Tensor, rope: Option<(&Tensor, &Tensor)>) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (nh, nkv, hd) = (self.heads, self.kv_heads, self.head_dim);
 
-        let q = self.q.forward(x)?.reshape((b, s, nh, hd))?;
-        let k = self.k.forward(x)?.reshape((b, s, nkv, hd))?;
-        let v = self.v.forward(x)?.reshape((b, s, nkv, hd))?;
-        let gate = self.gate.forward(x)?;
+        let projected = match &self.projections {
+            Some(pack) => pack.forward_lora(
+                x,
+                &[
+                    self.q.lora().unwrap(),
+                    self.k.lora().unwrap(),
+                    self.v.lora().unwrap(),
+                    self.gate.lora().unwrap(),
+                ],
+            )?,
+            None => vec![
+                self.q.forward(x)?,
+                self.k.forward(x)?,
+                self.v.forward(x)?,
+                self.gate.forward(x)?,
+            ],
+        };
+        let q = projected[0].reshape((b, s, nh, hd))?;
+        let k = projected[1].reshape((b, s, nkv, hd))?;
+        let v = projected[2].reshape((b, s, nkv, hd))?;
+        let gate = &projected[3];
 
         let q = rms_scale_diff(&q, &self.norm_q, self.eps)?;
         let k = rms_scale_diff(&k, &self.norm_k, self.eps)?;
@@ -327,7 +366,7 @@ impl TrainAttention {
         let o = sdpa_diff_budgeted(&q, &k, &v, self.scale, self.attn_budget)?;
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
 
-        let gated = (o * sigmoid(&gate)?)?;
+        let gated = (o * sigmoid(gate)?)?;
         self.o.forward(&gated)
     }
 }
@@ -423,7 +462,9 @@ pub struct MainCtx {
 /// Request-owned base/control conditioning. The text-fusion projection, joint RoPE, and encoded
 /// control-image tokens do not vary with Euler time or seed, so the control provider prepares them
 /// once before entering its denoise loop.
+#[derive(Clone)]
 pub(crate) struct PreparedControlConditioning {
+    lifecycle: Arc<()>,
     context: Tensor,
     pub(crate) ctrl_tokens: Tensor,
     cap_len: usize,
@@ -437,10 +478,34 @@ pub(crate) struct PreparedControlConditioning {
     rsin: Tensor,
 }
 
+/// Frozen caption output owned by one installed model lifecycle. No evolving joint
+/// state or image/time-dependent activation is retained here.
+#[derive(Clone)]
+pub(crate) struct PreparedCaption {
+    context: Tensor,
+    lifecycle: Arc<()>,
+}
+
+impl PreparedCaption {
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.context.elem_count() * self.context.dtype().size_in_bytes()
+    }
+    pub(crate) fn to_storage_device(&self, device: &Device) -> Result<Self> {
+        Ok(Self {
+            context: self.context.to_device(device)?,
+            lifecycle: self.lifecycle.clone(),
+        })
+    }
+}
+
 /// The trainable Krea 2 single-stream DiT. Built from the same mmap'd `transformer/` `Weights` the
 /// inference path loads — the frozen base is shared; only the attention projections grow a `Var`-backed
 /// LoRA residual (installed by [`build_lora_targets`](candle_gen::train::lora::build_lora_targets)).
 pub struct KreaTrainDit {
+    #[cfg(test)]
+    caption_projection_calls: std::cell::Cell<usize>,
+    lifecycle: Arc<()>,
+    conditioning_preparable: bool,
     cfg: Krea2Config,
     device: Device,
     dtype: DType,
@@ -504,6 +569,10 @@ impl KreaTrainDit {
             .reshape((1, 2, hidden))?;
 
         Ok(Self {
+            #[cfg(test)]
+            caption_projection_calls: std::cell::Cell::new(0),
+            lifecycle: Arc::new(()),
+            conditioning_preparable: true,
             cfg: cfg.clone(),
             device: w.device().clone(),
             dtype: w.dtype(),
@@ -558,30 +627,112 @@ impl KreaTrainDit {
         })
     }
 
+    /// Once per installed/resumed run. Source projections become views into the pack,
+    /// so the packed allocation replaces their dense bases rather than retaining copies.
+    pub(crate) fn prepare_training_projections(&mut self) -> Result<()> {
+        let mut count = 0;
+        let mut bytes = 0;
+        for block in &mut self.blocks {
+            if block.attn.projections.is_none() {
+                block.attn.prepare_projections()?;
+            }
+            if let Some(pack) = &block.attn.projections {
+                count += 1;
+                bytes += pack.resident_bytes();
+            }
+        }
+        eprintln!("krea training: {count} frozen Q/K/V/gate packs, {bytes} resident base bytes shared by source views");
+        Ok(())
+    }
+
+    fn project_caption(&self, context: &Tensor) -> Result<Tensor> {
+        #[cfg(test)]
+        self.caption_projection_calls
+            .set(self.caption_projection_calls.get() + 1);
+        let context = self.text_fusion.forward(&context.to_dtype(self.dtype)?)?;
+        let context = self.txt_in_norm.forward(&context)?;
+        self.txt_in_l2
+            .forward(&self.txt_in_l1.forward(&context)?.gelu()?)
+    }
+
+    /// Admission is conservative after an additive walk: it may have installed a
+    /// trainable text target or changed a frozen text weight. A tracked source must
+    /// also stay live. Raw training only installs adapters in the main block stack.
+    pub(crate) fn prepare_caption(&self, context: &Tensor) -> Result<Option<PreparedCaption>> {
+        if !self.conditioning_preparable || context.track_op() {
+            return Ok(None);
+        }
+        Ok(Some(PreparedCaption {
+            context: self.project_caption(context)?,
+            lifecycle: self.lifecycle.clone(),
+        }))
+    }
+
+    pub(crate) fn forward_pre_main_caption(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        prepared: &PreparedCaption,
+    ) -> Result<(Tensor, MainCtx)> {
+        if !Arc::ptr_eq(&self.lifecycle, &prepared.lifecycle)
+            || self.dtype != prepared.context.dtype()
+            || self.device.location() != prepared.context.device().location()
+            || latent.device().location() != self.device.location()
+        {
+            candle_gen::candle_core::bail!(
+                "krea training: stale prepared caption lifecycle, dtype, or device"
+            )
+        }
+        self.forward_pre_main_projected(latent, timestep, &prepared.context)
+    }
+
     /// Prepare the seed/step-invariant text/control state for a strict-pose request.
     pub(crate) fn prepare_control_conditioning(
         &self,
         context: &Tensor,
         ctrl_latent: &Tensor,
     ) -> candle_gen::Result<PreparedControlConditioning> {
-        let (_, channels, h, w) = ctrl_latent.dims4()?;
+        let caption = PreparedCaption {
+            context: self.project_caption(context)?,
+            lifecycle: self.lifecycle.clone(),
+        };
+        self.prepare_control_from_caption(&caption, ctrl_latent)
+    }
+
+    pub(crate) fn prepare_control_from_caption(
+        &self,
+        caption: &PreparedCaption,
+        ctrl_latent: &Tensor,
+    ) -> candle_gen::Result<PreparedControlConditioning> {
+        if !Arc::ptr_eq(&self.lifecycle, &caption.lifecycle)
+            || caption.context.dtype() != self.dtype
+        {
+            return Err(candle_gen::CandleError::Msg(
+                "krea control: stale caption lifecycle".into(),
+            ));
+        }
+        let (batch, channels, h, w) = ctrl_latent.dims4()?;
         let p = self.cfg.patch_size;
-        if channels != self.cfg.in_channels / (p * p) || h == 0 || w == 0 {
+        if channels != self.cfg.in_channels / (p * p)
+            || h == 0
+            || w == 0
+            || h % p != 0
+            || w % p != 0
+            || batch != caption.context.dim(0)?
+            || caption.context.dim(2)? != self.cfg.hidden_size
+            || ctrl_latent.device().location() != self.device.location()
+        {
             return Err(candle_gen::CandleError::Msg(
                 "krea control: prepared conditioning has an invalid control latent geometry".into(),
             ));
         }
         let (ht, wt) = (h / p, w / p);
-        let cap_len = context.dim(1)?;
-        let context = context.to_dtype(self.dtype)?;
-        let context = self.text_fusion.forward(&context)?;
-        let context = self.txt_in_norm.forward(&context)?;
-        let context = self
-            .txt_in_l2
-            .forward(&self.txt_in_l1.forward(&context)?.gelu()?)?;
+        let cap_len = caption.context.dim(1)?;
+        let context = caption.context.to_device(&self.device)?;
         let ctrl_tokens = self.embed_latent(ctrl_latent)?;
         let (rcos, rsin) = self.rope_tables(cap_len, ht, wt)?;
         Ok(PreparedControlConditioning {
+            lifecycle: self.lifecycle.clone(),
             context,
             ctrl_tokens,
             cap_len,
@@ -605,7 +756,8 @@ impl KreaTrainDit {
         let (_, channels, h, w) = latent.dims4()?;
         let p = self.cfg.patch_size;
         let latent_ch = self.cfg.in_channels / (p * p);
-        if prepared.latent_ch != latent_ch
+        if !Arc::ptr_eq(&self.lifecycle, &prepared.lifecycle)
+            || prepared.latent_ch != latent_ch
             || channels != prepared.latent_ch
             || (h / p, w / p) != (prepared.ht, prepared.wt)
             || h % p != 0
@@ -613,6 +765,12 @@ impl KreaTrainDit {
             || self.dtype != prepared.dtype
             || self.device.location() != prepared.device
             || latent.device().location() != prepared.device
+            || prepared.context.device().location() != prepared.device
+            || prepared.ctrl_tokens.device().location() != prepared.device
+            || prepared.rcos.device().location() != prepared.device
+            || prepared.rsin.device().location() != prepared.device
+            || prepared.context.dtype() != self.dtype
+            || prepared.ctrl_tokens.dtype() != self.dtype
         {
             return Err(candle_gen::CandleError::Msg(
                 "krea control: prepared conditioning request identity, geometry, dtype, or device does not match latent".into(),
@@ -654,15 +812,35 @@ impl KreaTrainDit {
         timestep: &Tensor,
         context: &Tensor,
     ) -> Result<(Tensor, MainCtx)> {
+        self.forward_pre_main_projected(latent, timestep, &self.project_caption(context)?)
+    }
+
+    fn forward_pre_main_projected(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+    ) -> Result<(Tensor, MainCtx)> {
         let cfg = &self.cfg;
         let p = cfg.patch_size;
         let dt = self.dtype;
-        let (_, _, h, w) = latent.dims4()?;
+        let (batch, channels, h, w) = latent.dims4()?;
+        if h == 0
+            || w == 0
+            || h % p != 0
+            || w % p != 0
+            || channels != cfg.in_channels / (p * p)
+            || context.dim(0)? != batch
+            || context.dim(2)? != cfg.hidden_size
+        {
+            candle_gen::candle_core::bail!(
+                "krea training: conditioning batch or latent bucket geometry mismatch"
+            )
+        }
         let (ht, wt) = (h / p, w / p);
         let img_len = ht * wt;
         let latent_ch = cfg.in_channels / (p * p);
         let cap_len = context.dim(1)?;
-        let context = context.to_dtype(dt)?;
 
         let img = self.img_in.forward(&patchify(&latent.to_dtype(dt)?, p)?)?;
 
@@ -672,13 +850,7 @@ impl KreaTrainDit {
             .forward(&self.time_embed_l1.forward(&t_sin)?.gelu()?)?;
         let tvec = self.time_mod_proj.forward(&t.gelu()?)?;
 
-        let ctx = self.text_fusion.forward(&context)?;
-        let ctx = self.txt_in_norm.forward(&ctx)?;
-        let ctx = self
-            .txt_in_l2
-            .forward(&self.txt_in_l1.forward(&ctx)?.gelu()?)?;
-
-        let combined = Tensor::cat(&[&ctx, &img], 1)?;
+        let combined = Tensor::cat(&[context, &img], 1)?;
         let (rcos, rsin) = self.rope_tables(cap_len, ht, wt)?;
         Ok((
             combined,
@@ -731,11 +903,15 @@ impl KreaTrainDit {
     /// [`Krea2Transformer::forward`](crate::transformer::Krea2Transformer::forward), built from the
     /// composable trainable blocks. Returns the **raw** velocity `[b, 16, H, W]` (no negation).
     pub fn forward(&self, latent: &Tensor, timestep: &Tensor, context: &Tensor) -> Result<Tensor> {
-        let (mut combined, ctx) = self.forward_pre_main(latent, timestep, context)?;
+        let (combined, ctx) = self.forward_pre_main(latent, timestep, context)?;
+        self.forward_main(combined, &ctx)
+    }
+
+    pub(crate) fn forward_main(&self, mut combined: Tensor, ctx: &MainCtx) -> Result<Tensor> {
         for blk in &self.blocks {
             combined = blk.forward(&combined, &ctx.tvec, &ctx.rcos, &ctx.rsin)?;
         }
-        self.velocity_out(&combined, &ctx)
+        self.velocity_out(&combined, ctx)
     }
 
     /// The single-stream stack, exposed for the pose-ControlNet spike (sc-8460): the control branch
@@ -791,7 +967,10 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
         &mut self,
         f: &mut dyn FnMut(&str, &mut dyn crate::adapters::AdditiveProj) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
+        self.lifecycle = Arc::new(());
+        self.conditioning_preparable = false;
         for (i, blk) in self.blocks.iter_mut().enumerate() {
+            blk.attn.projections = None;
             let p = format!("transformer_blocks.{i}");
             for (path, proj) in [
                 (format!("{p}.attn.to_q"), &mut blk.attn.q),
@@ -843,6 +1022,143 @@ mod tests {
     use crate::adapters::{install_additive, AdditiveDit};
     use candle_gen::gen_core::{AdapterKind, AdapterSpec};
     use std::cell::Cell;
+
+    #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
+    fn frozen_caption_lifecycle_and_live_input_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut dit, cfg, _) = crate::testfix::tiny_dit(&tmp);
+        let (latent, cap, _) = crate::testfix::tiny_batch(&cfg);
+        let context = cap.unsqueeze(0).unwrap();
+        let t = Tensor::from_vec(vec![0.5_f32], 1, &Device::Cpu).unwrap();
+        let prepared = dit.prepare_caption(&context).unwrap().unwrap();
+        assert_eq!(dit.caption_projection_calls.get(), 1);
+        for _ in 0..2 {
+            let (got, _) = dit
+                .forward_pre_main_caption(&latent, &t, &prepared)
+                .unwrap();
+            let (reference, _) = dit.forward_pre_main(&latent, &t, &context).unwrap();
+            let delta = (&got - &reference)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_vec0::<f32>()
+                .unwrap();
+            assert_eq!(delta, 0.0);
+        }
+        assert_eq!(
+            dit.caption_projection_calls.get(),
+            3,
+            "prepared calls never reproject"
+        );
+        let changed = (&context + 0.1).unwrap();
+        let changed = dit.prepare_caption(&changed).unwrap().unwrap();
+        assert!(
+            (&changed.context - &prepared.context)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_vec0::<f32>()
+                .unwrap()
+                > 0.0
+        );
+
+        // Geometry lives in the existing bucket-keyed RopeCache, independently of text.
+        let channels = cfg.in_channels / (cfg.patch_size * cfg.patch_size);
+        let other_bucket = Tensor::zeros((1, channels, 6, 4), DType::F32, &Device::Cpu).unwrap();
+        let (_, geometry) = dit
+            .forward_pre_main_caption(&other_bucket, &t, &prepared)
+            .unwrap();
+        assert_eq!(
+            (geometry.ht, geometry.wt),
+            (6 / cfg.patch_size, 4 / cfg.patch_size)
+        );
+        let live = candle_gen::candle_core::Var::from_tensor(&context).unwrap();
+        assert!(
+            dit.prepare_caption(live.as_tensor()).unwrap().is_none(),
+            "tracked text cannot be detached"
+        );
+        let derived = (live.as_tensor() * 2.0).unwrap();
+        assert!(dit.prepare_caption(&derived).unwrap().is_none());
+
+        let tmp2 = tempfile::tempdir().unwrap();
+        let (other, _, _) = crate::testfix::tiny_dit(&tmp2);
+        assert!(other
+            .forward_pre_main_caption(&latent, &t, &prepared)
+            .is_err());
+        let mut wrong_dtype = prepared.clone();
+        wrong_dtype.context = wrong_dtype.context.to_dtype(DType::BF16).unwrap();
+        assert!(dit
+            .forward_pre_main_caption(&latent, &t, &wrong_dtype)
+            .is_err());
+
+        // An additive install/fold visit can change text weights or target ownership.
+        // Reject all previous state and keep future text execution live conservatively.
+        let mut factors = None;
+        dit.visit_additive(&mut |path, projection| {
+            if path == "txt_in.linear_2" {
+                let (out, input) = projection.out_in();
+                let a = candle_gen::candle_core::Var::from_tensor(&Tensor::randn(
+                    0_f32,
+                    0.1_f32,
+                    (input, 2),
+                    &Device::Cpu,
+                )?)?;
+                let b = candle_gen::candle_core::Var::from_tensor(&Tensor::randn(
+                    0_f32,
+                    0.1_f32,
+                    (2, out),
+                    &Device::Cpu,
+                )?)?;
+                projection.add_lora(a.as_tensor().clone(), b.as_tensor().clone(), 1.0)?;
+                factors = Some((a, b));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(dit
+            .forward_pre_main_caption(&latent, &t, &prepared)
+            .is_err());
+        assert!(dit.prepare_caption(&context).unwrap().is_none());
+        let (a, b) = factors.expect("actual text target installed");
+        let before = dit.project_caption(&context).unwrap();
+        let grads = before.sum_all().unwrap().backward().unwrap();
+        for factor in [&a, &b] {
+            assert!(
+                grads
+                    .get(factor.as_tensor())
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max_all()
+                    .unwrap()
+                    .to_vec0::<f32>()
+                    .unwrap()
+                    > 0.0
+            );
+        }
+        // Optimizer mutation bypasses model visitation; admission remains disabled.
+        b.set(&(b.as_tensor() + 0.1).unwrap()).unwrap();
+        assert!(dit.prepare_caption(&context).unwrap().is_none());
+        let after = dit.project_caption(&context).unwrap();
+        assert!(
+            (&before - &after)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_vec0::<f32>()
+                .unwrap()
+                > 0.0
+        );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train_dit::tests::frozen_caption_lifecycle_and_live_input_guard");
+    }
 
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
