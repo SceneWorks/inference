@@ -27,6 +27,13 @@ thread_local! {
     }
 }
 
+/// Whether backward retains its gradient graph on this thread. Custom operations
+/// with first-order-only backward implementations can preserve this opt-in by
+/// using a composable fallback. Shares backward's cached environment setting.
+pub fn grad_do_not_detach() -> bool {
+    CANDLE_GRAD_DO_NOT_DETACH.with(|b| *b)
+}
+
 impl Tensor {
     /// Return all the nodes that lead to this value in a topologically sorted vec, the first
     /// elements having dependencies on the latter ones, e.g. the first element if any is the
@@ -188,7 +195,7 @@ impl Tensor {
             // do not have to allocate too often. Here we just call `.detach` to avoid computing
             // the backprop graph of the backprop itself. This would be an issue for second order
             // derivatives but these are out of scope at the moment.
-            let do_not_detach = CANDLE_GRAD_DO_NOT_DETACH.with(|b| *b);
+            let do_not_detach = grad_do_not_detach();
             let grad = if do_not_detach { grad } else { grad.detach() };
             if let Some(op) = node.op() {
                 match op {
@@ -865,7 +872,7 @@ impl GradStore {
                 Entry::Occupied(mut entry) => {
                     let new_grad = entry.get().add(&grad)?;
 
-                    let do_not_detach = CANDLE_GRAD_DO_NOT_DETACH.with(|b| *b);
+                    let do_not_detach = grad_do_not_detach();
                     let new_grad = if do_not_detach {
                         new_grad
                     } else {

@@ -63,7 +63,7 @@ pub(crate) fn try_forward(
     if plan.is_cancelled() {
         return Err(crate::CandleError::Canceled);
     }
-    if mask.is_some() || !eligible(q, k, v, scale) {
+    if candle_core::backprop::grad_do_not_detach() || mask.is_some() || !eligible(q, k, v, scale) {
         return Ok(None);
     }
     // Same per-query standard-softmax arithmetic/dtype. Internal query tiles

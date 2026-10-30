@@ -42,7 +42,7 @@ use candle_gen::{CandleError, Result};
 use crate::config::Krea2Config;
 use crate::loader::{rms_scale_weight, Weights};
 use crate::train_dit::{repeat_kv, rms_scale_diff, sdpa_diff_budgeted, KreaTrainDit, MainCtx};
-use crate::transformer::rope::apply_interleaved_rope;
+use candle_gen::train::krea_ops::rotary_interleaved as apply_interleaved_rope;
 
 /// Default residual RMS clamp τ. The run-3 probe showed `τ = 1.0` is destruction-permissive: the
 /// block-0 projection regrew to the ceiling even at lr 2e-5 (AdamW's normalized steps reach unit

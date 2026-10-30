@@ -1577,7 +1577,16 @@ jobs:
           type "%RUNNER_TEMP%\reference-attention-proof.log"
           findstr /c:"test result: ok. 1 passed; 0 failed; 0 ignored;" "%RUNNER_TEMP%\reference-attention-proof.log" >nul
           if errorlevel 1 exit /b 1
-      - name: Prove Krea normalization and rotary ownership raw CUDA arithmetic
+      - name: Prove shared RMS ownership and rounding contracts raw CUDA arithmetic
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked -p candle-gen --lib --features cuda train::norm::ownership_tests::shared_rms_contracts_match_composable -- --exact --ignored --nocapture > "%RUNNER_TEMP%\shared-rms-proof.log" 2>&1
+          if errorlevel 1 (type "%RUNNER_TEMP%\shared-rms-proof.log" & exit /b 1)
+          type "%RUNNER_TEMP%\shared-rms-proof.log"
+          findstr /c:"test result: ok. 1 passed; 0 failed; 0 ignored;" "%RUNNER_TEMP%\shared-rms-proof.log" >nul
+          if errorlevel 1 exit /b 1
+      - name: Prove Krea Raw and Control rotary ownership raw CUDA arithmetic
         shell: cmd
         run: |
           call "%VCVARS%"
@@ -1585,6 +1594,17 @@ jobs:
           if errorlevel 1 (type "%RUNNER_TEMP%\krea-ops-proof.log" & exit /b 1)
           type "%RUNNER_TEMP%\krea-ops-proof.log"
           findstr /c:"test result: ok. 1 passed; 0 failed; 0 ignored;" "%RUNNER_TEMP%\krea-ops-proof.log" >nul
+          if errorlevel 1 exit /b 1
+      - name: Prove graph-retaining norm rotary and Reference fallbacks
+        shell: cmd
+        env:
+          CANDLE_GRAD_DO_NOT_DETACH: "1"
+        run: |
+          call "%VCVARS%"
+          cargo test --locked -p candle-gen --lib --features cuda train::norm::ownership_tests::graph_retaining_norm_rope_attention_fallbacks -- --exact --ignored --nocapture > "%RUNNER_TEMP%\graph-retaining-proof.log" 2>&1
+          if errorlevel 1 (type "%RUNNER_TEMP%\graph-retaining-proof.log" & exit /b 1)
+          type "%RUNNER_TEMP%\graph-retaining-proof.log"
+          findstr /c:"test result: ok. 1 passed; 0 failed; 0 ignored;" "%RUNNER_TEMP%\graph-retaining-proof.log" >nul
           if errorlevel 1 exit /b 1
       - name: Prove half precision adapter rounding raw CUDA arithmetic
         shell: cmd
