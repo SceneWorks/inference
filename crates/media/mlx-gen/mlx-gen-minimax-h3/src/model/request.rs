@@ -304,7 +304,7 @@ pub(crate) fn request_references(req: &GenerationRequest) -> Result<Option<Ref2V
 /// Resolve the request's geometry: the canvas, and the frame count from `frames` (exact) or
 /// `duration` (aligned).
 pub(crate) fn request_geometry(req: &GenerationRequest) -> Result<RequestGeometry> {
-    // The shared resolver the Candle engine and allocation admission (`gen_core::veda::workspace`)
+    // The shared resolver the Candle engine and allocation admission (`gen_core_h3::veda::workspace`)
     // use, so the three can never resolve one request to different frame counts (sc-26691).
     let frames = mlx_gen::gen_core::h3_memory::resolve_request_frames(req.frames, req.duration)?;
     let frames = i32::try_from(frames)

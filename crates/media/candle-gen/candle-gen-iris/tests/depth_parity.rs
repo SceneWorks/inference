@@ -10,13 +10,13 @@
 //! * bf16 release policy (bf16 operands, f32 accumulation on CPU): 5e-2.
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::iris::depth::{
-    plan_depth_input, prepare_depth_input, DepthRequest, DepthResolution, IrisDepthEstimator,
-};
-use candle_gen::gen_core::iris::downstream::TaskExport;
-use candle_gen::gen_core::iris::{IrisTask, TEXT_ENCODER_COMPONENT};
 use candle_gen::gen_core::{Image, LoadSpec, Progress, WeightsSource};
 use candle_gen_iris::depth::{load, load_depth_export, DEPTH_MODEL_ID};
+use gen_core_iris::depth::{
+    plan_depth_input, prepare_depth_input, DepthRequest, DepthResolution, IrisDepthEstimator,
+};
+use gen_core_iris::downstream::TaskExport;
+use gen_core_iris::{IrisTask, TEXT_ENCODER_COMPONENT};
 
 use crate::common::{assert_close, fixture, fixtures, host_f32, tiny_backbone, Fixture};
 

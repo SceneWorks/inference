@@ -562,7 +562,7 @@ impl PackedLayout {
     /// Packed conditioning segments [`Self::veda_layout`] leaves as dense globals, each with
     /// the engine-observed reason, so an execution report can say why they were not tiled.
     pub fn veda_dense_segments(&self) -> Vec<String> {
-        use mlx_gen::gen_core::veda::contract::segment_grid;
+        use gen_core_h3::veda::contract::segment_grid;
         let mut reasons = Vec::new();
         let audio = self.num_condition_audio_rows as usize;
         if audio > 0 {
@@ -587,10 +587,8 @@ impl PackedLayout {
     pub fn veda_layout(
         &self,
         shape: mlx_gen::gen_core::veda::contract::TileShape,
-    ) -> Result<mlx_gen::gen_core::veda::contract::Layout> {
-        use mlx_gen::gen_core::veda::contract::{
-            least_padding_shape, segment_grid, Layout, TiledSpan,
-        };
+    ) -> Result<gen_core_h3::veda::contract::Layout> {
+        use gen_core_h3::veda::contract::{least_padding_shape, segment_grid, Layout, TiledSpan};
         let mut spans = Vec::new();
         for range in &self.condition_spans {
             if let Some(grid) = segment_grid(&self.position_rows[range.clone()]) {
@@ -855,7 +853,8 @@ mod tests {
 
     #[test]
     fn veda_native_layout_retains_reference_global_and_target_rows() {
-        use mlx_gen::gen_core::veda::contract::{Budget, TileShape};
+        use gen_core_h3::veda::contract::Budget;
+        use mlx_gen::gen_core::veda::contract::TileShape;
         for anchors in [
             vec![],
             vec![KeyframeAnchor::First],

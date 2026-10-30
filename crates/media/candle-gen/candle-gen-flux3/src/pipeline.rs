@@ -4,14 +4,14 @@
 //! `timesteps(steps, alpha)` → the autoencoder decode → RGB8.
 //!
 //! The flow-map schedule, the target-time conditioning and the `dt · velocity` rounding are the
-//! frozen source's, not FLUX.2's: the loop is written here against `gen_core::flux3` rather than
+//! frozen source's, not FLUX.2's: the loop is written here against `gen_core_flux3` rather than
 //! routed through the shared curated-sampler driver, whose sigma conventions do not express the
 //! flow map's `(t, t_ref)` pair.
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::flux3::{latent_ids, scaled_image_ids, GenerationParams};
 use candle_gen::gen_core::{CancelFlag, Image};
 use candle_gen::{CandleError as Error, Result};
+use gen_core_flux3::{latent_ids, scaled_image_ids, GenerationParams};
 use rand::SeedableRng;
 
 use crate::autoencoder::Flux3AutoEncoder;

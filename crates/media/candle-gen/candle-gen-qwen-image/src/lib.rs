@@ -9,7 +9,7 @@
 //! 34 template tokens dropped → 3584-wide `prompt_embeds`) → the MMDiT (interleaved 3-axis RoPE,
 //! dynamic-μ flow-match Euler, **true CFG** with norm-rescale) → the AutoencoderKLQwenImage decoder,
 //! registered under `"qwen_image"`. Deterministic CPU-seeded noise (sc-3673); tokenization reuses
-//! gen-core's [`TextTokenizer`] with [`ChatTemplate::QwenImage`](candle_gen::gen_core::tokenizer::ChatTemplate::QwenImage).
+//! gen-core's [`TextTokenizer`] with [`ChatTemplate::QwenImage`](gen_core_tokenizer::ChatTemplate::QwenImage).
 //!
 //! **Dtypes:** the Qwen2.5-VL encoder runs in **f32** (the fork rounds only the embeds to bf16) and
 //! the 20B MMDiT in **bf16** (its native checkpoint dtype) — ~74 GB resident, which fits the 96 GB
@@ -230,7 +230,6 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::tiling::TilingConfig;
-use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
     ModelDescriptor, PidWeights, Progress, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
@@ -238,6 +237,7 @@ use candle_gen::gen_core::{
 };
 use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_pid::PidEngine;
+use gen_core_tokenizer::TextTokenizer;
 
 /// The PiD backbone (latent-space) tag for the Qwen-Image VAE — resolves to the `qwenimage` `2kto4k`
 /// student + 4× SR (`candle_gen_pid::registry`). Shared with Krea (which reuses [`vae::QwenVae`]).

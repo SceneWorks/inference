@@ -78,7 +78,7 @@ fn expert_schedule_crossing(steps: usize, sampler: Sampler, shift: f64) -> gen_c
 struct SharedComponents {
     te: Arc<Umt5Encoder>,
     vae: Arc<ProviderVae>,
-    tok: Arc<candle_gen::gen_core::tokenizer::TextTokenizer>,
+    tok: Arc<gen_core_tokenizer::TextTokenizer>,
 }
 
 #[derive(Clone)]
@@ -157,7 +157,7 @@ impl Pipeline {
             .unwrap_or(&self.root)
     }
 
-    fn build_tokenizer(&self) -> CResult<candle_gen::gen_core::tokenizer::TextTokenizer> {
+    fn build_tokenizer(&self) -> CResult<gen_core_tokenizer::TextTokenizer> {
         crate::text_encode::build_umt5_tokenizer(
             self.shared_root(),
             &self.text_cfg,

@@ -1,0 +1,33 @@
+[package]
+name = "sceneworks-gen-core-iris"
+version = "0.1.0"
+edition = "2021"
+description = "Tensor-free Iris inference and training contracts (restoration, depth, downstream tasks, trainer controllers) on top of gen-core."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["iris", "training", "restoration", "generative"]
+categories = ["science"]
+
+[lib]
+# Neutral import path: `use gen_core_iris::…`, mirroring the `gen_core` lib-name convention.
+name = "gen_core_iris"
+
+[features]
+# Manual source-bound model input receipts on the reader sites this crate owns; no ordinary
+# runtime/read behavior changes.
+model-inference-proof = ["sceneworks-gen-core/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
+
+[dependencies]
+# The backend-neutral contract this crate builds on. Sibling crates depend on gen-core; gen-core
+# never depends on them (sc-27316). Tensor-free, like gen-core.
+sceneworks-gen-core = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
+# Header-only image validation and restoration/depth sample decode in the trainer controllers.
+image = { workspace = true, features = ["bmp", "gif", "tiff", "webp"] }
+safetensors = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

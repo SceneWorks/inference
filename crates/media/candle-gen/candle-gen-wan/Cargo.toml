@@ -28,9 +28,12 @@ sha2 = { workspace = true, optional = true }
 # The shared epic-2123 aux-loss builder (sc-24830): config -> PerceptualPath (depth anchoring
 # through the TAEHV tiny video decoder).
 candle-gen-perceptual = { path = "../candle-gen-perceptual" }
+sceneworks-gen-core-tokenizer = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
+sceneworks-gen-core-memory-wan = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen-depth/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen/model-inference-proof"]
+model-inference-proof = ["candle-gen-depth/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal", "candle-gen-perceptual/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-perceptual/cuda"]

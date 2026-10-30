@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor, D};
-use candle_gen::gen_core::iris::restoration_train::{
+use candle_gen::{CandleError as Error, Result};
+use gen_core_iris::restoration_train::{
     lpips_lin_keys, vgg_slices, VggOp, LPIPS_NORM_EPS, LPIPS_SCALE, LPIPS_SHIFT, VGG16_WIDTHS,
 };
-use candle_gen::{CandleError as Error, Result};
 
 enum Op {
     ConvRelu(Tensor, Tensor),

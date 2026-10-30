@@ -46,8 +46,6 @@ use candle_gen::candle_core::{DType, Device, Tensor, Var};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::tokenizer::TextTokenizer;
-use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport,
     TrainingRequest,
@@ -70,6 +68,8 @@ use candle_gen::train::perceptual::{
 use candle_gen::train::schedule::schedule_updates;
 use candle_gen::train::taehv::TaehvConfig;
 use candle_gen::{CandleError, Result};
+use gen_core_tokenizer::TextTokenizer;
+use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
 
 use crate::config::{
     TextEncoderConfig, TransformerConfig, Vae16Config, VaeConfig, I2V_14B_BOUNDARY, MODEL_ID,
@@ -385,7 +385,7 @@ fn compute_step_loss_grads(
 fn prepare_perceptual_references<'a>(
     path: &mut PerceptualPath,
     clean: impl Iterator<Item = &'a Tensor>,
-    masks: Option<candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks>,
+    masks: Option<gen_core_train::subject_mask::PerceptualSubjectMasks>,
 ) -> Result<()> {
     path.attach_subject_masks(masks);
     for (entry, x0) in clean.enumerate() {
@@ -473,7 +473,7 @@ fn perceptual_alternation(epoch_len: usize, accum: u32, n_experts: usize) -> Aux
 
 /// The perceptual plan of one micro-step with every aux loss's window confined to the routed
 /// expert's noise `band` (epic 2123 E8) — the shared gen-core
-/// [`plan_in_band`](candle_gen::gen_core::train::plan_in_band) policy over this path's schedules, minus the
+/// [`plan_in_band`](gen_core_train::plan_in_band) policy over this path's schedules, minus the
 /// losses unusable for `entry`. With the full band `(0, 1)` this is exactly
 /// [`PerceptualPath::plan`].
 fn plan_in_band(
@@ -489,10 +489,7 @@ fn plan_in_band(
     let usable = (0..schedules.len())
         .map(|i| path.is_usable(entry, i))
         .collect::<Result<Vec<bool>>>()?;
-    Ok(
-        candle_gen::gen_core::train::plan_in_band(&schedules, key, band, t)
-            .without_skipped(|i| !usable[i]),
-    )
+    Ok(gen_core_train::plan_in_band(&schedules, key, band, t).without_skipped(|i| !usable[i]))
 }
 
 /// Tokenize + UMT5-encode `caption` → `[1, 512, 4096]` (f32, zero-padded to 512 — the same context
@@ -954,12 +951,12 @@ impl Trainer for WanMoeTrainer {
         // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA
         // adapter the caller did not ask for (F-006/F-055).
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core_train::validate_control_request(self.descriptor(), req)?;
+        gen_core_train::validate_full_finetune_request(self.descriptor(), req)?;
         // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_edit_request(self.descriptor(), req)?;
         if !self.descriptor.supports_lokr && req.config.network_type == NetworkType::Lokr {
             return Err(gen_core::Error::Unsupported(format!(
                 "{} trainer is LoRA-only",
@@ -1012,7 +1009,7 @@ impl Trainer for WanMoeTrainer {
     ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
         let mut warnings = Vec::new();
         let output = self.train_impl(req, on_progress, &mut warnings)?;
@@ -1167,7 +1164,7 @@ impl WanMoeTrainer {
         if let Some(path) = perceptual.as_mut() {
             // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
             // cropped like the image and resampled onto its decoded size.
-            let masks = candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::load(
+            let masks = gen_core_train::subject_mask::PerceptualSubjectMasks::load(
                 "wan trainer",
                 &req.items,
                 cfg,
@@ -2765,9 +2762,9 @@ mod subject_mask_reference_tests {
     use std::any::Any;
     use std::sync::{Arc, Mutex};
 
-    use candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks;
     use candle_gen::train::perceptual::{AuxLoss, AuxLossSchedule, LossReference, PerceptualLoss};
     use candle_gen::train::taehv::{splitmix_uniform, synthetic_taehv_weights, TaehvDecoder};
+    use gen_core_train::subject_mask::PerceptualSubjectMasks;
 
     type Seen = Arc<Mutex<Vec<Option<(Vec<usize>, Vec<f32>)>>>>;
 

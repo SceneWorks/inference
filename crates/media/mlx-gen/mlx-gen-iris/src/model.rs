@@ -4,11 +4,11 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use gen_core::iris::{
+use gen_core::GenerationReport;
+use gen_core_iris::{
     validate_generation_request, GenerationParams, GenerationResources, IrisConfig, IrisTask,
     FAMILY, GENERATION_MODEL_ID, SAMPLERS,
 };
-use gen_core::GenerationReport;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     default_seed, gen_core, AdapterApplyReport, AdapterSpec, Capabilities, Error, GenerationOutput,
@@ -26,7 +26,7 @@ use crate::text_encoder::IrisTextEncoder;
 /// Registry id (the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = GENERATION_MODEL_ID;
 /// Output sides must be multiples of the patch size (load refuses a patch that does not divide it).
-pub const SIZE_MULTIPLE: u32 = gen_core::iris::SIZE_MULTIPLE;
+pub const SIZE_MULTIPLE: u32 = gen_core_iris::SIZE_MULTIPLE;
 /// Smallest side: one patch.
 pub const MIN_SIZE: u32 = 16;
 /// Largest side served (the release renders ~1 MP; 2048² is the pixel-space attention ceiling
@@ -44,7 +44,7 @@ pub fn descriptor() -> ModelDescriptor {
         control_kinds: None,
         // The Qwen3-VL text encoder is a load-time component (`components["text_encoder"]`);
         // `load` refuses without it.
-        required_components: &[gen_core::iris::TEXT_ENCODER_COMPONENT],
+        required_components: &[gen_core_iris::TEXT_ENCODER_COMPONENT],
         id: MODEL_ID,
         family: FAMILY,
         backend: "mlx",
@@ -184,7 +184,7 @@ pub fn load_backbone_quantized(
     crate::anchor_tests::record_generation_loader_entry("backbone");
     let requested = quant;
     let quant = BackboneQuant::for_load(quant)?;
-    let path = dir.join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
+    let path = dir.join(gen_core_iris::BACKBONE_WEIGHTS_FILE);
     // A pre-quantized artifact (`crate::packed`) is read packed — no dense transient, no load-time
     // quantization — and only at its own tier, under the bf16 compute its scales are stored at.
     // A dense artifact keeps the release path below unchanged.
@@ -291,7 +291,7 @@ pub fn load_backbone_streamed(
 
     #[cfg(all(test, target_os = "macos"))]
     crate::anchor_tests::record_generation_loader_entry("backbone");
-    let path = dir.join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
+    let path = dir.join(gen_core_iris::BACKBONE_WEIGHTS_FILE);
     let artifact = crate::packed::artifact_tier(&path)?;
     crate::packed::check_requested("the backbone", artifact, quant)?;
     crate::stream::refuse_stream_requantization(MODEL_ID, "the backbone", artifact, quant)?;
@@ -359,7 +359,7 @@ fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
             return Err(Error::Unsupported(format!(
                 "{MODEL_ID}: LoadSpec::{field} is not supported by the Iris-3B generation route \
                  (the text encoder is the '{}' component)",
-                gen_core::iris::TEXT_ENCODER_COMPONENT
+                gen_core_iris::TEXT_ENCODER_COMPONENT
             )));
         }
     }

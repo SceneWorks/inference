@@ -17,7 +17,7 @@
 //!   The 2.5 **weights** are gated on Hugging Face, so these fixtures are written on disk rather
 //!   than downloaded — but their `__metadata__` shape is not invented: it matches the real headers
 //!   sc-18756 captured under `docs/reference/sc-18756-headers/`, which
-//!   `gen_core::ltx_checkpoint`'s own tests parse directly. In particular the latent upsamplers and
+//!   `gen_core_ltx::ltx_checkpoint`'s own tests parse directly. In particular the latent upsamplers and
 //!   the packed text encoder declare **no** `model_version`, exactly as the shipped files do.
 //!   Upstream reference: `ltx_core/loader/sft_loader.py`, the per-component
 //!   `model_configurator.py` files, and `encoder_configurator._check_gemma_version` at
@@ -25,7 +25,7 @@
 
 use std::path::Path;
 
-use mlx_gen::gen_core::ltx_checkpoint::{
+use gen_core_ltx::ltx_checkpoint::{
     CaptionFeatureVersion, GemmaEncoderIdentity, GemmaVersionCheck, LtxCheckpointLayout,
     LtxComponent, SPLIT_MANIFEST_FILE,
 };
@@ -489,7 +489,7 @@ fn the_2_5_transformer_cannot_satisfy_the_vae_slot() {
     let transformer = dir
         .path()
         .join("diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors");
-    let err = mlx_gen::gen_core::ltx_checkpoint::LtxBundleBuilder::new()
+    let err = gen_core_ltx::ltx_checkpoint::LtxBundleBuilder::new()
         .with_component(LtxComponent::ConvVideoVae, transformer)
         .build()
         .expect_err("the transformer is not the video VAE");
@@ -661,7 +661,7 @@ fn real_2_5_snapshot_resolves_every_component() {
     let diff = bundle.require(LtxComponent::DiffusionVideoVae).unwrap();
     assert_eq!(
         diff.config().unwrap()["_class_name"],
-        mlx_gen::gen_core::ltx_checkpoint::DIFFUSION_VIDEO_VAE_CLASS
+        gen_core_ltx::ltx_checkpoint::DIFFUSION_VIDEO_VAE_CLASS
     );
 
     // 5. The real transformer and the real packed Gemma 4 encoder agree.
@@ -676,16 +676,16 @@ fn real_2_5_snapshot_resolves_every_component() {
     let te_path = root.join("text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors");
     let identity = GemmaEncoderIdentity::load(&te_path).expect("config-only identity");
     let assets =
-        mlx_gen::gen_core::gemma_assets::GemmaAssets::load(&te_path).expect("full asset unpack");
+        gen_core_ltx::gemma_assets::GemmaAssets::load(&te_path).expect("full asset unpack");
     let from_assets = GemmaEncoderIdentity::from_assets(&assets).expect("identity from assets");
     assert_eq!(identity.model_type, from_assets.model_type);
     assert_eq!(identity.gemma_version, from_assets.gemma_version);
     assert_eq!(
         identity.model_type.as_deref(),
-        Some(mlx_gen::gen_core::ltx_checkpoint::GEMMA4_UNIFIED_MODEL_TYPE)
+        Some(gen_core_ltx::ltx_checkpoint::GEMMA4_UNIFIED_MODEL_TYPE)
     );
     assert_eq!(
         assets.config_model_type().unwrap(),
-        mlx_gen::gen_core::ltx_checkpoint::GEMMA4_UNIFIED_MODEL_TYPE
+        gen_core_ltx::ltx_checkpoint::GEMMA4_UNIFIED_MODEL_TYPE
     );
 }

@@ -1,10 +1,10 @@
 //! The FLUX3 publisher-format kernels' bit-level CPU mirrors (`candle_quant_kernels::flux3_quant`)
-//! against the backend-neutral source oracles (`gen_core::flux3::quantization`). The device
+//! against the backend-neutral source oracles (`gen_core_flux3::quantization`). The device
 //! kernels are held to these mirrors by the GPU functional test; this half runs on every host.
-use candle_gen::gen_core::flux3::quantization::{
+use candle_quant_kernels::flux3_quant as mirror;
+use gen_core_flux3::quantization::{
     decode_e4m3, encode_e4m3, quantize_fp8_rows, quantize_nvfp4_static,
 };
-use candle_quant_kernels::flux3_quant as mirror;
 
 fn values(n: usize, salt: f32, spread: f32) -> Vec<f32> {
     (0..n)
@@ -85,17 +85,14 @@ fn weight_scale_swizzle_is_the_source_layout() {
     let raw: Vec<u8> = (0..rows * blocks).map(|i| (i % 251) as u8).collect();
     assert_eq!(
         mirror::swizzle_scales(&raw, rows, blocks),
-        candle_gen::gen_core::flux3::quantization::swizzle_scales(&raw, rows, blocks).unwrap()
+        gen_core_flux3::quantization::swizzle_scales(&raw, rows, blocks).unwrap()
     );
 }
 
 #[test]
 fn bf16_epilogue_rounding_is_the_shared_rule() {
     for v in values(4096, 0.1, 50.0) {
-        assert_eq!(
-            mirror::bf16_bits(v),
-            candle_gen::gen_core::flux3::affine::bf16_bits(v)
-        );
+        assert_eq!(mirror::bf16_bits(v), gen_core_flux3::affine::bf16_bits(v));
     }
     assert_eq!(
         mirror::fp8_rowwise_epilogue(2.0, 0.5, 3.0),

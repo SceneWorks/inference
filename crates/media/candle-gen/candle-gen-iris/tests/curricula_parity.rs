@@ -10,20 +10,18 @@
 use std::collections::HashMap;
 
 use candle_gen::candle_core::{DType, Tensor, Var};
-use candle_gen::gen_core::iris::train::ac::AcPolicy;
-use candle_gen::gen_core::iris::train::holdout::{grid_noise, grid_timestep};
-use candle_gen::gen_core::iris::train::repa::{
-    RepaPlan, RepaVariant, TeacherArch, TeacherFfn, PROJECTOR_PREFIX,
-};
-use candle_gen::gen_core::iris::train::{
-    FlowObjective, Prediction, TimestepSampler, TrainSchedule,
-};
 use candle_gen_iris::train::model::{
     checkpointed_regions, flow_loss_per_sample, loss_and_grads_ext, RepaTargets, StepBatch,
     TrainExtras, TrainModel, Trainable,
 };
 use candle_gen_iris::train::optim::{Params, Tensors};
 use candle_gen_iris::train::teacher::{spatial_normalize, Teacher};
+use gen_core_iris::train::ac::AcPolicy;
+use gen_core_iris::train::holdout::{grid_noise, grid_timestep};
+use gen_core_iris::train::repa::{
+    RepaPlan, RepaVariant, TeacherArch, TeacherFfn, PROJECTOR_PREFIX,
+};
+use gen_core_iris::train::{FlowObjective, Prediction, TimestepSampler, TrainSchedule};
 use serde_json::Value as Json;
 
 use crate::common::{
@@ -571,10 +569,8 @@ struct AcCase {
 }
 
 fn ac_case(compute: DType, ac: AcPolicy) -> AcCase {
-    use candle_gen::gen_core::iris::train::{
-        MuonAdjustLr, OptimizerKind, OptimizerPlan, ParamRoute,
-    };
     use candle_gen_iris::train::optim::{clip_grads, IrisOptimizer};
+    use gen_core_iris::train::{MuonAdjustLr, OptimizerKind, OptimizerPlan, ParamRoute};
     let model = model_at(compute);
     let params = base_params();
     let extras = TrainExtras { repa: None, ac };

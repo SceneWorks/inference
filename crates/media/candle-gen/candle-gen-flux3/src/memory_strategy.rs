@@ -39,11 +39,7 @@
 use std::path::Path;
 
 use candle_gen::candle_core::DType;
-use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
-use candle_gen::gen_core::flux3::quantization::DitFormat;
-use candle_gen::gen_core::flux3::{
-    resolve_checkpoint, Flux3Config, GenerationResources, TextEncoderConfig, BASE_MODEL_ID,
-};
+use candle_gen::gen_core::flux3::BASE_MODEL_ID;
 use candle_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, SafetensorsTensorHeader};
 use candle_gen::gen_core::{
     self, Error as CoreError, LoadShape, LoadSpec, MemoryArchitectureFacts, MemoryAssetFacts,
@@ -54,6 +50,9 @@ use candle_gen::gen_core::{
     MemoryStrategySupport, MemoryWindowMaterialization, Precision, Quant, ResidentRequestMemory,
     Result as CoreResult,
 };
+use gen_core_flux3::artifacts::NativeDitStorage;
+use gen_core_flux3::quantization::DitFormat;
+use gen_core_flux3::{resolve_checkpoint, Flux3Config, GenerationResources, TextEncoderConfig};
 
 #[cfg(test)]
 use candle_gen::gen_core::{MemoryBehaviorRoute, MemoryMode};
@@ -230,7 +229,7 @@ pub fn dit_bytes(id: &str, weights: &Path, precision: Precision) -> CoreResult<u
 /// * a publisher `<stem>.weight_scale` at its STAGED width whatever its stored rank: FP8R row
 ///   scales stage as f32 (4 B/element), NVFP4 block scales as their E4M3 bytes;
 /// * every other matrix at the compute width and every vector at f32, exactly as the dense path;
-/// * plus [`gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET`], charged ONCE as resident.
+/// * plus [`gen_core_flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET`], charged ONCE as resident.
 ///   The row-chunk planner caps every packed launch (f32 activation copy, Q8/FP8/FP4 activation
 ///   codes, output and padding) at it, and it also bounds candle's grows-only CUDA quantized-matmul
 ///   workspace, which persists after the largest launch. An upper bound, not a measurement.
@@ -239,7 +238,7 @@ pub fn native_dit_bytes(
     weights: &Path,
     precision: Precision,
     storage: NativeDitStorage,
-    cfg: &gen_core::flux3::DitConfig,
+    cfg: &gen_core_flux3::DitConfig,
 ) -> CoreResult<u64> {
     if storage == NativeDitStorage::Publisher(DitFormat::Dense) {
         return dit_bytes(id, weights, precision);
@@ -280,7 +279,7 @@ pub fn native_dit_bytes(
         }),
     )?;
     weights
-        .checked_add(gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET)
+        .checked_add(gen_core_flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET)
         .ok_or_else(|| CoreError::Unsupported(format!("{id}: DiT byte overflow")))
 }
 
@@ -513,7 +512,7 @@ pub(crate) fn preflight_checkpoint(
     } else {
         config.validate_native_storage_graph()?;
     }
-    let headers = gen_core::flux3::checkpoint_tensor_headers(package_dir)?;
+    let headers = gen_core_flux3::checkpoint_tensor_headers(package_dir)?;
     crate::dit::validate_checkpoint_headers(&config.dit, storage, &headers)?;
     Ok(storage)
 }
@@ -546,7 +545,7 @@ pub(crate) fn generation_contract(
     let precision = spec.precision;
     let mut contract = base_contract(id, precision, Some(config));
     for adapter in &spec.adapters {
-        gen_core::flux3::adapters::inspect(adapter, &config.dit)?;
+        gen_core_flux3::adapters::inspect(adapter, &config.dit)?;
     }
 
     let storage = selected_storage(id, spec.quantize)?;
@@ -585,7 +584,7 @@ pub(crate) fn generation_contract(
         decoder_bytes: decoder,
         overlay_bytes: 0,
     };
-    if let Some(dir) = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)? {
+    if let Some(dir) = gen_core_flux3::pup::UpsamplePackage::component_dir(spec)? {
         account_upsampler(
             id,
             &mut contract,
@@ -652,7 +651,7 @@ pub(crate) fn upsampler_residency(
                 precomputed_in: gen_core::MemoryPhase::Conditioning,
                 retained_bytes: 0,
                 evidence: "candle_gen_flux3::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest; \
-                           gen_core::flux3::phase_resource::tests::exclusive_work_fences_and_really_drops_before_the_next_phase"
+                           gen_core_flux3::phase_resource::tests::exclusive_work_fences_and_really_drops_before_the_next_phase"
                     .into(),
             }
         }
@@ -683,7 +682,7 @@ fn account_upsampler(
             MemoryFormulaVariable::OverlayBytes,
         ],
         resident_components: vec![gen_core::MemoryResidentComponent {
-            id: gen_core::flux3::pup::UPSAMPLER_COMPONENT.into(),
+            id: gen_core_flux3::pup::UPSAMPLER_COMPONENT.into(),
             kind: gen_core::MemoryComponentKind::PromptUpsampler,
             resident_bytes: bytes,
             bounded_by: None,
@@ -722,7 +721,7 @@ fn route_gate(
     _loaded_tier: MemoryNumericTier,
 ) -> CoreResult<()> {
     let id = contract.provider_id.as_str();
-    gen_core::flux3::references::validate_memory_route(
+    gen_core_flux3::references::validate_memory_route(
         &context.mode,
         context.geometry.reference_count,
     )?;
@@ -787,7 +786,7 @@ fn request_scope(
         },
     )?;
     Ok(Some(
-        gen_core::flux3::references::guard_memory_scope_with_resources(
+        gen_core_flux3::references::guard_memory_scope_with_resources(
             Box::new(candle_gen::request_scope::CandleRequestScopeCore::new(
                 config,
             )),
@@ -816,7 +815,7 @@ pub fn memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
 }
 
 /// PRE-FIT reference workspace of one request on the package `spec` names, through the shared
-/// formula ([`gen_core::flux3::reference_workspace`]). On the Candle CPU backend every DiT GEMM
+/// formula ([`gen_core_flux3::reference_workspace`]). On the Candle CPU backend every DiT GEMM
 /// runs over f32 temporaries whatever the compute dtype, so the per-token term is priced at f32.
 fn reference_workspace_for(
     provider_id: &str,
@@ -829,12 +828,12 @@ fn reference_workspace_for(
     } else {
         u64::from(compute_width(spec.precision))
     };
-    let inputs = gen_core::flux3::reference_workspace::ReferenceWorkspaceInputs::from_spec(
+    let inputs = gen_core_flux3::reference_workspace::ReferenceWorkspaceInputs::from_spec(
         spec,
         provider_id,
         width,
     )?;
-    gen_core::flux3::reference_workspace::reference_workspace_bytes(&inputs, Some(facts))
+    gen_core_flux3::reference_workspace::reference_workspace_bytes(&inputs, Some(facts))
 }
 
 /// `flux3_klein`'s pre-fit reference pricer.
@@ -932,11 +931,11 @@ mod tests {
         // package's encoder and autoencoder as components.
         let mut spec = LoadSpec::new(WeightsSource::Dir(fixture.join("tiny-base-snapshot")));
         spec.components.insert(
-            gen_core::flux3::TEXT_ENCODER_COMPONENT.into(),
+            gen_core_flux3::TEXT_ENCODER_COMPONENT.into(),
             WeightsSource::Dir(fixture.join("tiny-snapshot/text_encoder")),
         );
         spec.components.insert(
-            gen_core::flux3::AUTOENCODER_COMPONENT.into(),
+            gen_core_flux3::AUTOENCODER_COMPONENT.into(),
             WeightsSource::File(fixture.join("tiny-snapshot/ae.safetensors")),
         );
         let config =
@@ -965,7 +964,7 @@ mod tests {
             );
         }
         spec.components.insert(
-            gen_core::flux3::pup::UPSAMPLER_COMPONENT.into(),
+            gen_core_flux3::pup::UPSAMPLER_COMPONENT.into(),
             WeightsSource::Dir(fixture.join("tiny-pup-snapshot")),
         );
         let both = generation_contract(BASE_MODEL_ID, &spec, &resources, &config).unwrap();
@@ -1105,8 +1104,8 @@ mod tests {
     /// as a float matrix.
     #[test]
     fn publisher_scales_price_at_their_staged_width() {
-        use gen_core::flux3::safetensors_stream::{PlannedTensor, SafetensorsStreamWriter};
         use gen_core::weightsmeta::Dtype;
+        use gen_core_flux3::safetensors_stream::{PlannedTensor, SafetensorsStreamWriter};
         let cfg = resolve_checkpoint(
             &Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures/tiny-snapshot"),
@@ -1157,7 +1156,7 @@ mod tests {
                     }
                 })
                 .sum::<u64>()
-                + gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET;
+                + gen_core_flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET;
             assert_eq!(
                 native_dit_bytes(MODEL_ID, &path, Precision::Bf16, storage, &cfg).unwrap(),
                 want,
@@ -1187,11 +1186,11 @@ mod tests {
             // The tiny base package ships only config + DiT; both routes take the distilled
             // package's encoder and autoencoder as components, as the generator tests do.
             spec.components.insert(
-                gen_core::flux3::TEXT_ENCODER_COMPONENT.into(),
+                gen_core_flux3::TEXT_ENCODER_COMPONENT.into(),
                 gen_core::WeightsSource::Dir(fixtures.join("tiny-snapshot/text_encoder")),
             );
             spec.components.insert(
-                gen_core::flux3::AUTOENCODER_COMPONENT.into(),
+                gen_core_flux3::AUTOENCODER_COMPONENT.into(),
                 gen_core::WeightsSource::File(fixtures.join("tiny-snapshot/ae.safetensors")),
             );
             assert_eq!(

@@ -1,0 +1,31 @@
+[package]
+name = "sceneworks-gen-core-moss-image"
+version = "0.1.0"
+edition = "2021"
+description = "Tensor-free MOSS-Image schedule/DMD/package helpers, edit adapter helpers and the MOSS training recovery contract on top of gen-core."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["moss", "diffusion", "training", "generative"]
+categories = ["science"]
+
+[lib]
+# Neutral import path: `use gen_core_moss_image::…`, mirroring the `gen_core` lib-name convention.
+name = "gen_core_moss_image"
+
+[dependencies]
+# The backend-neutral contract this crate builds on. Sibling crates depend on gen-core; gen-core
+# never depends on them (sc-27316). Tensor-free, like gen-core.
+sceneworks-gen-core = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
+# Training-recovery input decode.
+image = { workspace = true, features = ["bmp", "gif", "tiff", "webp"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Host physical-memory probe (`sysctlbyname("hw.memsize")`) of the MOSS training recovery host.
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

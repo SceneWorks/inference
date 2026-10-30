@@ -195,7 +195,7 @@ impl MiniMaxH3Dit {
         // authority.
         let scan = crate::dit::curve::CurveScan::read(&shards)?;
         if scan.has_curve() {
-            candle_gen::gen_core::pruned_adaln::PrunedAdaLn::inspect(
+            gen_core_h3::pruned_adaln::PrunedAdaLn::inspect(
                 cfg.hidden_size,
                 cfg.num_layers,
                 cfg.time_embed_dim,
@@ -300,7 +300,7 @@ impl MiniMaxH3Dit {
     /// quant code or filesystem path takes part in the digest. See
     /// [`crate::dit::curve::CurveAdaLn::identity`] and
     /// [`AdaLnCache::is_current_for_pruning`].
-    pub fn pruning_identity(&self) -> Option<candle_gen::gen_core::pruned_adaln::PruningIdentity> {
+    pub fn pruning_identity(&self) -> Option<gen_core_h3::pruned_adaln::PruningIdentity> {
         self.curve.as_ref().map(CurveAdaLn::identity)
     }
 
@@ -316,7 +316,7 @@ impl MiniMaxH3Dit {
     /// Refuse an unpruned model or a different table/basis before serving an expected source.
     pub fn ensure_pruning_identity(
         &self,
-        expected: &candle_gen::gen_core::pruned_adaln::PruningIdentity,
+        expected: &gen_core_h3::pruned_adaln::PruningIdentity,
     ) -> Result<()> {
         match self.pruning_identity() {
             Some(identity) if &identity == expected => Ok(()),
@@ -885,7 +885,7 @@ impl JointDit {
 
     /// The loaded checkpoint's pruning identity, `None` on the stock path — the compatibility key
     /// a consumer checks a held [`AdaLnCache`] against ([`AdaLnCache::is_current_for_pruning`]).
-    pub fn pruning_identity(&self) -> Option<candle_gen::gen_core::pruned_adaln::PruningIdentity> {
+    pub fn pruning_identity(&self) -> Option<gen_core_h3::pruned_adaln::PruningIdentity> {
         self.dit.pruning_identity()
     }
 

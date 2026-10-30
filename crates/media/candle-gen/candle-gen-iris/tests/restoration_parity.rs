@@ -4,7 +4,7 @@
 //! enlarge → tile → resize back, multi-tile Gaussian fusion, 1×, a fractional scale, a single tile,
 //! a portrait 3×, the budgeted input path and a non-dyadic 1.3× (planned output size and enlarge
 //! branch exact); colour fix on and off. The host-side pixel ops are shared with the MLX twin
-//! (`gen_core::iris::restoration`) and held op by op there.
+//! (`gen_core_iris::restoration`) and held op by op there.
 //!
 //! Tolerances (the MLX twin's): the float images carry the backbone's FP32 summation-order distance
 //! (`dit_parity`) scaled by sigma — 1e-4 of peak; the RGB8 outputs may differ by one level where a
@@ -13,13 +13,13 @@
 use std::path::PathBuf;
 
 use candle_gen::candle_core::{Device, Tensor};
-use candle_gen::gen_core::iris::restoration::{restore_detailed, Planes};
 use candle_gen::gen_core::{
     CancelFlag, Image, InputSizing, LoadSpec, Precision, Progress, TargetSize, Transform,
     TransformRequest, WeightsSource,
 };
 use candle_gen::CandleError as Error;
 use candle_gen_iris::IrisRestorer;
+use gen_core_iris::restoration::{restore_detailed, Planes};
 
 use crate::common::{fixture, fixtures, host_f32, tiny_backbone};
 
@@ -203,7 +203,7 @@ fn cancel_between_tiles_is_typed_and_yields_no_image() {
 /// sc-25690 I11: a cancel that arrives after the last tile — at the post-processing marker — is
 /// honoured by the resize back / colour fix and yields no image, on the enlarge branch with the
 /// colour fix (the longest post-processing) and without either.
-/// MUTATION: drop the post-processing cancel checks in `gen_core::iris::restoration` — RED.
+/// MUTATION: drop the post-processing cancel checks in `gen_core_iris::restoration` — RED.
 #[test]
 #[ignore = "model inference; explicit model workflow only"]
 fn cancel_after_the_last_tile_is_typed_and_yields_no_image() {

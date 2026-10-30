@@ -25,7 +25,7 @@ use mlx_rs::ops::{abs, max, sum};
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
-use mlx_gen::gen_core::ltx_checkpoint::LtxCheckpointMetadata;
+use gen_core_ltx::ltx_checkpoint::LtxCheckpointMetadata;
 use mlx_gen::gen_core::OffloadPolicy;
 use mlx_gen::testing::peak_rel;
 use mlx_gen::weights::Weights;

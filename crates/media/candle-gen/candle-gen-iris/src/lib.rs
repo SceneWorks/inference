@@ -10,7 +10,7 @@
 //! ## Tasks and resources (E4)
 //!
 //! The backend-neutral task identity, resource layout, `config.yaml` reader, conditioning window,
-//! solver plan and control surface live in [`gen_core::iris`] (shared with the MLX twin and the
+//! solver plan and control surface live in [`gen_core_iris`] (shared with the MLX twin and the
 //! SceneWorks worker). The generation task is **backbone + text encoder**: `LoadSpec::weights` is
 //! the backbone directory and `LoadSpec::components["text_encoder"]` the Qwen3-VL snapshot.
 //! [`IrisDiT`] and [`load_backbone`] never touch the text encoder, so the depth and restoration
@@ -28,7 +28,7 @@
 //!
 //! [`train`] registers the `iris_3b` [`Trainer`](candle_gen::gen_core::train::Trainer): full
 //! training (random or weights init) and LoRA / LoKr adapters over the one backend-neutral contract
-//! `gen_core::iris::train` the MLX trainer reads, with its checkpoint layout, resume semantics,
+//! `gen_core_iris::train` the MLX trainer reads, with its checkpoint layout, resume semantics,
 //! artifact schemas and metadata stamps. Adapters are forward-time residuals in training **and** in
 //! [`load_backbone_with_adapters`], so a training preview renders exactly what the exported file
 //! renders here; artifacts load across backends (`tests/train_cross_backend.rs`).
@@ -60,7 +60,7 @@
 //!   RNG, so a seed reproduces within a backend but not across the two (upstream's `torch.randn`
 //!   matches neither; parity is measured with injected noise on both).
 //!
-//! [`gen_core::iris`]: candle_gen::gen_core::iris
+//! [`gen_core_iris`]: gen_core_iris
 
 // Private opt-in model-proof plumbing; feature-OFF observers expand to the original expression.
 #[macro_use]
@@ -84,11 +84,11 @@ pub mod tape;
 pub mod text_encoder;
 pub mod train;
 
-pub use candle_gen::gen_core::iris::{
+pub use dit::{IrisDiT, TextBatch};
+pub use gen_core_iris::{
     IrisTask, TEXT_ENCODER_COMPONENT, TEXT_ENCODER_REPO, TEXT_ENCODER_REVISION,
     UPSTREAM_CODE_REVISION, UPSTREAM_WEIGHTS_REPO, UPSTREAM_WEIGHTS_REVISION,
 };
-pub use dit::{IrisDiT, TextBatch};
 pub use model::{
     compute_dtype, descriptor, load, load_backbone, load_backbone_quantized,
     load_backbone_with_adapters, Iris3b, MODEL_ID,

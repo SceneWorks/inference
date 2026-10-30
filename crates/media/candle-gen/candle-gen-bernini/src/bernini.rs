@@ -36,13 +36,13 @@ use std::sync::{Arc, Mutex};
 use image::RgbImage;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, CancelFlag, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
     WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
+use gen_core_tokenizer::TextTokenizer;
 
 use candle_gen_wan::config::{
     TextEncoderConfig, TransformerConfig, DEFAULT_FRAMES_14B, NUM_TRAIN_TIMESTEPS,

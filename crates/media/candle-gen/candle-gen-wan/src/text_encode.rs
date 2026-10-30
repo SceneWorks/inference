@@ -22,8 +22,8 @@ use std::path::Path;
 
 use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::{CandleError, Result as CResult};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 
 use crate::config::TextEncoderConfig;
 use crate::text_encoder::Umt5Encoder;

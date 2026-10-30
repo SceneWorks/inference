@@ -163,10 +163,10 @@ pub fn sample_uniform_range(seed: u64, lower: f32, upper: f32) -> f32 {
 /// Stable digest of every input that selects cached training data. Item order, captions, paths, file
 /// contents, optional control inputs, ordered edit references, and resolution are length-delimited to
 /// prevent ambiguity. The one backend-neutral implementation lives in
-/// [`crate::gen_core::train::resume::request_fingerprint`]
+/// [`gen_core_train::resume::request_fingerprint`]
 /// (sc-24163), shared with the MLX trainers; the digest is unchanged, so existing bundles resume.
 pub fn request_fingerprint(req: &TrainingRequest) -> Result<String> {
-    Ok(crate::gen_core::train::resume::request_fingerprint(req)?)
+    Ok(gen_core_train::resume::request_fingerprint(req)?)
 }
 
 /// The per-step timestep RNG seed: mixes the config `seed` with `step` via the golden-ratio constant —
@@ -205,7 +205,7 @@ pub fn velocity_loss(v: &Tensor, target: &Tensor, mae: bool) -> candle_core::Res
 /// `weight = None` it IS [`velocity_loss`] (bit-identical); with a weight map `w` (broadcastable to
 /// `v`, built at cache time by [`subject_mask_weight`]) the per-element loss is multiplied by `w`
 /// **before** the mean — `mean(w ⊙ ℓ)`, the convention of
-/// [`gen_core::train::subject_mask`] shared with the MLX
+/// [`gen_core_train::subject_mask`] shared with the MLX
 /// trainers — so an element with `w = 0` contributes zero loss and zero gradient. The same weighting
 /// serves an ε-prediction loss (the "velocity" is then the predicted noise and `target` the noise).
 pub fn weighted_velocity_loss(
@@ -223,7 +223,7 @@ pub fn weighted_velocity_loss(
 }
 
 /// Turn a row-major `[grid_h, grid_w]` latent weight map (from
-/// [`subject_mask_latent_weights`](crate::gen_core::train::subject_mask::subject_mask_latent_weights))
+/// [`subject_mask_latent_weights`](gen_core_train::subject_mask::subject_mask_latent_weights))
 /// into an f32 tensor on `device` broadcast to `latent_shape`, whose **last two axes** are the latent
 /// `(H, W)` grid — the shape of the cached clean latent, so a trainer that packs its latent into
 /// tokens packs this tensor with the very same function.
@@ -257,7 +257,7 @@ pub fn subject_mask_weight(
 /// The cache-time entry point every candle trainer calls once per item (sc-24828): `None` when
 /// subject-masked loss is off (no file is read), else the item's latent weight map — its mask
 /// cropped with `crop_of(image_w, image_h)` (the trainer's own crop rule, e.g.
-/// [`CropBox::center_square`](crate::gen_core::train::subject_mask::CropBox::center_square)),
+/// [`CropBox::center_square`](gen_core_train::subject_mask::CropBox::center_square)),
 /// area-averaged onto the last two axes of `latent_shape` and broadcast to `latent_shape` on
 /// `device` (see [`subject_mask_weight`]). Refusals (missing / mis-sized / empty mask) name the
 /// image.
@@ -265,7 +265,7 @@ pub fn item_subject_mask_weight(
     label: &str,
     item: &crate::gen_core::TrainingItem,
     cfg: Option<&crate::gen_core::SubjectMaskLoss>,
-    crop_of: impl FnOnce(u32, u32) -> crate::gen_core::train::subject_mask::CropBox,
+    crop_of: impl FnOnce(u32, u32) -> gen_core_train::subject_mask::CropBox,
     latent_shape: &[usize],
     device: &Device,
 ) -> Result<Option<Tensor>> {
@@ -279,22 +279,22 @@ pub fn item_subject_mask_weight(
         )));
     }
     let (grid_h, grid_w) = (latent_shape[n - 2], latent_shape[n - 1]);
-    let weights = crate::gen_core::train::subject_mask::subject_mask_latent_weights(
+    let weights = gen_core_train::subject_mask::subject_mask_latent_weights(
         label, item, cfg, crop_of, grid_w, grid_h,
     )?;
     subject_mask_weight(&weights, grid_h, grid_w, latent_shape, device).map(Some)
 }
 
 /// Per-bucket entry point (sc-24828 × sc-2127): the weight map of one cached latent from an item's
-/// already-loaded [`PreparedSubjectMask`](crate::gen_core::train::subject_mask::PreparedSubjectMask)
+/// already-loaded [`PreparedSubjectMask`](gen_core_train::subject_mask::PreparedSubjectMask)
 /// — load it once per item with
-/// [`PreparedSubjectMask::load_if_enabled`](crate::gen_core::train::subject_mask::PreparedSubjectMask::load_if_enabled),
+/// [`PreparedSubjectMask::load_if_enabled`](gen_core_train::subject_mask::PreparedSubjectMask::load_if_enabled),
 /// then call this once per resolution bucket with that bucket's crop rule and clean-latent shape
 /// (last two axes = the latent grid). `None` in, `None` out.
 pub fn prepared_subject_mask_weight(
     label: &str,
-    mask: Option<&crate::gen_core::train::subject_mask::PreparedSubjectMask>,
-    crop_of: impl FnOnce(u32, u32) -> crate::gen_core::train::subject_mask::CropBox,
+    mask: Option<&gen_core_train::subject_mask::PreparedSubjectMask>,
+    crop_of: impl FnOnce(u32, u32) -> gen_core_train::subject_mask::CropBox,
     latent_shape: &[usize],
     device: &Device,
 ) -> Result<Option<Tensor>> {
@@ -1022,15 +1022,13 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     // cropped like the image and resampled onto its decoded size.
     let mut perceptual = perceptual;
     if let Some(path) = perceptual.as_mut() {
-        path.attach_subject_masks(
-            crate::gen_core::train::subject_mask::PerceptualSubjectMasks::load(
-                T::LABEL,
-                &req.items,
-                cfg,
-                schedule.n_buckets(),
-                crate::gen_core::train::subject_mask::CropBox::center_square,
-            )?,
-        );
+        path.attach_subject_masks(gen_core_train::subject_mask::PerceptualSubjectMasks::load(
+            T::LABEL,
+            &req.items,
+            cfg,
+            schedule.n_buckets(),
+            gen_core_train::subject_mask::CropBox::center_square,
+        )?);
     }
     let mut aux_driver = match perceptual {
         Some(path) => Some(AuxDriver::prepare(
@@ -1395,7 +1393,7 @@ mod tests {
     /// shape, and the masked-out region (the right half of the centre crop) is zero in each.
     #[test]
     fn prepared_subject_mask_weight_follows_each_bucket_latent() {
-        use crate::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
+        use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
         let dev = Device::Cpu;
         let dir = tempfile::tempdir().unwrap();
         // A 48x32 landscape image: centre crop x in [8, 40); subject = crop's left half [8, 24).

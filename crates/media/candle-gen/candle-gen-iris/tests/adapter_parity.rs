@@ -8,11 +8,11 @@
 //! forwards are FP32 on Candle CPU (the `dit_parity` 1e-4).
 
 use candle_gen::candle_core::DType;
-use candle_gen::gen_core::iris::IrisTask;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen_iris::adapters::merge_adapters;
 use candle_gen_iris::nn::safetensors_shapes;
 use candle_gen_iris::{load_backbone_with_adapters, TextBatch};
+use gen_core_iris::IrisTask;
 
 use crate::common::{
     assert_close, cpu, errors, fixture, fixtures, host_i32, tiny_backbone, tiny_config,
@@ -120,7 +120,7 @@ fn a_mismatched_checkpoint_is_refused_with_an_adapter_attached() {
         dir.path().join("model.safetensors"),
     )
     .unwrap();
-    let config = candle_gen::gen_core::iris::IrisConfig::from_dir(dir.path()).unwrap();
+    let config = gen_core_iris::IrisConfig::from_dir(dir.path()).unwrap();
     assert_eq!(config.model.pixel.depth, 1);
     let lora = spec("iris_lora.safetensors", AdapterKind::Lora, 0.75);
     let lokr = spec("iris_lokr.safetensors", AdapterKind::Lokr, 1.0);

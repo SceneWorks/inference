@@ -58,10 +58,10 @@ use crate::spatial_tiling::SpatialTiling;
 ///
 /// `canvas_multiple` in the reference pipeline. **Not** `VAE_RATIO` alone: a 16-aligned canvas can
 /// still be an odd number of latent columns, which has no patched representation.
-pub const SPATIAL_STRIDE: u32 = mlx_gen::gen_core::h3_memory::SPATIAL_STRIDE;
+pub const SPATIAL_STRIDE: u32 = gen_core_h3::h3_memory::SPATIAL_STRIDE;
 
 /// Short edge the released checkpoint generates on by default.
-pub const CANVAS_SHORT_EDGE: u32 = mlx_gen::gen_core::h3_memory::CANVAS_SHORT_EDGE;
+pub const CANVAS_SHORT_EDGE: u32 = gen_core_h3::h3_memory::CANVAS_SHORT_EDGE;
 
 /// Area budget of the released checkpoint's canvas, `768 · 1344` = 1 032 192 px.
 ///
@@ -72,7 +72,7 @@ pub const CANVAS_SHORT_EDGE: u32 = mlx_gen::gen_core::h3_memory::CANVAS_SHORT_ED
 /// unbounded area is an unbounded render cost regardless of what the duration bound says.
 /// Together with [`MAX_DURATION_SECONDS`] this closes the envelope: the longest sequence any
 /// accepted request can build is **104 030 rows** ([`crate::cost`]).
-pub const CANVAS_MAX_PIXELS: u32 = mlx_gen::gen_core::h3_memory::CANVAS_MAX_PIXELS;
+pub const CANVAS_MAX_PIXELS: u32 = gen_core_h3::h3_memory::CANVAS_MAX_PIXELS;
 
 /// Widest edge any canvas this model resolves to can carry — **2016**, the long edge at the 4:1
 /// aspect ceiling. This is what `Capabilities::max_size` declares (sc-17152).
@@ -186,7 +186,7 @@ impl RequestGeometry {
 /// quarters of a second of extra picture and sound the caller did not ask for and is not told about.
 /// A caller that wants the nearest legal count asks for it with [`align_frames_for_duration`].
 pub fn resolve_geometry(width: u32, height: u32, num_frames: i32) -> Result<RequestGeometry> {
-    mlx_gen::gen_core::h3_memory::validate_request_geometry(width, height, num_frames as u64, 1)
+    gen_core_h3::h3_memory::validate_request_geometry(width, height, num_frames as u64, 1)
         .map_err(|error| Error::Msg(error.to_string()))?;
     let latent_height = i32::try_from(height / VAE_RATIO as u32).map_err(|_| {
         Error::Msg(format!(
@@ -226,7 +226,7 @@ pub const SMALLEST_LEGAL_FRAMES: i32 = 124;
 /// own 5.1667 s, and this crate's tests pin 5.0 s as a refusal.)
 pub fn align_frames_for_duration(seconds: f32) -> Result<i32> {
     // One definition, shared with the Candle engine and allocation admission
-    // (`gen_core::veda::workspace`), so pricing and rendering can never resolve the same duration
+    // (`gen_core_h3::veda::workspace`), so pricing and rendering can never resolve the same duration
     // to different rungs (sc-26691).
     let aligned = mlx_gen::gen_core::h3_memory::align_frames_for_duration(seconds)?;
     let aligned = i32::try_from(aligned)

@@ -10,7 +10,7 @@
 //! flow-map Euler sampler. No Python runtime path.
 //!
 //! The backend-neutral half (identity, resources, `config.json`, text window, schedule, id and
-//! RoPE tables, request params, typed refusals) is [`gen_core::flux3`], shared with the MLX twin
+//! RoPE tables, request params, typed refusals) is [`gen_core_flux3`], shared with the MLX twin
 //! and the SceneWorks worker; the two providers accept the same generation request contract. The
 //! tensor work is here.
 //!
@@ -35,7 +35,7 @@
 //!   over bf16 operands and rounds its result to bf16, and the Qwen3-VL tower runs in f32
 //!   (`candle_llm`'s CPU rule); on CUDA both are the real bf16 kernels.
 //!
-//! [`gen_core::flux3`]: candle_gen::gen_core::flux3
+//! [`gen_core_flux3`]: gen_core_flux3
 
 pub mod adapters;
 pub mod autoencoder;
@@ -51,12 +51,13 @@ pub mod text_encoder;
 pub mod training;
 
 pub use autoencoder::Flux3AutoEncoder;
-pub use candle_gen::gen_core::flux3::{
-    AUTOENCODER_COMPONENT, DISTILLED_MODEL_ID, DISTILLED_WEIGHTS_REPO, DISTILLED_WEIGHTS_REVISION,
-    FAMILY, TEXT_ENCODER_COMPONENT, TEXT_ENCODER_UPSTREAM_REPO, TEXT_ENCODER_UPSTREAM_REVISION,
+pub use candle_gen::gen_core::flux3::DISTILLED_MODEL_ID;
+pub use dit::{Flux3Dit, SampleTokens};
+pub use gen_core_flux3::{
+    AUTOENCODER_COMPONENT, DISTILLED_WEIGHTS_REPO, DISTILLED_WEIGHTS_REVISION, FAMILY,
+    TEXT_ENCODER_COMPONENT, TEXT_ENCODER_UPSTREAM_REPO, TEXT_ENCODER_UPSTREAM_REVISION,
     UPSTREAM_CODE_REVISION,
 };
-pub use dit::{Flux3Dit, SampleTokens};
 pub use model::{
     compute_dtype, descriptor, descriptor_base, load, load_autoencoder, load_base, load_dit,
     Flux3Klein, MODEL_ID,

@@ -10,8 +10,8 @@
 use std::path::Path;
 
 use candle_gen::candle_core::{Device, Tensor};
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::{CandleError, Result};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 
 /// Text-to-image system prompt (reference `SYSTEM_PROMPT_4_T2I`).
 pub const SYSTEM_PROMPT_T2I: &str = "You are a helpful assistant that generates high-quality images based on user instructions. The instructions are as follows.";

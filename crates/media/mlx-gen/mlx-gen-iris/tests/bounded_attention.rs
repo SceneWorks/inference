@@ -137,7 +137,7 @@ fn production_solver_observes_every_site_and_cancels_inside_the_forward() {
 
 #[cfg(debug_assertions)]
 fn production_solver() {
-    use mlx_gen::gen_core::iris::GenerationParams;
+    use gen_core_iris::GenerationParams;
     use mlx_gen_iris::nn::diagnostics;
     use mlx_gen_iris::{
         encode,
@@ -238,7 +238,8 @@ fn generator_request_budget_reaches_cfg_and_non_cfg_solver_sites() {
 
 #[cfg(debug_assertions)]
 fn generator_request() {
-    use mlx_gen::gen_core::{iris::TEXT_ENCODER_COMPONENT, GenerationMemory};
+    use gen_core_iris::TEXT_ENCODER_COMPONENT;
+    use mlx_gen::gen_core::GenerationMemory;
     use mlx_gen_iris::nn::diagnostics;
     let mut spec =
         mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(crate::common::tiny_backbone()));
@@ -302,7 +303,7 @@ fn the_default_mac_request_runs_unbounded_and_bit_identical_to_the_legacy_path()
 
 #[cfg(debug_assertions)]
 fn default_request() {
-    use mlx_gen::gen_core::iris::{GenerationParams, TEXT_ENCODER_COMPONENT};
+    use gen_core_iris::{GenerationParams, TEXT_ENCODER_COMPONENT};
     use mlx_gen::gen_core::GenerationMemory;
     use mlx_gen_iris::nn::diagnostics;
     use mlx_gen_iris::{encode, pipeline, IrisTextEncoder};
@@ -497,9 +498,9 @@ fn default_paths_golden() {
 fn default_path_cases(
     golden: Option<&mlx_gen::weights::Weights>,
 ) -> Vec<(String, Vec<i32>, Vec<f32>)> {
-    use mlx_gen::gen_core::iris::depth::{DepthRequest, DepthResolution};
-    use mlx_gen::gen_core::iris::restoration::restore;
-    use mlx_gen::gen_core::iris::{GenerationParams, TEXT_ENCODER_COMPONENT};
+    use gen_core_iris::depth::{DepthRequest, DepthResolution};
+    use gen_core_iris::restoration::restore;
+    use gen_core_iris::{GenerationParams, TEXT_ENCODER_COMPONENT};
     use mlx_gen::{Image, LoadSpec, Precision, TargetSize, TransformRequest, WeightsSource};
     use mlx_gen_iris::TextConditioning;
     use mlx_gen_iris::{encode, pipeline, Conditioning, IrisRestorer, IrisTextEncoder};

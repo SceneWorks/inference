@@ -1,4 +1,6 @@
-//! Opt-in MiniMax-H3 learned sparse attention. An absent or disabled request preserves dense execution.
+//! Opt-in MiniMax-H3 learned sparse attention: the request/report contract. An absent or disabled
+//! request preserves dense execution. The predictor, selection and workspace pricing live in
+//! `gen_core_h3::veda` (sc-27316).
 
 /// A user budget is either a percentage skipped or a positive integer number of key tiles.
 /// Internal fractional tile allocation belongs to the selector, never to user input.
@@ -59,7 +61,6 @@ impl std::str::FromStr for VedaBudget {
         Ok(budget)
     }
 }
-
 /// Request controls use the frozen Veda defaults. Providers report what actually executed.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct VedaRequest {
@@ -157,7 +158,6 @@ impl VedaRequest {
             || self.full_attention_steps.contains(&step)
     }
 }
-
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct VedaExecutionReport {
     pub requested: bool,
@@ -187,7 +187,6 @@ pub struct VedaExecutionReport {
     /// explicitly scoped and must not be confused with `workspace_bytes`.
     pub terminal_telemetry: Option<serde_json::Value>,
 }
-
 impl VedaExecutionReport {
     /// Fraction of full attention actually computed over all successful joint-attention calls.
     /// Numerator includes dense exceptions and global/reference work, excluding padded rows.
@@ -232,7 +231,6 @@ impl VedaExecutionReport {
         outcome
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,7 +418,6 @@ mod tests {
     }
 }
 
-/// Frozen tensor-neutral tiling, predictor and selection contract.
+/// Frozen tensor-neutral tiling contract (the tile shape keying [`workspace::WorkspaceBound`]).
 pub mod contract;
-mod topk;
 pub mod workspace;

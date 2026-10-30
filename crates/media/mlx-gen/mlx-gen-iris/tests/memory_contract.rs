@@ -4,7 +4,7 @@
 //! bounded-attention selection execute end to end through the shared
 //! request-scope seam, not merely declared.
 
-use mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 use mlx_gen::gen_core::{
     self, GenerationMemory, MemoryBehaviorRoute, MemoryMode, MemoryNumericTier, MemoryRunContext,
     MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport,

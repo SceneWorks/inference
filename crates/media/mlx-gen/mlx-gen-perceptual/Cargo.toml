@@ -14,9 +14,10 @@ mlx-gen-depth = { path = "../mlx-gen-depth" }
 # ArcFace identity + FaceMesh landmark arms (sc-24831).
 mlx-gen-face = { path = "../mlx-gen-face" }
 mlx-gen-body = { path = "../mlx-gen-body" }
+sceneworks-gen-core-train = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 
 [features]
-model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-depth/model-inference-proof", "mlx-gen-face/model-inference-proof", "mlx-gen-body/model-inference-proof"]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-depth/model-inference-proof", "mlx-gen-face/model-inference-proof", "mlx-gen-body/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]

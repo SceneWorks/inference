@@ -1,5 +1,6 @@
 //! CPU-only verification of the frozen native terminal asset inventory; never creates a device.
-use candle_gen::gen_core::{moss_image::*, PinnedWeightsFile};
+use candle_gen::gen_core::PinnedWeightsFile;
+use gen_core_moss_image::moss_image::*;
 use std::path::PathBuf;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     for asset in MOSS_IMAGE_ASSETS {

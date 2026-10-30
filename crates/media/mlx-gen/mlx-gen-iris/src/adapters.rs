@@ -26,11 +26,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use mlx_gen::adapters::loader::apply_adapters_strict;
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
-use mlx_gen::gen_core::iris::{
+use gen_core_iris::{
     check_adapter_identity, IrisTask, ADAPTER_BASE_MODEL_KEY, ADAPTER_FAMILY_KEY, ADAPTER_TASK_KEY,
 };
+use mlx_gen::adapters::loader::apply_adapters_strict;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterApplyReport, AdapterSpec, Error, Result};
 use mlx_rs::{Array, Dtype};
@@ -918,9 +918,9 @@ pub fn header_inventory(
 /// alpha/rank multiplier VALUES are not architecture: factor dimensions, actual alpha-fold dtype
 /// widening and the scale-zero graph branch are. These facts are NOT physical/additivity evidence.
 pub fn generation_adapter_semantic_facts(spec: &mlx_gen::LoadSpec) -> Result<serde_json::Value> {
+    use gen_core_iris::{GenerationResources, BACKBONE_WEIGHTS_FILE};
     use mlx_gen::adapters::facts::{dtype_name, AdapterFacts};
     use mlx_gen::adapters::loader::UnfusedAdapterFormat;
-    use mlx_gen::gen_core::iris::{GenerationResources, BACKBONE_WEIGHTS_FILE};
     use serde_json::json;
 
     // Reuse the actual pure factory validation, including resources, config, tiers and component

@@ -27,13 +27,13 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::{CancelFlag, LoadPhase};
-use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
     OffloadPolicy, Progress, Quant, WeightsSource,
 };
 use candle_gen::{check_cancel as product_check_cancel, CandleError, Result as CResult};
+use gen_core_tokenizer::TextTokenizer;
 
 use crate::config::{
     TextEncoderConfig, TransformerConfig, Vae16Config, DEFAULT_FPS_14B, DEFAULT_FRAMES_14B,
@@ -149,7 +149,7 @@ struct Components {
     vae: Arc<ProviderVae>,
     /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across encodes (sc-8991 /
     /// F-011) instead of re-parsing `tokenizer.json` per prompt/branch.
-    tok: Arc<candle_gen::gen_core::tokenizer::TextTokenizer>,
+    tok: Arc<gen_core_tokenizer::TextTokenizer>,
 }
 
 struct Pipeline {
@@ -1486,8 +1486,8 @@ mod tests {
 
     #[test]
     fn both_a14b_public_loaders_publish_prepared_contracts_at_every_tier() {
-        use gen_core::wan_i2v_memory::{fixture_snapshot_root, WanI2vBackend, WanI2vRoute};
         use gen_core::Quant;
+        use gen_core_memory_wan::{fixture_snapshot_root, WanI2vBackend, WanI2vRoute};
         for (variant, route, repository, revision) in [
             (
                 Variant::T2v,

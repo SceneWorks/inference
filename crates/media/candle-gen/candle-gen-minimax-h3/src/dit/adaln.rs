@@ -457,7 +457,7 @@ pub struct AdaLnCache {
     /// The pruning identity this cache's basis carries — `Some` for a sc-26684 direct-curve
     /// checkpoint, `None` for the stock timestep-MLP path. A held cache may only be reused for a
     /// request whose basis is the one it was built from; see [`Self::is_current_for_pruning`].
-    identity: Option<candle_gen::gen_core::pruned_adaln::PruningIdentity>,
+    identity: Option<gen_core_h3::pruned_adaln::PruningIdentity>,
 }
 
 impl AdaLnCache {
@@ -521,13 +521,13 @@ impl AdaLnCache {
     /// Assemble a cache from already-projected modulation tables — the direct-curve
     /// (sc-26684) path, where the projection runs from interpolated table coordinates rather than
     /// from a timestep MLP. `identity` is the checkpoint's
-    /// [`PruningIdentity`](candle_gen::gen_core::pruned_adaln::PruningIdentity), hashed at load
+    /// [`PruningIdentity`](gen_core_h3::pruned_adaln::PruningIdentity), hashed at load
     /// over every stored operand; a caller that cannot state it must pass `None` and forgo the
     /// basis-matched reuse check.
     pub fn assemble(
         schedule: TimestepSchedule,
         layers: Vec<AdaLnModulation>,
-        identity: Option<candle_gen::gen_core::pruned_adaln::PruningIdentity>,
+        identity: Option<gen_core_h3::pruned_adaln::PruningIdentity>,
     ) -> Result<Self> {
         if layers.is_empty() {
             return Err(CandleError::Msg(
@@ -647,7 +647,7 @@ impl AdaLnCache {
     }
 
     /// The pruning identity this cache's basis carries, `None` on the stock path.
-    pub fn pruning_identity(&self) -> Option<candle_gen::gen_core::pruned_adaln::PruningIdentity> {
+    pub fn pruning_identity(&self) -> Option<gen_core_h3::pruned_adaln::PruningIdentity> {
         self.identity
     }
 
@@ -655,14 +655,14 @@ impl AdaLnCache {
     /// was built from **and** the pruning basis must be the one it was projected with.
     ///
     /// `expected` is the identity the caller wants served — the loaded checkpoint's
-    /// [`PruningIdentity`](candle_gen::gen_core::pruned_adaln::PruningIdentity). A cache from a
+    /// [`PruningIdentity`](gen_core_h3::pruned_adaln::PruningIdentity). A cache from a
     /// different checkpoint (same shapes, different table or any reduced weight or folded bias)
     /// answers `false`; so does a stock cache (`identity: None`) against any curve identity. This
     /// is the compatibility gate a consumer must pass before serving a held cache.
     pub fn is_current_for_pruning(
         &self,
         schedule: &TimestepSchedule,
-        expected: candle_gen::gen_core::pruned_adaln::PruningIdentity,
+        expected: gen_core_h3::pruned_adaln::PruningIdentity,
     ) -> bool {
         self.schedule.key() == schedule.key() && self.identity == Some(expected)
     }
@@ -672,7 +672,7 @@ impl AdaLnCache {
     pub fn check_current_for_pruning(
         &self,
         schedule: &TimestepSchedule,
-        expected: candle_gen::gen_core::pruned_adaln::PruningIdentity,
+        expected: gen_core_h3::pruned_adaln::PruningIdentity,
     ) -> Result<()> {
         if self.schedule.key() != schedule.key() {
             return Err(CandleError::Msg(

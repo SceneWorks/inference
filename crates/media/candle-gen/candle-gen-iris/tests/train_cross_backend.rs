@@ -15,13 +15,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Tensor};
-use candle_gen::gen_core::iris::train::{AdapterMetadata, OPTIONS_KEY};
-use candle_gen::gen_core::iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 use candle_gen::gen_core::{
     AdapterKind, AdapterSpec, LoadSpec, NetworkType, TrainingConfig, TrainingItem, TrainingRequest,
     WeightsSource,
 };
 use candle_gen_iris::{load_backbone, load_backbone_with_adapters, IrisDiT, TextBatch};
+use gen_core_iris::train::{AdapterMetadata, OPTIONS_KEY};
+use gen_core_iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 use serde_json::json;
 
 use crate::common::{

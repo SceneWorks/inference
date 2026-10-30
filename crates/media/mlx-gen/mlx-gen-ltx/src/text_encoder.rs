@@ -18,14 +18,14 @@
 //! the ONLY one this crate implements. That was previously implicit — nothing checked the loaded
 //! model actually selected V2 before running this math. [`LtxTextEncoder::from_weights`] /
 //! [`LtxTextEncoder::from_weights_av`] now require `ltx_cfg.caption_feature_version == V2` (see
-//! `gen_core::ltx_checkpoint::caption_feature_version`, sc-18757's shared, upstream-mirroring
+//! `gen_core_ltx::ltx_checkpoint::caption_feature_version`, sc-18757's shared, upstream-mirroring
 //! detector both backends fold onto as of the 2026-08-19 coordinator review), erroring loudly
 //! instead of silently running V2 math against a V1-shaped checkpoint.
 
 use mlx_rs::ops::{add, mean_axes, multiply, rsqrt, stack_axis};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::gen_core::ltx_checkpoint::CaptionFeatureVersion;
+use gen_core_ltx::ltx_checkpoint::CaptionFeatureVersion;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -319,8 +319,8 @@ mod version_gate_tests {
     // `LtxConfig::validated` (the fallible caption-detection step) is private to `crate::config`,
     // so these synthetic configs set the field directly rather than routing through it — `require_v2`
     // only cares about the field's value, not how a real load path resolved it. The detection logic
-    // itself (`gen_core::ltx_checkpoint::caption_feature_version`) has its own coverage in
-    // `crate::config`'s tests and in `gen_core::ltx_checkpoint`'s own test module.
+    // itself (`gen_core_ltx::ltx_checkpoint::caption_feature_version`) has its own coverage in
+    // `crate::config`'s tests and in `gen_core_ltx::ltx_checkpoint`'s own test module.
 
     fn v1_config() -> LtxConfig {
         let mut cfg = LtxConfig::video_only_defaults();

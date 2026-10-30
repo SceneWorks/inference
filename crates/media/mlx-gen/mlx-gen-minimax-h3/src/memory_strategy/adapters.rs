@@ -1,7 +1,8 @@
 //! Source-selected adapter facts; no model or adapter factor tensor is constructed.
 use std::path::Path;
 
-use mlx_gen::gen_core::h3_adapter_memory::{self, H3AdapterMemoryProfile};
+use gen_core_h3::h3_adapter_memory;
+use mlx_gen::gen_core::h3_adapter_memory::H3AdapterMemoryProfile;
 use mlx_gen::gen_core::h3_memory::NativeProjection;
 use mlx_gen::gen_core::{weightsmeta, AdapterSpec, Error, Result};
 

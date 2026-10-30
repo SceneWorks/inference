@@ -7,9 +7,9 @@
 //! covers Candle vs torch elementwise rounding. The 100-step default grid is compared in f64.
 
 use candle_gen::candle_core::Tensor;
-use candle_gen::gen_core::iris::{dpm_solver_plan, time_grid, Prediction};
 use candle_gen::gen_core::CancelFlag;
 use candle_gen_iris::solver::{cfg_combine, sample};
+use gen_core_iris::{dpm_solver_plan, time_grid, Prediction};
 
 use crate::common::{assert_close, fixture, Fixture};
 

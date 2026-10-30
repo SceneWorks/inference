@@ -54,7 +54,6 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Tensor, Var};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport,
     TrainingRequest,
@@ -71,6 +70,7 @@ use candle_gen::train::lora::LoraSet;
 use candle_gen::train::perceptual::{Parameterization, PerceptualPath};
 use candle_gen::train::taehv::TaehvConfig;
 use candle_gen::{CandleError, LatentDecoder, Result};
+use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
 
 use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
 use rand::{rngs::StdRng, SeedableRng};
@@ -463,14 +463,14 @@ impl Trainer for KreaTrainer {
         // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA
         // adapter the caller did not ask for (F-006/F-055).
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core_train::validate_full_finetune_request(self.descriptor(), req)?;
         // Shared control-training floor (F-006/F-055): no control branch, so a `control_type`
         // request is a typed reject, never silently trained as a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
+        gen_core_train::validate_control_request(self.descriptor(), req)?;
         // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_edit_request(self.descriptor(), req)?;
         validate_flow_match_request(req, LABEL).map_err(Into::into)
     }
 
@@ -492,7 +492,7 @@ impl Trainer for KreaTrainer {
     ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         // Every other `validate` floor too (control / full fine-tune / edit / flow-match knobs), so
         // a caller that skips `validate` cannot train a request it would refuse.
         self.validate(req)?;

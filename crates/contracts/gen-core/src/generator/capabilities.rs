@@ -304,7 +304,7 @@ pub struct Capabilities {
     /// opt-in that is quietly dropped is worse than a refusal, because the caller cannot tell the
     /// prediction never ran. A provider sets it `true` only when its load actually binds a duration
     /// head and its generate routes the opt-in through
-    /// [`crate::duration_head::resolve_request_num_frames`].
+    /// `gen_core_ltx::duration_head::resolve_request_num_frames`.
     pub supports_auto_duration: bool,
     /// Whether this model places **generated keyframe slots** at interior positions when the
     /// request sets [`GenerationRequest::num_generated_keyframes`] (reference

@@ -36,6 +36,8 @@ image = { workspace = true }
 # The shared epic-2123 aux-loss builder (sc-24830): config -> PerceptualPath (depth anchoring
 # through TAELTX2.3, the LTX-2.3 VAE's tiny decoder).
 mlx-gen-perceptual = { path = "../mlx-gen-perceptual" }
+sceneworks-gen-core-ltx = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [dev-dependencies]
 # Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
@@ -57,4 +59,4 @@ name = "integration"
 path = "tests/main.rs"
 
 [features]
-model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-llm/model-inference-proof", "mlx-gen-perceptual/model-inference-proof"]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-llm/model-inference-proof", "mlx-gen-perceptual/model-inference-proof", "sceneworks-gen-core-ltx/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]

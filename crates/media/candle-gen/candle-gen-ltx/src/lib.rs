@@ -89,9 +89,6 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 #[cfg(test)]
-use candle_gen::gen_core::ltx_checkpoint::LtxBundleBuilder;
-use candle_gen::gen_core::ltx_checkpoint::{LtxBundle, LtxCheckpointLayout, LtxComponent};
-#[cfg(test)]
 use candle_gen::gen_core::AdapterKind;
 use candle_gen::gen_core::{
     self, AdapterSpec, AudioTrack, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
@@ -99,6 +96,9 @@ use candle_gen::gen_core::{
     Progress, Quant, StepSupport, WeightsSource,
 };
 use candle_gen::{run_av_curated_sampler, AvLatents, CandleError, Result as CResult};
+#[cfg(test)]
+use gen_core_ltx::ltx_checkpoint::LtxBundleBuilder;
+use gen_core_ltx::ltx_checkpoint::{LtxBundle, LtxCheckpointLayout, LtxComponent};
 
 use audio_vae::AudioDecoder;
 use block_stream::LtxBlockStream;
@@ -998,18 +998,13 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32, Option<AudioTrack>)> {
         let (canvas_frames, _, mut keyframe_positions) =
-            candle_gen::gen_core::ltx_dfr::resolve_canvas(
-                frames as i64,
-                config::TEMPORAL_SCALE as i64,
-            )
-            .map_err(|e| CandleError::Msg(e.to_string()))?;
+            gen_core_ltx::ltx_dfr::resolve_canvas(frames as i64, config::TEMPORAL_SCALE as i64)
+                .map_err(|e| CandleError::Msg(e.to_string()))?;
         if let Some(count) = req.num_generated_keyframes.filter(|count| *count > 0) {
-            keyframe_positions.extend(
-                candle_gen::gen_core::ltx_dfr::evenly_spaced_keyframe_positions(
-                    count,
-                    canvas_frames,
-                ),
-            );
+            keyframe_positions.extend(gen_core_ltx::ltx_dfr::evenly_spaced_keyframe_positions(
+                count,
+                canvas_frames,
+            ));
             keyframe_positions.sort_unstable();
             keyframe_positions.dedup();
         }
@@ -1130,7 +1125,7 @@ impl Pipeline {
             head.predict_seconds(Some(&video_ctx), Some(&audio_ctx))
                 .map_err(|e| gen_core::Error::Msg(e.to_string()))
         };
-        let frames = candle_gen::gen_core::duration_head::resolve_request_num_frames(
+        let frames = gen_core_ltx::duration_head::resolve_request_num_frames(
             req.frames,
             req.auto_duration,
             fps as f32,
@@ -2192,7 +2187,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         WeightsSource::Dir(_) => root.clone(),
     };
     let declared_version = bundle::declared_model_version(&layout_probe)?;
-    if gen_core::ltx_checkpoint::layout_for_declared_version(declared_version.as_deref())
+    if gen_core_ltx::ltx_checkpoint::layout_for_declared_version(declared_version.as_deref())
         == LtxCheckpointLayout::Split
     {
         return Err(gen_core::Error::Unsupported(format!(

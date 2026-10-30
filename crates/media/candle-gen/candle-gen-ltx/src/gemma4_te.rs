@@ -45,12 +45,12 @@ use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::gemma_assets::GemmaAssets;
-use candle_gen::gen_core::ltx_checkpoint::{
+use gen_core_ltx::gemma_assets::GemmaAssets;
+use gen_core_ltx::ltx_checkpoint::{
     check_gemma_version, GemmaEncoderIdentity, GemmaVersionCheck, LtxCheckpointMetadata,
     LtxComponent,
 };
-use candle_gen::gen_core::LtxBundle;
+use gen_core_ltx::LtxBundle;
 
 use candle_llm::config::ModelConfig;
 use candle_llm::models::CausalLm;
@@ -378,7 +378,7 @@ fn gemma_config_value(te_path: &Path) -> Result<serde_json::Value> {
 
 /// R4: assert the packed encoder is the one this checkpoint declares, failing loudly on mismatch.
 ///
-/// Delegates the comparison to `gen_core::ltx_checkpoint::check_gemma_version` — upstream's
+/// Delegates the comparison to `gen_core_ltx::ltx_checkpoint::check_gemma_version` — upstream's
 /// `encoder_configurator._check_gemma_version` — rather than re-implementing the rules. The returned
 /// [`GemmaVersionCheck`] is deliberately **not** discarded. Both non-`Matched` outcomes are
 /// legitimate answers for *some* pair and so cannot be rejected by gen-core, but neither is
@@ -703,7 +703,7 @@ mod version_assertion_tests {
     #[test]
     fn from_bundle_av_reaches_the_version_assertion_through_the_bundle() {
         use candle_gen::candle_nn::VarBuilder;
-        use candle_gen::gen_core::ltx_checkpoint::{CaptionFeatureVersion, LtxBundleBuilder};
+        use gen_core_ltx::ltx_checkpoint::{CaptionFeatureVersion, LtxBundleBuilder};
 
         let dir = tempfile::tempdir().expect("tempdir");
         // The encoder declares a DIFFERENT Gemma 4 build than the transformer was trained against.
@@ -827,7 +827,7 @@ mod version_assertion_tests {
     /// producing plausible-looking, wrong conditioning.
     #[test]
     fn the_v2_gate_rejects_a_v1_selection() {
-        use candle_gen::gen_core::ltx_checkpoint::CaptionFeatureVersion;
+        use gen_core_ltx::ltx_checkpoint::CaptionFeatureVersion;
         require_v2_version(CaptionFeatureVersion::V2).expect("V2 must be accepted");
         let err = require_v2_version(CaptionFeatureVersion::V1).expect_err("V1 must be rejected");
         let msg = err.to_string();

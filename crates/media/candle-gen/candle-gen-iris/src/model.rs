@@ -1,15 +1,11 @@
 //! `Iris3b` — the Iris-3B text-to-image [`Generator`] on Candle: descriptor, load, request
 //! validation and the staged generate (text encoder → backbone), registered as [`MODEL_ID`]. The
-//! request/load surface is the MLX twin's, field for field (both read `gen_core::iris`).
+//! request/load surface is the MLX twin's, field for field (both read `gen_core_iris`).
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device};
-use candle_gen::gen_core::iris::{
-    validate_generation_request, GenerationParams, GenerationResources, IrisConfig, IrisTask,
-    BACKBONE_WEIGHTS_FILE, FAMILY, GENERATION_MODEL_ID, SAMPLERS, TEXT_ENCODER_COMPONENT,
-};
 use candle_gen::gen_core::{
     self, default_seed, AdapterApplyReport, AdapterSpec, Capabilities, GenerationOutput,
     GenerationReport, GenerationRequest, GenerationWarning, Generator, LoadSpec, Modality,
@@ -17,6 +13,10 @@ use candle_gen::gen_core::{
 };
 use candle_gen::residency::Residency;
 use candle_gen::{CandleError as Error, Result};
+use gen_core_iris::{
+    validate_generation_request, GenerationParams, GenerationResources, IrisConfig, IrisTask,
+    BACKBONE_WEIGHTS_FILE, FAMILY, GENERATION_MODEL_ID, SAMPLERS, TEXT_ENCODER_COMPONENT,
+};
 
 use crate::dit::IrisDiT;
 use crate::nn::{safetensors_shapes, BackboneQuant, Checkpoint};
@@ -26,7 +26,7 @@ use crate::text_encoder::IrisTextEncoder;
 /// Registry id (the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = GENERATION_MODEL_ID;
 /// Output sides must be multiples of the patch size (load refuses a patch that does not divide it).
-pub const SIZE_MULTIPLE: u32 = candle_gen::gen_core::iris::SIZE_MULTIPLE;
+pub const SIZE_MULTIPLE: u32 = gen_core_iris::SIZE_MULTIPLE;
 /// Smallest side: one patch.
 pub const MIN_SIZE: u32 = 16;
 /// Largest side served (the release renders ~1 MP; 2048² is the pixel-space attention ceiling

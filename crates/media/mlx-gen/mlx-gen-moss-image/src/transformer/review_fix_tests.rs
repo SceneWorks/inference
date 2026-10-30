@@ -1,6 +1,7 @@
 use super::author_fixture_tests::*;
 use super::*;
-use mlx_gen::gen_core::{moss_image::MossImageVariant, moss_image_training as contract};
+use gen_core_moss_image::moss_image_training as contract;
+use mlx_gen::gen_core::moss_image::MossImageVariant;
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 fn tiny() -> Transformer {
     let f = fixture("ordinary");

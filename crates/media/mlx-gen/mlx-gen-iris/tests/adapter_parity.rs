@@ -10,7 +10,7 @@
 //! measured max|Δ| / peak: LoRA 1.9e-5, LoKr 2.5e-5, both 2.6e-5 (with the former bf16 LoKr
 //! reconstruction: LoKr 6.5e-4, both 6.3e-4 — over this bound).
 
-use mlx_gen::gen_core::iris::{IrisTask, ADAPTER_TASK_KEY};
+use gen_core_iris::{IrisTask, ADAPTER_TASK_KEY};
 use mlx_gen::{AdapterKind, AdapterSpec, Error};
 use mlx_gen_iris::{load_backbone_with_adapters, TextBatch};
 use mlx_rs::Dtype;
@@ -125,7 +125,7 @@ fn a_mismatched_checkpoint_is_refused_with_an_adapter_attached() {
 
 fn a_mismatched_checkpoint_is_refused_with_an_adapter_attached_body() {
     let dir = mismatched_backbone();
-    let config = mlx_gen::gen_core::iris::IrisConfig::from_dir(dir.path()).unwrap();
+    let config = gen_core_iris::IrisConfig::from_dir(dir.path()).unwrap();
     assert_eq!(config.model.pixel.depth, 1);
     let lora = spec("iris_lora.safetensors", AdapterKind::Lora, 0.75);
     let lokr = spec("iris_lokr.safetensors", AdapterKind::Lokr, 1.0);

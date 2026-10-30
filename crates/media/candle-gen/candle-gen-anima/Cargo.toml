@@ -28,9 +28,11 @@ serde_json = { workspace = true }
 # The shared epic-2123 aux-loss builder (sc-24830): config -> PerceptualPath (depth anchoring
 # through TAEW2.1, the Qwen-Image VAE's tiny decoder).
 candle-gen-perceptual = { path = "../candle-gen-perceptual" }
+sceneworks-gen-core-tokenizer = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen-depth/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen-qwen-image/model-inference-proof", "candle-gen/model-inference-proof"]
+model-inference-proof = ["candle-gen-depth/model-inference-proof", "candle-gen-perceptual/model-inference-proof", "candle-gen-qwen-image/model-inference-proof", "candle-gen/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 # Default works on Mac / Linux CPU with NO extra features (candle-core defaults to the CPU backend);
 # this is the lane the `cargo check -F backend-candle` parity build and the CPU golden tests use.
 default = []

@@ -26,7 +26,11 @@ pub type ReportSink = Rc<RefCell<VedaExecutionReport>>;
 /// One executed head's selected rows: `(layer, head, rows)`.
 #[cfg(test)]
 pub(crate) type ExecutedMask = (usize, usize, Vec<Vec<usize>>);
-use mlx_gen::gen_core::veda::workspace::{self, Backend, Chunk, LayoutSize, Limits};
+use gen_core_h3::veda::{
+    workspace,
+    workspace::{LayoutSize, Limits},
+};
+use mlx_gen::gen_core::veda::workspace::{Backend, Chunk};
 /// Metal execution (sc-26214): the exact device tile scorer plus [`metal::attend`]'s block-sparse
 /// attention over selected key tiles read in place, and one dense call for the global query rows.
 /// FP32 `simdgroup_matrix` products, on a GPU without MLX's neural-accelerator kernels.

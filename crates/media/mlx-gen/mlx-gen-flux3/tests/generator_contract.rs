@@ -5,7 +5,7 @@
 //! both residency policies, the component overrides, typed errors for a missing resource and for
 //! the controls the flow map cannot honour.
 
-use mlx_gen::gen_core::flux3::{AUTOENCODER_COMPONENT, TEXT_ENCODER_COMPONENT};
+use gen_core_flux3::{AUTOENCODER_COMPONENT, TEXT_ENCODER_COMPONENT};
 use mlx_gen::gen_core::{Error as CoreError, Progress};
 use mlx_gen::{
     CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, OffloadPolicy, WeightsSource,
@@ -140,9 +140,10 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
                 (83, 67),
                 "single-auto result removes only the source padding"
             );
-            let exif = mlx_gen::gen_core::flux3::references::decode_reference_file(
-                &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../../contracts/gen-core/tests/fixtures/flux3-references/exif6.png"),
+            let exif = gen_core_flux3::references::decode_reference_file(
+                &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                    "../../../contracts/gen-core-flux3/tests/fixtures/flux3-references/exif6.png",
+                ),
             )
             .unwrap();
             edit.conditioning = vec![exif.clone()];
@@ -174,7 +175,7 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
             narrow.flux3_reference_output = Some(ReferenceOutputSize::default());
             // The ordinary memory scope normalizes numeric geometry BEFORE model validation.
             // Its 48px canvas must not be re-rejected by the descriptor T2I minimum.
-            let plan = mlx_gen::gen_core::flux3::references::normalize_request(&mut narrow)
+            let plan = gen_core_flux3::references::normalize_request(&mut narrow)
                 .unwrap()
                 .unwrap();
             assert_eq!(plan.output.canvas, (48, 64));
@@ -189,7 +190,7 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
                 "legacy no-reference minimum is unchanged"
             );
             let formats = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../contracts/gen-core/tests/fixtures/flux3-image-input");
+                .join("../../../contracts/gen-core-flux3/tests/fixtures/flux3-image-input");
             for file in [
                 "mode-luma16.png",
                 "mode-rgb16.png",
@@ -197,12 +198,11 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
                 "mode-rgb-trns.png",
             ] {
                 edit.conditioning =
-                    vec![mlx_gen::gen_core::flux3::references::decode_reference_file(
-                        &formats.join(file),
-                    )
-                    .unwrap()];
-                let normalized = mlx_gen::gen_core::flux3::references::request_images(&edit)
-                    .unwrap()[0]
+                    vec![
+                        gen_core_flux3::references::decode_reference_file(&formats.join(file))
+                            .unwrap(),
+                    ];
+                let normalized = gen_core_flux3::references::request_images(&edit).unwrap()[0]
                     .as_ref()
                     .clone();
                 let encoded = render(&edit);

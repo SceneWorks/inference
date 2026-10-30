@@ -11,21 +11,24 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{self, CancelFlag, LoadSpec, Modality, Precision, WeightsSource};
 use candle_gen::train::optim::TrainOptimizer;
 use candle_gen::{CandleError as Error, Result};
-use gen_core::flux3::training::{
-    controller::{self, RunPlan},
-    identity, lora_targets,
-    options::{TrainingOptions, TrainingPrecision},
-    preprocess::{self, PixelOptions},
-    rng::NativeRng,
-    sampler::BatchSampler,
-};
-use gen_core::flux3::{
-    assemble_window, Flux3Config, GenerationResources, AUTOENCODER_COMPONENT, BASE_MODEL_ID,
-    DIT_WEIGHTS_FILE, FAMILY, TEXT_ENCODER_COMPONENT,
-};
+use gen_core::flux3::BASE_MODEL_ID;
 use gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
     TrainingTechniques,
+};
+use gen_core_flux3::training::{
+    controller,
+    controller::RunPlan,
+    identity, lora_targets,
+    options::{TrainingOptions, TrainingPrecision},
+    preprocess,
+    preprocess::PixelOptions,
+    rng::NativeRng,
+    sampler::BatchSampler,
+};
+use gen_core_flux3::{
+    assemble_window, Flux3Config, GenerationResources, AUTOENCODER_COMPONENT, DIT_WEIGHTS_FILE,
+    FAMILY, TEXT_ENCODER_COMPONENT,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -60,7 +63,7 @@ pub struct Flux3Trainer {
     descriptor: TrainerDescriptor,
 }
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    gen_core::train::refuse_trainer_load_overlays(BASE_MODEL_ID, spec).map_err(Error::from)?;
+    gen_core_train::refuse_trainer_load_overlays(BASE_MODEL_ID, spec).map_err(Error::from)?;
     crate::memory_strategy::refuse_deferred_load_shape(BASE_MODEL_ID, spec).map_err(Error::from)?;
     if !matches!(spec.weights, WeightsSource::Dir(_))
         || spec.quantize.is_some()
@@ -88,10 +91,10 @@ impl Trainer for Flux3Trainer {
         &self.descriptor
     }
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
+        gen_core_train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core_train::validate_control_request(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_edit_request(self.descriptor(), req)?;
         let opts = TrainingOptions::parse(req)?;
         controller::ensure_new_output(req)?;
         if opts.precision == TrainingPrecision::Bf16
@@ -129,7 +132,7 @@ fn host_pixels(image: &gen_core::Image) -> Result<Tensor> {
 /// VarBuilder/model, so no full original-dtype GPU map shadows the F32/BF16 base.
 fn load_training_dit(
     path: &Path,
-    cfg: &gen_core::flux3::DitConfig,
+    cfg: &gen_core_flux3::DitConfig,
     dtype: DType,
     device: &Device,
     flag: &CancelFlag,
@@ -170,14 +173,14 @@ fn load_training_dit(
 /// preflighted from the headers — all before any resource, text-encoder, autoencoder, LoRA-target,
 /// dataset or device work.
 fn resolve_training_base(root: &Path) -> Result<Flux3Config> {
-    let cfg = gen_core::flux3::resolve_checkpoint(root).map_err(Error::from)?;
+    let cfg = gen_core_flux3::resolve_checkpoint(root).map_err(Error::from)?;
     cfg.validate_route(BASE_MODEL_ID).map_err(Error::from)?;
     identity::validate_release_config(&cfg).map_err(Error::from)?;
-    let headers = gen_core::flux3::checkpoint_tensor_headers(root).map_err(Error::from)?;
+    let headers = gen_core_flux3::checkpoint_tensor_headers(root).map_err(Error::from)?;
     crate::dit::validate_checkpoint_headers(
         &cfg.dit,
-        gen_core::flux3::artifacts::NativeDitStorage::Publisher(
-            gen_core::flux3::quantization::DitFormat::Dense,
+        gen_core_flux3::artifacts::NativeDitStorage::Publisher(
+            gen_core_flux3::quantization::DitFormat::Dense,
         ),
         &headers,
     )?;
@@ -375,7 +378,7 @@ fn execute(
             cache.push(CachedExample {
                 latent: latent.to_device(&Device::Cpu)?,
                 text,
-                text_ids: gen_core::flux3::text_ids(window.length()),
+                text_ids: gen_core_flux3::text_ids(window.length()),
                 empty_text,
                 reference,
                 grid,
@@ -404,7 +407,7 @@ fn execute(
     check(&req.cancel)?;
     // Re-read identities before any optimization: mutable input/source replacements
     // during caching must refuse, never continue under an earlier provenance hash.
-    if gen_core::train::resume::request_fingerprint(req).map_err(Error::from)? != identity.dataset
+    if gen_core_train::resume::request_fingerprint(req).map_err(Error::from)? != identity.dataset
         || identity::observe_pinned_resources(&resources, &req.cancel).map_err(Error::from)?
             != identity.artifacts
     {

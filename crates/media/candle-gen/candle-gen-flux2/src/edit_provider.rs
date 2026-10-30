@@ -121,7 +121,7 @@ pub struct Flux2Edit {
     upsampler: Option<CaptionUpsampler>,
     /// Prompt tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
     /// instead of re-parsing `tokenizer.json` per prompt/branch.
-    tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
+    tokenizer: gen_core_tokenizer::TextTokenizer,
     transformer: Option<Flux2Transformer>,
     vae: Option<Flux2Vae>,
     memory: GenerationMemory,

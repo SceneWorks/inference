@@ -1,9 +1,10 @@
 //! The frozen MOSS graph. The small geometry constructor is private to numerical tests.
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{self, Module};
-use candle_gen::gen_core::{moss_image::MossImageConfig, CancelFlag};
+use candle_gen::gen_core::CancelFlag;
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
+use gen_core_moss_image::moss_image::MossImageConfig;
 use std::collections::{BTreeSet, HashMap};
 
 #[derive(Clone, Copy, Debug)]
@@ -795,7 +796,7 @@ impl Transformer {
                 ));
             }
         }
-        let paths = candle_gen::gen_core::moss_image_training::target_paths(
+        let paths = gen_core_moss_image::moss_image_training::target_paths(
             self.g.layers,
             &c.lora_target_modules,
         )?;
@@ -877,7 +878,7 @@ impl Transformer {
         }
         let half = self.g.freq / 2;
         let features = if self.g.freq == 256 {
-            candle_gen::gen_core::moss_image::moss_time_features(time)?.to_vec()
+            gen_core_moss_image::moss_image::moss_time_features(time)?.to_vec()
         } else {
             let phase: Vec<_> = (0..half)
                 .map(|i| f64::from(time) * 10000_f64.powf(-(i as f64) / half as f64))
@@ -1007,7 +1008,7 @@ impl Transformer {
             return Err(CandleError::Msg("MOSS forward geometry/mask/skip".into()));
         }
         let features = if self.g.freq == 256 {
-            candle_gen::gen_core::moss_image::moss_time_features(time)?.to_vec()
+            gen_core_moss_image::moss_image::moss_time_features(time)?.to_vec()
         } else {
             let half = self.g.freq / 2;
             let phase: Vec<_> = (0..half)

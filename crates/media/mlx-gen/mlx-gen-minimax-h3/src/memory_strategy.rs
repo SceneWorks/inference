@@ -219,7 +219,8 @@ pub use routes::*;
 use crate::denoise::LEGAL_FRAME_COUNTS;
 use crate::model::{DIT_COMPONENT, MODEL_ID, TEXT_ENCODER_COMPONENT};
 use crate::pipeline::{CANVAS_MAX_PIXELS, SPATIAL_STRIDE};
-use mlx_gen::gen_core::pruned_adaln::{PrunedAdaLn, SourcePruneSizing, TABLE_KEY};
+use gen_core_h3::h3_memory::NativeAllocationFactsExt;
+use gen_core_h3::pruned_adaln::{PrunedAdaLn, SourcePruneSizing, TABLE_KEY};
 
 /// Calibration identity for this provider's measurements.
 ///

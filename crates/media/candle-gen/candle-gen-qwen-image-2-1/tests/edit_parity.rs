@@ -115,7 +115,7 @@ fn opaque_sources(w: &Fixture, case: &Case) -> Vec<RgbaImage> {
 }
 
 struct Snapshot {
-    tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
+    tokenizer: gen_core_tokenizer::TextTokenizer,
     encoder: QwenImage21TextEncoder,
     transformer: candle_gen_qwen_image_2_1::QwenImage21Transformer,
     vae: candle_gen_qwen_image_2_1::QwenImage21Vae,

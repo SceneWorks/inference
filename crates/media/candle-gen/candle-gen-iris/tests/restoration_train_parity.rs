@@ -10,15 +10,13 @@
 use std::collections::HashMap;
 
 use candle_gen::candle_core::{Device, Tensor, Var};
-use candle_gen::gen_core::iris::restoration_train::{
-    ConvNextConfig, CriticHeadConfig, VGG16_WIDTHS,
-};
-use candle_gen::gen_core::iris::train::{MuonAdjustLr, OptimizerKind, OptimizerPlan, ParamRoute};
 use candle_gen_iris::train::critic::{
     head_from_tensors, multilevel_loss, power_iteration, ConvNextTrunk, Critic, SpectralState,
 };
 use candle_gen_iris::train::lpips::Lpips;
 use candle_gen_iris::train::optim::{clip_grads, snapshot, IrisOptimizer, Params, Tensors};
+use gen_core_iris::restoration_train::{ConvNextConfig, CriticHeadConfig, VGG16_WIDTHS};
+use gen_core_iris::train::{MuonAdjustLr, OptimizerKind, OptimizerPlan, ParamRoute};
 
 use crate::common::{fixture, host_f32, Fixture};
 

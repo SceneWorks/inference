@@ -38,10 +38,10 @@ use std::path::Path;
 use mlx_rs::{Array, Dtype};
 
 use crate::block_stream::DitBlockStream;
+use gen_core_h3::pruned_adaln::PruningIdentity;
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::{AttentionBudget, AttentionChunkAxis, AttentionPlan, BoundedAttention};
 use mlx_gen::block_residency::{run_windowed, BlockPlan};
-use mlx_gen::gen_core::pruned_adaln::PruningIdentity;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
 

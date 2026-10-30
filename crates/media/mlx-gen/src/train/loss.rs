@@ -5,7 +5,7 @@
 //! [`reduce_loss`]. With no weight it is exactly the historical `mean(diff²)` / `mean(|diff|)` (the
 //! same ops, so a mask-off run is bit-identical). With a weight map `w` (built once per item at
 //! cache time by [`subject_mask_weight`] from the backend-neutral
-//! [`gen_core::train::subject_mask`](crate::train::subject_mask) map), the per-element loss is
+//! [`gen_core_train::subject_mask`](crate::train::subject_mask) map), the per-element loss is
 //! multiplied by `w` **before** the mean — `mean(w ⊙ ℓ)`, the convention documented there — so a
 //! latent element with `w = 0` contributes zero loss and zero gradient.
 

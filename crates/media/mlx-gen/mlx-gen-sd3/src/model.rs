@@ -158,7 +158,7 @@ impl Sd3Variant {
     where
         A: Sd3ReferencePreparer<R, P, E>,
     {
-        mlx_gen::gen_core::map_sd3_seeded_outputs(
+        gen_core_family::map_sd3_seeded_outputs(
             reference,
             base_seed,
             count,
@@ -638,7 +638,7 @@ pub(crate) fn component_footprint(
 fn projected_conditioning_bytes(root: &std::path::Path) -> Option<u64> {
     use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 
-    let artifacts = mlx_gen::gen_core::resolve_sd3_text_encoder_artifacts(root).ok()?;
+    let artifacts = gen_core_family::resolve_sd3_text_encoder_artifacts(root).ok()?;
     let clip_l =
         projected_safetensors_bytes(&artifacts.clip_l, |_| ResidentProjection::Float32).ok()?;
     let clip_g =

@@ -4,11 +4,11 @@
 //! strided convs use the backward-safe pad-and-crop form.
 
 use candle_gen::candle_core::{Device, Tensor};
-use candle_gen::gen_core::train::body::{
-    hybrik_encode_crop, hybrik_square_crop, HybrikConfig, HYBRIK_MEAN, HYBRIK_STD,
-};
 use candle_gen::weights::Weights;
 use candle_gen::Result;
+use gen_core_train::body::{
+    hybrik_encode_crop, hybrik_square_crop, HybrikConfig, HYBRIK_MEAN, HYBRIK_STD,
+};
 
 use super::{bn_fold, conv2d, linear, normalize, resample_nhwc, w32, AxisMatrix, BatchNorm};
 

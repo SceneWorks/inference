@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::gen_core::iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
+use gen_core_iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource};
 use mlx_gen_iris::{load_backbone_quantized, IrisTextEncoder, MODEL_ID};
 use mlx_rs::{Array, Dtype};
@@ -424,7 +424,7 @@ fn real_packed_projections_sit_on_their_stored_grid() {
 #[test]
 #[ignore = "needs the real weights (IRIS_WEIGHTS_DIR, IRIS_TEXT_ENCODER_DIR) and the GPU"]
 fn real_quantized_tiers_track_the_bf16_denoiser_at_512() {
-    use mlx_gen::gen_core::iris::GenerationParams;
+    use gen_core_iris::GenerationParams;
     use mlx_gen_iris::pipeline::{encode, noise, Conditioning};
     use mlx_gen_iris::solver::cfg_combine;
     use mlx_gen_iris::{IrisDiT, TextBatch};

@@ -11,7 +11,7 @@
 //!
 //! Every test runs in a CPU-default child (`cpu_process`).
 
-use mlx_gen::gen_core::iris::IrisConfig;
+use gen_core_iris::IrisConfig;
 use mlx_gen_iris::{load_backbone, TextBatch};
 use mlx_rs::Dtype;
 

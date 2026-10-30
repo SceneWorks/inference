@@ -13,11 +13,11 @@
 //!   reproduced (we accumulate fully in f32), which is why this tolerance is stated here and not
 //!   widened anywhere else.
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::flux3::quantization::{
-    decode_e4m3, dequantize_fp8_rows, quantize_fp8_rows, quantize_nvfp4_static,
-};
 use candle_quant_kernels::cublaslt::CublasLt;
 use candle_quant_kernels::flux3_quant as mirror;
+use gen_core_flux3::quantization::{
+    decode_e4m3, dequantize_fp8_rows, quantize_fp8_rows, quantize_nvfp4_static,
+};
 
 fn device() -> Device {
     Device::new_cuda(0).expect("CUDA device 0 (CUDA_VISIBLE_DEVICES selects GPU1)")

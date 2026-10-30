@@ -2,8 +2,7 @@
 //! `sampling.denoise_flow_map`): seeded bf16-valued noise in the packed latent space → the
 //! flow-map Euler loop over `timesteps(steps, alpha)` → the autoencoder decode → RGB8.
 
-use gen_core::flux3::{latent_ids, scaled_image_ids, GenerationParams};
-use mlx_gen::gen_core;
+use gen_core_flux3::{latent_ids, scaled_image_ids, GenerationParams};
 use mlx_gen::{CancelFlag, Error, Image, Result};
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};

@@ -15,11 +15,11 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_gen::gen_core::iris::depth::{
-    colorize_inferno, near_bright_control_image, DepthMap, DepthRequest, DepthResolution,
-};
 use candle_gen::gen_core::{Image, LoadSpec, Progress, WeightsSource};
 use candle_gen::testkit::{probe_gpu, used_mib, VramProbe};
+use gen_core_iris::depth::{
+    colorize_inferno, near_bright_control_image, DepthMap, DepthRequest, DepthResolution,
+};
 
 use crate::common::{fixture, host_f32};
 

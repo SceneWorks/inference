@@ -26,9 +26,10 @@ mod transformer;
 pub const SIZE_MULTIPLE: u32 = 16;
 
 use candle_gen::candle_core::Device;
-use candle_gen::gen_core::{self, moss_image::*, moss_image_edit::*, *};
+use candle_gen::gen_core::{self, *};
 use candle_gen_flux2::vae::Flux2Vae;
 use candle_llm::models::qwen35::Qwen35Model;
+use gen_core_moss_image::{moss_image::*, moss_image_edit::*};
 use loader::Sources;
 use release::release_then_sync;
 use std::collections::BTreeMap;

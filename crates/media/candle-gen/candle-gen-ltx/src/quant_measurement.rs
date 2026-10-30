@@ -240,9 +240,7 @@ fn select_case_bundle(
         let encoder =
             crate::quant_eval::snapshot_bound_file(snapshot, subpath, "bf16TextEncoderSubpath")?;
         spec.components.insert(
-            candle_gen::gen_core::LtxComponent::TextEncoder
-                .id()
-                .to_owned(),
+            gen_core_ltx::LtxComponent::TextEncoder.id().to_owned(),
             candle_gen::gen_core::WeightsSource::File(encoder),
         );
     }
@@ -599,7 +597,7 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         .into());
     }
     let transformer = resolved
-        .require(candle_gen::gen_core::LtxComponent::Transformer)?
+        .require(gen_core_ltx::LtxComponent::Transformer)?
         .path();
     let source_inspection =
         crate::advanced_quant::inspect_transformer_source(transformer, case.mode)?;
@@ -1166,7 +1164,7 @@ fn observe_bundle(
         .into());
     }
     let transformer = bundle
-        .require(candle_gen::gen_core::LtxComponent::Transformer)?
+        .require(gen_core_ltx::LtxComponent::Transformer)?
         .path();
     let inspection = crate::advanced_quant::inspect_transformer_source(transformer, case.mode)?;
     let runtime_bundle_sha256 = bundle_identity_sha256(
@@ -2105,7 +2103,7 @@ fn load_and_copy_reference(
         .into());
     }
     let reference_transformer = reference_bundle
-        .require(candle_gen::gen_core::LtxComponent::Transformer)?
+        .require(gen_core_ltx::LtxComponent::Transformer)?
         .path();
     crate::advanced_quant::inspect_transformer_source(reference_transformer, Ltx25QuantMode::Bf16)?;
     let reference_bundle_sha256 = bundle_identity_sha256(

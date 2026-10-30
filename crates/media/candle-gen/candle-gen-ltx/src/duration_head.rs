@@ -5,7 +5,7 @@
 //! `packages/ltx-core/src/ltx_core/duration_head/duration_head.py`), the architecture (per-modality
 //! input projections + additive modality embeddings → a 4-head `AttentionPooler` cross-attending one
 //! learnable query → a small MLP → log-duration → `exp`), and the pinned hyperparameters
-//! (`candle_gen::gen_core::duration_head::hparams`, shared with the MLX port so both backends read
+//! (`gen_core_ltx::duration_head::hparams`, shared with the MLX port so both backends read
 //! from one source of truth).
 //!
 //! Runs entirely in **f32** (same rationale as `mlx_gen_ltx::duration_head`: a tiny "quality island"
@@ -13,8 +13,8 @@
 //! activations here).
 
 use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
-use candle_gen::gen_core::duration_head::hparams;
 use candle_gen::weights::Weights;
+use gen_core_ltx::duration_head::hparams;
 
 /// `y = x·Wᵀ + b`, broadcasting over any leading batch dims (`w`: `[out, in]`, PyTorch layout).
 fn linear(x: &Tensor, w: &Tensor, b: &Tensor) -> Result<Tensor> {
@@ -349,13 +349,14 @@ mod tests {
     }
 
     /// Reachability at the real-component level (sc-18774 acceptance): wiring
-    /// `gen_core::duration_head::resolve_request_num_frames`'s injected predictor to this REAL (if
+    /// `gen_core_ltx::duration_head::resolve_request_num_frames`'s injected predictor to this REAL (if
     /// synthetic-weighted) `DurationHead::forward` proves the opt-in seam reaches all the way into
     /// the network's forward pass, not just a mock closure.
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
     fn opt_in_seam_reaches_the_real_forward_pass() {
-        use candle_gen::gen_core::duration_head::{resolve_request_num_frames, AutoDurationRange};
+        use candle_gen::gen_core::duration_head::AutoDurationRange;
+        use gen_core_ltx::duration_head::resolve_request_num_frames;
 
         let device = Device::Cpu;
         let head = DurationHead::from_weights(&synthetic_weights(&device), &device).unwrap();
@@ -370,7 +371,7 @@ mod tests {
             None,
             Some(AutoDurationRange::default()),
             24.0,
-            candle_gen::gen_core::duration_head::TEMPORAL_GRID,
+            gen_core_ltx::duration_head::TEMPORAL_GRID,
             &mut predict,
         )
         .unwrap();
@@ -392,7 +393,7 @@ mod tests {
             Some(65),
             Some(AutoDurationRange::default()),
             24.0,
-            candle_gen::gen_core::duration_head::TEMPORAL_GRID,
+            gen_core_ltx::duration_head::TEMPORAL_GRID,
             &mut predict2,
         )
         .unwrap();

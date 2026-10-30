@@ -426,14 +426,14 @@ mlx_gen::register_trainer! {
 fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
     // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
     // request (typed `Unsupported`) rather than silently training a plain adapter.
-    gen_core::train::validate_control_request(descriptor, req)?;
+    gen_core_train::validate_control_request(descriptor, req)?;
     // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
     // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    gen_core_train::validate_full_finetune_request(descriptor, req)?;
     // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
     // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-    gen_core::train::validate_training_techniques(descriptor, req)?;
-    gen_core::train::validate_edit_request(descriptor, req)?;
+    gen_core_train::validate_training_techniques(descriptor, req)?;
+    gen_core_train::validate_edit_request(descriptor, req)?;
     let id = descriptor.id;
     if req.items.is_empty() {
         return Err(format!("{id} trainer: dataset is empty").into());
@@ -479,7 +479,7 @@ impl Trainer for WanMoeTrainer {
     ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         let mut warnings = Vec::new();
         let output = self.train_impl(req, on_progress, &mut warnings)?;
         Ok(TrainingReport { output, warnings })
@@ -1158,7 +1158,7 @@ fn latent_frames_nchw(latent: &Array) -> Result<Array> {
 
 /// The perceptual plan of one micro-step with every aux loss's window confined to the routed
 /// expert's noise `band` (epic 2123 E8) — the shared gen-core
-/// [`plan_in_band`](mlx_gen::gen_core::train::plan_in_band) policy over this path's schedules, minus the
+/// [`plan_in_band`](gen_core_train::plan_in_band) policy over this path's schedules, minus the
 /// losses unusable for `entry`. With the full band `(0, 1)` this is exactly
 /// [`PerceptualPath::plan`].
 fn plan_in_band(
@@ -1172,10 +1172,7 @@ fn plan_in_band(
     let usable = (0..schedules.len())
         .map(|i| path.is_usable(entry, i))
         .collect::<Result<Vec<bool>>>()?;
-    Ok(
-        mlx_gen::gen_core::train::plan_in_band(&schedules, key, band, t)
-            .without_skipped(|i| !usable[i]),
-    )
+    Ok(gen_core_train::plan_in_band(&schedules, key, band, t).without_skipped(|i| !usable[i]))
 }
 
 /// The bucket index of the largest edge in `edges` (the first on a tie; `0` for an empty list) —

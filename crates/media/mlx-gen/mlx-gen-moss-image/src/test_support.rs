@@ -2,9 +2,9 @@
 //! The wrappers below only establish a CPU device/stream scope; they do not implement training,
 //! generation, optimizer logic or synthetic outputs. No runtime bundle enables this feature.
 use crate::loader::{Asset, Sources};
+use gen_core_moss_image::moss_image::*;
 use mlx_gen::gen_core::{
-    self, moss_image::*, AdapterSpec, Generator, LoadSpec, PinnedWeightsFile, Trainer,
-    WeightsSource,
+    self, AdapterSpec, Generator, LoadSpec, PinnedWeightsFile, Trainer, WeightsSource,
 };
 use std::path::Path;
 pub const HOST_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -444,7 +444,9 @@ mod tests {
                 },
                 |req| {
                     let prompts =
-                        gen_core::moss_image_training::recovery::conditioning_prompts(req);
+                        gen_core_moss_image::moss_image_training::recovery::conditioning_prompts(
+                            req,
+                        );
                     prompts
                         .iter()
                         .map(|prompt| {

@@ -665,9 +665,14 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
         ordinary = yaml.safe_load(CI.read_text(encoding='utf-8'))
         self.assertEqual(ordinary['concurrency']['group'], "inference-ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}")
         self.assertEqual(ordinary['concurrency']['cancel-in-progress'], "${{ github.event_name == 'pull_request' }}")
-        library = (ROOT / "crates/contracts/gen-core/src/lib.rs").read_text(encoding="utf-8")
+        # sc-27316: the H3/MOSS modules live in their sibling crates; gen-core keeps the request-surface
+        # halves of some, so each module must be exported exactly once by the crate that owns it.
+        libraries = [(ROOT / f"crates/contracts/{crate}/src/lib.rs").read_text(encoding="utf-8")
+                     for crate in ("gen-core", "gen-core-h3", "gen-core-moss-image")]
         for module in ("moss_image_edit", "pruned_adaln", "h3_adapter_memory", "h3_conditioning_memory", "h3_memory"):
-            self.assertEqual(library.count(f"pub mod {module};"), 1, "both main and H3 contract exports must survive integration")
+            counts = [library.count(f"pub mod {module};") for library in libraries]
+            self.assertTrue(counts and max(counts) == 1 and 1 in counts,
+                            "both main and H3 contract exports must survive integration")
 
     def test_manual_geometry_proof_requires_actual_devices_and_all_cases(self) -> None:
         name = "manual_unit_patch_and_mixed_reference_full_forward_matches_resident_control"

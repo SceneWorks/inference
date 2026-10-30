@@ -2870,7 +2870,7 @@ mod tests {
         let transparent = request_with(vec![rgba_reference()]);
         let opaque = request_with(vec![rgb_reference()]);
         assert_eq!(
-            gen_core::wan_i2v_memory::geometry_from_request(&transparent).reference_count,
+            gen_core_memory_wan::geometry_from_request(&transparent).reference_count,
             1,
             "admission must see one reference"
         );
@@ -2880,8 +2880,8 @@ mod tests {
             "execution must see the same one"
         );
         assert_eq!(
-            gen_core::wan_i2v_memory::geometry_from_request(&transparent),
-            gen_core::wan_i2v_memory::geometry_from_request(&opaque),
+            gen_core_memory_wan::geometry_from_request(&transparent),
+            gen_core_memory_wan::geometry_from_request(&opaque),
             "a transparent reference admits identically to an opaque one"
         );
 
@@ -2893,7 +2893,7 @@ mod tests {
             .pop()
             .unwrap();
         let mut context = fixture.context.clone();
-        let admitted = gen_core::wan_i2v_memory::geometry_from_request(&transparent);
+        let admitted = gen_core_memory_wan::geometry_from_request(&transparent);
         context.geometry.width = admitted.width;
         context.geometry.height = admitted.height;
         context.geometry.batch = admitted.batch;

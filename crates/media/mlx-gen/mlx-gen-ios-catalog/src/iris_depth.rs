@@ -5,7 +5,7 @@
 //! ([`crate::ios_admission`]): [`crate::Admission::load_depth`] for an evidence-admitted load, or a
 //! `crate::capture_permit` (feature `device-capture`) for a bounded device capture. There is no unadmitted loader.
 
-pub use mlx_gen::gen_core::iris::depth::{
+pub use gen_core_iris::depth::{
     DepthMap, DepthMetadata, DepthOutput, DepthRequest, DepthResolution, IrisDepthEstimator,
 };
 pub use mlx_gen_iris::depth::IrisDepth;

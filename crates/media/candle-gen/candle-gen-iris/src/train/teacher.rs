@@ -2,18 +2,21 @@
 //! `mlx_gen_iris::train::teacher`: the `facebookresearch/dinov2` hub ViT's
 //! `forward_features()["x_norm_patchtokens"]` and `repa.py`'s input path, in fp32 with no autograd
 //! tape (the teacher never trains). See the MLX twin for the step-by-step definition; both read
-//! the same backend-neutral resampling matrices from `gen_core::iris::train::repa`.
+//! the same backend-neutral resampling matrices from `gen_core_iris::train::repa`.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
-use candle_gen::gen_core::iris::train::repa::{
-    self as contract, hf_sources, TeacherArch, TeacherFfn, TeacherNaming, IMAGENET_MEAN,
-    IMAGENET_STD, SPATIAL_NORM_EPS, TEACHER_LN_EPS,
-};
 use candle_gen::{CandleError as Error, Result};
+use gen_core_iris::train::{
+    repa as contract,
+    repa::{
+        hf_sources, TeacherArch, TeacherFfn, TeacherNaming, IMAGENET_MEAN, IMAGENET_STD,
+        SPATIAL_NORM_EPS, TEACHER_LN_EPS,
+    },
+};
 
 /// The loaded teacher: every tensor under its hub name, f32 on the training device.
 pub struct Teacher {
@@ -21,7 +24,7 @@ pub struct Teacher {
     w: HashMap<String, Tensor>,
 }
 
-pub use candle_gen::gen_core::iris::train::repa::teacher_file;
+pub use gen_core_iris::train::repa::teacher_file;
 
 fn mat(m: Vec<f32>, rows: usize, cols: usize, device: &Device) -> Result<Tensor> {
     Ok(Tensor::from_vec(m, (rows, cols), device)?)

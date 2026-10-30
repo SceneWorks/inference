@@ -2,12 +2,13 @@
 use super::*;
 use crate::training;
 use candle_gen::candle_core::{backprop::GradStore, Var};
-use candle_gen::gen_core::{moss_image_training as contract, NetworkType, TrainingConfig};
+use candle_gen::gen_core::{NetworkType, TrainingConfig};
 use candle_gen::train::{
     lora::{self, LoraSet},
     optim::TrainOptimizer,
 };
 use candle_gen::CandleError;
+use gen_core_moss_image::moss_image_training as contract;
 use std::collections::BTreeMap;
 
 fn unit_resources() -> Value {
@@ -192,7 +193,7 @@ fn fixture_lineage(path: &std::path::Path) -> Value {
         ("Cargo.lock", include_bytes!("../../../../../../Cargo.lock")),
         (
             "moss-contract",
-            include_bytes!("../../../../../contracts/gen-core/src/moss_image_training.rs"),
+            include_bytes!("../../../../../contracts/gen-core-moss-image/src/moss_image_training.rs"),
         ),
         (
             "author-fixture",

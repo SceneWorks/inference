@@ -17,7 +17,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use mlx_gen::gen_core::ltx_checkpoint::{
+use gen_core_ltx::ltx_checkpoint::{
     caption_feature_version, CaptionFeatureVersion, LtxBundle, LtxComponent,
 };
 use mlx_gen::{Error, Result};
@@ -1281,12 +1281,12 @@ mod tests {
     // --- sc-18763: caption feature-extractor version selection ------------------------------------
     //
     // Detector collapse (sc-18757/#688, 2026-08-19 coordinator review): `mlx-gen-ltx` no longer
-    // duplicates upstream's V1/V2 detection logic — `gen_core::ltx_checkpoint::caption_feature_
+    // duplicates upstream's V1/V2 detection logic — `gen_core_ltx::ltx_checkpoint::caption_feature_
     // version` is the single shared detector both backends fold onto. These tests are KEPT (per
     // the coordinator's explicit instruction) but now call that shared function directly instead
     // of a local `detect_text_encoder_feature_version` twin, so this crate still pins its own
     // regression coverage of the cases its `LtxConfig`/fixtures care about, without a second copy
-    // of the classification rule. `gen_core::ltx_checkpoint`'s own test module covers the same 8
+    // of the classification rule. `gen_core_ltx::ltx_checkpoint`'s own test module covers the same 8
     // cases exhaustively (verified to agree with these before the collapse).
 
     /// The 2.5 transformer config's V2-detection keys, measured directly off the real

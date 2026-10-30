@@ -1,10 +1,9 @@
 //! FlowDPM-Solver++ (`iris3b/flow/solver.py`) applied to MLX tensors. The schedule and every
-//! scalar coefficient come from the backend-neutral plan ([`gen_core::iris::dpm_solver_plan`]); this
+//! scalar coefficient come from the backend-neutral plan ([`gen_core_iris::dpm_solver_plan`]); this
 //! module only applies them. The integration state (`x`, the `x0` history) is **f32** throughout,
 //! as upstream keeps it (`z.to(float32)`, `out.x.float()`).
 
-use gen_core::iris::{DpmStep, DpmUpdate, Prediction};
-use mlx_gen::gen_core;
+use gen_core_iris::{DpmStep, DpmUpdate, Prediction};
 use mlx_gen::{CancelFlag, Error, Result};
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};

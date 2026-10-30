@@ -5,7 +5,7 @@
 //! image), seeded determinism, the CFG-off render, both residency policies, typed errors for
 //! missing/incomplete task resources (the control surface itself is `controls_contract`).
 
-use mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 use mlx_gen::gen_core::{Error as CoreError, Progress};
 use mlx_gen::{
     CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, OffloadPolicy, WeightsSource,

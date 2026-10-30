@@ -26,7 +26,7 @@
 //!   the depth map) directly and no autoencoder exists on any route.
 //! * **Restoration tiling is the resident baseline, not a rung.** The restorer runs one backbone
 //!   forward per export tile (the release: 1024-px tiles on a 50 %-overlap stride,
-//!   [`gen_core::iris::restoration`]) on every request larger than one tile, whatever is selected,
+//!   [`gen_core_iris::restoration`]) on every request larger than one tile, whatever is selected,
 //!   and has no untiled path. Its accelerator transient is therefore bounded by one tile and stops
 //!   growing with the output; what does grow with the output is the host-side fusion canvas. That
 //!   is why the contract publishes [`MemoryStrategy::Resident`] only and a pixel-count formula: a
@@ -54,11 +54,11 @@
 
 use std::path::Path;
 
+use gen_core_iris::depth::DepthInputPlan;
+use gen_core_iris::downstream::TaskExport;
+use gen_core_iris::restoration::{RestorationPlan, RestorationResources};
+use gen_core_iris::{GenerationResources, IrisConfig, IrisTask};
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
-use mlx_gen::gen_core::iris::depth::DepthInputPlan;
-use mlx_gen::gen_core::iris::downstream::TaskExport;
-use mlx_gen::gen_core::iris::restoration::{RestorationPlan, RestorationResources};
-use mlx_gen::gen_core::iris::{GenerationResources, IrisConfig, IrisTask};
 #[cfg(test)]
 use mlx_gen::gen_core::MemoryBehaviorRoute;
 use mlx_gen::gen_core::{
@@ -270,7 +270,7 @@ const fn compute_width(precision: Precision) -> u32 {
 /// Architecture axes of the backbone.
 ///
 /// With a parsed `config.yaml` these are the checkpoint's own values. Weights-free, the one axis
-/// the route fixes at compile time is the patch size: [`gen_core::iris::SIZE_MULTIPLE`] is the
+/// the route fixes at compile time is the patch size: [`gen_core_iris::SIZE_MULTIPLE`] is the
 /// request grid every size is validated against, and the loaders refuse a checkpoint whose patch
 /// does not divide it. Heads, width and depth live only in `config.yaml` and are left undeclared
 /// rather than guessed. Pixel space has no latent and no autoencoder, so those axes are absent.
@@ -286,7 +286,7 @@ fn architecture_facts(
         transformer_blocks: model.and_then(|m| af::axis(m.depth)),
         patch_size: match model {
             Some(m) => af::axis(m.patch_size),
-            None => af::axis(gen_core::iris::SIZE_MULTIPLE),
+            None => af::axis(gen_core_iris::SIZE_MULTIPLE),
         },
         latent_channels: None,
         vae_spatial_scale: None,
@@ -495,7 +495,7 @@ pub(crate) fn generation_contract(
     let backbone_tier = crate::packed::artifact_tier(
         &resources
             .backbone_dir
-            .join(gen_core::iris::BACKBONE_WEIGHTS_FILE),
+            .join(gen_core_iris::BACKBONE_WEIGHTS_FILE),
     )?;
     let text_tier = crate::packed::text_encoder_tier(&resources.text_encoder_dir)?;
     let requested = spec.quantize.or(backbone_tier).or(text_tier);
@@ -528,7 +528,7 @@ pub(crate) fn generation_contract(
     let transformer = backbone_bytes(
         &resources
             .backbone_dir
-            .join(gen_core::iris::BACKBONE_WEIGHTS_FILE),
+            .join(gen_core_iris::BACKBONE_WEIGHTS_FILE),
         precision,
         quant,
     )?;
@@ -541,7 +541,7 @@ pub(crate) fn generation_contract(
         precision,
         &resources
             .backbone_dir
-            .join(gen_core::iris::BACKBONE_WEIGHTS_FILE),
+            .join(gen_core_iris::BACKBONE_WEIGHTS_FILE),
     )?;
     let overlay_bytes = overlays
         .iter()
@@ -1306,7 +1306,7 @@ pub const RESTORE_MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistra
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::gen_core::iris::restoration::{plan, Dims, RestorationOptions, TileGeometry};
+    use gen_core_iris::restoration::{plan, Dims, RestorationOptions, TileGeometry};
     use mlx_gen::gen_core::weightsmeta::{
         safetensors_path_tensor_headers, SafetensorsTensorHeader,
     };
@@ -1337,7 +1337,7 @@ mod tests {
                 let mut spec =
                     LoadSpec::new(WeightsSource::Dir(fixtures().join("tiny-snapshot/iris")));
                 spec.components.insert(
-                    gen_core::iris::TEXT_ENCODER_COMPONENT.into(),
+                    gen_core_iris::TEXT_ENCODER_COMPONENT.into(),
                     WeightsSource::Dir(fixtures().join("tiny-snapshot/text_encoder")),
                 );
                 spec
@@ -1686,7 +1686,7 @@ mod tests {
                 // The released miniature tower has no affine group (see
                 // `a_quantized_generation_load_prices_the_packed_projections`).
                 resources.components.insert(
-                    gen_core::iris::TEXT_ENCODER_COMPONENT.into(),
+                    gen_core_iris::TEXT_ENCODER_COMPONENT.into(),
                     WeightsSource::Dir(aligned_tower.clone()),
                 );
             }
@@ -2378,7 +2378,7 @@ mod tests {
             assert_eq!(axes.vae_spatial_scale, None);
             assert_eq!(
                 weights_free(task).architecture_facts.patch_size,
-                Some(gen_core::iris::SIZE_MULTIPLE)
+                Some(gen_core_iris::SIZE_MULTIPLE)
             );
             assert_eq!(weights_free(task).architecture_facts.attention_heads, None);
 
@@ -2455,7 +2455,7 @@ mod tests {
         let tower = write_aligned_tiny_text_encoder(scratch.path());
         let mut spec = tiny_spec(IrisTask::Generation);
         spec.components.insert(
-            gen_core::iris::TEXT_ENCODER_COMPONENT.into(),
+            gen_core_iris::TEXT_ENCODER_COMPONENT.into(),
             WeightsSource::Dir(tower.clone()),
         );
         let packed = |out: u64, padded_in: u64, bits: u64, group: u64| {

@@ -31,6 +31,9 @@ rand = { workspace = true }
 safetensors = "0.7"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+sceneworks-gen-core-flux3 = { workspace = true }
+sceneworks-gen-core-tokenizer = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [features]
 # Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda` on

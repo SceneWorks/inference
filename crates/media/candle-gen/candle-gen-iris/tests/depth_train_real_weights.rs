@@ -16,18 +16,16 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_gen::gen_core::iris::depth::{
-    colorize_inferno, DepthMap, DepthRequest, DepthResolution,
-};
-use candle_gen::gen_core::iris::train::depth::{
-    load_depth_sample, normalize_log_depth, DepthLossPlan, ITEM_DEPTH_KEY,
-};
-use candle_gen::gen_core::iris::train::OPTIONS_KEY;
 use candle_gen::gen_core::{
     CancelFlag, Image, LoadSpec, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
     WeightsSource,
 };
 use candle_gen::testkit::{probe_gpu, used_mib, VramProbe};
+use gen_core_iris::depth::{colorize_inferno, DepthMap, DepthRequest, DepthResolution};
+use gen_core_iris::train::depth::{
+    load_depth_sample, normalize_log_depth, DepthLossPlan, ITEM_DEPTH_KEY,
+};
+use gen_core_iris::train::OPTIONS_KEY;
 
 fn env_dir(name: &str) -> PathBuf {
     PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name} is required")))

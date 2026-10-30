@@ -2,10 +2,10 @@
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::imageops::{checked_image_buffer_len, resize_lanczos_u8};
-use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{CancelFlag, Image};
 use candle_gen::{CandleError, Result};
 use candle_llm::llava::splice_image_features;
+use gen_core_tokenizer::TextTokenizer;
 
 use crate::text_encoder::{Flux2PromptEncoder, UpsampleSampling};
 use crate::vision::{Mistral3Projector, PixtralVisionTower};

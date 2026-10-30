@@ -1,6 +1,6 @@
 //! Synthetic CPU PyTorch oracle; executed only on supported MLX hosts.
 use crate::common::{cpu_process, fixture, host_f32, on_cpu, tiny_base_config, tiny_package};
-use mlx_gen::gen_core::flux3::training::lora_targets;
+use gen_core_flux3::training::lora_targets;
 use mlx_gen::{train::lora::LoraParams, weights::Weights};
 use mlx_gen_flux3::{
     training::{optim::SourceAdamW, TrainingGraph},

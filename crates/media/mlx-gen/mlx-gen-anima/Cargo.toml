@@ -26,9 +26,10 @@ image = { workspace = true, optional = true }
 # The shared epic-2123 aux-loss builder (sc-24830): config -> PerceptualPath (depth anchoring
 # through TAEW2.1, the Qwen-Image VAE's tiny decoder).
 mlx-gen-perceptual = { path = "../mlx-gen-perceptual", optional = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [features]
-model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-z-image/model-inference-proof", "mlx-gen-qwen-image/model-inference-proof", "mlx-gen-perceptual?/model-inference-proof"]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-z-image/model-inference-proof", "mlx-gen-qwen-image/model-inference-proof", "mlx-gen-perceptual?/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 # The three LoRA trainers (`training`) and their training-only deps. Default-on, so every existing
 # consumer (`mlx-gen-catalog`) is unchanged; the iOS catalog depends with `default-features = false`
 # and compiles no trainer, no `mlx-gen-perceptual` and no depth/face/body perceptors (sc-26265).

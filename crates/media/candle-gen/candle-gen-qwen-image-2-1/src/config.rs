@@ -2,15 +2,15 @@
 //! and the `config.json` readers the loader uses so a miniature parity snapshot and the production
 //! snapshot go through one code path.
 //!
-//! The parsers are backend-neutral and live in [`candle_gen::gen_core::qwen_image_2_1::config`]
+//! The parsers are backend-neutral and live in [`gen_core_family::qwen_image_2_1::config`]
 //! (sc-27329), shared with the MLX twin; this module re-exports them so `config::*` paths stay
 //! stable, and adds what is bound to this engine: reading the JSON files ([`ConfigFile`]), and the
 //! vision-tower config typed in `candle-llm`.
 
 use std::path::Path;
 
-pub use candle_gen::gen_core::qwen_image_2_1::config::*;
 use candle_gen::{CandleError as Error, Result};
+pub use gen_core_family::qwen_image_2_1::config::*;
 use serde_json::Value;
 
 /// Which checkpoint of the Qwen-Image 2.1 family a generator serves (sc-25901). One architecture,

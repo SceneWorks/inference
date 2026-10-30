@@ -8,9 +8,9 @@
 //! the backward-safe pad-and-crop form, ConvTranspose2D backpropagates natively.
 
 use candle_gen::candle_core::{Device, Tensor, D};
-use candle_gen::gen_core::train::body::{VitPoseConfig, VitPoseWarp, IMAGENET_MEAN, IMAGENET_STD};
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
+use gen_core_train::body::{VitPoseConfig, VitPoseWarp, IMAGENET_MEAN, IMAGENET_STD};
 
 use super::{
     bn_fold, conv2d, layer_norm, linear, normalize, resample_nhwc, sdpa, w32, AxisMatrix, BatchNorm,

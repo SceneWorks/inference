@@ -23,9 +23,10 @@ serde_json = { workspace = true }
 # `lora_adapter_metadata` blob) for the inference LoRA/LoKr merge (sc-6220); candle's tensor loader
 # drops the `__metadata__`. Already in the workspace lock via candle.
 safetensors = "0.7"
+sceneworks-gen-core-tokenizer = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof"]
+model-inference-proof = ["candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal", "candle-gen-pid/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-pid/cuda"]

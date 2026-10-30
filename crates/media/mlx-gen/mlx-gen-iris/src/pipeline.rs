@@ -2,8 +2,7 @@
 //! noise → FlowDPM-Solver++ over the backbone → `clamp(−1, 1)` → RGB8, with an optional per-step
 //! preview of the predicted clean image.
 
-use gen_core::iris::{FlowConfig, GenerationParams};
-use mlx_gen::gen_core;
+use gen_core_iris::{FlowConfig, GenerationParams};
 use mlx_gen::preview::{emit_preview, project_latents, PreviewCounter};
 use mlx_gen::{CancelFlag, Error, Image, PreviewSink, Result};
 use mlx_rs::ops::{clip, concatenate_axis};

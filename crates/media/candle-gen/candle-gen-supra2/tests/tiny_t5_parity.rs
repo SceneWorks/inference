@@ -8,9 +8,9 @@ use std::collections::HashMap;
 
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::supra2::Supra2Tokens;
 use candle_gen_supra2::encode_tokens;
 use candle_transformers::models::t5::{Config, T5EncoderModel};
+use gen_core_checkpoint::supra2::Supra2Tokens;
 
 use crate::support::{devices, host, report, tol};
 

@@ -8,14 +8,15 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, GenerationRequest, LoadShape, LoadSpec, LtxComponent, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
-    MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport, OffloadPolicy, Quant,
-    ResidentRequestMemory, TransformerComponent, WeightsSource,
+    self, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
+    MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
+    MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
+    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
+    MemoryStrategySupport, OffloadPolicy, Quant, ResidentRequestMemory, TransformerComponent,
+    WeightsSource,
 };
+use gen_core_ltx::LtxComponent;
 
 use crate::config::DEFAULT_FRAMES;
 use crate::memory_strategy::{DECODE_OVERLAP, DECODE_TILE_EDGES};
@@ -174,7 +175,7 @@ fn checked_sum(label: &str, values: impl IntoIterator<Item = u64>) -> gen_core::
 
 fn exact_load_receipt(
     spec: &LoadSpec,
-    bundle: &gen_core::ltx_checkpoint::LtxBundle,
+    bundle: &gen_core_ltx::ltx_checkpoint::LtxBundle,
 ) -> gen_core::Result<MemoryAssetFacts> {
     let video_component = if uses_diffusion_decoder(spec) {
         LtxComponent::DiffusionVideoVae
@@ -317,7 +318,7 @@ fn exact_load_receipt(
 /// `MemoryArchitectureFacts::default()`.
 fn architecture_facts(
     spec: &LoadSpec,
-    bundle: Option<&gen_core::ltx_checkpoint::LtxBundle>,
+    bundle: Option<&gen_core_ltx::ltx_checkpoint::LtxBundle>,
 ) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
@@ -358,7 +359,7 @@ fn build_contract(
     spec: &LoadSpec,
     asset_facts: MemoryAssetFacts,
     calibration_fingerprint: &str,
-    bundle: Option<&gen_core::ltx_checkpoint::LtxBundle>,
+    bundle: Option<&gen_core_ltx::ltx_checkpoint::LtxBundle>,
 ) -> gen_core::Result<MemoryProviderContract> {
     let windowed = streamable(spec);
     let decode = bounded_decode(spec);
@@ -421,7 +422,7 @@ pub fn memory_strategy_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProvi
 
 fn memory_strategy_contract_for_bundle(
     spec: &LoadSpec,
-    bundle: &gen_core::ltx_checkpoint::LtxBundle,
+    bundle: &gen_core_ltx::ltx_checkpoint::LtxBundle,
 ) -> gen_core::Result<MemoryProviderContract> {
     build_contract(
         spec,
@@ -500,7 +501,7 @@ pub fn resolved_numeric_tier(spec: &LoadSpec) -> gen_core::Result<MemoryNumericT
 #[cfg(feature = "cuda")]
 pub(crate) fn contract_for_loaded(
     spec: &LoadSpec,
-    bundle: &gen_core::ltx_checkpoint::LtxBundle,
+    bundle: &gen_core_ltx::ltx_checkpoint::LtxBundle,
 ) -> gen_core::Result<(MemoryProviderContract, MemoryNumericTier)> {
     Ok((
         memory_strategy_contract_for_bundle(spec, bundle)?,
@@ -1125,7 +1126,7 @@ mod tests {
         let root = tmp.path();
         let load = physical_spec(root, false, true);
         // All four `CAPTION_V2_EXPECTED_CONFIG` keys declared, one with the wrong value: upstream's
-        // strict rule (`gen_core::ltx_checkpoint::caption_feature_version`) rejects it, so
+        // strict rule (`gen_core_ltx::ltx_checkpoint::caption_feature_version`) rejects it, so
         // `AvConfig::from_bundle` — and therefore the loader — errors on this exact bundle. The
         // trunk keys are present and healthy, to prove the `None`s come from the refusal rather
         // than from a missing section.

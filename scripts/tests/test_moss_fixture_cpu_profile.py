@@ -469,7 +469,7 @@ class DiagnosticBatchTests(unittest.TestCase):
             body = mlx.split(f"fn {function}()", 1)[1].split("\n#[test]", 1)[0]
             self.assertIn("let _device = crate::cpu_test_device();", body)
         for name in profile.MASK_TESTS:
-            self.assertIn("fn " + name.split("::")[-1] + "()", (ROOT / "crates/contracts/gen-core/src/train/subject_mask/tests.rs").read_text(encoding="utf-8"))
+            self.assertIn("fn " + name.split("::")[-1] + "()", (ROOT / "crates/contracts/gen-core-train/src/subject_mask/tests.rs").read_text(encoding="utf-8"))
 
     def test_fp32_witnesses_and_disable_controls_are_observed_before_recovery_assertions(self):
         for backend in ("candle-gen/candle-gen-moss-image", "mlx-gen/mlx-gen-moss-image"):
@@ -560,6 +560,7 @@ class DiagnosticBatchTests(unittest.TestCase):
                     profile, "compile_binary", return_value=(binary, {"source": source})) as compile_, mock.patch.object(
                     profile.subprocess, "run", return_value=mock.Mock(returncode=1)), mock.patch.object(
                     profile, "contract_fraction_tests", return_value={"passed": True}), mock.patch.object(
+                    profile, "subject_mask_tests", return_value={"passed": True}), mock.patch.object(
                     profile, "snapshot_reader_tests", return_value={"passed": True}), mock.patch.object(
                     profile, "independent_tests", return_value=[{"test": profile.PHASE_TEST, "status": "assertion_failed"}]), mock.patch.object(
                     profile, "assertion_red") as red:

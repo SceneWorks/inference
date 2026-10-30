@@ -15,12 +15,12 @@
 //!   a temp dir).
 //!
 //! Inputs: `IRIS_UPSCALER_DIR`, the pinned snapshot directories `IRIS_LPIPS_VGG16_DIR`,
-//! `IRIS_LPIPS_LIN_DIR`, `IRIS_CRITIC_TRUNK_DIR` (`gen_core::iris::restoration_train`'s
+//! `IRIS_LPIPS_LIN_DIR`, `IRIS_CRITIC_TRUNK_DIR` (`gen_core_iris::restoration_train`'s
 //! `TRAINING_RESOURCES`), `IRIS_OUT`.
 
 use std::path::{Path, PathBuf};
 
-use mlx_gen::gen_core::iris::restoration_train::{
+use gen_core_iris::restoration_train::{
     recipe_training_config, ConvNextConfig, TrainingResource, CRITIC_TRUNK_COMPONENT,
     CRITIC_TRUNK_RESOURCE, LPIPS_LIN_COMPONENT, LPIPS_LIN_RESOURCE, OPTIONS_KEY, VGG16_COMPONENT,
     VGG16_RESOURCE,

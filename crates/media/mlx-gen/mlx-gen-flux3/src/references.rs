@@ -1,6 +1,6 @@
 //! Frozen `Pipeline.encode_references`: independent AE image_cond rows, never noisy-state init.
 use crate::autoencoder::Flux3AutoEncoder;
-use mlx_gen::gen_core::flux3::references::{conditioning_ids, PreparedReferences};
+use gen_core_flux3::references::{conditioning_ids, PreparedReferences};
 use mlx_gen::{CancelFlag, Error, Result};
 use mlx_rs::{Array, Dtype};
 

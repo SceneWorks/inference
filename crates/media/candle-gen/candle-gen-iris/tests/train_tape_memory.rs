@@ -6,11 +6,6 @@
 use std::collections::{HashMap, HashSet};
 
 use candle_gen::candle_core::{CpuStorage, DType, Device, Storage, Tensor, Var, D};
-use candle_gen::gen_core::iris::restoration_train::ConvNextConfig;
-use candle_gen::gen_core::iris::train::ac::AcPolicy;
-use candle_gen::gen_core::iris::train::{
-    FlowObjective, Prediction, TimestepSampler, TrainSchedule,
-};
 use candle_gen::gen_core::CancelFlag;
 use candle_gen_iris::nn::loader_cast_bytes;
 use candle_gen_iris::tape::{fold1, fold3, with_unfolded_tape};
@@ -19,6 +14,9 @@ use candle_gen_iris::train::model::{
     flow_loss, loss_and_grads_ext, StepBatch, TrainExtras, TrainModel, Trainable,
 };
 use candle_gen_iris::train::optim::{snapshot, Params, Tensors};
+use gen_core_iris::restoration_train::ConvNextConfig;
+use gen_core_iris::train::ac::AcPolicy;
+use gen_core_iris::train::{FlowObjective, Prediction, TimestepSampler, TrainSchedule};
 
 use crate::common::{
     cpu, device, fixture, host_f32, host_i32, tiny_backbone, tiny_config, Fixture,

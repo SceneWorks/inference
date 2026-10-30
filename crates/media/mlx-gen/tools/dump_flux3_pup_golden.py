@@ -12,14 +12,14 @@ greedy mode over the four modes.
 
 Writes:
 
-* `crates/contracts/gen-core/tests/fixtures/flux3_pup/golden.json` — the text goldens: per mode
+* `crates/contracts/gen-core-flux3/tests/fixtures/flux3_pup/golden.json` — the text goldens: per mode
   case the `bbox.plan` output, the rendered chat text (`enable_thinking=False`), the real-tokenizer
   and tiny-tokenizer prompt lengths, the bypass caption; `bbox.reconcile` / `detect` /
   `is_finished` / `to_canvas` cases; `pup.reference_size` and the Qwen `smart_resize` token table.
-* `crates/contracts/gen-core/tests/fixtures/flux3_pup/policy_reference.safetensors` — synthetic
+* `crates/contracts/gen-core-flux3/tests/fixtures/flux3_pup/policy_reference.safetensors` — synthetic
   references (RGB / RGBA, up- and down-scaled, 1 / 2 / 3 refs) with upstream's LANCZOS output
   and the JPEG-q92 round-trip output.
-* `crates/contracts/gen-core/tests/fixtures/flux3_pup/tiny-pup-package/` — the miniature package
+* `crates/contracts/gen-core-flux3/tests/fixtures/flux3_pup/tiny-pup-package/` — the miniature package
   WITHOUT weights (config, WordLevel tokenizer, pinned chat template, processor configs, system
   prompts, an empty `model.safetensors`) for the host-side package tests.
 * `mlx-gen-flux3/tests/fixtures/tiny-pup-snapshot/` — the same package WITH the seeded miniature
@@ -93,7 +93,7 @@ PUP_PACKAGE_SHA256 = {
 }
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-GEN_CORE_FIXTURES = REPO_ROOT / "crates" / "contracts" / "gen-core" / "tests" / "fixtures" / "flux3_pup"
+GEN_CORE_FIXTURES = REPO_ROOT / "crates" / "contracts" / "gen-core-flux3" / "tests" / "fixtures" / "flux3_pup"
 TINY_PACKAGE = GEN_CORE_FIXTURES / "tiny-pup-package"
 TINY_SNAPSHOT = FIXTURE_DIR / "tiny-pup-snapshot"
 MLX_GOLDEN = FIXTURE_DIR / "flux3_pup_golden.safetensors"

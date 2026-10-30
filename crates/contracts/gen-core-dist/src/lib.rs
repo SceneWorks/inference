@@ -1,10 +1,10 @@
 //! The **host TCP collective transport** of the Iris distributed trainers (story sc-25689; moved
-//! out of `gen_core::iris::train::dist` in sc-27316 so the contract crate holds no network
+//! out of `gen_core_iris::train::dist` in sc-27316 so the contract crate holds no network
 //! transport or socket FFI).
 //!
 //! The backend-neutral half — strategy and mesh resolution, the [`World`] description and its
 //! single-world proof, the per-tensor shard layout, the typed [`DistError`] failures and the
-//! [`Collective`] trait itself — stays in [`gen_core::iris::train::dist`]; this crate provides
+//! [`Collective`] trait itself — stays in [`gen_core_iris::train::dist`]; this crate provides
 //! [`TcpCollective`], the Candle trainers' transport (CPU / CUDA, including Windows where NCCL
 //! does not exist) and the MLX trainer's host side channel: a host-staged transport over
 //! `std::net` with bounded socket timeouts — the minimal all-reduce / all-gather / reduce-scatter
@@ -18,11 +18,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value as JsonValue};
 
-use gen_core::iris::train::dist::{
+use gen_core::{CancelFlag, Error, Result};
+use gen_core_iris::train::dist::{
     assert_single_world, dist_error, reduce_in_rank_order, Collective, DistError, Partition,
     Precision, ReduceOp, World, DIST_TOKEN_ENV,
 };
-use gen_core::{CancelFlag, Error, Result};
 
 // ---- the host TCP transport ------------------------------------------------------------------
 
@@ -1119,7 +1119,7 @@ impl Collective for TcpCollective {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gen_core::iris::train::dist::{parse_dist, DistToken};
+    use gen_core_iris::train::dist::{parse_dist, DistToken};
 
     fn world(rank: usize, n: usize, port: u16) -> World {
         World {

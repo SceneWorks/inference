@@ -2,17 +2,12 @@
 //! VAE, then run upstream's `generate()` — tokenize/truncate/mask, encode, stored-or-fallback
 //! unconditional context, CFG-or-plain Euler flow integration, VAE decode, `save_image`
 //! quantization. The request/load surface is the MLX twin's (`mlx-gen-supra2`), field for field:
-//! both read [`candle_gen::gen_core::supra2`].
+//! both read [`gen_core_checkpoint::supra2`].
 
 use std::path::Path;
 use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::supra2::{
-    self as s2, image_seed, initial_noise, quantize_rgb, BundleCheck, Supra2Bundle, Supra2Config,
-    Supra2Resolved, Supra2Sources, Supra2Tokenizer, Supra2Tokens, PROVIDER_ID,
-    TEXT_ENCODER_COMPONENT, VAE_COMPONENT,
-};
 use candle_gen::gen_core::{
     self, CancelFlag, Capabilities, GenerationOutput, GenerationReport, GenerationRequest,
     Generator, Image, LoadShape, LoadSpec, MemoryAssetFacts, MemoryProviderContract,
@@ -23,6 +18,14 @@ use candle_gen::{CandleError as Error, Result};
 use candle_gen_sdxl::vae_decoder::SdxlVaeDecoder;
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKLConfig;
 use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
+use gen_core_checkpoint::{
+    supra2 as s2,
+    supra2::{
+        image_seed, initial_noise, quantize_rgb, BundleCheck, Supra2Bundle, Supra2Config,
+        Supra2Resolved, Supra2Sources, Supra2Tokenizer, Supra2Tokens, PROVIDER_ID,
+        TEXT_ENCODER_COMPONENT, VAE_COMPONENT,
+    },
+};
 
 use crate::dit::SupraDit;
 use crate::memory_strategy;
@@ -57,7 +60,7 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// The SD VAE ft-MSE AutoencoderKL geometry ([`gen_core::supra2`]'s pinned constants).
+/// The SD VAE ft-MSE AutoencoderKL geometry ([`gen_core_checkpoint::supra2`]'s pinned constants).
 pub fn vae_config() -> AutoEncoderKLConfig {
     AutoEncoderKLConfig {
         block_out_channels: s2::VAE_BLOCK_OUT_CHANNELS.to_vec(),

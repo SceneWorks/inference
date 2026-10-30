@@ -5,12 +5,12 @@
 //! and the render must then *do* what was selected.
 
 use candle_gen::attention::chunk_probe;
-use candle_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
 use candle_gen::gen_core::{
     GenerationMemory, GenerationOutput, GenerationRequest, Generator, LoadPhase, LoadSpec,
     MemoryBehaviorRoute, MemoryMode, MemoryNumericTier, MemoryRunContext, MemoryRunOutcome,
     MemorySafetyDecision, MemoryStrategy, OffloadPolicy, Precision, Progress, WeightsSource,
 };
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 
 use crate::common::{tiny_backbone, tiny_text_encoder};
 

@@ -6,7 +6,7 @@ pub mod optim;
 pub mod trainer;
 
 use crate::{Flux3Dit, SampleTokens};
-use mlx_gen::gen_core::flux3::training::{lora_targets, LoraTarget};
+use gen_core_flux3::training::{lora_targets, LoraTarget};
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::{Error, Result};
 use mlx_rs::error::Exception;

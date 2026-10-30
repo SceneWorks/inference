@@ -1,6 +1,6 @@
 //! Real saved-state continuation on SYNTHETIC tiny weights, on supported MLX hosts only.
 use crate::common::{cpu_process, fixture, fixtures, host_f32, on_cpu, tiny_base_config};
-use mlx_gen::gen_core::flux3::{
+use gen_core_flux3::{
     training::{
         checkpoint::{ResumePolicy, TrainingCursor},
         lora_targets, ResumeIdentity,
@@ -177,7 +177,7 @@ fn saved_checkpoint_resumes_corrected_optimizer_and_adapter_reloads_with_effect(
         let path = export_adapter(&resumed,&restored,&identity,root.path(),"trained.safetensors",&flag).unwrap();
         let config = tiny_base_config();
         let spec = AdapterSpec::new(path,1.0,AdapterKind::Lora);
-        assert_eq!(mlx_gen::gen_core::flux3::adapters::inspect(&spec,&config.dit).unwrap().len(),54);
+        assert_eq!(gen_core_flux3::adapters::inspect(&spec,&config.dit).unwrap().len(),54);
         let golden=fixture("flux3_training_golden.safetensors"); let get=|key:&str| golden.require(key).unwrap();
         let text_ids=ids(get("text_ids")); let image_ids=ids(get("image_ids")); let reference_ids=ids(get("reference_ids"));
         let sample=[SampleTokens {text:get("text"),text_ids:&text_ids,image:get("noise"),image_ids:&image_ids,image_cond:Some((get("reference"),&reference_ids)),timestep:0.6,target_timestep:None}];
@@ -313,8 +313,7 @@ fn export_records_the_configured_alpha_verbatim() {
                 );
                 assert_eq!(peft["r"], serde_json::json!(7));
                 let spec = AdapterSpec::new(path, 1.0, AdapterKind::Lora);
-                let resolved =
-                    mlx_gen::gen_core::flux3::adapters::inspect(&spec, &config.dit).unwrap();
+                let resolved = gen_core_flux3::adapters::inspect(&spec, &config.dit).unwrap();
                 assert_eq!(resolved.len(), 54);
                 assert!(resolved.iter().all(|module| module.rank == rank
                     && module.scale.to_bits() == (alpha / rank as f64).to_bits()));

@@ -25,12 +25,12 @@
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::Image;
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::PidDecoder;
 use candle_transformers::models::z_image::sampling::postprocess_image;
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use rand::{rngs::StdRng, SeedableRng};
 
 /// VAE spatial downscale — the latent is image/8 per side (the 4-stage AutoencoderKL has 3

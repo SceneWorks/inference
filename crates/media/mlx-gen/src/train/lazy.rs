@@ -146,7 +146,7 @@ mod tests {
         let loads = loads.clone();
         LazyTrainer::new(
             DESC,
-            gen_core::train::validate_training_techniques,
+            gen_core_train::validate_training_techniques,
             move || {
                 loads.set(loads.get() + 1);
                 Ok(Loaded)
@@ -233,7 +233,7 @@ mod tests {
                 })
             }
         }
-        let mut t = LazyTrainer::new(DESC, gen_core::train::validate_training_techniques, || {
+        let mut t = LazyTrainer::new(DESC, gen_core_train::validate_training_techniques, || {
             Ok(Reporting)
         });
         let report = t.train_with_report(&request(), &mut |_| {}).unwrap();

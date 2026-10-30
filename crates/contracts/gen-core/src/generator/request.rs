@@ -142,7 +142,7 @@ pub struct GenerationRequest {
     /// machinery it will drive is in place behind `ltx_dfr::evenly_spaced_keyframe_positions`.
     ///
     /// **Consumer (sc-18778):** `ltx_2_5` / `ltx_2_5_distilled` consume a positive count — it maps
-    /// through [`crate::ltx_dfr::evenly_spaced_keyframe_positions`] onto the DFR canvas. Gated by
+    /// through `gen_core_ltx::ltx_dfr::evenly_spaced_keyframe_positions` onto the DFR canvas. Gated by
     /// [`Capabilities::supports_generated_keyframes`]: an engine that does not advertise it
     /// refuses a positive value on the shared floor.
     pub num_generated_keyframes: Option<u32>,
@@ -177,7 +177,7 @@ pub struct GenerationRequest {
     /// only downsizes a short edge above [`reference_image_short_edge`](Self::reference_image_short_edge);
     /// `diffusers` forces that short edge, upscaling included (the pre-sc-26691 behaviour). The
     /// short-edge knob is read by `max` / `diffusers` only — under `match` it is inert (still
-    /// range-checked). Arithmetic: [`crate::resolve_reference_image_size`].
+    /// range-checked). Arithmetic: `gen_core_h3::resolve_reference_image_size`.
     ///
     /// Same single consumer as the short edge: MiniMax-H3's `ref2va` image references. First/last
     /// frames and video references never read it.
@@ -198,7 +198,7 @@ pub struct GenerationRequest {
     /// clamps the prediction to `[min_seconds, max_seconds]`.
     ///
     /// An explicit [`frames`](Self::frames) always wins and the head is never invoked — the
-    /// precedence [`crate::duration_head::resolve_request_num_frames`] implements. Gated by
+    /// precedence `gen_core_ltx::duration_head::resolve_request_num_frames` implements. Gated by
     /// [`Capabilities::supports_auto_duration`]: an engine that does not advertise a duration head
     /// refuses the request on the shared floor rather than silently ignoring the opt-in.
     pub auto_duration: Option<crate::duration_head::AutoDurationRange>,
@@ -503,7 +503,7 @@ impl GenerationRequest {
     ///
     /// This is the **execution-side** half of a pair: the admission side computes the same quantity
     /// from the request via
-    /// [`wan_i2v_memory::geometry_from_request`](crate::wan_i2v_memory::geometry_from_request), and
+    /// `gen_core_memory_wan::geometry_from_request`, and
     /// both request-scope cores reject a request whose `memory_reference_count()` differs from the
     /// admitted `MemoryGeometry::reference_count`. The two therefore have to agree carrier for
     /// carrier or the mode is unreachable by construction — admission and execution can never both

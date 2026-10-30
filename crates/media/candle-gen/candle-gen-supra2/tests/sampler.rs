@@ -5,10 +5,10 @@
 //! the trajectory is additionally held to the CPU one).
 
 use candle_gen::candle_core::{Device, Tensor};
-use candle_gen::gen_core::supra2::{image_seed, initial_noise};
 use candle_gen::gen_core::{CancelFlag, Progress};
 use candle_gen_supra2::sampling::{self, ContextBatch};
 use candle_gen_supra2::SupraDit;
+use gen_core_checkpoint::supra2::{image_seed, initial_noise};
 
 use crate::support::{devices, host, report, tiny, tiny_fixture, tol};
 
