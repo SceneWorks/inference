@@ -638,7 +638,7 @@ impl Flux3AutoEncoder {
         let c = self.latent_channels();
 
         let image = image.to_dtype(DType::F32)?.to_device(&self.device)?;
-        let moments = self.encoder.forward(&image)?;
+        let moments = __model_proof_output!(self.encoder.forward(&image))?;
         let mdims = moments.dims().to_vec();
         if mdims != [1, 2 * e, h * PATCH, w * PATCH] {
             return Err(layout_error(format!(
@@ -704,7 +704,7 @@ impl Flux3AutoEncoder {
             .permute((0, 1, 4, 2, 5, 3))?
             .contiguous()?
             .reshape((1, e, h * PATCH, w * PATCH))?;
-        let image = self.decoder.forward(&z)?;
+        let image = __model_proof_output!(self.decoder.forward(&z))?;
         let idims = image.dims().to_vec();
         let (height, width) = (h * PATCH * self.vae_ratio, w * PATCH * self.vae_ratio);
         if idims != [1, 3, height, width] {
@@ -907,7 +907,7 @@ impl FrozenTrainingEncoder {
         let image = training_cast_before_upload(image, self.compute, |rounded| {
             Ok(rounded.to_device(&self.device)?)
         })?;
-        let moments = self.encoder.training_forward(&image)?;
+        let moments = __model_proof_output!(self.encoder.training_forward(&image))?;
         if moments.dims() != [1, 2 * e, h * PATCH, w * PATCH] {
             return Err(layout_error(
                 "training encoder moments differ from expected geometry",

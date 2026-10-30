@@ -7,8 +7,7 @@
 //! the MLX twin `mlx_gen_iris::dit` op for op), so the released `model.safetensors` loads unchanged.
 //! Precision: see [`crate::nn`].
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::ops::sigmoid;
@@ -99,13 +98,19 @@ impl SelfAttention {
 /// Q/K/V projections of one stream: fused under full MHA, separate under GQA.
 enum Qkv {
     Fused(Linear),
-    Split { q: Linear, k: Linear, v: Linear },
+    Split {
+        q: Linear,
+        k: Linear,
+        v: Linear,
+        pack: Option<Box<candle_gen::train::projection::FrozenProjectionPack>>,
+    },
 }
 
 impl Qkv {
     fn load(l: &Loader, fused: &str, q: &str, k: &str, v: &str, gqa: bool) -> Result<Self> {
         Ok(if gqa {
             Qkv::Split {
+                pack: None,
                 q: l.linear(q, false)?,
                 k: l.linear(k, false)?,
                 v: l.linear(v, false)?,
@@ -131,13 +136,22 @@ impl Qkv {
                 let part = |i: usize| -> Result<Tensor> { Ok(out.narrow(2, i, 1)?.squeeze(2)?) };
                 Ok((part(0)?, part(1)?, part(2)?))
             }
-            Qkv::Split { q, k, v } => {
-                let qo = q.forward(x)?;
+            Qkv::Split { q, k, v, pack } => {
+                let (qo, ko, vo) = if let Some(pack) = pack {
+                    candle_gen::train::profile::cohort_reuse("iris:frozen-GQA-projection-pack");
+                    let mut ys = Linear::forward_frozen_group(pack, x, &[q, k, v])?.into_iter();
+                    (ys.next().unwrap(), ys.next().unwrap(), ys.next().unwrap())
+                } else {
+                    candle_gen::train::profile::cohort_reuse(
+                        "iris:separate-GQA-projection-fallback",
+                    );
+                    (q.forward(x)?, k.forward(x)?, v.forward(x)?)
+                };
                 let head_dim = qo.dim(2)? / heads;
                 Ok((
                     qo.reshape((b, n, heads, head_dim))?,
-                    k.forward(x)?.reshape((b, n, kv_heads, head_dim))?,
-                    v.forward(x)?.reshape((b, n, kv_heads, head_dim))?,
+                    ko.reshape((b, n, kv_heads, head_dim))?,
+                    vo.reshape((b, n, kv_heads, head_dim))?,
                 ))
             }
         }
@@ -246,6 +260,35 @@ struct TextAdapter {
     norm: RmsNorm,
 }
 
+/// Run-owned, bounded invariant tables shared by rebuilt training backbones and checkpoint replay.
+/// Each stage retains only its current geometry; switching buckets replaces that slot, so dynamic
+/// curriculum sizes cannot grow residency without bound. Keys include every frequency parameter.
+#[derive(Clone, Default)]
+pub struct TrainingGeometry(Arc<Mutex<GeometryTables>>);
+#[derive(Default)]
+struct GeometryTables {
+    ropes: [Option<(Vec<u64>, Rope)>; 3],
+    position: Option<(Vec<u64>, Tensor)>,
+}
+impl GeometryTables {
+    fn resident_bytes(&self) -> u64 {
+        self.ropes
+            .iter()
+            .flatten()
+            .map(|(_, r)| (r.cos.elem_count() + r.sin.elem_count()) as u64 * 4)
+            .sum::<u64>()
+            + self
+                .position
+                .as_ref()
+                .map_or(0, |(_, p)| p.elem_count() as u64 * 4)
+    }
+}
+impl TrainingGeometry {
+    pub fn resident_bytes(&self) -> u64 {
+        candle_gen::lock_recover(&self.0).resident_bytes()
+    }
+}
+
 /// The loaded Iris backbone.
 pub struct IrisDiT {
     cfg: ModelConfig,
@@ -265,7 +308,8 @@ pub struct IrisDiT {
     pixel_blocks: Vec<PitBlock>,
     final_norm: RmsNorm,
     final_linear: Linear,
-    pos_cache: Mutex<HashMap<(usize, usize), Tensor>>,
+    geometry: TrainingGeometry,
+    training_geometry_admission: bool,
     /// Bytes the built parameters hold ([`Self::resident_weight_bytes`]).
     resident_weight_bytes: u64,
 }
@@ -279,6 +323,91 @@ pub struct TextBatch<'a> {
 }
 
 impl IrisDiT {
+    pub(crate) fn with_training_geometry(mut self, geometry: &TrainingGeometry) -> Self {
+        self.geometry = geometry.clone();
+        self.training_geometry_admission = true;
+        self
+    }
+
+    #[allow(clippy::too_many_arguments)] // Exact stage plus source RoPE geometry/frequency signature.
+    fn cached_rope(
+        &self,
+        slot: usize,
+        head: usize,
+        height: usize,
+        width: usize,
+        theta: f32,
+        scale: f32,
+        square: bool,
+    ) -> Result<Rope> {
+        let key = vec![
+            head as u64,
+            height as u64,
+            width as u64,
+            theta.to_bits() as u64,
+            scale.to_bits() as u64,
+            square as u64,
+        ];
+        let mut cache = candle_gen::lock_recover(&self.geometry.0);
+        if let Some((cached, rope)) = &cache.ropes[slot] {
+            if cached == &key && rope.cos.device().same_device(&self.device) {
+                candle_gen::train::profile::cohort_reuse("iris:geometry-storage-hit");
+                return Ok(Rope {
+                    cos: rope.cos.clone(),
+                    sin: rope.sin.clone(),
+                });
+            }
+        }
+        let bytes = height as u64 * width as u64 * head as u64 * 4;
+        if self.training_geometry_admission {
+            candle_gen::train::flow_match::check_preparation_memory(
+                "Iris geometry",
+                bytes,
+                0,
+                candle_gen::train::flow_match::device_training_budget_bytes(
+                    &self.device,
+                    "Iris geometry",
+                ),
+            )?;
+        }
+        let rope = if slot == 1 {
+            Rope::line_1d(head, width, theta, &self.device)?
+        } else {
+            Rope::grid_2d_aspect(head, height, width, theta, scale, square, &self.device)?
+        };
+        cache.ropes[slot] = Some((
+            key,
+            Rope {
+                cos: rope.cos.clone(),
+                sin: rope.sin.clone(),
+            },
+        ));
+        Ok(rope)
+    }
+
+    pub(crate) fn install_training_projection_packs(
+        &mut self,
+        packs: &std::collections::BTreeMap<
+            String,
+            candle_gen::train::projection::FrozenProjectionPack,
+        >,
+    ) {
+        let set = |qkv: &mut Qkv, key: &str| {
+            if let Qkv::Split { pack, .. } = qkv {
+                *pack = packs.get(key).cloned().map(Box::new);
+            }
+        };
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            match block {
+                Block::Dual(block) => {
+                    set(&mut block.qkv_x, &format!("blocks.{i}.attn.q_proj_x"));
+                    set(&mut block.qkv_y, &format!("blocks.{i}.attn.q_proj_y"));
+                }
+                Block::Single(block) => set(&mut block.qkv, &format!("blocks.{i}.q_proj")),
+            }
+        }
+    }
+
     /// Build from the backbone's `model.safetensors` (upstream key names) at `compute` dtype on
     /// `device`. Every source key must be consumed; a leftover or missing key is a load error.
     pub fn from_checkpoint(
@@ -471,7 +600,8 @@ impl IrisDiT {
             pixel_blocks,
             final_norm: l.norm("final_layer.norm", eps)?,
             final_linear: l.linear("final_layer.linear", true)?,
-            pos_cache: Mutex::new(HashMap::new()),
+            geometry: TrainingGeometry::default(),
+            training_geometry_admission: false,
             resident_weight_bytes: w.resident_bytes() - held_before,
         };
         let unused = w.unused_keys();
@@ -600,14 +730,29 @@ impl IrisDiT {
 
     /// The fixed full-resolution 2D sincos table of `PixelEmbedder` (`[H, W, hidden]` f32), cached.
     fn pixel_pos(&self, height: usize, width: usize) -> Result<Tensor> {
-        let mut cache = candle_gen::lock_recover(&self.pos_cache);
-        if let Some(table) = cache.get(&(height, width)) {
-            return Ok(table.clone());
-        }
         let dim = self.cfg.pixel.hidden_size;
+        let key = vec![height as u64, width as u64, dim as u64];
+        let mut cache = candle_gen::lock_recover(&self.geometry.0);
+        if let Some((cached, table)) = &cache.position {
+            if *cached == key && table.device().same_device(&self.device) {
+                return Ok(table.clone());
+            }
+        }
+        let bytes = height as u64 * width as u64 * dim as u64 * 4;
+        if self.training_geometry_admission {
+            candle_gen::train::flow_match::check_preparation_memory(
+                "Iris position",
+                bytes,
+                0,
+                candle_gen::train::flow_match::device_training_budget_bytes(
+                    &self.device,
+                    "Iris position",
+                ),
+            )?;
+        }
         let data = iris::pixel_sincos_table(height, width, dim);
         let table = Tensor::from_vec(data, (height, width, dim), &self.device)?;
-        cache.insert((height, width), table.clone());
+        cache.position = Some((key, table.clone()));
         Ok(table)
     }
 
@@ -670,16 +815,24 @@ impl IrisDiT {
 
         let head_dim = cfg.hidden_size / cfg.num_heads;
         let square = cfg.rope_aspect == "square";
-        let rope_img = Rope::grid_2d_aspect(
+        let rope_img = self.cached_rope(
+            0,
             head_dim,
             hp,
             wp,
             cfg.rope_theta as f32,
             cfg.rope_scale as f32,
             square,
-            &self.device,
         )?;
-        let rope_txt = Rope::line_1d(head_dim, n_txt, cfg.text_rope_theta as f32, &self.device)?;
+        let rope_txt = self.cached_rope(
+            1,
+            head_dim,
+            1,
+            n_txt,
+            cfg.text_rope_theta as f32,
+            1.0,
+            false,
+        )?;
 
         let core_img = self.core_img.forward(&cond)?;
         let core_txt = self
@@ -715,14 +868,14 @@ impl IrisDiT {
             .contiguous()?
             .reshape((b * n_patches, p * p, pix))?;
         let pix_head = cfg.pixel.attn_hidden_size / cfg.pixel.num_heads;
-        let rope_pix = Rope::grid_2d_aspect(
+        let rope_pix = self.cached_rope(
+            2,
             pix_head,
             hp,
             wp,
             cfg.rope_theta as f32,
             cfg.rope_scale as f32,
             square,
-            &self.device,
         )?;
         let pctx = PixelCtx {
             rope_pix,

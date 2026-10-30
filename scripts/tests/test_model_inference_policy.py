@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -120,7 +121,7 @@ class WorkflowExecutionGraph(unittest.TestCase):
     def script(self, path, text):
         target = self.root / path
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding='utf-8')
+        target.write_text(text, encoding='utf-8', newline='\n')
         return path
 
     def workflow(self, command, event='push', guard=None):
@@ -131,6 +132,16 @@ class WorkflowExecutionGraph(unittest.TestCase):
 
     def errors(self, workflow):
         return policy.workflow_errors(workflow, 'renamable.yml', self.root)
+
+    def test_static_source_directory_keeps_windows_backslashes_literal(self):
+        base = Path(r'C:\Users\Michael\repo\scripts')
+        for expression in ('$(dirname "$0")', '$(dirname "${BASH_SOURCE[0]}")',
+                           '$(cd "$(dirname "$0")" && pwd)'):
+            with self.subTest(expression=expression):
+                graph = policy.RunGraph(self.root)
+                with patch.object(graph, 'command') as command:
+                    graph.shell('echo "' + expression + '"', base=base)
+                self.assertEqual(command.call_args.args[0], ['echo', str(base)])
 
     def test_reviewed_storage_action_and_node_test_require_the_complete_exact_source(self):
         workflow = self.workflow('node --test scripts/runner-storage-cleanup.test.mjs')
@@ -143,9 +154,14 @@ class WorkflowExecutionGraph(unittest.TestCase):
             with self.subTest(changed=relative):
                 path = self.root / relative
                 original = path.read_text(encoding='utf-8')
-                path.write_text(original + '\n# unreviewed source\n', encoding='utf-8')
+                path.write_text(original + '\n# unreviewed source\n', encoding='utf-8', newline='\n')
                 self.assertTrue(self.errors(workflow))
-                path.write_text(original, encoding='utf-8')
+                path.write_text(original, encoding='utf-8', newline='\n')
+                # Reviewed exemptions bind bytes, including the repository's LF
+                # invariant. Test fixtures must preserve those bytes on Windows.
+                path.write_bytes(original.replace('\n', '\r\n').encode('utf-8'))
+                self.assertTrue(self.errors(workflow))
+                path.write_bytes(original.encode('utf-8'))
         missing = self.root / '.github/actions/cleanup-runner-storage/storage.ps1'
         missing.unlink()
         self.assertTrue(self.errors(workflow))
@@ -474,11 +490,17 @@ class WorkflowExecutionGraph(unittest.TestCase):
 class PrebuiltAssignmentParser(unittest.TestCase):
     def parser(self, output):
         import subprocess
+        # This parser is POSIX-only. Windows' system bash.exe is a WSL launcher;
+        # use the supported Git Bash rather than interpreting its failure as a
+        # rejected parser input. Preserve the host environment it needs to start.
+        git_bash = Path(os.environ.get('ProgramFiles', 'C:/Program Files')) / 'Git/bin/bash.exe'
+        bash = str(git_bash) if os.name == 'nt' and git_bash.is_file() else shutil.which('bash')
+        self.assertIsNotNone(bash, 'prebuilt assignment parser tests require Bash')
         source = (ROOT / '.github/kv-poc/build.sh').read_text(encoding="utf-8")
         function = 'parse_prebuilt_env() {' + source.split('parse_prebuilt_env() {', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
         # Execute ONLY the isolated assignment parser; never source/run the build workflow.
         program = function + '\nparse_prebuilt_env "$TEST_OUTPUT" || exit $?\nprintf "%s\\n%s" "$PMETAL_MLX_PREBUILT_DIR" "$PMETAL_METALLIB_PATH"\n'
-        return subprocess.run(['bash', '-c', program], env={'PATH': os.environ['PATH'], 'TEST_OUTPUT': output},
+        return subprocess.run([bash, '-c', program], env={**os.environ, 'TEST_OUTPUT': output},
                               text=True, capture_output=True, timeout=5, encoding="utf-8")
 
     def test_complete_contract_and_raw_spaces_are_preserved(self):

@@ -171,6 +171,7 @@ fn cursor(accumulation: u32) -> TrainingCursor {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn real_saved_checkpoint_resumes_optimizer_then_adapter_reloads_with_effect_and_zero_identity() {
     let continuous = graph();
     let mut opt = optimizer(&continuous);
@@ -283,9 +284,13 @@ fn real_saved_checkpoint_resumes_optimizer_then_adapter_reloads_with_effect_and_
             .map(f32::to_bits)
             .collect::<Vec<_>>()
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED training_checkpoint::real_saved_checkpoint_resumes_optimizer_then_adapter_reloads_with_effect_and_zero_identity");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn interrupted_gradient_accumulation_is_saved_and_resumed_without_reset() {
     let continuous = graph();
     let mut opt = optimizer(&continuous);
@@ -355,9 +360,13 @@ fn interrupted_gradient_accumulation_is_saved_and_resumed_without_reset() {
     let resumed_acc = resumed_acc.unwrap();
     resumed_opt.step(&resumed_acc).unwrap();
     assert_eq!(values(&resumed), values(&continuous));
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED training_checkpoint::interrupted_gradient_accumulation_is_saved_and_resumed_without_reset");
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn mismatched_identity_and_corrupted_state_are_refused_before_mutating_factors() {
     let trained = graph();
     let mut opt = optimizer(&trained);
@@ -438,6 +447,9 @@ fn mismatched_identity_and_corrupted_state_are_refused_before_mutating_factors()
     assert_eq!(values(&fresh), initial);
     let (_, state) = fresh_opt.snapshot().unwrap();
     assert_eq!(state["optim.step"], "0");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED training_checkpoint::mismatched_identity_and_corrupted_state_are_refused_before_mutating_factors");
 }
 
 /// PR #1288 review: the exported global alpha is the CONFIGURED value, never re-derived as

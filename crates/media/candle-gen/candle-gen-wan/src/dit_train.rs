@@ -22,14 +22,20 @@
 //! transformer output to the flow-match step *without* negation (opposite of Z-Image), so the trainer
 //! regresses the raw velocity toward `noise − x0` (see [`crate::training`]).
 
-use candle_gen::candle_core::{DType, Module, Result, Tensor, D};
+use candle_gen::candle_core::{DType, Module, Result, Tensor, TensorId, D};
 use candle_gen::candle_nn::ops::softmax;
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::train::gradient_checkpoint::Segment;
 use candle_gen::train::lora::{lora_linear, LoraHost, LoraLinear};
+use candle_gen::train::projection::FrozenProjectionPack;
 
 use crate::config::TransformerConfig;
-use crate::transformer::{linear, ln_no_affine, rms, timestep_sinusoid};
+use crate::transformer::{linear, ln_no_affine, timestep_sinusoid};
+
+fn rms(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+    candle_gen::train::profile::cohort_reuse("wan:shared-differentiable-RMS");
+    candle_gen::train::norm::rms_norm_diff(x, &weight.to_dtype(DType::F32)?, eps)
+}
 
 /// Composable interleaved RoPE — the differentiable twin of [`crate::rope::apply_rope`], which wraps
 /// candle's fused `rotary_emb::rope_i` (a `CustomOp` with NO backward — the fused-ops trap: a fused RoPE
@@ -67,6 +73,7 @@ pub const WAN_ATTN_TARGETS: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
 /// the composable softmax (the stock `softmax_last_dim` has no backward).
 #[derive(Debug, Clone)]
 struct TrainAttention {
+    projection_pack: Option<FrozenProjectionPack>,
     to_q: LoraLinear,
     to_k: LoraLinear,
     to_v: LoraLinear,
@@ -82,6 +89,7 @@ impl TrainAttention {
     fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.dim;
         Ok(Self {
+            projection_pack: None,
             to_q: lora_linear(cfg.dim, inner, vb.pp("to_q"))?,
             to_k: lora_linear(cfg.dim, inner, vb.pp("to_k"))?,
             to_v: lora_linear(cfg.dim, inner, vb.pp("to_v"))?,
@@ -92,6 +100,19 @@ impl TrainAttention {
             head_dim: cfg.head_dim,
             eps: cfg.eps,
         })
+    }
+
+    fn prepare_training(&mut self, self_attention: bool) -> Result<()> {
+        self.projection_pack = if self_attention {
+            FrozenProjectionPack::prepare_lora(&mut [
+                &mut self.to_q,
+                &mut self.to_k,
+                &mut self.to_v,
+            ])?
+        } else {
+            FrozenProjectionPack::prepare_lora(&mut [&mut self.to_k, &mut self.to_v])?
+        };
+        Ok(())
     }
 
     fn visit_lora_mut(
@@ -116,9 +137,34 @@ impl TrainAttention {
     ) -> Result<Tensor> {
         let (b, s, _) = hidden.dims3()?;
         let s_kv = context.dim(1)?;
-        let q = rms(&self.to_q.forward(hidden)?, &self.norm_q, self.eps)?;
-        let k = rms(&self.to_k.forward(context)?, &self.norm_k, self.eps)?;
-        let v = self.to_v.forward(context)?;
+        let (q, k, v) = match &self.projection_pack {
+            Some(pack) if pack.widths().len() == 3 => {
+                if hidden.id() != context.id() {
+                    candle_gen::candle_core::bail!(
+                        "Wan self-attention pack requires identical Q/K/V input"
+                    );
+                }
+                let values = pack.forward_lora(hidden, &[&self.to_q, &self.to_k, &self.to_v])?;
+                candle_gen::train::profile::cohort_reuse("wan:actual-frozen-projection-pack");
+                (values[0].clone(), values[1].clone(), values[2].clone())
+            }
+            Some(pack) => {
+                let values = pack.forward_lora(context, &[&self.to_k, &self.to_v])?;
+                candle_gen::train::profile::cohort_reuse("wan:actual-frozen-projection-pack");
+                (
+                    self.to_q.forward(hidden)?,
+                    values[0].clone(),
+                    values[1].clone(),
+                )
+            }
+            None => (
+                self.to_q.forward(hidden)?,
+                self.to_k.forward(context)?,
+                self.to_v.forward(context)?,
+            ),
+        };
+        let q = rms(&q, &self.norm_q, self.eps)?;
+        let k = rms(&k, &self.norm_k, self.eps)?;
         let to_heads = |t: &Tensor, len: usize| -> Result<Tensor> {
             t.reshape((b, len, self.num_heads, self.head_dim))?
                 .transpose(1, 2)?
@@ -133,9 +179,15 @@ impl TrainAttention {
         }
         let scale = (self.head_dim as f64).powf(-0.5);
         // Composable SDPA (NOT the fused `softmax_last_dim` — that CustomOp has no backward).
-        let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * scale)?;
-        let attn = softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
-        let out = attn.matmul(&v.contiguous()?)?; // [B,H,S,d]
+        let out = candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            None,
+            |scores| softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype()),
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?; // [B,H,S,d]
         let out = out
             .transpose(1, 2)?
             .reshape((b, s, self.num_heads * self.head_dim))?;
@@ -272,6 +324,7 @@ pub struct WanTransformerTrain {
     scale_shift_table: Tensor, // [1,2,dim] f32
     cfg: TransformerConfig,
     dtype: DType,
+    prepared_context_ids: Vec<TensorId>,
 }
 
 impl WanTransformerTrain {
@@ -317,12 +370,32 @@ impl WanTransformerTrain {
             scale_shift_table,
             cfg: *cfg,
             dtype: vb.dtype(),
+            prepared_context_ids: Vec::new(),
         })
+    }
+
+    pub fn prepare_training(&mut self) -> Result<()> {
+        for block in &mut self.blocks {
+            block.attn1.prepare_training(true)?;
+            block.attn2.prepare_training(false)?;
+        }
+        Ok(())
+    }
+
+    /// Each expert prepares its own caption projection: their frozen text embedders differ.
+    pub fn prepare_training_context(&mut self, prompt_embeds: &Tensor) -> Result<Tensor> {
+        let context = self.embed_text(prompt_embeds)?;
+        self.prepared_context_ids.push(context.id());
+        Ok(context)
     }
 
     /// Project UMT5 prompt embeds `[B,S,4096]` → cross-attn context `[B,S,dim]`. `gelu` between the two
     /// linears (PixArtAlphaTextProjection). Frozen — no adapter targets here.
     pub fn embed_text(&self, prompt_embeds: &Tensor) -> Result<Tensor> {
+        if self.prepared_context_ids.contains(&prompt_embeds.id()) {
+            candle_gen::train::profile::cohort_reuse("wan:expert-owned-caption-storage-hit");
+            return Ok(prompt_embeds.clone());
+        }
         let x = prompt_embeds.to_dtype(self.dtype)?;
         __model_proof_output!(self
             .text_l2

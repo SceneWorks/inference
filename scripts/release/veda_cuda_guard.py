@@ -7,6 +7,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import time
@@ -30,13 +31,27 @@ def command(args: list[str], deadline: float | None = None) -> str:
 
 
 def inventory(out: Path | None = None, label: str = "snapshot",
-              deadline: float | None = None) -> tuple[list[dict], list[list[str]]]:
-    rows = command(["nvidia-smi", "--query-gpu=index,uuid,name,driver_version,memory.total,memory.used,memory.free,utilization.gpu", "--format=csv,noheader,nounits"], deadline)
+              deadline: float | None = None, *, selected_uuid: str | None = None) -> tuple[list[dict], list[list[str]]]:
+    # A source-authenticated shared-headroom caller needs fresh selected-card counters,
+    # not a host-wide typed-process census. Strict callers retain the full inventory.
+    args = ["nvidia-smi", "--query-gpu=index,uuid,name,driver_version,memory.total,memory.used,memory.free,utilization.gpu", "--format=csv,noheader,nounits"]
+    if selected_uuid is not None:
+        if not re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", selected_uuid):
+            raise ValueError("invalid selected physical GPU UUID")
+        args.append("--id=" + selected_uuid)
+    rows = command(args, deadline)
     devices = []
     for row in csv.reader(rows.splitlines()):
         i, uuid, name, driver, total, used, free, utilization = [v.strip() for v in row]
         devices.append(dict(index=int(i), uuid=uuid, name=name, driver=driver, total_mib=int(total),
-                            used_mib=int(used), free_mib=int(free), utilization_percent=int(utilization)))
+                            used_mib=int(used), free_mib=int(free),
+                            utilization_percent=(None if selected_uuid is not None and utilization == "[N/A]"
+                                                 else int(utilization))))
+    if selected_uuid is not None:
+        if len(devices) != 1 or devices[0]["uuid"] != selected_uuid:
+            raise RuntimeError("selected physical GPU UUID absent or ambiguous; no device fallback")
+        devices[0]["process_inventory_status"] = "unknown/not-collected-diagnostic-only"
+        return devices, []
     xml = command(["nvidia-smi", "-q", "-x"], deadline)
     if out is not None:
         (out / f"{label}-nvidia-smi.xml").write_text(xml, encoding="utf-8", newline="\n")
@@ -91,7 +106,8 @@ def process_identities(uuid: str, processes: list[list[str]]) -> list[tuple[str,
 
 def sample_baseline(device: dict, out: Path, phase: str,
                     baseline: dict | None = None, idle_check=None, identity_key=None,
-                    permit_bounded_growth: bool = False) -> tuple[dict, dict]:
+                    permit_bounded_growth: bool = False,
+                    require_stable_contexts: bool = True, inventory_reader=None) -> tuple[dict, dict]:
     """Admit one physical UUID only after bounded, stable driver observations."""
     samples = []
     started = time.monotonic()
@@ -99,7 +115,7 @@ def sample_baseline(device: dict, out: Path, phase: str,
         for index in range(BASELINE_SAMPLES):
             if index:
                 time.sleep(BASELINE_INTERVAL_SECONDS)
-            devices, processes = inventory(out, f"{phase}-sample-{index + 1}", started + MAX_SAMPLING_SECONDS)
+            devices, processes = (inventory_reader or inventory)(out, f"{phase}-sample-{index + 1}", started + MAX_SAMPLING_SECONDS)
             matches = [row for row in devices if row["uuid"] == device["uuid"]]
             sample = dict(sample_number=index + 1, elapsed_seconds=time.monotonic() - started,
                           devices=devices, processes=processes)
@@ -113,7 +129,7 @@ def sample_baseline(device: dict, out: Path, phase: str,
             if index == 0 and baseline is None:
                 baseline = dict(uuid=device["uuid"], reserved_baseline_mib=current["used_mib"],
                                 process_identities=identities)
-            if (identities != baseline["process_identities"]
+            if ((require_stable_contexts and identities != baseline["process_identities"])
                     or (not permit_bounded_growth and
                         (current["used_mib"] > baseline["reserved_baseline_mib"] or
                          (index and current["used_mib"] > samples[index - 1]["selected_used_mib"])))):
@@ -158,9 +174,11 @@ def claim_device(out: Path):
 
 
 def verify_idle(device: dict, out: Path, phase: str, baseline: dict, idle_check=None,
-                identity_key=None, permit_bounded_growth: bool = False):
+                identity_key=None, permit_bounded_growth: bool = False,
+                require_stable_contexts: bool = True, inventory_reader=None):
     sample_baseline(device, out, phase, baseline, idle_check=idle_check,
-                    identity_key=identity_key, permit_bounded_growth=permit_bounded_growth)
+                    identity_key=identity_key, permit_bounded_growth=permit_bounded_growth,
+                    require_stable_contexts=require_stable_contexts, inventory_reader=inventory_reader)
 
 
 def persist_receipt(out: Path, receipt: dict):

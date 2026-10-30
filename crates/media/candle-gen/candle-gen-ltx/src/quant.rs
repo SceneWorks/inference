@@ -232,6 +232,13 @@ impl QLinear {
     /// Expose the same trainable residual seam used by the standalone training DiT.  Keeping this
     /// on the packed-aware wrapper is what makes full AV QLoRA train the actual loaded projection
     /// instead of rebuilding a dense video-only shadow model.
+    pub(crate) fn lora(&self) -> Option<&LoraLinear> {
+        match &self.base {
+            QLinearBase::Adapt(linear) => Some(linear),
+            QLinearBase::ConvRot(_) | QLinearBase::Nvfp4(_) => None,
+        }
+    }
+
     pub(crate) fn lora_mut(&mut self) -> Option<&mut LoraLinear> {
         match &mut self.base {
             QLinearBase::Adapt(linear) => Some(linear),
@@ -807,5 +814,92 @@ mod tests {
         assert_eq!(ok.dims2()?, (8, 8));
 
         Ok(())
+    }
+}
+
+/// Run-owned frozen same-input packs; all adapter targets remain independent source leaves.
+#[derive(Default)]
+pub(crate) struct TrainingProjectionPacks {
+    input: Option<candle_gen::train::projection::FrozenProjectionPack>,
+    context: Option<candle_gen::train::projection::FrozenProjectionPack>,
+}
+
+impl TrainingProjectionPacks {
+    pub(crate) fn prepare(
+        q: &mut LoraLinear,
+        k: &mut LoraLinear,
+        v: &mut LoraLinear,
+        gate: Option<&mut LoraLinear>,
+        self_attention: bool,
+    ) -> Result<Self> {
+        use candle_gen::train::projection::FrozenProjectionPack as Pack;
+        if self_attention {
+            if let Some(gate) = gate {
+                let input = Pack::prepare_lora(&mut [&mut *q, &mut *k, &mut *v, gate])?;
+                if input.is_some() {
+                    return Ok(Self {
+                        input,
+                        context: None,
+                    });
+                }
+            }
+            // A packed/incompatible gate does not disable an otherwise valid dense QKV pack.
+            let input = Pack::prepare_lora(&mut [q, k, v])?;
+            Ok(Self {
+                input,
+                context: None,
+            })
+        } else {
+            let input = match gate {
+                Some(gate) => Pack::prepare_lora(&mut [q, gate])?,
+                None => None,
+            };
+            let context = Pack::prepare_lora(&mut [k, v])?;
+            Ok(Self { input, context })
+        }
+    }
+
+    pub(crate) fn active(&self) -> bool {
+        self.input.is_some() || self.context.is_some()
+    }
+
+    pub(crate) fn forward(
+        &self,
+        x: &Tensor,
+        context: Option<&Tensor>,
+        q: &LoraLinear,
+        k: &LoraLinear,
+        v: &LoraLinear,
+        gate: Option<&LoraLinear>,
+    ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
+        if let (None, Some(pack)) = (context, &self.input) {
+            let layers = match gate {
+                Some(gate) if pack.widths().len() == 4 => vec![q, k, v, gate],
+                _ => vec![q, k, v],
+            };
+            let values = pack.forward_lora(x, &layers)?;
+            return Ok((
+                values[0].clone(),
+                values[1].clone(),
+                values[2].clone(),
+                values.get(3).cloned(),
+            ));
+        }
+        let (query, logits) = match (&self.input, gate) {
+            (Some(pack), Some(gate)) => {
+                let values = pack.forward_lora(x, &[q, gate])?;
+                (values[0].clone(), Some(values[1].clone()))
+            }
+            _ => (q.forward(x)?, None),
+        };
+        let ctx = context.unwrap_or(x);
+        let (key, value) = match &self.context {
+            Some(pack) => {
+                let values = pack.forward_lora(ctx, &[k, v])?;
+                (values[0].clone(), values[1].clone())
+            }
+            None => (k.forward(ctx)?, v.forward(ctx)?),
+        };
+        Ok((query, key, value, logits))
     }
 }

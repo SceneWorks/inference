@@ -33,6 +33,7 @@ fn close(
     );
 }
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn explicit_f32_teacher_is_not_bf16_output_upcast_and_honors_training_window() {
     let cfg = tiny_config();
     let root = tiny_package().join("text_encoder");
@@ -118,6 +119,9 @@ fn explicit_f32_teacher_is_not_bf16_output_upcast_and_honors_training_window() {
             .tokens,
         golden.require("f32/rotary_probe/tokens"),
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED text_training::explicit_f32_teacher_is_not_bf16_output_upcast_and_honors_training_window");
 }
 #[test]
 fn cpu_bf16_teacher_is_actionably_rejected_not_silently_f32() {

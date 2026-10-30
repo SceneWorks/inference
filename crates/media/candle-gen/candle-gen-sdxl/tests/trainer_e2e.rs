@@ -474,3 +474,105 @@ fn render_finite_with_adapter(adapter_path: &Path, kind: AdapterKind) {
         "rendered image should not be all-black"
     );
 }
+
+#[cfg(feature = "model-inference-proof")]
+fn bounded_output_root() -> PathBuf {
+    let root = PathBuf::from(
+        std::env::var_os("MODEL_PROOF_OUTPUT_DIR")
+            .expect("manual model-proof executor must own the retained output directory"),
+    );
+    let path = root.join("cohort_acceptance");
+    std::fs::create_dir_all(&path).unwrap();
+    path
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, dir: &Path) {
+    let peak = sampler.stop();
+    assert!(peak > 0, "must observe selected physical CUDA device");
+    std::fs::write(
+        dir.join("peak_device_bytes.txt"),
+        (peak * 1024 * 1024).to_string(),
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn bounded_render_finite_with_adapter(adapter_path: &Path, kind: AdapterKind) {
+    let spec = sdxl_load_spec().with_adapters(vec![AdapterSpec::new(
+        adapter_path.to_path_buf(),
+        1.0,
+        kind,
+    )]);
+    let g = candle_gen_sdxl::load(&spec).expect("load generator with adapter");
+    let req = GenerationRequest {
+        prompt: "a solid colour swatch".into(),
+        width: 512,
+        height: 512,
+        steps: Some(2),
+        seed: Some(7),
+        count: 1,
+        ..Default::default()
+    };
+    let out = g.generate(&req, &mut |_| {}).expect("adapted generate");
+    let GenerationOutput::Images(imgs) = out else {
+        panic!("expected images");
+    };
+    assert_eq!(imgs.len(), 1);
+    candle_gen::testkit::save_image_png(
+        &bounded_output_root().join("adapter_sample.png"),
+        &imgs[0],
+    );
+    assert_eq!(imgs.len(), 1);
+    assert_eq!((imgs[0].width, imgs[0].height), (512, 512));
+    assert_eq!(imgs[0].pixels.len(), 512 * 512 * 3, "RGB8 buffer");
+    // Sanity: not a degenerate all-zero buffer.
+    assert!(
+        imgs[0].pixels.iter().any(|&p| p != 0),
+        "rendered image should not be all-black"
+    );
+}
+#[test]
+#[cfg(feature = "model-inference-proof")]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn sdxl_bounded_acceleration_acceptance() {
+    let tmp = bounded_output_root().join("data");
+    let retained = bounded_output_root();
+    let sampler = candle_gen::testkit::PeakSampler::start_rendered();
+    let out = candle_gen::train::profile::with_bounded_cohort_for(
+        &retained.join("metrics.json"),
+        &[
+            "sdxl-or-kolors:differentiable-LayerNorm",
+            "sdxl-or-kolors:frozen-cross-base-KV-storage-hit",
+            "sdxl:actual-frozen-projection-pack",
+        ],
+        || run(&tmp, "bounded.safetensors", NetworkType::Lora, 4, false),
+    );
+    bounded_peak(sampler, &retained);
+
+    // The adapter carries PEFT keys under the SDXL prefix + reload metadata.
+    let meta = read_meta(&out.adapter_path);
+    assert_eq!(meta.get("networkType").map(String::as_str), Some("lora"));
+    let tensors =
+        candle_gen::candle_core::safetensors::load(&out.adapter_path, &Device::Cpu).unwrap();
+    let n_targets = tensors
+        .keys()
+        .filter(|k| k.ends_with(".lora_A.weight"))
+        .count();
+    assert!(n_targets > 0, "adapter should contain LoRA factors");
+    assert!(
+        tensors
+            .keys()
+            .any(|k| k.starts_with("base_model.model.unet.") && k.ends_with(".to_q.lora_A.weight")),
+        "adapter should carry PEFT-prefixed attention LoRA keys"
+    );
+
+    // Round-trip 1 — merge report: every target merges, nothing skipped.
+    assert_reloads(&out.adapter_path, AdapterKind::Lora, n_targets);
+
+    // Round-trip 2 — full generate with the adapter merged: a finite, correctly-sized image.
+    bounded_render_finite_with_adapter(&out.adapter_path, AdapterKind::Lora);
+    println!("[sdxl-lora] e2e OK — {n_targets} targets reload + merge, render finite");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::sdxl_bounded_acceleration_acceptance");
+}

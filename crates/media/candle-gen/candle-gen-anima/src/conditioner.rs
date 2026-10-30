@@ -15,6 +15,7 @@ use crate::adapt::AdaptLinear;
 use crate::config::ConditionerConfig;
 use crate::nn::{apply_rope_half, rms_norm, sdpa};
 use crate::rope::text_rope;
+use candle_gen::train::projection::FrozenProjectionPack;
 
 /// `(cos, sin)` RoPE tables, one pair per sequence length.
 type Rope<'a> = (&'a Tensor, &'a Tensor);
@@ -26,6 +27,7 @@ struct Attention {
     k_proj: AdaptLinear,
     v_proj: AdaptLinear,
     o_proj: AdaptLinear,
+    projection_pack: Option<FrozenProjectionPack>,
     q_norm: Tensor,
     k_norm: Tensor,
     heads: usize,
@@ -41,6 +43,7 @@ impl Attention {
             q_proj: AdaptLinear::dense(vb, &format!("{prefix}.q_proj"))?,
             k_proj: AdaptLinear::dense(vb, &format!("{prefix}.k_proj"))?,
             v_proj: AdaptLinear::dense(vb, &format!("{prefix}.v_proj"))?,
+            projection_pack: None,
             o_proj: AdaptLinear::dense(vb, &format!("{prefix}.o_proj"))?,
             q_norm: vb.get_unchecked(&format!("{prefix}.q_norm.weight"))?,
             k_norm: vb.get_unchecked(&format!("{prefix}.k_norm.weight"))?,
@@ -65,18 +68,32 @@ impl Attention {
         let kv_src = encoder.unwrap_or(hidden);
         let sk = kv_src.dim(1)?;
 
-        let q = self
-            .q_proj
-            .forward(hidden)?
-            .reshape((b, sq, self.heads, self.head_dim))?;
-        let k = self
-            .k_proj
-            .forward(kv_src)?
-            .reshape((b, sk, self.heads, self.head_dim))?;
-        let v = self
-            .v_proj
-            .forward(kv_src)?
-            .reshape((b, sk, self.heads, self.head_dim))?;
+        let (q, k, v) = if let Some(pack) = &self.projection_pack {
+            if encoder.is_none() {
+                let mut ys = pack
+                    .forward_adapt(hidden, &[&self.q_proj, &self.k_proj, &self.v_proj])?
+                    .into_iter();
+                (ys.next().unwrap(), ys.next().unwrap(), ys.next().unwrap())
+            } else {
+                let mut ys = pack
+                    .forward_adapt(kv_src, &[&self.k_proj, &self.v_proj])?
+                    .into_iter();
+                (
+                    self.q_proj.forward(hidden)?,
+                    ys.next().unwrap(),
+                    ys.next().unwrap(),
+                )
+            }
+        } else {
+            (
+                self.q_proj.forward(hidden)?,
+                self.k_proj.forward(kv_src)?,
+                self.v_proj.forward(kv_src)?,
+            )
+        };
+        let q = q.reshape((b, sq, self.heads, self.head_dim))?;
+        let k = k.reshape((b, sk, self.heads, self.head_dim))?;
+        let v = v.reshape((b, sk, self.heads, self.head_dim))?;
 
         let q = rms_norm(&q, &self.q_norm, self.eps)?;
         let k = rms_norm(&k, &self.k_norm, self.eps)?;
@@ -91,6 +108,21 @@ impl Attention {
             .transpose(1, 2)?
             .reshape((b, sq, self.heads * self.head_dim))?;
         Ok(self.o_proj.forward(&o)?)
+    }
+
+    fn prepare_training(&mut self, cross: bool) -> Result<()> {
+        if self.projection_pack.is_none() {
+            self.projection_pack = if cross {
+                FrozenProjectionPack::prepare_adapt(&mut [&mut self.k_proj, &mut self.v_proj])?
+            } else {
+                FrozenProjectionPack::prepare_adapt(&mut [
+                    &mut self.q_proj,
+                    &mut self.k_proj,
+                    &mut self.v_proj,
+                ])?
+            };
+        }
+        Ok(())
     }
 
     /// Visit this attention's four adaptable projections (`{prefix}.{q,k,v,o}_proj`) for the
@@ -187,6 +219,7 @@ pub struct AnimaTextConditioner {
     norm: Tensor,
     cfg: ConditionerConfig,
     device: Device,
+    training_rope: std::collections::HashMap<usize, (Tensor, Tensor)>,
 }
 
 impl AnimaTextConditioner {
@@ -204,7 +237,41 @@ impl AnimaTextConditioner {
             norm: vb.get_unchecked("norm.weight")?,
             cfg,
             device: vb.device().clone(),
+            training_rope: std::collections::HashMap::new(),
         })
+    }
+
+    pub(crate) fn training_geometry_bytes(&self, inputs: &[(&Tensor, &Tensor)]) -> Result<u64> {
+        let mut lengths = std::collections::HashSet::new();
+        for (source, target) in inputs {
+            lengths.insert(source.dim(1)?);
+            lengths.insert(target.dim(1)?);
+        }
+        Ok((lengths.into_iter().sum::<usize>() * self.cfg.head_dim() * 8) as u64)
+    }
+
+    pub(crate) fn prepare_training(&mut self, inputs: &[(&Tensor, &Tensor)]) -> Result<()> {
+        for block in &mut self.blocks {
+            block.self_attn.prepare_training(false)?;
+            block.cross_attn.prepare_training(true)?;
+        }
+        self.training_rope.clear();
+        for (source, target) in inputs {
+            for length in [source.dim(1)?, target.dim(1)?] {
+                if !self.training_rope.contains_key(&length) {
+                    self.training_rope.insert(
+                        length,
+                        text_rope(
+                            length,
+                            self.cfg.head_dim(),
+                            self.cfg.rope_theta as f64,
+                            &self.device,
+                        )?,
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `source_hidden`: `[B, Ss, source_dim]` Qwen3 states (already mask-multiplied), in `dtype`.
@@ -224,8 +291,18 @@ impl AnimaTextConditioner {
 
         let hd = self.cfg.head_dim();
         let theta = self.cfg.rope_theta as f64;
-        let (t_cos, t_sin) = text_rope(st, hd, theta, &self.device)?; // target positions
-        let (s_cos, s_sin) = text_rope(ss, hd, theta, &self.device)?; // source positions
+        let (t_cos, t_sin) = self
+            .training_rope
+            .get(&st)
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| text_rope(st, hd, theta, &self.device))?; // target positions
+        let (s_cos, s_sin) = self
+            .training_rope
+            .get(&ss)
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| text_rope(ss, hd, theta, &self.device))?; // source positions
         let target_rope = (&t_cos, &t_sin);
         let source_rope = (&s_cos, &s_sin);
 

@@ -1061,6 +1061,7 @@ fn apply_modality_conditioning(
 /// Their zero loss mask preserves the references as context without training the model to recreate
 /// them; concatenating their own RoPE positions is the bit that prevents a reference from merely
 /// replacing arbitrary target tokens.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn append_active_reference(
     plan: &ModalityConditioningPlan,
@@ -1072,6 +1073,33 @@ fn append_active_reference(
     target: Tensor,
     loss: Tensor,
     positions: Tensor,
+) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    append_active_reference_with_positions(
+        plan,
+        condition_tensors,
+        condition_positions,
+        seed,
+        sample_index,
+        input,
+        target,
+        loss,
+        positions,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_active_reference_with_positions(
+    plan: &ModalityConditioningPlan,
+    condition_tensors: &HashMap<String, Tensor>,
+    condition_positions: &HashMap<String, Tensor>,
+    seed: u64,
+    sample_index: u64,
+    input: Tensor,
+    target: Tensor,
+    loss: Tensor,
+    positions: Tensor,
+    prepared_positions: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
     let active = plan
         .conditions
@@ -1122,7 +1150,10 @@ fn append_active_reference(
         Tensor::cat(&[&input, reference], 1)?,
         Tensor::cat(&[&target, &zeros], 1)?,
         Tensor::cat(&[&loss, &zero_loss], 1)?,
-        Tensor::cat(&[&positions, reference_positions], 2)?,
+        match prepared_positions {
+            Some(positions) => positions.clone(),
+            None => Tensor::cat(&[&positions, reference_positions], 2)?,
+        },
     ))
 }
 
@@ -1292,6 +1323,7 @@ pub struct AvTrainingExample {
     condition_tensors: HashMap<String, Tensor>,
     condition_positions: HashMap<String, Tensor>,
     positions: AvTrainingPositions,
+    prepared_positions: Option<AvTrainingPositions>,
     video_geometry: Option<LtxTokenGeometry>,
     audio_geometry: Option<LtxTokenGeometry>,
     condition_seed: u64,
@@ -1736,7 +1768,14 @@ fn ltx25_video_grid(
     let mut max = (0, 0, 0);
     for item in items {
         let path = PathBuf::from(required_prepared_path(item)?);
-        let metadata = safetensors_file_metadata(&path).map_err(|error| {
+        let metadata = candle_gen::gen_core::__model_input_reader!(
+            safetensors_file_metadata(&path),
+            "candle-gen-ltx::training::validate_prepared_ltx25_bundle/header-configuration",
+            Configuration,
+            &path,
+            |actual_path| safetensors_file_metadata(actual_path)
+        )
+        .map_err(|error| {
             CandleError::Msg(format!(
                 "{MODEL_25_ID} trainer: could not read prepared bundle header `{}`: {error}",
                 path.display()
@@ -2760,7 +2799,8 @@ fn compute_av_step_loss_grads(
                    geometry: Option<LtxTokenGeometry>,
                    positions: Option<&Tensor>,
                    plan: &ModalityConditioningPlan,
-                   noise: Option<&Tensor>|
+                   noise: Option<&Tensor>,
+                   prepared_positions: Option<&Tensor>|
      -> Result<Option<ActiveModality>> {
         if !plan.present {
             // Presence is an executable routing control, not merely validation metadata.  An
@@ -2794,7 +2834,7 @@ fn compute_av_step_loss_grads(
             cached.condition_seed,
             cached.sample_index,
         )?;
-        let (input, target, loss_mask, positions) = append_active_reference(
+        let (input, target, loss_mask, positions) = append_active_reference_with_positions(
             plan,
             &cached.condition_tensors,
             &cached.condition_positions,
@@ -2804,6 +2844,7 @@ fn compute_av_step_loss_grads(
             target,
             loss_mask,
             positions.clone(),
+            prepared_positions,
         )?;
         // The flexible strategy's generated/loss mask is also the token-wise sigma multiplier:
         // intrinsic, clean/frozen, and appended reference tokens all remain at timestep zero.
@@ -2828,6 +2869,10 @@ fn compute_av_step_loss_grads(
         cached.positions.video.as_ref(),
         &cached.conditioning.video,
         video_noise,
+        cached
+            .prepared_positions
+            .as_ref()
+            .and_then(|p| p.video.as_ref()),
     )?;
     let audio = prepare(
         cached.audio_clean.as_ref(),
@@ -2836,6 +2881,10 @@ fn compute_av_step_loss_grads(
         cached.positions.audio.as_ref(),
         &cached.conditioning.audio,
         audio_noise,
+        cached
+            .prepared_positions
+            .as_ref()
+            .and_then(|p| p.audio.as_ref()),
     )?;
     for (name, modality) in [("video", video.as_ref()), ("audio", audio.as_ref())] {
         if let Some(modality) = modality {
@@ -3061,6 +3110,7 @@ pub(crate) fn production_masked_av_lifecycle(
         validation: LTX25_VALIDATION_DEFAULTS.into(),
     };
     let cached = AvTrainingExample {
+        prepared_positions: None,
         video_clean: video_present.then(|| video_clean.clone()),
         audio_clean: audio_present.then(|| audio_clean.clone()),
         video_context: video_present.then(|| video_context.clone()),
@@ -3492,11 +3542,16 @@ impl FlowMatchTrainer for LtxTrainer {
                     &conn_cfg,
                     &audio_conn_cfg,
                 )?;
-                let tokenizer = Ltx25Tokenizer::from_packed_te_file(
-                    bundle
-                        .require(LtxComponent::TextEncoder)
-                        .map_err(|e| CandleError::Msg(e.to_string()))?
-                        .path(),
+                let tokenizer_path = bundle
+                    .require(LtxComponent::TextEncoder)
+                    .map_err(|e| CandleError::Msg(e.to_string()))?
+                    .path();
+                let tokenizer = candle_gen::gen_core::__model_input_reader!(
+                    Ltx25Tokenizer::from_packed_te_file(tokenizer_path),
+                    "candle-gen-ltx::training::LtxTrainer::cache/ltx25-tokenizer",
+                    Tokenizer,
+                    tokenizer_path,
+                    Ltx25Tokenizer::from_packed_te_file
                 )?;
                 let tokenizer = TrainingTokenizer::Gemma4(tokenizer);
                 let encoder = TrainingTextEncoder::Gemma4(Box::new(encoder));
@@ -3557,6 +3612,7 @@ impl FlowMatchTrainer for LtxTrainer {
                         _ => Vec::new(),
                     };
                     cached.push(TrainingCached::Ltx25(Box::new(AvTrainingExample {
+                        prepared_positions: None,
                         video_clean: prepared.video_clean,
                         audio_clean: prepared.audio_clean,
                         video_context: conditioning.video.present.then_some(video_context),
@@ -3623,6 +3679,101 @@ impl FlowMatchTrainer for LtxTrainer {
                 Ok((cached, TrainingAux::Ltx25(aux), sample_plan))
             }
         }
+    }
+
+    fn prepare_training(
+        &self,
+        dit: &mut Self::Dit,
+        cache: &mut [Self::Cached],
+        _aux: &mut Self::Aux,
+        _req: &TrainingRequest,
+        _device: &Device,
+    ) -> Result<()> {
+        match dit {
+            TrainingDiT::Ltx23(dit) => {
+                dit.prepare_training()?;
+                for item in cache {
+                    if let TrainingCached::Ltx23 {
+                        context, positions, ..
+                    } = item
+                    {
+                        *context = context.to_dtype(DType::F32)?;
+                        dit.prepare_training_positions(positions)?;
+                    }
+                }
+            }
+            TrainingDiT::Ltx25(dit) => {
+                dit.prepare_training()?;
+                let mut position_interner = crate::rope::TrainingPositionInterner::default();
+                for item in cache {
+                    if let TrainingCached::Ltx25(example) = item {
+                        let effective = |base: Option<&Tensor>,
+                                         plan: &ModalityConditioningPlan|
+                         -> Result<Option<Tensor>> {
+                            let Some(base) = base else { return Ok(None) };
+                            let active =
+                                plan.conditions
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(ordinal, condition)| {
+                                        condition.reference
+                                            && condition_draw(
+                                                example.condition_seed,
+                                                example.sample_index,
+                                                *ordinal,
+                                            ) < condition.probability
+                                    });
+                            match active {
+                                Some((_, condition)) => {
+                                    let key = condition
+                                        .tensor_key
+                                        .as_deref()
+                                        .expect("validated reference key");
+                                    let reference =
+                                        example.condition_positions.get(key).ok_or_else(|| {
+                                            CandleError::Msg(format!(
+                                                "missing reference positions {key}"
+                                            ))
+                                        })?;
+                                    // New concatenated positions overlap both existing grids.
+                                    flow_match::check_preparation_memory(
+                                        "LTX reference geometry",
+                                        (base.elem_count() + reference.elem_count()) as u64 * 4,
+                                        0,
+                                        flow_match::device_training_budget_bytes(
+                                            base.device(),
+                                            "LTX reference geometry",
+                                        ),
+                                    )?;
+                                    Ok(Some(Tensor::cat(&[base, reference], 2)?))
+                                }
+                                None => Ok(Some(base.clone())),
+                            }
+                        };
+                        let positions = AvTrainingPositions {
+                            video: effective(
+                                example.positions.video.as_ref(),
+                                &example.conditioning.video,
+                            )?
+                            .map(|positions| position_interner.intern(positions))
+                            .transpose()?,
+                            audio: effective(
+                                example.positions.audio.as_ref(),
+                                &example.conditioning.audio,
+                            )?
+                            .map(|positions| position_interner.intern(positions))
+                            .transpose()?,
+                        };
+                        dit.prepare_training_positions(
+                            positions.video.as_ref(),
+                            positions.audio.as_ref(),
+                        )?;
+                        example.prepared_positions = Some(positions);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn build_dit(&self, _req: &TrainingRequest, device: &Device) -> Result<TrainingDiT> {
@@ -5480,6 +5631,7 @@ mod ltx25_depth_anchoring_tests {
         let loss = loss.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let depth_frames = select_depth_frames(&loss, GEOM.frames, GEOM.height * GEOM.width, 2);
         let example = AvTrainingExample {
+            prepared_positions: None,
             video_clean: Some(video_clean),
             audio_clean: with_audio.then(|| audio_clean.clone()),
             video_context: Some(context.clone()),

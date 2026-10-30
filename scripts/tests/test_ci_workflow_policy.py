@@ -4564,6 +4564,23 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     "process on each listener can overwhelm Windows with rustc launches",
                 )
 
+    def test_training_raw_cuda_proofs_are_exact_and_manual_only(self) -> None:
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        jobs = workflow["jobs"]
+        manual = jobs["windows-cuda"]
+        self.assertIn("github.event_name == 'workflow_dispatch'", manual["if"])
+        cases = {
+            "Prove streaming training attention raw CUDA arithmetic": "training_attention::tests::streaming_forward_backward_matches_composable",
+            "Prove half precision adapter rounding raw CUDA arithmetic": "train::projection::tests::half_precision_keeps_output_scale_rounding",
+        }
+        for name, case in cases.items():
+            step = next(s for s in manual["steps"] if s.get("name") == name)
+            self.assertIn(f"--features cuda {case} -- --exact --ignored --nocapture", step["run"])
+            self.assertIn("1 passed; 0 failed; 0 ignored;", step["run"])
+            self.assertIn("if errorlevel 1 exit /b 1", step["run"])
+            self.assertFalse(step.get("continue-on-error", False))
+            self.assertNotIn(case, "\n".join(s.get("run", "") for s in jobs["windows-cuda-check"]["steps"]))
+
     def test_heavy_windows_cuda_jobs_clear_only_the_sccache_wrapper(self) -> None:
         """native-12219: the shared Windows box exports RUSTC_WRAPPER=sccache runner-globally.
 

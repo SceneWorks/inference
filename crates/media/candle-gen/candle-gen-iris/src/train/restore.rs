@@ -467,6 +467,7 @@ pub fn miniature_parts(
     let (frozen, head, sn) = build_frozen(res, plan, nets.as_ref(), device)?;
     Ok((
         TrainModel {
+            geometry: Default::default(),
             cfg: config.model.clone(),
             compute,
             device: device.clone(),
@@ -576,6 +577,7 @@ impl Run {
         let (model, mut params) = match &plan.artifact {
             RestoreArtifact::Full => (
                 TrainModel {
+                    geometry: Default::default(),
                     cfg: config.model.clone(),
                     compute,
                     device: device.clone(),
@@ -633,12 +635,14 @@ impl Run {
                 }
                 (
                     TrainModel {
+                        geometry: Default::default(),
                         cfg: config.model.clone(),
                         compute,
                         device: device.clone(),
                         trainable: Trainable::Adapter {
                             kind,
                             targets,
+                            packs: super::model::prepare_adapter_projection_packs(&mut base)?,
                             base,
                         },
                     },
@@ -815,12 +819,29 @@ impl Run {
         let mut finished = self.step >= plan.max_steps as u64;
         let mut epoch = self.epoch;
         let mut start_pos = self.pos;
+        if candle_gen::train::profile::cohort_active() {
+            // Both owners are captured before timing: the first critic update
+            // must not allocate its initial diagnostics in a steady interval.
+            let vars = self
+                .params
+                .iter()
+                .filter(|(name, _)| self.opt.is_trained(name))
+                .chain(
+                    self.head
+                        .iter()
+                        .filter(|(name, _)| self.critic_opt.is_trained(name)),
+                )
+                .map(|(_, var)| var.clone())
+                .collect::<Vec<_>>();
+            candle_gen::train::profile::cohort_capture_initial(&vars)?;
+        }
         while !finished && !cancelled && epoch <= max_epoch {
             for pos in start_pos..bpe {
                 if req.cancel.is_cancelled() && batch_count.is_multiple_of(per_step) {
                     cancelled = true;
                     break;
                 }
+                candle_gen::train::profile::cohort_begin_step(&self.device)?;
                 let batch = self.batch(req, epoch, pos)?;
                 let (phase, sync) = phase_of(batch_count, accum);
                 batch_count += 1;
@@ -862,10 +883,19 @@ impl Run {
                                     .filter(|(k, _)| self.opt.is_trained(k))
                                     .collect();
                                 let (_, g) = clip_grads(g, plan.generator.clip)?;
+                                let cohort_vars =
+                                    super::cohort_before_named_update(&self.params, &g, &self.opt)?;
                                 self.opt.step(&self.params, &g, lr)?;
+                                candle_gen::train::profile::cohort_after_update();
                                 if let (Some(e), Some(d)) = (self.ema.as_mut(), plan.ema) {
                                     ema_update(e, &self.params, d)?;
                                 }
+                                candle_gen::train::profile::cohort_end_step(
+                                    &self.device,
+                                    g_sums[0] as f32,
+                                    &cohort_vars,
+                                    "iris-restoration-generator",
+                                )?;
                                 self.losses[..4].copy_from_slice(&g_sums);
                             }
                             g_sums = [0.0; 4];
@@ -900,7 +930,19 @@ impl Run {
                                     if let Some(g) = d_acc.grads.take() {
                                         let lr = self.lr_critic * self.factor();
                                         let (_, g) = clip_grads(g, plan.critic.clip)?;
+                                        let cohort_vars = super::cohort_before_named_update(
+                                            &self.head,
+                                            &g,
+                                            &self.critic_opt,
+                                        )?;
                                         self.critic_opt.step(&self.head, &g, lr)?;
+                                        candle_gen::train::profile::cohort_after_update();
+                                        candle_gen::train::profile::cohort_end_step(
+                                            &self.device,
+                                            loss as f32,
+                                            &cohort_vars,
+                                            "iris-restoration-critic",
+                                        )?;
                                     }
                                     self.losses[4] = loss;
                                 }

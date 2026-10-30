@@ -26,7 +26,7 @@
 //! Lens feeds the transformer output to the flow-match step *without* negation (opposite of Z-Image),
 //! so the trainer regresses the raw velocity toward `noise − x0` (see [`crate::training`]).
 
-use candle_gen::candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_gen::candle_core::{DType, Device, Module, Result, Tensor, TensorId, D};
 use candle_gen::candle_nn::ops::softmax;
 use candle_gen::candle_nn::{linear, linear_no_bias, rms_norm, Linear, RmsNorm, VarBuilder};
 use candle_gen::train::gradient_checkpoint::Segment;
@@ -36,6 +36,19 @@ use crate::rope::LensRope;
 use crate::transformer::{
     build_joint_mask, gated, modulate, LensDitConfig, NormOut, TimeEmbed, EPS, TXT_NORM_EPS,
 };
+
+fn rms_diff(norm: &RmsNorm, x: &Tensor) -> Result<Tensor> {
+    candle_gen::train::profile::cohort_reuse("lens:shared-differentiable-RMS");
+    candle_gen::train::norm::rms_norm_cast_before_weight(x, norm.weight(), norm.eps())
+}
+
+#[derive(Clone)]
+struct PreparedGeometry {
+    img_cos: Tensor,
+    img_sin: Tensor,
+    txt_cos: Tensor,
+    txt_sin: Tensor,
+}
 
 /// The Lens LoRA/LoKr target suffixes — the fused dual-stream attention projections, matching the
 /// torch `lens_train_runner` `DEFAULT_LORA_TARGET_MODULES` (sc-2218) and the inference merge surface
@@ -145,10 +158,10 @@ impl TrainJointAttention {
         let (tq, tk, tv) = self.qkv(&self.txt_qkv, txt)?;
 
         // QK RMSNorm over head_dim (composable `forward_diff` — the fused `forward` has no backward).
-        let iq = self.norm_q.forward_diff(&iq)?;
-        let ik = self.norm_k.forward_diff(&ik)?;
-        let tq = self.norm_added_q.forward_diff(&tq)?;
-        let tk = self.norm_added_k.forward_diff(&tk)?;
+        let iq = rms_diff(&self.norm_q, &iq)?;
+        let ik = rms_diff(&self.norm_k, &ik)?;
+        let tq = rms_diff(&self.norm_added_q, &tq)?;
+        let tk = rms_diff(&self.norm_added_k, &tk)?;
 
         // To heads-first `[B, heads, seq, head_dim]`, then interleaved RoPE on q/k.
         let bhsd = |x: &Tensor| -> Result<Tensor> { x.transpose(1, 2)?.contiguous() };
@@ -171,7 +184,7 @@ impl TrainJointAttention {
         // rows (byte-identical for common sizes). The softmax closure preserves the exact f32-upcast
         // composable `softmax(_, D::Minus1)` so the backward is unchanged.
         let qd = q.dtype();
-        let o = candle_gen::sdpa_budgeted_bhsd(
+        let o = candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
             &q,
             &k,
             &v,
@@ -287,8 +300,8 @@ impl TrainBlock {
         );
 
         // attention path
-        let (img_n, img_g1) = modulate(&self.img_norm1.forward_diff(hidden)?, &im0)?;
-        let (txt_n, txt_g1) = modulate(&self.txt_norm1.forward_diff(encoder)?, &tm0)?;
+        let (img_n, img_g1) = modulate(&rms_diff(&self.img_norm1, hidden)?, &im0)?;
+        let (txt_n, txt_g1) = modulate(&rms_diff(&self.txt_norm1, encoder)?, &tm0)?;
         let (img_attn, txt_attn) = self
             .attn
             .forward(&img_n, &txt_n, img_cos, img_sin, txt_cos, txt_sin, mask)?;
@@ -296,9 +309,9 @@ impl TrainBlock {
         let encoder = gated(encoder, &txt_g1, &txt_attn)?;
 
         // feed-forward path (SwiGLU)
-        let (img_n2, img_g2) = modulate(&self.img_norm2.forward_diff(&hidden)?, &im1)?;
+        let (img_n2, img_g2) = modulate(&rms_diff(&self.img_norm2, &hidden)?, &im1)?;
         let hidden = gated(&hidden, &img_g2, &self.img_mlp.forward(&img_n2)?)?;
-        let (txt_n2, txt_g2) = modulate(&self.txt_norm2.forward_diff(&encoder)?, &tm1)?;
+        let (txt_n2, txt_g2) = modulate(&rms_diff(&self.txt_norm2, &encoder)?, &tm1)?;
         let encoder = gated(&encoder, &txt_g2, &self.txt_mlp.forward(&txt_n2)?)?;
 
         Ok((encoder, hidden))
@@ -336,6 +349,8 @@ pub struct LensTransformerTrain {
     cfg: LensDitConfig,
     device: Device,
     dtype: DType,
+    prepared_encoder_ids: Vec<TensorId>,
+    prepared_geometry: std::collections::HashMap<(usize, usize, usize, usize), PreparedGeometry>,
 }
 
 impl LensTransformerTrain {
@@ -371,7 +386,55 @@ impl LensTransformerTrain {
             cfg: *cfg,
             device: vb.device().clone(),
             dtype: vb.dtype(),
+            prepared_encoder_ids: Vec::new(),
+            prepared_geometry: std::collections::HashMap::new(),
         })
+    }
+
+    /// Replace the run's multi-layer frozen caption features with their initial projection.
+    /// Adapters start in the block stack; evolving text states never enter this cache.
+    pub fn prepare_training_features(&mut self, features: &[Tensor]) -> Result<Vec<Tensor>> {
+        let features = features
+            .iter()
+            .map(|f| f.to_dtype(self.dtype))
+            .collect::<Result<Vec<_>>>()?;
+        let encoder = self.embed_text(&features)?;
+        self.prepared_encoder_ids.push(encoder.id());
+        Ok(vec![encoder])
+    }
+
+    pub fn prepare_training_geometry(
+        &mut self,
+        txt_len: usize,
+        frame: usize,
+        h: usize,
+        w: usize,
+    ) -> Result<()> {
+        let key = (txt_len, frame, h, w);
+        if !self.prepared_geometry.contains_key(&key) {
+            let (img_cos, img_sin) = self.rope.img_cos_sin(frame, h, w, &self.device)?;
+            let (txt_cos, txt_sin) = self.rope.txt_cos_sin(txt_len, h, w, &self.device)?;
+            self.prepared_geometry.insert(
+                key,
+                PreparedGeometry {
+                    img_cos,
+                    img_sin,
+                    txt_cos,
+                    txt_sin,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn embed_text(&self, text_feats: &[Tensor]) -> Result<Tensor> {
+        assert_eq!(text_feats.len(), self.cfg.num_text_layers);
+        let normed = text_feats
+            .iter()
+            .enumerate()
+            .map(|(i, feat)| rms_diff(&self.txt_norm[i], feat))
+            .collect::<Result<Vec<_>>>()?;
+        __model_proof_output!(self.txt_in.forward(&Tensor::cat(&normed, D::Minus1)?))
     }
 
     pub fn config(&self) -> &LensDitConfig {
@@ -396,31 +459,43 @@ impl LensTransformerTrain {
         h: usize,
         w: usize,
     ) -> Result<(Tensor, Tensor, PreCtx)> {
-        assert_eq!(
-            text_feats.len(),
-            self.cfg.num_text_layers,
-            "expected {} text-feature layers, got {}",
-            self.cfg.num_text_layers,
-            text_feats.len()
-        );
         let img_len = hidden_states.dim(1)?;
         let txt_len = text_feats[0].dim(1)?;
-
         let hidden = __model_proof_output!(self.img_in.forward(hidden_states))?;
-
-        let mut normed = Vec::with_capacity(self.cfg.num_text_layers);
-        for (i, feat) in text_feats.iter().enumerate() {
-            normed.push(self.txt_norm[i].forward_diff(feat)?);
-        }
-        let normed_refs: Vec<&Tensor> = normed.iter().collect();
         let encoder =
-            __model_proof_output!(self.txt_in.forward(&Tensor::cat(&normed_refs, D::Minus1)?))?;
+            if text_feats.len() == 1 && self.prepared_encoder_ids.contains(&text_feats[0].id()) {
+                candle_gen::train::profile::cohort_reuse("lens:frozen-caption-storage-hit");
+                text_feats[0].clone()
+            } else {
+                self.embed_text(text_feats)?
+            };
 
         let temb = self
             .time_embed
             .forward(timestep, &self.device, self.dtype)?;
-        let (img_cos, img_sin) = self.rope.img_cos_sin(frame, h, w, &self.device)?;
-        let (txt_cos, txt_sin) = self.rope.txt_cos_sin(txt_len, h, w, &self.device)?;
+        let PreparedGeometry {
+            img_cos,
+            img_sin,
+            txt_cos,
+            txt_sin,
+        } = match self.prepared_geometry.get(&(txt_len, frame, h, w)) {
+            Some(geometry) => {
+                candle_gen::train::profile::cohort_reuse(
+                    "lens:rope-storage-hit;E3-already-fused-native-QKV",
+                );
+                geometry.clone()
+            }
+            None => {
+                let (img_cos, img_sin) = self.rope.img_cos_sin(frame, h, w, &self.device)?;
+                let (txt_cos, txt_sin) = self.rope.txt_cos_sin(txt_len, h, w, &self.device)?;
+                PreparedGeometry {
+                    img_cos,
+                    img_sin,
+                    txt_cos,
+                    txt_sin,
+                }
+            }
+        };
         let mask = match text_valid {
             Some(valid) => Some(build_joint_mask(valid, img_len, self.dtype, &self.device)?),
             None => None,
@@ -670,9 +745,40 @@ mod parity_tests {
         let hs = randn_seeded(&mut rng, 1.0, &[1, img_len, cfg.in_channels], &dev);
         let feat = randn_seeded(&mut rng, 1.0, &[1, 3, cfg.enc_hidden_dim], &dev);
 
+        let (_, reference_encoder, reference_ctx) = model
+            .forward_pre_main(&hs, std::slice::from_ref(&feat), None, 0.3, frame, h, w)
+            .unwrap();
+        let prepared = model.prepare_training_features(&[feat]).unwrap();
+        model.prepare_training_geometry(3, frame, h, w).unwrap();
+        let (_, cached_encoder, cached_ctx) = model
+            .forward_pre_main(&hs, &prepared, None, 0.3, frame, h, w)
+            .unwrap();
+        assert_eq!(
+            reference_encoder.to_vec3::<f32>().unwrap(),
+            cached_encoder.to_vec3::<f32>().unwrap()
+        );
+        assert_eq!(
+            reference_ctx
+                .img_cos
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            cached_ctx
+                .img_cos
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        );
+        assert_eq!(
+            cached_ctx.img_cos.id(),
+            model.prepared_geometry[&(3, frame, h, w)].img_cos.id()
+        );
+
         // Run the block stack via the public segments API and form a loss over both final streams.
         let (hidden, encoder, ctx) = model
-            .forward_pre_main(&hs, &[feat], None, 0.3, frame, h, w)
+            .forward_pre_main(&hs, &prepared, None, 0.3, frame, h, w)
             .unwrap();
         let mut state = vec![hidden, encoder];
         for seg in model.main_block_segments(&ctx) {

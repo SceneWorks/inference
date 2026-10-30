@@ -75,6 +75,7 @@ fn base_params() -> Params {
 
 fn full_model(compute: DType) -> TrainModel {
     TrainModel {
+        geometry: Default::default(),
         cfg: tiny_config().model,
         compute,
         device: cpu(),
@@ -542,6 +543,7 @@ fn folds_are_bit_identical_on_the_build_device() {
         })
         .collect();
     let model = TrainModel {
+        geometry: Default::default(),
         cfg: tiny_config().model,
         compute: DType::BF16,
         device: dev.clone(),

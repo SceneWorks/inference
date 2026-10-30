@@ -47,6 +47,65 @@ class InputReceipts(unittest.TestCase):
         roles.start(); grades.start()
         self.addCleanup(roles.stop); self.addCleanup(grades.stop)
 
+    def test_flux3_bounded_requires_base_tensors_text_config_and_tokenizer(self):
+        registry = json.loads((ROOT / 'scripts/ci/model-inference-proofs.json').read_text(encoding='utf-8'))
+        case = next(row for row in registry if row['fqn'] == 'real_weights::flux3_bounded_acceleration_acceptance')
+        requirements = case['input_contract']['requirements']
+        self.assertEqual({r['slot'] for r in requirements},
+                         {'flux3-source-tensors', 'flux3-text-config', 'flux3-tokenizer'})
+        events = [event(item('/MOCK-ONLY/' + r['slot']), scope=case['fqn'],
+                        reader=r['readers'][0], role=r['role']) for r in requirements]
+        self.assertEqual(inputs.assess_inputs(case, ''.join(events))['input_grade'], 'successful-reader-binding')
+        for omitted in range(len(events)):
+            with self.subTest(omitted=requirements[omitted]['slot']), self.assertRaises(ValueError):
+                inputs.assess_inputs(case, ''.join(e for i, e in enumerate(events) if i != omitted))
+        # A generated-adapter reload receipt cannot substitute for base source weights.
+        reload = event(item('/MOCK-ONLY/adapter.safetensors'), scope=case['fqn'],
+                       reader='candle-core::safetensors::load', role='tensor-input')
+        with self.assertRaises(ValueError):
+            inputs.assess_inputs(case, reload + ''.join(events[1:]))
+
+    def test_flux3_cpu_oracles_require_native_pup_readers_and_every_config_collection(self):
+        registry = json.loads((ROOT / 'scripts/ci/model-inference-proofs.json').read_text(encoding='utf-8'))
+        cases = [case for case in registry if case['package'] == 'candle-gen-flux3'
+                 and case['fqn'].startswith('pup_parity::native_cpu_f32_')]
+        self.assertEqual(len(cases), 4)
+        json_reader = 'crates/llm/candle-llm/src/provider.rs::read_json::std::fs::read_to_string@267613'
+        # Actual reader roles/files from the checked-in miniature PUP load path;
+        # paths and event contents here are mock metadata, never native model IO.
+        reads = [
+            ('candle-llm::primitives::Weights::from_dir', 'model-weights', 'model.safetensors'),
+            ('core-llm::tokenizer::Tokenizer::from_file', 'tokenizer', 'tokenizer.json'),
+            ('crates/llm/candle-llm/src/starvector.rs::read_config::std::fs::read_to_string@10042', 'artifact-input', 'config.json'),
+            (json_reader, 'artifact-input', 'config.json'),
+            (json_reader, 'artifact-input', 'generation_config.json'),
+            (json_reader, 'artifact-input', 'tokenizer_config.json'),
+            ('crates/llm/candle-llm/src/provider.rs::sidecar_chat_template::std::fs::read_to_string@189409', 'artifact-input', 'chat_template.jinja'),
+        ]
+        for case in cases:
+            with self.subTest(case=case['fqn']):
+                events = [event(item('/MOCK-ONLY/tiny-pup/' + name), scope=case['fqn'], reader=reader, role=role)
+                          for reader, role, name in reads]
+                assessment = inputs.assess_inputs(case, ''.join(events))
+                self.assertEqual(assessment['input_grade'], 'successful-reader-binding')
+                self.assertFalse(assessment['checkpoint_byte_integrity_attested'])
+                self.assertFalse(assessment['verified_named_revision'])
+                for omitted in range(len(events)):
+                    with self.subTest(omitted=reads[omitted]), self.assertRaises(ValueError):
+                        inputs.assess_inputs(case, ''.join(e for i, e in enumerate(events) if i != omitted))
+                    reader, role, name = reads[omitted]
+                    partial = event(item('/MOCK-ONLY/tiny-pup/' + name), scope=case['fqn'],
+                                    reader=reader, role=role, complete=False)
+                    with self.assertRaises(ValueError):
+                        inputs.assess_inputs(case, ''.join(events[:omitted] + [partial] + events[omitted + 1:]))
+                # Repeating config.json cannot replace the other two successful JSON reads.
+                with self.assertRaises(ValueError):
+                    inputs.assess_inputs(case, ''.join(events[:4] + [events[3], events[3]] + events[6:]))
+                generic_tensor = event(item('/MOCK-ONLY/model.safetensors'), scope=case['fqn'],
+                                       reader='candle-core::safetensors::load', role='tensor-input')
+                with self.assertRaises(ValueError):
+                    inputs.assess_inputs(case, generic_tensor + ''.join(events[1:]))
+
     def test_source_defined_fixture_remains_source_bound_without_checkpoint_claim(self):
         result = inputs.assess_inputs(row('source-defined'), '')
         self.assertEqual(result['input_grade'], 'source-defined')

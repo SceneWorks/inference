@@ -39,6 +39,7 @@ fn text_encoder(device: &Device) -> Flux3TextEncoder {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn generate_matches_upstream_from_injected_noise() {
     let device = cpu();
     let config = tiny_config();
@@ -133,11 +134,15 @@ fn generate_matches_upstream_from_injected_noise() {
         Err(candle_gen::CandleError::Canceled) => {}
         other => panic!("expected Canceled, got {:?}", other.map(|_| ())),
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_parity::generate_matches_upstream_from_injected_noise");
 }
 
 /// The release's bf16 sampling policy vs upstream's bf16-autocast loop on the same noise, on the
 /// build's device.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn bf16_release_policy_matches_upstream_autocast_loop() {
     let device = device();
     let config = tiny_config();
@@ -185,4 +190,7 @@ fn bf16_release_policy_matches_upstream_autocast_loop() {
         want_f32,
         bound,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED e2e_parity::bf16_release_policy_matches_upstream_autocast_loop");
 }

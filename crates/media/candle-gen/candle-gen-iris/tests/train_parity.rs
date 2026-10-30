@@ -96,6 +96,7 @@ fn vars(m: HashMap<String, Tensor>) -> Params {
 fn full_model() -> (TrainModel, Params) {
     (
         TrainModel {
+            geometry: Default::default(),
             cfg: tiny_config().model,
             compute: DType::F32,
             device: cpu(),
@@ -341,7 +342,7 @@ fn adapter_model(
     HashMap<String, String>,
 ) {
     let targets: Vec<String> = g.meta("targets").split(',').map(str::to_string).collect();
-    let base = base_f32();
+    let mut base = base_f32();
     let kind = if kind_name == "lora" {
         AdapterKind::Lora {
             rank: 2,
@@ -389,12 +390,15 @@ fn adapter_model(
         .flat_map(|t| t.factor_keys(kind).into_iter().map(|k| (k, t.path.clone())))
         .collect();
     let model = TrainModel {
+        geometry: Default::default(),
         cfg: tiny_config().model,
         compute: DType::F32,
         device: cpu(),
         trainable: Trainable::Adapter {
             kind,
             targets,
+            packs: candle_gen_iris::train::model::prepare_adapter_projection_packs(&mut base)
+                .unwrap(),
             base,
         },
     };
@@ -450,6 +454,64 @@ fn first_window_grads(model: &TrainModel, params: &Params, g: &Fixture) -> Tenso
 fn adapter_case(kind_name: &str, opt_kind: OptimizerKind, tol: f32) {
     let g = fixture(GOLDEN);
     let (model, params, init, owner) = adapter_model(&g, kind_name);
+    let raw = if let Trainable::Adapter {
+        kind,
+        targets,
+        base,
+        ..
+    } = &model.trainable
+    {
+        TrainModel {
+            geometry: Default::default(),
+            cfg: model.cfg.clone(),
+            compute: model.compute,
+            device: model.device.clone(),
+            trainable: Trainable::Adapter {
+                kind: *kind,
+                targets: targets.clone(),
+                base: base.clone(),
+                packs: BTreeMap::new(),
+            },
+        }
+    } else {
+        unreachable!()
+    };
+    let b = batch(&g, 0);
+    let obj = objective(Prediction::Velocity);
+    let (raw_loss, raw_grads) = loss_and_grads(&raw, &params, &b, &obj, 1.0).unwrap();
+    let (packed_loss, packed_grads) = loss_and_grads(&model, &params, &b, &obj, 1.0).unwrap();
+    assert!((raw_loss - packed_loss).abs() < 2e-6);
+    for (key, expected) in raw_grads {
+        let actual = &packed_grads[&key];
+        let magnitude = expected
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let error = expected
+            .sub(actual)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            error <= magnitude * 2e-5 + 1e-8,
+            "GQA pack {key}: {error}/{magnitude}"
+        );
+    }
+    assert!(model.geometry.resident_bytes() > 0);
+    let resident = model.geometry.resident_bytes();
+    let _ = loss_and_grads(&model, &params, &b, &obj, 1.0).unwrap();
+    assert_eq!(
+        resident,
+        model.geometry.resident_bytes(),
+        "rebuilt backbones must share geometry slots"
+    );
     // AdamW only: Muon's Newton–Schulz has no per-element `ε` conditioning.
     let keep: Option<HashMap<String, Vec<bool>>> = (opt_kind == OptimizerKind::AdamW).then(|| {
         first_window_grads(&model, &params, &g)

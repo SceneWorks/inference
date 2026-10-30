@@ -6,6 +6,7 @@ use std::sync::Arc;
 use candle_core::{DType, Device, Result, Tensor, Var, D};
 use candle_gen::gen_core::{PrecisionFloorComponent, Quant};
 use candle_gen::quant::{AdaptLinear as QLinear, PackedWeightSidecars};
+use candle_gen::train::projection::FrozenProjectionPack;
 use candle_gen_boogu::loader::Weights;
 
 use crate::config::{HEAD_DIM, NORM_EPS};
@@ -48,16 +49,7 @@ fn streamed_linear(
 }
 
 fn rms(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
-    let norm = x
-        .to_dtype(DType::F32)?
-        .sqr()?
-        .mean_keepdim(D::Minus1)?
-        .affine(1., NORM_EPS)?
-        .sqrt()?;
-    x.to_dtype(DType::F32)?
-        .broadcast_div(&norm)?
-        .broadcast_mul(&weight.to_dtype(DType::F32)?)?
-        .to_dtype(x.dtype())
+    candle_gen::train::norm::rms_norm_diff(x, &weight.to_dtype(DType::F32)?, NORM_EPS)
 }
 
 fn layer_norm(x: &Tensor) -> Result<Tensor> {
@@ -149,6 +141,8 @@ impl FeedForward {
 }
 
 struct JointAttention {
+    image_pack: Option<FrozenProjectionPack>,
+    text_pack: Option<FrozenProjectionPack>,
     to_q: QLinear,
     to_k: QLinear,
     to_v: QLinear,
@@ -212,13 +206,19 @@ fn sdpa_planned_by_heads(
         .head_chunks(b as u64, h as u64, sq as u64, sk as u64);
     if !head_plan.chunks_heads() {
         record_attention_head_chunk_count(1);
-        return candle_gen::sdpa_planned_bhsd(
+        return candle_gen::fused_attention::training_sdpa_bhsd(
             q,
             k,
             v,
             scale,
             None,
-            candle_nn::ops::softmax_last_dim,
+            |scores| {
+                if scores.track_op() {
+                    candle_nn::ops::softmax(scores, D::Minus1)
+                } else {
+                    candle_nn::ops::softmax_last_dim(scores)
+                }
+            },
             plan,
         );
     }
@@ -231,13 +231,19 @@ fn sdpa_planned_by_heads(
             return Err(candle_gen::CandleError::Canceled);
         }
         let len = heads_per_chunk.min(h - start);
-        chunks.push(candle_gen::sdpa_planned_bhsd(
+        chunks.push(candle_gen::fused_attention::training_sdpa_bhsd(
             &q.narrow(1, start, len)?,
             &k.narrow(1, start, len)?,
             &v.narrow(1, start, len)?,
             scale,
             None,
-            candle_nn::ops::softmax_last_dim,
+            |scores| {
+                if scores.track_op() {
+                    candle_nn::ops::softmax(scores, D::Minus1)
+                } else {
+                    candle_nn::ops::softmax_last_dim(scores)
+                }
+            },
             plan,
         )?);
         start += len;
@@ -255,6 +261,8 @@ impl JointAttention {
     ) -> Result<Self> {
         let l = |name: &str| streamed_linear(w, &format!("{prefix}.{name}"), true, sidecars);
         Ok(Self {
+            image_pack: None,
+            text_pack: None,
             to_q: l("to_q")?,
             to_k: l("to_k")?,
             to_v: l("to_v")?,
@@ -284,24 +292,28 @@ impl JointAttention {
         let (_, nt, _) = text.dims3()?;
         let shape_i = (ni, self.heads, HEAD_DIM);
         let shape_t = (nt, self.heads, HEAD_DIM);
-        let iq = rope::apply(
-            &rms(&self.to_q.forward(image)?.reshape(shape_i)?, &self.norm_q)?,
-            table,
-        )?;
-        let ik = rope::apply(
-            &rms(&self.to_k.forward(image)?.reshape(shape_i)?, &self.norm_k)?,
-            table,
-        )?;
-        let iv = self.to_v.forward(image)?.reshape(shape_i)?;
-        let tq = rms(
-            &self.add_q.forward(text)?.reshape(shape_t)?,
-            &self.norm_add_q,
-        )?;
-        let tk = rms(
-            &self.add_k.forward(text)?.reshape(shape_t)?,
-            &self.norm_add_k,
-        )?;
-        let tv = self.add_v.forward(text)?.reshape(shape_t)?;
+        let project = |pack: &Option<FrozenProjectionPack>,
+                       x: &Tensor,
+                       q: &QLinear,
+                       k: &QLinear,
+                       v: &QLinear|
+         -> Result<(Tensor, Tensor, Tensor)> {
+            if let Some(pack) = pack {
+                candle_gen::train::profile::cohort_reuse("mage:frozen-projection-pack");
+                let mut ys = pack.forward_adapt(x, &[q, k, v])?.into_iter();
+                Ok((ys.next().unwrap(), ys.next().unwrap(), ys.next().unwrap()))
+            } else {
+                Ok((q.forward(x)?, k.forward(x)?, v.forward(x)?))
+            }
+        };
+        let (iq, ik, iv) = project(&self.image_pack, image, &self.to_q, &self.to_k, &self.to_v)?;
+        let (tq, tk, tv) = project(&self.text_pack, text, &self.add_q, &self.add_k, &self.add_v)?;
+        let iq = rope::apply(&rms(&iq.reshape(shape_i)?, &self.norm_q)?, table)?;
+        let ik = rope::apply(&rms(&ik.reshape(shape_i)?, &self.norm_k)?, table)?;
+        let iv = iv.reshape(shape_i)?;
+        let tq = rms(&tq.reshape(shape_t)?, &self.norm_add_q)?;
+        let tk = rms(&tk.reshape(shape_t)?, &self.norm_add_k)?;
+        let tv = tv.reshape(shape_t)?;
 
         let image_cu = layout.image_cu();
         let text_cu = layout.text_cu();
@@ -552,9 +564,127 @@ pub struct MageTransformer {
     final_mod: QLinear,
     output: QLinear,
     dtype: DType,
+    training_rope: Vec<(PackLayout, RopeTable)>,
+    // Frozen initial conditioning base only. Live txt_in residuals are evaluated each step.
+    training_text: Vec<(
+        candle_core::TensorId,
+        candle_core::TensorId,
+        candle_core::TensorId,
+        Option<candle_core::TensorId>,
+        Tensor,
+        Tensor,
+    )>,
 }
 
 impl MageTransformer {
+    /// Retained geometry and initial-conditioning base outputs, priced before allocation.
+    pub(crate) fn training_preparation_bytes(&self, inputs: &[(&Tensor, &PackLayout)]) -> u64 {
+        let mut layouts = Vec::new();
+        let mut ids = std::collections::HashSet::new();
+        let mut bytes = 0usize;
+        for (text, layout) in inputs {
+            if !layouts.contains(layout) {
+                layouts.push(*layout);
+                bytes += layout.image_tokens() * HEAD_DIM * self.dtype.size_in_bytes();
+            }
+            if !self.text_norm.track_op() && ids.insert(text.id()) {
+                if let Some(base) = self
+                    .text_in
+                    .dense_base()
+                    .filter(|b| !b.weight().track_op() && !b.bias().is_some_and(Tensor::track_op))
+                {
+                    bytes += (text.elem_count()
+                        + text.elem_count() / text.dims()[2] * base.weight().dims()[0])
+                        * self.dtype.size_in_bytes();
+                }
+            }
+        }
+        bytes as u64
+    }
+
+    /// Maximum deterministic scratch during the sequential preparation above.
+    /// RoPE keeps its f32 angles and one f32 trig output while casting. Frozen
+    /// text normalization can overlap its input cast, f32 full-width intermediates,
+    /// reduction rows and weight cast; retained norm/output tensors are priced separately.
+    pub(crate) fn training_preparation_workspace_bytes(
+        &self,
+        inputs: &[(&Tensor, &PackLayout)],
+    ) -> u64 {
+        inputs
+            .iter()
+            .map(|(text, layout)| {
+                let rope = layout.image_tokens() as u64 * (HEAD_DIM / 2) as u64 * 8;
+                let norm = if !self.text_norm.track_op()
+                    && self.text_in.dense_base().is_some_and(|base| {
+                        !base.weight().track_op() && !base.bias().is_some_and(Tensor::track_op)
+                    }) {
+                    let elements = text.elem_count() as u64;
+                    let width = *text.dims().last().expect("validated text rank") as u64;
+                    elements * (12 + self.dtype.size_in_bytes() as u64)
+                        + width * 4
+                        + elements / width * 12
+                } else {
+                    0
+                };
+                rope.max(norm)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn prepare_training(&mut self, inputs: &[(&Tensor, &PackLayout)]) -> Result<()> {
+        if let MageBlocks::Resident(blocks) = &mut self.blocks {
+            for block in blocks {
+                let a = &mut block.attention;
+                if a.image_pack.is_none() {
+                    a.image_pack = FrozenProjectionPack::prepare_adapt(&mut [
+                        &mut a.to_q,
+                        &mut a.to_k,
+                        &mut a.to_v,
+                    ])?;
+                }
+                if a.text_pack.is_none() {
+                    a.text_pack = FrozenProjectionPack::prepare_adapt(&mut [
+                        &mut a.add_q,
+                        &mut a.add_k,
+                        &mut a.add_v,
+                    ])?;
+                }
+            }
+        }
+        self.training_rope.clear();
+        self.training_text.clear();
+        for (text, layout) in inputs {
+            if !self.training_rope.iter().any(|(key, _)| key == *layout) {
+                self.training_rope.push((
+                    (*layout).clone(),
+                    RopeTable::build(layout, self.dtype, text.device())?,
+                ));
+            }
+            if !self.text_norm.track_op()
+                && !self.training_text.iter().any(|(id, ..)| *id == text.id())
+            {
+                if let Some(base) = self
+                    .text_in
+                    .dense_base()
+                    .filter(|b| !b.weight().track_op() && !b.bias().is_some_and(Tensor::track_op))
+                {
+                    let normed = rms(&text.to_dtype(self.dtype)?, &self.text_norm)?;
+                    let output = candle_nn::Module::forward(base, &normed)?;
+                    self.training_text.push((
+                        text.id(),
+                        self.text_norm.id(),
+                        base.weight().id(),
+                        base.bias().map(Tensor::id),
+                        normed,
+                        output,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn visit_adaptable_mut(
         &mut self,
         visitor: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> Result<()>,
@@ -689,6 +819,8 @@ impl MageTransformer {
             final_mod: linear(weights, "norm_out.linear", true)?,
             output: linear(weights, "proj_out", true)?,
             dtype,
+            training_rope: Vec::new(),
+            training_text: Vec::new(),
         })
     }
 
@@ -741,6 +873,8 @@ impl MageTransformer {
             final_mod: linear(&weights, "norm_out.linear", true)?,
             output: linear(&weights, "proj_out", true)?,
             dtype: DType::BF16,
+            training_rope: Vec::new(),
+            training_text: Vec::new(),
         };
         transformer.place_non_blocks(quant, target_device)?;
         Ok(transformer)
@@ -813,11 +947,39 @@ impl MageTransformer {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> Result<Tensor> {
-        let table = RopeTable::build(layout, self.dtype, image.device())?;
+        let temporary;
+        let table =
+            if let Some((_, table)) = self.training_rope.iter().find(|(key, table)| {
+                key == layout && table.cos.device().same_device(image.device())
+            }) {
+                candle_gen::train::profile::cohort_reuse("mage:geometry-storage-hit");
+                table
+            } else {
+                temporary = RopeTable::build(layout, self.dtype, image.device())?;
+                &temporary
+            };
         let image = self.image_in.forward(&image.to_dtype(self.dtype)?)?;
-        let text = self
-            .text_in
-            .forward(&rms(&text.to_dtype(self.dtype)?, &self.text_norm)?)?;
+        let text = if let Some((_, norm_id, base_id, bias_id, normed, output)) =
+            self.training_text.iter().find(|(id, ..)| *id == text.id())
+        {
+            if self.text_norm.id() != *norm_id
+                || self.text_in.dense_base().map(|b| b.weight().id()) != Some(*base_id)
+                || self
+                    .text_in
+                    .dense_base()
+                    .and_then(|b| b.bias().map(Tensor::id))
+                    != *bias_id
+            {
+                candle_core::bail!(
+                    "mage prepared conditioning invalidated by norm/base replacement"
+                );
+            }
+            candle_gen::train::profile::cohort_reuse("mage:frozen-caption-base-hit-live-residual");
+            self.text_in.apply_residuals(normed, output.clone())?
+        } else {
+            self.text_in
+                .forward(&rms(&text.to_dtype(self.dtype)?, &self.text_norm)?)?
+        };
         let temb = self
             .timestep
             .forward(&sigma.to_dtype(self.dtype)?, self.dtype)?;
@@ -833,7 +995,7 @@ impl MageTransformer {
                         image,
                         text,
                         &temb,
-                        &table,
+                        table,
                         layout,
                         attention_budget,
                         cancel,
@@ -878,7 +1040,7 @@ impl MageTransformer {
                                     image,
                                     text,
                                     &temb,
-                                    &table,
+                                    table,
                                     layout,
                                     attention_budget,
                                     cancel,

@@ -3849,6 +3849,36 @@
       ],
       "selector": "minimax-h3/adapter-source",
       "condition": "Actual configured H3 adapter file consumed in apply_minimax_h3_adapters; distinct from TE/vision ModelWeights file reads. Source-owned generic adapter purpose, not a case/FQN/recipe alias. Existing successful physical base OR qualified event only. Lazy/header reader binding; unchanged subsequent GPU verification/classification/folding must still succeed in real execution."
+    },
+    "candle-gen-ltx::trainer_e2e::real_ltx25_prepared_item/real-ltx23-target-data": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-ltx::training::LtxTrainer::cache/ltx25-tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-ltx::training::validate_prepared_ltx25_bundle/header-configuration": {
+      "role": "configuration",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-moss-image::loader::load_weights_cancellable": {
+      "role": "model-weights",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-moss-image::text_encoder::tokenizer": {
+      "role": "tokenizer",
+      "grades": [
+        "reader-binding"
+      ]
     }
   },
   "ordered_record_source_facts_sha256": "888da778962d6902bcf54ab53b83436e5677abc22668902d3421a23b67506f44"

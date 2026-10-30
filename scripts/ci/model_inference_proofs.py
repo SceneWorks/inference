@@ -8,6 +8,7 @@ from contextlib import contextmanager, nullcontext
 import tempfile
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -27,6 +28,7 @@ from scripts.ci.model_proof_inputs import assess_inputs, receipt_claims, validat
 from scripts.ci import model_proof_multi_cuda as multi_cuda
 from scripts.ci.native_darwin_sdk import select_sdk as select_native_darwin_sdk
 from scripts.ci.prepare_iris_quant_proof_assets import validate_receipt as validate_iris_asset_receipt
+from scripts.ci.prepare_bespoke_training_proof_assets import exact_bindings as bespoke_training_bindings
 
 REGISTRY_PATH = Path(__file__).with_name('model-inference-proofs.json')
 IGNORE_PREFIX = 'model inference; explicit model-proof workflow'
@@ -54,6 +56,7 @@ IRIS_CUDA_CORRECTNESS_PROOFS = frozenset(
     binding for binding in IRIS_QUANT_PROOFS if binding.startswith('candle-gen-iris/')
 )
 IRIS_CUDA_CORRECTNESS_PROFILE = 'non-isolated-correctness-low-activity'
+SHARED_CUDA_HEADROOM_PROFILE = 'non-isolated-correctness-headroom'
 
 
 def identity(row: dict) -> str:
@@ -287,7 +290,15 @@ def validate_configurations(row: dict, *, root: Path | None = None) -> None:
                                      if all(key in row for key in ('package', 'target', 'fqn'))
                                      and identity(row) in IRIS_CUDA_CORRECTNESS_PROOFS
                                      and name in ('source_selected_cuda', 'source_selected_cuda_gpu0') else None)
-        if (('cuda_activity_profile' in recipe) != (expected_activity_profile is not None)
+        shared_headroom = recipe.get('cuda_activity_profile') == SHARED_CUDA_HEADROOM_PROFILE
+        if shared_headroom and (expected_activity_profile is not None or route != 'candle-cuda'
+                                or recipe.get('required_cuda_physical_index') != 1
+                                or type(recipe.get('required_cuda_physical_index')) is not int
+                                or not isinstance(row.get('required_cuda_device_uuid'), str)
+                                or not re.fullmatch(r'GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}',
+                                                    row['required_cuda_device_uuid'])):
+            raise ValueError('shared CUDA headroom profile requires an explicit GPU1 UUID/index source binding')
+        if not shared_headroom and (('cuda_activity_profile' in recipe) != (expected_activity_profile is not None)
                 or recipe.get('cuda_activity_profile') != expected_activity_profile
                 or (expected_activity_profile is not None and route != 'candle-cuda')):
             raise ValueError('CUDA low-activity profile is limited to the exact Iris correctness recipes')
@@ -433,11 +444,17 @@ def load_registry(path: Path = REGISTRY_PATH, *, root: Path = ROOT) -> tuple[dic
         required_index = row.get('required_cuda_physical_index')
         if required_index is not None and (type(required_index) is not int or required_index < 0):
             raise ValueError('fixed physical CUDA index must be a nonnegative integer')
-        if (required_uuid is not None or required_index is not None) and lane(row) != 'candle-cuda':
-            raise ValueError('physical CUDA restrictions require the CUDA execution route')
         validate_configurations(row, root=root)
+        if required_uuid is not None or required_index is not None:
+            routes = (
+                (lane(configured_case(row, name)) for name in row['configurations'])
+                if 'configurations' in row else (lane(row),)
+            )
+            if any(route != 'candle-cuda' for route in routes):
+                raise ValueError('physical CUDA restrictions require the CUDA execution route')
         validate_child_visibility(row)
         validate_contract(row)
+        validate_generated_adapter_artifacts(row)
         multi_cuda.validate_source(row)
         default_lane = ('configuration-required' if 'configurations' in row and row['default_configuration'] is None
                         else lane(configured_case(row)))
@@ -702,7 +719,142 @@ def owned_output(path: Path, temporary: Path) -> Path:
     return resolved
 
 
-def publish_file(source: Path, destination: Path, owned: Path, cap: int, *, log: bool = False, destination_root: Path | None = None) -> dict:
+def validate_generated_adapter_spec(spec: dict) -> None:
+    """Source-owned export shape contract, never caller/environment permission."""
+    fields = {'kind', 'rank', 'dtype', 'per_target_alpha', 'max_bytes', 'targets'}
+    if isinstance(spec, dict) and 'metadata_format' in spec:
+        # Native FLUX3 export_adapter has its own established PEFT metadata.
+        # This is an explicit dialect, not a global set of interchangeable aliases.
+        fields |= {'metadata_format', 'alpha'}
+        if (spec.get('metadata_format') != 'flux3' or spec.get('per_target_alpha') is not False
+                or type(spec.get('alpha')) not in (int, float)
+                or not math.isfinite(spec['alpha']) or spec['alpha'] <= 0):
+            raise ValueError('native FLUX3 adapter needs its explicit format and positive expected alpha')
+    if (not isinstance(spec, dict) or set(spec) != fields or spec['kind'] != 'lora'
+            or type(spec['rank']) is not int or not 1 <= spec['rank'] <= 1024
+            or spec['dtype'] not in ('F32', 'F16', 'BF16')
+            or type(spec['per_target_alpha']) is not bool
+            or type(spec['max_bytes']) is not int or not 1 <= spec['max_bytes'] <= 2**31
+            or not isinstance(spec['targets'], dict) or not spec['targets']):
+        raise ValueError('generated adapter needs an explicit bounded LoRA export contract')
+    for name, shape in spec['targets'].items():
+        if (not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.]*', name)
+                or '..' in name or name.endswith('.') or not isinstance(shape, list) or len(shape) != 2
+                or any(type(n) is not int or not spec['rank'] <= n <= 2**20 for n in shape)):
+            raise ValueError('generated adapter targets need exact names and [out,in] dimensions')
+
+
+def validate_generated_adapter_artifacts(row: dict) -> dict:
+    """Only explicitly listed generated outputs can carry an adapter exception."""
+    specs = row.get('generated_adapter_artifacts', {})
+    if not isinstance(specs, dict):
+        raise ValueError('generated adapter artifacts must be an exact output-path map')
+    for relative, spec in specs.items():
+        if (not isinstance(relative, str) or '\\' in relative or ':' in relative
+                or Path(relative).is_absolute() or '..' in Path(relative).parts
+                or Path(relative).suffix != '.safetensors'
+                or relative not in row.get('output_artifacts', [])):
+            raise ValueError('generated adapter permission must name a confined declared output artifact')
+        validate_generated_adapter_spec(spec)
+    return specs
+
+
+def validate_generated_lora_bytes(raw: bytes, spec: dict) -> None:
+    """Validate exact factors and packed payload ranges, without executing tensors.
+
+    This validates an exported adapter's format, not its training history. Fresh
+    owned generated paths and the selected source body's update/save/reload proof
+    establish that lifecycle; input paths, links and generic checkpoints are not
+    admitted by this header validator.
+    """
+    validate_generated_adapter_spec(spec)
+    if len(raw) < 8 or len(raw) > spec['max_bytes']:
+        raise ValueError('generated adapter is truncated or exceeds its exact file bound')
+    size = int.from_bytes(raw[:8], 'little')
+    if not 2 <= size <= 1024 * 1024 or size + 8 > len(raw):
+        raise ValueError('generated adapter safetensors header length is invalid')
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate generated adapter header key')
+            result[key] = value
+        return result
+    def reject_constant(value):
+        raise ValueError('nonfinite generated adapter JSON constant: ' + value)
+    try:
+        header = json.loads(raw[8:8+size].decode('utf-8'), object_pairs_hook=unique,
+                            parse_constant=reject_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError('invalid generated adapter safetensors header') from error
+    if not isinstance(header, dict):
+        raise ValueError('generated adapter safetensors header must be an object')
+    metadata = header.pop('__metadata__', {})
+    if not isinstance(metadata, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in metadata.items()):
+        raise ValueError('generated adapter metadata must contain only string values')
+    if spec.get('metadata_format') == 'flux3':
+        # candle-gen-flux3/src/training/checkpoint.rs::export_adapter. Base identity
+        # strings are exporter metadata, not attestation of checkpoint bytes/revision.
+        required = {'base_model', 'base_revision', 'network_type', 'rank', 'lora_alpha',
+                    'scaling_convention', 'training_identity', 'lora_adapter_metadata'}
+        if (not required <= set(metadata) or set(metadata) - required - {'fixture'}
+                or metadata['network_type'] != 'lora' or metadata['rank'] != str(spec['rank'])
+                or metadata['scaling_convention'] != 'alpha/rank'
+                or any(not metadata[key] for key in required)):
+            raise ValueError('native FLUX3 adapter metadata differs from its exporter contract')
+        try:
+            alpha = float(metadata['lora_alpha'])
+            peft = json.loads(metadata['lora_adapter_metadata'], object_pairs_hook=unique,
+                              parse_constant=reject_constant)
+        except (ValueError, TypeError) as error:
+            raise ValueError('native FLUX3 adapter has invalid alpha/PEFT metadata') from error
+        expected_peft = {'peft_type': 'LORA', 'r': spec['rank'], 'lora_alpha': spec['alpha'],
+                         'use_rslora': False, 'use_dora': False, 'rank_pattern': {}, 'alpha_pattern': {}}
+        if (not math.isfinite(alpha) or alpha != spec['alpha'] or not isinstance(peft, dict)
+                or peft != expected_peft or type(peft.get('r')) is not int
+                or type(peft.get('lora_alpha')) not in (int, float)
+                or peft.get('use_rslora') is not False or peft.get('use_dora') is not False):
+            raise ValueError('native FLUX3 adapter alpha/rank/PEFT metadata conflicts with source contract')
+    else:
+        if metadata.get('networkType') != 'lora' or metadata.get('rank') != str(spec['rank']):
+            raise ValueError('generated adapter metadata differs from its LoRA rank contract')
+        try:
+            if not math.isfinite(float(metadata['alpha'])):
+                raise ValueError('nonfinite generated adapter alpha')
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError('generated adapter needs finite alpha metadata') from error
+    expected = {}
+    for name, (out_features, in_features) in spec['targets'].items():
+        expected[name + '.lora_A.weight'] = (spec['dtype'], [spec['rank'], in_features])
+        expected[name + '.lora_B.weight'] = (spec['dtype'], [out_features, spec['rank']])
+        if spec['per_target_alpha']:
+            expected[name + '.alpha'] = ('F32', [1])
+    if set(header) != set(expected):
+        raise ValueError('generated adapter has missing factors or unapproved/model tensor keys')
+    spans = []
+    for name, (dtype, shape) in expected.items():
+        entry = header[name]
+        if (not isinstance(entry, dict) or set(entry) != {'dtype', 'shape', 'data_offsets'}
+                or entry['dtype'] != dtype or entry['shape'] != shape
+                or any(type(n) is not int for n in entry['shape'])):
+            raise ValueError('generated adapter factor shape/dtype differs from source contract')
+        offsets = entry['data_offsets']
+        length = math.prod(shape) * (4 if dtype == 'F32' else 2)
+        if (not isinstance(offsets, list) or len(offsets) != 2
+                or any(type(n) is not int or n < 0 for n in offsets)
+                or offsets[1] - offsets[0] != length):
+            raise ValueError('generated adapter factor payload range is invalid')
+        spans.append(tuple(offsets))
+    end = 0
+    for start, stop in sorted(spans):
+        if start != end:
+            raise ValueError('generated adapter payload has gaps or overlapping factors')
+        end = stop
+    if end != len(raw) - 8 - size:
+        raise ValueError('generated adapter contains truncated or trailing payload')
+
+
+def publish_file(source: Path, destination: Path, owned: Path, cap: int, *, log: bool = False, destination_root: Path | None = None, adapter: dict | None = None) -> dict:
     unlinked_path(source, owned)
     unlinked_path(destination, destination_root if destination_root is not None else owned)
     info = source.lstat()
@@ -710,11 +862,16 @@ def publish_file(source: Path, destination: Path, owned: Path, cap: int, *, log:
         raise ValueError('evidence must be a regular non-linked owned file')
     if not source.resolve().is_relative_to(owned.resolve()) or info.st_size > cap:
         raise ValueError('evidence path/size violates the owned-output contract')
-    if not log and source.suffix.lower() not in {'.png', '.jpg', '.jpeg', '.webp', '.svg', '.wav', '.flac', '.json', '.txt', '.csv', '.npy'}:
+    if adapter is not None and (log or source.suffix != '.safetensors'):
+        raise ValueError('generated adapter exception is only for its original safetensors format')
+    if not log and adapter is None and source.suffix.lower() not in {'.png', '.jpg', '.jpeg', '.webp', '.svg', '.wav', '.flac', '.json', '.txt', '.csv', '.npy'}:
         raise ValueError('checkpoint/model payload is not an uploadable output')
     if not log and any(re.search(r'checkpoint|huggingface|models--|optimizer|credentials', part, re.I) for part in source.parts):
         raise ValueError('model/cache/credential path is not evidence')
-    raw = source.read_bytes()
+    with source.open('rb') as handle:
+        raw = handle.read(cap + 1)
+    if adapter is not None:
+        validate_generated_lora_bytes(raw, adapter)
     if log:
         text = raw.decode('utf-8', errors='replace')
         text = redact(text, dict(os.environ))
@@ -1046,11 +1203,14 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                         published = publish_file(path, case_artifact / path.name, case_work, cap, log=True, destination_root=artifact)
                         published['path'] = (case_artifact / path.name).relative_to(artifact).as_posix()
                         result['outputs'].append(published)
+                adapter_specs = validate_generated_adapter_artifacts(row)
                 for relative in row.get('output_artifacts', []):
                     if not isinstance(relative, str) or Path(relative).is_absolute() or '..' in Path(relative).parts:
                         raise ValueError('known output must be confined to the owned generated directory')
                     destination = case_artifact / 'generated' / relative
-                    published = publish_file(generated / relative, destination, generated, policy.stdout_cap_bytes, destination_root=artifact)
+                    adapter = adapter_specs.get(relative)
+                    cap = adapter['max_bytes'] if adapter is not None else policy.stdout_cap_bytes
+                    published = publish_file(generated / relative, destination, generated, cap, destination_root=artifact, adapter=adapter)
                     published['path'] = destination.relative_to(artifact).as_posix()
                     result['outputs'].append(published)
                 repository_identity(expected)
@@ -1199,6 +1359,7 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
     metadata_cap = sum(stream_caps.values())
     file_caps = {'receipt.json': metadata_cap * (len(approved_rows) + 1), 'summary.md': metadata_cap}
     case_allowed = []
+    adapter_contracts = {}
     for index, row in enumerate(approved_rows):
         prefix = f'{index:05d}/'
         file_caps[prefix + 'result.json'] = metadata_cap
@@ -1208,11 +1369,15 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
                 relative = prefix + phase + suffix
                 file_caps[relative] = cap
                 allowed.add(relative)
+        adapter_specs = validate_generated_adapter_artifacts(row)
         for generated in row.get('output_artifacts', []):
             if not isinstance(generated, str) or Path(generated).is_absolute() or '..' in Path(generated).parts:
                 raise ValueError('approved generated output escapes its owned directory')
             relative = prefix + 'generated/' + generated
-            file_caps[relative] = value['policy']['stdoutCapBytes']
+            adapter = adapter_specs.get(generated)
+            file_caps[relative] = adapter['max_bytes'] if adapter is not None else value['policy']['stdoutCapBytes']
+            if adapter is not None:
+                adapter_contracts[relative] = adapter
             allowed.add(relative)
         case_allowed.append(allowed)
     if receipt_path.stat().st_size > file_caps['receipt.json']:
@@ -1267,6 +1432,9 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
                 raise ValueError('unknown/duplicate output, not an approved source-defined artifact')
             expected_files.add(relative)
             hashes[relative] = item
+        required_outputs = {f'{index:05d}/generated/{name}' for name in approved_rows[index].get('output_artifacts', [])}
+        if case['accepted'] and not required_outputs <= {item['path'] for item in case.get('outputs', [])}:
+            raise ValueError('accepted case omits a required generated output artifact')
     if receipt['completed'] != sum(case['accepted'] for case in cases):
         raise ValueError('completed count differs from sealed accepted cases')
     found = set()
@@ -1289,8 +1457,12 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
                 raise ValueError('evidence tree exceeds its bounded aggregate byte budget')
             if relative in hashes:
                 recorded = hashes[relative]
-                if info.st_size != recorded['bytes'] or hashlib.sha256(path.read_bytes()).hexdigest() != recorded['sha256']:
+                with path.open('rb') as handle:
+                    raw = handle.read(file_caps[relative] + 1)
+                if info.st_size != recorded['bytes'] or len(raw) != info.st_size or hashlib.sha256(raw).hexdigest() != recorded['sha256']:
                     raise ValueError('published evidence bytes differ from their recorded hash')
+                if relative in adapter_contracts:
+                    validate_generated_lora_bytes(raw, adapter_contracts[relative])
             found.add(relative)
     if found != expected_files:
         raise ValueError('missing evidence files; no partial upload')
@@ -1374,6 +1546,17 @@ def main() -> int:
                           or args.backend == 'candle-cuda')
             asset_setup = ('iris-quant' if iris_route and len(rows) == 1
                            and identity(rows[0]) in IRIS_QUANT_PROOFS else 'none')
+            if (args.backend == 'candle-cuda' and len(rows) == 1
+                    and rows[0]['package'] == 'candle-gen-krea'
+                    and rows[0]['fqn'] == 'trainer_e2e::krea_bounded_acceleration_profile'):
+                asset_setup = 'krea-training'
+            from scripts.ci.prepare_cohort_training_proof_assets import BINDINGS as COHORT_TRAINING_BINDINGS
+            if (args.backend == 'candle-cuda' and len(rows) == 1
+                    and rows[0]['package'] + '/' + rows[0]['fqn'] in COHORT_TRAINING_BINDINGS
+                    and value.get('configuration') == 'fixed_cuda'):
+                asset_setup = 'cohort-training'
+            if bespoke_training_bindings(rows, args.backend) is not None:
+                asset_setup = 'bespoke-training'
             plan = {'runner': runner, 'asset_setup': asset_setup, 'backend': args.backend, 'request': value, 'selected': len(rows),
                     'bindings': [identity(row) for row in rows]}
             configured = {identity(row): row['selected_configuration'] for row in rows if 'selected_configuration' in row}

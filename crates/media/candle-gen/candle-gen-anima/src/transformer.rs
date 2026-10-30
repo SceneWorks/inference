@@ -21,6 +21,7 @@ use crate::adapt::AdaptLinear;
 use crate::config::DitConfig;
 use crate::nn::{apply_rope_half, layer_norm_no_affine, modulate, rms_norm, sdpa, timestep_sincos};
 use crate::rope::cosmos_image_rope;
+use candle_gen::train::projection::FrozenProjectionPack;
 
 /// q/k RMSNorm eps in diffusers `Attention` (`qk_norm="rms_norm"`, default `eps=1e-5`).
 const ATTN_QK_NORM_EPS: f64 = 1e-5;
@@ -254,6 +255,7 @@ struct Attention {
     to_k: AdaptLinear,
     to_v: AdaptLinear,
     to_out: AdaptLinear,
+    projection_pack: Option<FrozenProjectionPack>,
     norm_q: Tensor,
     norm_k: Tensor,
     heads: usize,
@@ -268,6 +270,7 @@ impl Attention {
             to_q: AdaptLinear::detect(vb, &format!("{prefix}.q_proj"))?,
             to_k: AdaptLinear::detect(vb, &format!("{prefix}.k_proj"))?,
             to_v: AdaptLinear::detect(vb, &format!("{prefix}.v_proj"))?,
+            projection_pack: None,
             to_out: AdaptLinear::detect(vb, &format!("{prefix}.output_proj"))?,
             norm_q: vb.get_unchecked(&format!("{prefix}.q_norm.weight"))?,
             norm_k: vb.get_unchecked(&format!("{prefix}.k_norm.weight"))?,
@@ -289,18 +292,33 @@ impl Attention {
         let kv_src = encoder.unwrap_or(hidden);
         let sk = kv_src.dim(1)?;
 
-        let q = self
-            .to_q
-            .forward(hidden)?
-            .reshape((b, sq, self.heads, self.head_dim))?;
-        let k = self
-            .to_k
-            .forward(kv_src)?
-            .reshape((b, sk, self.heads, self.head_dim))?;
-        let v = self
-            .to_v
-            .forward(kv_src)?
-            .reshape((b, sk, self.heads, self.head_dim))?;
+        let (q, k, v) = if let Some(pack) = &self.projection_pack {
+            candle_gen::train::profile::cohort_reuse("anima:frozen-projection-pack");
+            if encoder.is_none() {
+                let mut ys = pack
+                    .forward_adapt(hidden, &[&self.to_q, &self.to_k, &self.to_v])?
+                    .into_iter();
+                (ys.next().unwrap(), ys.next().unwrap(), ys.next().unwrap())
+            } else {
+                let mut ys = pack
+                    .forward_adapt(kv_src, &[&self.to_k, &self.to_v])?
+                    .into_iter();
+                (
+                    self.to_q.forward(hidden)?,
+                    ys.next().unwrap(),
+                    ys.next().unwrap(),
+                )
+            }
+        } else {
+            (
+                self.to_q.forward(hidden)?,
+                self.to_k.forward(kv_src)?,
+                self.to_v.forward(kv_src)?,
+            )
+        };
+        let q = q.reshape((b, sq, self.heads, self.head_dim))?;
+        let k = k.reshape((b, sk, self.heads, self.head_dim))?;
+        let v = v.reshape((b, sk, self.heads, self.head_dim))?;
 
         // per-head q/k RMSNorm (over the head_dim).
         let q = rms_norm(&q, &self.norm_q, ATTN_QK_NORM_EPS)?;
@@ -323,6 +341,21 @@ impl Attention {
             .transpose(1, 2)?
             .reshape((b, sq, self.heads * self.head_dim))?;
         Ok(self.to_out.forward(&o)?)
+    }
+
+    fn prepare_training(&mut self, cross: bool) -> Result<()> {
+        if self.projection_pack.is_none() {
+            self.projection_pack = if cross {
+                FrozenProjectionPack::prepare_adapt(&mut [&mut self.to_k, &mut self.to_v])?
+            } else {
+                FrozenProjectionPack::prepare_adapt(&mut [
+                    &mut self.to_q,
+                    &mut self.to_k,
+                    &mut self.to_v,
+                ])?
+            };
+        }
+        Ok(())
     }
 
     /// Visit this attention's four adaptable projections (`{prefix}.{q,k,v,output}_proj`) for the
@@ -452,6 +485,7 @@ pub struct CosmosDiT {
     cfg: DitConfig,
     device: Device,
     load_id: u64,
+    training_rope: Vec<PreparedRope>,
 }
 
 impl CosmosDiT {
@@ -471,7 +505,39 @@ impl CosmosDiT {
             cfg,
             device: vb.device().clone(),
             load_id: next_cosmos_dit_load_id(),
+            training_rope: Vec::new(),
         })
+    }
+
+    pub(crate) fn training_geometry_bytes(&self, latents: &[&Tensor]) -> Result<u64> {
+        let mut requests = Vec::new();
+        let mut bytes = 0;
+        for latent in latents {
+            let request = PreparedRopeRequest::new(self.load_id, latent, self.cfg.patch_size)?;
+            if !requests.contains(&request) {
+                let (t, h, w) = request.patch_geometry;
+                bytes += (t * h * w * self.cfg.attention_head_dim * 8) as u64;
+                requests.push(request);
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// Job-owned preparation after residual installation. Only invariant geometry is cached;
+    /// the bundled trainable conditioner is evaluated on every micro-step.
+    pub(crate) fn prepare_training(&mut self, latents: &[&Tensor]) -> Result<()> {
+        for block in &mut self.blocks {
+            block.attn1.prepare_training(false)?;
+            block.attn2.prepare_training(true)?;
+        }
+        self.training_rope.clear();
+        for latent in latents {
+            let request = PreparedRopeRequest::new(self.load_id, latent, self.cfg.patch_size)?;
+            if !self.training_rope.iter().any(|p| p.request == request) {
+                self.training_rope.push(self.prepare_rope(latent)?);
+            }
+        }
+        Ok(())
     }
 
     pub fn config(&self) -> &DitConfig {
@@ -550,6 +616,14 @@ impl CosmosDiT {
         encoder: &Tensor,
         dtype: DType,
     ) -> Result<Tensor> {
+        if let Some(prepared) = self.training_rope.iter().find(|p| {
+            p.request
+                .validate(self.load_id, latents, self.cfg.patch_size)
+                .is_ok()
+        }) {
+            candle_gen::train::profile::cohort_reuse("anima:geometry-storage-hit");
+            return self.forward_prepared(latents, sigma, encoder, dtype, prepared);
+        }
         let prepared = self.prepare_rope(latents)?;
         self.forward_prepared(latents, sigma, encoder, dtype, &prepared)
     }

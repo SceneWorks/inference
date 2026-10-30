@@ -130,6 +130,9 @@ fn real_text_encoder_matches_upstream() {
         g.require("text/tokens"),
         4e-2,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_text_encoder_matches_upstream");
 }
 
 /// One flow-map forward of the real DiT on the golden's inputs. Under bf16 the bound is 1.5× the
@@ -194,6 +197,9 @@ fn real_dit_forward_matches_upstream() {
             bound,
         );
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_dit_forward_matches_upstream");
 }
 
 /// The real autoencoder decodes the golden's random tokens (4×4) to upstream's f32 image.
@@ -216,6 +222,11 @@ fn real_autoencoder_decode_matches_upstream() {
         &decoded,
         &batched_nchw(g.require("ae/decoded")),
         5e-3,
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_autoencoder_decode_matches_upstream"
     );
 }
 
@@ -291,6 +302,9 @@ fn real_e2e_64_matches_upstream() {
         (1.5 * distance).max(bound)
     };
     assert_close("real e2e/image", &image, &want_image, image_bound);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_e2e_64_matches_upstream");
 }
 
 /// The ordinary catalog route on the real package: `provider_registry().load("flux3_klein")` →
@@ -402,4 +416,157 @@ fn real_distilled_text_to_image_renders() {
         png.display()
     );
     let _ = Progress::Decoding;
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_distilled_text_to_image_renders");
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn bounded_root() -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("MODEL_PROOF_OUTPUT_DIR").expect("manual executor output directory"),
+    )
+    .join("bespoke_acceptance");
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, root: &std::path::Path) {
+    let peak = sampler.stop();
+    assert!(
+        peak > 0,
+        "selected physical CUDA device peak must be observed"
+    );
+    std::fs::write(
+        root.join("peak_device_bytes.txt"),
+        (peak * 1024 * 1024).to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+#[cfg(feature = "model-inference-proof")]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn flux3_bounded_acceleration_acceptance() {
+    use candle_gen::gen_core::flux3::BASE_MODEL_ID;
+    use candle_gen::gen_core::{
+        AdapterKind, AdapterSpec, TrainingConfig, TrainingItem, TrainingRequest,
+    };
+    use gen_core_flux3::training::options::OPTIONS_KEY;
+    let root = bounded_root();
+    let base = env_dir("FLUX3_BASE_PACKAGE_DIR");
+    let input = root.join("input.png");
+    image::RgbImage::from_pixel(64, 64, image::Rgb([80, 140, 210]))
+        .save(&input)
+        .unwrap();
+    let reference = root.join("reference.png");
+    image::RgbImage::from_pixel(64, 64, image::Rgb([210, 160, 30]))
+        .save(&reference)
+        .unwrap();
+    let mut item = TrainingItem::captioned(input, "a blue tile".into());
+    item.reference_image_paths.push(reference);
+    let mut config = TrainingConfig {
+        rank: 2,
+        alpha: 2.,
+        learning_rate: 1e-3,
+        steps: 4,
+        resolution: 64,
+        batch_size: 1,
+        gradient_accumulation: 1,
+        optimizer: "adamw".into(),
+        loss_type: "mse".into(),
+        train_dtype: "bf16".into(),
+        gradient_checkpointing: false,
+        save_every: 0,
+        lr_warmup_steps: 0,
+        seed: 7,
+        ..Default::default()
+    };
+    config.model_options.insert(
+        OPTIONS_KEY.into(),
+        serde_json::json!({"mode":"edit", "caption_dropout":0., "random_flip":false}),
+    );
+    let spec = LoadSpec::new(WeightsSource::Dir(base));
+    let sampler = candle_gen::testkit::PeakSampler::start_rendered();
+    let output = candle_gen::train::profile::with_bounded_cohort_for(
+        &root.join("metrics.json"),
+        &[
+            "flux3:geometry-storage-hit",
+            "flux3:frozen-caption-projection-consumed",
+            "flux3:frozen-projection-pack",
+        ],
+        || {
+            let mut trainer = candle_gen_flux3::provider_registry()
+                .unwrap()
+                .load_trainer(BASE_MODEL_ID, &spec)
+                .unwrap();
+            let output = trainer
+                .train(
+                    &TrainingRequest {
+                        items: vec![item],
+                        config,
+                        output_dir: root.join("out"),
+                        file_name: "adapter.safetensors".into(),
+                        trigger_words: vec![],
+                        cancel: CancelFlag::new(),
+                    },
+                    &mut |_| {},
+                )
+                .unwrap();
+            assert_eq!(output.steps, 4);
+            assert!(output.final_loss.is_finite());
+            output
+        },
+    );
+    bounded_peak(sampler, &root);
+    let tensors = candle_gen::candle_core::safetensors::load(
+        &output.adapter_path,
+        &candle_gen::candle_core::Device::Cpu,
+    )
+    .unwrap();
+    assert!(!tensors.is_empty());
+    drop(tensors);
+    let generator = candle_gen_flux3::provider_registry()
+        .unwrap()
+        .load(
+            BASE_MODEL_ID,
+            &spec.with_adapters(vec![AdapterSpec::new(
+                output.adapter_path,
+                1.,
+                AdapterKind::Lora,
+            )]),
+        )
+        .unwrap();
+    let GenerationOutput::Images(images) = generator
+        .generate(
+            &GenerationRequest {
+                prompt: "a blue tile".into(),
+                width: 256,
+                height: 256,
+                steps: Some(4),
+                seed: Some(7),
+                conditioning: vec![candle_gen::gen_core::Conditioning::Reference {
+                    image: candle_gen::gen_core::Image {
+                        width: 64,
+                        height: 64,
+                        pixels: image::RgbImage::from_pixel(64, 64, image::Rgb([210, 160, 30]))
+                            .into_raw(),
+                    },
+                    strength: None,
+                }],
+                ..Default::default()
+            },
+            &mut |_| {},
+        )
+        .unwrap()
+    else {
+        panic!("expected image");
+    };
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].pixels.len(), 256 * 256 * 3);
+    assert!(images[0].pixels.iter().any(|p| *p != 0));
+    candle_gen::testkit::save_image_png(&root.join("adapter_sample.png"), &images[0]);
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::flux3_bounded_acceleration_acceptance"
+    );
 }

@@ -248,6 +248,7 @@ impl Trainer for IrisDepthTrainer {
 
 /// The trainable depth model: the frozen empty-prompt conditioning, the compute dtype, the device.
 pub struct DepthModel {
+    pub geometry: crate::dit::TrainingGeometry,
     pub config: IrisConfig,
     pub compute: DType,
     pub device: Device,
@@ -266,6 +267,7 @@ impl DepthModel {
         device: &Device,
     ) -> Result<Self> {
         Ok(Self {
+            geometry: Default::default(),
             config,
             compute,
             device: device.clone(),
@@ -294,6 +296,7 @@ impl DepthModel {
         let channels = cfg.in_channels + DEPTH_EXTRA_INPUT_CHANNELS;
         let build = |ckpt: &Checkpoint| {
             IrisDiT::from_checkpoint_widened(ckpt, cfg, self.compute, &self.device, channels)
+                .map(|dit| dit.with_training_geometry(&self.geometry))
         };
         let ckpt = Checkpoint::from_tensors(backbone, &self.device);
         let dit = build(&ckpt)?;
@@ -479,6 +482,7 @@ impl DepthWindow {
             self.discard();
             return Ok(None);
         };
+        let cohort_loss = self.mean_loss() as f32;
         self.discard();
         let grads: Tensors = grads
             .into_iter()
@@ -488,7 +492,17 @@ impl DepthWindow {
         if let Some((ema, decay)) = ema {
             ema_update(ema, params, decay)?;
         }
+        let cohort_vars = super::cohort_before_named_update(params, &grads, opt)?;
         opt.step(params, &grads, lr)?;
+        candle_gen::train::profile::cohort_after_update();
+        if let Some(var) = cohort_vars.first() {
+            candle_gen::train::profile::cohort_end_step(
+                var.device(),
+                cohort_loss,
+                &cohort_vars,
+                "iris-depth",
+            )?;
+        }
         Ok(Some(norm))
     }
 }
@@ -788,6 +802,7 @@ impl Run {
         retire_foreign_checkpoints(&ckpt_root, resume_src.as_deref())?;
         Ok(Self {
             model: DepthModel {
+                geometry: Default::default(),
                 ac: plan.ac,
                 ..DepthModel::new(config, compute, &prompt, &device)?
             },
@@ -837,6 +852,7 @@ impl Run {
                     cancelled = true;
                     break;
                 }
+                candle_gen::train::profile::cohort_begin_step(&self.model.device)?;
                 let batch = assemble_batch(req, &plan, &self.kept, &self.walk, epoch, pos)?;
                 let step = DepthStep::new(&batch, &plan.loss, &self.model.device)?;
                 drop(batch);

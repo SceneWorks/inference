@@ -113,6 +113,21 @@ A named supported recipe is required. Exact, package, and `all` selectors refuse
 that unresolved case rather than silently omitting it or claiming partial coverage.
 The packed CPU reference-pair case retains its genuine CPU source-default recipe.
 
+Reviewed CUDA correctness recipes may explicitly declare
+`cuda_activity_profile: "non-isolated-correctness-headroom"`, a source-owned
+`required_cuda_physical_index: 1`, and a row-level `required_cuda_device_uuid`.
+This profile is bound to the exact registered case, source, and selected recipe;
+requests and inherited environment cannot enable or change it. It verifies the
+selected GPU1 UUID/index and five fresh memory-headroom observations before and
+after execution. Background utilization and foreign contexts, including changes
+between observations, are retained diagnostically and do not gate admission.
+This is non-isolated correctness evidence, without an isolated benchmark claim.
+The existing supervisor still enforces child host/GPU caps, reserves, deadlines,
+owned-child device scope and cleanup, including conservative WDDM global-used
+accounting when owned memory cannot be attributed. Exact source/input, completed
+BODY, actual-device and successful-libtest evidence remain required. Other
+recipes retain their strict or explicitly declared Iris activity policy.
+
 A recipe may separately declare `execution_lane` for its required compile/resource
 host. For example, the Qwen2.1 miniature block-0 comparison retains its original
 CUDA-or-Metal file gate but actually evaluates learned models on CPU. Its declared

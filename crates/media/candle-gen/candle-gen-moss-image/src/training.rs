@@ -902,6 +902,28 @@ impl MossImageTrainer {
             window = pending;
             transformer.validate_residuals()?;
         }
+        let preparation_inputs = plan
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                contexts[entry.item].as_ref().map(|context| {
+                    (
+                        context,
+                        entry.height as usize / 16,
+                        entry.width as usize / 16,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let preparation_bytes = transformer.training_preparation_bytes(&preparation_inputs);
+        let preparation_peak = estimate
+            .backward
+            .max(estimate.preview)
+            .saturating_add(preparation_bytes);
+        if preparation_peak > budget {
+            return Err(CandleError::Msg(format!("MOSS frozen preparation needs {preparation_peak} device bytes including {preparation_bytes} retained cache bytes, budget {budget}")));
+        }
+        transformer.prepare_training(&preparation_inputs)?;
         let (updates, warmup) =
             schedule_updates(c.steps, c.gradient_accumulation, c.lr_warmup_steps);
 
@@ -948,6 +970,7 @@ impl MossImageTrainer {
             estimate
                 .check(admission::Phase::Backward, budget)
                 .map_err(admission_error)?;
+            candle_gen::train::profile::cohort_begin_step(&self.device)?;
             let mut batch_loss = 0.;
             let mut batch_tokens = 0u64;
             let draw = plan.batch(step - 1)?;
@@ -1023,7 +1046,9 @@ impl MossImageTrainer {
             if step % c.gradient_accumulation == 0 || step == c.steps {
                 let mut grads = window.take(&set.vars)?;
                 opt.set_lr_scaled(lr_multiplier(c.lr_scheduler, update, updates, warmup));
+                candle_gen::train::profile::cohort_before_update(&grads, &set.vars)?;
                 lora::adapter_optimizer_step(&mut opt, &mut grads, &set, c, update, c.seed)?;
+                candle_gen::train::profile::cohort_after_update();
                 transformer.validate_residuals()?;
                 update += 1;
             }
@@ -1031,6 +1056,12 @@ impl MossImageTrainer {
             if let Some(probe) = &probe {
                 probe.update(|r| r.microsteps.push(step))?;
             }
+            candle_gen::train::profile::cohort_end_step(
+                &self.device,
+                final_loss,
+                &set.vars,
+                "moss-image",
+            )?;
             progress(TrainingProgress::Training {
                 step,
                 total: c.steps,

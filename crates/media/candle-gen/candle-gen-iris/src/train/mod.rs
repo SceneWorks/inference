@@ -763,6 +763,7 @@ impl Run {
                 };
                 (
                     TrainModel {
+                        geometry: Default::default(),
                         cfg: config.model.clone(),
                         compute,
                         device: device.clone(),
@@ -772,7 +773,7 @@ impl Run {
                 )
             }
             art => {
-                let base = source.ok_or_else(|| {
+                let mut base = source.ok_or_else(|| {
                     Error::Msg("iris training: adapter runs need backbone weights".into())
                 })?;
                 let (kind, targets_paths) = match art {
@@ -814,12 +815,14 @@ impl Run {
                 let params = init_adapter(kind, &targets, plan.seed, &device)?;
                 (
                     TrainModel {
+                        geometry: Default::default(),
                         cfg: config.model.clone(),
                         compute,
                         device: device.clone(),
                         trainable: Trainable::Adapter {
                             kind,
                             targets,
+                            packs: model::prepare_adapter_projection_packs(&mut base)?,
                             base,
                         },
                     },
@@ -1420,6 +1423,7 @@ impl Run {
                     self.topo.coll.set_cancel_armed(false);
                     break;
                 }
+                candle_gen::train::profile::cohort_begin_step(&self.topo.device)?;
                 let position = skip + local_step;
                 plan_samples += positions.len();
                 let (batch, targets) = self.batch(req, epoch, position, positions)?;
@@ -1630,6 +1634,7 @@ impl Run {
         }
         let skipped = found_inf && self.scaler.is_some();
         if !skipped {
+            let cohort_vars = cohort_before_named_update(&self.params, &grads, &self.opt)?;
             if plan.dist.sharded() {
                 let Self {
                     opt, params, topo, ..
@@ -1639,6 +1644,13 @@ impl Run {
             } else {
                 self.opt.step(&self.params, &grads, lr)?;
             }
+            candle_gen::train::profile::cohort_after_update();
+            candle_gen::train::profile::cohort_end_step(
+                &self.topo.device,
+                flow as f32,
+                &cohort_vars,
+                "iris-generation",
+            )?;
         }
         if let Some(s) = self.scaler.as_mut() {
             s.update(found_inf);
@@ -2341,4 +2353,30 @@ fn render_preview(
         negative.map(|n| (&n.states, n.mask.as_slice())),
         seed,
     )
+}
+
+/// Adapt the existing named Iris gradient map to the shared proof observer. Only
+/// the optimizer-owned surface is expected; frozen named parameters stay absent.
+/// No snapshots or gradient copies are made without the exact manual scope.
+pub(crate) fn cohort_before_named_update(
+    params: &optim::Params,
+    grads: &optim::Tensors,
+    opt: &optim::IrisOptimizer,
+) -> Result<Vec<candle_gen::candle_core::Var>> {
+    if !candle_gen::train::profile::cohort_active() {
+        return Ok(Vec::new());
+    }
+    let mut observed = candle_gen::candle_core::backprop::GradStore::default();
+    let mut vars = Vec::new();
+    for (name, var) in params.iter().filter(|(name, _)| opt.is_trained(name)) {
+        let grad = grads.get(name).ok_or_else(|| {
+            Error::Msg(format!(
+                "iris bounded proof: missing active gradient {name}"
+            ))
+        })?;
+        observed.insert(var.as_tensor(), grad.clone());
+        vars.push(var.clone());
+    }
+    candle_gen::train::profile::cohort_before_update(&observed, &vars)?;
+    Ok(vars)
 }

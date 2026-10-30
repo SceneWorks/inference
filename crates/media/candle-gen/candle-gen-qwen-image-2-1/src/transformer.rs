@@ -41,11 +41,12 @@
 //! its `.scales`/`.biases` siblings without materialising a dense weight; with no packed sidecar the
 //! dense path is a plain `candle_nn::Linear`.
 
-use candle_core::{DType, Device, IndexOp, Tensor, D};
-use candle_gen::candle_nn::ops::{rms_norm, rms_norm_slow, softmax, softmax_last_dim};
+use candle_core::{DType, Device, IndexOp, Tensor, TensorId, D};
+use candle_gen::candle_nn::ops::{rms_norm, softmax, softmax_last_dim};
 use candle_gen::candle_nn::rotary_emb::{rope_i, rope_i_slow};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::quant::AdaptLinear;
+use candle_gen::train::{norm::rms_normalize_f32, profile, projection::FrozenProjectionPack};
 use candle_gen::{CandleError as Error, Result};
 
 use crate::config::TransformerConfig;
@@ -104,7 +105,7 @@ pub const GLOBAL_ADAPTER_TARGETS: [&str; 8] = [
 ///
 /// * [`Ops::Fused`] — candle's fused kernels (`rms_norm`, `rope_i`, `softmax_last_dim`): the render
 ///   path, byte-for-byte what it has always been.
-/// * [`Ops::Composable`] — their composable equivalents (`rms_norm_slow`, `rope_i_slow`, an
+/// * [`Ops::Composable`] — their composable equivalents (shared f32 RMS, `rope_i_slow`, an
 ///   f32-upcast `softmax`): the **training** path (sc-24160). The fused kernels are `CustomOp`s with
 ///   no backward, so a loss built through them cannot reach the adapter factors. The softmax is
 ///   taken in f32 whatever the compute dtype, so a bf16 CUDA run does not exponentiate in bf16.
@@ -250,14 +251,9 @@ impl JointLayout {
 /// Zero-centred RMSNorm (`QwenImage21ZeroCenterRMSNorm`): effective scale `weight + 1`, f32.
 fn zero_center_rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     let dtype = x.dtype();
-    let x32 = x.to_dtype(DType::F32)?;
-    let ms = x32.sqr()?.mean_keepdim(D::Minus1)?;
-    let rrms = (ms + eps)?.sqrt()?.recip()?;
+    let normalized = rms_normalize_f32(x, eps)?;
     let scale = (weight.to_dtype(DType::F32)? + 1.0)?;
-    Ok(x32
-        .broadcast_mul(&rrms)?
-        .broadcast_mul(&scale)?
-        .to_dtype(dtype)?)
+    Ok(normalized.broadcast_mul(&scale)?.to_dtype(dtype)?)
 }
 
 /// Affine-free LayerNorm over the last axis, computed in f32 (`mlx_rs::fast::layer_norm(x, None,
@@ -396,8 +392,18 @@ fn block_causal_attention(
     prefix_len: usize,
     softmax: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>,
     budget: usize,
+    training: bool,
 ) -> Result<Tensor> {
     let (_b, _h, s, _d) = q.dims4()?;
+    let attention = |q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>| {
+        if training {
+            candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
+                q, k, v, scale, mask, softmax, budget,
+            )
+        } else {
+            candle_gen::sdpa_budgeted_bhsd(q, k, v, scale, mask, softmax, budget)
+        }
+    };
     let device = q.device();
     let dtype = q.dtype();
     let mut outputs: Vec<Tensor> = Vec::with_capacity(prefix_segments.len() + 1);
@@ -417,26 +423,10 @@ fn block_causal_attention(
         } else {
             None
         };
-        outputs.push(candle_gen::sdpa_budgeted_bhsd(
-            &qs,
-            &ks,
-            &vs,
-            scale,
-            mask.as_ref(),
-            softmax,
-            budget,
-        )?);
+        outputs.push(attention(&qs, &ks, &vs, mask.as_ref())?);
     }
     let qt = q.narrow(2, prefix_len, s - prefix_len)?.contiguous()?;
-    outputs.push(candle_gen::sdpa_budgeted_bhsd(
-        &qt,
-        &k.contiguous()?,
-        &v.contiguous()?,
-        scale,
-        None,
-        softmax,
-        budget,
-    )?);
+    outputs.push(attention(&qt, &k.contiguous()?, &v.contiguous()?, None)?);
     Ok(Tensor::cat(&outputs, 2)?)
 }
 
@@ -445,6 +435,7 @@ struct Attention {
     to_k: AdaptLinear,
     to_v: AdaptLinear,
     to_out: AdaptLinear,
+    qkv_pack: Option<FrozenProjectionPack>,
     norm_q: Tensor,
     norm_k: Tensor,
     heads: usize,
@@ -460,6 +451,7 @@ impl Attention {
             to_k: lin(inner, inner, vb, "to_k")?,
             to_v: lin(inner, inner, vb, "to_v")?,
             to_out: lin(inner, inner, vb, "to_out.0")?,
+            qkv_pack: None,
             norm_q: vb.get(cfg.attention_head_dim, "norm_q.weight")?,
             norm_k: vb.get(cfg.attention_head_dim, "norm_k.weight")?,
             heads: cfg.num_attention_heads,
@@ -483,14 +475,28 @@ impl Attention {
         let heads = |y: Tensor| -> Result<Tensor> {
             Ok(y.reshape((b, s, h, hd))?.transpose(1, 2)?.contiguous()?)
         };
-        let q = heads(self.to_q.forward(x)?)?;
-        let k = heads(self.to_k.forward(x)?)?;
-        let v = heads(self.to_v.forward(x)?)?;
+        let projected = match &self.qkv_pack {
+            Some(pack) => {
+                profile::cohort_reuse("qwen21_frozen_qkv_pack");
+                pack.forward_adapt(x, &[&self.to_q, &self.to_k, &self.to_v])?
+            }
+            None => vec![
+                self.to_q.forward(x)?,
+                self.to_k.forward(x)?,
+                self.to_v.forward(x)?,
+            ],
+        };
+        let q = heads(projected[0].clone())?;
+        let k = heads(projected[1].clone())?;
+        let v = heads(projected[2].clone())?;
         let norm = |y: &Tensor, w: &Tensor| -> Result<Tensor> {
             let (y32, w32) = (y.to_dtype(DType::F32)?, w.to_dtype(DType::F32)?);
             let normed = match ops {
                 Ops::Fused => rms_norm(&y32, &w32, self.eps)?,
-                Ops::Composable => rms_norm_slow(&y32, &w32, self.eps)?,
+                Ops::Composable => {
+                    profile::cohort_reuse("qwen21_shared_rms");
+                    rms_normalize_f32(&y32, self.eps as f64)?.broadcast_mul(&w32)?
+                }
             };
             Ok(normed.to_dtype(v.dtype())?)
         };
@@ -528,6 +534,7 @@ impl Attention {
             prefix_len,
             softmax,
             candle_gen::ATTN_SCORES_BUDGET,
+            ops == Ops::Composable,
         )?;
         let o = o.transpose(1, 2)?.reshape((b, s, h * hd))?;
         Ok(self.to_out.forward(&o)?)
@@ -808,6 +815,34 @@ impl PrefixKvCache {
     }
 }
 
+/// Only frozen initial projections and layout tables. No evolving joint stream or prefix KV.
+#[derive(Default)]
+struct TrainingPreparation {
+    text: std::collections::HashMap<TensorId, PreparedText>,
+    references: std::collections::HashMap<TensorId, Tensor>,
+    geometry: Vec<(JointLayout, Tensor, Tensor)>,
+    image_weights: Vec<TensorId>,
+}
+
+struct PreparedText {
+    value: Tensor,
+    stage: u8,
+    weights: Vec<TensorId>,
+}
+
+fn frozen_projection_identity(linear: &AdaptLinear) -> Option<Vec<TensorId>> {
+    if linear.is_adapted() {
+        return None;
+    }
+    let base = linear.dense_base()?;
+    if base.weight().track_op() || base.bias().is_some_and(Tensor::track_op) {
+        return None;
+    }
+    let mut ids = vec![base.weight().id()];
+    ids.extend(base.bias().map(Tensor::id));
+    Some(ids)
+}
+
 /// The single-stream Qwen-Image 2.1 transformer.
 pub struct QwenImage21Transformer {
     cfg: TransformerConfig,
@@ -823,6 +858,7 @@ pub struct QwenImage21Transformer {
     blocks: Vec<Block>,
     norm_out: AdaptLinear,
     proj_out: AdaptLinear,
+    training_preparation: TrainingPreparation,
 }
 
 impl QwenImage21Transformer {
@@ -858,6 +894,7 @@ impl QwenImage21Transformer {
             blocks,
             norm_out: lin(inner, inner, &vb, "norm_out.linear")?,
             proj_out: lin(inner, cfg.out_channels, &vb, "proj_out")?,
+            training_preparation: TrainingPreparation::default(),
         })
     }
 
@@ -1080,7 +1117,6 @@ impl QwenImage21Transformer {
     ) -> Result<JointPrelude> {
         layout.validate()?;
         let dtype = self.compute_dtype();
-        let eps = self.cfg.eps as f64;
         let image_segments = layout
             .segments
             .iter()
@@ -1108,10 +1144,26 @@ impl QwenImage21Transformer {
         }
 
         // Projections into the joint width.
-        let txt = zero_center_rms_norm(&text.to_dtype(dtype)?, &self.txt_norm, eps)?;
-        let txt = self
-            .txt_out
-            .forward(&gelu_tanh(&self.txt_in.forward(&txt)?)?)?;
+        let prepared = &self.training_preparation;
+        let txt = match prepared.text.get(&text.id()).filter(|_| {
+            !text.track_op()
+                && self
+                    .frozen_text_identity(prepared.text[&text.id()].stage)
+                    .as_ref()
+                    == Some(&prepared.text[&text.id()].weights)
+        }) {
+            Some(value) => {
+                profile::cohort_reuse("qwen21_frozen_initial_text");
+                match value.stage {
+                    2 => value.value.clone(),
+                    1 => self.txt_out.forward(&value.value)?,
+                    _ => self
+                        .txt_out
+                        .forward(&gelu_tanh(&self.txt_in.forward(&value.value)?)?)?,
+                }
+            }
+            None => self.project_text(text)?,
+        };
         trace.push("txt_in", &txt)?;
         let mut pieces: Vec<Tensor> = Vec::with_capacity(layout.segments.len());
         let (mut text_cursor, mut image_cursor) = (0usize, 0usize);
@@ -1130,7 +1182,18 @@ impl QwenImage21Transformer {
                             img.dim(1)?
                         )));
                     }
-                    let projected = self.img_in.forward(&img.to_dtype(dtype)?)?;
+                    let projected = match prepared.references.get(&img.id()).filter(|_| {
+                        image_cursor + 1 < images.len()
+                            && !img.track_op()
+                            && frozen_projection_identity(&self.img_in).as_ref()
+                                == Some(&prepared.image_weights)
+                    }) {
+                        Some(value) => {
+                            profile::cohort_reuse("qwen21_frozen_reference_input");
+                            value.clone()
+                        }
+                        None => self.img_in.forward(&img.to_dtype(dtype)?)?,
+                    };
                     // Keyed by segment: a multi-image layout (the edit path) would otherwise emit
                     // the SAME `img_in` key once per condition image, and every consumer that keys
                     // a trace by name — including `transformer_parity.rs`'s stage-count assertion —
@@ -1144,7 +1207,13 @@ impl QwenImage21Transformer {
         let x = Tensor::cat(&pieces, 1)?.contiguous()?;
         let s = x.dim(1)?;
 
-        let (cos, sin) = self.rope(layout)?;
+        let (cos, sin) = match prepared.geometry.iter().find(|(key, _, _)| key == layout) {
+            Some((_, cos, sin)) => {
+                profile::cohort_reuse("qwen21_joint_geometry");
+                (cos.clone(), sin.clone())
+            }
+            None => self.rope(layout)?,
+        };
 
         let (modulation, out_rows) = self.modulation_rows(timestep, trace)?;
         // `_select_modulation_rows`: target tokens take row 0 (their sample's timestep), every
@@ -1411,6 +1480,178 @@ impl QwenImage21Transformer {
 
     // ── training (sc-24160) ─────────────────────────────────────────────────────────────────────
 
+    fn frozen_text_identity(&self, stage: u8) -> Option<Vec<TensorId>> {
+        if self.txt_norm.track_op() {
+            return None;
+        }
+        let mut ids = vec![self.txt_norm.id()];
+        if stage >= 1 {
+            ids.extend(frozen_projection_identity(&self.txt_in)?);
+        }
+        if stage >= 2 {
+            ids.extend(frozen_projection_identity(&self.txt_out)?);
+        }
+        Some(ids)
+    }
+
+    fn project_text(&self, text: &Tensor) -> Result<Tensor> {
+        let txt = zero_center_rms_norm(
+            &text.to_dtype(self.dtype)?,
+            &self.txt_norm,
+            self.cfg.eps as f64,
+        )?;
+        Ok(self
+            .txt_out
+            .forward(&gelu_tanh(&self.txt_in.forward(&txt)?)?)?)
+    }
+
+    /// Prepare once after installing/resuming adapters. Every item/bucket is bounded by the
+    /// caller's remaining train-stage admission. Captions/reference tensors, exact layouts,
+    /// dtype/device and this model's frozen weight identities scope reuse. Explicit text or
+    /// img_in targets refuse that projection cache; all live residuals and joint/prefix states
+    /// stay on the ordinary autograd path. A new call replaces the complete run cache.
+    pub fn prepare_training(
+        &mut self,
+        examples: &[(&Tensor, &[Tensor], &JointLayout)],
+        available_bytes: u64,
+    ) -> Result<()> {
+        self.training_preparation = TrainingPreparation::default();
+        let text_stage = (0..=2)
+            .rev()
+            .find(|&stage| self.frozen_text_identity(stage).is_some());
+        let text_identity = text_stage.and_then(|stage| self.frozen_text_identity(stage));
+        let image_identity = frozen_projection_identity(&self.img_in);
+        let mut texts = std::collections::HashSet::new();
+        let mut references = std::collections::HashSet::new();
+        let mut layouts = Vec::new();
+        let mut bytes = 0u64;
+        let width = self.dtype.size_in_bytes() as u64;
+        let inner = self.cfg.inner_dim() as u64;
+        for &(text, refs, layout) in examples {
+            layout.validate()?;
+            if text_identity.is_some() && !text.track_op() && texts.insert(text.id()) {
+                bytes = bytes.saturating_add(
+                    text.dim(1)? as u64
+                        * if text_stage == Some(0) {
+                            self.cfg.context_in_dim as u64
+                        } else {
+                            inner
+                        }
+                        * width,
+                );
+            }
+            for input in refs {
+                if image_identity.is_some() && !input.track_op() && references.insert(input.id()) {
+                    bytes = bytes.saturating_add(input.dim(1)? as u64 * inner * width);
+                }
+            }
+            if !layouts.contains(&layout) {
+                bytes = bytes.saturating_add(
+                    layout.total_len() as u64 * self.cfg.attention_head_dim as u64 * 4,
+                );
+                layouts.push(layout);
+            }
+        }
+        // One block's concatenated QKV temporarily coexists with its old bases. After each
+        // replacement those bases are storage-sharing views, so no duplicate retained weight.
+        let packing_peak = self
+            .blocks
+            .iter()
+            .filter(|block| block.attn.qkv_pack.is_none())
+            .filter(|block| {
+                [&block.attn.to_q, &block.attn.to_k, &block.attn.to_v]
+                    .iter()
+                    .all(|layer| {
+                        layer
+                            .dense_base()
+                            .is_some_and(|base| !base.weight().track_op())
+                    })
+            })
+            .map(|_| 3 * inner * inner * width)
+            .max()
+            .unwrap_or(0);
+        if bytes.saturating_add(packing_peak) > available_bytes {
+            return Err(Error::Msg(format!("qwen_image_2_1: training preparation requires {bytes} retained bytes plus {packing_peak} temporary packing bytes, available {available_bytes}")));
+        }
+        let mut prepared = TrainingPreparation {
+            image_weights: image_identity.clone().unwrap_or_default(),
+            ..Default::default()
+        };
+        for &(text, refs, layout) in examples {
+            if text_identity.is_some()
+                && !text.track_op()
+                && !prepared.text.contains_key(&text.id())
+            {
+                let stage = text_stage.unwrap();
+                let normalized = zero_center_rms_norm(
+                    &text.to_dtype(self.dtype)?,
+                    &self.txt_norm,
+                    self.cfg.eps as f64,
+                )?;
+                let value = if stage >= 1 {
+                    gelu_tanh(&self.txt_in.forward(&normalized)?)?
+                } else {
+                    normalized
+                };
+                let value = if stage >= 2 {
+                    self.txt_out.forward(&value)?
+                } else {
+                    value
+                };
+                prepared.text.insert(
+                    text.id(),
+                    PreparedText {
+                        value,
+                        stage,
+                        weights: text_identity.clone().unwrap(),
+                    },
+                );
+            }
+            for input in refs {
+                if image_identity.is_some()
+                    && !input.track_op()
+                    && !prepared.references.contains_key(&input.id())
+                {
+                    prepared.references.insert(
+                        input.id(),
+                        self.img_in.forward(&input.to_dtype(self.dtype)?)?,
+                    );
+                }
+            }
+            if !prepared.geometry.iter().any(|(key, _, _)| key == layout) {
+                let (cos, sin) = self.rope(layout)?;
+                prepared.geometry.push((layout.clone(), cos, sin));
+            }
+        }
+        for block in &mut self.blocks {
+            if block.attn.qkv_pack.is_none() {
+                block.attn.qkv_pack = FrozenProjectionPack::prepare_adapt(&mut [
+                    &mut block.attn.to_q,
+                    &mut block.attn.to_k,
+                    &mut block.attn.to_v,
+                ])?;
+            }
+        }
+        self.training_preparation = prepared;
+        Ok(())
+    }
+
+    /// Exact new retained activation/table bytes (packed bases replace original storage).
+    pub fn training_preparation_bytes(&self) -> usize {
+        let prep = &self.training_preparation;
+        prep.text
+            .values()
+            .map(|entry| &entry.value)
+            .chain(prep.references.values())
+            .map(|t| t.elem_count() * t.dtype().size_in_bytes())
+            .sum::<usize>()
+            + prep
+                .geometry
+                .iter()
+                .map(|(_, cos, sin)| (cos.elem_count() + sin.elem_count()) * 4)
+                .sum::<usize>()
+    }
+
     /// Number of transformer blocks.
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()
@@ -1634,13 +1875,13 @@ mod tests {
             .next()
             .expect("the file has a shipped half");
         let calls = shipped.matches("sdpa_budgeted_bhsd(").count();
-        assert_eq!(calls, 2, "one prefix-segment call and one target call");
+        assert_eq!(calls, 2, "one training dispatch and one inference dispatch");
         // Both SDPA calls forward the parameter, and exactly one production call site supplies the
         // constant. This is what catches `block_causal_attention` hardcoding a budget of its own
         // and ignoring its argument — a mutation the equivalence test below cannot see, because
         // both of its branches would then take the same path and agree trivially.
         assert_eq!(
-            shipped.matches("        budget,\n").count(),
+            shipped.matches("softmax, budget").count(),
             calls,
             "every SDPA call must forward the `budget` parameter"
         );
@@ -1720,6 +1961,7 @@ mod tests {
             prefix,
             &softmax_last_dim,
             forced,
+            true,
         )
         .unwrap();
         let single = block_causal_attention(
@@ -1731,6 +1973,7 @@ mod tests {
             prefix,
             &softmax_last_dim,
             usize::MAX,
+            true,
         )
         .unwrap();
         assert_eq!(chunked.dims(), single.dims());
@@ -1796,6 +2039,7 @@ mod tests {
             prefix,
             &softmax_last_dim,
             usize::MAX,
+            true,
         )
         .unwrap()
         .narrow(2, prefix, target)
@@ -1824,6 +2068,7 @@ mod tests {
                 0,
                 &softmax_last_dim,
                 budget,
+                true,
             )
             .unwrap();
             assert_eq!(got.dims(), want.dims(), "{label}");

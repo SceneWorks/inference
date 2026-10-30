@@ -80,6 +80,7 @@ impl TrainingGraph {
                 scale,
             )?;
         }
+        dit.prepare_training_projections()?;
         Ok(Self {
             dit,
             factors,

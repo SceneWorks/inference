@@ -262,8 +262,15 @@ impl Residual {
         }
         let x = x.to_dtype(DType::F32)?;
         let value = match self {
-            Self::Lora { down, up, .. } => Linear::new(up.clone(), None)
-                .forward(&Linear::new(down.clone(), None).forward(&x.contiguous()?)?)?,
+            Self::Lora { down, up, .. } => {
+                let rank = Linear::new(down.clone(), None).forward(&x.contiguous()?)?;
+                if down.dim(0)? < up.dim(0)? && scale != 1.0 {
+                    return Ok(Some(
+                        Linear::new(up.clone(), None).forward(&(rank * scale)?)?,
+                    ));
+                }
+                Linear::new(up.clone(), None).forward(&rank)?
+            }
             Self::Lokr { first, second, .. } => {
                 let (a, c) = first.shape();
                 let (b, d) = second.shape();
@@ -285,7 +292,11 @@ impl Residual {
                 y.contiguous()?.reshape(shape)?
             }
         };
-        Ok(Some((value * scale)?))
+        Ok(Some(if scale == 1.0 {
+            value
+        } else {
+            (value * scale)?
+        }))
     }
 }
 

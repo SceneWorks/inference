@@ -75,6 +75,7 @@ impl ModeModulation {
 
 /// `Block`: parallel attention + SwiGLU MLP under one modulation, one gated residual.
 struct Block {
+    projection_pack: Option<candle_gen::train::projection::FrozenProjectionPack>,
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
@@ -98,6 +99,7 @@ impl Block {
         let head_dim = cfg.head_dim();
         let mlp_hidden = cfg.mlp_hidden();
         let block = Self {
+            projection_pack: None,
             q_proj: l.linear(&format!("{prefix}.q_proj"))?,
             k_proj: l.linear(&format!("{prefix}.k_proj"))?,
             v_proj: l.linear(&format!("{prefix}.v_proj"))?,
@@ -161,13 +163,25 @@ impl Block {
         } else {
             rmsnorm_rope
         };
-        let q = normalize(
-            &split(self.q_proj.forward(&x_mod)?)?,
-            &self.query_norm,
-            rope,
-        )?;
-        let k = normalize(&split(self.k_proj.forward(&x_mod)?)?, &self.key_norm, rope)?;
-        let v = split(self.v_proj.forward(&x_mod)?)?;
+        let (q, k, v) = if let Some(pack) = &self.projection_pack {
+            candle_gen::train::profile::cohort_reuse("flux3:frozen-projection-pack");
+            let mut ys = Linear::forward_frozen_group(
+                pack,
+                &x_mod,
+                &[&self.q_proj, &self.k_proj, &self.v_proj],
+            )?
+            .into_iter();
+            (ys.next().unwrap(), ys.next().unwrap(), ys.next().unwrap())
+        } else {
+            (
+                self.q_proj.forward(&x_mod)?,
+                self.k_proj.forward(&x_mod)?,
+                self.v_proj.forward(&x_mod)?,
+            )
+        };
+        let q = normalize(&split(q)?, &self.query_norm, rope)?;
+        let k = normalize(&split(k)?, &self.key_norm, rope)?;
+        let v = split(v)?;
         let attention = if training {
             packed_attention_training
         } else {
@@ -247,6 +261,8 @@ pub struct Flux3Dit {
     final_layer: LastLayer,
     /// `timestep_embedding`'s frequencies `[1, 128]` f32.
     freqs: Tensor,
+    training_rope: std::collections::HashMap<Vec<[u32; 4]>, Rope>,
+    training_text_prepared: bool,
 }
 
 /// Append one sample's tokens of `mode` to the per-mode pack and record its `(start, end)` run
@@ -565,6 +581,8 @@ impl Flux3Dit {
             single_blocks: blocks("single_blocks", cfg.depth_single)?,
             final_layer: LastLayer::load(&l, "final_layer.image")?,
             freqs: Tensor::from_vec(freqs, (1, half), device)?,
+            training_rope: std::collections::HashMap::new(),
+            training_text_prepared: false,
         };
         let (out, _) = dit.final_layer.linear.out_in()?;
         if out != cfg.image_in_channels {
@@ -574,6 +592,49 @@ impl Flux3Dit {
             )));
         }
         Ok(dit)
+    }
+
+    pub(crate) fn prepare_training_projections(&mut self) -> Result<()> {
+        for block in self
+            .image_blocks
+            .iter_mut()
+            .chain(&mut self.image_cond_blocks)
+            .chain(&mut self.txt_blocks)
+            .chain(&mut self.single_blocks)
+        {
+            if block.projection_pack.is_none() {
+                block.projection_pack = Linear::prepare_frozen_group(&mut [
+                    &mut block.q_proj,
+                    &mut block.k_proj,
+                    &mut block.v_proj,
+                ])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The trainer cannot target txt_in. Replace its host cache with the frozen projection,
+    /// retaining host residency and uploading only the hidden-width states during a step.
+    pub(crate) fn prepare_training_text(&self, text: &Tensor) -> Result<Tensor> {
+        self.txt_in
+            .forward(&text.to_device(&self.device)?)?
+            .to_device(text.device())
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn prepare_training_geometry(&mut self, ids: &[Vec<[f32; 4]>]) -> Result<()> {
+        self.training_rope.clear();
+        for ids in ids {
+            let key = ids
+                .iter()
+                .map(|id| id.map(f32::to_bits))
+                .collect::<Vec<_>>();
+            if !self.training_rope.contains_key(&key) {
+                self.training_rope.insert(key, self.rope(ids)?);
+            }
+        }
+        self.training_text_prepared = true;
+        Ok(())
     }
 
     pub fn config(&self) -> &DitConfig {
@@ -622,13 +683,24 @@ impl Flux3Dit {
     }
 
     fn rope(&self, ids: &[[f32; 4]]) -> Result<Rope> {
+        if let Some(rope) = self.training_rope.get(
+            &ids.iter()
+                .map(|id| id.map(f32::to_bits))
+                .collect::<Vec<_>>(),
+        ) {
+            candle_gen::train::profile::cohort_reuse("flux3:geometry-storage-hit");
+            return Ok(Rope {
+                cos: rope.cos.clone(),
+                sin: rope.sin.clone(),
+            });
+        }
         Rope::new(ids, &self.cfg.axes_dim, self.cfg.theta, &self.device)
     }
 
     /// Velocity prediction for the image tokens of every sample, `[Σ Ni, image_in_channels]` in
     /// the compute dtype, in sample order (the image tokens of sample 0, then sample 1, …).
     pub fn forward(&self, samples: &[SampleTokens<'_>]) -> Result<Tensor> {
-        self.forward_impl(samples, false)
+        __model_proof_output!(self.forward_impl(samples, false))
     }
 
     /// Training-only autograd path. Inference retains the exact existing fused norm path.
@@ -638,7 +710,7 @@ impl Flux3Dit {
                 "flux3 training: requires the undistilled base DiT".into(),
             ));
         }
-        self.forward_impl(samples, true)
+        __model_proof_output!(self.forward_impl(samples, true))
     }
 
     fn forward_impl(&self, samples: &[SampleTokens<'_>], training: bool) -> Result<Tensor> {
@@ -666,7 +738,14 @@ impl Flux3Dit {
                     s.text_ids.len()
                 )));
             }
-            if c_img != self.cfg.image_in_channels || c_txt != self.cfg.text_in_channels {
+            if c_img != self.cfg.image_in_channels
+                || c_txt
+                    != if training && self.training_text_prepared {
+                        self.cfg.hidden
+                    } else {
+                        self.cfg.text_in_channels
+                    }
+            {
                 return Err(Error::Msg(format!(
                     "flux3: token widths {:?} / {:?} do not match the DiT ({} / {})",
                     s.image.dims(),
@@ -715,6 +794,12 @@ impl Flux3Dit {
             let x = match mode {
                 0 => self.emb_in_image.forward(&x)?,
                 1 => self.emb_in_image_cond.forward(&x)?,
+                _ if training && self.training_text_prepared => {
+                    candle_gen::train::profile::cohort_reuse(
+                        "flux3:frozen-caption-projection-consumed",
+                    );
+                    x.to_device(&self.device)?
+                }
                 _ => self.txt_in.forward(&x)?,
             };
             let rope = self.rope(&ids[mode])?;

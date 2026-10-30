@@ -19,6 +19,7 @@ CUDA_METADATA_HELPER_SHA256 = '0eaa7a4f32a0c0d686544b9736505584875a6d2f8c9319a5e
 CUDA_METADATA_ABI_CHECKSUM = '1cea5f10a99e025c1b44ae2354c2d8326b25ddbd0baf76bde8e55cfd4018a2cc'
 STRICT_CUDA_ACTIVITY = 'strict-zero-utilization'
 IRIS_CUDA_CORRECTNESS_ACTIVITY = 'non-isolated-correctness-low-activity'
+SHARED_CUDA_HEADROOM_ACTIVITY = 'non-isolated-correctness-headroom'
 
 
 class CudaClaimRejected(ValueError):
@@ -34,7 +35,8 @@ class CudaReleaseRejected(ValueError):
 
 
 def proof_cuda_contexts(uuid: str, processes: list[list[str]], *, activity_profile: str = STRICT_CUDA_ACTIVITY) -> list[tuple[str, str, str]]:
-    types = ('C', 'C+G', 'G') if activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY else ('C', 'C+G')
+    types = (('C', 'C+G', 'G') if activity_profile in
+             (IRIS_CUDA_CORRECTNESS_ACTIVITY, SHARED_CUDA_HEADROOM_ACTIVITY) else ('C', 'C+G'))
     return sorted((row[0], row[1], row[3]) for row in processes
                   if len(row) == 4 and row[0] == uuid and row[3] in types)
 
@@ -46,6 +48,12 @@ def proof_cuda_idle(device: dict, processes: list[list[str]], policy,
     total, used, free, utilization = (device.get(key) for key in
                                       ('total_mib', 'used_mib', 'free_mib', 'utilization_percent'))
     reserve, cap = policy.gpu_free_reserve_bytes, policy.child_gpu_cap_bytes
+    if activity_profile == SHARED_CUDA_HEADROOM_ACTIVITY:
+        # Foreign utilization/contexts are observations, not ownership or safety prerequisites.
+        return (all(type(value) is int for value in (total, used, free, reserve, cap))
+                and total > 0 and 0 <= used <= total and 0 <= free <= total
+                and used + free <= total + 2 and reserve > 0 and cap > 0
+                and free * mib >= reserve + cap)
     limit = (MAX_BASELINE_UTILIZATION_PERCENT if activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY
              else 1 if activity_profile == STRICT_CUDA_ACTIVITY else None)
     if (limit is None or any(type(value) is not int for value in (total, used, free, utilization, reserve, cap))
@@ -62,12 +70,20 @@ def proof_cuda_idle(device: dict, processes: list[list[str]], policy,
 
 
 def bound_cuda_activity_profile(constraints: dict) -> str:
-    """A request/environment cannot widen admission; only four exact Iris registry recipes can."""
+    """Only exact source-owned registry recipes may select non-default admission."""
     recipe = constraints.get('selected_configuration')
     profile = recipe.get('cuda_activity_profile') if isinstance(recipe, dict) else None
     if profile is None:
         return STRICT_CUDA_ACTIVITY
     from scripts.ci import model_inference_proofs as proofs
+    if profile == SHARED_CUDA_HEADROOM_ACTIVITY:
+        proofs.apply_configuration(constraints, {})
+        registered = next((row for row in proofs.load_registry()
+                           if proofs.identity(row) == proofs.identity(constraints)), None)
+        if (profile != proofs.SHARED_CUDA_HEADROOM_PROFILE or registered is None
+                or constraints != proofs.configured_case(registered, recipe['name'])):
+            raise ValueError('shared CUDA headroom profile requires its exact registered source recipe')
+        return profile
     binding = '/'.join(str(constraints.get(key)) for key in ('package', 'target', 'fqn'))
     if (profile != IRIS_CUDA_CORRECTNESS_ACTIVITY or profile != proofs.IRIS_CUDA_CORRECTNESS_PROFILE
             or binding not in proofs.IRIS_CUDA_CORRECTNESS_PROOFS
@@ -88,9 +104,12 @@ def cuda_claim_diagnostic(uuid: str, devices: list[dict], processes: list[list[s
         return value if re.fullmatch(r'GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', value) else 'invalid-uuid'
     types = [row[3] if len(row) == 4 and row[3] in ('G', 'C+G', 'C', 'unknown') else 'malformed-or-other' for row in rows]
     low_activity = activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY
-    predicate_name = ('proof_correctness_profile_headroom_and_stable_contexts' if low_activity
+    shared_headroom = activity_profile == SHARED_CUDA_HEADROOM_ACTIVITY
+    predicate_name = ('proof_shared_correctness_headroom' if shared_headroom else
+                      'proof_correctness_profile_headroom_and_stable_contexts' if low_activity
                       else 'proof_policy_headroom_and_inactive_contexts')
     utilization = selected.get('utilization_percent') if selected is not None else None
+    processes_unknown = selected is not None and selected.get('process_inventory_status') == 'unknown/not-collected-diagnostic-only'
     allowed_types = ('G', 'C+G') if low_activity and type(utilization) is int and utilization > 0 else ('G', 'C+G', 'C')
     return {'requested_uuid': safe_uuid(uuid), 'matched_uuid_count': len(matched),
             'activity_profile': activity_profile,
@@ -98,15 +117,19 @@ def cuda_claim_diagnostic(uuid: str, devices: list[dict], processes: list[list[s
             'observed_gpu_count': len(devices),
             'selected_card': (None if selected is None else {
                 key: selected.get(key) for key in ('index', 'total_mib', 'used_mib', 'free_mib', 'utilization_percent')}),
-            **({'activity_limits': {'minimum_free_bytes': policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes,
+            **({'headroom_limits': {'minimum_free_bytes': policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes,
+                                    'background_activity_is_diagnostic': True}}
+               if shared_headroom else
+               {'activity_limits': {'minimum_free_bytes': policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes,
                                     'selected_utilization_percent_exclusive': MAX_BASELINE_UTILIZATION_PERCENT,
                                     'allowed_process_types_at_observed_utilization': list(allowed_types)}}
                if low_activity else
                {'idle_limits': {'minimum_free_bytes': policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes,
                                 'selected_utilization_percent': 0,
                                 'allowed_process_types': ['G', 'C+G', 'C']}}),
-            'selected_process_count': len(rows),
-            'selected_process_type_counts': {kind: types.count(kind) for kind in ('G', 'C+G', 'C', 'unknown', 'malformed-or-other')},
+            'process_inventory_status': 'unknown/not-collected-diagnostic-only' if processes_unknown else 'observed',
+            'selected_process_count': None if processes_unknown else len(rows),
+            'selected_process_type_counts': None if processes_unknown else {kind: types.count(kind) for kind in ('G', 'C+G', 'C', 'unknown', 'malformed-or-other')},
             'selected_processes': [{'pid': row[1] if len(row) == 4 and row[1].isdecimal() and len(row[1]) <= 10 else 'invalid',
                                     'driver_type': kind} for row, kind in zip(rows[:64], types[:64])],
             'process_list_truncated': len(rows) > 64,
@@ -116,10 +139,11 @@ def cuda_claim_diagnostic(uuid: str, devices: list[dict], processes: list[list[s
                            'free_memory_above_policy_headroom': selected is not None and
                                type(selected.get('free_mib')) is int and
                                selected['free_mib'] * 1024**2 >= policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes,
+                           **({} if shared_headroom else {
                            ('selected_gpu_below_profile_utilization_limit' if low_activity else 'selected_gpu_zero_utilization'):
                                type(utilization) is int and 0 <= utilization < (MAX_BASELINE_UTILIZATION_PERCENT if low_activity else 1),
                            'selected_process_types_allowed': all(len(row) == 4 and row[3] in allowed_types and row[1]
-                                                                 for row in rows)}}
+                                                                 for row in rows)})}}
 
 
 def cuda_sample_diagnostic(output: Path, phase: str, uuid: str, physical_index: int, policy, baseline: dict,
@@ -150,15 +174,18 @@ def cuda_sample_diagnostic(output: Path, phase: str, uuid: str, physical_index: 
             observed = cuda_claim_diagnostic(uuid, devices, processes, policy, activity_profile=activity_profile)
             card = observed['selected_card']
             matched = [device for device in devices if device.get('uuid') == uuid]
-            contexts_match = proof_cuda_contexts(uuid, processes, activity_profile=activity_profile) == baseline['process_identities']
+            contexts_match = (None if observed['process_inventory_status'] != 'observed' else
+                              proof_cuda_contexts(uuid, processes, activity_profile=activity_profile) == baseline['process_identities'])
             index_matches = card is not None and card.get('index') == physical_index
             facts.append({'sample_number': sample.get('sample_number'),
                           'selected_card': card,
                           'selected_index_matches_admission': index_matches,
+                          'process_inventory_status': observed['process_inventory_status'],
                           'selected_process_count': observed['selected_process_count'],
                           'selected_process_type_counts': observed['selected_process_type_counts'],
                           'context_identities_match_admission': contexts_match,
-                          'transient_utilization_only': (len(matched) == 1 and index_matches and contexts_match
+                          'transient_utilization_only': (activity_profile != SHARED_CUDA_HEADROOM_ACTIVITY
+                              and len(matched) == 1 and index_matches and contexts_match
                               and type(card.get('utilization_percent')) is int and card['utilization_percent'] > 0
                               and proof_cuda_idle({**matched[0], 'utilization_percent': 0}, processes, policy,
                                                   activity_profile=activity_profile)),
@@ -176,20 +203,21 @@ def cuda_release_diagnostic(output: Path, uuid: str, physical_index: int, policy
 
 
 def accepted_utilization_samples(output: Path, phase: str, uuid: str, physical_index: int,
-                                 policy, baseline: dict, activity_profile: str) -> list[int]:
+                                 policy, baseline: dict, activity_profile: str) -> list[int | None]:
     """Keep the five actual selected-card readings, not an isolated benchmark claim."""
     facts = cuda_sample_diagnostic(output, phase, uuid, physical_index, policy, baseline,
                                    activity_profile=activity_profile)
     values = [(sample.get('selected_card') or {}).get('utilization_percent') for sample in facts.get('samples', [])]
     if (facts.get('status') != 'retained-existing-samples' or facts.get('sample_count') != 5
-            or len(values) != 5 or any(type(value) is not int for value in values)):
+            or len(values) != 5 or any(type(value) is not int
+                and not (value is None and activity_profile == SHARED_CUDA_HEADROOM_ACTIVITY) for value in values)):
         raise ValueError('missing exact-card utilization readings for correctness proof')
     return values
 
 
 def settled_cuda_samples(probe, output: Path, phase: str, uuid: str, physical_index: int,
                          policy, baseline: dict, deadline: float, *, activity_profile: str = STRICT_CUDA_ACTIVITY):
-    """Require five clean samples; retry only a bounded transient utilization reading."""
+    """Require five fresh samples; strict profiles may retry bounded transient utilization."""
     failed_attempts = []
     for attempt in range(5):
         if time.monotonic() >= deadline:
@@ -199,7 +227,7 @@ def settled_cuda_samples(probe, output: Path, phase: str, uuid: str, physical_in
             if time.monotonic() >= deadline:
                 raise RuntimeError(f'CUDA settle deadline expired during {phase}')
             return result
-        except RuntimeError as error:
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
             diagnostic = cuda_sample_diagnostic(output, phase, uuid, physical_index, policy, baseline,
                                                 activity_profile=activity_profile)
             failed_attempts.append(diagnostic)
@@ -207,7 +235,8 @@ def settled_cuda_samples(probe, output: Path, phase: str, uuid: str, physical_in
             predicate_name = ('proof_correctness_profile_headroom_and_stable_contexts'
                               if activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY
                               else 'proof_policy_headroom_and_inactive_contexts')
-            transient = (str(error) == f'physical GPU occupied during {phase}' and samples
+            transient = (activity_profile != SHARED_CUDA_HEADROOM_ACTIVITY
+                         and str(error) == f'physical GPU occupied during {phase}' and samples
                          and all(item['predicates'][predicate_name]
                                  and item['selected_index_matches_admission']
                                  and item['context_identities_match_admission'] for item in samples[:-1])
@@ -218,7 +247,7 @@ def settled_cuda_samples(probe, output: Path, phase: str, uuid: str, physical_in
             time.sleep(0.5)
 
 
-def cuda_settle_refusal(error: RuntimeError, diagnostic: dict) -> dict:
+def cuda_settle_refusal(error: Exception, diagnostic: dict) -> dict:
     attempts = getattr(error, 'cuda_settle_attempts', None)
     if attempts:
         return {**diagnostic, 'settle_attempt_count': len(attempts), 'settle_attempts': attempts}
@@ -382,10 +411,14 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
                     raise ValueError('approved wait deadline expired before physical-device claim')
                 time.sleep(policy.poll_millis / 1000)
         from scripts.release import veda_cuda_guard
-        devices, processes = veda_cuda_guard.inventory(output, 'model-proof-claimed-device')
+        activity_profile = bound_cuda_activity_profile(constraints)
+        shared_headroom = activity_profile == SHARED_CUDA_HEADROOM_ACTIVITY
+        inventory_reader = (lambda out, label, deadline: veda_cuda_guard.inventory(
+            out, label, deadline, selected_uuid=uuid)) if shared_headroom else veda_cuda_guard.inventory
+        devices, processes = (inventory_reader(output, 'model-proof-claimed-device', started + policy.deadline_seconds)
+                              if shared_headroom else veda_cuda_guard.inventory(output, 'model-proof-claimed-device'))
         matched = [device for device in devices if device['uuid'] == uuid]
         required_index = constraints.get('required_cuda_physical_index')
-        activity_profile = bound_cuda_activity_profile(constraints)
         if len(matched) == 1 and required_index is not None and matched[0]['index'] != required_index:
             raise ValueError('claimed UUID violates this case fixed physical-index restriction')
         idle_check = lambda device, rows: (device.get('uuid') == uuid and
@@ -400,7 +433,11 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
         record = {'mechanism': 'existing PUBLIC/SceneWorks/gpu-locks UUID lock', 'device_uuid': uuid,
                   'physical_index': matched[0]['index'], 'runner': env.get('RUNNER_NAME'),
                   'activity_profile': activity_profile, 'claim_utilization_percent': matched[0]['utilization_percent']}
-        if activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY:
+        if shared_headroom:
+            record['activity_policy'] = ('non-isolated correctness; exact-card identity and policy cap plus reserve free; '
+                                         'background utilization and contexts are diagnostic only')
+            record['isolated_benchmark_claim'] = False
+        elif activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY:
             record['activity_policy'] = ('non-isolated correctness, stable selected-card G/C+G contexts when utilization '
                                          'is nonzero; C also permitted at zero; below '
                                          f'{MAX_BASELINE_UTILIZATION_PERCENT}% utilization, policy cap plus reserve free')
@@ -420,10 +457,11 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
             selected, baseline = settled_cuda_samples(
                 lambda: veda_cuda_guard.sample_baseline(
                     matched[0], output, 'model-proof-admission', context_baseline, idle_check=idle_check,
-                    identity_key=identity_key, permit_bounded_growth=True),
+                    identity_key=identity_key, permit_bounded_growth=True,
+                    require_stable_contexts=not shared_headroom, inventory_reader=inventory_reader),
                 output, 'model-proof-admission', uuid, matched[0]['index'], policy, context_baseline,
                 settle_deadline, activity_profile=activity_profile)
-        except RuntimeError as error:
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
             diagnostic = cuda_sample_diagnostic(output, 'model-proof-admission', uuid, matched[0]['index'], policy,
                                                 context_baseline, activity_profile=activity_profile)
             raise CudaClaimRejected({**cuda_claim_diagnostic(uuid, devices, processes, policy,
@@ -432,9 +470,13 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
                                      'admission_error': str(error)}) from error
         record['post_execution_verified'] = False
         record['admission_baseline'] = baseline
-        if activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY:
+        if activity_profile in (IRIS_CUDA_CORRECTNESS_ACTIVITY, SHARED_CUDA_HEADROOM_ACTIVITY):
             record['admission_utilization_percent'] = accepted_utilization_samples(
                 output, 'model-proof-admission', uuid, matched[0]['index'], policy, baseline, activity_profile)
+        if shared_headroom:
+            record['admission_background_activity'] = cuda_sample_diagnostic(
+                output, 'model-proof-admission', uuid, matched[0]['index'], policy, baseline,
+                activity_profile=activity_profile)
         (output / 'physical-execution-claim.json').write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
         try:
             yield record
@@ -443,18 +485,22 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
                 settled_cuda_samples(
                     lambda: veda_cuda_guard.verify_idle(
                         selected, output, 'model-proof-release', baseline, idle_check=idle_check,
-                        identity_key=identity_key, permit_bounded_growth=True),
+                        identity_key=identity_key, permit_bounded_growth=True,
+                        require_stable_contexts=not shared_headroom, inventory_reader=inventory_reader),
                     output, 'model-proof-release', uuid, matched[0]['index'], policy, baseline,
                     min(started + policy.deadline_seconds, time.monotonic() + 30),
                     activity_profile=activity_profile)
-            except RuntimeError as error:
+            except (RuntimeError, OSError, subprocess.SubprocessError) as error:
                 raise CudaReleaseRejected('CUDA post-idle verification failed: ' + str(error),
                                           cuda_settle_refusal(
                                               error, cuda_release_diagnostic(output, uuid, matched[0]['index'], policy,
                                                                              baseline, activity_profile=activity_profile))) from error
-            if activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY:
+            if activity_profile in (IRIS_CUDA_CORRECTNESS_ACTIVITY, SHARED_CUDA_HEADROOM_ACTIVITY):
                 record['release_utilization_percent'] = accepted_utilization_samples(
                     output, 'model-proof-release', uuid, matched[0]['index'], policy, baseline, activity_profile)
+            if shared_headroom:
+                record['release_background_activity'] = cuda_release_diagnostic(
+                    output, uuid, matched[0]['index'], policy, baseline, activity_profile=activity_profile)
             record['post_execution_verified'] = True
     finally:
         if claimed:

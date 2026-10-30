@@ -798,6 +798,7 @@ mod tests {
     /// *Mutations that red this:* accepting a dense request on a packed package (or another
     /// tier), skipping `verify_native_package`, or loading packed targets as dense.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn converted_ggml_package_loads_only_as_its_exact_tier_and_renders_close_to_dense() {
         use gen_core_flux3::AUTOENCODER_COMPONENT;
         let dir = tempfile::tempdir().unwrap();
@@ -876,9 +877,13 @@ mod tests {
             .is_err(),
             "a q8 request never quantizes a dense package at load"
         );
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED model::tests::converted_ggml_package_loads_only_as_its_exact_tier_and_renders_close_to_dense");
     }
 
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest() {
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures");
@@ -934,6 +939,9 @@ mod tests {
                 "bypass must evict a prior resident PUP owner"
             );
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest");
     }
 
     #[test]

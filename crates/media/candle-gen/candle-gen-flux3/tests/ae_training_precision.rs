@@ -18,6 +18,7 @@ fn difference(got: &Tensor, want: &Tensor) -> (f32, f32) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn frozen_training_encoder_selected_precision_cpu_emulation() {
     let golden = fixture("flux3_ae_training_precision.safetensors");
     for (dtype, name, max_bound, mean_bound) in [
@@ -56,6 +57,9 @@ fn frozen_training_encoder_selected_precision_cpu_emulation() {
             );
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ae_training_precision::frozen_training_encoder_selected_precision_cpu_emulation");
 }
 
 #[test]

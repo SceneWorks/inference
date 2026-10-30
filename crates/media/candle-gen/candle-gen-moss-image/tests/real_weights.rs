@@ -295,3 +295,127 @@ fn native_complete_surface_campaign() {
         );
     }
 }
+
+#[cfg(feature = "model-inference-proof")]
+fn bounded_root() -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("MODEL_PROOF_OUTPUT_DIR").expect("manual executor output directory"),
+    )
+    .join("bespoke_acceptance");
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, root: &std::path::Path) {
+    let peak = sampler.stop();
+    assert!(
+        peak > 0,
+        "selected physical CUDA device peak must be observed"
+    );
+    std::fs::write(
+        root.join("peak_device_bytes.txt"),
+        (peak * 1024 * 1024).to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+#[cfg(feature = "model-inference-proof")]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn moss_bounded_acceleration_acceptance() {
+    let root = bounded_root();
+    let base = required("MOSS_BASE_SNAPSHOT");
+    let shared = required("MOSS_SHARED_SNAPSHOT");
+    let input = root.join("input.png");
+    image::RgbImage::from_pixel(64, 64, image::Rgb([80, 140, 210]))
+        .save(&input)
+        .unwrap();
+    let sampler = candle_gen::testkit::PeakSampler::start_rendered();
+    let (output, spec) = candle_gen::train::profile::with_bounded_cohort_for(
+        &root.join("metrics.json"),
+        &[
+            "moss:geometry-storage-hit",
+            "moss:frozen-caption-storage-hit",
+            "moss:frozen-projection-pack",
+        ],
+        || {
+            let spec = prepared(MossImageVariant::Base, &base, &shared, &shared);
+            let mut trainer = candle_gen_moss_image::register_providers(
+                candle_gen::gen_core::ProviderRegistryBuilder::new(),
+            )
+            .build()
+            .unwrap()
+            .load_trainer(MossImageVariant::Base.provider_id(), &spec)
+            .unwrap();
+            let output = trainer
+                .train(
+                    &TrainingRequest {
+                        items: vec![TrainingItem::captioned(input, "a blue tile".into())],
+                        config: TrainingConfig {
+                            rank: 2,
+                            alpha: 2.,
+                            learning_rate: 1e-3,
+                            steps: 4,
+                            resolution: 64,
+                            batch_size: 1,
+                            gradient_accumulation: 1,
+                            lr_warmup_steps: 0,
+                            save_every: 0,
+                            seed: 7,
+                            train_dtype: "bf16".into(),
+                            gradient_checkpointing: false,
+                            ..Default::default()
+                        },
+                        output_dir: root.join("out"),
+                        file_name: "adapter.safetensors".into(),
+                        trigger_words: vec![],
+                        cancel: CancelFlag::new(),
+                    },
+                    &mut |_| {},
+                )
+                .unwrap();
+            assert_eq!(output.steps, 4);
+            assert!(output.final_loss.is_finite());
+            (output, spec)
+        },
+    );
+    bounded_peak(sampler, &root);
+    let tensors =
+        candle_gen::candle_core::safetensors::load(&output.adapter_path, &Device::Cpu).unwrap();
+    assert!(!tensors.is_empty());
+    drop(tensors);
+    let generator = candle_gen_moss_image::register_providers(
+        candle_gen::gen_core::ProviderRegistryBuilder::new(),
+    )
+    .build()
+    .unwrap()
+    .load(
+        MossImageVariant::Base.provider_id(),
+        &spec.with_adapters(vec![AdapterSpec::new(
+            output.adapter_path,
+            1.,
+            AdapterKind::Lora,
+        )]),
+    )
+    .unwrap();
+    let rendered = images(
+        generator
+            .generate(
+                &GenerationRequest {
+                    prompt: "a blue tile".into(),
+                    width: 256,
+                    height: 256,
+                    steps: Some(2),
+                    seed: Some(7),
+                    ..Default::default()
+                },
+                &mut |_| {},
+            )
+            .unwrap(),
+    );
+    assert_eq!(rendered.len(), 1);
+    assert_eq!(rendered[0].pixels.len(), 256 * 256 * 3);
+    assert!(rendered[0].pixels.iter().any(|p| *p != 0));
+    candle_gen::testkit::save_image_png(&root.join("adapter_sample.png"), &rendered[0]);
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_weights::moss_bounded_acceleration_acceptance");
+}

@@ -110,11 +110,13 @@ pub enum Trainable {
         kind: AdapterKind,
         targets: Vec<AdapterTarget>,
         base: HashMap<String, Tensor>,
+        packs: BTreeMap<String, candle_gen::train::projection::FrozenProjectionPack>,
     },
 }
 
 /// The trainable backbone.
 pub struct TrainModel {
+    pub geometry: crate::dit::TrainingGeometry,
     pub cfg: ModelConfig,
     pub compute: DType,
     pub device: Device,
@@ -169,6 +171,62 @@ pub fn provider_residual(kind: AdapterKind, t: &AdapterTarget, p: &Tensors) -> R
     }
 }
 
+/// Prepare only split GQA bases once per adapter run. Original checkpoint keys retain slices
+/// of the same packed allocation; independent residual target names and widths stay intact.
+/// MHA is already fused, full weights are tracked, and CPU half GEMMs retain their oracle.
+pub fn prepare_adapter_projection_packs(
+    base: &mut HashMap<String, Tensor>,
+) -> Result<BTreeMap<String, candle_gen::train::projection::FrozenProjectionPack>> {
+    let keys = base
+        .keys()
+        .filter(|key| {
+            key.ends_with(".q_proj.weight")
+                || key.ends_with(".q_proj_x.weight")
+                || key.ends_with(".q_proj_y.weight")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut packs = BTreeMap::new();
+    for q in keys {
+        let k = q.replace(".q_proj", ".k_proj");
+        let v = q.replace(".q_proj", ".v_proj");
+        let names = [&q, &k, &v];
+        let Some(weights) = names
+            .iter()
+            .map(|key| base.get(*key).cloned())
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if weights
+            .iter()
+            .any(|w| w.track_op() || (w.device().is_cpu() && w.dtype() != DType::F32))
+        {
+            continue;
+        }
+        let mut facades = weights
+            .into_iter()
+            .map(|weight| {
+                let (out, input) = weight.dims2()?;
+                Ok(candle_gen::quant::AdaptLinear::from_dense(
+                    candle_gen::candle_nn::Linear::new(weight, None),
+                    input,
+                    out,
+                ))
+            })
+            .collect::<candle_gen::candle_core::Result<Vec<_>>>()?;
+        if let Some(pack) = candle_gen::train::projection::FrozenProjectionPack::prepare_adapt(
+            &mut facades.iter_mut().collect::<Vec<_>>(),
+        )? {
+            for (key, facade) in names.into_iter().zip(facades) {
+                base.insert(key.clone(), facade.dense_base().unwrap().weight().clone());
+            }
+            packs.insert(q.trim_end_matches(".weight").to_owned(), pack);
+        }
+    }
+    Ok(packs)
+}
+
 impl TrainModel {
     /// The backbone of one step at the compute dtype, from `trainable` (the run's tensors — `Var`
     /// tensors under autograd, or plain snapshots / the EMA for a preview).
@@ -187,11 +245,13 @@ impl TrainModel {
                     .collect();
                 let ckpt = Checkpoint::from_tensors(map, &self.device);
                 IrisDiT::from_checkpoint(&ckpt, &self.cfg, self.compute, &self.device)
+                    .map(|dit| dit.with_training_geometry(&self.geometry))
             }
             Trainable::Adapter {
                 kind,
                 targets,
                 base,
+                packs,
             } => {
                 let mut residuals = BTreeMap::new();
                 for t in targets {
@@ -202,7 +262,10 @@ impl TrainModel {
                 }
                 let ckpt = Checkpoint::from_tensors(base.clone(), &self.device)
                     .with_residuals(residuals)?;
-                IrisDiT::from_checkpoint(&ckpt, &self.cfg, self.compute, &self.device)
+                let mut dit =
+                    IrisDiT::from_checkpoint(&ckpt, &self.cfg, self.compute, &self.device)?;
+                dit.install_training_projection_packs(packs);
+                Ok(dit.with_training_geometry(&self.geometry))
             }
         }
     }
@@ -242,7 +305,10 @@ impl TrainModel {
                     self.compute,
                     &self.device,
                 )?;
-                Ok((tracked, Some(free)))
+                Ok((
+                    tracked.with_training_geometry(&self.geometry),
+                    Some(free.with_training_geometry(&self.geometry)),
+                ))
             }
             Trainable::Adapter { .. } => {
                 let detached: Tensors = trainable
@@ -1119,6 +1185,7 @@ mod tests {
         let cfg = gen_core_iris::IrisConfig::from_dir(&dir).unwrap().model;
         let weights = random_init(&cfg, 0, false, &Device::Cpu).unwrap();
         let model = TrainModel {
+            geometry: Default::default(),
             cfg,
             compute: DType::F32,
             device: Device::Cpu,

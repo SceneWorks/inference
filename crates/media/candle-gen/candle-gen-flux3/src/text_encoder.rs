@@ -391,7 +391,7 @@ impl Flux3TextEncoder {
             })
             .collect::<Result<_>>()?;
         // `stack(dim=1).permute(0, 2, 1, 3).reshape(L, -1)`: layer-major within each token row.
-        let tokens = Tensor::cat(&picked, 1)?.to_dtype(self.output_dtype)?;
+        let tokens = __model_proof_output!(Tensor::cat(&picked, 1)?.to_dtype(self.output_dtype))?;
         Ok(TextConditioning {
             tokens,
             ids: text_ids(n),

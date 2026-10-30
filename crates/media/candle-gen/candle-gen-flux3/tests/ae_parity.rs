@@ -36,6 +36,7 @@ fn golden_grid(g: &Fixture) -> (usize, usize) {
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn encode_matches_upstream() {
     let g = golden();
     let ae = autoencoder(&cpu());
@@ -58,6 +59,9 @@ fn encode_matches_upstream() {
         "latent_channels() must be the packed width the oracle produced"
     );
     assert_close("encode tokens", &tokens, want, TOL);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ae_parity::encode_matches_upstream");
 }
 
 /// The oracle's ids are `latent_ids(h, w)`; the port emits tokens in that order (proven by the
@@ -94,6 +98,7 @@ fn token_order_is_row_major_latent_ids() {
 /// `decode(encode(image))` through the port against the oracle's own round trip — exercises the
 /// bn de-normalization, the 2×2 unpatchify, `post_quant_conv` and the whole decoder.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn decode_round_trip_matches_upstream() {
     let g = golden();
     let ae = autoencoder(&cpu());
@@ -115,10 +120,14 @@ fn decode_round_trip_matches_upstream() {
         peak > 1.0,
         "golden must exercise the unclamped range (peak {peak})"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ae_parity::decode_round_trip_matches_upstream");
 }
 
 /// Decode of seeded N(0, 1) tokens — the DiT-output regime, independent of the encoder.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn decode_random_tokens_matches_upstream() {
     let g = golden();
     let ae = autoencoder(&cpu());
@@ -142,12 +151,16 @@ fn decode_random_tokens_matches_upstream() {
         max_abs > 0.0,
         "bf16 input rounding must be observable (cast happened)"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ae_parity::decode_random_tokens_matches_upstream");
 }
 
 /// The same decode on the build's device: under `--features cuda` the real CUDA conv / GroupNorm /
 /// attention kernels, held to the f32 oracle at a kernel-order tolerance (cuDNN-free candle convs
 /// are im2col GEMMs; f32 on both sides).
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn decode_random_tokens_matches_upstream_on_device() {
     let device = device();
     let g = golden();
@@ -157,6 +170,9 @@ fn decode_random_tokens_matches_upstream_on_device() {
     let want = batched_nchw(g.require("decoded_rand"));
     let decoded = ae.decode(&tokens, h, w).expect("decode");
     assert_close("decode(tokens_rand) on device", &decoded, &want, 1e-3);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED ae_parity::decode_random_tokens_matches_upstream_on_device");
 }
 
 #[test]

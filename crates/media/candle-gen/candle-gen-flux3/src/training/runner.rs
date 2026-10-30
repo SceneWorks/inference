@@ -46,6 +46,7 @@ pub(crate) struct CandleSession {
     pub seed: u64,
     pub accumulation: u32,
     pending: Option<GradStore>,
+    cohort_loss: f32,
 }
 fn invalid(detail: impl std::fmt::Display) -> Error {
     Error::Unsupported(format!("flux3 training session: {detail}"))
@@ -59,9 +60,9 @@ fn check(flag: &CancelFlag) -> Result<()> {
 }
 impl CandleSession {
     pub fn new(
-        graph: TrainingGraph,
+        mut graph: TrainingGraph,
         optimizer: TrainOptimizer,
-        examples: Vec<CachedExample>,
+        mut examples: Vec<CachedExample>,
         options: TrainingOptions,
         identity: ResumeIdentity,
         seed: u64,
@@ -99,6 +100,52 @@ impl CandleSession {
                 ));
             }
         }
+        let mut geometry = Vec::new();
+        let mut prepared_text: std::collections::HashMap<
+            candle_gen::candle_core::TensorId,
+            Tensor,
+        > = std::collections::HashMap::new();
+        for example in &mut examples {
+            let image = scaled_image_ids(
+                &latent_ids(example.grid.0, example.grid.1),
+                IMAGE_ROPE_SCALE,
+            );
+            let condition = if example.reference.is_some() {
+                training_condition_ids(example.grid.0, example.grid.1).map_err(Error::from)?
+            } else {
+                Vec::new()
+            };
+            geometry.push(image.clone());
+            geometry.push(condition.clone());
+            geometry.push(example.text_ids.clone());
+            geometry.push([image, condition, example.text_ids.clone()].concat());
+            for text in std::iter::once(&mut example.text).chain(example.empty_text.iter_mut()) {
+                let id = text.id();
+                let projected = match prepared_text.get(&id) {
+                    Some(value) => value.clone(),
+                    None => {
+                        let value = graph.dit.prepare_training_text(text)?;
+                        prepared_text.insert(id, value.clone());
+                        value
+                    }
+                };
+                *text = projected;
+            }
+        }
+        let geometry_bytes = geometry
+            .iter()
+            .map(|ids| ids.len() * (graph.dit.config().hidden / graph.dit.config().heads) * 4)
+            .sum::<usize>() as u64;
+        candle_gen::train::flow_match::check_aux_memory(
+            "flux3 training geometry",
+            0,
+            geometry_bytes,
+            candle_gen::train::flow_match::device_training_budget_bytes(
+                graph.dit.device(),
+                "flux3 training geometry",
+            ),
+        )?;
+        graph.dit.prepare_training_geometry(&geometry)?;
         Ok(Self {
             graph,
             optimizer,
@@ -108,6 +155,7 @@ impl CandleSession {
             seed,
             accumulation,
             pending: None,
+            cohort_loss: 0.,
         })
     }
     fn named_pending(&self) -> BTreeMap<String, Tensor> {
@@ -258,6 +306,7 @@ impl SourceTrainingSession for CandleSession {
                 return Err(invalid("empty micro-batch"));
             }
             let vars = self.graph.vars();
+            candle_gen::train::profile::cohort_begin_step(self.graph.dit.device())?;
             let mut raw_loss = 0.0f32;
             for (position, index) in indices.iter().enumerate() {
                 check(flag)?;
@@ -313,8 +362,7 @@ impl SourceTrainingSession for CandleSession {
                         .empty_text
                         .as_ref()
                         .ok_or_else(|| invalid("missing matched-window empty caption"))?,
-                }
-                .to_device(self.graph.dit.device())?;
+                };
                 let reference = example
                     .reference
                     .as_ref()
@@ -327,7 +375,7 @@ impl SourceTrainingSession for CandleSession {
                 let cond_ids =
                     training_condition_ids(example.grid.0, example.grid.1).map_err(Error::from)?;
                 let samples = [SampleTokens {
-                    text: &text,
+                    text,
                     text_ids: &example.text_ids,
                     image: &image,
                     image_ids: &image_ids,
@@ -351,6 +399,7 @@ impl SourceTrainingSession for CandleSession {
                 accumulate_grads(&mut self.pending, gradients, &vars)?;
             }
             check(flag)?;
+            self.cohort_loss = raw_loss;
             Ok(raw_loss)
         })();
         result.map_err(Into::into)
@@ -388,7 +437,15 @@ impl SourceTrainingSession for CandleSession {
                 scale_grads(pending, &vars, coefficient as f64)?;
             }
             self.optimizer.set_lr_scaled(lr_multiplier);
+            candle_gen::train::profile::cohort_before_update(pending, &vars)?;
             self.optimizer.step(pending)?;
+            candle_gen::train::profile::cohort_after_update();
+            candle_gen::train::profile::cohort_end_step(
+                self.graph.dit.device(),
+                self.cohort_loss,
+                &vars,
+                "flux3",
+            )?;
             self.pending = None;
             check(flag)
         })();
@@ -676,6 +733,7 @@ mod tests {
             .collect()
     }
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn real_loop_interrupts_with_pending_gradient_resumes_identically_and_reloads() {
         let continuous_dir = tempfile::tempdir().unwrap();
         let (mut continuous, config) = session();
@@ -789,6 +847,8 @@ mod tests {
             gen_core_flux3::training::controller::ensure_new_output(&req).is_err(),
             "a completed run must not be silently overwritten"
         );
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::runner::tests::real_loop_interrupts_with_pending_gradient_resumes_identically_and_reloads");
     }
     fn factor_bits(session: &CandleSession) -> BTreeMap<String, Vec<u32>> {
         session
@@ -818,6 +878,7 @@ mod tests {
     /// its functional gradient returns zeros) is EXACTLY that partition, and that an unreached
     /// factor is left bit-identical by the update (no moment, no decoupled weight decay).
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn each_workflow_steps_exactly_the_factors_its_native_graph_reaches() {
         for workflow in [Workflow::Captioned, Workflow::PairedEdit] {
             let (mut session, _) = session_for(workflow);
@@ -858,11 +919,14 @@ mod tests {
                 }
             }
         }
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::runner::tests::each_workflow_steps_exactly_the_factors_its_native_graph_reaches");
     }
     /// PR #1288 review: a TRAINED export (not a hand-made fixture) loads through the public
     /// provider path SceneWorks uses, `LoadSpec.adapters` -> `load("flux3_klein_base")` ->
     /// `generate`, applies on every trained projection, changes the image, and is inert at 0.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn trained_export_loads_through_the_public_base_provider_and_changes_generation() {
         use gen_core::{
             GenerationOutput, GenerationRequest, Generator, LoadSpec, Precision, WeightsSource,
@@ -931,5 +995,7 @@ mod tests {
             .load("flux3_klein_base", &spec_with(vec![inert]))
             .unwrap();
         assert_eq!(render(zero.as_ref()), bare, "scale 0 must be bit-inert");
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED training::runner::tests::trained_export_loads_through_the_public_base_provider_and_changes_generation");
     }
 }

@@ -260,36 +260,6 @@ fn tensor_bytes(t: &Tensor) -> usize {
     t.elem_count() * t.dtype().size_in_bytes()
 }
 
-/// Apply a **2-D** factor `w` `[in, out]` to an activation `x` whose last dim is `in`, folding every
-/// leading dim into the GEMM's `M`.
-///
-/// **Never `broadcast_matmul` here.** candle materializes a broadcast rhs through `.contiguous()`
-/// (`candle-core`'s own `broadcast_matmul` carries the `TODO: Avoid concretising the broadcasted
-/// matrixes` note), so a 2-D factor against a `[N, S, in]` activation is physically **copied `N`
-/// times** and then multiplied as `N` batched GEMMs with `M = S`. That is free where `N = 1` — every
-/// DiT trunk site — and pathological where a site folds a token count into the *batch* dim: the Krea
-/// text-fusion `layerwise_blocks` run `[n_tokens, num_layers, d]`, so a 2048² image **edit**
-/// (`n_tokens = 4107` vision+text tokens, `d = 2560`, rank 256) turned each rank-256 factor into a
-/// 2.7e9-element / **5.4 GB** copy and then a 4107-batch `M = 12` GEMM against it — 32 such legs per
-/// denoise step across the two layerwise blocks' eight adapted projections. The first denoise step
-/// never finished (hours), while the same render without an adapter took 55 s.
-///
-/// Flattening is mathematically identical (`matmul` contracts the last dim either way), allocates
-/// nothing beyond the result, and issues ONE large-`M` GEMM — the same lesson sc-11785 applied to the
-/// LoKr vec-trick's expensive leg, here for the plain-LoRA legs.
-fn apply_factor(x: &Tensor, w: &Tensor) -> candle_core::Result<Tensor> {
-    let dims = x.dims();
-    // A non-2-D factor has no flattened form; keep the general (broadcasting) path.
-    if w.rank() != 2 || dims.len() <= 2 {
-        return x.broadcast_matmul(w);
-    }
-    let (lead, k) = dims.split_at(dims.len() - 1);
-    let m: usize = lead.iter().product();
-    let mut out_dims = lead.to_vec();
-    out_dims.push(w.dim(1)?);
-    x.reshape((m, k[0]))?.matmul(w)?.reshape(out_dims)
-}
-
 impl Adapter {
     /// A scalar-zero LoRA contributes exactly nothing. Detect it before reading either factor: this
     /// keeps disabled adapters byte-identical to the bare host even when an unused factor contains a
@@ -315,8 +285,7 @@ impl Adapter {
             } => {
                 let xd = x.dtype();
                 let (a, b) = prepared.factors(a, b, xd)?;
-                let r = apply_factor(&apply_factor(x, &a)?, &b)?;
-                r * *scale
+                crate::train::projection::scaled_lora(x, &a, &b, *scale)
             }
             Adapter::TrainableLora {
                 down,
@@ -327,8 +296,7 @@ impl Adapter {
                 let xd = x.dtype();
                 let down = leaf(down, *frozen).to_dtype(xd)?;
                 let up = leaf(up, *frozen).to_dtype(xd)?;
-                let r = apply_factor(&apply_factor(x, &down.t()?)?, &up.t()?)?;
-                r * *scale
+                crate::train::projection::scaled_lora(x, &down.t()?, &up.t()?, *scale)
             }
             Adapter::TrainableLokr {
                 w1,
@@ -1016,6 +984,18 @@ impl AdaptLinear {
     /// is byte-identical to the bare base forward.
     pub fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         self.apply_residuals(x, self.base.forward(x)?)
+    }
+
+    /// Dense base inspection without dequantization. Preparation refuses tracked weights.
+    pub fn dense_base(&self) -> Option<&Linear> {
+        match &self.base {
+            Base::Dense(base) => Some(base),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn replace_dense_base(&mut self, base: Linear) {
+        self.base = Base::Dense(base);
     }
 
     /// Add this layer's existing residual stack to an already computed base output. Providers

@@ -1329,6 +1329,8 @@ fn opened_work(output: &RunOutput) -> Result<WorkDir, RunError> {
 /// crash needs can proceed, while a live holder still refuses a second claimant, fresh or resumed.
 #[test]
 fn a_stale_claim_is_taken_over_but_a_live_claim_still_refuses() {
+    use std::io::{Read as _, Seek as _};
+
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("song");
     let work = partial_dir(&dir);
@@ -1339,11 +1341,13 @@ fn a_stale_claim_is_taken_over_but_a_live_claim_still_refuses() {
     // An earlier build's in-directory claim file is stale too.
     fs::write(work.join(LOCK_FILE), "pid 4294967295\n").unwrap();
 
-    let held = opened_work(&RunOutput::resume(&dir)).expect("an unheld claim is taken over");
-    assert_eq!(
-        fs::read_to_string(&lock).unwrap(),
-        format!("pid {}\n", std::process::id())
-    );
+    let mut held = opened_work(&RunOutput::resume(&dir)).expect("an unheld claim is taken over");
+    // Windows excludes I/O through other handles while the claim is locked. Inspect the holder
+    // through its own handle so the assertion never has to release the exclusive claim.
+    held._claim._file.rewind().unwrap();
+    let mut holder = String::new();
+    held._claim._file.read_to_string(&mut holder).unwrap();
+    assert_eq!(holder, format!("pid {}\n", std::process::id()));
     assert!(
         !work.join(LOCK_FILE).exists(),
         "the legacy claim file is removed"

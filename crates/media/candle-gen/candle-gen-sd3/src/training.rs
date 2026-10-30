@@ -531,6 +531,21 @@ impl Sd3Trainer {
                 device,
             )?,
         };
+        transformer.prepare_training()?;
+        let mut prepared_contexts = HashMap::<_, Tensor>::new();
+        for (_, conditioning, _) in &mut cache {
+            let id = conditioning.context.id();
+            let projected = match prepared_contexts.get(&id) {
+                Some(projected) => projected.clone(),
+                None => {
+                    let projected = transformer.prepare_training_context(&conditioning.context)?;
+                    prepared_contexts.insert(id, projected.clone());
+                    projected
+                }
+            };
+            conditioning.context = projected;
+        }
+        drop(prepared_contexts);
         let accum = cfg.gradient_accumulation.max(1);
         let mut opt = TrainOptimizer::from_config(
             &cfg.optimizer,
@@ -577,6 +592,7 @@ impl Sd3Trainer {
             if req.cancel.is_cancelled() {
                 break;
             }
+            candle_gen::train::profile::cohort_begin_step(device)?;
             let sample = step_sample(aux_driver.as_mut(), step, &schedule);
             let (x0, conditioning, mask_weight) = &cache[sample.entry];
             let noise = flow_match::sample_noise(
@@ -614,6 +630,7 @@ impl Sd3Trainer {
                 update_idx += 1;
             }
             steps_run = step;
+            candle_gen::train::profile::cohort_end_step(device, last_loss, &set.vars, "sd3")?;
             on_progress(TrainingProgress::Training {
                 step,
                 total: cfg.steps,
@@ -911,10 +928,31 @@ mod tests {
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-        let mut transformer = Sd3Transformer::new(&cfg, vb).unwrap();
-        // Target the second attention's output projection: it is downstream of SDPA, so this test
-        // exercises the MMDiT-X route without depending on the attention kernel's q/k backward.
-        let targets = vec!["attn2.to_out.0".to_string()];
+        let _fixture = Sd3Transformer::new(&cfg, vb).unwrap();
+        // The production loader owns frozen tensors, unlike a VarMap fixture. Rebuild
+        // from detached storage-sharing tensors so this proof exercises actual packing.
+        let weights = vm
+            .data()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_tensor().detach()))
+            .collect();
+        let mut transformer =
+            Sd3Transformer::new(&cfg, VarBuilder::from_tensors(weights, DType::F32, &dev)).unwrap();
+        // Both joint image/text and the MMDiT-X image-only attention must propagate
+        // through per-head RMS normalization into independent Q/K adapter factors.
+        let targets = [
+            "attn.to_q",
+            "attn.to_k",
+            "attn.add_q_proj",
+            "attn.add_k_proj",
+            "attn2.to_q",
+            "attn2.to_k",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
         let set = build_adapt_lora_targets(&mut transformer, &targets, 2, 2.0, 7, &dev).unwrap();
         let latent = Tensor::randn(0f32, 1f32, (1, 16, 8, 8), &dev).unwrap();
         let context = Tensor::randn(
@@ -926,37 +964,153 @@ mod tests {
         .unwrap();
         let pooled = Tensor::randn(0f32, 1f32, (1, cfg.pooled_dim), &dev).unwrap();
         let timestep = Tensor::full(500f32, 1, &dev).unwrap();
-        let loss1 = transformer
+        let reference = transformer
             .forward(&latent, &context, &pooled, &timestep)
+            .unwrap();
+        transformer.prepare_training().unwrap();
+        let prepared_context = transformer.prepare_training_context(&context).unwrap();
+        let packed = transformer
+            .forward(&latent, &prepared_context, &pooled, &timestep)
+            .unwrap();
+        let error = (&reference - &packed)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(error <= 1e-5, "packed/prepared SD3 parity {error}");
+        let loss1 = transformer
+            .forward(&latent, &prepared_context, &pooled, &timestep)
             .unwrap()
             .sqr()
             .unwrap()
             .mean_all()
             .unwrap();
         let grads1 = loss1.backward().unwrap();
-        assert!(
-            grads1.get(set.vars[1].as_tensor()).is_some(),
-            "the real MMDiT-X path must reach zero-initialized B"
+        let named = set.named_vars();
+        assert_eq!(
+            set.len(),
+            10,
+            "joint Q/K in both blocks plus image-only Q/K"
         );
+        // The final context_pre_only block discards text attention output. Attention
+        // is rowwise in Q, so its text-query factors are connected through cat/narrow
+        // but have an exactly zero derivative. Text K remains live in image rows.
+        let discarded_query = "transformer_blocks.1.attn.add_q_proj.lora_B.weight";
+        assert_eq!(
+            named.iter().filter(|(n, _)| n == discarded_query).count(),
+            1
+        );
+        for factors in named.chunks_exact(2) {
+            let (name, b) = &factors[1];
+            let a_grad = grads1
+                .get(factors[0].1.as_tensor())
+                .unwrap_or_else(|| panic!("missing initial A gradient for {name}"));
+            assert_eq!(
+                a_grad
+                    .abs()
+                    .unwrap()
+                    .sum_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap(),
+                0.0,
+                "zero-initialized B must give zero initial A gradient: {name}"
+            );
+            let g = grads1
+                .get(b.as_tensor())
+                .unwrap_or_else(|| panic!("missing Q/K B gradient through RMSNorm: {name}"));
+            let magnitude = g
+                .abs()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            if name == discarded_query {
+                assert_eq!(magnitude, 0.0, "discarded final text-query rows: {name}");
+            } else {
+                assert!(
+                    magnitude.is_finite() && magnitude > 0.0,
+                    "live Q/K B gradient: {name} = {magnitude}"
+                );
+            }
+        }
         let mut optimizer =
             TrainOptimizer::from_config("adam", set.vars.clone(), 0.05, 0.0).unwrap();
         optimizer.step(&grads1).unwrap();
         let loss2 = transformer
-            .forward(&latent, &context, &pooled, &timestep)
+            .forward(&latent, &prepared_context, &pooled, &timestep)
             .unwrap()
             .sqr()
             .unwrap()
             .mean_all()
             .unwrap();
         let grads2 = loss2.backward().unwrap();
+        for factors in named.chunks_exact(2) {
+            let (name, a) = &factors[0];
+            let g = grads2
+                .get(a.as_tensor())
+                .unwrap_or_else(|| panic!("missing Q/K A gradient after B update: {name}"));
+            let magnitude = g
+                .abs()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            if factors[1].0 == discarded_query {
+                assert_eq!(magnitude, 0.0, "discarded final text-query rows: {name}");
+            } else {
+                assert!(
+                    magnitude.is_finite() && magnitude > 0.0,
+                    "live Q/K A gradient after B update: {name} = {magnitude}"
+                );
+            }
+        }
         assert!(
-            grads2.get(set.vars[0].as_tensor()).is_some(),
-            "the real MMDiT-X path must reach A after B's optimizer step"
+            set.vars.len() >= 12,
+            "joint image/text and dual Q/K factors"
         );
-        assert_eq!(
-            set.vars.len(),
+
+        // A newly targeted context embedder must invalidate the old prepared activation,
+        // while raw inputs still carry its adapter gradients and are never cached.
+        let context_set = build_adapt_lora_targets(
+            &mut transformer,
+            &["context_embedder".to_string()],
             2,
-            "the one attn2 projection has A/B factors"
+            2.0,
+            9,
+            &dev,
+        )
+        .unwrap();
+        assert!(transformer
+            .forward(&latent, &prepared_context, &pooled, &timestep)
+            .is_err());
+        let live_context = transformer.prepare_training_context(&context).unwrap();
+        assert_eq!(live_context.id(), context.id());
+        let live_grads = transformer
+            .forward(&latent, &live_context, &pooled, &timestep)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .mean_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        let g = live_grads
+            .get(context_set.vars[1].as_tensor())
+            .expect("live context adapter gradient");
+        assert!(
+            g.abs()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+                > 0.0
         );
 
         #[cfg(feature = "model-inference-proof")]

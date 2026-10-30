@@ -149,6 +149,40 @@ jobs:
         env:
           CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
         run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_iris_quant_proof_assets.py --backend candle-cuda'
+      - name: Bind pinned installed bespoke bounded training inputs
+        if: matrix.asset_setup == 'bespoke-training' && runner.os == 'Windows'
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" -I scripts\ci\model_inference_proofs.py --plan --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" > "%RUNNER_TEMP%\model-proof-plan.json"
+          if errorlevel 1 exit /b %ERRORLEVEL%
+          "%REVIEWED_PYTHON%" -I scripts\ci\prepare_bespoke_training_proof_assets.py --plan "%RUNNER_TEMP%\model-proof-plan.json"
+      - name: Bind provisioned Raw snapshot for bounded Krea training
+        if: matrix.asset_setup == 'krea-training' && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $snapshot = 'E:\huggingface\hub\models--krea--Krea-2-Raw\snapshots\4ad9f4b627a647fad78b3dfeebb09f2654aeb494'
+          $required = @('model_index.json', 'transformer/config.json', 'transformer/diffusion_pytorch_model.safetensors.index.json', 'text_encoder/config.json', 'text_encoder/model.safetensors', 'tokenizer/tokenizer.json', 'tokenizer/tokenizer_config.json', 'vae/config.json', 'vae/diffusion_pytorch_model.safetensors')
+          foreach ($relative in $required) {
+            $file = Get-Item -LiteralPath (Join-Path $snapshot $relative)
+            if ($file.PSIsContainer -or $file.Length -eq 0) { throw "Missing/empty Krea asset: $relative" }
+          }
+          $index = Get-Content -LiteralPath (Join-Path $snapshot 'transformer/diffusion_pytorch_model.safetensors.index.json') -Raw | ConvertFrom-Json
+          $shards = @($index.weight_map.PSObject.Properties.Value | Sort-Object -Unique)
+          if ($shards.Count -ne 3) { throw 'Expected three provisioned Raw transformer shards' }
+          foreach ($shard in $shards) {
+            if ($shard -notmatch '^diffusion_pytorch_model-\d{5}-of-00003\.safetensors$') { throw "Invalid Raw shard name: $shard" }
+            $file = Get-Item -LiteralPath (Join-Path $snapshot "transformer/$shard")
+            if ($file.PSIsContainer -or $file.Length -eq 0) { throw "Missing/empty Raw shard: $shard" }
+          }
+          # Layout availability only. The source-owned input witnesses record the
+          # actual files consumed; this path is not a substitute for those receipts.
+          Write-Host "Bound existing Krea Raw snapshot: $snapshot; shards=$($shards -join ',')"
+          "KREA_RAW_DIR=$snapshot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Bind installed pinned assets for exact bounded cohort CUDA proof
+        if: matrix.asset_setup == 'cohort-training' && runner.os == 'Windows'
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" -I scripts\ci\prepare_cohort_training_proof_assets.py'
       - name: Run exact registered model tests under external guards (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash

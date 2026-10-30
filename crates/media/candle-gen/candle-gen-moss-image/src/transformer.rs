@@ -2,6 +2,7 @@
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{self, Module};
 use candle_gen::gen_core::CancelFlag;
+use candle_gen::train::projection::FrozenProjectionPack;
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
 use gen_core_moss_image::moss_image::MossImageConfig;
@@ -127,6 +128,58 @@ impl Linear {
             edit_fused_bias: false,
         })
     }
+    fn prepare_frozen_group(layers: &mut [&mut Self]) -> Result<Option<FrozenProjectionPack>> {
+        if layers.iter().any(|l| {
+            l.low_rank.is_some()
+                || l.edit_fused_bias
+                || (l.dtype() == DType::BF16 && l.base.weight().device().is_cpu())
+        }) {
+            return Ok(None);
+        }
+        let mut facades = layers
+            .iter()
+            .map(|l| {
+                let (out, input) = l.base.weight().dims2()?;
+                Ok(candle_gen::quant::AdaptLinear::from_dense(
+                    l.base.clone(),
+                    input,
+                    out,
+                ))
+            })
+            .collect::<candle_gen::candle_core::Result<Vec<_>>>()?;
+        let pack =
+            FrozenProjectionPack::prepare_adapt(&mut facades.iter_mut().collect::<Vec<_>>())?;
+        if pack.is_some() {
+            for (layer, facade) in layers.iter_mut().zip(&facades) {
+                layer.base = facade.dense_base().unwrap().clone();
+            }
+        }
+        Ok(pack)
+    }
+
+    fn forward_frozen_group(
+        pack: &FrozenProjectionPack,
+        x: &Tensor,
+        layers: &[&Self],
+    ) -> Result<Vec<Tensor>> {
+        let facades = layers
+            .iter()
+            .map(|l| {
+                let (out, input) = l.base.weight().dims2()?;
+                Ok(candle_gen::quant::AdaptLinear::from_dense(
+                    l.base.clone(),
+                    input,
+                    out,
+                ))
+            })
+            .collect::<candle_gen::candle_core::Result<Vec<_>>>()?;
+        pack.forward_adapt(x, &facades.iter().collect::<Vec<_>>())?
+            .into_iter()
+            .zip(layers)
+            .map(|(y, l)| l.apply_residuals(x, y))
+            .collect()
+    }
+
     fn dtype(&self) -> DType {
         self.base.weight().dtype()
     }
@@ -153,7 +206,9 @@ impl Linear {
         }
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let mut output = self.forward_dmd(x)?;
+        self.apply_residuals(x, self.forward_dmd(x)?)
+    }
+    fn apply_residuals(&self, x: &Tensor, mut output: Tensor) -> Result<Tensor> {
         for residual in &self.residuals {
             let frozen;
             let residual = if self.residuals_frozen {
@@ -211,12 +266,7 @@ impl Norm {
         Ok(Self(t))
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let f = x.to_dtype(DType::F32)?;
-        let normalized = f.broadcast_mul(
-            &((f.sqr()?.mean_keepdim(candle_gen::candle_core::D::Minus1)? + 1e-6)?
-                .sqrt()?
-                .recip()?),
-        )?;
+        let normalized = candle_gen::train::norm::rms_normalize_f32(x, 1e-6)?;
         // PyTorch promotes the normalized activation when the norm weight is an FP32 island.
         let dtype = if x.dtype() == DType::F32 || self.0.dtype() == DType::F32 {
             DType::F32
@@ -321,10 +371,21 @@ fn attention(q: &Tensor, k: &Tensor, v: &Tensor, r: &Tensor, heads: usize) -> Re
     let (b, s, d) = q.dims3()?;
     let output_dtype = v.dtype();
     // Explicit FP32 score and value accumulation, then round to the activation dtype.
-    let scores = {
-        let (q, kt) = attention_qk_operands(q, k, output_dtype, r, heads)?;
-        (q.matmul(&kt)? / ((d / heads) as f64).sqrt())?
-    };
+    let (qh, kt) = attention_qk_operands(q, k, output_dtype, r, heads)?;
+    let vh = attention_value_operand(v, heads)?;
+    if let Some(out) = candle_gen::fused_attention::try_training_sdpa_bhsd(
+        &qh,
+        &kt.transpose(2, 3)?,
+        &vh,
+        1.0 / ((d / heads) as f64).sqrt(),
+        None,
+    )? {
+        return Ok(out
+            .to_dtype(output_dtype)?
+            .transpose(1, 2)?
+            .reshape((b, s, d))?);
+    }
+    let scores = (qh.matmul(&kt)? / ((d / heads) as f64).sqrt())?;
     // The optimized inference kernel uses apply_op1_no_bwd and severs every Q/K adapter
     // gradient. Recorded training/recomputation graphs must use differentiable FP32 softmax.
     let p = if scores.track_op() {
@@ -332,7 +393,7 @@ fn attention(q: &Tensor, k: &Tensor, v: &Tensor, r: &Tensor, heads: usize) -> Re
     } else {
         candle_nn::ops::softmax_last_dim(&scores)?
     };
-    Ok(p.matmul(&attention_value_operand(v, heads)?)?
+    Ok(p.matmul(&vh)?
         .to_dtype(output_dtype)?
         .transpose(1, 2)?
         .reshape((b, s, d))?)
@@ -406,6 +467,7 @@ impl TextBlock {
     }
 }
 struct Block {
+    projection_pack: Option<FrozenProjectionPack>,
     n1: Norm,
     n2: Norm,
     qn: Norm,
@@ -427,6 +489,7 @@ impl Block {
         keys: &mut BTreeSet<String>,
     ) -> Result<Self> {
         Ok(Self {
+            projection_pack: None,
             n1: Norm::load(w, &format!("{p}.norm1"), g.dim, keys)?,
             n2: Norm::load(w, &format!("{p}.norm2"), g.dim, keys)?,
             qn: Norm::load(w, &format!("{p}.q_norm"), g.dim / g.heads, keys)?,
@@ -471,27 +534,27 @@ impl Block {
             .broadcast_add(&part(0)?.to_dtype(dtype)?)?
             .to_dtype(self.q.dtype())?;
         let (b, s, d) = y.dims3()?;
+        let (q, k, v) = if let Some(pack) = &self.projection_pack {
+            candle_gen::train::profile::cohort_reuse("moss:frozen-projection-pack");
+            let mut ys =
+                Linear::forward_frozen_group(pack, &y, &[&self.q, &self.k, &self.v])?.into_iter();
+            (ys.next().unwrap(), ys.next().unwrap(), ys.next().unwrap())
+        } else {
+            (
+                self.q.forward(&y)?,
+                self.k.forward(&y)?,
+                self.v.forward(&y)?,
+            )
+        };
         let q = self
             .qn
-            .forward(
-                &self
-                    .q
-                    .forward(&y)?
-                    .reshape((b, s, self.heads, d / self.heads))?,
-            )?
+            .forward(&q.reshape((b, s, self.heads, d / self.heads))?)?
             .reshape((b, s, d))?;
         let k = self
             .kn
-            .forward(
-                &self
-                    .k
-                    .forward(&y)?
-                    .reshape((b, s, self.heads, d / self.heads))?,
-            )?
+            .forward(&k.reshape((b, s, self.heads, d / self.heads))?)?
             .reshape((b, s, d))?;
-        let projected = self
-            .o
-            .forward(&attention(&q, &k, &self.v.forward(&y)?, r, self.heads)?)?;
+        let projected = self.o.forward(&attention(&q, &k, &v, r, self.heads)?)?;
         // Selective custom targets can widen Q without widening O (or vice versa). Promote
         // the actual multiplication/addition operands, never infer O's dtype from Q.
         let promoted = |a: DType, b: DType| {
@@ -530,6 +593,8 @@ impl Block {
 
 pub(crate) struct Transformer {
     resident_bytes: u64,
+    training_context: HashMap<candle_gen::candle_core::TensorId, Tensor>,
+    training_rope: Vec<((usize, usize, usize, DType), Tensor)>,
     g: Geometry,
     video: Linear,
     text: Linear,
@@ -543,6 +608,73 @@ pub(crate) struct Transformer {
     final_linear: Linear,
 }
 impl Transformer {
+    pub(crate) fn training_preparation_bytes(&self, inputs: &[(&Tensor, usize, usize)]) -> u64 {
+        let mut ids = std::collections::HashSet::new();
+        let mut geometry = std::collections::HashSet::new();
+        let mut bytes = 0usize;
+        for (context, h, w) in inputs {
+            let tokens = context.dims()[1];
+            if ids.insert(context.id()) {
+                bytes += tokens * self.g.dim * 4;
+            }
+            if geometry.insert((*h, *w, tokens)) {
+                bytes += (h * w + tokens)
+                    * (self.g.dim / self.g.heads)
+                    * self.video.dtype().size_in_bytes();
+            }
+        }
+        bytes as u64
+    }
+
+    /// Called once after adapter installation/resume, only for existing cached captions.
+    /// Uncached text remains uncached; previews and misses never extend run residency.
+    pub(crate) fn prepare_training(&mut self, inputs: &[(&Tensor, usize, usize)]) -> Result<()> {
+        for block in &mut self.layers {
+            if block.projection_pack.is_none() {
+                block.projection_pack =
+                    Linear::prepare_frozen_group(&mut [&mut block.q, &mut block.k, &mut block.v])?;
+            }
+        }
+        self.training_context.clear();
+        self.training_rope.clear();
+        for (context, h, w) in inputs {
+            let tokens = context.dim(1)?;
+            let key = (*h, *w, tokens, self.video.dtype());
+            if !self.training_rope.iter().any(|(k, _)| *k == key) {
+                self.training_rope.push((
+                    key,
+                    rope(
+                        *h,
+                        *w,
+                        tokens,
+                        self.g.dim / self.g.heads,
+                        self.video.dtype(),
+                        self.device(),
+                    )?,
+                ));
+            }
+            if !self.training_context.contains_key(&context.id()) {
+                let r = &self
+                    .training_rope
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .unwrap()
+                    .1;
+                let mut text = self.project_context(context)?;
+                for block in &self.text_blocks {
+                    text = block.forward(&text, &r.narrow(1, h * w, tokens)?)?;
+                }
+                if text.track_op() {
+                    return Err(CandleError::Msg(
+                        "MOSS cannot cache trainable text conditioning".into(),
+                    ));
+                }
+                self.training_context.insert(context.id(), text);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn channels(&self) -> usize {
         self.g.channels
     }
@@ -551,6 +683,16 @@ impl Transformer {
     }
     pub(crate) fn resident_bytes(&self) -> u64 {
         self.resident_bytes
+            + self
+                .training_context
+                .values()
+                .map(|t| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
+                .sum::<u64>()
+            + self
+                .training_rope
+                .iter()
+                .map(|(_, t)| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
+                .sum::<u64>()
             + self
                 .layers
                 .iter()
@@ -567,6 +709,8 @@ impl Transformer {
         let mut keys = BTreeSet::new();
         let mut result = Self {
             resident_bytes: 0,
+            training_context: HashMap::new(),
+            training_rope: Vec::new(),
             g,
             video: Linear::load(
                 w,
@@ -909,18 +1053,34 @@ impl Transformer {
             .to_dtype(self.video.dtype())?
             .contiguous()?;
         let video = self.video.forward(&video)?;
-        let r = rope(
-            h,
-            w,
-            tokens,
-            self.g.dim / self.g.heads,
-            video.dtype(),
-            x.device(),
-        )?;
-        let mut text = self.project_context(context)?;
-        for block in &self.text_blocks {
-            text = block.forward(&text, &r.narrow(1, h * w, tokens)?)?;
-        }
+        let r = match self
+            .training_rope
+            .iter()
+            .find(|(key, _)| *key == (h, w, tokens, video.dtype()))
+        {
+            Some((_, r)) => {
+                candle_gen::train::profile::cohort_reuse("moss:geometry-storage-hit");
+                r.clone()
+            }
+            None => rope(
+                h,
+                w,
+                tokens,
+                self.g.dim / self.g.heads,
+                video.dtype(),
+                x.device(),
+            )?,
+        };
+        let text = if let Some(text) = self.training_context.get(&context.id()) {
+            candle_gen::train::profile::cohort_reuse("moss:frozen-caption-storage-hit");
+            text.clone()
+        } else {
+            let mut text = self.project_context(context)?;
+            for block in &self.text_blocks {
+                text = block.forward(&text, &r.narrow(1, h * w, tokens)?)?;
+            }
+            text
+        };
         let y = Tensor::cat(&[video, text], 1)?.detach();
         let finish = |y: &Tensor| -> Result<Tensor> {
             let y = self
@@ -935,11 +1095,11 @@ impl Transformer {
                 .to_dtype(dtype)?
                 .broadcast_mul(&(head.i((.., 1, ..))?.unsqueeze(1)?.to_dtype(dtype)? + 1.)?)?
                 .broadcast_add(&head.i((.., 0, ..))?.unsqueeze(1)?.to_dtype(dtype)?)?;
-            let pred = self
+            let pred = __model_proof_output!(self
                 .final_linear
-                .forward(&y.to_dtype(self.final_linear.dtype())?)?
-                .transpose(1, 2)?
-                .reshape((1, c, h, w))?;
+                .forward(&y.to_dtype(self.final_linear.dtype())?))?
+            .transpose(1, 2)?
+            .reshape((1, c, h, w))?;
             Ok(candle_gen::train::flow_match::weighted_velocity_loss(
                 &pred, target, mask, mae,
             )?)

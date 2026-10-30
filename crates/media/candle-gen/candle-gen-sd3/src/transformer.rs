@@ -25,7 +25,7 @@
 //! The forward predicts the flow-match velocity in patchified space and unpatchifies to the
 //! 16-channel latent. C1 builds the FULL Large forward at real shapes; C2 drives it from a pipeline.
 
-use candle_gen::candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_gen::candle_core::{DType, Device, Module, Result, Tensor, TensorId, D};
 use candle_gen::candle_nn::{self, RmsNorm, VarBuilder};
 use candle_gen::gen_core::Quant;
 
@@ -39,6 +39,7 @@ use crate::config::Sd3Config;
 // and the residuals survive it. With no adapter the forward is byte-identical to the bare base.
 use crate::quant::{conv2d_to, linear_detect_dense, rms_norm_to};
 use candle_gen::quant::AdaptLinear as QLinear;
+use candle_gen::train::projection::FrozenProjectionPack;
 
 /// Affine-free LayerNorm eps (diffusers `elementwise_affine=False, eps=1e-6` on the AdaLN norms).
 const LN_EPS: f64 = 1e-6;
@@ -335,6 +336,10 @@ fn to_heads(x: &Tensor, heads: usize, head_dim: usize, norm: Option<&RmsNorm>) -
     let (b, s, _) = x.dims3()?;
     let x = x.reshape((b, s, heads, head_dim))?;
     let x = match norm {
+        Some(n) if x.track_op() || n.weight().track_op() => {
+            candle_gen::train::profile::cohort_reuse("sd3:differentiable-QK-RMS");
+            candle_gen::train::norm::rms_norm_cast_before_weight(&x, n.weight(), n.eps())?
+        }
         Some(n) => n.forward(&x)?,
         None => x,
     };
@@ -351,7 +356,7 @@ fn to_heads(x: &Tensor, heads: usize, head_dim: usize, norm: Option<&RmsNorm>) -
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor, head_dim: usize) -> Result<Tensor> {
     let (b, h, s, d) = q.dims4()?;
     let scale = (head_dim as f64).powf(-0.5);
-    let o = candle_gen::sdpa_budgeted_bhsd(
+    let o = candle_gen::fused_attention::training_sdpa_budgeted_bhsd(
         q,
         k,
         v,
@@ -363,15 +368,32 @@ fn attention(q: &Tensor, k: &Tensor, v: &Tensor, head_dim: usize) -> Result<Tens
     o.transpose(1, 2)?.reshape((b, s, h * d))
 }
 
+fn project_qkv(
+    pack: Option<&FrozenProjectionPack>,
+    x: &Tensor,
+    layers: [&QLinear; 3],
+) -> Result<Vec<Tensor>> {
+    match pack {
+        Some(pack) => {
+            let output = pack.forward_adapt(x, &layers)?;
+            candle_gen::train::profile::cohort_reuse("sd3:actual-frozen-QKV-pack");
+            Ok(output)
+        }
+        None => layers.iter().map(|p| p.forward(x)).collect(),
+    }
+}
+
 /// Joint attention for a SD3.5 joint block: separate image (`to_q/k/v`) and text (`add_q/k/v_proj`)
 /// projections with per-head q/k RMSNorm, attention over the concatenated `[text, image]` sequence
 /// (NO RoPE), split back. Returns `(image_out, text_out)`; `text_out` is `None` when the block is
 /// `context_pre_only` (the final block has no `to_add_out`).
 struct JointAttention {
+    qkv_pack: Option<FrozenProjectionPack>,
     to_q: QLinear,
     to_k: QLinear,
     to_v: QLinear,
     to_out: QLinear,
+    added_qkv_pack: Option<FrozenProjectionPack>,
     add_q: QLinear,
     add_k: QLinear,
     add_v: QLinear,
@@ -416,10 +438,12 @@ impl JointAttention {
             )?)
         };
         Ok(Self {
+            qkv_pack: None,
             to_q: QLinear::linear_detect(inner, inner, &vb, "to_q", true)?,
             to_k: QLinear::linear_detect(inner, inner, &vb, "to_k", true)?,
             to_v: QLinear::linear_detect(inner, inner, &vb, "to_v", true)?,
             to_out,
+            added_qkv_pack: None,
             add_q: QLinear::linear_detect(inner, inner, &vb, "add_q_proj", true)?,
             add_k: QLinear::linear_detect(inner, inner, &vb, "add_k_proj", true)?,
             add_v: QLinear::linear_detect(inner, inner, &vb, "add_v_proj", true)?,
@@ -431,6 +455,20 @@ impl JointAttention {
             heads: cfg.num_heads,
             head_dim: hd,
         })
+    }
+
+    fn prepare_training(&mut self) -> Result<()> {
+        self.qkv_pack = FrozenProjectionPack::prepare_adapt(&mut [
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+        ])?;
+        self.added_qkv_pack = FrozenProjectionPack::prepare_adapt(&mut [
+            &mut self.add_q,
+            &mut self.add_k,
+            &mut self.add_v,
+        ])?;
+        Ok(())
     }
 
     /// Fold every projection (image q/k/v/out + text add_q/k/v + to_add_out) to `Q4_0`/`Q8_0`
@@ -508,22 +546,22 @@ impl JointAttention {
         let (h, hd) = (self.heads, self.head_dim);
         let txt_seq = norm_txt.dim(1)?;
 
-        let iq = to_heads(&self.to_q.forward(norm_img)?, h, hd, self.norm_q.as_ref())?;
-        let ik = to_heads(&self.to_k.forward(norm_img)?, h, hd, self.norm_k.as_ref())?;
-        let iv = to_heads(&self.to_v.forward(norm_img)?, h, hd, None)?;
-        let tq = to_heads(
-            &self.add_q.forward(norm_txt)?,
-            h,
-            hd,
-            self.norm_added_q.as_ref(),
+        let image = project_qkv(
+            self.qkv_pack.as_ref(),
+            norm_img,
+            [&self.to_q, &self.to_k, &self.to_v],
         )?;
-        let tk = to_heads(
-            &self.add_k.forward(norm_txt)?,
-            h,
-            hd,
-            self.norm_added_k.as_ref(),
+        let iq = to_heads(&image[0], h, hd, self.norm_q.as_ref())?;
+        let ik = to_heads(&image[1], h, hd, self.norm_k.as_ref())?;
+        let iv = to_heads(&image[2], h, hd, None)?;
+        let text = project_qkv(
+            self.added_qkv_pack.as_ref(),
+            norm_txt,
+            [&self.add_q, &self.add_k, &self.add_v],
         )?;
-        let tv = to_heads(&self.add_v.forward(norm_txt)?, h, hd, None)?;
+        let tq = to_heads(&text[0], h, hd, self.norm_added_q.as_ref())?;
+        let tk = to_heads(&text[1], h, hd, self.norm_added_k.as_ref())?;
+        let tv = to_heads(&text[2], h, hd, None)?;
 
         // Concat [txt, img] along the sequence axis (NO RoPE).
         let q = Tensor::cat(&[&tq, &iq], 2)?;
@@ -549,6 +587,7 @@ impl JointAttention {
 /// but it does NOT touch the text stream and runs over the image sequence alone (NO RoPE, like the
 /// rest of SD3.5). Only constructed for `dual_attention_layers` blocks.
 struct SelfAttention {
+    qkv_pack: Option<FrozenProjectionPack>,
     to_q: QLinear,
     to_k: QLinear,
     to_v: QLinear,
@@ -573,6 +612,7 @@ impl SelfAttention {
         };
         Ok(Self {
             // Packed-detecting `attn2` projections (sc-9414); `to_out.0` base preserves the nested key.
+            qkv_pack: None,
             to_q: QLinear::linear_detect(inner, inner, &vb, "to_q", true)?,
             to_k: QLinear::linear_detect(inner, inner, &vb, "to_k", true)?,
             to_v: QLinear::linear_detect(inner, inner, &vb, "to_v", true)?,
@@ -582,6 +622,15 @@ impl SelfAttention {
             heads: cfg.num_heads,
             head_dim: hd,
         })
+    }
+
+    fn prepare_training(&mut self) -> Result<()> {
+        self.qkv_pack = FrozenProjectionPack::prepare_adapt(&mut [
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+        ])?;
+        Ok(())
     }
 
     /// Fold the image-only `attn2` projections (q/k/v/out) to `Q4_0`/`Q8_0` in place.
@@ -622,9 +671,14 @@ impl SelfAttention {
     /// Returns the image-only attention output `[B, img_seq, inner]` (before the `gate_msa2` gate).
     fn forward(&self, norm_img2: &Tensor) -> Result<Tensor> {
         let (h, hd) = (self.heads, self.head_dim);
-        let q = to_heads(&self.to_q.forward(norm_img2)?, h, hd, self.norm_q.as_ref())?;
-        let k = to_heads(&self.to_k.forward(norm_img2)?, h, hd, self.norm_k.as_ref())?;
-        let v = to_heads(&self.to_v.forward(norm_img2)?, h, hd, None)?;
+        let projected = project_qkv(
+            self.qkv_pack.as_ref(),
+            norm_img2,
+            [&self.to_q, &self.to_k, &self.to_v],
+        )?;
+        let q = to_heads(&projected[0], h, hd, self.norm_q.as_ref())?;
+        let k = to_heads(&projected[1], h, hd, self.norm_k.as_ref())?;
+        let v = to_heads(&projected[2], h, hd, None)?;
         let o = attention(&q, &k, &v, hd)?; // [B, img_seq, inner]
         self.to_out.forward(&o)
     }
@@ -934,6 +988,7 @@ pub struct Sd3Transformer {
     norm_out: AdaLayerNormContinuous,
     proj_out: QLinear,
     cfg: Sd3Config,
+    prepared_context_ids: Vec<(TensorId, TensorId)>,
 }
 
 impl Sd3Transformer {
@@ -968,7 +1023,38 @@ impl Sd3Transformer {
             norm_out: AdaLayerNormContinuous::new(inner, vb.pp("norm_out"))?,
             proj_out: QLinear::linear_detect(inner, cfg.patch_dim(), &vb, "proj_out", true)?,
             cfg: cfg.clone(),
+            prepared_context_ids: Vec::new(),
         })
+    }
+
+    /// Replace a frozen initial caption projection in the run cache. The caller drops the
+    /// unprojected caption, so preparation retains only the smaller projected stream. Joint
+    /// block text states and adapted context embedders always stay live.
+    pub fn prepare_training_context(&mut self, context: &Tensor) -> Result<Tensor> {
+        let Some(base) = self.context_embedder.dense_base() else {
+            return Ok(context.clone());
+        };
+        if self.context_embedder.is_adapted() || base.weight().track_op() || context.track_op() {
+            return Ok(context.clone());
+        }
+        let base_id = base.weight().id();
+        let projected = self
+            .context_embedder
+            .forward(&context.to_dtype(base.weight().dtype())?)?;
+        self.prepared_context_ids.push((projected.id(), base_id));
+        Ok(projected)
+    }
+
+    /// Prepare the job-owned dense bases after adapter installation. Packs share storage with
+    /// their source projections; packed and full-trainable bases retain their original route.
+    pub fn prepare_training(&mut self) -> Result<()> {
+        for block in &mut self.blocks {
+            block.attn.prepare_training()?;
+            if let Some(attn) = &mut block.attn2 {
+                attn.prepare_training()?;
+            }
+        }
+        Ok(())
     }
 
     /// Fold every compute-heavy MMDiT projection to `Q4_0`/`Q8_0` **in place** — uniform across the
@@ -1076,9 +1162,24 @@ impl Sd3Transformer {
         let (mut img, h, w) = self.pos_embed.forward(latent)?; // [B, h*w, inner]
                                                                // Run the whole DiT in the image stream's (loaded weight) dtype so every joint matmul agrees
                                                                // — the context arrives in f32 (aggregator) and must be cast to match (sc-7881, C6).
-        let mut txt = self
-            .context_embedder
-            .forward(&context.to_dtype(img.dtype())?)?; // [B, ctx_seq, inner]
+        let mut txt = if let Some((_, base_id)) = self
+            .prepared_context_ids
+            .iter()
+            .find(|(id, _)| *id == context.id())
+        {
+            if self.context_embedder.is_adapted()
+                || self.context_embedder.dense_base().map(|b| b.weight().id()) != Some(*base_id)
+            {
+                candle_gen::candle_core::bail!(
+                    "prepared SD3 context invalidated by context embedder change"
+                );
+            }
+            candle_gen::train::profile::cohort_reuse("sd3:frozen-context-storage-hit");
+            context.to_dtype(img.dtype())?
+        } else {
+            self.context_embedder
+                .forward(&context.to_dtype(img.dtype())?)?
+        }; // [B, ctx_seq, inner]
 
         for block in &self.blocks {
             let (i, t) = block.forward(&img, &txt, &temb)?;

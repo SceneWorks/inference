@@ -1,5 +1,6 @@
 """Mock collector integration: no Cargo, model, weights, GPU or real resource probes."""
 import contextlib
+import copy
 import importlib.util
 import json
 import os
@@ -57,7 +58,166 @@ def external_case(grade='reader-binding'):
     return row, 'MODEL_INFERENCE_INPUT_USED ' + row['fqn'] + ' ' + json.dumps(packet) + '\n'
 
 
+def adapter_spec():
+    return {'kind': 'lora', 'rank': 2, 'dtype': 'F32', 'per_target_alpha': True,
+            'max_bytes': 4096, 'targets': {'blocks.0.to_q': [3, 4]}}
+
+
+def flux3_adapter_spec():
+    return {**adapter_spec(), 'metadata_format': 'flux3', 'alpha': 2.0, 'per_target_alpha': False}
+
+
+def adapter_bytes(mutate=None, *, flux3=False):
+    # Format-only fixture: zero bytes, no tensor library or learned execution.
+    header = {'__metadata__': {'networkType': 'lora', 'rank': '2', 'alpha': '2'}}
+    factors = [('lora_A.weight', [2, 4]), ('lora_B.weight', [3, 2])]
+    if flux3:
+        # Native export_adapter metadata, without product changes or invented aliases.
+        header['__metadata__'] = {
+            'base_model': 'MOCK model identity; not attested', 'base_revision': 'MOCK revision',
+            'network_type': 'lora', 'rank': '2', 'lora_alpha': '2', 'scaling_convention': 'alpha/rank',
+            'training_identity': '{}', 'lora_adapter_metadata': json.dumps({
+                'peft_type': 'LORA', 'r': 2, 'lora_alpha': 2.0, 'use_rslora': False,
+                'use_dora': False, 'rank_pattern': {}, 'alpha_pattern': {}})}
+    else:
+        factors.append(('alpha', [1]))
+    end = 0
+    for name, shape in factors:
+        count = 1
+        for dim in shape:
+            count *= dim
+        header['blocks.0.to_q.' + name] = {'dtype': 'F32', 'shape': shape, 'data_offsets': [end, end + 4*count]}
+        end += 4*count
+    if mutate:
+        mutate(header)
+    raw = json.dumps(header, separators=(',', ':')).encode()
+    raw += b' ' * (-len(raw) % 8)
+    return len(raw).to_bytes(8, 'little') + raw + bytes(end)
+
+
 class Collector(unittest.TestCase):
+    def test_native_flux3_metadata_requires_explicit_typed_source_contract(self):
+        proof.validate_generated_lora_bytes(adapter_bytes(flux3=True), flux3_adapter_spec())
+        for changes in ({'metadata_format': 'unknown'}, {'per_target_alpha': True},
+                        {'alpha': None}, {'alpha': True}, {'alpha': float('inf')}, {'alpha': 0}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                proof.validate_generated_adapter_spec({**flux3_adapter_spec(), **changes})
+        for spec, raw in ((adapter_spec(), adapter_bytes(flux3=True)),
+                          (flux3_adapter_spec(), adapter_bytes())):
+            with self.assertRaises(ValueError):
+                proof.validate_generated_lora_bytes(raw, spec)
+
+    def test_native_flux3_rejects_conflicting_metadata_and_wrong_factors(self):
+        def peft_change(header, **changes):
+            metadata = header['__metadata__']
+            peft = json.loads(metadata['lora_adapter_metadata'])
+            metadata['lora_adapter_metadata'] = json.dumps({**peft, **changes})
+        mutations = [
+            lambda h: h['__metadata__'].pop('rank'),
+            lambda h: h['__metadata__'].pop('lora_adapter_metadata'),
+            lambda h: h['__metadata__'].update(network_type='checkpoint'),
+            lambda h: h['__metadata__'].update(networkType='lora'),
+            lambda h: h['__metadata__'].update(alpha='2'),
+            lambda h: h['__metadata__'].update(lora_alpha='nan'),
+            lambda h: h['__metadata__'].update(lora_alpha='3'),
+            lambda h: h['__metadata__'].update(rank='3'),
+            lambda h: h['__metadata__'].update(scaling_convention='alpha/sqrt(rank)'),
+            lambda h: h['__metadata__'].update(lora_adapter_metadata='{"r":2,"r":2}'),
+            lambda h: peft_change(h, lora_alpha=3),
+            lambda h: peft_change(h, use_dora=True),
+            lambda h: peft_change(h, rank_pattern={'blocks.0.to_q': 3}),
+            lambda h: h.update({'model.weight': h.pop('blocks.0.to_q.lora_A.weight')}),
+            lambda h: h['blocks.0.to_q.lora_A.weight'].update(shape=[4, 2]),
+            lambda h: h['blocks.0.to_q.lora_B.weight'].update(data_offsets=[0, 24]),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                proof.validate_generated_lora_bytes(adapter_bytes(mutate, flux3=True), flux3_adapter_spec())
+
+    def test_native_flux3_survives_collector_without_relaxing_generic_safetensors_ban(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            row = case()
+            name = 'trained/adapter.safetensors'
+            row['output_artifacts'] = [name]
+            row['generated_adapter_artifacts'] = {name: flux3_adapter_spec()}
+            raw = adapter_bytes(flux3=True)
+            status, _, verified, _, output = self._mock_run(root, row_override=row, generated_outputs={name: raw})
+            self.assertEqual(status, 0)
+            self.assertTrue(verified['accepted_model_run'])  # MOCK ONLY.
+            artifact = output / '00000/generated' / name
+            self.assertEqual(artifact.read_bytes(), raw)
+            with self.assertRaisesRegex(ValueError, 'checkpoint/model payload'):
+                proof.publish_file(artifact, output / 'undeclared.safetensors', output, 4096)
+
+    def test_generated_adapter_requires_exact_declared_output_contract(self):
+        row = case()
+        row['output_artifacts'] = ['trained/adapter.safetensors']
+        row['generated_adapter_artifacts'] = {'trained/adapter.safetensors': adapter_spec()}
+        self.assertEqual(proof.validate_generated_adapter_artifacts(row), row['generated_adapter_artifacts'])
+        for path in ('unlisted.safetensors', '../input.safetensors', '/input.safetensors', 'C:\\input.safetensors'):
+            bad = copy.deepcopy(row)
+            bad['generated_adapter_artifacts'] = {path: adapter_spec()}
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                proof.validate_generated_adapter_artifacts(bad)
+        for key, value in [('kind', 'checkpoint'), ('rank', 4096), ('dtype', 'I64'), ('max_bytes', 0), ('targets', {})]:
+            bad = adapter_spec(); bad[key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                proof.validate_generated_adapter_spec(bad)
+
+    def test_generated_adapter_header_rejects_model_keys_shape_dtype_rank_and_payload(self):
+        proof.validate_generated_lora_bytes(adapter_bytes(), adapter_spec())
+        mutations = [
+            lambda h: h.update({'model.weight': h.pop('blocks.0.to_q.lora_A.weight')}),
+            lambda h: h.pop('blocks.0.to_q.lora_B.weight'),
+            lambda h: h['blocks.0.to_q.lora_A.weight'].update(shape=[4, 2]),
+            lambda h: h['blocks.0.to_q.lora_A.weight'].update(dtype='BF16'),
+            lambda h: h['blocks.0.to_q.lora_A.weight'].update(data_offsets=[0, 28]),
+            lambda h: h['blocks.0.to_q.lora_B.weight'].update(data_offsets=[0, 24]),
+            lambda h: h['__metadata__'].update(rank='3'),
+            lambda h: h['__metadata__'].update(alpha='nan'),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                proof.validate_generated_lora_bytes(adapter_bytes(mutate), adapter_spec())
+        for raw in (adapter_bytes()[:-1], adapter_bytes()+b'extra', b'\xff'*8+b'{}', b'x'*4097):
+            with self.assertRaises(ValueError):
+                proof.validate_generated_lora_bytes(raw, adapter_spec())
+        valid = adapter_bytes()
+        size = int.from_bytes(valid[:8], 'little')
+        utf16_header = valid[8:8+size].decode('utf-8').encode('utf-16')
+        with self.assertRaises(ValueError):
+            proof.validate_generated_lora_bytes(
+                len(utf16_header).to_bytes(8, 'little') + utf16_header + valid[8+size:], adapter_spec())
+
+    def test_adapter_publisher_preserves_checkpoint_input_link_and_size_bans(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            generated = root / 'generated'; generated.mkdir()
+            published = root / 'published'; published.mkdir()
+            source = generated / 'adapter.safetensors'; source.write_bytes(adapter_bytes())
+            destination = published / 'adapter.safetensors'
+            # Even a well-formed LoRA is forbidden without explicit source permission.
+            with self.assertRaises(ValueError):
+                proof.publish_file(source, destination, generated, 4096, destination_root=published)
+            result = proof.publish_file(source, destination, generated, 4096, destination_root=published, adapter=adapter_spec())
+            self.assertEqual(result['bytes'], len(adapter_bytes()))
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+            external = root / 'existing-input.safetensors'; external.write_bytes(adapter_bytes())
+            with self.assertRaises(ValueError):
+                proof.publish_file(external, destination, generated, 4096, destination_root=published, adapter=adapter_spec())
+            source.unlink(); os.link(external, source)
+            with self.assertRaises(ValueError):
+                proof.publish_file(source, destination, generated, 4096, destination_root=published, adapter=adapter_spec())
+            source.unlink(); source.symlink_to(external)
+            with self.assertRaises(ValueError):
+                proof.publish_file(source, destination, generated, 4096, destination_root=published, adapter=adapter_spec())
+            source.unlink(); source.write_bytes(adapter_bytes())
+            with self.assertRaises(ValueError):
+                proof.publish_file(source, destination, generated, 32, destination_root=published, adapter=adapter_spec())
+            source.write_bytes(adapter_bytes(lambda h: h.update({'model.weight': h.pop('blocks.0.to_q.lora_A.weight')})))
+            with self.assertRaises(ValueError):
+                proof.publish_file(source, destination, generated, 4096, destination_root=published, adapter=adapter_spec())
     def test_global_cuda_card_bound_is_labeled_without_attributed_peak(self):
         # CI_IMPACT: pure result-label check; adds no model, Cargo, GPU or process work.
         bounded = safety.RunResult(1, 0, 0, None, 0, 0, 0.1,
@@ -72,6 +232,7 @@ class Collector(unittest.TestCase):
         self.assertEqual(proof.gpu_peak_observation(multi),
                          'global-used-upper-bound-sampled/not-child-attributed')
 
+    @unittest.skipIf(os.name == 'nt', 'Unix proxy contract; Windows pinned binaries have separate tests')
     def test_toolchain_uses_declaration_and_verified_proxies_for_actual_commands(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -226,7 +387,7 @@ class Collector(unittest.TestCase):
                 proof.publish_file(source, destination / 'hard.png', root, 100)
             self.assertEqual(victim.read_bytes(), b'private')
 
-    def _mock_run(self, root, *, fail=False, missing=False, preseal=None, row_override=None, input_body='', observer_events=True):
+    def _mock_run(self, root, *, fail=False, missing=False, preseal=None, row_override=None, input_body='', observer_events=True, generated_outputs=None):
         row = case() if row_override is None else row_override
         if missing:
             row['required_environment'] = ['MODEL_PROOF_TEST_PREREQUISITE_ABSENT']
@@ -242,6 +403,11 @@ class Collector(unittest.TestCase):
         def guarded(argv, **kwargs):
             self.assertEqual(kwargs['env']['CARGO_ENCODED_RUSTFLAGS'], 'MOCK_NATIVE_LINKER_FLAGS')
             discovery = '--list' in argv
+            if not discovery:
+                for name, payload in (generated_outputs or {}).items():
+                    generated = Path(kwargs['env']['MODEL_PROOF_OUTPUT_DIR']) / name
+                    generated.parent.mkdir(parents=True, exist_ok=True)
+                    generated.write_bytes(payload)
             text = (row['fqn'] + ': test\n\n1 test, 0 benchmarks\n') if discovery else (
                 'test result: ok. 1 passed; 0 failed; 0 ignored;\n'
                 'MODEL_INFERENCE_BODY_COMPLETED ' + row['fqn'] + '\n'
@@ -297,6 +463,44 @@ class Collector(unittest.TestCase):
             self.assertTrue(verified['accepted_model_run'])  # MOCK ONLY, temp tree removed.
             self.assertTrue((output / '00000/body.events.jsonl').is_file())
             self.assertFalse(any(path.suffix == '.safetensors' for path in output.rglob('*')))
+
+    def test_generated_adapter_survives_existing_collector_and_reverification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            row = case()
+            name = 'trained/adapter.safetensors'
+            row['output_artifacts'] = [name]
+            row['generated_adapter_artifacts'] = {name: adapter_spec()}
+            status, receipt, verified, _, output = self._mock_run(
+                Path(temporary).resolve(), row_override=row, generated_outputs={name: adapter_bytes()})
+            self.assertEqual(status, 0)
+            self.assertTrue(verified['accepted_model_run'])  # MOCK ONLY.
+            self.assertEqual((output / '00000/generated' / name).read_bytes(), adapter_bytes())
+            self.assertTrue(any(item['path'].endswith(name) for item in receipt['cases'][0]['outputs']))
+
+    def test_adapter_reverification_rejects_removed_output_and_rehashed_model_payload(self):
+        for remove in (False, True):
+            with self.subTest(remove=remove), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                row = case()
+                name = 'trained/adapter.safetensors'
+                row['output_artifacts'] = [name]
+                row['generated_adapter_artifacts'] = {name: adapter_spec()}
+                _, receipt, _, _, output = self._mock_run(
+                    root, row_override=row, generated_outputs={name: adapter_bytes()})
+                result = receipt['cases'][0]
+                artifact = output / '00000/generated' / name
+                record = next(item for item in result['outputs'] if item['path'].endswith(name))
+                if remove:
+                    artifact.unlink()
+                    result['outputs'].remove(record)
+                else:
+                    raw = adapter_bytes(lambda h: h.update({'model.weight': h.pop('blocks.0.to_q.lora_A.weight')}))
+                    artifact.write_bytes(raw)
+                    record.update(bytes=len(raw), sha256=proof.hashlib.sha256(raw).hexdigest())
+                (output / 'receipt.json').write_text(json.dumps(receipt), encoding='utf-8')
+                (output / '00000/result.json').write_text(json.dumps(result), encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'required generated output|unapproved/model tensor'):
+                    proof.verify_artifacts(output, root, request(), '1' * 40, (row,))
 
     def test_success_without_optional_observer_events_keeps_actual_supervision(self):
         # CI_IMPACT: pure mocked controller regression for the Windows no-event

@@ -191,6 +191,153 @@ fn read_meta(path: &Path) -> HashMap<String, String> {
     md.metadata().clone().unwrap_or_default()
 }
 
+/// sc-26850 terminal acceptance: ONE invocation, eighteen total optimizer
+/// updates including attribution/warmup. This is smoke/throughput evidence,
+/// not a convergence claim. The existing historical tests remain separate.
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn krea_bounded_acceleration_profile() {
+    #[cfg(not(feature = "model-inference-proof"))]
+    panic!("requires explicit model-inference-proof feature and registered CUDA lane");
+    #[cfg(feature = "model-inference-proof")]
+    {
+        let raw = std::env::var("KREA_RAW_DIR")
+            .map(PathBuf::from)
+            .expect("KREA_RAW_DIR required; Turbo is not a Raw timing baseline");
+        let tmp = std::env::var_os("MODEL_PROOF_OUTPUT_DIR")
+            .map(PathBuf::from)
+            .expect("existing model-proof executor must bind its owned generated output directory")
+            .join("krea_bounded_acceleration");
+        let items = make_dataset(&tmp.join("data"));
+        let mut cfg = config(NetworkType::Lora, 18, false);
+        cfg.rank = 16;
+        cfg.alpha = 16.;
+        cfg.resolution = 1024;
+        cfg.gradient_accumulation = 1;
+        // Preserve the established production preview policy; the one acceptance
+        // sample below is generated after save/reload/apply, outside step timing.
+        cfg.sample_every = 500;
+        let req = TrainingRequest {
+            items,
+            config: cfg,
+            output_dir: tmp.join("out"),
+            file_name: "krea_bounded.safetensors".into(),
+            trigger_words: vec![],
+            cancel: CancelFlag::new(),
+        };
+        let sampler = candle_gen::testkit::PeakSampler::start_rendered();
+        let mut trainer = candle_gen_krea::provider_registry()
+            .unwrap()
+            .load_trainer(
+                "krea_2_raw",
+                &LoadSpec::new(WeightsSource::Dir(raw.clone())),
+            )
+            .unwrap();
+        let mut losses = Vec::new();
+        let out = candle_gen::train::profile::with_bounded_krea_profile(|| {
+            trainer.train(&req, &mut |p| {
+                if let TrainingProgress::Training { loss, .. } = p {
+                    losses.push(loss);
+                }
+            })
+        })
+        .expect("bounded matched profile succeeds");
+        drop(trainer);
+        let peak_mib = sampler.stop();
+        assert!(
+            peak_mib > 0,
+            "peak sampler must observe the selected physical GPU"
+        );
+        assert_eq!(out.steps, 18);
+        assert_eq!(losses.len(), 18);
+        assert!(losses.iter().all(|l| l.is_finite()));
+        assert_eq!(
+            read_meta(&out.adapter_path).get("rank").map(String::as_str),
+            Some("16")
+        );
+        assert_eq!(
+            adapter_keys(&out.adapter_path)
+                .iter()
+                .filter(|k| k.ends_with(".lora_A.weight"))
+                .count(),
+            112
+        );
+        // Production loader reopens the saved file and applies it to the Raw
+        // snapshot. One sample only; no baseline/scale sweep or extra training.
+        let gen = candle_gen_krea::provider_registry()
+            .unwrap()
+            .load(
+                "krea_2_raw",
+                &LoadSpec::new(WeightsSource::Dir(raw)).with_adapters(vec![AdapterSpec::new(
+                    out.adapter_path.clone(),
+                    1.,
+                    AdapterKind::Lora,
+                )]),
+            )
+            .expect("reload/apply saved adapter");
+        let request = GenerationRequest {
+            prompt: "a solid colour swatch number 0".into(),
+            width: 1024,
+            height: 1024,
+            count: 1,
+            seed: Some(7),
+            steps: Some(28),
+            ..Default::default()
+        };
+        let GenerationOutput::Images(images) = gen
+            .generate(&request, &mut |_| {})
+            .expect("one saved-adapter sample")
+        else {
+            panic!("expected images")
+        };
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].pixels.len(), 1024 * 1024 * 3);
+        assert!(images[0].pixels.iter().any(|b| *b != 0));
+        save_image_png(&tmp.join("adapter_sample.png"), &images[0]);
+        // The existing proof publisher retains only explicitly declared files.
+        // Keep the scalar run evidence beside the selected adapter/sample; the
+        // complete per-step timings, attribution and go/no-go remain in the
+        // independently retained body.stderr.log, where the driver emits them.
+        let metrics = serde_json::json!({
+            "schema_version": 1,
+            "completed_optimizer_updates": out.steps,
+            "configuration": {
+                "rank": req.config.rank,
+                "alpha": req.config.alpha,
+                "learning_rate": req.config.learning_rate,
+                "optimizer": &req.config.optimizer,
+                "resolution": req.config.resolution,
+                "train_dtype": &req.config.train_dtype,
+                "gradient_accumulation": req.config.gradient_accumulation,
+                "gradient_checkpointing": req.config.gradient_checkpointing,
+                "seed": req.config.seed,
+                "sample_every": req.config.sample_every,
+                "save_every": req.config.save_every,
+                "complete_source_configuration_debug": format!("{:?}",req.config)
+            },
+            "losses_by_physical_update": losses,
+            "selected_adapter_final_loss": out.final_loss,
+            "peak_device_mib_training_and_preparation": peak_mib,
+            "adapter": "out/krea_bounded.safetensors",
+            "sample": "adapter_sample.png",
+            "profile_log": "body.stderr.log",
+            "profile_records": ["KREA_PROFILE_STEP", "KREA_PROFILE_ATTRIBUTION", "KREA_PROFILE_OPTIMIZER", "KREA_PROFILE_RESULT"],
+            "claim_limit": "Bounded smoke and throughput only; four steady updates per segment. Device peak includes preparation and is not a per-process allocation measurement. Provisioned snapshot path/layout does not attest weight integrity; actual input receipts and learned-device witnesses are separate."
+        });
+        std::fs::write(
+            tmp.join("metrics.json"),
+            serde_json::to_vec_pretty(&metrics).unwrap(),
+        )
+        .expect("write declared bounded-profile metrics artifact");
+        println!(
+            "KREA_PROFILE_ARTIFACT adapter={} peak_device_mib={peak_mib} sample={}",
+            out.adapter_path.display(),
+            tmp.join("adapter_sample.png").display()
+        );
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::krea_bounded_acceleration_profile");
+    }
+}
+
 /// Sorted tensor keys of the adapter file (via candle's loader).
 fn adapter_keys(path: &Path) -> Vec<String> {
     let map = candle_gen::candle_core::safetensors::load(path, &Device::Cpu).unwrap();
@@ -681,4 +828,158 @@ fn krea_lora_roundtrip_raw_to_turbo() {
 
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::krea_lora_roundtrip_raw_to_turbo");
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn bounded_root() -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("MODEL_PROOF_OUTPUT_DIR").expect("manual executor output directory"),
+    )
+    .join("bespoke_acceptance");
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_runtime() -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("BESPOKE_RUNTIME_DIR")
+            .expect("source-owned persistent runtime checkpoint directory"),
+    );
+    assert!(root.is_absolute());
+    assert!(
+        root.join(".sc-26850-owned-runtime").is_file(),
+        "asset setup owns this runtime directory"
+    );
+    root
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, root: &std::path::Path) {
+    let peak = sampler.stop();
+    assert!(peak > 0);
+    std::fs::write(
+        root.join("peak_device_bytes.txt"),
+        (peak * 1024 * 1024).to_string(),
+    )
+    .unwrap();
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_export_receipt(root: &std::path::Path, path: &std::path::Path) {
+    assert!(
+        path.starts_with(bounded_runtime()),
+        "actual export stays in the owned runtime area"
+    );
+    let receipt = serde_json::json!({"actual_export":path, "bytes":std::fs::metadata(path).unwrap().len(),
+        "sha256":candle_gen::testkit::sha256_file(path), "runtime_directory":bounded_runtime(),
+        "publication":"complete model/control checkpoint retained in legitimate runtime storage; model-weight publication ban preserved",
+        "reload":"same exported path reopened/applied by production reader before sample; see actual reader receipts"});
+    std::fs::write(
+        root.join("retained_export.json"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+#[cfg(feature = "model-inference-proof")]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn krea_control_bounded_acceleration_acceptance() {
+    use candle_gen::gen_core::OffloadPolicy;
+    use candle_gen_krea::{Krea2Control, Krea2ControlPaths, Krea2ControlRequest};
+    let root = bounded_root();
+    let snapshot = PathBuf::from(
+        std::env::var_os("KREA_CONTROL_BASE_DIR").expect("pinned native Turbo snapshot"),
+    );
+    let input = root.join("input.png");
+    image::RgbImage::from_pixel(64, 64, image::Rgb([80, 140, 210]))
+        .save(&input)
+        .unwrap();
+    let control = root.join("control.png");
+    // Nonconstant, aligned control pixels are encoded by the production VAE.
+    image::RgbImage::from_fn(64, 64, |x, y| {
+        image::Rgb([(x * 4) as u8, (y * 4) as u8, 80])
+    })
+    .save(&control)
+    .unwrap();
+    let mut item = TrainingItem::captioned(input, "a blue tile following the control".into());
+    item.control_image_path = Some(control);
+    let sampler = candle_gen::testkit::PeakSampler::start_rendered();
+    let output = candle_gen::train::profile::with_bounded_cohort_for(
+        &root.join("metrics.json"),
+        &["krea-control:active-item-conditioning-hit"],
+        || {
+            let mut trainer = candle_gen_krea::provider_registry()
+                .unwrap()
+                .load_trainer(
+                    "krea_2_control",
+                    &LoadSpec::new(WeightsSource::Dir(snapshot.clone())),
+                )
+                .unwrap();
+            let output = trainer
+                .train(
+                    &TrainingRequest {
+                        items: vec![item],
+                        config: TrainingConfig {
+                            control_type: Some("pose".into()),
+                            learning_rate: 1e-5,
+                            steps: 4,
+                            resolution: 64,
+                            batch_size: 1,
+                            gradient_accumulation: 1,
+                            lr_warmup_steps: 0,
+                            save_every: 0,
+                            seed: 7,
+                            train_dtype: "bf16".into(),
+                            gradient_checkpointing: true,
+                            ..Default::default()
+                        },
+                        output_dir: bounded_runtime().join("control"),
+                        file_name: "control.safetensors".into(),
+                        trigger_words: vec![],
+                        cancel: CancelFlag::new(),
+                    },
+                    &mut |_| {},
+                )
+                .unwrap();
+            assert_eq!(output.steps, 4);
+            assert!(output.final_loss.is_finite());
+            output
+        },
+    );
+    bounded_peak(sampler, &root);
+    let generator = Krea2Control::load(&Krea2ControlPaths {
+        root: snapshot,
+        convrot_dit: None,
+        native_dit: None,
+        control: output.adapter_path.clone(),
+        adapters: vec![],
+        branch_tier: None,
+        chunk_attention: false,
+        offload_policy: OffloadPolicy::default(),
+    })
+    .unwrap();
+    let control_image = Image {
+        width: 256,
+        height: 256,
+        pixels: image::RgbImage::from_fn(256, 256, |x, y| image::Rgb([x as u8, y as u8, 80]))
+            .into_raw(),
+    };
+    let sample = generator
+        .generate(
+            &Krea2ControlRequest {
+                prompt: "a blue tile following the control".into(),
+                width: 256,
+                height: 256,
+                steps: 4,
+                seed: 7,
+                ..Default::default()
+            },
+            &control_image,
+            &mut |_| {},
+        )
+        .unwrap();
+    assert_eq!(sample.pixels.len(), 256 * 256 * 3);
+    assert!(sample.pixels.iter().any(|v| *v != 0));
+    candle_gen::testkit::save_image_png(&root.join("adapter_sample.png"), &sample);
+    bounded_export_receipt(&root, &output.adapter_path);
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::krea_control_bounded_acceleration_acceptance");
 }

@@ -123,6 +123,7 @@ fn dit(compute: DType, device: &Device) -> candle_gen_flux3::Flux3Dit {
 /// Frozen source independently encodes ordered non-square RGB references and holds their AE
 /// tokens fixed across every step, including BOTH base CFG branches at guidance zero and one.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn ordered_reference_edits_match_frozen_source() {
     use candle_gen::gen_core::{flux3::references::ReferenceOutputSize, CancelFlag, Image};
     use candle_gen_flux3::pipeline::{
@@ -337,9 +338,15 @@ fn ordered_reference_edits_match_frozen_source() {
             }
         }
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::ordered_reference_edits_match_frozen_source"
+    );
 }
 
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn single_sample_forward_matches_upstream_in_fp32() {
     let dit = dit(DType::F32, &cpu());
     assert!(dit.is_flow_map());
@@ -361,6 +368,9 @@ fn single_sample_forward_matches_upstream_in_fp32() {
         .unwrap();
     assert_eq!(out.dtype(), DType::F32);
     assert_close("velocity", &out, golden.require("single/velocity"), 1e-4);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::single_sample_forward_matches_upstream_in_fp32");
 }
 
 /// Two samples with different prompts, grids and times, packed mode-major: each sample's image
@@ -370,6 +380,7 @@ fn single_sample_forward_matches_upstream_in_fp32() {
 /// *Mutation that reds this:* attending over the whole packed stream instead of per sample, or
 /// applying one sample's modulation rows to the other's tokens.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn two_sample_pack_matches_upstream_in_fp32() {
     let dit = dit(DType::F32, &cpu());
     let golden = fixture("flux3_dit_golden.safetensors");
@@ -412,10 +423,16 @@ fn two_sample_pack_matches_upstream_in_fp32() {
         golden.require("single/velocity"),
         1e-4,
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::two_sample_pack_matches_upstream_in_fp32"
+    );
 }
 
 /// The bf16 policy on the build's device vs the oracle's bf16-autocast forward.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn single_sample_forward_matches_upstream_in_bf16() {
     let device = device();
     let dit = dit(DType::BF16, &device);
@@ -450,6 +467,9 @@ fn single_sample_forward_matches_upstream_in_bf16() {
         golden.require("single/velocity"),
     );
     assert!(max_abs > 1e-4, "the bf16 oracle differs from the f32 one");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::single_sample_forward_matches_upstream_in_bf16");
 }
 
 /// The timestep embedding forms `1000·t` in the compute dtype: under bf16 the DiT sees the
@@ -478,6 +498,7 @@ fn timestep_embedding_follows_the_compute_dtype() {
 /// A flow-map DiT refuses a sample without a target time; the checkpoint/config `flow_map`
 /// disagreement is a typed refusal at load.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn flow_map_inputs_and_config_are_checked() {
     let dit = dit(DType::F32, &cpu());
     let golden = fixture("flux3_dit_golden.safetensors");
@@ -509,10 +530,14 @@ fn flow_map_inputs_and_config_are_checked() {
         Err(candle_gen::CandleError::Unsupported(m)) => assert!(m.contains("flow_map"), "{m}"),
         other => panic!("expected a typed refusal, got {:?}", other.err()),
     }
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::flow_map_inputs_and_config_are_checked");
 }
 
 /// Independent frozen-source CFG and additive adapter goldens; CPU only, no real weights.
 #[test]
+#[ignore = "model inference; explicit model-proof workflow"]
 fn base_cfg_and_explicit_adapter_identity_match_frozen_source() {
     use candle_gen::candle_core::safetensors;
     use candle_gen::candle_nn::VarBuilder;
@@ -650,4 +675,7 @@ fn base_cfg_and_explicit_adapter_identity_match_frozen_source() {
         host_f32(&disabled),
         "zero adapter scale is a bitwise no-op"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED dit_parity::base_cfg_and_explicit_adapter_identity_match_frozen_source");
 }

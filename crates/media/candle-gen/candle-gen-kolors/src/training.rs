@@ -560,6 +560,31 @@ impl KolorsTrainer {
                 device,
             )?,
         };
+        let mut contexts = HashMap::<_, Tensor>::new();
+        for (_, context, _, _) in &mut cache {
+            let id = context.id();
+            *context = match contexts.get(&id) {
+                Some(context) => context.clone(),
+                None => {
+                    let projected = __model_proof_output!(
+                        context_projection.forward(&context.to_dtype(dtype)?)
+                    )?;
+                    contexts.insert(id, projected.clone());
+                    projected
+                }
+            };
+        }
+        drop(context_projection);
+        let contexts = contexts.into_values().collect::<Vec<_>>();
+        let preparation_bytes = unet.training_preparation_bytes(&contexts)? as u64;
+        flow_match::check_preparation_memory(
+            LABEL,
+            preparation_bytes,
+            0,
+            flow_match::device_training_budget_bytes(device, LABEL),
+        )?;
+        unet.prepare_training(&contexts)?;
+        drop(contexts);
         let schedule = AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END);
         let accum = cfg.gradient_accumulation.max(1);
         let mut optimizer = TrainOptimizer::from_config(
@@ -610,6 +635,7 @@ impl KolorsTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
+            candle_gen::train::profile::cohort_begin_step(device)?;
             let sample = step_sample(aux_driver.as_mut(), step, &sample_order);
             let index = sample.entry;
             let (x0, context, pooled, mask_weight) = &cache[index];
@@ -618,13 +644,12 @@ impl KolorsTrainer {
             let timestep = rng.random_range(0..NUM_TRAIN_TIMESTEPS);
             let noise = sample_noise(x0.dims(), noise_seed(cfg.seed, step), device)?;
             let (timestep, aux) = plan_timestep(&sample, timestep)?;
-            let projected =
-                __model_proof_output!(context_projection.forward(&context.to_dtype(dtype)?))?;
+            let projected = context;
             let (losses, grads) = kolors_step(
                 &unet,
                 &schedule,
                 x0,
-                &projected,
+                projected,
                 pooled,
                 step_time_ids,
                 timestep,
@@ -646,9 +671,12 @@ impl KolorsTrainer {
                 let divisor = accumulation_divisor(step, accum);
                 scale_grads(&mut grads, &set.vars, 1.0 / divisor as f64)?;
                 // Epic 2123 (sc-24827): clip → gradient noise → step → weight noise.
+                candle_gen::train::profile::cohort_before_update(&grads, &set.vars)?;
                 adapter_optimizer_step(&mut optimizer, &mut grads, &set, cfg, update, cfg.seed)?;
+                candle_gen::train::profile::cohort_after_update();
                 update += 1;
             }
+            candle_gen::train::profile::cohort_end_step(device, last_loss, &set.vars, "kolors")?;
             on_progress(TrainingProgress::Training {
                 step,
                 total: cfg.steps,
@@ -934,7 +962,7 @@ mod tests {
                 norm_num_groups: 32,
                 use_linear_projection: false,
             };
-            let mut unet = UNet2DConditionModel::new(vb.clone(), 4, 4, false, cfg)
+            let mut unet = UNet2DConditionModel::new(vb.clone(), 4, 4, false, cfg.clone())
                 .unwrap()
                 .with_add_embedding(vb, 8, 16 + 6 * 8)
                 .unwrap();
@@ -981,6 +1009,18 @@ mod tests {
                     .unwrap();
                 }
             }
+            let weights = vm
+                .data()
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(name, value)| (name.clone(), value.as_tensor().detach()))
+                .collect();
+            let vb = VarBuilder::from_tensors(weights, DType::F32, &dev);
+            let mut unet = UNet2DConditionModel::new(vb.clone(), 4, 4, false, cfg)
+                .unwrap()
+                .with_add_embedding(vb, 8, 16 + 6 * 8)
+                .unwrap();
             let set = build_lora_targets(&mut unet, &paths, 4, 8.0, 7, &dev).unwrap();
             for (i, v) in set.vars.iter().enumerate() {
                 v.set(&seeded(v.as_tensor().dims(), 100 + i as u64, 0.02))
@@ -1214,9 +1254,34 @@ mod tests {
         #[test]
         #[ignore = "model inference; explicit model workflow only"]
         fn depth_off_is_bit_identical_to_the_legacy_step() {
-            let f = fixture();
+            let mut f = fixture();
             let (l, g) = run(&f, 500, None);
             assert_eq!((l.diffusion, l.aux), (Some(l.total), None));
+            assert!(
+                f.unet
+                    .training_preparation_bytes(&[f.projected.clone()])
+                    .unwrap()
+                    > 0
+            );
+            f.unet.prepare_training(&[f.projected.clone()]).unwrap();
+            let (prepared, prepared_grads) = run(&f, 500, None);
+            assert!(
+                (prepared.total - l.total).abs() < 1e-4,
+                "Kolors prepared KV loss"
+            );
+            for var in &f.vars {
+                let a = g.get(var.as_tensor()).unwrap();
+                let b = prepared_grads.get(var.as_tensor()).unwrap();
+                let error = (a - b)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                assert!(error < 1e-4, "Kolors prepared/fused gradient {error}");
+            }
             let noisy = ddpm_noise(&f.alphas, &f.x0, &f.noise, 500).unwrap();
             let prediction = f
                 .unet
@@ -1233,9 +1298,9 @@ mod tests {
             let loss = epsilon_loss(&prediction, &f.noise, None, false).unwrap();
             let legacy = loss.to_scalar::<f32>().unwrap();
             let lg = loss.backward().unwrap();
-            assert_eq!(l.total.to_bits(), legacy.to_bits());
+            assert_eq!(prepared.total.to_bits(), legacy.to_bits());
             for v in &f.vars {
-                assert_eq!(grad_bits(&g, v), grad_bits(&lg, v));
+                assert_eq!(grad_bits(&prepared_grads, v), grad_bits(&lg, v));
             }
 
             #[cfg(feature = "model-inference-proof")]

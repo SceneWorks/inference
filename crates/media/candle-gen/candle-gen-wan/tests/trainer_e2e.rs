@@ -474,3 +474,108 @@ fn wan_trainer_emits_preview_samples() {
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_trainer_emits_preview_samples");
 }
+
+#[cfg(feature = "model-inference-proof")]
+fn bounded_output_root() -> PathBuf {
+    let root = PathBuf::from(
+        std::env::var_os("MODEL_PROOF_OUTPUT_DIR")
+            .expect("manual model-proof executor must own the retained output directory"),
+    );
+    let path = root.join("cohort_acceptance");
+    std::fs::create_dir_all(&path).unwrap();
+    path
+}
+#[cfg(feature = "model-inference-proof")]
+fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, dir: &Path) {
+    let peak = sampler.stop();
+    assert!(peak > 0, "must observe selected physical CUDA device");
+    std::fs::write(
+        dir.join("peak_device_bytes.txt"),
+        (peak * 1024 * 1024).to_string(),
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn bounded_render_finite_with_pair(high: &Path, low: &Path, kind: AdapterKind) {
+    let spec = LoadSpec::new(WeightsSource::Dir(snapshot())).with_adapters(vec![
+        AdapterSpec::new(high.to_path_buf(), 1.0, kind).with_moe_expert(MoeExpert::High),
+        AdapterSpec::new(low.to_path_buf(), 1.0, kind).with_moe_expert(MoeExpert::Low),
+    ]);
+    let g = candle_gen_wan::wan14b::load_t2v_14b(&spec).expect("load A14B generator with adapters");
+    let req = GenerationRequest {
+        prompt: "a solid colour swatch".into(),
+        width: 256,
+        height: 256,
+        steps: Some(4),
+        frames: Some(1),
+        seed: Some(7),
+        ..Default::default()
+    };
+    let out = g.generate(&req, &mut |_| {}).expect("adapted generate");
+    let GenerationOutput::Video { frames, .. } = out else {
+        panic!("expected video frames");
+    };
+    assert_eq!(frames.len(), 1);
+    candle_gen::testkit::save_image_png(
+        &bounded_output_root().join("adapter_sample.png"),
+        &frames[0],
+    );
+    for f in &frames {
+        assert_eq!((f.width, f.height), (256, 256));
+        assert_eq!(f.pixels.len(), 256 * 256 * 3, "RGB8 buffer");
+        assert!(
+            f.pixels.iter().any(|&p| p != 0),
+            "rendered frame should not be all-black"
+        );
+    }
+}
+#[test]
+#[cfg(feature = "model-inference-proof")]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn wan_t2v_14b_bounded_acceleration_acceptance() {
+    let tmp = bounded_output_root().join("data");
+    // 96 steps ⇒ 48 micro-steps per expert — enough for a clear median fall on each band.
+    let retained = bounded_output_root();
+    let sampler = candle_gen::testkit::PeakSampler::start_rendered();
+    let out = candle_gen::train::profile::with_bounded_cohort_for(
+        &retained.join("metrics.json"),
+        &[
+            "wan:shared-differentiable-RMS",
+            "wan:expert-owned-caption-storage-hit",
+            "wan:actual-frozen-projection-pack",
+        ],
+        || run(&tmp, "bounded.safetensors", NetworkType::Lora, 4),
+    );
+    bounded_peak(sampler, &retained);
+
+    for p in [&out.high_path, &out.low_path] {
+        assert_eq!(
+            read_meta(p).get("networkType").map(String::as_str),
+            Some("lora")
+        );
+        let tensors = candle_gen::candle_core::safetensors::load(p, &Device::Cpu).unwrap();
+        assert!(
+            tensors
+                .keys()
+                .any(|k| k.ends_with(".attn1.to_q.lora_A.weight")),
+            "adapter should carry bare-dotted attention LoRA keys: {}",
+            p.display()
+        );
+    }
+    let n_high = count_targets(&out.high_path, AdapterKind::Lora);
+    let n_low = count_targets(&out.low_path, AdapterKind::Lora);
+    assert!(
+        n_high > 0 && n_high == n_low,
+        "both experts adapt the same target set"
+    );
+
+    assert_reloads_pair(&out.high_path, &out.low_path, AdapterKind::Lora);
+    bounded_render_finite_with_pair(&out.high_path, &out.low_path, AdapterKind::Lora);
+    println!("[wan-lora] e2e OK — {n_high} targets/expert reload + merge, video renders finite");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_t2v_14b_bounded_acceleration_acceptance"
+    );
+}

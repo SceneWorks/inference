@@ -1120,6 +1120,16 @@ pub(crate) fn load_weights_cancellable(
         }
     }
     crate::transformer::check_cancel(cancel)?;
+    #[cfg(feature = "model-inference-proof")]
+    candle_gen::gen_core::model_input_proof::record_reader_paths(
+        "candle-gen-moss-image::loader::load_weights_cancellable",
+        candle_gen::gen_core::model_input_proof::InputRole::ModelWeights,
+        &assets
+            .iter()
+            .filter(|a| a.role == role && a.relative.ends_with(".safetensors"))
+            .map(|a| a.pin.canonical_target_path())
+            .collect::<Vec<_>>(),
+    );
     Ok(Weights::from_map(map))
 }
 pub(crate) fn tensor_f32(t: &Tensor) -> Result<Vec<f32>> {

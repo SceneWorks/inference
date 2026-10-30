@@ -58,6 +58,63 @@ use candle_core::{DType, Tensor};
 
 use crate::attention::{sdpa_planned_bhsd, AttentionPlan};
 
+/// Candidate-only seam for callers owning a separate replay/tape fallback.
+/// Select outside the tape fold: `Some` carries the native custom backward;
+/// `None` means reference mode, unsupported input, or cached compile refusal.
+/// Allocation and execution errors propagate. The caller retains its existing
+/// cancellation checks and must not wrap a successful candidate in another
+/// autograd owner. Standard unmasked SDPA only, with no dropout or softcap.
+pub fn try_training_sdpa_bhsd(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+) -> candle_core::Result<Option<Tensor>> {
+    crate::training_attention::try_streaming(q, k, v, scale, mask.is_some())
+}
+
+/// First-order training SDPA. The experimental streaming candidate is explicitly
+/// scoped by [`crate::training_attention::with_training_attention_mode`]. Callers
+/// must supply ordinary last-axis softmax (possibly upcast to f32), with no
+/// dropout, softcap or other score transform. Masks always retain the reference.
+/// Cancellation is checked before launch; a native launch cannot be interrupted.
+pub fn training_sdpa_bhsd(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+    softmax: impl Fn(&Tensor) -> candle_core::Result<Tensor>,
+    plan: AttentionPlan<'_>,
+) -> crate::Result<Tensor> {
+    if plan.is_cancelled() {
+        return Err(crate::CandleError::Canceled);
+    }
+    if let Some(out) = crate::training_attention::try_streaming(q, k, v, scale, mask.is_some())? {
+        return Ok(out);
+    }
+    sdpa_planned_bhsd(q, k, v, scale, mask, softmax, plan)
+}
+
+/// Legacy-budget overload of [`training_sdpa_bhsd`], retaining the exact
+/// composable fallback. GQA inputs must be expanded by the caller when the
+/// reference requires it; the candidate itself can sum grouped KV gradients.
+pub fn training_sdpa_budgeted_bhsd(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+    softmax: impl Fn(&Tensor) -> candle_core::Result<Tensor>,
+    budget: usize,
+) -> candle_core::Result<Tensor> {
+    if let Some(out) = crate::training_attention::try_streaming(q, k, v, scale, mask.is_some())? {
+        return Ok(out);
+    }
+    crate::attention::sdpa_budgeted_bhsd(q, k, v, scale, mask, softmax, budget)
+}
+
 /// Largest `head_dim` the dispatcher hands to the fused kernel. candle-flash-attn compiles
 /// kernels up to 512 at this rev, but the 256 ceiling is the long-standing FA2 envelope and covers
 /// every media head dim in the tree (MiniMax-H3's DiT is 128, the Qwen3-VL tower 72).
