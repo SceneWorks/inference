@@ -230,7 +230,8 @@ def settled_cuda_samples(probe, output: Path, phase: str, uuid: str, physical_in
             predicate_name = ('proof_correctness_profile_headroom_and_stable_contexts'
                               if activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY
                               else 'proof_policy_headroom_and_inactive_contexts')
-            transient = (str(error) == f'physical GPU occupied during {phase}' and samples
+            transient = (activity_profile != SHARED_CUDA_HEADROOM_ACTIVITY
+                         and str(error) == f'physical GPU occupied during {phase}' and samples
                          and all(item['predicates'][predicate_name]
                                  and item['selected_index_matches_admission']
                                  and item['context_identities_match_admission'] for item in samples[:-1])

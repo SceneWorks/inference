@@ -94,6 +94,28 @@ class SharedHeadroom(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'MOCK child failure'):
             self.claim([([self.card()], [])] * 11, body=fail)
 
+    def test_later_headroom_or_index_loss_preserves_structured_refusal_in_both_phases(self):
+        # CI_IMPACT: prior successful synthetic samples must not enter strict-profile retry analysis.
+        valid = ([self.card()], [])
+        for sample_number in (2, 4):
+            for invalid in (self.card(index=0), self.card(free_mib=10239, used_mib=87648)):
+                bad = ([invalid], [])
+                with self.subTest(phase='admission', sample=sample_number, card=invalid):
+                    with self.assertRaises(resources.CudaClaimRejected) as caught:
+                        self.claim([valid] * sample_number + [bad],
+                                   body=lambda _: self.fail('failed admission reached body'))
+                    diagnostic = caught.exception.diagnostic['admission_samples']
+                    self.assertEqual(diagnostic['status'], 'retained-existing-samples')
+                    self.assertEqual(diagnostic['sample_count'], sample_number)
+                    self.assertEqual(diagnostic['settle_attempt_count'], 1)
+                with self.subTest(phase='release', sample=sample_number, card=invalid):
+                    with self.assertRaises(resources.CudaReleaseRejected) as caught:
+                        self.claim([valid] * (5 + sample_number) + [bad])
+                    diagnostic = caught.exception.diagnostic
+                    self.assertEqual(diagnostic['status'], 'retained-existing-samples')
+                    self.assertEqual(diagnostic['sample_count'], sample_number)
+                    self.assertEqual(diagnostic['settle_attempt_count'], 1)
+
     def test_deadline_and_driver_failure_cannot_become_shared_admission_success(self):
         probe = Mock()
         with tempfile.TemporaryDirectory() as temporary:
