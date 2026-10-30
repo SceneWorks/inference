@@ -14,9 +14,11 @@ name = "gen_core_dist"
 
 [dependencies]
 # The backend-neutral distributed contract this transport implements (`Collective`, `World`,
-# `DistError`, …) lives in gen-core's `iris::train::dist`; this crate holds only the `std::net`
-# transport and its socket FFI, moved out of gen-core in sc-27316. Tensor-free, like gen-core.
+# `DistError`, …) lives in gen-core-iris's `train::dist` (split out of gen-core with the rest of
+# the Iris contract, sc-27316); this crate holds only the `std::net` transport and its socket FFI.
+# Tensor-free, like gen-core.
 sceneworks-gen-core = { workspace = true }
+sceneworks-gen-core-iris = { workspace = true }
 serde_json = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

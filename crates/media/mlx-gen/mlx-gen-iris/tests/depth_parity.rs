@@ -13,12 +13,12 @@
 //! The bf16 release policy (upstream's CUDA autocast) is held to 5e-2 (every case runs in a
 //! CPU-default child process, sc-25689: no op reaches the GPU).
 
-use mlx_gen::gen_core::iris::depth::{
+use gen_core_iris::depth::{
     colorize_inferno, plan_depth_input, prepare_depth_input, DepthMap, DepthRequest,
     DepthResolution, IrisDepthEstimator,
 };
-use mlx_gen::gen_core::iris::downstream::TaskExport;
-use mlx_gen::gen_core::iris::{IrisTask, TEXT_ENCODER_COMPONENT};
+use gen_core_iris::downstream::TaskExport;
+use gen_core_iris::{IrisTask, TEXT_ENCODER_COMPONENT};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Image, LoadSpec, Precision, Progress, WeightsSource};
 use mlx_gen_iris::depth::{load, load_depth, load_depth_export, DEPTH_MODEL_ID};

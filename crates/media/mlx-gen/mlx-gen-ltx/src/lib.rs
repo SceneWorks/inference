@@ -276,7 +276,7 @@ mod explicit_registry_tests {
     }
 
     fn ltx25_memory_spec(tmp: &tempfile::TempDir, quantized: bool, bits: i32) -> LoadSpec {
-        use mlx_gen::gen_core::ltx_checkpoint::LtxComponent;
+        use gen_core_ltx::ltx_checkpoint::LtxComponent;
 
         let root = tmp.path().join(if quantized {
             format!("q{bits}")

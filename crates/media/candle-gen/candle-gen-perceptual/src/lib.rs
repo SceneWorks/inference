@@ -211,9 +211,7 @@ fn build_identity(cfg: &TrainingConfig, ctx: &AuxLossContext<'_>) -> Result<AuxL
 
 /// The identity loss's pre-load footprint (fixed 112² crop; the shipped glintr100 checkpoint).
 fn identity_footprint(_cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootprint {
-    candle_gen_face::train::identity_loss_footprint(
-        candle_gen::gen_core::train::face_loss::IRESNET100_LAYERS,
-    )
+    candle_gen_face::train::identity_loss_footprint(gen_core_train::face_loss::IRESNET100_LAYERS)
 }
 
 /// The identity loss's config when it is enabled: upstream gates the landmark loss on the identity
@@ -300,7 +298,7 @@ fn body_shape_footprint(cfg: &TrainingConfig, _h: u32, _w: u32) -> AuxModelFootp
 fn normal_footprint(cfg: &TrainingConfig, h: u32, w: u32) -> AuxModelFootprint {
     let mut f = candle_gen_body::arm_footprint(&cfg.body_losses, candle_gen_body::BodyArm::Normal);
     f.reference_bytes_per_image +=
-        gen_core::train::subject_mask::PerceptualSubjectMasks::bytes_per_entry(cfg, h, w);
+        gen_core_train::subject_mask::PerceptualSubjectMasks::bytes_per_entry(cfg, h, w);
     f
 }
 
@@ -1001,7 +999,7 @@ mod tests {
         };
         let g = AuxGeometry::image(512, 3);
         let id_fp = candle_gen_face::train::identity_loss_footprint(
-            candle_gen::gen_core::train::face_loss::IRESNET100_LAYERS,
+            gen_core_train::face_loss::IRESNET100_LAYERS,
         );
         assert_eq!(
             perceptual_footprint(&c, &ctx.decoder, g),

@@ -162,7 +162,7 @@ fn run() {
     assert_eq!(schedule.len(), 5);
     assert_eq!(
         schedule,
-        mlx_gen::gen_core::flux3::flow_map_schedule(4, 6.93).unwrap(),
+        gen_core_flux3::flow_map_schedule(4, 6.93).unwrap(),
         "the oracle's schedule is the contract's"
     );
     let mut steps = Vec::new();

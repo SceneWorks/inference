@@ -1661,7 +1661,7 @@ mod ltx25_real_bundle {
     #[test]
     #[ignore = "sc-18776: needs the built LTX-2.5 tiers (LTX25_TIER_DIR). CPU-only, header-reads only"]
     fn every_real_component_resolves_the_config_its_loader_reads() {
-        use candle_gen::gen_core::ltx_checkpoint::{
+        use gen_core_ltx::ltx_checkpoint::{
             CONV_VIDEO_VAE_CLASS, DIFFUSION_VIDEO_VAE_CLASS, LATENT_UPSAMPLER_CLASS,
             TRANSFORMER_CLASS,
         };

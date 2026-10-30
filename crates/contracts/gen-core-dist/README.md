@@ -10,8 +10,8 @@ its transport; the MLX trainer (`mlx-gen-iris`) uses it as the bounded side chan
 own collectives.
 
 The backend-neutral contract it implements — the `Collective` trait, `World`, `DistPlan`, mesh
-resolution, shard layout and the typed `DistError` — stays in
-[`gen-core`](../gen-core/README.md) at `gen_core::iris::train::dist`. This crate was split out of
+resolution, shard layout and the typed `DistError` — lives in
+[`gen-core-iris`](../gen-core-iris/README.md) at `gen_core_iris::train::dist`. This crate was split out of
 gen-core in sc-27316 so the contract crate carries no network transport or socket FFI
 (`libc` / `windows-sys` keepalive options). Like gen-core it has no tensor dependency, so it
 builds and tests on the Linux contracts lane.

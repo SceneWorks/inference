@@ -18,7 +18,7 @@ exclusive platform targets, not additive features. Build/test per platform lane 
 
 ```sh
 # Contracts + conformance testkits (any platform)
-cargo test --locked -p core-llm -p core-llm-testkit -p sceneworks-gen-core -p sceneworks-gen-core-testkit -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry
+cargo test --locked -p core-llm -p core-llm-testkit -p 'sceneworks-gen-core*'
 
 # Candle CPU lane (Linux/any)
 cargo clippy --locked -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu --all-targets -- -D warnings
@@ -121,10 +121,13 @@ backend-neutral contracts  →  MLX/Candle engines  →  provider-family crates
 ```
 
 - `crates/contracts/` — `core-llm` (LLM contracts) and `sceneworks-gen-core` (media contracts),
-  plus their `*-testkit` conformance suites and gen-core's host-side siblings
+  plus their `*-testkit` conformance suites and gen-core's siblings (sc-27316): the host-side
   `sceneworks-gen-core-dist` (Iris TCP collective transport) and `sceneworks-gen-core-telemetry`
-  (opt-in H3 host RSS telemetry), split out with their socket/process FFI (sc-27316). **These stay tensor-neutral** — never depend on MLX or
-  Candle tensor types here.
+  (opt-in H3 host RSS telemetry), and the family/feature crates `gen-core-{train,tokenizer,iris,
+  flux3,moss-image,memory-wan,h3,ltx,checkpoint,image,family}`, grouped by consumer so a family's
+  change does not rebuild gen-core. Siblings depend on gen-core, never the reverse; gen-core keeps
+  only the types the contract names (and the sibling re-exports them). **These stay
+  tensor-neutral** — never depend on MLX or Candle tensor types here.
 - `crates/llm/` — `mlx-llm` (+ `server`) and `candle-llm` engines.
 - `crates/kernels/` — shared low-precision Candle kernels (`candle-quant-kernels`: the NVFP4 /
   FP8 / INT8 cuBLASLt paths and codecs) used by both `candle-gen` and `candle-llm`, plus the fused

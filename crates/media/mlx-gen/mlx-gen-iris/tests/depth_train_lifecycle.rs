@@ -9,15 +9,15 @@
 
 use std::path::{Path, PathBuf};
 
-use mlx_gen::gen_core::iris::depth::{DepthRequest, DepthResolution};
-use mlx_gen::gen_core::iris::downstream::{weights_metadata, EmptyPrompt, TaskExport};
-use mlx_gen::gen_core::iris::train::depth::{
+use gen_core_iris::depth::{DepthRequest, DepthResolution};
+use gen_core_iris::downstream::{weights_metadata, EmptyPrompt, TaskExport};
+use gen_core_iris::train::depth::{
     load_depth_sample, normalize_log_depth, DepthLossPlan, EMPTY_PROMPT_COMPONENT, ITEM_DEPTH_KEY,
 };
-use mlx_gen::gen_core::iris::train::{
+use gen_core_iris::train::{
     checkpoint_root, latest_checkpoint, read_checkpoint_state, OPTIONS_KEY,
 };
-use mlx_gen::gen_core::iris::{IrisTask, TEXT_ENCODER_COMPONENT};
+use gen_core_iris::{IrisTask, TEXT_ENCODER_COMPONENT};
 use mlx_gen::gen_core::{
     Error as CoreError, Trainer, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
 };

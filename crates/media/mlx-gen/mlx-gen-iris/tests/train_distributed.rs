@@ -21,13 +21,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use mlx_gen::gen_core::iris::train::dist::{
+use gen_core_iris::train::dist::{
     dist_error, parse_dist, Collective, DistError, Partition, Precision, ReduceOp, World,
 };
-use mlx_gen::gen_core::iris::train::{
+use gen_core_iris::train::{
     checkpoint_root, latest_checkpoint, read_checkpoint_state, OPTIONS_KEY,
 };
-use mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 use mlx_gen::gen_core::{
     LrSchedule, Trainer, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
 };
@@ -158,7 +158,7 @@ fn run_job(j: &Json) -> Json {
     };
     if let Some(ms) = j["writer_delay_ms"].as_u64() {
         std::env::set_var(
-            mlx_gen::gen_core::iris::train::dist::WRITER_TEST_DELAY_ENV,
+            gen_core_iris::train::dist::WRITER_TEST_DELAY_ENV,
             ms.to_string(),
         );
     }

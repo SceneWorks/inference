@@ -24,9 +24,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device};
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::WeightsSource;
 use candle_gen::{CandleError as Error, Result};
+use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 
 use crate::config::ConfigFile;
 

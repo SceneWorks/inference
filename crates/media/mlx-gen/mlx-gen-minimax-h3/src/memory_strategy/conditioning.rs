@@ -93,8 +93,7 @@ pub(super) fn complete(
     } else {
         weightsmeta::Dtype::BF16
     };
-    let video_allocation =
-        mlx_gen::gen_core::h3_memory::video_allocation(&video_headers, target, true)?;
+    let video_allocation = gen_core_h3::h3_memory::video_allocation(&video_headers, target, true)?;
     let stats = cfg.latent_channels as u64 * width.max(4) * 2;
     let stats_cast = if width == 4 {
         0
@@ -102,7 +101,7 @@ pub(super) fn complete(
         cfg.latent_channels as u64 * width
     };
     let video_bytes = video_allocation.resident_bytes.saturating_add(stats);
-    let audio_bytes = mlx_gen::gen_core::h3_memory::audio_allocation(
+    let audio_bytes = gen_core_h3::h3_memory::audio_allocation(
         &audio,
         &crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder::tensor_names(&a),
         &crate::audio_vae::MiniMaxH3AudioVae::tensor_names(&a),

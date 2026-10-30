@@ -1,6 +1,6 @@
 //! Native Candle **Iris-3B depth training** (story sc-25687) — the twin of
 //! `mlx_gen_iris::train::depth` over the one backend-neutral contract
-//! [`gen_core::iris::train::depth`]: the supervised direct-regression fine-tune of the depth task
+//! [`gen_core_iris::train::depth`]: the supervised direct-regression fine-tune of the depth task
 //! (paper §5.2), registered as the [`DEPTH_TRAINER_ID`] (`iris_3b_depth`) trainer in the Candle
 //! catalog.
 //!
@@ -10,49 +10,52 @@
 //! reducer as the estimator's `[1, C]` [`Linear`]. The loss is Eq. 5 on tensors (the contract's
 //! host reference is `depth_loss_host`), its gradient of `loss / grad_accum`; each optimizer step
 //! clips, updates the optional EMA from the pre-step weights and steps AdamW / Muon — the
-//! generation trainer's optimizer and checkpoint code ([`super::optim`], `gen_core::iris::train`).
+//! generation trainer's optimizer and checkpoint code ([`super::optim`], `gen_core_iris::train`).
 //! Checkpoints use the MLX twin's layout and identities, so a run resumes across backends.
 //!
 //! Candle's `abs` backward is `+1` at exactly 0 where torch's is 0 — reachable only when a valid
 //! pixel's error (or a valid pair's difference error) is exactly zero, which a continuous
 //! regression does not produce; masked pixels are multiplied by 0 either way.
 //!
-//! [`gen_core::iris::train::depth`]: candle_gen::gen_core::iris::train::depth
+//! [`gen_core_iris::train::depth`]: gen_core_iris::train::depth
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor, Var};
-use candle_gen::gen_core::iris::depth::{colorize_inferno, DepthMap, DEPTH_EXTRA_INPUT_CHANNELS};
-use candle_gen::gen_core::iris::downstream::{
-    parse_task_settings, EmptyPrompt, TaskExport, EMPTY_PROMPT_FILE,
+use candle_gen::gen_core::train::{
+    Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
-use candle_gen::gen_core::iris::train::ac::AcPolicy;
-use candle_gen::gen_core::iris::train::depth::{
+use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
+use candle_gen::{CandleError as Error, Result};
+use gen_core_iris::depth::{colorize_inferno, DepthMap, DEPTH_EXTRA_INPUT_CHANNELS};
+use gen_core_iris::downstream::{parse_task_settings, EmptyPrompt, TaskExport, EMPTY_PROMPT_FILE};
+use gen_core_iris::train::ac::AcPolicy;
+use gen_core_iris::train::depth::{
     assemble_batch, check_depth_resume, depth_dataset_fingerprint, depth_dataset_pass,
     depth_export_config_yaml, depth_export_metadata, depth_tensor_shapes, preview_row,
     reducer_init_values, validate_depth_items, widened_projections, DepthBatch, DepthInit,
     DepthLossPlan, DepthTrainPlan, DEPTH_TRAINER_ID, EMPTY_PROMPT_COMPONENT,
     EXPORT_BACKBONE_PREFIX, REDUCER_BIAS, REDUCER_WEIGHT,
 };
-use candle_gen::gen_core::iris::train::lineage::{publish_export_dir, retire_foreign_checkpoints};
-use candle_gen::gen_core::iris::train::{
-    self as contract, backbone_identity, checkpoint_root, checkpoint_staging_dir, file_stem,
-    full_param_route, latest_checkpoint, lr_factor, prune_checkpoints, publish_checkpoint,
-    read_checkpoint_state, CheckpointState, DataWalk, MixedPrecision, ResumeDataPolicy,
-    WeightsSelect, CKPT_EMA, CKPT_OPTIMIZER, CKPT_STATE, CKPT_TRAINABLE, TECHNIQUES,
+use gen_core_iris::train::lineage::{publish_export_dir, retire_foreign_checkpoints};
+use gen_core_iris::{
+    train as contract,
+    train::{
+        backbone_identity, checkpoint_root, checkpoint_staging_dir, file_stem, full_param_route,
+        latest_checkpoint, lr_factor, prune_checkpoints, publish_checkpoint, read_checkpoint_state,
+        CheckpointState, DataWalk, MixedPrecision, ResumeDataPolicy, WeightsSelect, CKPT_EMA,
+        CKPT_OPTIMIZER, CKPT_STATE, CKPT_TRAINABLE, TECHNIQUES,
+    },
 };
-use candle_gen::gen_core::iris::{
+use gen_core_iris::{
     IrisConfig, IrisTask, BACKBONE_CONFIG_FILE, BACKBONE_WEIGHTS_FILE, FAMILY,
     TEXT_ENCODER_COMPONENT,
 };
-use candle_gen::gen_core::train::{
+use gen_core_train::{
     refuse_reference_control_model_options, refuse_trainer_load_overlays, validate_control_request,
-    validate_edit_request, validate_full_finetune_request, validate_training_techniques, Trainer,
-    TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
+    validate_edit_request, validate_full_finetune_request, validate_training_techniques,
 };
-use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
-use candle_gen::{CandleError as Error, Result};
 
 use super::model::{grads_under_ac, save_safetensors_atomic};
 use super::optim::{

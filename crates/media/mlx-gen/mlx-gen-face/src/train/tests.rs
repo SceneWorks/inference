@@ -108,7 +108,7 @@ fn mesh_program(f: &Value) -> Program {
         w.insert(k.clone(), synth::tensor(seed, k, &shape));
     }
     Program::new(
-        mlx_gen::gen_core::fx_program::ProgramSpec::from_value(&m["program"]).unwrap(),
+        gen_core_family::fx_program::ProgramSpec::from_value(&m["program"]).unwrap(),
         &w,
     )
     .unwrap()
@@ -177,7 +177,7 @@ fn expect(v: &Value) -> f32 {
 
 fn noise_px(key: &str, h: usize, w: usize) -> Array {
     Array::from_slice(
-        &mlx_gen::gen_core::train::face_loss::synth::noise_image(IDENTITY_NOISE_SEED, key, h, w),
+        &gen_core_train::face_loss::synth::noise_image(IDENTITY_NOISE_SEED, key, h, w),
         &[1, h as i32, w as i32, 3],
     )
 }
@@ -781,7 +781,7 @@ fn testing_checkpoints_load_through_the_real_loaders() {
         })
         .collect();
     let got: std::collections::BTreeMap<String, Vec<usize>> =
-        mlx_gen::gen_core::train::face_loss::synth::tiny_arcface_shapes()
+        gen_core_train::face_loss::synth::tiny_arcface_shapes()
             .into_iter()
             .collect();
     assert_eq!(got, want);
@@ -810,7 +810,7 @@ fn testing_checkpoints_load_through_the_real_loaders() {
 /// The executor refuses an op the converter never emits, naming it.
 #[test]
 fn an_unknown_program_op_is_refused_by_name() {
-    let err = mlx_gen::gen_core::fx_program::ProgramSpec::parse(
+    let err = gen_core_family::fx_program::ProgramSpec::parse(
         r#"{"inputs":["x"],"outputs":["y"],"nodes":[{"op":"gelu","out":"y","inputs":["x"]}]}"#,
     )
     .unwrap_err()
@@ -822,7 +822,7 @@ fn an_unknown_program_op_is_refused_by_name() {
 /// Mutation: drop the size check in `max_pool_nhwc` ⇒ the subtraction underflows ⇒ panic ⇒ red.
 #[test]
 fn a_max_pool_kernel_larger_than_its_input_is_refused() {
-    let spec = mlx_gen::gen_core::fx_program::ProgramSpec::parse(
+    let spec = gen_core_family::fx_program::ProgramSpec::parse(
         r#"{"inputs":["x"],"outputs":["y"],"nodes":[{"op":"maxpool2d","out":"y","inputs":["x"],
             "kernel":[9,9],"stride":[1,1],"padding":[1,1]}]}"#,
     )

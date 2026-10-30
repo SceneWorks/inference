@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use candle_gen::candle_core::Device;
-use candle_gen::gen_core::{self, ltx_checkpoint::LtxBundle, LoadSpec, LtxComponent, Quant};
+use candle_gen::gen_core::{self, LoadSpec, Quant};
+use gen_core_ltx::{ltx_checkpoint::LtxBundle, LtxComponent};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1785,7 +1786,7 @@ mod tests {
             Some(&gen_core::WeightsSource::File(canonical_encoder.clone()))
         );
 
-        let bundle = candle_gen::gen_core::ltx_checkpoint::LtxBundleBuilder::new()
+        let bundle = gen_core_ltx::ltx_checkpoint::LtxBundleBuilder::new()
             .with_component(
                 LtxComponent::Transformer,
                 fs::canonicalize(&transformer).unwrap(),

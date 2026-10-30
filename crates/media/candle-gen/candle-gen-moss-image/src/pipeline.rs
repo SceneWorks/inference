@@ -5,11 +5,10 @@ use crate::{
     transformer::{check_cancel, install_replacements, Geometry, Transformer},
 };
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::{
-    self, moss_image::*, AdapterApplyReport, GenerationRequest, Image, Progress,
-};
+use candle_gen::gen_core::{self, AdapterApplyReport, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_gen_flux2::vae::Flux2Vae;
+use gen_core_moss_image::moss_image::*;
 use rand::{rngs::StdRng, SeedableRng};
 
 pub(crate) struct Renderer {

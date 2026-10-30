@@ -198,9 +198,9 @@ pub fn layernorm_modulation(x: &Array, scale: &Array, shift: &Array) -> Result<A
 
 /// `rmsnorm_rope(x, scale, freqs)`: per-head RMSNorm in f32 with an f32 gain, then the adjacent-pair
 /// complex rotation in f32, returned in `x`'s dtype. `x` is `[B, H, L, D]`; `cos`/`sin` are
-/// `[L, D/2]` (the [`gen_core::flux3::rope_cos_sin`] tables of the tokens, in token order).
+/// `[L, D/2]` (the [`gen_core_flux3::rope_cos_sin`] tables of the tokens, in token order).
 ///
-/// [`gen_core::flux3::rope_cos_sin`]: mlx_gen::gen_core::flux3::rope_cos_sin
+/// [`gen_core_flux3::rope_cos_sin`]: gen_core_flux3::rope_cos_sin
 pub fn rmsnorm_rope(x: &Array, scale: &Array, cos: &Array, sin: &Array) -> Result<Array> {
     let sh = x.shape();
     let (b, h, l, d) = (sh[0], sh[1], sh[2], sh[3]);
@@ -298,7 +298,7 @@ pub fn expect_shape(name: &str, a: &Array, want: &[i32]) -> Result<()> {
 #[cfg(test)]
 mod affine_tests {
     use super::*;
-    use mlx_gen::gen_core::flux3::affine;
+    use gen_core_flux3::affine;
 
     fn seeded(n: usize, salt: f32) -> Vec<f32> {
         (0..n)

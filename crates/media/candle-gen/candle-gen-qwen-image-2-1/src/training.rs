@@ -46,7 +46,7 @@
 //!
 //! ## Edit mode (sc-24162; the MLX twin's sc-24161)
 //! A dataset whose items carry [`TrainingItem::reference_image_paths`] trains an **edit** adapter.
-//! The shared gen-core floor ([`gen_core::train::validate_edit_request`]) caps each item at
+//! The shared gen-core floor ([`gen_core_train::validate_edit_request`]) caps each item at
 //! [`MAX_REFERENCE_IMAGES`] — the render path's own cap (the constant
 //! [`crate::reference::validate_reference_count`] enforces), advertised through
 //! [`TrainerDescriptor::max_reference_images`] — and refuses mixed datasets. Each item's ordered
@@ -89,8 +89,6 @@ use crate::config::ConfigFile;
 use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Tensor, Var};
 use candle_gen::gen_core::tiling::TilingConfig;
-use candle_gen::gen_core::tokenizer::TextTokenizer;
-use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingItem, TrainingOutput, TrainingProgress,
     TrainingReport, TrainingRequest,
@@ -120,6 +118,8 @@ use candle_gen::train::schedule::schedule_updates;
 use candle_gen::train::tae::TinyDecoderSpec;
 use candle_gen::{CandleError as Error, Result};
 use candle_gen_perceptual::{AuxGeometry, AuxLossContext, DecoderSpec};
+use gen_core_tokenizer::TextTokenizer;
+use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
 
 use crate::config::{
     SchedulerConfig, TextEncoderConfig, TransformerConfig, VaeConfig, VisionConfig,
@@ -991,7 +991,7 @@ impl QwenImage21Trainer {
             )));
         }
         // Shared with the MLX twin (sc-24163): one refusal, one message.
-        gen_core::train::refuse_trainer_load_overlays(&format!("{TRAINER_ID} trainer"), spec)?;
+        gen_core_train::refuse_trainer_load_overlays(&format!("{TRAINER_ID} trainer"), spec)?;
         let root = loader::snapshot_root(&spec.weights)?.to_path_buf();
         // sc-25901: a Turbo snapshot is not a training base. Refused by name here, rather than
         // incidentally by the scheduler-config reader further down.
@@ -1075,7 +1075,7 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     // empty list or string, `{}`, `false`, `"none"`) selects nothing and is ignored like any other.
     // The list, the off-value rule and the message are gen-core's, shared with the MLX twin
     // (sc-24163), so the two backends cannot drift.
-    gen_core::train::refuse_reference_control_model_options(LABEL, req)?;
+    gen_core_train::refuse_reference_control_model_options(LABEL, req)?;
     Ok(())
 }
 
@@ -2048,15 +2048,15 @@ impl Trainer for QwenImage21Trainer {
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
         // Shared floors: a control-branch or full-base-fine-tune request on this adapter-only
         // trainer is a typed `Unsupported`, never a silently trained plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core_train::validate_control_request(self.descriptor(), req)?;
+        gen_core_train::validate_full_finetune_request(self.descriptor(), req)?;
         // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         // Instruction-edit datasets: the shared floor caps references at this descriptor's
         // `max_reference_images` (the render path's own cap) and refuses mixed or hybrid
         // datasets; the snapshot must also carry the vision tower the references go through.
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
+        gen_core_train::validate_edit_request(self.descriptor(), req)?;
         if req.items.iter().any(TrainingItem::is_edit_pair) && self.vision.is_none() {
             return Err(missing_vision_tower().into());
         }
@@ -2091,7 +2091,7 @@ impl Trainer for QwenImage21Trainer {
     ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
         let mut warnings = Vec::new();
         let output = self.train_impl(req, on_progress, &mut warnings)?;
@@ -2109,7 +2109,7 @@ impl QwenImage21Trainer {
     ) -> Result<TrainingOutput> {
         // Edit mode is a different training input, so its floor is re-checked here rather than
         // trusted to a prior `validate` call.
-        gen_core::train::validate_edit_request(&self.descriptor, req)?;
+        gen_core_train::validate_edit_request(&self.descriptor, req)?;
         validate_request(req)?;
         let edit = req.items.iter().any(TrainingItem::is_edit_pair);
         let vision = if edit {
@@ -2419,7 +2419,7 @@ impl QwenImage21Trainer {
         let mut perceptual = perceptual;
         if let Some(path) = perceptual.as_mut() {
             path.attach_subject_masks(
-                candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::load_with(
+                gen_core_train::subject_mask::PerceptualSubjectMasks::load_with(
                     "qwen_image_2_1 trainer",
                     &req.items,
                     cfg,
@@ -2951,7 +2951,7 @@ mod tests {
     /// or string, `false`, `"none"`), which selects nothing — so a defaults-shaped map, on the
     /// config and on the items, passes `validate`. The same keys turned *on* are still refused.
     ///
-    /// *Mutation that reds this:* `gen_core::train::model_option_selects_something` treating
+    /// *Mutation that reds this:* `gen_core_train::model_option_selects_something` treating
     /// any non-null value as present (the
     /// original rule — `[]`, `""`, `false` and `"none"` then refuse a defaults-shaped run).
     #[test]

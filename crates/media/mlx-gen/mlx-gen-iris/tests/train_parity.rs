@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_gen::gen_core::iris::train::{
+use gen_core_iris::train::{
     adapter_param_route, full_param_route, FlowObjective, MuonAdjustLr, OptimizerKind,
     OptimizerPlan, Prediction, TimestepSampler, TrainSchedule,
 };

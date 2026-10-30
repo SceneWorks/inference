@@ -25,9 +25,11 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 # Read adapter `.safetensors` header metadata for the bundled TurboTime LoRA merge (turbo path).
 safetensors = "0.7"
+sceneworks-gen-core-family = { workspace = true }
+sceneworks-gen-core-tokenizer = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen-flux2/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof"]
+model-inference-proof = ["candle-gen-flux2/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof", "sceneworks-gen-core-family/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal", "candle-gen-flux2/metal", "candle-gen-pid/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-gen-pid/cuda"]

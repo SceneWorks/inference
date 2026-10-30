@@ -152,6 +152,10 @@ sceneworks-gen-core-testkit = { workspace = true, optional = true }
 mlx-rs = { workspace = true }
 mlx-sys = { workspace = true }
 sceneworks-gen-core = { workspace = true }
+sceneworks-gen-core-checkpoint = { workspace = true }
+sceneworks-gen-core-iris = { workspace = true }
+sceneworks-gen-core-tokenizer = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 # The shared MLX sampler + SplitMix64 the media pipelines' text decode draws through
 # (`text_sample`, epic sc-24432 E8): one implementation, never a crate-local copy.
 mlx-llm = { workspace = true }
@@ -194,7 +198,7 @@ name = "integration"
 path = "tests/main.rs"
 
 [features]
-model-inference-proof = ["sceneworks-gen-core/model-inference-proof", "mlx-llm/model-inference-proof"]
+model-inference-proof = ["sceneworks-gen-core/model-inference-proof", "mlx-llm/model-inference-proof", "sceneworks-gen-core-iris/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 # Shared test-only comparison helpers (`mlx_gen::testing`, sc-27323) for provider tests; enabled
 # through a provider dev-dependency, never by a runtime bundle.
 test-support = ["dep:sceneworks-gen-core-testkit"]

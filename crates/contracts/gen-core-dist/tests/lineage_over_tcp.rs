@@ -1,19 +1,19 @@
-//! Iris checkpoint lineage (`gen_core::iris::train::lineage`) driven over the real host TCP
+//! Iris checkpoint lineage (`gen_core_iris::train::lineage`) driven over the real host TCP
 //! transport: resume agreement, per-node writer election and probe cleanup across loopback ranks.
 //! These ran as gen-core unit tests until the transport moved here (sc-27316).
 
 use std::path::{Path, PathBuf};
 
-use gen_core::iris::train::dist::{
-    dist_error, CheckpointIo, Collective, DistError, Partition, Precision, ReduceOp, World,
-};
-use gen_core::iris::train::lineage::{agree_resume, elect_checkpoint_writer};
-use gen_core::iris::train::{
-    checkpoint_dir_name, latest_checkpoint, read_checkpoint_state, CheckpointState, CKPT_STATE,
-};
-use gen_core::iris::IrisTask;
 use gen_core::{CancelFlag, Error, Result};
 use gen_core_dist::TcpCollective;
+use gen_core_iris::train::dist::{
+    dist_error, CheckpointIo, Collective, DistError, Partition, Precision, ReduceOp, World,
+};
+use gen_core_iris::train::lineage::{agree_resume, elect_checkpoint_writer};
+use gen_core_iris::train::{
+    checkpoint_dir_name, latest_checkpoint, read_checkpoint_state, CheckpointState, CKPT_STATE,
+};
+use gen_core_iris::IrisTask;
 
 /// A minimal complete checkpoint at `root/step_<step>` with the given `lr` (part of the state
 /// fingerprint) and `last_loss` (excluded from it).

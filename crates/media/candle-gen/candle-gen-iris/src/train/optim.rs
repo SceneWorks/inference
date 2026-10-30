@@ -17,18 +17,18 @@
 //! bf16 `@`) on a GPU; Candle's CPU backend has no half GEMM, so there they run as exactly that
 //! contract spelled out (bf16 operands promoted, f32 product, one rounding).
 //!
-//! [`full_param_route`]: candle_gen::gen_core::iris::train::full_param_route
-//! [`adapter_param_route`]: candle_gen::gen_core::iris::train::adapter_param_route
+//! [`full_param_route`]: gen_core_iris::train::full_param_route
+//! [`adapter_param_route`]: gen_core_iris::train::adapter_param_route
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Tensor, Var};
-use candle_gen::gen_core::iris::train::{
+use candle_gen::{CandleError as Error, Result};
+use gen_core_iris::train::{
     clip_coefficient, muon_split_scales, MuonAdjustLr, OptimizerKind, OptimizerPlan, ParamRoute,
     ADAMW_EPSILON, MUON_EPSILON, NEWTON_SCHULZ_COEFFS,
 };
-use candle_gen::{CandleError as Error, Result};
 
 /// The trainable tensors of a run (f32 `Var` masters), keyed and ordered by name.
 pub type Params = BTreeMap<String, Var>;
@@ -443,9 +443,9 @@ pub fn ema_update(ema: &mut Tensors, params: &Params, decay: f64) -> Result<()> 
 }
 
 /// Save keyed tensors to a safetensors file (sorted keys, no metadata) — a checkpoint member,
-/// published by [`gen_core::iris::train::publish_checkpoint`]'s fsync + rename.
+/// published by [`gen_core_iris::train::publish_checkpoint`]'s fsync + rename.
 ///
-/// [`gen_core::iris::train::publish_checkpoint`]: candle_gen::gen_core::iris::train::publish_checkpoint
+/// [`gen_core_iris::train::publish_checkpoint`]: gen_core_iris::train::publish_checkpoint
 pub fn save_tensors(path: &Path, tensors: &[(String, Tensor)]) -> Result<()> {
     let mut list: Vec<(&str, &Tensor)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
     list.sort_by(|a, b| a.0.cmp(b.0));

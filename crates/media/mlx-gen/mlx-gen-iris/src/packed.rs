@@ -454,7 +454,7 @@ pub fn prequantize_export(src: &Path, dst: &Path, bits: i32, prefix: &str) -> Re
             "iris convert: q{bits} is not a packed tier (q8, q4)"
         )));
     }
-    let weights_file = src.join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
+    let weights_file = src.join(gen_core_iris::BACKBONE_WEIGHTS_FILE);
     if artifact_tier(&weights_file)?.is_some() {
         return Err(Error::Unsupported(format!(
             "iris convert: {} is already packed",
@@ -509,7 +509,7 @@ pub fn prequantize_export(src: &Path, dst: &Path, bits: i32, prefix: &str) -> Re
     drop(source);
     std::fs::create_dir_all(dst)?;
     save(
-        &dst.join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE),
+        &dst.join(gen_core_iris::BACKBONE_WEIGHTS_FILE),
         &out,
         bits,
         QUANT_GROUP_SIZE as i32,
@@ -647,7 +647,7 @@ pub fn cpu_conversion_tensor_bytes(kind: ConvertKind, src: &Path, bits: i32) -> 
     let overflow = || Error::Msg("iris convert: byte count overflow".into());
     let (files, untied, group): (Vec<std::path::PathBuf>, bool, i32) = match kind {
         ConvertKind::Export { .. } => (
-            vec![src.join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE)],
+            vec![src.join(gen_core_iris::BACKBONE_WEIGHTS_FILE)],
             false,
             QUANT_GROUP_SIZE as i32,
         ),

@@ -428,7 +428,7 @@ const fn tier_directory(packed: Option<Quant>) -> &'static str {
 /// The typed geometry is cross-checked rather than trusted: a packed base must carry both affine
 /// leaves, the group-64 width must come out to exactly the selected bit width, and an orphan
 /// `.scales` / `.biases` or an unaccounted non-float leaf is a refusal. That is the same shape
-/// `gen_core::wan_i2v_memory`'s `packed_transformer_bytes` enforces for the Wan tiers, which is the
+/// `gen_core_memory_wan`'s `packed_transformer_bytes` enforces for the Wan tiers, which is the
 /// other consumer of these same MLX-affine rehosts.
 fn packed_dit_bytes(path: &Path, quant: Quant) -> gen_core::Result<u64> {
     use std::collections::{BTreeMap, BTreeSet};

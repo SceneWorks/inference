@@ -6749,6 +6749,13 @@ jobs:
           cache-bin: "false"
       - name: Prove W4A8 native arithmetic against the external fixture
         run: source scripts/ci/real-weights/synthetic-w4a8-mlx/prove-w4a8-native-arithmetic-against-the-external-fixture.sh
+      - name: Prove H3 ConvRot INT8 native projections against pinned Kitchen
+        run: source scripts/ci/real-weights/synthetic-w4a8-mlx/prove-h3-convrot-int8-native-projections-against-pinned-kitchen.sh
+      # sc-26691: the tiled INT8 GEMM's bit-exact parity with the serial kernels and its H3
+      # throughput. Its real-checkpoint slice is the only input fetched from the Hub (four tensors
+      # by byte range, when no complete cached copy exists), so this step sets no HF_HUB_OFFLINE.
+      - name: Prove tiled INT8 GEMM parity and measure throughput on Metal
+        run: source scripts/ci/real-weights/synthetic-w4a8-mlx/prove-tiled-int8-gemm-parity-and-measure-throughput-on-metal.sh
       - name: Prove H3 AdaLN cache complete model on Metal
         env:
           HF_HOME: ${{ runner.temp }}/h3-adaln-cache-${{ github.run_id }}-${{ github.run_attempt }}/hf-home

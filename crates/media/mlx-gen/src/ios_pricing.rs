@@ -803,7 +803,7 @@ pub struct IosPricingRequest<'a> {
     /// exclusive with `generation`; fixed-provider diagnostics may omit both only explicitly.
     pub transform: Option<&'a crate::gen_core::TransformRequest>,
     /// Actual Iris depth request, including original source and resolution projection.
-    pub depth: Option<&'a crate::gen_core::iris::depth::DepthRequest>,
+    pub depth: Option<&'a gen_core_iris::depth::DepthRequest>,
     /// Encoded text window in tokens where it is request-dependent (SDXL CLIP windows x 77); 0
     /// where the provider pads to a fixed, artifact-determined window.
     pub token_window: u32,

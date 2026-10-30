@@ -1,15 +1,15 @@
 //! `SupraDiT` — faithful port of the frozen upstream `inference.py` model classes.
 //!
 //! Patchify → `x_embed` + learned `pos_embed`; sinusoidal timestep features (host-side, shared with
-//! Candle through [`mlx_gen::gen_core::supra2::timestep_features`]) → `t_embed` MLP; `ctx_proj` of the
+//! Candle through [`gen_core_checkpoint::supra2::timestep_features`]) → `t_embed` MLP; `ctx_proj` of the
 //! Flan-T5 context; `depth` × [AdaLN-Zero self-attention, **unmodulated** cross-attention masked by
 //! the text attention mask, AdaLN-Zero MLP]; AdaLN final layer; unpatchify. Runs in f32 (the
 //! checkpoint's dtype and upstream's CPU/MPS execution dtype). Weight keys are upstream's
 //! `state_dict` names verbatim.
 
+use gen_core_checkpoint::supra2::{timestep_features, Supra2Config};
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
-use mlx_gen::gen_core::supra2::{timestep_features, Supra2Config};
 use mlx_gen::nn::{gelu_tanh, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};

@@ -7271,7 +7271,7 @@ fn fused_full_split_literals_preserve_correlated_overwrite_and_raw_floor_host() 
     use crate::ldm::pricing::{
         order_invariant_projection, split_in_exact_source_order, OrderInvariantProjection,
     };
-    use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as C;
+    use gen_core_family::sdxl_ldm::SdxlComponent as C;
     use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
     let mut headers = fused_literal_headers();
     let whole = split_in_exact_source_order(&headers, &[0, 1, 2, 3, 4]).unwrap();
@@ -7350,7 +7350,7 @@ fn fused_split_and_actual_selected_raw_load_guard_match_cpu() {
     };
     {
         use crate::ldm::pricing::{order_invariant_projection, OrderInvariantProjection};
-        use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as C;
+        use gen_core_family::sdxl_ldm::SdxlComponent as C;
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("fused.safetensors");
         let headers = fused_literal_headers();
@@ -8376,7 +8376,7 @@ fn fused_unet_upsampler_aliases_match_every_world_host() {
             source
                 .aliases
                 .iter()
-                .filter(|a| a.component == mlx_gen::gen_core::sdxl_ldm::SdxlComponent::Unet)
+                .filter(|a| a.component == gen_core_family::sdxl_ldm::SdxlComponent::Unet)
                 .count(),
             2,
             "{case}: weight and bias are separate realizable groups"
@@ -8465,7 +8465,7 @@ fn fused_vae_attention_aliases_match_every_world_host() {
         source
             .aliases
             .iter()
-            .filter(|a| a.component == mlx_gen::gen_core::sdxl_ldm::SdxlComponent::Vae)
+            .filter(|a| a.component == gen_core_family::sdxl_ldm::SdxlComponent::Vae)
             .count(),
         2
     );
@@ -8519,7 +8519,7 @@ fn fused_text_and_heavy_aliases_combine_to_every_world_host() {
 /// unread, a realizable heavy alias changes shapes or loaded bytes, never an activation dtype.
 #[test]
 fn ldm_heavy_remap_collisions_are_upsampler_slots_and_vae_spellings_host() {
-    use mlx_gen::gen_core::sdxl_ldm::{remap_sdxl_ldm_key, SdxlComponent as C, TensorRemap};
+    use gen_core_family::sdxl_ldm::{remap_sdxl_ldm_key, SdxlComponent as C, TensorRemap};
     let leaves = ["weight", "bias", "scales", "biases"];
     let mut keys = Vec::new();
     let unet_parts = [
@@ -8712,6 +8712,6 @@ fn fused_adapter_selected_headers_are_normalized_host() {
         .any(|h| h.name.starts_with("model.diffusion_model.")));
     let expected = crate::ldm::pricing::FusedHeaderSource::read(&file)
         .unwrap()
-        .headers_with(mlx_gen::gen_core::sdxl_ldm::SdxlComponent::Unet, &[]);
+        .headers_with(gen_core_family::sdxl_ldm::SdxlComponent::Unet, &[]);
     assert_eq!(selected, expected);
 }

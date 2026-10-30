@@ -22,20 +22,20 @@ and the catalog's licence rows (`gen_core::license`, `candle-gen-catalog/src/lic
 ## Coverage (S2 = the distilled text-to-image route, Candle column)
 
 Every row of the MLX twin's coverage table marked S1 is ported here one-to-one, against the same
-`gen_core::flux3` contract and the same committed goldens:
+`gen_core_flux3` contract and the same committed goldens:
 
 | Upstream behaviour | Candle (`candle-gen-flux3`) |
 | --- | --- |
 | Chat template, clamp 4096, pad-80 window, pad positions = 1, padded causal attention | `text_encoder.rs` over `candle_llm::CausalLm::hidden_states_with_mask_at` (explicit positions + additive mask) |
 | Conditioning = the 8 hidden states concatenated per token → `[L, 20480]` bf16 | `text_encoder.rs` |
 | Autoencoder: 8× KL VAE + 2×2 patchify + BatchNorm-stat latents, f32 | `autoencoder.rs` (NCHW; every 3×3 conv through `candle_gen::conv2d_budgeted`, the mid attention through the shared i32-safe SDPA) |
-| Image ids, 4-axis RoPE tables, timestep embedding, per-mode modulation, per-mode + single-stream blocks, `LastLayer` | `dit.rs` + `nn.rs` (`gen_core::flux3` tables) |
-| Flow-map Euler, `dt · velocity` rounded to the compute dtype, f32 state | `pipeline.rs` (written against `gen_core::flux3::flow_map_schedule`, not the shared sigma-convention sampler driver) |
+| Image ids, 4-axis RoPE tables, timestep embedding, per-mode modulation, per-mode + single-stream blocks, `LastLayer` | `dit.rs` + `nn.rs` (`gen_core_flux3` tables) |
+| Flow-map Euler, `dt · velocity` rounded to the compute dtype, f32 state | `pipeline.rs` (written against `gen_core_flux3::flow_map_schedule`, not the shared sigma-convention sampler driver) |
 | Output `clamp(−1, 1)` → RGB8 (truncating cast) | `pipeline::float_image_to_rgb8` |
-| Default seed `sha256(caption)` when the request carries none | `gen_core::flux3::prompt_seed` |
+| Default seed `sha256(caption)` when the request carries none | `gen_core_flux3::prompt_seed` |
 | Base CFG50/3.5, explicit negative conditioning, additive identity-checked LoRA | `pipeline::denoise_cfg`, `adapters.rs`, native `AdaptLinear` residuals (S6) |
 | Optional prompt upsampler | separate `pup.rs` model and shared four-mode contract (S5) |
-| Ordered 1–10 RGB/RGBA references; single Lanczos fit/reflect-or-symmetric padding, multi-reference fit/centre crop; optional output-size intent and single auto output crop | `gen_core::flux3::references`, `references.rs`, immutable `image_cond` in both flow-map and both base CFG samples (S3); generation Qwen encoding stays text-only |
+| Ordered 1–10 RGB/RGBA references; single Lanczos fit/reflect-or-symmetric padding, multi-reference fit/centre crop; optional output-size intent and single auto output crop | `gen_core_flux3::references`, `references.rs`, immutable `image_cond` in both flow-map and both base CFG samples (S3); generation Qwen encoding stays text-only |
 | Source EXIF/RGB conversion versus PUP alpha-over-white fork | caller-authorized asset decode preserves oriented RGBA; AE drops alpha, existing PUP sees original RGBA; no raw-path generation-request carrier |
 | Boxes, quantized variants | typed `Unsupported` refusals (sc-26237, sc-26241) |
 

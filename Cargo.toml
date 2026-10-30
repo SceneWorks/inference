@@ -22,9 +22,20 @@ members = [
     "crates/contracts/core-llm",
     "crates/contracts/core-llm/core-llm-testkit",
     "crates/contracts/gen-core",
+    "crates/contracts/gen-core-checkpoint",
     "crates/contracts/gen-core-dist",
+    "crates/contracts/gen-core-family",
+    "crates/contracts/gen-core-flux3",
+    "crates/contracts/gen-core-h3",
+    "crates/contracts/gen-core-image",
+    "crates/contracts/gen-core-iris",
+    "crates/contracts/gen-core-ltx",
+    "crates/contracts/gen-core-memory-wan",
+    "crates/contracts/gen-core-moss-image",
     "crates/contracts/gen-core-telemetry",
     "crates/contracts/gen-core-testkit",
+    "crates/contracts/gen-core-tokenizer",
+    "crates/contracts/gen-core-train",
     "crates/kernels/candle-quant-kernels",
     "crates/bundles/*",
     "crates/llm/candle-llm",
@@ -60,6 +71,19 @@ sceneworks-gen-core-testkit = { path = "crates/contracts/gen-core-testkit" }
 # with their socket / process FFI (sc-27316).
 sceneworks-gen-core-dist = { path = "crates/contracts/gen-core-dist" }
 sceneworks-gen-core-telemetry = { path = "crates/contracts/gen-core-telemetry" }
+# Family- and feature-specific host code split out of gen-core so a family's change no longer
+# rebuilds the contract crate and everything above it (sc-27316).
+sceneworks-gen-core-checkpoint = { path = "crates/contracts/gen-core-checkpoint" }
+sceneworks-gen-core-family = { path = "crates/contracts/gen-core-family" }
+sceneworks-gen-core-flux3 = { path = "crates/contracts/gen-core-flux3" }
+sceneworks-gen-core-h3 = { path = "crates/contracts/gen-core-h3" }
+sceneworks-gen-core-image = { path = "crates/contracts/gen-core-image" }
+sceneworks-gen-core-iris = { path = "crates/contracts/gen-core-iris" }
+sceneworks-gen-core-ltx = { path = "crates/contracts/gen-core-ltx" }
+sceneworks-gen-core-memory-wan = { path = "crates/contracts/gen-core-memory-wan" }
+sceneworks-gen-core-moss-image = { path = "crates/contracts/gen-core-moss-image" }
+sceneworks-gen-core-tokenizer = { path = "crates/contracts/gen-core-tokenizer" }
+sceneworks-gen-core-train = { path = "crates/contracts/gen-core-train" }
 runtime-catalog = { path = "crates/bundles/runtime-catalog" }
 mlx-gen-catalog = { path = "crates/media/mlx-gen/mlx-gen-catalog" }
 mlx-gen-ios-catalog = { path = "crates/media/mlx-gen/mlx-gen-ios-catalog" }

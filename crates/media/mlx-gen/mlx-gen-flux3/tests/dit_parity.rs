@@ -11,7 +11,7 @@
 //!
 //! Every test runs in a CPU-default child (`cpu_process`).
 
-use mlx_gen::gen_core::flux3::text_ids;
+use gen_core_flux3::text_ids;
 use mlx_gen_flux3::{load_dit, SampleTokens};
 use mlx_rs::{Array, Dtype};
 
@@ -134,13 +134,8 @@ fn ordered_reference_edits_match_frozen_source() {
 /// tokens fixed across every step, including BOTH base CFG branches at guidance zero and one.
 fn ordered_reference_edits_match_frozen_source_body() {
     on_cpu(|| {
-        use mlx_gen::gen_core::{
-            flux3::{
-                assemble_window,
-                references::{prepare, ReferenceOutputSize},
-            },
-            CancelFlag, Image,
-        };
+        use gen_core_flux3::{assemble_window, references::prepare};
+        use mlx_gen::gen_core::{flux3::references::ReferenceOutputSize, CancelFlag, Image};
         use mlx_gen_flux3::pipeline::{
             decode_tokens, denoise_cfg_with_references, denoise_flow_map_with_references,
         };
@@ -148,7 +143,7 @@ fn ordered_reference_edits_match_frozen_source_body() {
         let golden = fixture("flux3_reference_edit_golden.safetensors");
         assert_eq!(
             golden.metadata("upstream_code_revision").unwrap(),
-            mlx_gen::gen_core::flux3::UPSTREAM_CODE_REVISION
+            gen_core_flux3::UPSTREAM_CODE_REVISION
         );
         let ae = load_autoencoder(&tiny_package().join("ae.safetensors")).unwrap();
         let flow = mlx_gen_flux3::load_dit(
@@ -231,8 +226,8 @@ fn ordered_reference_edits_match_frozen_source_body() {
                     .collect(),
                 ..Default::default()
             };
-            let ae_input = mlx_gen::gen_core::flux3::references::request_images(&mixed).unwrap();
-            let mixed_prepared = mlx_gen::gen_core::flux3::references::prepare_borrowed(
+            let ae_input = gen_core_flux3::references::request_images(&mixed).unwrap();
+            let mixed_prepared = gen_core_flux3::references::prepare_borrowed(
                 &ae_input.iter().map(|i| i.as_ref()).collect::<Vec<_>>(),
                 ReferenceOutputSize::default(),
             )
@@ -241,7 +236,7 @@ fn ordered_reference_edits_match_frozen_source_body() {
                 mixed_prepared.images, prepared.images,
                 "source RGB-drop-alpha is exact, not white-premultiplied"
             );
-            let pup = mlx_gen::gen_core::flux3::references::upsampler_input(&mixed).unwrap();
+            let pup = gen_core_flux3::references::upsampler_input(&mixed).unwrap();
             for (position, &i) in order.iter().enumerate() {
                 if i.is_multiple_of(2) {
                     let (_, _, rgb) = pup.references[position].to_rgb8().unwrap();
@@ -544,7 +539,7 @@ fn timestep_embedding_follows_the_compute_dtype_body() {
         .unwrap();
         // The first interior point of the 16-step release schedule (≈ 0.99047), read off the
         // contract rather than spelled as a literal f32 cannot hold exactly.
-        let t = mlx_gen::gen_core::flux3::flow_map_schedule(16, 6.93).unwrap()[1];
+        let t = gen_core_flux3::flow_map_schedule(16, 6.93).unwrap()[1];
         assert!((0.9904..0.9905).contains(&t), "schedule[1] = {t}");
         let f_embedding = f32_dit.timestep_embedding(t).unwrap();
         let b_embedding = bf16_dit.timestep_embedding(t).unwrap();
@@ -596,8 +591,9 @@ fn base_cfg_and_explicit_adapter_identity_match_frozen_source() {
         "dit_parity::base_cfg_and_explicit_adapter_identity_match_frozen_source",
         || {
             on_cpu(|| {
+                use gen_core_flux3::assemble_window;
                 use mlx_gen::{
-                    gen_core::{flux3::assemble_window, AdapterKind, AdapterSpec, CancelFlag},
+                    gen_core::{AdapterKind, AdapterSpec, CancelFlag},
                     weights::Weights,
                 };
                 use mlx_gen_flux3::pipeline::denoise_cfg;

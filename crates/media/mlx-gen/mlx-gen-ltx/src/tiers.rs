@@ -86,7 +86,7 @@ use mlx_rs::ops::quantize;
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Device, Dtype};
 
-use mlx_gen::gen_core::ltx_checkpoint::{LtxBundle, LtxComponent, LtxResolvedComponent};
+use gen_core_ltx::ltx_checkpoint::{LtxBundle, LtxComponent, LtxResolvedComponent};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -265,7 +265,7 @@ fn matches_quant_suffix(key: &str, suffixes: &[&str]) -> bool {
 /// embedding **lookup**. The two `text_embedding_projection` aggregate embeds are quantized too, but
 /// under [`CONNECTOR_QUANT_SUFFIXES`]: the tier moves them into the connector component.
 fn is_text_encoder_quantizable(key: &str) -> bool {
-    if mlx_gen::gen_core::gemma_assets::is_gemma_asset_key(key) {
+    if gen_core_ltx::gemma_assets::is_gemma_asset_key(key) {
         return false;
     }
     matches_quant_suffix(key, GEMMA_QUANT_SUFFIXES)
@@ -806,7 +806,7 @@ fn emit_component(
 /// A source component's `__metadata__`, verbatim, plus the tier stamp.
 ///
 /// Verbatim matters in three ways: the `config` slice is what the loader builds the module from,
-/// `model_version` is what [`mlx_gen::gen_core::ltx_checkpoint`] keys the split layout on, and the
+/// `model_version` is what [`gen_core_ltx::ltx_checkpoint`] keys the split layout on, and the
 /// embedded LTX-2.x Community License text travels with the weights it licenses.
 fn component_metadata(resolved: &LtxResolvedComponent, tier: LtxTier) -> BTreeMap<String, String> {
     let mut metadata = resolved.metadata().raw().clone();
@@ -847,7 +847,7 @@ fn transformer_metadata(
 ///
 /// The `config` key is **dropped** rather than copied, so that exactly one emitted file declares
 /// each [`LtxComponent`] slot. A `vae_encoder.safetensors` carrying `config.vae` would classify as a
-/// second `conv_video_vae` and make [`mlx_gen::gen_core::ltx_checkpoint::discover_split_bundle`]
+/// second `conv_video_vae` and make [`gen_core_ltx::ltx_checkpoint::discover_split_bundle`]
 /// refuse the whole tree as ambiguous; a `connector.safetensors` carrying `config.transformer`
 /// would do the same to the transformer slot. The configs are not lost — the primary half of the
 /// same split keeps the whole slice ([`component_metadata`]), and the tier's merged
@@ -858,7 +858,7 @@ fn derived_metadata(
     derived_from: &str,
 ) -> BTreeMap<String, String> {
     let mut metadata = component_metadata(resolved, tier);
-    metadata.remove(mlx_gen::gen_core::ltx_checkpoint::CONFIG_METADATA_KEY);
+    metadata.remove(gen_core_ltx::ltx_checkpoint::CONFIG_METADATA_KEY);
     metadata.insert(
         "sceneworks_derived_from".to_string(),
         derived_from.to_string(),
@@ -903,7 +903,7 @@ fn stamp_gemma_quantization(
     let Some(bits) = tier.bits() else {
         return Ok(());
     };
-    let key = mlx_gen::gen_core::ltx_checkpoint::GEMMA_CONFIG_METADATA_KEY;
+    let key = gen_core_ltx::ltx_checkpoint::GEMMA_CONFIG_METADATA_KEY;
     let raw = metadata.get(key).ok_or_else(|| {
         Error::Msg(format!(
             "ltx tiers: {} carries no __metadata__[{key:?}] — the text encoder must ship its \
@@ -954,7 +954,7 @@ fn stamp_gemma_quantization(
 /// Build one tier of an LTX-2.5 split bundle into `out_dir`.
 ///
 /// `bundle` is a resolved 2.5 bundle ([`crate::bundle::resolve_split_bundle`] or
-/// `gen_core::ltx_checkpoint::discover_split_bundle`). The transformer, the conv video VAE and the
+/// `gen_core_ltx::ltx_checkpoint::discover_split_bundle`). The transformer, the conv video VAE and the
 /// text encoder are **required**; every other component is emitted when the bundle carries it, so a
 /// video-only or upsampler-less install converts without a special mode.
 ///

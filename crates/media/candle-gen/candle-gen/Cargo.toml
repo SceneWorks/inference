@@ -13,6 +13,7 @@ autotests = false
 [dependencies]
 # Shared pins live in [workspace.dependencies] (mirrors mlx-gen F-151).
 sceneworks-gen-core = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 # Backend-neutral host-side test helpers (`gen_core_testkit::host`, sc-27323), re-exported from
 # `testkit`. Zero tensor deps; only compiled with the test-only `testkit` feature.
 sceneworks-gen-core-testkit = { workspace = true, optional = true }
@@ -57,7 +58,7 @@ libc = { workspace = true }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [features]
-model-inference-proof = ["candle-quant-kernels/model-inference-proof", "sceneworks-gen-core/model-inference-proof", "candle-core/model-inference-proof"]
+model-inference-proof = ["candle-quant-kernels/model-inference-proof", "sceneworks-gen-core/model-inference-proof", "candle-core/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 # Default works on Mac with NO extra features: candle-core defaults to the CPU backend.
 default = []
 # Test-support helpers (sc-9055 / F-069): the shared `testkit` module (PPM IO / cosine / env-path /

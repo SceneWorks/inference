@@ -44,6 +44,7 @@ pub mod coherence;
 pub mod convrot_int8;
 pub mod error;
 pub mod img2img;
+pub mod int8_gemm;
 pub mod ios_anchor_law;
 pub mod ios_pricing;
 pub mod ios_quantum;

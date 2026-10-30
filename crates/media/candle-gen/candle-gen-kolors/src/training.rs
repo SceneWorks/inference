@@ -14,7 +14,6 @@ use candle_gen::diffusion_schedule::{
     KOLORS_TRAIN_STEPS as NUM_TRAIN_TIMESTEPS,
 };
 use candle_gen::gen_core::sampling::AlphaSchedule;
-use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
 };
@@ -41,6 +40,7 @@ use candle_gen::train::tae::TinyDecoderSpec;
 use candle_gen::{CandleError, Result};
 use candle_gen_perceptual::{AuxGeometry, AuxLossContext, DecoderSpec};
 use candle_gen_sdxl::{sdxl_unet_config, UNet2DConditionModel, VaeMomentsEncoder};
+use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 use crate::chatglm3::ChatGlmModel;
@@ -173,12 +173,12 @@ impl Trainer for KolorsTrainer {
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core_train::validate_control_request(self.descriptor(), req)?;
+        gen_core_train::validate_full_finetune_request(self.descriptor(), req)?;
         // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_edit_request(self.descriptor(), req)?;
         validate_request(req).map_err(Into::into)
     }
 
@@ -189,7 +189,7 @@ impl Trainer for KolorsTrainer {
     ) -> gen_core::Result<TrainingOutput> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
@@ -586,15 +586,13 @@ impl KolorsTrainer {
         // cropped like the image and resampled onto its decoded size.
         let mut perceptual = perceptual;
         if let Some(path) = perceptual.as_mut() {
-            path.attach_subject_masks(
-                candle_gen::gen_core::train::subject_mask::PerceptualSubjectMasks::load(
-                    "kolors trainer",
-                    &req.items,
-                    cfg,
-                    edges.len(),
-                    CropBox::center_square,
-                )?,
-            );
+            path.attach_subject_masks(gen_core_train::subject_mask::PerceptualSubjectMasks::load(
+                "kolors trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?);
         }
         let mut aux_driver = match perceptual {
             Some(path) => Some(AuxDriver::prepare(

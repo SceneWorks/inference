@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use candle_core::{safetensors, Device, Tensor};
-use candle_gen::gen_core::sdxl_ldm::{remap_sdxl_ldm_key, SdxlComponent, TensorRemap};
+use gen_core_family::sdxl_ldm::{remap_sdxl_ldm_key, SdxlComponent, TensorRemap};
 
 use candle_gen::{CandleError, Result};
 

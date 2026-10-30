@@ -102,7 +102,6 @@ mod conditioning;
 
 use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::DType;
-use candle_gen::gen_core::pruned_adaln::{PrunedAdaLn, SourcePruneSizing, TABLE_KEY};
 use candle_gen::gen_core::{
     adapter_stack_resident_bytes, safetensors_path_bytes, AdapterResidencyMode, Error as CoreError,
     LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity,
@@ -112,6 +111,8 @@ use candle_gen::gen_core::{
     MemoryStrategyCapability, MemoryStrategySupport, MemoryWindowMaterialization,
     ResidentRequestMemory, TransformerComponent, WeightsSource,
 };
+use gen_core_h3::h3_memory::NativeAllocationFactsExt;
+use gen_core_h3::pruned_adaln::{PrunedAdaLn, SourcePruneSizing, TABLE_KEY};
 
 use crate::model::{BASE_DIT_PARTITION, REFERENCE_DIT_PARTITION};
 use crate::MODEL_ID;
@@ -523,9 +524,9 @@ fn native_backend() -> candle_gen::gen_core::h3_memory::NativeBackend {
 fn dit_allocation(
     path: &std::path::Path,
     pruned: bool,
-) -> candle_gen::gen_core::Result<candle_gen::gen_core::h3_memory::NativeComponentAllocation> {
+) -> candle_gen::gen_core::Result<gen_core_h3::h3_memory::NativeComponentAllocation> {
     let mut allocation =
-        candle_gen::gen_core::h3_memory::component_allocation(path, native_backend(), 2, |h| {
+        gen_core_h3::h3_memory::component_allocation(path, native_backend(), 2, |h| {
             if pruned
                 && (h.name == TABLE_KEY
                     || h.name.contains(".adaln_proj.linear.")
@@ -1425,7 +1426,7 @@ fn memory_contract_surface_specs() -> Vec<candle_gen::gen_core::MemoryContractSu
 pub fn veda_workspace_bound(
     req: candle_gen::gen_core::veda::workspace::Request<'_>,
 ) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::veda::workspace::WorkspaceBound>> {
-    candle_gen::gen_core::veda::workspace::for_video_request(
+    gen_core_h3::veda::workspace::for_video_request(
         req,
         candle_gen::gen_core::veda::workspace::Backend::Cuda,
     )
@@ -1447,7 +1448,7 @@ pub fn veda_workspace_bound_for_contract(
         Some(native) => native.selected_patch(req)?,
         None => [1, 2, 2], // unresolved inventory only; no materialized source geometry exists
     };
-    candle_gen::gen_core::veda::workspace::for_video_request_with_patch(
+    gen_core_h3::veda::workspace::for_video_request_with_patch(
         req,
         candle_gen::gen_core::veda::workspace::Backend::Cuda,
         patch,
@@ -1591,7 +1592,7 @@ mod tests {
             ..Default::default()
         };
         let workspace =
-            candle_gen::gen_core::h3_conditioning_memory::workspace(&(&req).into(), vae).unwrap();
+            gen_core_h3::h3_conditioning_memory::workspace(&(&req).into(), vae).unwrap();
         assert!(workspace.decode_bytes > 0);
     }
 

@@ -55,12 +55,6 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use candle_gen::candle_core::DType;
-use candle_gen::gen_core::iris::depth::DepthInputPlan;
-use candle_gen::gen_core::iris::downstream::{TaskExport, EMPTY_PROMPT_FILE};
-use candle_gen::gen_core::iris::restoration::{RestorationPlan, RestorationResources};
-use candle_gen::gen_core::iris::{
-    GenerationResources, IrisConfig, IrisTask, TextEncoderConfig, BACKBONE_WEIGHTS_FILE,
-};
 use candle_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, SafetensorsTensorHeader};
 use candle_gen::gen_core::{
     self, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
@@ -70,6 +64,12 @@ use candle_gen::gen_core::{
     MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
     MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
     MemoryStrategySupport, MemoryWindowMaterialization, ResidentRequestMemory,
+};
+use gen_core_iris::depth::DepthInputPlan;
+use gen_core_iris::downstream::{TaskExport, EMPTY_PROMPT_FILE};
+use gen_core_iris::restoration::{RestorationPlan, RestorationResources};
+use gen_core_iris::{
+    GenerationResources, IrisConfig, IrisTask, TextEncoderConfig, BACKBONE_WEIGHTS_FILE,
 };
 
 use crate::depth::DEPTH_MODEL_ID;
@@ -1088,10 +1088,10 @@ mod tests {
 
     use super::*;
     use candle_gen::candle_core::Device;
-    use candle_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
     use candle_gen::gen_core::{
         AdapterKind, AdapterSpec, OffloadPolicy, Precision, Quant, WeightsSource,
     };
+    use gen_core_iris::TEXT_ENCODER_COMPONENT;
 
     use crate::nn::{safetensors_shapes, Checkpoint};
 
@@ -2348,10 +2348,8 @@ mod tests {
     /// unconditionally (a tiled plan's forward is then priced at the whole image).
     #[test]
     fn restoration_tiling_bounds_the_forward_at_one_tile() {
-        use candle_gen::gen_core::iris::restoration::{
-            plan, Dims, RestorationOptions, TileGeometry,
-        };
         use candle_gen::gen_core::InputSizing;
+        use gen_core_iris::restoration::{plan, Dims, RestorationOptions, TileGeometry};
 
         let geometry = TileGeometry::RELEASE;
         let options = RestorationOptions {

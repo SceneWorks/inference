@@ -2,7 +2,7 @@
 //! the bound transform/depth wrappers, and the non-circular capture permit.
 use super::*;
 use crate::sdxl::tests::{admit_fixture_rows as admit_with_rows, budget, DEVICE};
-use mlx_gen::gen_core::iris::depth::{DepthOutput, IrisDepthEstimator};
+use gen_core_iris::depth::{DepthOutput, IrisDepthEstimator};
 use mlx_gen::gen_core::{
     GenerationOutput, Generator, Image, MemoryStrategy, Progress, Transform, TransformDescriptor,
     WeightsSource,

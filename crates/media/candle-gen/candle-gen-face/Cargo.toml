@@ -20,6 +20,8 @@ candle-nn = { workspace = true }
 # Face-loss test stand-ins (sc-24831) write fx-program checkpoints with metadata; candle's own
 # safetensors version (0.7) so its `View` impl for `Tensor` applies (same pin as candle-gen).
 safetensors = "0.7"
+sceneworks-gen-core-family = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [dev-dependencies]
 # The face-loss parity fixture is JSON and pins its producer script's sha256 (sc-24831).
@@ -31,7 +33,7 @@ tempfile = { workspace = true }
 image = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen/model-inference-proof", "candle-core/model-inference-proof"]
+model-inference-proof = ["candle-gen/model-inference-proof", "candle-core/model-inference-proof", "sceneworks-gen-core-family/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 # Pass the backend selection through to the core crate so a downstream `--features cuda`/`metal` on
 # this crate selects the matching candle backend everywhere (the face stack itself runs f32, but the
 # device follows the build so InstantID/PuLID keep one device).

@@ -1500,7 +1500,7 @@ fn solver_update(
     l: &mut NativeLedger,
     n: u64,
     prediction: Prediction,
-    update: &mlx_gen::gen_core::iris::DpmUpdate,
+    update: &gen_core_iris::DpmUpdate,
     guided: bool,
 ) -> Result<()> {
     if guided {
@@ -1512,11 +1512,11 @@ fn solver_update(
         l.repeated(4, n, 2)?; // s*out, x-(s*out)
     }
     match update {
-        mlx_gen::gen_core::iris::DpmUpdate::First { .. } => {
+        gen_core_iris::DpmUpdate::First { .. } => {
             l.repeated(4, 1, 2)?; // cx, c0
             l.repeated(4, n, 3)?; // cx*x, c0*x0, difference
         }
-        mlx_gen::gen_core::iris::DpmUpdate::Second { .. } => {
+        gen_core_iris::DpmUpdate::Second { .. } => {
             l.repeated(4, 1, 4)?; // r0, cx, c0, c1
             l.repeated(4, n, 7)?; // x0-prev, /r0, cx*x, c0*x0, subtract, c1*d, subtract
         }
@@ -1570,7 +1570,7 @@ fn generation_upper(
         req.execution.stage_residency || req.spec.offload_policy == OffloadPolicy::Sequential;
     let path = resources
         .backbone_dir
-        .join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
+        .join(gen_core_iris::BACKBONE_WEIGHTS_FILE);
     crate::memory_strategy::refuse_streamed_adapters(crate::model::MODEL_ID, req.spec)
         .map_err(Error::from)?;
     let mut bb = priced_backbone(
@@ -1626,12 +1626,12 @@ fn generation_upper(
         )?;
         installed_adapters::load(l, &adapter_inventory, packed_hosts)?;
     }
-    let tokenizer = mlx_gen::gen_core::tokenizer::TextTokenizer::from_file(
+    let tokenizer = gen_core_tokenizer::TextTokenizer::from_file(
         resources.text_encoder_dir.join("tokenizer.json"),
-        mlx_gen::gen_core::tokenizer::TokenizerConfig {
+        gen_core_tokenizer::TokenizerConfig {
             max_length: usize::MAX,
             pad_token_id: 0,
-            chat_template: mlx_gen::gen_core::tokenizer::ChatTemplate::None,
+            chat_template: gen_core_tokenizer::ChatTemplate::None,
             pad_to_max_length: false,
         },
     )
@@ -1640,7 +1640,7 @@ fn generation_upper(
         .encode_ids(PROMPT_PREFIX, false)
         .map_err(Error::from)?;
     let suffix = tokenizer
-        .encode_ids(mlx_gen::gen_core::iris::PROMPT_SUFFIX, false)
+        .encode_ids(gen_core_iris::PROMPT_SUFFIX, false)
         .map_err(Error::from)?;
     let encodes = p!(b, 1) + u64::from(work.envelope.uses_cfg());
     match &work.prompts {
@@ -1653,7 +1653,7 @@ fn generation_upper(
                 .chain(work.envelope.uses_cfg().then_some(negative.as_str()))
             {
                 let caption = tokenizer.encode_ids(prompt, false).map_err(Error::from)?;
-                let window = mlx_gen::gen_core::iris::assemble_window(
+                let window = gen_core_iris::assemble_window(
                     &prefix,
                     &caption,
                     &suffix,
@@ -3704,7 +3704,7 @@ pub(super) fn host_analysis_from_sources(
         if plan.color_fix {
             analysis.worker_stack_request_bytes = product(&[
                 3,
-                mlx_gen::gen_core::iris::restoration::COLOR_FIX_WORKER_STACK_BYTES as u64,
+                gen_core_iris::restoration::COLOR_FIX_WORKER_STACK_BYTES as u64,
             ])?;
         }
     }
@@ -3846,7 +3846,7 @@ pub(super) fn restoration_host_upper_with_token(
 
 mod host_payload {
     use super::*;
-    use mlx_gen::gen_core::iris::restoration::{Dims, RestorationPlanMetadata};
+    use gen_core_iris::restoration::{Dims, RestorationPlanMetadata};
 
     /// TOOLCHAIN-POLICY ASSUMPTION, NOT MLX/Iris source authority: RawVec's amortized growth
     /// requests new capacity <= max(2*old, required, min_non_zero_cap), min_non_zero_cap <= 8.
@@ -3965,7 +3965,7 @@ mod host_payload {
         }
         let (hp, wp) = (h / patch, w / patch);
         let t = m.text_len as u64;
-        p.vec::<f32>(mlx_gen::gen_core::iris::TIMESTEP_FREQUENCY_DIM as u64 / 2)?;
+        p.vec::<f32>(gen_core_iris::TIMESTEP_FREQUENCY_DIM as u64 / 2)?;
         p.vec::<f32>(product(&[b, t, t])?)?; // key_padding_additive vec![0;B*T*T]
         let head = (m.hidden_size / m.num_heads) as u64;
         grid_rope(p, hp, wp, head)?;
@@ -4053,7 +4053,7 @@ mod host_payload {
         }
         if plan.color_fix {
             let o = pixels(plan.output)?;
-            let dilations = mlx_gen::gen_core::iris::restoration::COLOR_FIX_DILATIONS.len() as u64;
+            let dilations = gen_core_iris::restoration::COLOR_FIX_DILATIONS.len() as u64;
             p.repeat(3, |worker| {
                 // EACH split has high+low and one blur output PER dilation, no release credit.
                 worker.repeat(2, |split| {
@@ -4255,12 +4255,12 @@ mod host_payload {
             }
             resolved.vec::<u8>(params.negative_prompt.len() as u64)
         })?;
-        let tokenizer = mlx_gen::gen_core::tokenizer::TextTokenizer::from_file(
+        let tokenizer = gen_core_tokenizer::TextTokenizer::from_file(
             resources.text_encoder_dir.join("tokenizer.json"),
-            mlx_gen::gen_core::tokenizer::TokenizerConfig {
+            gen_core_tokenizer::TokenizerConfig {
                 max_length: usize::MAX,
                 pad_token_id: 0,
-                chat_template: mlx_gen::gen_core::tokenizer::ChatTemplate::None,
+                chat_template: gen_core_tokenizer::ChatTemplate::None,
                 pad_to_max_length: false,
             },
         )
@@ -4269,7 +4269,7 @@ mod host_payload {
             .encode_ids(PROMPT_PREFIX, false)
             .map_err(Error::from)?;
         let suffix = tokenizer
-            .encode_ids(mlx_gen::gen_core::iris::PROMPT_SUFFIX, false)
+            .encode_ids(gen_core_iris::PROMPT_SUFFIX, false)
             .map_err(Error::from)?;
         let staged =
             req.execution.stage_residency || req.spec.offload_policy == OffloadPolicy::Sequential;
@@ -4294,7 +4294,7 @@ mod host_payload {
             .chain(params.uses_cfg().then_some(params.negative_prompt.as_str()))
         {
             let caption = tokenizer.encode_ids(prompt, false).map_err(Error::from)?;
-            let window = mlx_gen::gen_core::iris::assemble_window(
+            let window = gen_core_iris::assemble_window(
                 &prefix,
                 &caption,
                 &suffix,
@@ -4312,7 +4312,7 @@ mod host_payload {
                 params.caption_overflow,
                 mlx_gen::gen_core::CaptionOverflowPolicy::Warn
             ) {
-                if let Some(warning) = mlx_gen::gen_core::iris::caption_overflow_warning(
+                if let Some(warning) = gen_core_iris::caption_overflow_warning(
                     &window,
                     config.text_encoder.max_length,
                     suffix.len(),
@@ -4365,9 +4365,7 @@ mod host_payload {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use mlx_gen::gen_core::iris::restoration::{
-            plan_metadata, RestorationOptions, TileGeometry,
-        };
+        use gen_core_iris::restoration::{plan_metadata, RestorationOptions, TileGeometry};
         fn plan(w: u32, h: u32, scale: f64, color_fix: bool) -> RestorationPlanMetadata {
             plan_metadata(
                 Dims::new(w, h),
@@ -4429,11 +4427,9 @@ mod host_payload {
             let mut fixed = Payload::default();
             restoration_driver(&mut fixed, &colored, 3 * 32 * 16).unwrap();
             let o = pixels(colored.output).unwrap();
-            let planes = (2
-                * (2 + mlx_gen::gen_core::iris::restoration::COLOR_FIX_DILATIONS.len() as u64)
-                + 1)
-                * 3
-                + 3;
+            let planes =
+                (2 * (2 + gen_core_iris::restoration::COLOR_FIX_DILATIONS.len() as u64) + 1) * 3
+                    + 3;
             let mut workers = Payload::default();
             workers.growth::<std::thread::ScopedJoinHandle<'static, mlx_gen::gen_core::Result<Vec<f32>>>>(3).unwrap();
             workers.growth::<Vec<f32>>(3).unwrap();
@@ -4596,7 +4592,7 @@ mod host_payload {
             .unwrap();
             assert_eq!(checks, 1);
             assert_eq!(complete, known.checked_add(777).unwrap());
-            let depth_work = mlx_gen::gen_core::iris::depth::DepthRequest {
+            let depth_work = gen_core_iris::depth::DepthRequest {
                 image: transform.image.clone(),
                 ..Default::default()
             };
@@ -4791,7 +4787,7 @@ fn known_yaml_tree_layout(input_bytes: u64) -> Result<u64> {
         product(&[width, elements])
     }
     // The ACTUAL parser element sizes, measured on gen-core's private types (no mirror).
-    let layout = mlx_gen::gen_core::iris::yaml_parser_layouts();
+    let layout = gen_core_iris::yaml_parser_layouts();
     let slots = plus(product(&[4, input_bytes])?, product(&[8, input_bytes])?)?;
     let lines = if input_bytes == 0 {
         0
@@ -5229,7 +5225,7 @@ fn callback_event_upper(req: &IosPricingRequest<'_>) -> Result<CallbackEventUppe
                 && crate::packed::artifact_tier(
                     &resources
                         .backbone_dir
-                        .join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE),
+                        .join(gen_core_iris::BACKBONE_WEIGHTS_FILE),
                 )?
                 .is_none();
             if !req.spec.adapters.is_empty() || dense_load_quant {
@@ -5241,7 +5237,7 @@ fn callback_event_upper(req: &IosPricingRequest<'_>) -> Result<CallbackEventUppe
             if !req.spec.adapters.is_empty() {
                 let path = resources
                     .backbone_dir
-                    .join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
+                    .join(gen_core_iris::BACKBONE_WEIGHTS_FILE);
                 let projection_host = crate::adapters::projection_host_facts_from_headers(&path)?;
                 let inventory = crate::adapters::header_inventory(
                     &req.spec.adapters,
@@ -6148,7 +6144,7 @@ pub(super) fn restoration_worker_os_stack_request_bytes(
     if plan.color_fix {
         product(&[
             3,
-            mlx_gen::gen_core::iris::restoration::COLOR_FIX_WORKER_STACK_BYTES as u64,
+            gen_core_iris::restoration::COLOR_FIX_WORKER_STACK_BYTES as u64,
         ])
     } else {
         Ok(0)

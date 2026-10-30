@@ -4,16 +4,14 @@ use super::{
     optim::{AdamMoment, SourceAdamW},
     TrainingGraph,
 };
-use mlx_gen::gen_core::{
-    flux3::{
-        training::{
-            checkpoint::{publish_bytes, ResumePolicy, TrainingCursor},
-            ResumeIdentity,
-        },
-        BASE_WEIGHTS_REPO, BASE_WEIGHTS_REVISION,
+use gen_core_flux3::{
+    training::{
+        checkpoint::{publish_bytes, ResumePolicy, TrainingCursor},
+        ResumeIdentity,
     },
-    CancelFlag,
+    BASE_WEIGHTS_REPO, BASE_WEIGHTS_REVISION,
 };
+use mlx_gen::gen_core::CancelFlag;
 use mlx_gen::{train::lora::LoraParams, Error, Result};
 use mlx_rs::{transforms::eval, Array, Dtype};
 use sha2::{Digest, Sha256};

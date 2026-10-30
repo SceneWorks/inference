@@ -470,7 +470,9 @@ class CurrentFailedAdapterTests(unittest.TestCase):
             self.assertEqual(checkout_identity(root), before)
 
         live_identity = checkout_identity(repository)
-        self.assertEqual(run(repository, "status", "--porcelain"), "")
+        # Source validation runs against a clean disposable fixture below. The
+        # developer checkout may already contain edits or agent-local files.
+        live_status = run(repository, "status", "--porcelain")
         event_name = os.environ.get("GITHUB_EVENT_NAME")
         fixture_candidate = False
         if event_name == "pull_request":
@@ -564,6 +566,13 @@ class CurrentFailedAdapterTests(unittest.TestCase):
                                  fixture_head).splitlines(), expected)
             self.assertEqual(current.validate_source_closure(fixture, fixture_head, self.cfg),
                              expected)
+            local_file = fixture / "agent-local-state"
+            local_file.write_text("untracked fixture mutation", encoding="utf-8")
+            try:
+                with self.assertRaisesRegex(ValueError, "live checkout must be clean"):
+                    current.validate_source_closure(fixture, fixture_head, self.cfg)
+            finally:
+                local_file.unlink()
             selector_name = self.cfg["selector"].rsplit("::", 1)[1]
             for selector in (f"wrong_module::{selector_name}",
                              "conditioning_velocity_diagnostic::missing_selector"):
@@ -604,7 +613,7 @@ class CurrentFailedAdapterTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "production blob changed"):
                     current.validate_source_closure(fixture, production_commit, self.cfg)
         self.assertEqual(checkout_identity(repository), live_identity)
-        self.assertEqual(run(repository, "status", "--porcelain"), "")
+        self.assertEqual(run(repository, "status", "--porcelain"), live_status)
 
     def test_zip_checks_complete_digest_and_extracts_only_fixed_members(self):
         with tempfile.TemporaryDirectory() as directory:

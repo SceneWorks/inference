@@ -12,7 +12,7 @@ pub(super) fn apply_predicted_frames(
     predict_seconds: &mut dyn FnMut() -> Result<f32>,
 ) -> Result<GenerationRequest> {
     let mut core_predict = || predict_seconds().map_err(mlx_gen::gen_core::Error::from);
-    let frames = mlx_gen::gen_core::duration_head::resolve_request_num_frames(
+    let frames = gen_core_ltx::duration_head::resolve_request_num_frames(
         req.frames,
         req.auto_duration,
         fps,
@@ -39,7 +39,7 @@ pub(super) fn plan_dfr_request(req: &GenerationRequest) -> Result<Option<DfrPlan
     }
 
     let (canvas_frames, automatic_positions) = if temporal_upsample_rounds > 0 {
-        let (canvas, _, positions) = mlx_gen::gen_core::ltx_dfr::resolve_canvas(
+        let (canvas, _, positions) = gen_core_ltx::ltx_dfr::resolve_canvas(
             i64::from(requested_frames),
             i64::from(TEMPORAL_SCALE),
         )?;
@@ -48,7 +48,7 @@ pub(super) fn plan_dfr_request(req: &GenerationRequest) -> Result<Option<DfrPlan
         (requested_frames, Vec::new())
     };
     let keyframe_positions = if generated_count > 0 {
-        mlx_gen::gen_core::ltx_dfr::evenly_spaced_keyframe_positions(
+        gen_core_ltx::ltx_dfr::evenly_spaced_keyframe_positions(
             generated_count,
             i64::from(canvas_frames),
         )

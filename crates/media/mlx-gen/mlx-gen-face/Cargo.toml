@@ -16,6 +16,8 @@ mlx-rs = { workspace = true }
 # The FaceMesh fx-program checkpoint's structure travels as JSON in its safetensors metadata
 # (sc-24831).
 serde_json = { workspace = true }
+sceneworks-gen-core-family = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [dev-dependencies]
 # The face-loss parity fixture pins its producer script's sha256 (sc-24831).
@@ -33,4 +35,4 @@ name = "integration"
 path = "tests/main.rs"
 
 [features]
-model-inference-proof = ["mlx-gen/model-inference-proof"]
+model-inference-proof = ["mlx-gen/model-inference-proof", "sceneworks-gen-core-family/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]

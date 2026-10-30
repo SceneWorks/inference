@@ -44,9 +44,11 @@ safetensors = "0.7"
 # Detect a pre-quantized MLX-packed tier by the `quantization` block in a component's `config.json`
 # (sc-9408 packed-load — `candle_gen::quant::PackedConfig::from_config`). Same dep flux2 uses (sc-9087).
 serde_json = { workspace = true }
+sceneworks-gen-core-tokenizer = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen-perceptual/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof", "candle-core/model-inference-proof"]
+model-inference-proof = ["candle-gen-perceptual/model-inference-proof", "candle-gen-pid/model-inference-proof", "candle-gen/model-inference-proof", "candle-core/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 # Pass the backend selection through to the core crate AND candle-transformers so a downstream
 # `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.
 default = []

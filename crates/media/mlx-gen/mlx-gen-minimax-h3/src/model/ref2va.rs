@@ -45,11 +45,7 @@ impl MiniMaxH3 {
         let resize_mode = mlx_gen::gen_core::effective_reference_image_resize_mode(req);
         let num_frames = geometry.joint.num_frames as usize;
         let truncate = |a: &mlx_gen::media::AudioTrack| {
-            mlx_gen::gen_core::truncate_reference_audio(
-                a,
-                num_frames,
-                crate::denoise::MINIMAX_H3_FPS,
-            )
+            gen_core_h3::truncate_reference_audio(a, num_frames, crate::denoise::MINIMAX_H3_FPS)
         };
         let mut normalized: Vec<Ref2VaReference> = Vec::with_capacity(references.len());
         for r in references.as_slice() {

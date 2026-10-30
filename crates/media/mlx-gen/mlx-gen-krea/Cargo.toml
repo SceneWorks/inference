@@ -39,6 +39,8 @@ image = { workspace = true }
 # The shared epic-2123 aux-loss builder (sc-24830): config -> PerceptualPath (depth anchoring
 # through TAEW2.1, the Qwen-Image VAE's tiny decoder).
 mlx-gen-perceptual = { path = "../mlx-gen-perceptual" }
+sceneworks-gen-core-family = { workspace = true }
+sceneworks-gen-core-train = { workspace = true }
 
 [dev-dependencies]
 # Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
@@ -67,4 +69,4 @@ name = "integration"
 path = "tests/main.rs"
 
 [features]
-model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-qwen-image/model-inference-proof", "mlx-gen-wan/model-inference-proof", "mlx-gen-pid/model-inference-proof", "mlx-gen-boogu/model-inference-proof", "mlx-gen-perceptual/model-inference-proof"]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-qwen-image/model-inference-proof", "mlx-gen-wan/model-inference-proof", "mlx-gen-pid/model-inference-proof", "mlx-gen-boogu/model-inference-proof", "mlx-gen-perceptual/model-inference-proof", "sceneworks-gen-core-family/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]

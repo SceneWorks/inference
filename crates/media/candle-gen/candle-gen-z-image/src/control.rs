@@ -634,7 +634,7 @@ pub struct ZImageControl {
     text_encoder: Option<TextEnc>,
     /// Qwen tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
     /// instead of re-parsing `tokenizer.json` per prompt/uncond branch.
-    tokenizer: Option<candle_gen::gen_core::tokenizer::TextTokenizer>,
+    tokenizer: Option<gen_core_tokenizer::TextTokenizer>,
     transformer: Option<ZImageControlTransformer>,
     vae: Option<AutoEncoderKL>,
     vae_encoder: Option<VaeEncoder>,
@@ -870,7 +870,7 @@ impl ZImageControl {
     fn text_embeddings_with(
         &self,
         text_encoder: &TextEnc,
-        tokenizer: &candle_gen::gen_core::tokenizer::TextTokenizer,
+        tokenizer: &gen_core_tokenizer::TextTokenizer,
         prompt: &str,
     ) -> Result<Tensor> {
         let ids = common::prompt_ids(tokenizer, prompt, "z-image control")?;
@@ -882,7 +882,7 @@ impl ZImageControl {
     fn uncond_embeddings_with(
         &self,
         text_encoder: &TextEnc,
-        tokenizer: &candle_gen::gen_core::tokenizer::TextTokenizer,
+        tokenizer: &gen_core_tokenizer::TextTokenizer,
         negative_prompt: &str,
     ) -> Result<Tensor> {
         let ids = common::uncond_ids(tokenizer, negative_prompt, "z-image control")?;

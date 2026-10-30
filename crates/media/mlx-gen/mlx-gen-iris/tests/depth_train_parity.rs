@@ -15,14 +15,12 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_gen::gen_core::iris::downstream::{EmptyPrompt, TaskExport};
-use mlx_gen::gen_core::iris::train::depth::{
+use gen_core_iris::downstream::{EmptyPrompt, TaskExport};
+use gen_core_iris::train::depth::{
     normalize_log_depth, DepthBatch, DepthLossPlan, MIN_VALID_PIXELS_FLOOR,
 };
-use mlx_gen::gen_core::iris::train::{
-    full_param_route, MuonAdjustLr, OptimizerKind, OptimizerPlan,
-};
-use mlx_gen::gen_core::iris::IrisTask;
+use gen_core_iris::train::{full_param_route, MuonAdjustLr, OptimizerKind, OptimizerPlan};
+use gen_core_iris::IrisTask;
 use mlx_gen_iris::train::depth::{load_export_tensors, DepthModel, DepthStep, DepthWindow};
 use mlx_gen_iris::train::optim::{IrisOptimizer, Params};
 use mlx_rs::{Array, Dtype};
@@ -226,8 +224,8 @@ fn tensor_loss_matches_the_host_reference_body() {
         let mut batch = golden_batch(&g);
         let pred = host_f32(g.require("pred0").unwrap());
         for reduction in [
-            mlx_gen::gen_core::iris::train::depth::LossReduction::ValidPixels,
-            mlx_gen::gen_core::iris::train::depth::LossReduction::PerImage,
+            gen_core_iris::train::depth::LossReduction::ValidPixels,
+            gen_core_iris::train::depth::LossReduction::PerImage,
         ] {
             for weight in [5.0, 0.0, 1.5] {
                 let plan = DepthLossPlan {
@@ -240,8 +238,7 @@ fn tensor_loss_matches_the_host_reference_body() {
                 let got = mlx_gen_iris::train::depth::depth_loss(&p, &step, weight)
                     .unwrap()
                     .item::<f32>() as f64;
-                let want =
-                    mlx_gen::gen_core::iris::train::depth::depth_loss_host(&pred, &batch, &plan);
+                let want = gen_core_iris::train::depth::depth_loss_host(&pred, &batch, &plan);
                 assert!(
                     ((got - want) / want).abs() <= 1e-5,
                     "{reduction:?} λ={weight}: {got} vs {want}"
@@ -271,7 +268,7 @@ fn activation_checkpointing_gradients_equal_the_plain_graph() {
 }
 
 fn activation_checkpointing_gradients_equal_the_plain_graph_body() {
-    use mlx_gen::gen_core::iris::train::ac::AcPolicy;
+    use gen_core_iris::train::ac::AcPolicy;
     use mlx_gen_iris::train::depth::loss_and_grads;
     use mlx_gen_iris::train::model::checkpointed_regions;
     on_cpu(|| {

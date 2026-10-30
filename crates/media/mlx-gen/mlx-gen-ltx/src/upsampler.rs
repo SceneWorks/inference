@@ -16,7 +16,7 @@
 //!
 //! Which variant a checkpoint is comes from the **rank of `upsampler.0.weight`** (4 → Conv2d
 //! spatial, 5 → Conv3d temporal), not from a file name and not from a config: SceneWorks-converted
-//! 2.3 trees carry no `__metadata__` at all. `gen_core::ltx_checkpoint::LatentUpsamplerConfig` reads
+//! 2.3 trees carry no `__metadata__` at all. `gen_core_ltx::ltx_checkpoint::LatentUpsamplerConfig` reads
 //! the declared config where one exists, and
 //! [`LatentUpsampler::assert_matches_config`] cross-checks the two —
 //! [`LatentUpsampler::from_checkpoint`] is the path-taking constructor that runs both, so the
@@ -52,10 +52,10 @@
 use mlx_rs::ops::{add, divide, mean_axes, multiply, subtract, var_axes};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::array::scalar;
-use mlx_gen::gen_core::ltx_checkpoint::{
+use gen_core_ltx::ltx_checkpoint::{
     upsampled_latent_frames, LatentUpsamplerConfig, LatentUpsamplerMode, LtxCheckpointMetadata,
 };
+use mlx_gen::array::scalar;
 use mlx_gen::nn::{conv2d, conv3d, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};

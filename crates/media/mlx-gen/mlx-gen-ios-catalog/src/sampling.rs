@@ -169,7 +169,7 @@ pub fn resolve_transform(
 pub fn resolve_depth(
     provider: &str,
     spec: &mlx_gen::LoadSpec,
-    request: &mlx_gen::gen_core::iris::depth::DepthRequest,
+    request: &gen_core_iris::depth::DepthRequest,
 ) -> Result<SamplingIdentity> {
     if provider != crate::ios_admission::IRIS_DEPTH_ID {
         return Err(unsupported(provider));
@@ -876,7 +876,7 @@ pub fn restoration_configured_representatives(
 }
 pub fn depth_configured_representatives(
     spec: &mlx_gen::LoadSpec,
-    carrier: &mlx_gen::gen_core::iris::depth::DepthRequest,
+    carrier: &gen_core_iris::depth::DepthRequest,
 ) -> Result<Vec<Result<SamplingIdentity>>> {
     Ok(
         mlx_gen_iris::ios_pricing::depth_representatives(spec, carrier)?
@@ -904,7 +904,7 @@ pub fn apply_transform_for_spec(
 pub fn apply_depth_for_spec(
     spec: &mlx_gen::LoadSpec,
     token: &str,
-    request: &mut mlx_gen::gen_core::iris::depth::DepthRequest,
+    request: &mut gen_core_iris::depth::DepthRequest,
 ) -> Result<SamplingIdentity> {
     let raw = native_token("iris-depth1-", token)?;
     mlx_gen_iris::ios_pricing::DepthToken::from_token(&raw)?.apply_runtime_to(spec, request)?;

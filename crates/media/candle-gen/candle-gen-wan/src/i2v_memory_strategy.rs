@@ -8,10 +8,10 @@ use candle_gen::gen_core::{
     MemorySafetyDecision, MemoryStrategy, OffloadPolicy,
 };
 
-pub use gen_core::wan_i2v_memory::{PreparedWanI2vMemory, WanI2vBackend};
+pub use gen_core_memory_wan::{PreparedWanI2vMemory, WanI2vBackend};
 
 pub fn prepare_load_spec(spec: &mut LoadSpec, provider_id: &str) -> gen_core::Result<()> {
-    gen_core::wan_i2v_memory::prepare_load_spec(spec, WanI2vBackend::Candle, provider_id)
+    gen_core_memory_wan::prepare_load_spec(spec, WanI2vBackend::Candle, provider_id)
 }
 
 /// Seal the Candle receipt for `provider_id` and stamp this crate's architecture axes onto it.
@@ -19,7 +19,7 @@ pub fn prepare_load_spec(spec: &mut LoadSpec, provider_id: &str) -> gen_core::Re
 /// The sealed `prepared.contract` is exactly what every Wan I2V generator returns from
 /// `Generator::memory_strategy_contract()`, so the axes must be stamped here rather than only on
 /// the per-request contract [`request_contract_for_mode`] builds — otherwise the loaded path
-/// publishes `gen_core::wan_i2v_memory`'s empty default (epic SC-22657, E2).
+/// publishes `gen_core_memory_wan`'s empty default (epic SC-22657, E2).
 pub fn prepare(spec: &LoadSpec, provider_id: &str) -> gen_core::Result<PreparedWanI2vMemory> {
     let prepared = PreparedWanI2vMemory::prepare(spec, WanI2vBackend::Candle, provider_id)?;
     let facts = architecture_facts(prepared.route);
@@ -30,7 +30,7 @@ pub fn request_evidence_revision(
     prepared: &PreparedWanI2vMemory,
     request: &GenerationRequest,
 ) -> gen_core::Result<String> {
-    gen_core::wan_i2v_memory::request_evidence_revision(prepared, request)
+    gen_core_memory_wan::request_evidence_revision(prepared, request)
 }
 
 thread_local! {
@@ -123,8 +123,8 @@ pub fn selected_decode_cap(request: &GenerationRequest) -> gen_core::Result<Opti
     let overlap = memory.decode_overlap.ok_or_else(|| {
         gen_core::Error::Unsupported("Wan BoundedDecode requires an overlap".to_owned())
     })?;
-    if !gen_core::wan_i2v_memory::DECODE_TILE_EDGES.contains(&edge)
-        || !gen_core::wan_i2v_memory::DECODE_OVERLAPS.contains(&overlap)
+    if !gen_core_memory_wan::DECODE_TILE_EDGES.contains(&edge)
+        || !gen_core_memory_wan::DECODE_OVERLAPS.contains(&overlap)
     {
         return Err(gen_core::Error::Unsupported(format!(
             "Wan decode pair {edge}/{overlap} is outside the sealed domain"
@@ -137,9 +137,7 @@ pub fn safety_check(
     prepared: &PreparedWanI2vMemory,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    MemorySafetyDecision::from_validation(gen_core::wan_i2v_memory::validate_context(
-        prepared, context,
-    ))
+    MemorySafetyDecision::from_validation(gen_core_memory_wan::validate_context(prepared, context))
 }
 
 struct WanI2vRequestScope {
@@ -152,7 +150,7 @@ struct WanI2vRequestScope {
 
 impl MemoryRequestScope for WanI2vRequestScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
-        let actual = gen_core::wan_i2v_memory::validate_request_evidence(
+        let actual = gen_core_memory_wan::validate_request_evidence(
             &self.prepared,
             request,
             &self.selection,
@@ -173,7 +171,7 @@ impl MemoryRequestScope for WanI2vRequestScope {
 
 /// The trunk and autoencoder geometry each Wan I2V route actually runs (epic SC-22657, E2).
 ///
-/// `gen_core::wan_i2v_memory` builds one shared contract for all four routes and publishes
+/// `gen_core_memory_wan` builds one shared contract for all four routes and publishes
 /// [`gen_core::MemoryArchitectureFacts::default`] there, because it is backend-neutral and holds no
 /// model config. This crate does, and — unlike the registry's weights-free contract surface — a
 /// [`PreparedWanI2vMemory`] only exists for a snapshot that has already been resolved, sealed and
@@ -187,22 +185,22 @@ impl MemoryRequestScope for WanI2vRequestScope {
 /// `transformer_blocks` is ONE expert's depth on the dual-expert 14B routes, exactly as the preset
 /// states it: a denoise step traverses the low-noise expert or the high-noise one, never both.
 pub fn architecture_facts(
-    route: gen_core::wan_i2v_memory::WanI2vRoute,
+    route: gen_core_memory_wan::WanI2vRoute,
 ) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
     let (dit, latent_channels, tiling) = match route {
-        gen_core::wan_i2v_memory::WanI2vRoute::Ti2v5b => (
+        gen_core_memory_wan::WanI2vRoute::Ti2v5b => (
             crate::config::TransformerConfig::ti2v_5b(),
             crate::config::VaeConfig::ti2v_5b().z_dim,
             crate::WAN_Z48_VAE_TILING,
         ),
         // T2V and I2V A14B share `wan14b.rs` and therefore one transformer preset; the routes
         // differ in their carrier, not in their trunk shape.
-        gen_core::wan_i2v_memory::WanI2vRoute::T2v14b
-        | gen_core::wan_i2v_memory::WanI2vRoute::I2v14b
-        | gen_core::wan_i2v_memory::WanI2vRoute::Vace
-        | gen_core::wan_i2v_memory::WanI2vRoute::VaceFun => (
+        gen_core_memory_wan::WanI2vRoute::T2v14b
+        | gen_core_memory_wan::WanI2vRoute::I2v14b
+        | gen_core_memory_wan::WanI2vRoute::Vace
+        | gen_core_memory_wan::WanI2vRoute::VaceFun => (
             crate::config::TransformerConfig::i2v_14b(),
             crate::config::Vae16Config::wan21().z_dim,
             crate::WAN_Z16_VAE_TILING,
@@ -231,12 +229,12 @@ pub fn architecture_facts(
 }
 
 /// The per-request contract for one public mode, with this crate's architecture axes published over
-/// the backend-neutral default `gen_core::wan_i2v_memory` can only supply.
+/// the backend-neutral default `gen_core_memory_wan` can only supply.
 pub fn request_contract_for_mode(
     prepared: &PreparedWanI2vMemory,
     mode: &str,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    let mut contract = gen_core::wan_i2v_memory::contract_for_mode_key(prepared, mode)?;
+    let mut contract = gen_core_memory_wan::contract_for_mode_key(prepared, mode)?;
     contract.architecture_facts = architecture_facts(prepared.route);
     Ok(contract)
 }
@@ -248,7 +246,7 @@ pub fn begin_request(
     device: Device,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    gen_core::wan_i2v_memory::validate_context(prepared, context)?;
+    gen_core_memory_wan::validate_context(prepared, context)?;
     let request_contract = request_contract_for_mode(prepared, context.mode.as_key())?;
     let memory = request_contract.generation_memory(&context.selection);
     let mut config = candle_gen::request_scope::CandleRequestScopeConfig::new(
@@ -257,14 +255,14 @@ pub fn begin_request(
         context.geometry,
         memory,
         false,
-        if prepared.route == gen_core::wan_i2v_memory::WanI2vRoute::Ti2v5b {
+        if prepared.route == gen_core_memory_wan::WanI2vRoute::Ti2v5b {
             30
         } else {
             40
         },
         |_pid, edge, overlap| {
-            if gen_core::wan_i2v_memory::DECODE_TILE_EDGES.contains(&edge)
-                && gen_core::wan_i2v_memory::DECODE_OVERLAPS.contains(&overlap)
+            if gen_core_memory_wan::DECODE_TILE_EDGES.contains(&edge)
+                && gen_core_memory_wan::DECODE_OVERLAPS.contains(&overlap)
             {
                 Ok(())
             } else {
@@ -292,7 +290,7 @@ pub fn begin_request(
 // a full memory receipt and yet resolved nothing at all before the weights existed.
 // ---------------------------------------------------------------------------------------------
 
-/// The isolated namespace [`gen_core::wan_i2v_memory::weights_free_calibration_fingerprint`] mints
+/// The isolated namespace [`gen_core_memory_wan::weights_free_calibration_fingerprint`] mints
 /// in. A contract carrying it describes a load that never happened.
 const WEIGHTS_FREE_INFIX: &str = "-weights-free-conformance-";
 
@@ -304,9 +302,9 @@ fn weights_free(contract: &gen_core::MemoryProviderContract) -> bool {
         .is_some_and(|identity| identity.fingerprint.contains(WEIGHTS_FREE_INFIX))
 }
 
-fn a14b_route(provider_id: &str) -> gen_core::Result<gen_core::wan_i2v_memory::WanI2vRoute> {
-    let route = gen_core::wan_i2v_memory::WanI2vRoute::for_provider(provider_id)?;
-    if gen_core::wan_i2v_memory::a14b_public_mode_key(route).is_none() {
+fn a14b_route(provider_id: &str) -> gen_core::Result<gen_core_memory_wan::WanI2vRoute> {
+    let route = gen_core_memory_wan::WanI2vRoute::for_provider(provider_id)?;
+    if gen_core_memory_wan::a14b_public_mode_key(route).is_none() {
         return Err(gen_core::Error::Unsupported(format!(
             "{provider_id}: not an A14B route"
         )));
@@ -327,7 +325,7 @@ fn a14b_weights_free_contract(
     provider_id: &'static str,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     a14b_route(provider_id)?;
-    gen_core::wan_i2v_memory::weights_free_contract(provider_id, WanI2vBackend::Candle, spec)
+    gen_core_memory_wan::weights_free_contract(provider_id, WanI2vBackend::Candle, spec)
 }
 
 fn a14b_tier(
@@ -336,7 +334,7 @@ fn a14b_tier(
     provider_id: &'static str,
 ) -> gen_core::Result<gen_core::MemoryNumericTier> {
     if weights_free(contract) {
-        gen_core::wan_i2v_memory::spec_numeric_tier(spec, WanI2vBackend::Candle)
+        gen_core_memory_wan::spec_numeric_tier(spec, WanI2vBackend::Candle)
     } else {
         Ok(prepare(spec, provider_id)?.tier)
     }
@@ -349,7 +347,7 @@ fn a14b_safety_check(
     provider_id: &'static str,
 ) -> MemorySafetyDecision {
     let decision = if weights_free(contract) {
-        gen_core::wan_i2v_memory::validate_weights_free_context(
+        gen_core_memory_wan::validate_weights_free_context(
             provider_id,
             WanI2vBackend::Candle,
             spec,
@@ -358,7 +356,7 @@ fn a14b_safety_check(
         )
     } else {
         prepare(spec, provider_id)
-            .and_then(|prepared| gen_core::wan_i2v_memory::validate_context(&prepared, context))
+            .and_then(|prepared| gen_core_memory_wan::validate_context(&prepared, context))
     };
     MemorySafetyDecision::from_validation(decision)
 }
@@ -380,8 +378,8 @@ fn a14b_valid_fixtures(
     }
     let tier = a14b_tier(spec, contract, provider_id)?;
     let mode_key =
-        gen_core::wan_i2v_memory::a14b_public_mode_key(route).expect("a14b_route admitted it");
-    let reference_count = u32::from(route == gen_core::wan_i2v_memory::WanI2vRoute::I2v14b);
+        gen_core_memory_wan::a14b_public_mode_key(route).expect("a14b_route admitted it");
+    let reference_count = u32::from(route == gen_core_memory_wan::WanI2vRoute::I2v14b);
     let mut context = gen_core::standard_memory_behavior_context(
         contract,
         strategy,
@@ -394,15 +392,15 @@ fn a14b_valid_fixtures(
             overlay: None,
         },
     )?;
-    let (width, height, frames) = gen_core::wan_i2v_memory::A14B_FIXTURE_GEOMETRY;
+    let (width, height, frames) = gen_core_memory_wan::A14B_FIXTURE_GEOMETRY;
     context.geometry.width = width;
     context.geometry.height = height;
     context.geometry.frames = frames;
     if contract.engages(strategy, MemoryStrategy::BoundedDecode) {
         context.selection.parameters.decode_tile_edge =
-            gen_core::wan_i2v_memory::DECODE_TILE_EDGES.first().copied();
+            gen_core_memory_wan::DECODE_TILE_EDGES.first().copied();
         context.selection.parameters.decode_overlap =
-            gen_core::wan_i2v_memory::DECODE_OVERLAPS.first().copied();
+            gen_core_memory_wan::DECODE_OVERLAPS.first().copied();
     }
     contract.validate_selection(&context.selection)?;
     let mut fixture = gen_core::MemoryBehaviorFixture::new(context);
@@ -420,7 +418,7 @@ fn a14b_begin_request(
         let prepared = prepare(spec, provider_id)?;
         return begin_request(&prepared, Device::Cpu, context);
     }
-    gen_core::wan_i2v_memory::validate_weights_free_context(
+    gen_core_memory_wan::validate_weights_free_context(
         provider_id,
         WanI2vBackend::Candle,
         spec,
@@ -447,8 +445,8 @@ fn a14b_begin_request(
                 gen_core::Error::Unsupported(format!("{provider_id}: trunk depth exceeds usize"))
             })?,
         |_pid, edge, overlap| {
-            if gen_core::wan_i2v_memory::DECODE_TILE_EDGES.contains(&edge)
-                && gen_core::wan_i2v_memory::DECODE_OVERLAPS.contains(&overlap)
+            if gen_core_memory_wan::DECODE_TILE_EDGES.contains(&edge)
+                && gen_core_memory_wan::DECODE_OVERLAPS.contains(&overlap)
             {
                 Ok(())
             } else {
@@ -576,7 +574,7 @@ pub fn selected_strategy(request: &GenerationRequest) -> Option<MemoryStrategy> 
 /// block and therefore preserves the load-time policy.
 ///
 /// The rung→policy mapping itself is **not** restated here: it is
-/// [`gen_core::wan_i2v_memory::load_policy_for_selection`], the shared declaration both backends
+/// [`gen_core_memory_wan::load_policy_for_selection`], the shared declaration both backends
 /// read. A hand-written `match` on the memory block drifted from it — `stage_residency` was routed
 /// to `Sequential` but `tile_vae_decode` fell through to the `Resident` arm, so an admitted
 /// BoundedDecode request ran the resident renderer while the doc above and the shared declaration
@@ -589,7 +587,7 @@ pub fn selected_offload_policy(
     let Some(strategy) = selected_strategy(request) else {
         return loaded;
     };
-    match gen_core::wan_i2v_memory::load_policy_for_selection(strategy) {
+    match gen_core_memory_wan::load_policy_for_selection(strategy) {
         OffloadPolicy::Sequential => OffloadPolicy::Sequential,
         // The shared declaration says this rung is resident; only an explicitly admitted Resident
         // route may override the conservative load default to say so.
@@ -604,7 +602,7 @@ mod tests {
 
     #[test]
     fn a14b_surface_has_no_axes_until_snapshot_admission() {
-        use gen_core::wan_i2v_memory::WanI2vRoute;
+        use gen_core_memory_wan::WanI2vRoute;
 
         let missing = tempfile::tempdir().unwrap();
         let spec = LoadSpec::new(gen_core::WeightsSource::Dir(missing.path().join("missing")));
@@ -625,7 +623,7 @@ mod tests {
     }
 
     /// AC (SC-22662, review follow-up): the Candle I2V routes publish their own trunk and VAE axes
-    /// rather than `MemoryArchitectureFacts::default()`. `gen_core::wan_i2v_memory` has no model
+    /// rather than `MemoryArchitectureFacts::default()`. `gen_core_memory_wan` has no model
     /// config, so its shared contract can only publish the empty default; this crate overlays the
     /// geometry its loader instantiates.
     ///
@@ -633,7 +631,7 @@ mod tests {
     /// literals, so a VAE reassignment cannot leave the published axes describing the old
     /// autoencoder.
     /// Feature-end review (SC-22667, blocker): the contract a **loaded** generator publishes is the
-    /// sealed `prepared.contract`, and `gen_core::wan_i2v_memory` can only seal the empty default
+    /// sealed `prepared.contract`, and `gen_core_memory_wan` can only seal the empty default
     /// axes into it. Every route's `prepare` must therefore hand back a receipt whose contract
     /// already carries this crate's facts — the per-request overlay in `request_contract_for_mode`
     /// is not enough, because `Generator::memory_strategy_contract()` never goes through it.
@@ -642,7 +640,7 @@ mod tests {
     /// (the shape under review) — every route then publishes `is_empty()` facts.
     #[test]
     fn the_sealed_contract_every_loaded_route_publishes_carries_the_trunk_and_vae_axes() {
-        use gen_core::wan_i2v_memory::WanI2vRoute;
+        use gen_core_memory_wan::WanI2vRoute;
 
         for route in [
             WanI2vRoute::Ti2v5b,
@@ -683,7 +681,7 @@ mod tests {
 
     #[test]
     fn every_i2v_route_publishes_its_trunk_and_vae_axes() {
-        use gen_core::wan_i2v_memory::WanI2vRoute;
+        use gen_core_memory_wan::WanI2vRoute;
 
         let ti2v = architecture_facts(WanI2vRoute::Ti2v5b);
         assert_eq!(
@@ -790,8 +788,8 @@ mod tests {
 
         resident.memory = Some(gen_core::GenerationMemory {
             tile_vae_decode: true,
-            decode_tile_edge: Some(gen_core::wan_i2v_memory::DECODE_TILE_EDGES[0]),
-            decode_overlap: Some(gen_core::wan_i2v_memory::DECODE_OVERLAPS[0]),
+            decode_tile_edge: Some(gen_core_memory_wan::DECODE_TILE_EDGES[0]),
+            decode_overlap: Some(gen_core_memory_wan::DECODE_OVERLAPS[0]),
             ..Default::default()
         });
         assert_eq!(
@@ -831,7 +829,7 @@ mod tests {
             };
             assert_eq!(
                 selected_offload_policy(OffloadPolicy::Sequential, true, &request),
-                gen_core::wan_i2v_memory::load_policy_for_selection(strategy),
+                gen_core_memory_wan::load_policy_for_selection(strategy),
                 "{strategy:?} must agree with the shared rung -> load-policy declaration"
             );
         }

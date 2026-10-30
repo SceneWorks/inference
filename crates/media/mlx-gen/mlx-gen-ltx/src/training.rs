@@ -80,7 +80,7 @@ use crate::text_encoder::LtxTextEncoder;
 use crate::tokenizer::{Ltx25Tokenizer, LtxTokenizer};
 use crate::transformer::{AvDiT, AvPerturbation, BlockLoraRef, LtxAdaptable, LtxDiT, Precision};
 use crate::vae::LtxVideoVae;
-use mlx_gen::gen_core::ltx_checkpoint::LtxComponent;
+use gen_core_ltx::ltx_checkpoint::LtxComponent;
 use mlx_gen::gen_core::BucketSchedule;
 
 // The trainer's concerns, split out of this file (sc-27342): the LTX-2.5 workflow / modality /
@@ -255,7 +255,7 @@ impl Trainer for LtxTrainer {
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         refuse_ltx25_subject_mask(self.descriptor.id, req)?;
         refuse_ltx25_depth_anchoring(self.descriptor.id, req)?;
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         let mut warnings = Vec::new();
         let output = self.train_impl(req, on_progress, &mut warnings)?;
         Ok(TrainingReport { output, warnings })

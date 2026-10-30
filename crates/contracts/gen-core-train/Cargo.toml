@@ -1,0 +1,32 @@
+[package]
+name = "sceneworks-gen-core-train"
+version = "0.1.0"
+edition = "2021"
+description = "Family-agnostic, tensor-free trainer helpers for the gen-core Trainer contract."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["training", "lora", "generative"]
+categories = ["science"]
+
+[lib]
+# Neutral import path: `use gen_core_train::…`, mirroring the `gen_core` lib-name convention.
+name = "gen_core_train"
+
+[features]
+# Manual source-bound model input receipts on the reader sites this crate owns; no ordinary
+# runtime/read behavior changes.
+model-inference-proof = ["sceneworks-gen-core/model-inference-proof"]
+
+[dependencies]
+# The backend-neutral contract this crate builds on. Sibling crates depend on gen-core; gen-core
+# never depends on them (sc-27316). Tensor-free, like gen-core.
+sceneworks-gen-core = { workspace = true }
+# Subject-mask decode and aspect-ratio crops (epic 2123, sc-24828), moved out of gen-core with the
+# helpers that read them (sc-27316).
+image = { workspace = true, features = ["bmp", "gif", "tiff", "webp"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

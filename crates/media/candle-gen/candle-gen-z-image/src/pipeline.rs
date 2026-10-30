@@ -77,7 +77,7 @@ use candle_transformers::models::z_image::text_encoder::{TextEncoderConfig, ZIma
 use candle_transformers::models::z_image::transformer::Config as DitConfig;
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
 
-use candle_gen::gen_core::tokenizer::TextTokenizer;
+use gen_core_tokenizer::TextTokenizer;
 
 use crate::common::{self, ResizePolicy};
 use crate::dit::ZImageTransformer2DModel as DenseDit;

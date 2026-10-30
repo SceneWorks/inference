@@ -42,7 +42,7 @@
 //!
 //! ## Edit mode (sc-24161)
 //! A dataset whose items carry [`TrainingItem::reference_image_paths`] trains an **edit** adapter.
-//! The shared gen-core floor ([`gen_core::train::validate_edit_request`]) caps each item at
+//! The shared gen-core floor ([`gen_core_train::validate_edit_request`]) caps each item at
 //! [`MAX_REFERENCE_IMAGES`] — the render path's own cap, advertised through
 //! [`TrainerDescriptor::max_reference_images`] — and refuses mixed datasets. Each item's ordered
 //! references go through the **render path's own** assembly: host preprocessing
@@ -852,7 +852,7 @@ impl QwenImage21Trainer {
             )));
         }
         // Shared with the candle twin (sc-24163): one refusal, one message.
-        gen_core::train::refuse_trainer_load_overlays(&format!("{TRAINER_ID} trainer"), spec)?;
+        gen_core_train::refuse_trainer_load_overlays(&format!("{TRAINER_ID} trainer"), spec)?;
         let root = loader::snapshot_root(&spec.weights)?.to_path_buf();
         // sc-25909 (the candle twin's sc-25901 rule): a Turbo snapshot is not a training base.
         // Refused by name here, before anything else is read — not incidentally by the scheduler
@@ -927,7 +927,7 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     // rather than silently trained without it; its *off* state (null, `[]`, `""`, `{}`, `false`,
     // `"none"`) selects nothing. The list, the off-value rule and the message are gen-core's, shared
     // with the candle twin, so the two backends cannot drift.
-    gen_core::train::refuse_reference_control_model_options(&prefix, req)?;
+    gen_core_train::refuse_reference_control_model_options(&prefix, req)?;
     Ok(())
 }
 
@@ -1811,15 +1811,15 @@ impl Trainer for QwenImage21Trainer {
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
         // Shared floors: a control-branch or full-base-fine-tune request on this adapter-only
         // trainer is a typed `Unsupported`, never a silently trained plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core_train::validate_control_request(self.descriptor(), req)?;
+        gen_core_train::validate_full_finetune_request(self.descriptor(), req)?;
         // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         // Instruction-edit datasets (sc-24161): the shared floor caps references at this
         // descriptor's `max_reference_images` (the render path's own cap) and refuses mixed or
         // hybrid datasets; the snapshot must also carry the vision tower the references go through.
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
+        gen_core_train::validate_edit_request(self.descriptor(), req)?;
         if req.items.iter().any(TrainingItem::is_edit_pair) && self.vision.is_none() {
             return Err(missing_vision_tower().into());
         }
@@ -1854,7 +1854,7 @@ impl Trainer for QwenImage21Trainer {
     ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         // The full `validate` — the shared control / full-fine-tune / edit floors included — so a
         // caller that skips it cannot slip a control or full-tune request through as a plain
         // text-to-image run (the candle twin does the same).
@@ -2043,7 +2043,7 @@ impl QwenImage21Trainer {
     /// its floor is re-checked here rather than trusted to a prior `validate` call.
     fn plan_run<'r>(&self, req: &'r TrainingRequest) -> Result<RunPlan<'r>> {
         validate_request(req)?;
-        gen_core::train::validate_edit_request(&self.descriptor, req)?;
+        gen_core_train::validate_edit_request(&self.descriptor, req)?;
         let edit = req.items.iter().any(TrainingItem::is_edit_pair);
         let vision = if edit {
             Some(self.vision.clone().ok_or_else(missing_vision_tower)?)
@@ -5196,7 +5196,7 @@ mod tests {
             assert!(err.contains(&format!("model_options `{key}`")), "{err}");
             // The candle twin calls the same gen-core refusal with the same label, so the text
             // is identical on both backends.
-            let shared = gen_core::train::refuse_reference_control_model_options(
+            let shared = gen_core_train::refuse_reference_control_model_options(
                 "qwen_image_2_1 trainer",
                 &on_req,
             )

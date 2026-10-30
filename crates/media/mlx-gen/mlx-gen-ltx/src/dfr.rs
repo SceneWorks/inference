@@ -2,7 +2,7 @@
 //! detailing pass, and tiled temporal upsampling rounds. Port of the reference
 //! `ltx_pipelines/dfr_pipeline.py` (Lightricks/LTX-2 v1.2.0 @ `d1511477`) over this crate's
 //! token-native conditioning ([`crate::conditioning`]) and denoise loops ([`crate::pipeline`]),
-//! with the shared integer geometry in [`mlx_gen::gen_core::ltx_dfr`].
+//! with the shared integer geometry in [`gen_core_ltx::ltx_dfr`].
 //!
 //! Layering: [`run_temporal_rounds`] owns every piece of round/tile/seam arithmetic — window
 //! slicing, anchor gathering, slot seeding, per-tile noise seeds, the latent stitch, slot
@@ -15,8 +15,8 @@
 use mlx_rs::ops::{broadcast_to, concatenate_axis, multiply};
 use mlx_rs::Array;
 
-use mlx_gen::gen_core::ltx_dfr as gen_core_dfr;
-use mlx_gen::gen_core::ltx_dfr::DfrTileRange;
+use gen_core_ltx::ltx_dfr as gen_core_dfr;
+use gen_core_ltx::ltx_dfr::DfrTileRange;
 use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::conditioning::{
@@ -1298,19 +1298,19 @@ mod tests {
     #[test]
     fn real_tile_anchor_list_flows_through_the_keyframe_append() {
         let _cpu = CpuGuard::new();
-        let (n, _, pos) = mlx_gen::gen_core::ltx_dfr::resolve_canvas(121, 8).unwrap();
+        let (n, _, pos) = gen_core_ltx::ltx_dfr::resolve_canvas(121, 8).unwrap();
         let seams: Vec<i64> = pos.iter().map(|p| 2 * p).collect();
-        let n1 = mlx_gen::gen_core::ltx_dfr::temporal_upsampled_frames(n);
-        let tiles = mlx_gen::gen_core::ltx_dfr::tile_ranges(
+        let n1 = gen_core_ltx::ltx_dfr::temporal_upsampled_frames(n);
+        let tiles = gen_core_ltx::ltx_dfr::tile_ranges(
             &seams,
             n1,
             2,
             8,
-            mlx_gen::gen_core::ltx_dfr::TILE_LEAD_SEGMENTS,
+            gen_core_ltx::ltx_dfr::TILE_LEAD_SEGMENTS,
         )
         .unwrap();
         let tile1 = &tiles[1];
-        let local = mlx_gen::gen_core::ltx_dfr::remap_positions_to_local(
+        let local = gen_core_ltx::ltx_dfr::remap_positions_to_local(
             &tile1.anchor_kf_global,
             tile1.pixel_start,
         );

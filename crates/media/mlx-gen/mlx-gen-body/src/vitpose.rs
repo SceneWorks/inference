@@ -14,7 +14,7 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::ops::{add, concatenate_axis, conv_transpose2d, maximum, multiply};
 use mlx_rs::Array;
 
-use mlx_gen::gen_core::train::body::{VitPoseConfig, VitPoseWarp, IMAGENET_MEAN, IMAGENET_STD};
+use gen_core_train::body::{VitPoseConfig, VitPoseWarp, IMAGENET_MEAN, IMAGENET_STD};
 
 use super::{bn_fold, conv_ohwi, normalize, resample_nhwc, w32, AxisMatrix};
 use mlx_gen::nn::{conv2d, gelu_exact, linear};

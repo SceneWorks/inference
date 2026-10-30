@@ -26,7 +26,7 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::gen_core::iris::restoration::{plan, Dims, RestorationOptions, TileGeometry};
+use gen_core_iris::restoration::{plan, Dims, RestorationOptions, TileGeometry};
 use mlx_gen::gen_core::{
     GenerationMemory, LoadShape, MemoryGeometry, MemoryMode, MemoryStrategy, TransformerComponent,
 };
@@ -187,7 +187,7 @@ fn print_the_reachable_sizes_prediction() {
                     LoadSpec::new(WeightsSource::Dir(root.clone())).with_load_shape(shape);
                 spec.quantize = tier;
                 spec.components.insert(
-                    mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT.into(),
+                    gen_core_iris::TEXT_ENCODER_COMPONENT.into(),
                     WeightsSource::Dir(te_dir.clone()),
                 );
                 spec
@@ -213,7 +213,7 @@ fn print_the_reachable_sizes_prediction() {
         geometry: Box::new(move |edge| match task {
             // Restoration: `edge` is the OUTPUT edge at the default 4x; admitted at the size its
             // plan processes.
-            mlx_gen::gen_core::iris::IrisTask::Restoration => {
+            gen_core_iris::IrisTask::Restoration => {
                 let p = plan(
                     Dims::new((edge / 4) as u32, (edge / 4) as u32),
                     &RestorationOptions {
@@ -235,7 +235,7 @@ fn print_the_reachable_sizes_prediction() {
             },
         }),
     };
-    use mlx_gen::gen_core::iris::IrisTask;
+    use gen_core_iris::IrisTask;
     let routes = [
         generation(1),
         generation(2),

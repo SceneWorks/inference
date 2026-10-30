@@ -73,7 +73,7 @@
 //!
 //! [`TierPaths::detect`] requires `quantize_config.json`, which no 2.5 tier ships, so a 2.5
 //! directory can never take the 2.3 path; [`Ltx25Tier::detect`] gates on the manifest's declared
-//! `model_version` (via the shared [`candle_gen::gen_core::ltx_checkpoint::layout_for_declared_version`]), so a
+//! `model_version` (via the shared [`gen_core_ltx::ltx_checkpoint::layout_for_declared_version`]), so a
 //! SceneWorks-converted **2.3** tree — which also ships a `split_model.json` — can never take the
 //! 2.5 path either.
 //!
@@ -98,12 +98,12 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::var_builder::Rename;
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::ltx_checkpoint::{
-    layout_for_declared_version, LtxCheckpointLayout, LtxCheckpointMetadata,
-};
 use candle_gen::gen_core::weightsmeta::Dtype;
 use candle_gen::gen_core::{safetensors_path_tensor_headers, SafetensorsTensorHeader};
 use candle_gen::{CandleError, Result as CResult};
+use gen_core_ltx::ltx_checkpoint::{
+    layout_for_declared_version, LtxCheckpointLayout, LtxCheckpointMetadata,
+};
 
 /// The resolved file set of a packed LTX tier subfolder (`.../q4` or `.../q8`) + its sibling `gemma/`.
 pub struct TierPaths {
@@ -706,7 +706,7 @@ pub const EMBEDDED_CONFIG_FILE: &str = "embedded_config.json";
 /// One component of an LTX-2.5 tier, by the id the tier manifest uses.
 ///
 /// This is deliberately the **tier's** vocabulary, not
-/// [`candle_gen::gen_core::ltx_checkpoint::LtxComponent`]'s: the tier splits what that enum calls one
+/// [`gen_core_ltx::ltx_checkpoint::LtxComponent`]'s: the tier splits what that enum calls one
 /// `conv_video_vae` slot into a separate `vae_decoder` / `vae_encoder` pair (and likewise for the
 /// diffusion VAE), and it carries a `connector` file that the upstream 2.5 release keeps inside the
 /// transformer. Mapping one onto the other would have to invent or drop a file, so the reader speaks
@@ -948,7 +948,7 @@ impl Ltx25Tier {
         let json = read_manifest_json(&path)?;
         // Step 1: the version gate, on `model_version` and nothing else.
         let declared = json
-            .get(candle_gen::gen_core::ltx_checkpoint::MODEL_VERSION_METADATA_KEY)
+            .get(gen_core_ltx::ltx_checkpoint::MODEL_VERSION_METADATA_KEY)
             .and_then(serde_json::Value::as_str);
         if layout_for_declared_version(declared) != LtxCheckpointLayout::Split {
             return Ok(None);

@@ -4,9 +4,8 @@ use crate::{
     pipeline::{check, digest_f32, logical_f32_readback},
     transformer::Transformer,
 };
+use gen_core_moss_image::{moss_image::*, moss_image_edit::*};
 use mlx_gen::gen_core::{
-    moss_image::*,
-    moss_image_edit::*,
     weightsmeta::{CheckpointMeta, Dtype as StoredDtype},
     PinnedWeightsFile,
 };

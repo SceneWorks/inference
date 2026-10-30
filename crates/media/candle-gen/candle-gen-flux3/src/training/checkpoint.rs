@@ -2,18 +2,16 @@
 //! All host readback here is checkpoint I/O AFTER backward, never a forward/autograd seam.
 use super::TrainingGraph;
 use candle_gen::candle_core::{DType, Device, Tensor, Var};
-use candle_gen::gen_core::{
-    flux3::{
-        training::{
-            checkpoint::{publish_bytes, ResumePolicy, TrainingCursor},
-            ResumeIdentity,
-        },
-        BASE_WEIGHTS_REPO, BASE_WEIGHTS_REVISION,
-    },
-    CancelFlag,
-};
+use candle_gen::gen_core::CancelFlag;
 use candle_gen::train::optim::TrainOptimizer;
 use candle_gen::{CandleError as Error, Result};
+use gen_core_flux3::{
+    training::{
+        checkpoint::{publish_bytes, ResumePolicy, TrainingCursor},
+        ResumeIdentity,
+    },
+    BASE_WEIGHTS_REPO, BASE_WEIGHTS_REVISION,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},

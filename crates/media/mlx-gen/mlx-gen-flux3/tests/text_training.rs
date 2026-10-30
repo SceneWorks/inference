@@ -1,6 +1,6 @@
 //! Supported-host frozen teacher tests. Windows edit/fmt only; not locally executed.
 use crate::common::{cpu_process, fixture, host_f32, on_cpu, tiny_config, tiny_package};
-use mlx_gen::gen_core::flux3::{assemble_window, TextWindow};
+use gen_core_flux3::{assemble_window, TextWindow};
 use mlx_gen_flux3::Flux3TextEncoder;
 use mlx_rs::{Array, Dtype};
 fn prompt(name: &str) -> &'static str {

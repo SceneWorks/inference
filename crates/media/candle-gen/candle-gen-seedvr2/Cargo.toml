@@ -19,9 +19,10 @@ rand_distr = { workspace = true }
 # histogram matches were a single-threaded host hot loop serialized against the GPU pipeline. Rayon
 # spreads the per-row / per-pixel / per-channel work across cores with per-element numerics unchanged.
 rayon = "1"
+sceneworks-gen-core-family = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen/model-inference-proof"]
+model-inference-proof = ["candle-gen/model-inference-proof", "sceneworks-gen-core-family/model-inference-proof"]
 default = []
 metal = ["candle-gen/metal"]
 cuda = ["candle-gen/cuda"]

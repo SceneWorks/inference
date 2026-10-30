@@ -1,10 +1,10 @@
 //! SeedVR2 video-mode orchestration (sc-4814): the MLX budget source over the shared host planner.
 //!
 //! Chunk planning, the overlap cross-fade, the budget-model selectors and spatial tiling are
-//! backend-neutral and live in [`mlx_gen::gen_core::seedvr2_video`] (sc-27256), shared with the
+//! backend-neutral and live in [`gen_core_family::seedvr2_video`] (sc-27256), shared with the
 //! Candle twin; this module re-exports them so `video::*` paths stay stable and adds the MLX budget.
 
-pub use mlx_gen::gen_core::seedvr2_video::*;
+pub use gen_core_family::seedvr2_video::*;
 
 /// The safe peak-GB budget — [`mlx_gen::memory::safe_budget_gib`], which clamps the MLX limit × 0.85
 /// by the Metal per-single-buffer cap (`maxBufferLength`, sc-8135) so a budget-sized tile never admits

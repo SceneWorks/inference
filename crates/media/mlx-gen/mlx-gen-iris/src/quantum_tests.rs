@@ -11,9 +11,9 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use mlx_gen::gen_core::iris::depth::{DepthRequest, DepthResolution, IrisDepthEstimator};
-use mlx_gen::gen_core::iris::downstream::TaskExport;
-use mlx_gen::gen_core::iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
+use gen_core_iris::depth::{DepthRequest, DepthResolution, IrisDepthEstimator};
+use gen_core_iris::downstream::TaskExport;
+use gen_core_iris::{IrisConfig, IrisTask, TEXT_ENCODER_COMPONENT};
 use mlx_gen::ios_quantum::{
     take_refusal, with_cpu_diagnostic_headroom, with_cpu_diagnostic_observer, QuantumEvent,
     PROCESS_RESERVE_BYTES,

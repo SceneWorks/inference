@@ -2,20 +2,20 @@
 //! as `mlx-gen-supra2::dit`, op for op.
 //!
 //! Patchify → `x_embed` + learned `pos_embed`; sinusoidal timestep features (host-side, shared with
-//! MLX through [`gen_core::supra2::timestep_features`]) → `t_embed` MLP; `ctx_proj` of the Flan-T5
+//! MLX through [`gen_core_checkpoint::supra2::timestep_features`]) → `t_embed` MLP; `ctx_proj` of the Flan-T5
 //! context; `depth` × [AdaLN-Zero self-attention, **unmodulated** cross-attention masked by the text
 //! attention mask, AdaLN-Zero MLP]; AdaLN final layer; unpatchify. Runs in f32 (the checkpoint's
 //! dtype and upstream's CPU/MPS execution dtype). Weight keys are upstream's `state_dict` names
 //! verbatim.
 //!
-//! [`gen_core::supra2::timestep_features`]: candle_gen::gen_core::supra2::timestep_features
+//! [`gen_core_checkpoint::supra2::timestep_features`]: gen_core_checkpoint::supra2::timestep_features
 
 use std::collections::HashMap;
 
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::{ops::softmax_last_dim, Linear, Module};
-use candle_gen::gen_core::supra2::{timestep_features, Supra2Config};
 use candle_gen::{CandleError as Error, Result};
+use gen_core_checkpoint::supra2::{timestep_features, Supra2Config};
 
 const LN_EPS: f64 = 1e-6;
 

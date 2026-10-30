@@ -5,9 +5,9 @@
 //! guidance when an unconditional context is supplied.
 
 use candle_gen::candle_core::Tensor;
-use candle_gen::gen_core::supra2::{euler_dt, euler_timesteps};
 use candle_gen::gen_core::{CancelFlag, Progress};
 use candle_gen::{CandleError as Error, Result};
+use gen_core_checkpoint::supra2::{euler_dt, euler_timesteps};
 
 use crate::dit::SupraDit;
 
@@ -58,7 +58,7 @@ pub fn velocity(
 
 /// Integrate `z0` over `steps` uniform Euler steps (`z += dt · v`). CFG runs iff `uncond` is
 /// supplied — callers pass it exactly when
-/// [`cfg_enabled`](candle_gen::gen_core::supra2::cfg_enabled) holds for `guidance`. Checks
+/// [`cfg_enabled`](gen_core_checkpoint::supra2::cfg_enabled) holds for `guidance`. Checks
 /// `cancel` before every step and reports 1-based step progress.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise(

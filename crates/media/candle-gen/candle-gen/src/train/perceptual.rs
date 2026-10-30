@@ -15,7 +15,7 @@
 //! 4. **Run the frozen model on the live x0** ([`PerceptualLoss::loss`]) — differentiable in the
 //!    live input; the model's weights are plain (untracked) tensors, so `backward()` only produces
 //!    adapter gradients.
-//! 5. **Schedule**: the backend-neutral policy in [`gen_core::train::aux_schedule`] (re-exported):
+//! 5. **Schedule**: the backend-neutral policy in [`gen_core_train::aux_schedule`] (re-exported):
 //!    [`AuxAlternation`], [`plan_step`], [`StepPlan`]; [`PerceptualPath::plan`] applies the per-image
 //!    skips.
 //!
@@ -31,11 +31,11 @@ use std::collections::HashMap;
 
 use candle_core::{Tensor, D};
 
-pub use crate::gen_core::train::aux_schedule::{
+pub use crate::gen_core::train::AuxLossSchedule;
+pub use gen_core_train::aux_schedule::{
     combine_step_terms, perceptual_footprint_bytes, plan_step, AltKey, AuxAlternation,
     AuxModelFootprint, StepPlan,
 };
-pub use crate::gen_core::train::AuxLossSchedule;
 
 use super::tae::TinyDecoder;
 use crate::{CandleError, Result};
@@ -211,7 +211,7 @@ pub struct PerceptualPath {
     reference_computations: usize,
     /// The job's subject masks for the losses that read one (sc-24832), see
     /// [`attach_subject_masks`](Self::attach_subject_masks).
-    subject_masks: Option<crate::gen_core::train::subject_mask::PerceptualSubjectMasks>,
+    subject_masks: Option<gen_core_train::subject_mask::PerceptualSubjectMasks>,
 }
 
 impl PerceptualPath {
@@ -284,7 +284,7 @@ impl PerceptualPath {
     /// this once with `PerceptualSubjectMasks::load` before preparing references.
     pub fn attach_subject_masks(
         &mut self,
-        masks: Option<crate::gen_core::train::subject_mask::PerceptualSubjectMasks>,
+        masks: Option<gen_core_train::subject_mask::PerceptualSubjectMasks>,
     ) {
         self.subject_masks = masks;
     }

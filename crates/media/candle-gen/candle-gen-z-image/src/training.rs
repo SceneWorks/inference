@@ -15,7 +15,7 @@
 //!     ([`decode_square`] + [`square_image_tensor`]), encode the **deterministic latent mean** (the stock z_image
 //!     [`Encoder`](VaeEncoder) → `(mean − shift)·scale`; the `reg` sampling is skipped so caching is
 //!     reproducible), and encode the caption through the Qwen3 text encoder with the *exact* gen-core
-//!     [`TokenizerConfig`](candle_gen::gen_core::tokenizer::TokenizerConfig) inference uses → `(L, 2560)`. The VAE + text encoder are dropped after
+//!     [`TokenizerConfig`](gen_core_tokenizer::TokenizerConfig) inference uses → `(L, 2560)`. The VAE + text encoder are dropped after
 //!     caching.
 //!  2. **Loop** (driver-owned) — sample a flow-match `σ ∈ [1e-3, 1−1e-3]`
 //!     ([`sample_unit_timestep`](candle_gen::train::flow_match::sample_unit_timestep)), form
@@ -56,8 +56,6 @@ use candle_core::{DType, Device, IndexOp, Tensor, Var};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::tokenizer::TextTokenizer;
-use candle_gen::gen_core::train::subject_mask::{CropBox, PreparedSubjectMask};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingReport,
     TrainingRequest,
@@ -74,6 +72,8 @@ use candle_gen::train::perceptual::{Parameterization, PerceptualPath};
 use candle_gen::train::tae::TinyDecoderSpec;
 use candle_gen::{CandleError, Result};
 use candle_gen_perceptual::{AuxGeometry, AuxLossContext, DecoderSpec};
+use gen_core_tokenizer::TextTokenizer;
+use gen_core_train::subject_mask::{CropBox, PreparedSubjectMask};
 
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
 use candle_transformers::models::z_image::sampling::postprocess_image;
@@ -260,7 +260,7 @@ fn vae_encode_mean(encoder: &VaeEncoder, img: &Tensor, shift: f64, scale: f64) -
 }
 
 /// Tokenize `caption` with the Qwen chat template + encode it through the Qwen3 text encoder to the
-/// cached conditioning `(L, cap_feat_dim)` at f32 — the exact [`TokenizerConfig`](candle_gen::gen_core::tokenizer::TokenizerConfig) / encoder the
+/// cached conditioning `(L, cap_feat_dim)` at f32 — the exact [`TokenizerConfig`](gen_core_tokenizer::TokenizerConfig) / encoder the
 /// inference [`crate::pipeline`] uses (parity), minus the device-dtype cast (caching keeps f32).
 fn encode_caption(
     tok: &TextTokenizer,
@@ -508,14 +508,14 @@ impl Trainer for ZImageTrainer {
         // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA
         // adapter the caller did not ask for (F-006/F-055).
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core_train::validate_full_finetune_request(self.descriptor(), req)?;
         // Shared control-training floor (F-006/F-055): no control branch, so a `control_type`
         // request is a typed reject, never silently trained as a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
+        gen_core_train::validate_control_request(self.descriptor(), req)?;
         // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
         // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_edit_request(self.descriptor(), req)?;
         validate_flow_match_request(req, LABEL).map_err(Into::into)
     }
 
@@ -537,7 +537,7 @@ impl Trainer for ZImageTrainer {
     ) -> gen_core::Result<TrainingReport> {
         // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
-        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
+        gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         // Every other `validate` floor too (control / full fine-tune / edit / flow-match knobs), so
         // a caller that skips `validate` cannot train a request it would refuse.
         self.validate(req)?;

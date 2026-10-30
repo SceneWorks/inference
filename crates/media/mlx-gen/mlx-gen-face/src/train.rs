@@ -53,13 +53,13 @@ use crate::iresnet::ArcFace;
 use crate::program::Program;
 use crate::scrfd::Scrfd;
 
-pub use mlx_gen::gen_core::train::face_loss::{
+pub use gen_core_train::face_loss::{
     arcface_param_count, bilinear_matrix, crop_resample_matrices, face_crop_box,
     face_landmark_loss_footprint, identity_loss_footprint, CropBox, ARCFACE_FILE, ARCFACE_INPUT,
     FACEMESH_FILE, FACEMESH_INPUT, FACEMESH_LANDMARKS, FACEMESH_V2_PARAMS, FACE_CROP_PAD,
     SCRFD_10G_PARAMS, SCRFD_FILE,
 };
-use mlx_gen::gen_core::train::face_loss::{
+use gen_core_train::face_loss::{
     detect_with_retry, face_loss_timestep_weight, synth, IDENTITY_CLEAN_COS_FLOOR,
     IDENTITY_NOISE_SAMPLES, IDENTITY_NOISE_SEED, INNER_EYES, INTER_EYE_FLOOR, LANDMARK_EPS,
     LANDMARK_REGIONS, NOSE_TIP,
@@ -718,8 +718,8 @@ pub mod testing {
     use std::collections::HashMap;
     use std::path::Path;
 
-    use mlx_gen::gen_core::fx_program::FORMAT;
-    use mlx_gen::gen_core::train::face_loss::synth::{
+    use gen_core_family::fx_program::FORMAT;
+    use gen_core_train::face_loss::synth::{
         tiny_arcface_shapes, tiny_facemesh_shapes, ARCFACE_SEED, FACEMESH_SEED,
         TINY_FACEMESH_PROGRAM,
     };

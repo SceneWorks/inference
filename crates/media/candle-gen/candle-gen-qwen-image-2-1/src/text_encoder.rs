@@ -54,13 +54,13 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_gen::candle_nn::{ops::softmax_last_dim, rms_norm, Embedding, RmsNorm, VarBuilder};
-use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::{CandleError as Error, Result};
 use candle_llm::models::deepstack::{
     add_visual_features, mrope_positions_mm, splice_vision_features,
 };
 use candle_llm::models::Qwen35VisionModel;
 use candle_llm::primitives::{apply_rope, Rope};
+use gen_core_tokenizer::TextTokenizer;
 
 use crate::config::{TextEncoderConfig, VisionConfig, SYSTEM_PROMPT};
 use crate::quant::{guard_dense, QLinear, GROUP_SIZE};

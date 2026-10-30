@@ -5,7 +5,7 @@ use super::*;
 /// Per-technique support flags for the optional training techniques of epic 2123 (weight noising
 /// weight noising, gradient noise, resolution buckets and depth anchoring today; masked loss and
 /// the perceptual identity/body/latent losses join here as their stories land). Each flag gates one
-/// technique's [`TrainingConfig`] knob(s) through [`validate_training_techniques`].
+/// technique's [`TrainingConfig`] knob(s) through `gen_core_train::validate_training_techniques`.
 ///
 /// Non-supporting descriptors spell [`TrainingTechniques::NONE`], so a new flag defaults to
 /// *unsupported* everywhere without touching them; a supporting descriptor names the flags it
@@ -149,6 +149,7 @@ pub fn enabled_aux_losses(cfg: &TrainingConfig) -> Vec<&'static str> {
 /// Whether a decoded-x0 loss lacks its x0 decoder: [`TrainingConfig::perceptual_decoder_dir`] is
 /// unset and the trainer does not build its own decoder
 /// ([`TrainingTechniques::builtin_x0_decoder`]).
-pub(super) fn lacks_x0_decoder(desc: &TrainerDescriptor, cfg: &TrainingConfig) -> bool {
+#[doc(hidden)]
+pub fn lacks_x0_decoder(desc: &TrainerDescriptor, cfg: &TrainingConfig) -> bool {
     cfg.perceptual_decoder_dir.is_none() && !desc.techniques.builtin_x0_decoder
 }

@@ -1,15 +1,15 @@
 //! Structural resident memory contract: byte facts from the safetensors headers of exactly the
 //! tensors the provider materializes (shared with the MLX twin through
-//! [`gen_core::supra2::memory_asset_facts`]). No calibration is claimed (the terminal campaign
+//! [`gen_core_checkpoint::supra2::memory_asset_facts`]). No calibration is claimed (the terminal campaign
 //! measures).
 //!
-//! [`gen_core::supra2::memory_asset_facts`]: candle_gen::gen_core::supra2::memory_asset_facts
+//! [`gen_core_checkpoint::supra2::memory_asset_facts`]: gen_core_checkpoint::supra2::memory_asset_facts
 
-use candle_gen::gen_core::supra2::{
+use candle_gen::gen_core::*;
+use gen_core_checkpoint::supra2::{
     memory_architecture_facts, memory_asset_facts, BundleCheck, Supra2Config, Supra2Sources,
     PROVIDER_ID,
 };
-use candle_gen::gen_core::*;
 
 pub(crate) fn contract_with_facts(
     cfg: &Supra2Config,
@@ -78,13 +78,13 @@ pub(crate) fn witness_specs() -> Vec<MemoryContractSurfaceSpec> {
 
 /// Text-to-image only (shared with MLX: [`supra2::memory_safety`]).
 ///
-/// [`supra2::memory_safety`]: candle_gen::gen_core::supra2::memory_safety
+/// [`supra2::memory_safety`]: gen_core_checkpoint::supra2::memory_safety
 pub(crate) fn safety(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    candle_gen::gen_core::supra2::memory_safety(spec, contract, context)
+    gen_core_checkpoint::supra2::memory_safety(spec, contract, context)
 }
 
 #[cfg(test)]

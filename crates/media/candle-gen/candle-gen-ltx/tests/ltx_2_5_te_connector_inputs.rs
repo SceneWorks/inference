@@ -25,12 +25,12 @@
 use std::collections::HashMap;
 
 use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
-use candle_gen::gen_core::ltx_checkpoint::{CaptionFeatureVersion, LtxCheckpointMetadata};
 use candle_gen::testkit::{tensor_max_abs_host, tensor_peak_rel_host};
 use candle_gen_ltx::config::{AvConfig, ConnectorConfig};
 use candle_gen_ltx::gemma4_te::Ltx25TextEncoder;
 use candle_gen_ltx::tier::Ltx25Tier;
 use candle_gen_ltx::tokenizer::Ltx25Tokenizer;
+use gen_core_ltx::ltx_checkpoint::{CaptionFeatureVersion, LtxCheckpointMetadata};
 
 /// The committed 2.3 reference fixture, reached across the backend boundary exactly as
 /// `connector_parity.rs` reaches it. Consumed **by path** for its geometry; never re-recorded, and

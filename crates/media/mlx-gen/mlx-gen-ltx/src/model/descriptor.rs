@@ -86,7 +86,7 @@ pub fn descriptor_25() -> ModelDescriptor {
     out.capabilities.supports_auto_duration = true;
     out.capabilities.supports_generated_keyframes = true;
     out.capabilities.max_temporal_upsample_rounds =
-        mlx_gen::gen_core::ltx_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS;
+        gen_core_ltx::ltx_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS;
     out.capabilities.supports_diffusion_decoder = true;
     // The catalog entry spans both packed transformer variants.  The loaded provider narrows this
     // union to the exact checkpoint identity in `descriptor_25_for_variant`, so a distilled load

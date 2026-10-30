@@ -35,9 +35,10 @@ mlx-gen-sdxl = { path = "../mlx-gen-sdxl", default-features = false }
 # `default-features = false` drops the crate's `training` feature (trainer, perceptual/depth aux
 # losses, dataset decode). The base `z_image` variants are not registered here.
 mlx-gen-z-image = { path = "../mlx-gen-z-image", default-features = false }
+sceneworks-gen-core-iris = { workspace = true }
 
 [features]
-model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-sana/model-inference-proof", "mlx-gen-anima/model-inference-proof", "mlx-gen-iris/model-inference-proof", "mlx-gen-sdxl/model-inference-proof", "mlx-gen-z-image/model-inference-proof"]
+model-inference-proof = ["mlx-gen/model-inference-proof", "mlx-gen-sana/model-inference-proof", "mlx-gen-anima/model-inference-proof", "mlx-gen-iris/model-inference-proof", "mlx-gen-sdxl/model-inference-proof", "mlx-gen-z-image/model-inference-proof", "sceneworks-gen-core-iris/model-inference-proof"]
 # The labelled bounded DEVICE CAPTURE permit (`capture_permit`). Never in a product build: only
 # `runtime-ios/device-capture`, which only the device harness (`ios-host/smoke`) enables, turns it on.
 device-capture = []

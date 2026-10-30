@@ -5,7 +5,7 @@
 //! `AttentionPooler`).
 //!
 //! Architecture (15 tensors, `model_patches/ltx-2.5-duration-head-bf16.safetensors`; hyperparameters
-//! pinned in `mlx_gen::gen_core::duration_head::hparams` — the checkpoint's own
+//! pinned in `gen_core_ltx::duration_head::hparams` — the checkpoint's own
 //! `config.duration_head` metadata section ships empty, see that module's docs):
 //!
 //! * `video_input_proj` / `audio_input_proj` — per-modality `Linear(cross_attention_dim,
@@ -37,7 +37,7 @@ use mlx_rs::nn::gelu_approximate;
 use mlx_rs::ops::{add, concatenate_axis, exp, tile};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::gen_core::duration_head::hparams;
+use gen_core_ltx::duration_head::hparams;
 use mlx_gen::nn::linear;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -326,13 +326,14 @@ mod tests {
     }
 
     /// Reachability at the real-component level (sc-18774 acceptance): wiring
-    /// `gen_core::duration_head::resolve_request_num_frames`'s injected predictor to this REAL (if
+    /// `gen_core_ltx::duration_head::resolve_request_num_frames`'s injected predictor to this REAL (if
     /// synthetic-weighted) `DurationHead::forward` proves the opt-in seam reaches all the way into
     /// the network's forward pass, not just a mock closure.
     #[test]
     #[ignore = "model inference; explicit model-proof workflow"]
     fn opt_in_seam_reaches_the_real_forward_pass() {
-        use mlx_gen::gen_core::duration_head::{resolve_request_num_frames, AutoDurationRange};
+        use gen_core_ltx::duration_head::resolve_request_num_frames;
+        use mlx_gen::gen_core::duration_head::AutoDurationRange;
 
         let head = DurationHead::from_weights(&synthetic_weights()).unwrap();
         let video = probe(&[1, 5, hparams::VIDEO_CROSS_ATTENTION_DIM as i32]);
@@ -346,7 +347,7 @@ mod tests {
             None,
             Some(AutoDurationRange::default()),
             24.0,
-            mlx_gen::gen_core::duration_head::TEMPORAL_GRID,
+            gen_core_ltx::duration_head::TEMPORAL_GRID,
             &mut predict,
         )
         .unwrap();
@@ -368,7 +369,7 @@ mod tests {
             Some(65),
             Some(AutoDurationRange::default()),
             24.0,
-            mlx_gen::gen_core::duration_head::TEMPORAL_GRID,
+            gen_core_ltx::duration_head::TEMPORAL_GRID,
             &mut predict2,
         )
         .unwrap();

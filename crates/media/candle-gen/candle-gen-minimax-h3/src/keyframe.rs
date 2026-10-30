@@ -57,11 +57,11 @@
 
 //!
 //! The canvas resolution and the keyframe fit are backend-neutral and live in
-//! [`candle_gen::gen_core::h3_keyframe`] (sc-27256), shared with the MLX twin; this module
+//! [`gen_core_h3::h3_keyframe`] (sc-27256), shared with the MLX twin; this module
 //! re-exports them so `keyframe::*` paths stay stable, and keeps the anchor shapes and the VAE
 //! pixel normalization onto this crate's tensors.
 
-pub use candle_gen::gen_core::h3_keyframe::*;
+pub use gen_core_h3::h3_keyframe::*;
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::Image;

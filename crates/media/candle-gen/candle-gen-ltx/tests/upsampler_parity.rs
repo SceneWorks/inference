@@ -22,8 +22,8 @@ use std::path::PathBuf;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::ltx_checkpoint::{LatentUpsamplerConfig, LatentUpsamplerMode};
 use candle_gen_ltx::upsampler::LatentUpsampler;
+use gen_core_ltx::ltx_checkpoint::{LatentUpsamplerConfig, LatentUpsamplerMode};
 
 const SPATIAL: &str = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors";
 const TEMPORAL: &str = "ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors";

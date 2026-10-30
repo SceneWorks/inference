@@ -374,11 +374,11 @@ impl FaceAnalysis {
 }
 
 /// Every key [`Scrfd::from_weights`] requires (the one enumeration lives in gen-core,
-/// [`mlx_gen::gen_core::train::face_loss::synth::scrfd_standin_shapes`], shared with the Candle
+/// [`gen_core_train::face_loss::synth::scrfd_standin_shapes`], shared with the Candle
 /// loader). Test fixtures build weightless stand-ins from it ([`FaceAnalysis::new_for_tests`], the
 /// sc-24831 builder tests).
 pub fn scrfd_schema_keys() -> Vec<String> {
-    mlx_gen::gen_core::train::face_loss::synth::scrfd_standin_shapes()
+    gen_core_train::face_loss::synth::scrfd_standin_shapes()
         .into_iter()
         .map(|(k, _)| k)
         .collect()

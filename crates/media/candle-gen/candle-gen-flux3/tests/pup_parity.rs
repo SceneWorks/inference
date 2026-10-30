@@ -1,8 +1,11 @@
 //! Frozen Torch CPU/F32 numerical parity and separate build-selected native PUP behavior.
 
 use candle_gen::gen_core::core_llm::{self, Channel, StreamEvent};
-use candle_gen::gen_core::flux3::pup::{self, PromptUpsampler, UpsampleOptions, UpsamplePlan};
 use candle_gen_flux3::pup::Flux3PromptUpsampler;
+use gen_core_flux3::{
+    pup,
+    pup::{PromptUpsampler, UpsampleOptions, UpsamplePlan},
+};
 
 use crate::common::{fixture, fixtures, host_f32, host_i32, Fixture};
 

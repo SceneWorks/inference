@@ -34,7 +34,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::pruned_adaln::{interpolation_position, TABLE_KEY};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::train::merge::read_adapter;
 use candle_gen::Weights;
@@ -44,6 +43,7 @@ use candle_gen_minimax_h3::{
     JointSchedule, MiniMaxH3Dit, MiniMaxH3DitConfig, UnmatchedTargetClass, AUDIO_SIGMA_SHIFT,
     BLOCK_TARGETS,
 };
+use gen_core_h3::pruned_adaln::{interpolation_position, TABLE_KEY};
 
 use crate::common::{dit_fixture_config, weights, Golden, DIT_FIXTURE};
 use candle_gen::testkit::tensor_max_abs;
@@ -249,7 +249,7 @@ fn full_dit_on(cfg: &MiniMaxH3DitConfig, device: &Device) -> MiniMaxH3Dit {
 /// The committed tiny DiT's tensors transformed into the pruned coordinate-table topology: the
 /// full timestep MLP, the full-width per-block AdaLN projections and the final projection are
 /// removed and replaced by `adaln_t_table` plus the reduced operands
-/// `gen_core::pruned_adaln::inspect` requires — one entry per transformer block plus the final
+/// `gen_core_h3::pruned_adaln::inspect` requires — one entry per transformer block plus the final
 /// one. **Every body tensor is carried over byte-identically**, which is what makes the
 /// cross-topology delta comparison a one-variable experiment.
 fn pruned_fixture_map(cfg: &MiniMaxH3DitConfig, device: &Device) -> HashMap<String, Tensor> {

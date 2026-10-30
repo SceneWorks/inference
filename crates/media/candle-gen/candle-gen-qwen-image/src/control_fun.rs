@@ -153,7 +153,7 @@ pub struct QwenFunControl {
     te: QwenTextEncoder,
     /// Qwen tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
     /// instead of re-parsing `tokenizer.json` per prompt/branch.
-    tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
+    tokenizer: gen_core_tokenizer::TextTokenizer,
     transformer: QwenTransformer,
     controlnet: QwenFunControlBranch,
     vae: QwenVae,

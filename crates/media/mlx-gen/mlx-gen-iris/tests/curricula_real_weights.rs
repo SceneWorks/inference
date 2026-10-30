@@ -20,12 +20,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mlx_gen::gen_core::iris::train::repa::TEACHER_COMPONENT;
-use mlx_gen::gen_core::iris::train::upstream::stage_preset_config;
-use mlx_gen::gen_core::iris::train::{
+use gen_core_iris::train::repa::TEACHER_COMPONENT;
+use gen_core_iris::train::upstream::stage_preset_config;
+use gen_core_iris::train::{
     checkpoint_root, latest_checkpoint, read_checkpoint_state, OPTIONS_KEY,
 };
-use mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
+use gen_core_iris::TEXT_ENCODER_COMPONENT;
 use mlx_gen::gen_core::{Trainer, TrainingConfig, TrainingItem, TrainingRequest};
 use mlx_gen::{LoadSpec, WeightsSource};
 use serde_json::{json, Value as Json};

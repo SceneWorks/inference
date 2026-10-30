@@ -1,9 +1,10 @@
 //! Terminal-only native smoke. Never executed by ordinary CI or the implementation story.
 use candle_gen::{
     candle_core::Device,
-    gen_core::{self, moss_image::*, *},
+    gen_core::{self, *},
 };
 use candle_gen_moss_image::MossImageGenerator;
+use gen_core_moss_image::moss_image::*;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},

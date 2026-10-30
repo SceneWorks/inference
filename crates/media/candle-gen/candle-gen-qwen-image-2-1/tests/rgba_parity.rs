@@ -208,7 +208,7 @@ fn the_rgb_emission_is_the_white_composite_of_the_rgba_emission() {
 }
 
 struct Snapshot {
-    tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
+    tokenizer: gen_core_tokenizer::TextTokenizer,
     encoder: candle_gen_qwen_image_2_1::QwenImage21TextEncoder,
     transformer: candle_gen_qwen_image_2_1::QwenImage21Transformer,
     vae: candle_gen_qwen_image_2_1::QwenImage21Vae,

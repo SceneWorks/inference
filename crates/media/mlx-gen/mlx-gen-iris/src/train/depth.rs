@@ -1,6 +1,6 @@
 //! Native MLX **Iris-3B depth training** (story sc-25687): the supervised direct-regression fine-tune
 //! of the depth task (paper §5.2) over the backend-neutral contract
-//! [`gen_core::iris::train::depth`], registered as the [`DEPTH_TRAINER_ID`] (`iris_3b_depth`)
+//! [`gen_core_iris::train::depth`], registered as the [`DEPTH_TRAINER_ID`] (`iris_3b_depth`)
 //! trainer.
 //!
 //! Every step runs **the inference forward** ([`crate::depth::depth_forward`]): the widened backbone
@@ -8,11 +8,11 @@
 //! ([`IrisDiT::from_weights_widened`], the provider's autocast policy), the zero 4th channel is
 //! concatenated, one forward at `t = flow.num_train_timesteps` on the empty-prompt conditioning, the
 //! 1×1 reducer in the compute dtype. The loss is Eq. 5 on tensors (the contract's
-//! [`depth_loss_host`](gen_core::iris::train::depth::depth_loss_host) is its reference), its gradient
+//! [`depth_loss_host`](gen_core_iris::train::depth::depth_loss_host) is its reference), its gradient
 //! of `loss / grad_accum` over every trained tensor; each optimizer step clips the global norm,
 //! updates the optional EMA from the pre-step weights and steps AdamW (or the Muon hybrid) — the
 //! generation trainer's optimizer, clipping, EMA and checkpoint code ([`super::optim`],
-//! `gen_core::iris::train`).
+//! `gen_core_iris::train`).
 //!
 //! A run starts from a `depth/` export (`LoadSpec::weights`; no other resource) or from the
 //! **generation** backbone (the paper's parent; input projections widened with zero columns, the
@@ -25,30 +25,35 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use gen_core::iris::depth::{colorize_inferno, DepthMap};
-use gen_core::iris::downstream::{parse_task_settings, EmptyPrompt, TaskExport, EMPTY_PROMPT_FILE};
-use gen_core::iris::train::depth::{
+use gen_core::train::{
+    Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
+};
+use gen_core_iris::depth::{colorize_inferno, DepthMap};
+use gen_core_iris::downstream::{parse_task_settings, EmptyPrompt, TaskExport, EMPTY_PROMPT_FILE};
+use gen_core_iris::train::depth::{
     assemble_batch, check_depth_resume, depth_dataset_fingerprint, depth_dataset_pass,
     depth_export_config_yaml, depth_export_metadata, depth_tensor_shapes, preview_row,
     reducer_init_values, validate_depth_items, widened_projections, DepthBatch, DepthInit,
     DepthLossPlan, DepthTrainPlan, DEPTH_TRAINER_ID, EMPTY_PROMPT_COMPONENT,
     EXPORT_BACKBONE_PREFIX, REDUCER_BIAS, REDUCER_WEIGHT,
 };
-use gen_core::iris::train::lineage::{publish_export_dir, retire_foreign_checkpoints};
-use gen_core::iris::train::{
-    self as contract, backbone_identity, checkpoint_root, checkpoint_staging_dir, file_stem,
-    full_param_route, latest_checkpoint, lr_factor, prune_checkpoints, publish_checkpoint,
-    read_checkpoint_state, CheckpointState, DataWalk, MixedPrecision, ResumeDataPolicy,
-    WeightsSelect, CKPT_EMA, CKPT_OPTIMIZER, CKPT_STATE, CKPT_TRAINABLE, TECHNIQUES,
+use gen_core_iris::train::lineage::{publish_export_dir, retire_foreign_checkpoints};
+use gen_core_iris::{
+    train as contract,
+    train::{
+        backbone_identity, checkpoint_root, checkpoint_staging_dir, file_stem, full_param_route,
+        latest_checkpoint, lr_factor, prune_checkpoints, publish_checkpoint, read_checkpoint_state,
+        CheckpointState, DataWalk, MixedPrecision, ResumeDataPolicy, WeightsSelect, CKPT_EMA,
+        CKPT_OPTIMIZER, CKPT_STATE, CKPT_TRAINABLE, TECHNIQUES,
+    },
 };
-use gen_core::iris::{
+use gen_core_iris::{
     IrisConfig, IrisTask, BACKBONE_CONFIG_FILE, BACKBONE_WEIGHTS_FILE, FAMILY,
     TEXT_ENCODER_COMPONENT,
 };
-use gen_core::train::{
+use gen_core_train::{
     refuse_reference_control_model_options, refuse_trainer_load_overlays, validate_control_request,
-    validate_edit_request, validate_full_finetune_request, validate_training_techniques, Trainer,
-    TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
+    validate_edit_request, validate_full_finetune_request, validate_training_techniques,
 };
 use mlx_gen::gen_core;
 use mlx_gen::weights::Weights;
@@ -64,7 +69,7 @@ use super::optim::{clip_grads, ema_update, IrisOptimizer, Params};
 use crate::depth::{depth_forward, depth_forward_hooked, DepthParts};
 use crate::dit::IrisDiT;
 use crate::text_encoder::IrisTextEncoder;
-use gen_core::iris::train::ac::AcPolicy;
+use gen_core_iris::train::ac::AcPolicy;
 
 /// Identity + capabilities of the MLX Iris depth trainer: a full fine-tune, no adapters.
 pub fn trainer_descriptor() -> TrainerDescriptor {
@@ -305,7 +310,7 @@ impl DepthModel {
             &Weights::from_map(backbone),
             cfg,
             self.compute,
-            cfg.in_channels + gen_core::iris::depth::DEPTH_EXTRA_INPUT_CHANNELS,
+            cfg.in_channels + gen_core_iris::depth::DEPTH_EXTRA_INPUT_CHANNELS,
         )?;
         let get = |k: &str| {
             params

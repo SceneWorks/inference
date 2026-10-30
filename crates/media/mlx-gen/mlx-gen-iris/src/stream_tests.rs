@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use mlx_gen::gen_core::iris::{IrisConfig, TEXT_ENCODER_COMPONENT};
+use gen_core_iris::{IrisConfig, TEXT_ENCODER_COMPONENT};
 use mlx_gen::gen_core::{
     GenerationMemory, LoadShape, MemorySelection, MemoryStrategy, TransformerComponent,
 };
@@ -214,7 +214,7 @@ fn backbone_parity_body() {
             &pconfig,
             Dtype::Bfloat16,
             &[],
-            mlx_gen::gen_core::iris::IrisTask::Generation,
+            gen_core_iris::IrisTask::Generation,
             crate::model::MODEL_ID,
             Some(quant),
         )
@@ -1231,8 +1231,7 @@ fn pricing_body() {
             Ok(())
         });
         let (chosen, memory) = selection(crate::restoration::MODEL_ID, &spec, strategy, None);
-        let mode =
-            crate::memory_strategy::memory_mode(mlx_gen::gen_core::iris::IrisTask::Restoration);
+        let mode = crate::memory_strategy::memory_mode(gen_core_iris::IrisTask::Restoration);
         let pricing = crate::ios_pricing::price(
             &IosPricingRequest {
                 provider: crate::restoration::MODEL_ID,
@@ -1257,27 +1256,23 @@ fn pricing_body() {
 
         // Depth, at its model grid.
         let spec = with_tier(LoadSpec::new(WeightsSource::Dir(depth_dir)).with_load_shape(shape));
-        let actual_depth = mlx_gen::gen_core::iris::depth::DepthRequest {
+        let actual_depth = gen_core_iris::depth::DepthRequest {
             image: Image {
                 width: 24,
                 height: 16,
                 pixels: (0..24 * 16 * 3).map(|i| (i * 31 % 256) as u8).collect(),
             },
-            resolution: mlx_gen::gen_core::iris::depth::DepthResolution::Native,
+            resolution: gen_core_iris::depth::DepthResolution::Native,
             ..Default::default()
         };
         let observed = observed_phases(|| {
             let depth = crate::depth::load_depth(&spec)?;
-            mlx_gen::gen_core::iris::depth::IrisDepthEstimator::estimate(
-                &depth,
-                &actual_depth,
-                &mut |_| {},
-            )
-            .map_err(mlx_gen::Error::from)?;
+            gen_core_iris::depth::IrisDepthEstimator::estimate(&depth, &actual_depth, &mut |_| {})
+                .map_err(mlx_gen::Error::from)?;
             Ok(())
         });
         let (chosen, memory) = selection(crate::depth::DEPTH_MODEL_ID, &spec, strategy, None);
-        let mode = crate::memory_strategy::memory_mode(mlx_gen::gen_core::iris::IrisTask::Depth);
+        let mode = crate::memory_strategy::memory_mode(gen_core_iris::IrisTask::Depth);
         let pricing = crate::ios_pricing::price(
             &IosPricingRequest {
                 provider: crate::depth::DEPTH_MODEL_ID,

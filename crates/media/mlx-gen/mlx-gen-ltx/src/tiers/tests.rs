@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use mlx_gen::gen_core::ltx_checkpoint::{LtxBundleBuilder, LtxComponent};
+use gen_core_ltx::ltx_checkpoint::{LtxBundleBuilder, LtxComponent};
 
 use super::*;
 
@@ -588,7 +588,7 @@ fn write_duration_head(root: &Path) -> PathBuf {
 
 /// Assemble the fixture bundle through the **real** split resolver, so a fixture that would not
 /// resolve is a test failure rather than a private shortcut.
-fn fixture_bundle(root: &Path) -> mlx_gen::gen_core::ltx_checkpoint::LtxBundle {
+fn fixture_bundle(root: &Path) -> gen_core_ltx::ltx_checkpoint::LtxBundle {
     LtxBundleBuilder::new()
         .with_component(LtxComponent::Transformer, write_transformer(root))
         .with_component(LtxComponent::TextEncoder, write_text_encoder(root))
@@ -1395,9 +1395,9 @@ fn the_gemma_checkpoints_load_bearing_shapes_survive_the_repack() {
     // The asset payloads themselves, byte-for-byte, through the real unpacker.
     for tier in LtxTier::ALL {
         let packed = out.join(tier.id()).join("text_encoder.safetensors");
-        let assets = mlx_gen::gen_core::gemma_assets::GemmaAssets::from_single_file(&packed)
+        let assets = gen_core_ltx::gemma_assets::GemmaAssets::from_single_file(&packed)
             .unwrap_or_else(|e| panic!("{tier}: unpack the tier's Gemma assets: {e}"));
-        let original = mlx_gen::gen_core::gemma_assets::GemmaAssets::from_single_file(
+        let original = gen_core_ltx::gemma_assets::GemmaAssets::from_single_file(
             src.join("text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"),
         )
         .unwrap();
@@ -1438,7 +1438,7 @@ fn a_tier_directory_resolves_and_its_sidecars_parse() {
     );
     assert_eq!(
         crate::bundle::declared_layout(&out).unwrap(),
-        mlx_gen::gen_core::ltx_checkpoint::LtxCheckpointLayout::Split
+        gen_core_ltx::ltx_checkpoint::LtxCheckpointLayout::Split
     );
 
     // The quant geometry the DiT loader reads.
@@ -1460,7 +1460,7 @@ fn a_tier_directory_resolves_and_its_sidecars_parse() {
     // `resolve_split_bundle`, and it is exactly what breaks if a split half keeps a config section
     // it should have dropped (two files claiming one slot) or drops one it should have kept (no
     // file claiming it).
-    let scanned = mlx_gen::gen_core::ltx_checkpoint::discover_split_bundle(&out)
+    let scanned = gen_core_ltx::ltx_checkpoint::discover_split_bundle(&out)
         .expect("a tier tree must resolve without an ambiguous component");
     for component in [
         LtxComponent::Transformer,
@@ -1496,7 +1496,7 @@ fn a_tier_directory_resolves_and_its_sidecars_parse() {
     // candidates for a slot.
     for name in ["connector", "vae_encoder", "vocoder"] {
         let path = out.join(format!("{name}.safetensors"));
-        let meta = mlx_gen::gen_core::ltx_checkpoint::LtxCheckpointMetadata::from_file(&path)
+        let meta = gen_core_ltx::ltx_checkpoint::LtxCheckpointMetadata::from_file(&path)
             .unwrap_or_else(|e| panic!("read {name} metadata: {e}"));
         assert_eq!(
             meta.classify(),

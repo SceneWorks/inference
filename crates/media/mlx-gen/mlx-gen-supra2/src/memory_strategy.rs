@@ -1,7 +1,7 @@
 //! Structural resident memory contract: byte facts from the safetensors headers of exactly the
 //! tensors the provider materializes. No calibration is claimed (the terminal campaign measures).
 
-use mlx_gen::gen_core::supra2::{
+use gen_core_checkpoint::supra2::{
     memory_architecture_facts, memory_asset_facts, Supra2Config, PROVIDER_ID,
 };
 use mlx_gen::gen_core::*;
@@ -38,7 +38,7 @@ pub(crate) fn contract_for(s: &Supra2Sources) -> Result<MemoryProviderContract> 
 pub(crate) fn contract(spec: &LoadSpec) -> Result<MemoryProviderContract> {
     contract_for(&Supra2Sources::resolve_checked(
         spec,
-        mlx_gen::gen_core::supra2::BundleCheck::SizesOnly,
+        gen_core_checkpoint::supra2::BundleCheck::SizesOnly,
     )?)
 }
 
@@ -55,7 +55,7 @@ pub(crate) fn safety(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    mlx_gen::gen_core::supra2::memory_safety(spec, contract, context)
+    gen_core_checkpoint::supra2::memory_safety(spec, contract, context)
 }
 
 pub(crate) fn surface_specs() -> Vec<MemoryContractSurfaceSpec> {

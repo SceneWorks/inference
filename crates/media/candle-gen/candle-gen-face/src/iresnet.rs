@@ -19,7 +19,7 @@ use crate::common::{Conv, Weights};
 /// The iresnet100 (antelopev2 `glintr100`) and iresnet50 (buffalo_l `w600k_r50`, the upstream
 /// ai-toolkit-perceptual identity-loss checkpoint, sc-24831) per-layer block counts — the one
 /// gen-core definition both backends re-export (mlx-gen-face's `iresnet.rs` does the same).
-pub use candle_gen::gen_core::train::face_loss::{IRESNET100_LAYERS, IRESNET50_LAYERS};
+pub use gen_core_train::face_loss::{IRESNET100_LAYERS, IRESNET50_LAYERS};
 
 /// The per-layer block counts a converted checkpoint carries, read from its keys
 /// (`layer{l}.{b}.conv1.weight`) — the twin of mlx-gen-face's `infer_layers` (sc-24831).

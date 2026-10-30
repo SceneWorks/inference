@@ -18,9 +18,10 @@ model-inference-proof = ["core-llm/model-inference-proof"]
 
 [dependencies]
 # Shared pins live in the workspace root [workspace.dependencies] (F-151). gen-core deliberately
-# depends on NOTHING tensor-related — thiserror (error), tokenizers (text), and core-llm.
+# depends on NOTHING tensor-related — thiserror (error) and core-llm. Text tokenization, image/EXR
+# decode and the `.pth` zip reader moved to the sibling `gen-core-*` crates with the code that uses
+# them (sc-27316).
 thiserror = { workspace = true }
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # Neutral safetensors header/byte-view reader for the weights-metadata layer (sc-3722). NOT a tensor
 # dep — exposes keys/dtypes/shapes/raw bytes only.
 safetensors = { workspace = true }
@@ -35,17 +36,8 @@ sha2 = { workspace = true }
 # `gen_core::core_llm` so the gen-ai side consumes the unified `core_llm::TextLlm` engine. core-llm is
 # itself tensor-free, so depending on it keeps gen-core's zero-tensor invariant intact.
 core-llm = { workspace = true }
-# OpenEXR read/write for the HDR lane (sc-18790). Pure Rust and tensor-free: it moves `f32` sample
-# buffers and header attributes only, so gen-core's zero-tensor invariant is intact.
-exr = { workspace = true }
-# Subject-mask decode for masked-loss training (epic 2123, sc-24828): a mask PNG becomes an `f32`
-# latent weight map in `train::subject_mask`. Pure Rust and tensor-free, so the zero-tensor invariant
-# holds; already in the lock (every backend kit links it).
-image = { workspace = true, features = ["bmp", "gif", "tiff", "webp"] }
+# Volume identity for prepared-file seals (`runtime::seal`) and bounded filesystem reads.
 libc = { workspace = true }
-# The tensor-free torch `.pth`/`.pt` reader (`pth`, moved from mlx-gen in sc-24213 so the Supra2
-# converter runs on both backends): STORED zip entries only, no inflater compiled in.
-zip = { version = "9", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # Stable std does not expose durable Windows file IDs/change time. Prepared File identities use the
@@ -57,6 +49,3 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 # Self-removing fixture roots for the test suites (sc-17755).
 tempfile = { workspace = true }
-# Already a normal dependency; integration tests are separate crates and need it declared here
-# too, to AUTHOR the odd channel layouts the reader must cope with (a luminance-only `Y` plate).
-exr = { workspace = true }

@@ -5,9 +5,12 @@
 use std::path::Path;
 
 use crate::sampling::{self, ContextBatch};
-use mlx_gen::gen_core::supra2::{
-    self as s2, image_seed, initial_noise, quantize_rgb, BundleCheck, Supra2Bundle, Supra2Config,
-    Supra2Resolved, Supra2Tokenizer, PROVIDER_ID, TEXT_ENCODER_COMPONENT, VAE_COMPONENT,
+use gen_core_checkpoint::{
+    supra2 as s2,
+    supra2::{
+        image_seed, initial_noise, quantize_rgb, BundleCheck, Supra2Bundle, Supra2Config,
+        Supra2Resolved, Supra2Tokenizer, PROVIDER_ID, TEXT_ENCODER_COMPONENT, VAE_COMPONENT,
+    },
 };
 use mlx_gen::gen_core::{
     self, GenerationReport, LoadShape, MemoryAssetFacts, MemoryProviderContract, MemoryRunContext,
@@ -57,7 +60,7 @@ pub fn descriptor() -> ModelDescriptor {
 }
 
 /// The resolved component directories of one load (backend-neutral; shared with the Candle port).
-pub use mlx_gen::gen_core::supra2::Supra2Sources;
+pub use gen_core_checkpoint::supra2::Supra2Sources;
 
 fn vae_config() -> VaeConfig {
     VaeConfig {

@@ -12,12 +12,12 @@ use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{VarBuilder, VarMap};
-use candle_gen::gen_core::supra2::{Supra2Config, Supra2Tokenizer, PROMPT_TRUNCATED_WARNING};
 use candle_gen::gen_core::{GenerationOutput, GenerationRequest, Generator, Image};
 use candle_gen_sdxl::SdxlVaeDecoder;
 use candle_gen_supra2::{Supra2Image, SupraDit};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKLConfig;
 use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
+use gen_core_checkpoint::supra2::{Supra2Config, Supra2Tokenizer, PROMPT_TRUNCATED_WARNING};
 
 /// An 8-token context, so the long prompt below (10 words + `</s>`) overflows it.
 fn tiny() -> Supra2Config {

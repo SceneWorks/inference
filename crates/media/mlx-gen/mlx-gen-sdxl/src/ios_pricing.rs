@@ -184,7 +184,7 @@ pub fn configured_overlay_semantic_facts(spec: &LoadSpec) -> Result<serde_json::
                 crate::quant::header_dtype(h.dtype)?;
             }
             let source = crate::ldm::component_header_source(file)?;
-            use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as C;
+            use gen_core_family::sdxl_ldm::SdxlComponent as C;
             // The identity is a function of the source, not of one native order: every
             // order-dependent UNet group lists each realizable winner's layouts and adapter facts.
             let mut groups = Vec::new();
@@ -1553,7 +1553,7 @@ impl Inputs {
     /// native source order, summed over the text and heavy splits; zero for Directory inputs.
     /// Counter-scoped: not task footprint, retirement or source-parent subtraction.
     fn fused_counter_order_variance(&self) -> Result<u64> {
-        use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as C;
+        use gen_core_family::sdxl_ldm::SdxlComponent as C;
         let Some(fused) = &self.fused else {
             return Ok(0);
         };
@@ -1913,7 +1913,7 @@ impl Priced {
             mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(file)
                 .map_err(|e| Error::Msg(e.to_string()))
         };
-        use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as C;
+        use gen_core_family::sdxl_ldm::SdxlComponent as C;
         let component_headers = |file: &Path, component: C| match &inputs.fused {
             Some(fused) => Ok(fused.source.headers_with(component, &fused.world)),
             None => headers(file),

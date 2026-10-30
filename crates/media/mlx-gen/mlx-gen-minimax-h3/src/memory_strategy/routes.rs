@@ -329,7 +329,7 @@ pub(super) fn memory_contract_surface_specs() -> Vec<mlx_gen::gen_core::MemoryCo
 pub fn veda_workspace_bound(
     req: mlx_gen::gen_core::veda::workspace::Request<'_>,
 ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::veda::workspace::WorkspaceBound>> {
-    mlx_gen::gen_core::veda::workspace::for_video_request(
+    gen_core_h3::veda::workspace::for_video_request(
         req,
         mlx_gen::gen_core::veda::workspace::Backend::Mlx,
     )
@@ -351,7 +351,7 @@ pub fn veda_workspace_bound_for_contract(
         Some(native) => native.selected_patch(req)?,
         None => [1, 2, 2], // unresolved inventory only; no materialized source geometry exists
     };
-    mlx_gen::gen_core::veda::workspace::for_video_request_with_patch(
+    gen_core_h3::veda::workspace::for_video_request_with_patch(
         req,
         mlx_gen::gen_core::veda::workspace::Backend::Mlx,
         patch,

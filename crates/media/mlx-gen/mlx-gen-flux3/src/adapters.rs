@@ -1,13 +1,7 @@
 //! Native additive LoRA installation after tensor-neutral identity/key/rank admission.
 use crate::dit::Flux3Dit;
-use mlx_gen::{
-    gen_core::{
-        flux3::{adapters, DitConfig},
-        AdapterSpec,
-    },
-    weights::Weights,
-    Error, Result,
-};
+use gen_core_flux3::{adapters, DitConfig};
+use mlx_gen::{gen_core::AdapterSpec, weights::Weights, Error, Result};
 
 pub fn validate(specs: &[AdapterSpec], config: &DitConfig) -> Result<()> {
     for spec in specs {

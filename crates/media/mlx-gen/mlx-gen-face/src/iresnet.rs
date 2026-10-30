@@ -31,7 +31,7 @@ use crate::common::Conv;
 
 /// Per-layer block counts of glintr100 (iresnet100) and w600k_r50 (iresnet50, upstream's identity
 /// checkpoint) — one definition, in gen-core (sc-24831).
-pub use mlx_gen::gen_core::train::face_loss::{IRESNET100_LAYERS, IRESNET50_LAYERS};
+pub use gen_core_train::face_loss::{IRESNET100_LAYERS, IRESNET50_LAYERS};
 
 /// The per-layer block counts a converted checkpoint carries, read from its keys
 /// (`layer{l}.{b}.conv1.weight`), so one loader serves iresnet100 (`glintr100`), iresnet50

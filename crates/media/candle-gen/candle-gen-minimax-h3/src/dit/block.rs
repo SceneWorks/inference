@@ -327,7 +327,7 @@ impl DitBlock {
     /// curve projection `curve` ([`crate::dit::curve::CurveProjection`], at its stored precision)
     /// replaces it.
     ///
-    /// [`PrunedAdaLn::inspect`](candle_gen::gen_core::pruned_adaln::PrunedAdaLn::inspect) must have
+    /// [`PrunedAdaLn::inspect`](gen_core_h3::pruned_adaln::PrunedAdaLn::inspect) must have
     /// validated the whole reduced topology before this runs; a block constructed here against a
     /// checkpoint the inspector refused would be exactly the plausible-garbage load the contract
     /// forbids.
@@ -373,9 +373,7 @@ impl DitBlock {
     /// `None` on the stock path — the check [`crate::dit::curve::CurveAdaLn::precompute`] runs
     /// before projecting any block, so a projection from a different basis cannot be labelled with
     /// this curve's identity.
-    pub fn curve_pruning_identity(
-        &self,
-    ) -> Option<candle_gen::gen_core::pruned_adaln::PruningIdentity> {
+    pub fn curve_pruning_identity(&self) -> Option<gen_core_h3::pruned_adaln::PruningIdentity> {
         self.curve.as_ref().map(|p| p.pruning_identity())
     }
     /// This block's AdaLN projection, or `None` once it has been evicted.

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import shutil
 import subprocess
@@ -108,6 +109,11 @@ class CompiledFeatureIdentityTests(unittest.TestCase):
             environment["CARGO_INCREMENTAL"] = "0"
             environment["CARGO_BUILD_JOBS"] = "4"
             environment["CARGO_PROFILE_DEV_DEBUG"] = "0"
+            if platform.system() == "Darwin":
+                # Rust 1.96's debuginfo stripping can misalign proc-macro dylibs,
+                # which macOS 27 refuses to load (rust-lang/rust#157750).
+                environment["CARGO_PROFILE_DEV_STRIP"] = "none"
+                environment["CARGO_PROFILE_DEV_BUILD_OVERRIDE_STRIP"] = "none"
 
             def capture(features="", reference=None, manifest=sdk / "Cargo.toml", offline=True):
                 command = ["cargo", "run", "--quiet", "--manifest-path", str(manifest)]

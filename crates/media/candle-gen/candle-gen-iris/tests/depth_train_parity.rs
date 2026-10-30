@@ -7,19 +7,17 @@
 use std::collections::HashMap;
 
 use candle_gen::candle_core::{Tensor, Var};
-use candle_gen::gen_core::iris::downstream::{EmptyPrompt, TaskExport};
-use candle_gen::gen_core::iris::train::depth::{
-    depth_loss_host, normalize_log_depth, DepthBatch, DepthLossPlan, LossReduction,
-    MIN_VALID_PIXELS_FLOOR,
-};
-use candle_gen::gen_core::iris::train::{
-    full_param_route, MuonAdjustLr, OptimizerKind, OptimizerPlan,
-};
-use candle_gen::gen_core::iris::IrisTask;
 use candle_gen_iris::train::depth::{
     depth_loss, load_export_tensors, loss_and_grads, DepthModel, DepthStep, DepthWindow,
 };
 use candle_gen_iris::train::optim::{IrisOptimizer, Params};
+use gen_core_iris::downstream::{EmptyPrompt, TaskExport};
+use gen_core_iris::train::depth::{
+    depth_loss_host, normalize_log_depth, DepthBatch, DepthLossPlan, LossReduction,
+    MIN_VALID_PIXELS_FLOOR,
+};
+use gen_core_iris::train::{full_param_route, MuonAdjustLr, OptimizerKind, OptimizerPlan};
+use gen_core_iris::IrisTask;
 
 use crate::common::{cpu, fixture, fixtures, host_f32, Fixture};
 use candle_gen::testkit::peak_rel_slices;
@@ -220,8 +218,8 @@ fn tensor_loss_matches_the_host_reference() {
 #[ignore = "model inference; explicit model workflow only"]
 fn activation_checkpointing_gradients_equal_the_plain_graph() {
     use candle_gen::candle_core::DType;
-    use candle_gen::gen_core::iris::train::ac::AcPolicy;
     use candle_gen_iris::train::model::checkpointed_regions;
+    use gen_core_iris::train::ac::AcPolicy;
     let g = fixture("iris_depth_train_golden.safetensors");
     let batch = golden_batch(&g);
     let loss_plan = DepthLossPlan::default();

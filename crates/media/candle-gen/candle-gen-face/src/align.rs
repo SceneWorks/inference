@@ -2,11 +2,11 @@
 //! and the ArcFace embedding ([`crate::iresnet`]).
 //!
 //! The similarity solver, the cv2-exact warp and both crops are backend-neutral and live in
-//! [`candle_gen::gen_core::face_align`] (sc-27256), shared with the MLX twin; this module re-exports
+//! [`gen_core_family::face_align`] (sc-27256), shared with the MLX twin; this module re-exports
 //! them so `align::*` paths stay stable and adds the candle ArcFace input packing (NCHW; MLX packs
 //! NHWC).
 
-pub use candle_gen::gen_core::face_align::*;
+pub use gen_core_family::face_align::*;
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::Result;

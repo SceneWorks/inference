@@ -7,7 +7,7 @@ MediaPipe's FaceMesh-v2 landmark detector natively. Its only published PyTorch f
 (`face_landmarks_detector.pt`). Neither loads natively. `convert_mp_facemesh_v2.py` lowers the
 GraphModule to a **`sceneworks-fx-program/1`** safetensors file. The parameters are tensors and the
 op list is JSON in `__metadata__.program`. The format is documented in `fx_program.py` and parsed by
-`gen_core::fx_program`. Both native executors run it. The script re-executes the lowered program and
+`gen_core_family::fx_program`. Both native executors run it. The script re-executes the lowered program and
 refuses to write output that differs from torch by more than 1e-4. If the graph contains an op it
 does not know, it raises and names that op.
 
@@ -31,6 +31,6 @@ After the upload, pin the commit it reports. Add a SceneWorks `componentOnly` ca
 whose trainer declares `techniques.face_landmark_loss`.
 
 If the self-check reports an unsupported op, add it to `fx_program.py`,
-`gen_core::fx_program::Op`, and both executors (`mlx-gen-face/src/program.rs` and
+`gen_core_family::fx_program::Op`, and both executors (`mlx-gen-face/src/program.rs` and
 `candle-gen-face/src/program.rs`). Extend `crates/media/face_loss_fixtures/` so the new op is
 pinned across torch, MLX and Candle.

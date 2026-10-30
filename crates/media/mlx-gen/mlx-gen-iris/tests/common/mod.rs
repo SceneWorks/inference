@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 pub mod metal_guard;
 
-use mlx_gen::gen_core::iris::IrisConfig;
+use gen_core_iris::IrisConfig;
 use mlx_gen::weights::Weights;
 use mlx_rs::{Array, Dtype};
 

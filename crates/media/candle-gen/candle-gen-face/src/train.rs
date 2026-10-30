@@ -2,7 +2,7 @@
 //! the Candle shared perceptual path ([`candle_gen::train::perceptual`]) — the twin of
 //! `mlx-gen-face`'s `train` (read its module docs for the full contract). The backend-neutral half —
 //! crop box, resample matrices, region weights, footprints — lives in
-//! [`candle_gen::gen_core::train::face_loss`], so both backends crop, resample, normalize, weight
+//! [`gen_core_train::face_loss`], so both backends crop, resample, normalize, weight
 //! and budget identically; the committed torch fixture (`crates/media/face_loss_fixtures/`) pins
 //! both against upstream.
 //!
@@ -22,19 +22,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
 use candle_gen::candle_core::{DType, Device, Tensor, D};
-pub use candle_gen::gen_core::train::face_loss::{
+use candle_gen::gen_core::train::{IdentityLossConfig, IdentityReferenceMode};
+use candle_gen::train::perceptual::{reference_as, LossReference, PerceptualLoss};
+use candle_gen::{CandleError, Result};
+pub use gen_core_train::face_loss::{
     arcface_param_count, crop_resample_matrices, face_crop_box, face_landmark_loss_footprint,
     identity_loss_footprint, CropBox, ARCFACE_FILE, ARCFACE_INPUT, FACEMESH_FILE, FACEMESH_INPUT,
     FACEMESH_LANDMARKS, SCRFD_FILE,
 };
-use candle_gen::gen_core::train::face_loss::{
+use gen_core_train::face_loss::{
     detect_with_retry, face_loss_timestep_weight, synth, IDENTITY_CLEAN_COS_FLOOR,
     IDENTITY_NOISE_SAMPLES, IDENTITY_NOISE_SEED, INNER_EYES, INTER_EYE_FLOOR, LANDMARK_EPS,
     LANDMARK_REGIONS, NOSE_TIP,
 };
-use candle_gen::gen_core::train::{IdentityLossConfig, IdentityReferenceMode};
-use candle_gen::train::perceptual::{reference_as, LossReference, PerceptualLoss};
-use candle_gen::{CandleError, Result};
 
 use crate::common::Weights;
 use crate::face::detector_blob;
@@ -678,12 +678,12 @@ pub mod testing {
     use std::path::Path;
 
     use candle_gen::candle_core::{Device, Tensor};
-    use candle_gen::gen_core::fx_program::FORMAT;
-    use candle_gen::gen_core::train::face_loss::synth::{
+    use candle_gen::{CandleError, Result};
+    use gen_core_family::fx_program::FORMAT;
+    use gen_core_train::face_loss::synth::{
         scrfd_standin_shapes, tiny_arcface_shapes, tiny_facemesh_shapes, ARCFACE_SEED,
         FACEMESH_SEED, TINY_FACEMESH_PROGRAM,
     };
-    use candle_gen::{CandleError, Result};
 
     use super::{ARCFACE_FILE, FACEMESH_FILE, SCRFD_FILE};
     use crate::synth;

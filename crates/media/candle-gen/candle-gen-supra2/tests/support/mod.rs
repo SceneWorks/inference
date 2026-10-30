@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::supra2::Supra2Config;
+use gen_core_checkpoint::supra2::Supra2Config;
 
 /// Every device this build can run: the CPU (the exact-f32 structural gate) always, plus the
 /// process-default accelerator when the build selected one (`cuda:0` under `--features cuda`).

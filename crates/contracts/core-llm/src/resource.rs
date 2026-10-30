@@ -376,7 +376,7 @@ pub fn effective_memory_budget(capacity: Option<u64>, budget: Option<u64>) -> Re
 /// Fresh host/unified-memory availability snapshot. This is never used as CUDA capacity.
 ///
 /// This is the one host-availability probe for both contracts: gen-core's MOSS recovery
-/// (`gen_core::moss_image_training::recovery::host::available_bytes`) wraps it (sc-27317). Every
+/// (`gen_core_moss_image::moss_image_training::recovery::host::available_bytes`) wraps it (sc-27317). Every
 /// arm queries the kernel in-process; it never spawns a helper process by bare name, so admission
 /// carries no per-request process start-up cost and no Windows application-directory search
 /// (sc-27306, sc-27311).

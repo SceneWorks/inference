@@ -10,8 +10,8 @@
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::imageops::{resize_bicubic_u8, resize_lanczos_u8};
-use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::{CandleError, Result};
+use gen_core_tokenizer::TextTokenizer;
 
 use crate::image_processor::{Grid, ImageInput, QwenImageProcessor};
 use crate::pipeline::pack_latents;

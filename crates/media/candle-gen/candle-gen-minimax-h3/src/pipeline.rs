@@ -67,10 +67,10 @@ use crate::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
 ///
 /// `canvas_multiple` in the reference pipeline. **Not** `VAE_RATIO` alone: a 16-aligned canvas can
 /// still be an odd number of latent columns, which has no patched representation.
-pub const SPATIAL_STRIDE: u32 = candle_gen::gen_core::h3_memory::SPATIAL_STRIDE;
+pub const SPATIAL_STRIDE: u32 = gen_core_h3::h3_memory::SPATIAL_STRIDE;
 
 /// Short edge the released checkpoint generates on by default.
-pub const CANVAS_SHORT_EDGE: u32 = candle_gen::gen_core::h3_memory::CANVAS_SHORT_EDGE;
+pub const CANVAS_SHORT_EDGE: u32 = gen_core_h3::h3_memory::CANVAS_SHORT_EDGE;
 
 /// Area budget of the released checkpoint's canvas, `768 · 1344` = 1 032 192 px.
 ///
@@ -79,7 +79,7 @@ pub const CANVAS_SHORT_EDGE: u32 = candle_gen::gen_core::h3_memory::CANVAS_SHORT
 /// budget. Canvas area is the *dominant* term in the packed sequence — it sets rows per latent
 /// frame, and attention is quadratic in the sequence — so an unbounded area is an unbounded render
 /// cost regardless of what the duration bound says.
-pub const CANVAS_MAX_PIXELS: u32 = candle_gen::gen_core::h3_memory::CANVAS_MAX_PIXELS;
+pub const CANVAS_MAX_PIXELS: u32 = gen_core_h3::h3_memory::CANVAS_MAX_PIXELS;
 
 /// Widest edge any canvas this model resolves to can carry — **2016**, the long edge at the 4:1
 /// aspect ceiling. This is what `Capabilities::max_size` declares (sc-17152).
@@ -172,7 +172,7 @@ impl RequestGeometry {
 /// over [`CANVAS_MAX_PIXELS`], on a frame count that is not `17n + 5`, and on a duration outside the
 /// model's own 5.1667–14.375 s range.
 pub fn resolve_geometry(width: u32, height: u32, num_frames: usize) -> Result<RequestGeometry> {
-    candle_gen::gen_core::h3_memory::validate_request_geometry(width, height, num_frames as u64, 1)
+    gen_core_h3::h3_memory::validate_request_geometry(width, height, num_frames as u64, 1)
         .map_err(|error| CandleError::Msg(error.to_string()))?;
     Ok(RequestGeometry {
         width,
@@ -193,7 +193,7 @@ pub fn resolve_geometry(width: u32, height: u32, num_frames: usize) -> Result<Re
 /// never leave it, so no ceiling clamp is needed and there is no duration in range that silently
 /// renders shorter than it asked for.
 pub fn align_frames_for_duration(seconds: f32) -> Result<usize> {
-    // One definition, shared with allocation admission (`gen_core::veda::workspace`), so pricing
+    // One definition, shared with allocation admission (`gen_core_h3::veda::workspace`), so pricing
     // and rendering can never resolve the same duration to different rungs (sc-26691).
     let aligned = candle_gen::gen_core::h3_memory::align_frames_for_duration(seconds)? as usize;
     debug_assert!(
@@ -986,7 +986,7 @@ mod tests {
             assert_eq!(align_frames_for_duration(secs).unwrap(), f);
         }
         // The shared gen-core resolver admission prices with is this lattice, not a copy of it.
-        use candle_gen::gen_core::h3_memory as shared;
+        use gen_core_h3::h3_memory as shared;
         assert_eq!(shared::FPS, MINIMAX_H3_FPS);
         assert_eq!(shared::MIN_FRAMES as usize, LEGAL_FRAME_COUNTS[0]);
         assert_eq!(
@@ -1271,9 +1271,10 @@ mod tests {
     #[test]
     fn match_resize_and_audio_truncation_shrink_the_ref2va_sequence() {
         use crate::reference::ReferenceKind;
-        use candle_gen::gen_core::{
+        use candle_gen::gen_core::ReferenceImageResizeMode;
+        use gen_core_h3::{
             h3_reference::{reference_audio_max_samples_per_channel, REFERENCE_IMAGE_MULTIPLE},
-            resolve_reference_image_size, ReferenceImageResizeMode,
+            resolve_reference_image_size,
         };
         let d = Device::Cpu;
         let g = resolve_geometry(1088, 544, 124).unwrap();
