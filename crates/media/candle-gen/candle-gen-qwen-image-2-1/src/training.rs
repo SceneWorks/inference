@@ -2407,6 +2407,17 @@ impl QwenImage21Trainer {
             }
         }
 
+        // sc-26857: invariant preparation only after adapter installation and resume.
+        let prepared_examples: Vec<_> = cache
+            .iter()
+            .map(|item| (&item.text, item.references.as_slice(), &item.layout))
+            .collect();
+        dit.prepare_training(
+            &prepared_examples,
+            budget.saturating_sub(training_footprint(&self.facts, &shape).train_phase),
+        )?;
+        candle_gen::train::profile::cohort_capture_initial(&set.vars)?;
+
         // --- train loop ---
         // sc-2127: which cached (item, bucket) entry each step trains on (round-robin over items
         // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
@@ -2456,6 +2467,7 @@ impl QwenImage21Trainer {
             if req.cancel.is_cancelled() {
                 break;
             }
+            candle_gen::train::profile::cohort_begin_step(&device)?;
             let picked = step_sample(aux_driver.as_mut(), step, &schedule);
             let sample = &cache[picked.entry];
             let t = flow_match::sample_unit_timestep(
@@ -2505,6 +2517,12 @@ impl QwenImage21Trainer {
                 update_idx += 1;
             }
 
+            candle_gen::train::profile::cohort_end_step(
+                &device,
+                last_loss,
+                &set.vars,
+                "qwen-image-2-1",
+            )?;
             on_progress(TrainingProgress::Training {
                 step,
                 total: cfg.steps,
@@ -3975,6 +3993,18 @@ mod tests {
             .unwrap()
     }
 
+    fn assert_prepared_parity(raw: &(f32, GradStore), prepared: &(f32, &GradStore), vars: &[Var]) {
+        assert!((raw.0 - prepared.0).abs() <= 1e-5 * raw.0.abs().max(1.0));
+        for var in vars {
+            let (a, b) = (grad_values(&raw.1, var), grad_values(prepared.1, var));
+            let scale = a.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-6);
+            assert!(
+                a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4 * scale),
+                "prepared factor gradient changed"
+            );
+        }
+    }
+
     /// AC: the gradient-checkpointed backward is the dense one — same loss, same grads, for LoRA
     /// (and LoKr at a full and a low-rank `w2`), over the default block surface AND a surface
     /// including global targets (stitched through the retained pre-block forward).
@@ -4003,12 +4033,22 @@ mod tests {
                 let set = install(&mut dit, network, rank, modules.clone());
                 perturb(&set);
                 let (x0, ctx, noise) = fixed_batch(&dit);
-                let run = |checkpoint| {
-                    t2i_loss_grads(&dit, &set.vars, &x0, &ctx, &noise, 0.4, false, checkpoint)
+                let run = |dit: &QwenImage21Transformer, checkpoint| {
+                    t2i_loss_grads(dit, &set.vars, &x0, &ctx, &noise, 0.4, false, checkpoint)
                         .unwrap()
                 };
-                let (l_dense, g_dense) = run(false);
-                let (l_ckpt, g_ckpt) = run(true);
+                let raw = run(&dit, false);
+                dit.prepare_training(&[(&ctx, &[], &t2i_layout())], u64::MAX)
+                    .unwrap();
+                let retained = dit.training_preparation_bytes();
+                let (l_dense, g_dense) = run(&dit, false);
+                assert_prepared_parity(&raw, &(l_dense, &g_dense), &set.vars);
+                let (l_ckpt, g_ckpt) = run(&dit, true);
+                assert_eq!(
+                    retained,
+                    dit.training_preparation_bytes(),
+                    "no per-step cache growth"
+                );
                 assert!(
                     (l_dense - l_ckpt).abs() <= 1e-5 * l_dense.abs().max(1.0),
                     "{network:?}: loss {l_dense} vs {l_ckpt}"
@@ -4027,6 +4067,77 @@ mod tests {
                     !modules.is_empty()
                 );
                 assert!(max_rel < 1e-4, "{network:?} r{rank}: {max_rel:.2e}");
+                // Current factor Vars remain live after preparation. Replacing a frozen text
+                // base invalidates its cached projection; new caption TensorIds miss safely.
+                for var in &set.vars {
+                    var.set(&(var.as_tensor() + 0.003).unwrap()).unwrap();
+                }
+                let live = run(&dit, false);
+                assert_ne!(
+                    live.0, l_dense,
+                    "current factor values must affect the step"
+                );
+                dit.visit_adaptable_mut(&mut |name, linear| {
+                    if name == "txt_in.out_layer" {
+                        let delta = Tensor::ones(
+                            (linear.out_features(), linear.in_features()),
+                            DType::F32,
+                            &Device::Cpu,
+                        )?;
+                        linear
+                            .fold_dense_delta(&(delta * 0.001)?)
+                            .map_err(to_core)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                if modules.is_empty() {
+                    // Adapter target installation after preparation must invalidate the final
+                    // text cache even when the frozen base TensorId is unchanged.
+                    dit.visit_adaptable_mut(&mut |name, linear| {
+                        if name == "txt_in.out_layer" {
+                            let down =
+                                Var::ones((1, linear.in_features()), DType::F32, &Device::Cpu)?;
+                            let up =
+                                Var::ones((linear.out_features(), 1), DType::F32, &Device::Cpu)?;
+                            linear.push_trainable_lora(
+                                down.as_tensor().clone(),
+                                up.as_tensor().clone(),
+                                0.001,
+                            );
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+                let invalidated = run(&dit, false);
+                let changed_caption = (&ctx * 0.9).unwrap();
+                let miss = t2i_loss_grads(
+                    &dit,
+                    &set.vars,
+                    &x0,
+                    &changed_caption,
+                    &noise,
+                    0.4,
+                    false,
+                    false,
+                )
+                .unwrap();
+                dit.prepare_training(&[], u64::MAX).unwrap();
+                let uncached = run(&dit, false);
+                assert_prepared_parity(&invalidated, &(uncached.0, &uncached.1), &set.vars);
+                let fresh = t2i_loss_grads(
+                    &dit,
+                    &set.vars,
+                    &x0,
+                    &changed_caption,
+                    &noise,
+                    0.4,
+                    false,
+                    false,
+                )
+                .unwrap();
+                assert_prepared_parity(&miss, &(fresh.0, &fresh.1), &set.vars);
             }
         }
 
@@ -4050,6 +4161,14 @@ mod tests {
             perturb(&set);
             let (x0, ctx, noise) = fixed_batch(&dit);
             let edit = fixed_edit_batch(&dit);
+            dit.prepare_training(
+                &[
+                    (&ctx, &[], &t2i_layout()),
+                    (&edit.text, &edit.references, &edit.layout),
+                ],
+                u64::MAX,
+            )
+            .unwrap();
             for checkpoint in [false, true] {
                 // Text-to-image, then an edit step (f32 cached reference latents into the half-
                 // precision joint forward).
@@ -5372,6 +5491,14 @@ mod tests {
         let (x0, ctx, noise) = fixed_batch(&dit);
         let layout = t2i_layout();
         let edit = fixed_edit_batch(&dit);
+        dit.prepare_training(
+            &[
+                (&ctx, &[], &layout),
+                (&edit.text, &edit.references, &edit.layout),
+            ],
+            u64::MAX,
+        )
+        .unwrap();
         // The packed target weight `[1, 16, 1]` of a 4×4 latent grid, built as production does.
         let map = |w: &[f32]| {
             let grid =
@@ -5585,12 +5712,15 @@ mod tests {
                 let set = install(&mut dit, network, 4, modules);
                 perturb(&set);
                 let batch = fixed_edit_batch(&dit);
-                let run = |checkpoint| {
-                    compute_loss_grads(&dit, &set.vars, &batch.step(0.4), false, checkpoint)
-                        .unwrap()
+                let run = |dit: &QwenImage21Transformer, checkpoint| {
+                    compute_loss_grads(dit, &set.vars, &batch.step(0.4), false, checkpoint).unwrap()
                 };
-                let (l_dense, g_dense) = run(false);
-                let (l_ckpt, g_ckpt) = run(true);
+                let raw = run(&dit, false);
+                dit.prepare_training(&[(&batch.text, &batch.references, &batch.layout)], u64::MAX)
+                    .unwrap();
+                let (l_dense, g_dense) = run(&dit, false);
+                assert_prepared_parity(&raw, &(l_dense, &g_dense), &set.vars);
+                let (l_ckpt, g_ckpt) = run(&dit, true);
                 assert!(
                     (l_dense - l_ckpt).abs() <= 1e-5 * l_dense.abs().max(1.0),
                     "{network:?}: loss {l_dense} vs {l_ckpt}"
