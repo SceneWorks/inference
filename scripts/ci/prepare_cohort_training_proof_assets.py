@@ -1,4 +1,4 @@
-"""Bind installed pinned assets for nine exact bounded CUDA proofs (no fetch/compute)."""
+"""Bind installed pinned assets for exact bounded CUDA proofs (no fetch/compute)."""
 from __future__ import annotations
 import json
 import os
@@ -31,6 +31,8 @@ BINDINGS = {
         "KOLORS_TRAIN_SNAPSHOT": snapshot("Kwai-Kolors/Kolors-diffusers", "7e091c75199e910a26cd1b51ed52c28de5db3711")},
     "candle-gen-sd3/trainer_cuda_smoke::sd35_medium_bounded_acceleration_acceptance": {
         "SD35_MEDIUM_TRAIN_SNAPSHOT": snapshot("stabilityai/stable-diffusion-3.5-medium", "b940f670f0eda2d07fbb75229e779da1ad11eb80")},
+    "candle-gen-qwen-image-2-1/train_peak_real_weights::qwen21_bounded_acceleration_acceptance": {
+        "CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT": snapshot("Qwen/Qwen-Image-2.1", "790c92633540aa0cb11d9abf19eb46d861714758")},
 }
 
 

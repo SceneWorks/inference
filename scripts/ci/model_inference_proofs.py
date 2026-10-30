@@ -1552,3 +1552,20 @@ def main() -> int:
                 asset_setup = 'cohort-training'
             if bespoke_training_bindings(rows, args.backend) is not None:
                 asset_setup = 'bespoke-training'
+            plan = {'runner': runner, 'asset_setup': asset_setup, 'backend': args.backend, 'request': value, 'selected': len(rows),
+                    'bindings': [identity(row) for row in rows]}
+            configured = {identity(row): row['selected_configuration'] for row in rows if 'selected_configuration' in row}
+            if configured:
+                plan['configurations'] = configured
+            print(json.dumps(plan, indent=2))
+            return 0
+        if args.output is None:
+            raise ValueError('an owned workflow output directory is required')
+        return run(rows, args.backend, value, args.expected_sha, args.output)
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        print('model proof rejected: ' + str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
