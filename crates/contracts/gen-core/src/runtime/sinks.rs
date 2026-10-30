@@ -324,10 +324,10 @@ pub enum Progress {
     /// Resident owners may remain cached. This Rust callback event is not a wire message,
     /// denoising step, or terminal generation result; consumers not pricing phases may ignore it.
     PromptUpsamplingComplete,
-    /// The preceding `Loading(EncodingPrompt)` computation completed successfully, including
-    /// materialization required by a lazy backend. Paired only with actual encoding work; reused
-    /// supplied conditioning emits neither boundary. Further reference conditioning may follow,
-    /// so this does not imply [`Self::ConditioningComplete`] or a denoising step.
+    /// The preceding `Loading(EncodingPrompt)` stage yielded control back to its caller.
+    /// This logical boundary does not force lazy device work or imply synchronization, successful
+    /// full conditioning, or a denoising step. Further reference conditioning may follow.
+    /// Supplied/reused conditioning that skips the encoding stage emits neither boundary.
     PromptEncodingComplete,
     /// Optional exact phase boundary: all text and reference conditioning has been materialized
     /// and its device work successfully synchronized, before the first denoiser forward. Emitted
