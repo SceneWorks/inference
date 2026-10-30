@@ -48,7 +48,21 @@ REVIEWED_STORAGE_STEP_DIGESTS = {
     'synthetic-w4a8-cuda': 'e75d9a616cdc6eeb4c291863f790dea2ec800b0a1c37490627bc52a3418f7bcc',
     'moss-edit-cuda': '3cd52c621b7251bdbefc183df2cd535875d402b32a51afb38cab0627e1835c49',
 }
-CURRENT_STEP_DIGESTS = {**STEP_DIGESTS, **REPAIRED_H3_STEP_DIGESTS, **REVIEWED_STORAGE_STEP_DIGESTS}
+# sc-26691 adds exactly two explicit Metal steps to synthetic-w4a8-mlx (the MLX Kitchen ConvRot
+# oracle and the tiled INT8 GEMM parity/microbench route). With those two removed the job must
+# still equal the REPAIRED_H3 receipt above, so no original step can drift under this receipt.
+SC26691_ADDED_STEPS = {
+    'synthetic-w4a8-mlx': (
+        'Prove H3 ConvRot INT8 native projections against pinned Kitchen',
+        'Prove tiled INT8 GEMM parity and measure throughput on Metal',
+    ),
+}
+SC26691_STEP_DIGESTS = {
+    'synthetic-w4a8-mlx': '5475ed6448f16a7d1f8c5e6b87bbaea1091c0d4320ff83199606e3cb3eacc2c3',
+}
+CURRENT_STEP_DIGESTS = {
+    **STEP_DIGESTS, **REPAIRED_H3_STEP_DIGESTS, **REVIEWED_STORAGE_STEP_DIGESTS, **SC26691_STEP_DIGESTS
+}
 
 # sc-27365 repins only the receipt-upload action of these jobs from the drifted v7.0.1 SHA to
 # the v4 SHA every other workflow step uses. The receipts above stay authoritative: the test maps
@@ -119,6 +133,11 @@ class ManualModelWorkflowRelocationTests(unittest.TestCase):
                 for step in steps:
                     if 'run' in step: step['run'] = step['run'].replace('python3.12 ', 'python3 ')
             self.assertEqual(digest(receipt_steps(name, steps)), CURRENT_STEP_DIGESTS[name], name)
+            if name in SC26691_ADDED_STEPS:
+                added = SC26691_ADDED_STEPS[name]
+                self.assertEqual([s['name'] for s in steps if s.get('name') in added], list(added), name)
+                prior = [s for s in steps if s.get('name') not in added]
+                self.assertEqual(digest(receipt_steps(name, prior)), REPAIRED_H3_STEP_DIGESTS[name], name)
         hosted = self.manual['jobs']['h3-pruned-hosted-metal']
         step = next(step for step in hosted['steps'] if step.get('name', '').startswith('Check H3 precise'))
         self.assertEqual(digest(step), STEP_DIGESTS['h3-pruned-hosted-metal'])
