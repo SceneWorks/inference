@@ -36,6 +36,75 @@ class VedaCudaGuardTests(unittest.TestCase):
                 s0.command(["nvidia-smi"], deadline=time.monotonic() - 1)
             probe.assert_not_called()
 
+    def test_guard_vendor_is_exactly_the_authenticated_canonical_component(self):
+        from scripts.ci import model_proof_cuda_primitives as primitives
+        root = Path(__file__).resolve().parents[2]
+        self.assertEqual((root / 'scripts/release/veda_cuda_guard.py').read_bytes(),
+                         (root / 'scripts/ci/vendor/veda_cuda_guard.py').read_bytes())
+        primitives.component('veda_cuda_guard.py', primitives.GUARD_SHA)
+
+    def test_synced_vendor_preserves_legacy_positional_sampling_and_receipt_shape(self):
+        from scripts.ci import model_proof_cuda_primitives as primitives
+        vendor = primitives.component('veda_cuda_guard.py', primitives.GUARD_SHA)
+        card = dict(uuid='GPU-test', used_mib=1164, utilization_percent=0)
+        rows = [['GPU-test', '1', 'MOCK', 'C+G']]
+        baseline = dict(uuid='GPU-test', reserved_baseline_mib=1164,
+                        process_identities=[('GPU-test', '1', 'C+G')])
+        with tempfile.TemporaryDirectory() as temporary, patch.object(vendor, 'inventory', return_value=([card], rows)), \
+                patch.object(vendor.time, 'sleep'):
+            checked, observed = vendor.sample_baseline(card, Path(temporary), 'legacy', baseline)
+            vendor.verify_idle(card, Path(temporary), 'legacy-release', baseline)
+            self.assertEqual(checked, card)
+            self.assertEqual(observed, baseline)
+            samples = json.loads((Path(temporary) / 'legacy-samples.json').read_text(encoding='utf-8'))
+            self.assertEqual(len(samples), 5)
+            self.assertEqual(set(samples[0]), {'sample_number', 'elapsed_seconds', 'devices', 'processes', 'selected_used_mib'})
+            self.assertEqual(samples[0]['processes'], rows)
+        with tempfile.TemporaryDirectory() as temporary, patch.object(vendor, 'inventory', return_value=(
+                [dict(card, utilization_percent=5)], rows)), patch.object(vendor.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'occupied'):
+                vendor.sample_baseline(card, Path(temporary), 'legacy', baseline)
+
+    def test_strict_inventory_still_requires_typed_census(self):
+        row = "1, GPU-test, MOCK, 596.36, 97887, 100, 97787, 0"
+        with patch.object(s0, 'command', side_effect=[row, TimeoutError('MOCK slow census')]) as probe:
+            with self.assertRaisesRegex(TimeoutError, 'slow census'):
+                s0.inventory(deadline=10)
+            self.assertEqual(probe.call_args_list[1].args, (["nvidia-smi", "-q", "-x"], 10))
+
+    def test_selected_inventory_never_runs_optional_host_process_census(self):
+        uuid = "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+        row = f"1, {uuid}, GPU, 596.36, 97887, 5247, 92192, [N/A]"
+        def driver(args, deadline):
+            self.assertIn("--id=" + uuid, args)
+            self.assertIn("--query-gpu=index,uuid,name,driver_version,memory.total,memory.used,memory.free,utilization.gpu", args)
+            # A full XML/process census could exhaust the unchanged sampling window.
+            # It must never be requested by this selected metadata reader.
+            self.assertNotIn("-x", args)
+            return row
+        with patch.object(s0, "command", side_effect=driver) as probe:
+            devices, processes = s0.inventory(deadline=10, selected_uuid=uuid)
+        probe.assert_called_once()
+        self.assertEqual(devices[0]["free_mib"], 92192)
+        self.assertIsNone(devices[0]["utilization_percent"])
+        self.assertEqual(devices[0]["process_inventory_status"], "unknown/not-collected-diagnostic-only")
+        self.assertEqual(processes, [])
+
+    def test_selected_inventory_refuses_missing_wrong_duplicate_or_invalid_primary_metadata(self):
+        uuid = "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+        row = f"1, {uuid}, GPU, 596.36, 97887, 5247, 92192, 0"
+        for response in ("", row.replace(uuid, "GPU-other"), row + "\n" + row,
+                         row.replace("92192", "[N/A]"), row.replace("92192", "nan"),
+                         row.replace("97887", "inf"), TimeoutError("MOCK primary deadline"),
+                         subprocess.TimeoutExpired("nvidia-smi", 5)):
+            with self.subTest(response=response), patch.object(s0, "command", side_effect=[response]):
+                with self.assertRaises((ValueError, RuntimeError, TimeoutError, subprocess.TimeoutExpired)):
+                    s0.inventory(selected_uuid=uuid)
+        with patch.object(s0, "command") as probe:
+            with self.assertRaisesRegex(ValueError, "invalid selected"):
+                s0.inventory(selected_uuid="1")
+            probe.assert_not_called()
+
     def test_atomic_partial_receipt_persists_completed_phase(self):
         with tempfile.TemporaryDirectory() as out:
             output=Path(out)
