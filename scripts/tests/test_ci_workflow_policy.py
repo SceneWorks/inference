@@ -253,6 +253,45 @@ def job_if_expression(workflow: str, job: str) -> str:
     raise AssertionError(f"missing if policy for workflow job: {job}")
 
 
+def workflow_input_context(workflow: dict, event: str, overrides: dict | None = None) -> dict:
+    """Typed dispatch defaults, or absent (empty-string) inputs on other events.
+
+    This models the input truthiness used by CI's job conditions, not a complete
+    Actions interpreter. `inputs` does not inherit dispatch defaults on PR/push.
+    """
+    events = workflow.get("on", workflow.get(True, {}))
+    schema = (events.get("workflow_dispatch") or {}).get("inputs", {})
+    supplied = overrides or {}
+    return {
+        "inputs." + name: supplied.get(name, definition.get("default", ""))
+        if event == "workflow_dispatch" else ""
+        for name, definition in schema.items()
+    }
+
+
+def evaluate_condition(expression: str, values: dict) -> bool:
+    """Evaluate the tested logical subset over explicit, trusted fixture context.
+
+    Missing input properties are empty strings (falsey in Actions); unknown
+    non-input context still fails loudly. Unary ! is distinct from !=.
+    """
+    rendered = expression.removeprefix("${{").removesuffix("}}").strip()
+    for name in sorted(values, key=len, reverse=True):
+        rendered = rendered.replace(name, repr(values[name]))
+    rendered = re.sub(r"\binputs\.[A-Za-z_]\w*", "''", rendered)
+    rendered = rendered.replace("&&", " and ").replace("||", " or ")
+    rendered = re.sub(r"!(?!=)", " not ", rendered).strip()
+    # Inspect only unquoted tokens: dots inside a branch or repository string
+    # are data, whereas an unresolved github/needs property is a test bug.
+    unquoted = re.sub(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"", "''", rendered)
+    if re.search(r"[A-Za-z_]\w*(?:\.\w+)+", unquoted):
+        raise AssertionError(f"unrecognized workflow context in policy: {rendered}")
+    return bool(eval(rendered, {"__builtins__": {}}, {
+        "always": lambda: True, "startsWith": str.startswith,
+        "true": True, "false": False, "null": None,
+    }))
+
+
 def evaluate_policy(
     expression: str,
     *,
@@ -268,17 +307,10 @@ def evaluate_policy(
         "github.event_name": event_name,
         "github.event.pull_request.head.repo.full_name": head_repository,
         "github.repository": repository,
-        "inputs.lanes": dispatch_lanes,
-        "inputs.raw_training_math_only": raw_training_math_only,
+        "inputs.lanes": dispatch_lanes if event_name == "workflow_dispatch" else "",
+        "inputs.raw_training_math_only": raw_training_math_only if event_name == "workflow_dispatch" else "",
     }
-    rendered = expression
-    for name in sorted(values, key=len, reverse=True):
-        rendered = rendered.replace(name, repr(values[name]))
-    rendered = rendered.replace("&&", " and ").replace("||", " or ")
-    rendered = re.sub(r"!(?!=)", " not ", rendered)
-    if re.search(r"[A-Za-z_]\w*(?:\.\w+)+", rendered):
-        raise AssertionError(f"unrecognized workflow context in policy: {rendered}")
-    return bool(eval(rendered, {"__builtins__": {}}, {}))
+    return evaluate_condition(expression, values)
 
 
 def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
@@ -4581,7 +4613,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             self.assertIn(f"--features cuda {case} -- --exact --ignored --nocapture", step["run"])
             self.assertIn("1 passed; 0 failed; 0 ignored;", step["run"])
             self.assertIn("if errorlevel 1 exit /b 1", step["run"])
-            self.assertFalse(step.get("continue-on-error", False))
+            self.assertIs(step.get("continue-on-error"), True)
+            gate = next(s for s in manual["steps"] if s.get("id") == "raw_proofs_gate")
+            self.assertEqual(gate["if"], "always()")
+            self.assertFalse(gate.get("continue-on-error", False))
+            self.assertIn("${{ steps." + step["id"] + ".outcome }}", gate["env"].values())
+            self.assertIn('exit "$failed"', gate["run"])
             self.assertNotIn(case, "\n".join(s.get("run", "") for s in jobs["windows-cuda-check"]["steps"]))
 
     def test_heavy_windows_cuda_jobs_clear_only_the_sccache_wrapper(self) -> None:
