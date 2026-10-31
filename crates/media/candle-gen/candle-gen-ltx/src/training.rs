@@ -1768,14 +1768,7 @@ fn ltx25_video_grid(
     let mut max = (0, 0, 0);
     for item in items {
         let path = PathBuf::from(required_prepared_path(item)?);
-        let metadata = candle_gen::gen_core::__model_input_reader!(
-            safetensors_file_metadata(&path),
-            "candle-gen-ltx::training::validate_prepared_ltx25_bundle/header-configuration",
-            Configuration,
-            &path,
-            |actual_path| safetensors_file_metadata(actual_path)
-        )
-        .map_err(|error| {
+        let metadata = safetensors_file_metadata(&path).map_err(|error| {
             CandleError::Msg(format!(
                 "{MODEL_25_ID} trainer: could not read prepared bundle header `{}`: {error}",
                 path.display()
@@ -2392,7 +2385,14 @@ fn validate_prepared_ltx25_bundle(
     conditioning: &Ltx25ConditioningPlan,
 ) -> Result<()> {
     let path = PathBuf::from(required_prepared_path(item)?);
-    let metadata = safetensors_file_metadata(&path).map_err(|error| {
+    let metadata = candle_gen::gen_core::__model_input_reader!(
+        safetensors_file_metadata(&path),
+        "candle-gen-ltx::training::validate_prepared_ltx25_bundle/header-configuration",
+        Configuration,
+        &path,
+        |actual_path| safetensors_file_metadata(actual_path)
+    )
+    .map_err(|error| {
         CandleError::Msg(format!(
             "ltx_2_5 trainer: could not read prepared bundle header `{}`: {error}",
             path.display()

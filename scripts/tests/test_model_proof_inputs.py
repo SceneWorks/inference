@@ -47,6 +47,45 @@ class InputReceipts(unittest.TestCase):
         roles.start(); grades.start()
         self.addCleanup(roles.stop); self.addCleanup(grades.stop)
 
+    def test_ltx25_prepared_configuration_receipt_binds_validator_without_aux_losses(self):
+        registry = json.loads((ROOT / 'scripts/ci/model-inference-proofs.json').read_text(encoding='utf-8'))
+        case = next(case for case in registry if case['package'] == 'candle-gen-ltx'
+                    and case['fqn'] == 'trainer_e2e::ltx25_bounded_acceleration_acceptance')
+        requirements = case['input_contract']['requirements']
+        self.assertEqual(len(requirements), 7)
+        prepared = next(r for r in requirements if r['slot'] == 'ltx25-prepared-schema-shapes-fps')
+        reader = 'candle-gen-ltx::training::validate_prepared_ltx25_bundle/header-configuration'
+        self.assertEqual(prepared, {'slot': 'ltx25-prepared-schema-shapes-fps', 'role': 'configuration',
+            'readers': [reader], 'minimum_collections': 1, 'minimum_items': 1,
+            'required_grade': 'reader-binding', 'scope': 'case'})
+        source = (ROOT / 'crates/media/candle-gen/candle-gen-ltx/src/training.rs').read_text(encoding='utf-8')
+        validator = source.split('fn validate_prepared_ltx25_bundle(', 1)[1].split('\nfn prepared_tensor(', 1)[0]
+        grid = source.split('fn ltx25_video_grid(', 1)[1].split('\nfn preflight_aux_ltx25(', 1)[0]
+        # A no-aux run must witness the existing read that consumes schema, both
+        # shapes and fps; a depth-only grid read cannot supply that purpose.
+        read = validator.split('if metadata.get("schemaVersion")', 1)[0]
+        self.assertIn('__model_input_reader!(', read)
+        self.assertIn('safetensors_file_metadata(&path)', read)
+        self.assertIn('|actual_path| safetensors_file_metadata(actual_path)', read)
+        self.assertEqual(read.count(reader), 1)
+        self.assertNotIn(reader, grid)
+        for key in ('schemaVersion', 'videoShape', 'audioShape', 'fps'):
+            self.assertIn('"' + key + '"', validator)
+        events = [event(item('/MOCK-ONLY/' + r['slot'], kind=(
+                            'successful-reader-binding' if 'reader-binding' in inputs.READER_GRADES[r['readers'][0]]
+                            else 'same-read-buffer')), scope=case['fqn'],
+                        reader=r['readers'][0], role=r['role']) for r in requirements]
+        self.assertEqual(inputs.assess_inputs(case, ''.join(events))['input_grade'], 'successful-reader-binding')
+        index = requirements.index(prepared)
+        with self.assertRaises(ValueError):
+            inputs.assess_inputs(case, ''.join(e for i, e in enumerate(events) if i != index))
+        # The generic receipt seen in the failed real run is honest, but cannot
+        # substitute for this source-qualified schema/shapes/fps requirement.
+        events[index] = event(item('/MOCK-ONLY/prepared.safetensors'), scope=case['fqn'],
+                              reader='gen-core::weightsmeta::safetensors_file_metadata', role='configuration')
+        with self.assertRaises(ValueError):
+            inputs.assess_inputs(case, ''.join(events))
+
     def test_flux3_bounded_requires_base_tensors_text_config_and_tokenizer(self):
         registry = json.loads((ROOT / 'scripts/ci/model-inference-proofs.json').read_text(encoding='utf-8'))
         case = next(row for row in registry if row['fqn'] == 'real_weights::flux3_bounded_acceleration_acceptance')
