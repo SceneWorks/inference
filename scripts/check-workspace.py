@@ -224,6 +224,9 @@ PRODUCTION_ENV_READS = frozenset({
     "SDXL_LDM_CHECKPOINT", "SDXL_TOKENIZER_ROOT", "SDXL_GOLDEN_WRITE",
     "QWEN_IMAGE_2_1_LORA_PHASE", "QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS",
     "QWEN_IMAGE_2_1_TRAINING_DIAGNOSTICS_OUT",
+    # Manual proof-only comparison scope; inert without model-inference-proof
+    # and with_stage, whose source-owned recipe checks exact UUID/index mapping.
+    "MODEL_PROOF_COMPARISON_STAGE", "MODEL_PROOF_COMPARISON_BINDING", "SCENEWORKS_GPU_ID",
     # Subprocess capture markers set by a parent test harness for its own child.
     "IOS_CAPTURE_IN_CHILD", "IOS_CAPTURE_PERMIT_CPU_CHILD", "IRIS_STREAM_CPU_CHILD",
     "SDXL_IOS_QUANTUM_CPU_BODY_DONE", "SDXL_IOS_QUANTUM_CPU_CHILD",

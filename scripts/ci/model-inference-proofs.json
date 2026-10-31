@@ -79392,12 +79392,18 @@
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Four completed real optimizer updates, finite losses/every reached gradient and nonzero aggregate gradient/factor delta; source-required repeated normalization/cache/geometry/packing consumption, synchronized warmup/steady timings, selected physical-device peak, native save/reopen/preflight/reload/apply and exactly one generated adapter sample. Exact late BODY and actual learned CUDA DEVICE required. This short smoke is not convergence or per-model speedup certification.",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": "fixed_cuda",
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/train_peak_real_weights.rs::train_peak_real_weights::qwen21_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -79414,9 +79420,55 @@
         ],
         "required_cuda_physical_index": 1,
         "cuda_activity_profile": "non-isolated-correctness-headroom"
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/train_peak_real_weights.rs::train_peak_real_weights::qwen21_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 0,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/train_peak_real_weights.rs::train_peak_real_weights::qwen21_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "mixed",
       "source_identity": "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/train_peak_real_weights.rs::train_peak_real_weights::qwen21_bounded_acceleration_acceptance",
@@ -285075,12 +285127,18 @@
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary and one exact late BODY; actual learned CUDA device/input readers; four real optimizer updates and retained metrics, device peak, generated LoRA and one adapted sample; no missing-work events",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": null,
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-kolors/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::kolors_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -285095,9 +285153,55 @@
         ],
         "required_cuda_physical_index": 1,
         "cuda_activity_profile": "non-isolated-correctness-headroom"
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-kolors/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::kolors_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 0,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-kolors/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::kolors_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "mixed",
       "source_identity": "crates/media/candle-gen/candle-gen-kolors/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::kolors_bounded_acceleration_acceptance",
@@ -287433,12 +287537,18 @@
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary and one exact late BODY; actual learned CUDA device/input readers; four real optimizer updates and retained metrics, device peak, generated LoRA and one adapted sample; no missing-work events",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": null,
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-lens/tests/trainer_e2e.rs::trainer_e2e::lens_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -287453,9 +287563,55 @@
         ],
         "required_cuda_physical_index": 1,
         "cuda_activity_profile": "non-isolated-correctness-headroom"
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-lens/tests/trainer_e2e.rs::trainer_e2e::lens_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 0,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-lens/tests/trainer_e2e.rs::trainer_e2e::lens_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "mixed",
       "source_identity": "crates/media/candle-gen/candle-gen-lens/tests/trainer_e2e.rs::trainer_e2e::lens_bounded_acceleration_acceptance",
@@ -288320,12 +288476,18 @@
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary and one exact late BODY; actual learned CUDA device/input readers; four real optimizer updates and retained metrics, device peak, generated LoRA and one adapted sample; no missing-work events",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": null,
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-ltx/tests/trainer_e2e.rs::trainer_e2e::ltx23_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -288340,9 +288502,55 @@
         ],
         "required_cuda_physical_index": 1,
         "cuda_activity_profile": "non-isolated-correctness-headroom"
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-ltx/tests/trainer_e2e.rs::trainer_e2e::ltx23_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 0,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-ltx/tests/trainer_e2e.rs::trainer_e2e::ltx23_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "mixed",
       "source_identity": "crates/media/candle-gen/candle-gen-ltx/tests/trainer_e2e.rs::trainer_e2e::ltx23_bounded_acceleration_acceptance",
@@ -289974,12 +290182,18 @@
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary and one exact late BODY; actual learned CUDA device/input readers; four real optimizer updates and retained metrics, device peak, generated LoRA and one adapted sample; no missing-work events",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": null,
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-ltx/tests/trainer_e2e.rs::trainer_e2e::ltx25_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -289994,9 +290208,55 @@
         ],
         "required_cuda_physical_index": 1,
         "cuda_activity_profile": "non-isolated-correctness-headroom"
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-ltx/tests/trainer_e2e.rs::trainer_e2e::ltx25_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 0,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-ltx/tests/trainer_e2e.rs::trainer_e2e::ltx25_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "mixed",
       "source_identity": "crates/media/candle-gen/candle-gen-ltx/tests/trainer_e2e.rs::trainer_e2e::ltx25_bounded_acceleration_acceptance",
@@ -295511,12 +295771,18 @@
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary and one exact late BODY; actual learned CUDA device/input readers; four real optimizer updates and retained metrics, device peak, generated LoRA and one adapted sample; no missing-work events",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": null,
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_medium_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -295531,9 +295797,55 @@
         ],
         "required_cuda_physical_index": 1,
         "cuda_activity_profile": "non-isolated-correctness-headroom"
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_medium_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 0,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_medium_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "mixed",
       "source_identity": "crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_medium_bounded_acceleration_acceptance",
@@ -296638,12 +296950,18 @@
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary and one exact late BODY; actual learned CUDA device/input readers; four real optimizer updates and retained metrics, device peak, generated LoRA and one adapted sample; no missing-work events",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": null,
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-sdxl/tests/trainer_e2e.rs::trainer_e2e::sdxl_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -296658,9 +296976,55 @@
         ],
         "required_cuda_physical_index": 1,
         "cuda_activity_profile": "non-isolated-correctness-headroom"
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-sdxl/tests/trainer_e2e.rs::trainer_e2e::sdxl_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 0,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-sdxl/tests/trainer_e2e.rs::trainer_e2e::sdxl_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "mixed",
       "source_identity": "crates/media/candle-gen/candle-gen-sdxl/tests/trainer_e2e.rs::trainer_e2e::sdxl_bounded_acceleration_acceptance",
@@ -299007,12 +299371,18 @@
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary and one exact late BODY; actual learned CUDA device/input readers; four real optimizer updates and retained metrics, device peak, generated LoRA and one adapted sample; no missing-work events",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": null,
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/trainer_e2e.rs::trainer_e2e::wan_t2v_14b_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -299027,9 +299397,55 @@
         ],
         "required_cuda_physical_index": 1,
         "cuda_activity_profile": "non-isolated-correctness-headroom"
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/trainer_e2e.rs::trainer_e2e::wan_t2v_14b_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 0,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/trainer_e2e.rs::trainer_e2e::wan_t2v_14b_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "mixed",
       "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/trainer_e2e.rs::trainer_e2e::wan_t2v_14b_bounded_acceleration_acceptance",
@@ -301695,12 +302111,18 @@
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary and one exact late BODY; actual learned CUDA device/input readers; four real optimizer updates and retained metrics, device peak, generated LoRA and one adapted sample; no missing-work events",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": null,
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/training_modes_cuda.rs::training_modes_cuda::wan_ti2v_5b_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -301715,9 +302137,55 @@
         ],
         "required_cuda_physical_index": 1,
         "cuda_activity_profile": "non-isolated-correctness-headroom"
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/training_modes_cuda.rs::training_modes_cuda::wan_ti2v_5b_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 0,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/training_modes_cuda.rs::training_modes_cuda::wan_ti2v_5b_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "mixed",
       "source_identity": "crates/media/candle-gen/candle-gen-wan/tests/training_modes_cuda.rs::training_modes_cuda::wan_ti2v_5b_bounded_acceleration_acceptance",
@@ -302773,12 +303241,18 @@
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary and one exact late BODY; actual learned CUDA device/input readers; four real optimizer updates and retained metrics, device peak, generated LoRA and one adapted sample; no missing-work events",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": null,
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-z-image/tests/trainer_e2e.rs::trainer_e2e::z_image_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -302793,9 +303267,55 @@
         ],
         "required_cuda_physical_index": 1,
         "cuda_activity_profile": "non-isolated-correctness-headroom"
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/tests/trainer_e2e.rs::trainer_e2e::z_image_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 0,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-z-image/tests/trainer_e2e.rs::trainer_e2e::z_image_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "mixed",
       "source_identity": "crates/media/candle-gen/candle-gen-z-image/tests/trainer_e2e.rs::trainer_e2e::z_image_bounded_acceleration_acceptance",
@@ -303430,13 +303950,19 @@
     ],
     "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
     "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": "fixed_cuda",
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-anima/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::anima_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -303454,6 +303980,52 @@
         ],
         "cuda_activity_profile": "non-isolated-correctness-headroom",
         "required_cuda_physical_index": 1
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-anima/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::anima_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 0,
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-anima/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::anima_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1,
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
     "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
@@ -305619,13 +306191,19 @@
     ],
     "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
     "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": "fixed_cuda",
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::mage_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -305643,6 +306221,52 @@
         ],
         "cuda_activity_profile": "non-isolated-correctness-headroom",
         "required_cuda_physical_index": 1
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::mage_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 0,
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::mage_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1,
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
     "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
@@ -306001,13 +306625,19 @@
     ],
     "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
     "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": "fixed_cuda",
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-moss-image/tests/real_weights.rs::real_weights::moss_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -306025,6 +306655,52 @@
         ],
         "cuda_activity_profile": "non-isolated-correctness-headroom",
         "required_cuda_physical_index": 1
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-moss-image/tests/real_weights.rs::real_weights::moss_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 0,
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-moss-image/tests/real_weights.rs::real_weights::moss_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1,
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
     "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
@@ -307125,13 +307801,19 @@
     ],
     "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
     "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": "fixed_cuda",
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::flux3_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -307149,6 +307831,52 @@
         ],
         "cuda_activity_profile": "non-isolated-correctness-headroom",
         "required_cuda_physical_index": 1
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::flux3_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 0,
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs::real_weights::flux3_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1,
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
     "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
@@ -308278,13 +309006,19 @@
     ],
     "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
     "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": "fixed_cuda",
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/train_real_weights.rs::train_real_weights::iris_generation_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -308303,6 +309037,52 @@
         ],
         "cuda_activity_profile": "non-isolated-correctness-headroom",
         "required_cuda_physical_index": 1
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/train_real_weights.rs::train_real_weights::iris_generation_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 0,
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/train_real_weights.rs::train_real_weights::iris_generation_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1,
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
     "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
@@ -309454,13 +310234,19 @@
     ],
     "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
     "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": "fixed_cuda",
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_real_weights.rs::depth_train_real_weights::iris_depth_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -309478,6 +310264,52 @@
         ],
         "cuda_activity_profile": "non-isolated-correctness-headroom",
         "required_cuda_physical_index": 1
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_real_weights.rs::depth_train_real_weights::iris_depth_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 0,
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/depth_train_real_weights.rs::depth_train_real_weights::iris_depth_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1,
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
     "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
@@ -309574,13 +310406,19 @@
     ],
     "device_witness": "Successful learned native Tensor boundary records actual candle-cuda, separately from host/default identity.",
     "output_contract": "One nonzero complete source BODY, actual CUDA DEVICE and all actual input slots; four optimizer updates TOTAL including first warmup, three steady smoke timings, finite losses/every optimizer-owned gradient, actual nonzero aggregate parameter delta, repeated actual mechanism consumption, preparation and sampled selected-device peak. Save/reload/apply and exactly one generated sample. No convergence or per-family speed target claim.",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "MODEL_PROOF_COMPARISON_BINDING",
+      "MODEL_PROOF_COMPARISON_STAGE"
+    ],
     "default_configuration": "fixed_cuda",
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_real_weights.rs::restoration_train_real_weights::iris_restoration_bounded_acceleration_acceptance/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": null,
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -309598,6 +310436,52 @@
         ],
         "cuda_activity_profile": "non-isolated-correctness-headroom",
         "required_cuda_physical_index": 1
+      },
+      "fixed_cuda_comparison_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_real_weights.rs::restoration_train_real_weights::iris_restoration_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu0",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu0",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 0,
+        "required_cuda_device_uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0",
+        "comparison_protocol": "conditional-v1"
+      },
+      "fixed_cuda_comparison_gpu1": {
+        "source_identity": "crates/media/candle-gen/candle-gen-iris/tests/restoration_train_real_weights.rs::restoration_train_real_weights::iris_restoration_bounded_acceleration_acceptance/fixed_cuda_comparison_gpu1",
+        "environment": {
+          "MODEL_PROOF_COMPARISON_BINDING": "gpu1",
+          "MODEL_PROOF_COMPARISON_STAGE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Source-owned bounded timing-only conditional comparison; pristine native child per applicable stage; no new quality sample",
+        "required_work": [
+          "Exact source stage list/physical cap; real legacy/current branches; complete owner warm/timed cycles; finite reached gradients and actual commits; actual canonical initial parameter/optimizer state; same selected physical UUID and compiled binary; no automatic retry or production promotion"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1,
+        "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "comparison_protocol": "conditional-v1"
       }
     },
     "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",

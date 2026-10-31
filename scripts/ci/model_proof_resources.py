@@ -135,8 +135,12 @@ def bound_cuda_activity_profile(constraints: dict) -> str:
         proofs.apply_configuration(constraints, {})
         registered = next((row for row in proofs.load_registry()
                            if proofs.identity(row) == proofs.identity(constraints)), None)
+        expected = proofs.configured_case(registered, recipe['name']) if registered is not None else None
+        if constraints.get('training_comparison_stage'):
+            from scripts.ci.training_comparison import stage_row
+            expected = stage_row(expected, constraints['training_comparison_stage']) if expected is not None else None
         if (profile != proofs.SHARED_CUDA_HEADROOM_PROFILE or registered is None
-                or constraints != proofs.configured_case(registered, recipe['name'])):
+                or constraints != expected):
             raise ValueError('shared CUDA headroom profile requires its exact registered source recipe')
         return profile
     binding = '/'.join(str(constraints.get(key)) for key in ('package', 'target', 'fqn'))
