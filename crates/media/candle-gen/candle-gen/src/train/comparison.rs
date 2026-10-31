@@ -45,6 +45,8 @@ pub enum ComparisonCadence {
     Ordinary,
     WanDual,
     IrisRestoration,
+    /// Failed-only MOSS recovery: one counted warmup and two timed updates.
+    MossRecovery,
 }
 
 impl ComparisonCadence {
@@ -53,11 +55,12 @@ impl ComparisonCadence {
             Self::Ordinary => 4,
             Self::WanDual => 6,
             Self::IrisRestoration => 8,
+            Self::MossRecovery => 3,
         }
     }
     pub fn warmups(self) -> usize {
         match self {
-            Self::Ordinary => 1,
+            Self::Ordinary | Self::MossRecovery => 1,
             Self::WanDual | Self::IrisRestoration => 2,
         }
     }
@@ -66,6 +69,66 @@ impl ComparisonCadence {
             Self::Ordinary => "ordinary",
             Self::WanDual => "wan-dual",
             Self::IrisRestoration => "iris-restoration",
+            Self::MossRecovery => "moss_recovery",
+        }
+    }
+
+    /// The shorter recovery cannot reduce another model's registered cadence.
+    pub fn allows_model(self, model_id: &str) -> bool {
+        self != Self::MossRecovery || model_id == "moss"
+    }
+}
+
+#[cfg(test)]
+mod cadence_metadata_tests {
+    use super::ComparisonCadence;
+
+    #[test]
+    fn recovery_is_exact_three_one_two_without_changing_existing_cadences() {
+        for (cadence, id, updates, warmups, timed) in [
+            (ComparisonCadence::Ordinary, "ordinary", 4, 1, 3),
+            (ComparisonCadence::WanDual, "wan-dual", 6, 2, 4),
+            (
+                ComparisonCadence::IrisRestoration,
+                "iris-restoration",
+                8,
+                2,
+                6,
+            ),
+            (ComparisonCadence::MossRecovery, "moss_recovery", 3, 1, 2),
+        ] {
+            assert_eq!(cadence.id(), id);
+            assert_eq!(cadence.updates(), updates);
+            assert_eq!(cadence.warmups(), warmups);
+            assert_eq!(cadence.updates() as usize - cadence.warmups(), timed);
+        }
+        let recovery = ComparisonCadence::MossRecovery;
+        assert_eq!(6 * recovery.updates(), 18);
+        // The original failed arm stays charged four; no refund or transfer.
+        assert_eq!(4 + 6 * recovery.updates(), 22);
+        assert_eq!(24 - (4 + 6 * recovery.updates()), 2);
+    }
+
+    #[test]
+    fn shortened_cadence_is_moss_only_and_old_moss_cadence_remains_valid() {
+        assert!(ComparisonCadence::MossRecovery.allows_model("moss"));
+        assert!(ComparisonCadence::Ordinary.allows_model("moss"));
+        for model in [
+            "mage-adapter",
+            "wan2_2_ti2v_5b",
+            "iris-restoration",
+            "krea",
+            "",
+            "MOSS",
+        ] {
+            assert!(!ComparisonCadence::MossRecovery.allows_model(model));
+            for cadence in [
+                ComparisonCadence::Ordinary,
+                ComparisonCadence::WanDual,
+                ComparisonCadence::IrisRestoration,
+            ] {
+                assert!(cadence.allows_model(model));
+            }
         }
     }
 }
@@ -232,6 +295,7 @@ pub fn with_stage<T>(
         !model_id.is_empty() && !model_id.to_ascii_lowercase().contains("krea"),
         "Krea budget is excluded"
     );
+    assert!(cadence.allows_model(model_id), "MOSS-only recovery cadence");
     assert!(
         active_stage().is_none() && !super::profile::active() && !super::profile::cohort_active(),
         "nested comparison scope"

@@ -459,11 +459,16 @@ pub(super) fn with_comparison_observation<T>(
     cadence: super::comparison::ComparisonCadence,
     f: impl FnOnce() -> T,
 ) -> T {
+    let claim_limit = if cadence == super::comparison::ComparisonCadence::MossRecovery {
+        "Conditional ablations, serial shared GPU; MOSS-only failed recovery with one counted warmup and two timed single-owner updates; original failed four-update charge retained; small-sample timing, no isolated timing or convergence claim"
+    } else {
+        "Conditional ablations, serial shared GPU; one warmup per owner; three timed ordinary or restoration cycles, two timed updates per Wan expert; no isolated timing or convergence claim"
+    };
     let comparison = serde_json::json!({"schema_version":1, "model":model_id,
         "stage":stage.id(), "cadence":cadence.id(), "state_reset":"fresh-native-child-process",
         "cuda_visible_devices":std::env::var("CUDA_VISIBLE_DEVICES").expect("comparison UUID"),
         "physical_index":super::comparison::required_physical_index().expect("comparison physical index"),
-        "claim_limit":"Conditional ablations, serial shared GPU; one warmup per owner; three timed ordinary or restoration cycles, two timed updates per Wan expert; no isolated timing or convergence claim"});
+        "claim_limit":claim_limit});
     with_observation(
         output,
         cadence.updates(),
