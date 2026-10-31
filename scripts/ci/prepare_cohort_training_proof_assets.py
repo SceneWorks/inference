@@ -30,7 +30,9 @@ BINDINGS = {
     "candle-gen-kolors/trainer_cuda_smoke::kolors_bounded_acceleration_acceptance": {
         "KOLORS_TRAIN_SNAPSHOT": snapshot("Kwai-Kolors/Kolors-diffusers", "7e091c75199e910a26cd1b51ed52c28de5db3711")},
     "candle-gen-sd3/trainer_cuda_smoke::sd35_medium_bounded_acceleration_acceptance": {
-        "SD35_MEDIUM_TRAIN_SNAPSHOT": snapshot("stabilityai/stable-diffusion-3.5-medium", "b940f670f0eda2d07fbb75229e779da1ad11eb80")},
+        "SD35_MEDIUM_TRAIN_SNAPSHOT": snapshot("stabilityai/stable-diffusion-3.5-medium", "b940f670f0eda2d07fbb75229e779da1ad11eb80"),
+        # Generation's exact production artifact is distinct from the upstream training source.
+        "SD35_MEDIUM_SAMPLE_SNAPSHOT": snapshot("SceneWorks/sd3.5-medium-mlx", "5413e962bb326db248be2026a93b147c323392b6", "bf16")},
     "candle-gen-qwen-image-2-1/train_peak_real_weights::qwen21_bounded_acceleration_acceptance": {
         "CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT": snapshot("Qwen/Qwen-Image-2.1", "790c92633540aa0cb11d9abf19eb46d861714758")},
 }
