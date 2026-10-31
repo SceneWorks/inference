@@ -1174,8 +1174,9 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                                              and physical.get('activity_profile') == SHARED_CUDA_HEADROOM_PROFILE)
                         if shared_completion:
                             supervision['retain_owned_completion'] = True
+                            supervision['claim_deadline_monotonic'] = physical['claim_deadline_monotonic']
                         if not discover and krea_paired.validate_binding(row):
-                            result['krea_paired_body_launched'] = True
+                            result['krea_paired_supervisor_invocation_attempted'] = True
                         try:
                             guarded = run_guarded(argv, cwd=ROOT, env=env, policy=discovery_policy if discover else policy,
                                                   stdout_path=stdout, stderr_path=stderr,
@@ -1283,12 +1284,25 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                 break
             finally:
                 if krea_paired.validate_binding(row):
-                    body_log = case_work / 'body.stderr.log'
-                    observed = None
-                    if body_log.is_file() and not body_log.is_symlink() and body_log.stat().st_size <= policy.stderr_cap_bytes:
-                        observed = body_log.read_text(encoding='utf-8', errors='replace')
+                    body_paths = [case_work / ('body.' + stream + '.log') for stream in ('stdout', 'stderr')]
+                    observed_parts = []
+                    for path, cap in zip(body_paths, (policy.stdout_cap_bytes, policy.stderr_cap_bytes)):
+                        if path.is_file() and not path.is_symlink() and path.stat().st_size <= cap:
+                            observed_parts.append(path.read_text(encoding='utf-8', errors='replace'))
+                    observed = '\n'.join(observed_parts) if observed_parts else None
+                    no_creation = result.get('physical_execution', {}).get('owned_execution_completion')
+                    if 'cuda_claim_diagnostic' in result:
+                        discovery_paths = [case_work / ('discovery.' + stream + '.log') for stream in ('stdout', 'stderr')]
+                        if all(path.is_file() and not path.is_symlink() and path.stat().st_size <= cap
+                               for path, cap in zip(discovery_paths, (policy.stdout_cap_bytes, policy.stderr_cap_bytes))):
+                            discovery_text = '\n'.join(path.read_text(encoding='utf-8', errors='replace') for path in discovery_paths)
+                            try:
+                                no_creation = krea_paired.verify_prebody_refusal(row, result, discovery_text)
+                            except ValueError:
+                                no_creation = None
                     result['krea_paired_update_accounting'] = krea_paired.update_accounting(
-                        observed, body_launched=result.get('krea_paired_body_launched', False), accepted=result['accepted'])
+                        observed, body_launched=result.get('krea_paired_supervisor_invocation_attempted', False), accepted=result['accepted'],
+                        no_creation_evidence=no_creation)
                 result['duration_seconds'] = round(time.monotonic() - started, 6)
                 write_json(case_artifact / 'result.json', result, owned=artifact)
                 write_json(artifact / 'receipt.json', receipt, owned=artifact)

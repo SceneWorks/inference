@@ -48,15 +48,68 @@ def attempted_updates(text: str) -> int:
     return len(re.findall(r'^KREA_PROFILE_BOUNDARY phase=update-start(?: |$)', text, re.M))
 
 
-def update_accounting(text: str | None, *, body_launched: bool, accepted: bool) -> dict:
+def verify_prebody_refusal(row: dict, case: dict, discovery_text: str) -> dict:
+    """Source/receipt protocol proof, requiring separately verified producer and file hashes.
+
+    The structured CudaClaimRejected handler can execute only before the physical
+    claim yields; the body supervisor is called only inside that never-entered
+    scope. Absent logs/counters alone are deliberately insufficient.
+    """
+    from scripts.ci import model_inference_proofs as proof
+    if (not validate_binding(row) or case.get('declared') != row
+            or case.get('binding') != proof.identity(row)
+            or case.get('accepted') is not False or case.get('body_proof_accepted') is not False
+            or case.get('resource_verification_pending') is not True
+            or case.get('physical_execution') != {'mechanism':'metadata-only discovery; no model execution'}
+            or case.get('krea_paired_body_launched', False) is not False
+            or case.get('krea_paired_supervisor_invocation_attempted', False) is not False
+            or case.get('error') != 'claimed CUDA UUID is absent or occupied; no model execution'
+            or not isinstance(case.get('cuda_claim_diagnostic'), dict)
+            or case['cuda_claim_diagnostic'].get('requested_uuid') != row['required_cuda_device_uuid']
+            or case.get('actual_devices') != []):
+        raise ValueError('not a source-proven paired pre-body physical-admission refusal')
+    commands = case.get('commands', [])
+    output_names = {item.get('path') for item in case.get('outputs', [])}
+    if (not {'00000/discovery.stdout.log','00000/discovery.stderr.log'} <= output_names
+            or len(commands) != 1 or commands[0].get('argv') != proof.command(row, True)
+            or commands[0].get('supervision', {}).get('returncode') != 0
+            or commands[0].get('supervision', {}).get('admission', {}).get('backend') != 'windows-cpu'
+            or any(not item.get('path', '').startswith('00000/discovery.') for item in case.get('outputs', []))
+            or any(line.startswith(('MODEL_INFERENCE_BODY_COMPLETED ', 'MODEL_INFERENCE_DEVICE ',
+                                   'KREA_PROFILE_BOUNDARY phase=update-')) for line in discovery_text.splitlines())):
+        raise ValueError('body/unknown commands cannot prove zero optimizer updates')
+    discovery = proof.verify_discovery(row, discovery_text)
+    if discovery.get('model_bodies_executed') != 0 or case.get('compiled_target') != discovery:
+        raise ValueError('pre-body refusal requires the actual exact metadata-only discovery')
+    return {'scope':'source-verified-physical-admission-refusal','body_created':False,
+            'basis':'typed-CudaClaimRejected-before-physical-context-yield; exact metadata-only command'}
+
+
+def update_accounting(text: str | None, *, body_launched: bool, accepted: bool,
+                      no_creation_evidence: dict | None = None) -> dict:
     starts = attempted_updates(text or '')
     commits = len(re.findall(r'^KREA_PROFILE_BOUNDARY phase=update-committed(?: |$)',text or '',re.M))
+    no_creation = no_creation_evidence in (
+        {'scope':'supervisor-no-child-created','creation_attempted':False},
+        {'scope':'source-verified-physical-admission-refusal','body_created':False,
+         'basis':'typed-CudaClaimRejected-before-physical-context-yield; exact metadata-only command'})
+    # Booleans must be actual source observations, never integer lookalikes.
+    if no_creation:
+        boolean = 'creation_attempted' if no_creation_evidence['scope']=='supervisor-no-child-created' else 'body_created'
+        no_creation = no_creation_evidence.get(boolean) is False
+    body_witness = bool(re.search(r'^(?:MODEL_INFERENCE_BODY_COMPLETED |MODEL_INFERENCE_DEVICE |KREA_PROFILE_(?:STEP |GRADIENTS |BOUNDARY ))', text or '', re.M))
+    contradictory = no_creation and (starts > 0 or commits > 0 or accepted or body_witness)
+    zero_proven = no_creation and not contradictory
     return {'observed_starts':starts,'observed_commits':commits,
             'observed_uncommitted_starts':max(0,starts-commits),
             'prior_conservative_charge':20,'authorized_new_update_cap':12,'hard_total_cap':32,
-            'conservative_new_charge':12 if body_launched else 0,
+            'conservative_new_charge':0 if zero_proven else 12,
+            'collector_body_scope_entered':body_launched,
+            'actual_body_creation':'source-proven-none' if zero_proven else 'unknown-or-created',
+            'no_creation_evidence':no_creation_evidence if zero_proven else None,
+            'no_creation_evidence_conflicts_with_updates':contradictory,
             'complete_accepted_accounting':accepted,
-            'claim_limit':'Every warmup/partial/failed start counts. Incomplete/missing logs are lower bounds; reserve all12 for a launched failed body until separately audited. No automatic retry.'}
+            'claim_limit':'Zero requires affirmative source-verified pre-body/no-creation evidence. Plain flags, missing logs and zero counters do not prove zero. Unknown/started/partial/failed work reserves12; every warmup/attempt counts. No automatic retry.'}
 
 
 def verify_execution(row: dict, text: str) -> dict:

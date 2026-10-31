@@ -1098,6 +1098,7 @@ def run_guarded(
     additional_cuda_probes: tuple[object, ...] = (),
     reap_metadata_descendants: bool = False,
     retain_owned_completion: bool = False,
+    claim_deadline_monotonic: float | None = None,
 ) -> RunResult:
     """Run one row under runtime-guarded, estimate-plus-reserve admission.
 
@@ -1113,6 +1114,9 @@ def run_guarded(
     if (type(retain_owned_completion) is not bool or
             (retain_owned_completion and (policy.backend != "windows-cuda" or additional_cuda_policies))):
         raise SupervisionError("invalid-policy", "owned completion receipts require explicit single-device Windows CUDA")
+    if claim_deadline_monotonic is not None and (not retain_owned_completion
+            or type(claim_deadline_monotonic) not in (int, float) or not math.isfinite(claim_deadline_monotonic)):
+        raise SupervisionError("invalid-policy", "original claim deadline requires scoped owned-completion supervision")
     admission = None
     cuda_states: tuple[_CudaWatch, ...] = ()
     spawned: list[int] = []
@@ -1152,6 +1156,7 @@ def run_guarded(
             reap_metadata_descendants=reap_metadata_descendants,
             retain_owned_completion=retain_owned_completion,
             on_creation_attempt=record_creation_attempt if retain_owned_completion else None,
+            claim_deadline_monotonic=claim_deadline_monotonic,
         )
     except SupervisionError as error:
         if retain_owned_completion and not creation_attempted:
@@ -1172,6 +1177,7 @@ def _run_admitted(
     reap_metadata_descendants: bool = False,
     retain_owned_completion: bool = False,
     on_creation_attempt: Callable[[], None] | None = None,
+    claim_deadline_monotonic: float | None = None,
 ) -> RunResult:
     if (not isinstance(pass_fds, tuple) or any(type(fd) is not int or fd < 3 for fd in pass_fds)
             or (os.name == 'nt' and pass_fds)):
@@ -1187,6 +1193,14 @@ def _run_admitted(
     devices = cuda_states or ((_CudaWatch(policy, probe, admission, 0),)
                              if policy.backend in {"linux-cuda", "windows-cuda"} else ())
     started = clock()
+    def deadline_reached() -> bool:
+        return (clock() - started >= policy.deadline_seconds
+                or (claim_deadline_monotonic is not None and clock() >= claim_deadline_monotonic))
+    if claim_deadline_monotonic is not None:
+        admission['originalClaimDeadlineMonotonic'] = claim_deadline_monotonic
+        admission['remainingClaimSecondsAtSupervisorEntry'] = max(0., claim_deadline_monotonic - started)
+        if deadline_reached():
+            raise SupervisionError("deadline", "original CUDA claim deadline expired before child creation")
     # On macOS the admission measure counts reclaimable clean file cache (darwin_host_memory),
     # and the live reserve watchdog below uses the same measure, so page cache alone never
     # aborts an admitted row. The components are recorded in the admission itself, so refused,
@@ -1206,7 +1220,7 @@ def _run_admitted(
             f"{ESTIMATE_PLUS_RESERVE_RULE})")
     gpu_free = None
     for state in devices:
-        if multi_cuda and clock() - started >= policy.deadline_seconds:
+        if (multi_cuda or claim_deadline_monotonic is not None) and deadline_reached():
             raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
         device, sampler, device_admission = state.policy, state.probe, state.admission
         device_admission["hostAvailableBytes"] = host_free
@@ -1225,7 +1239,7 @@ def _run_admitted(
                 f"{label}free {available_gpu} bytes is below reserve {device.gpu_free_reserve_bytes} plus "
                 f"estimate {device_admission['gpuEstimateBytes']} bytes ({device_admission['gpuEstimateSource']}; "
                 f"{ESTIMATE_PLUS_RESERVE_RULE})")
-    if multi_cuda and clock() - started >= policy.deadline_seconds:
+    if (multi_cuda or claim_deadline_monotonic is not None) and deadline_reached():
         raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1299,7 +1313,7 @@ def _run_admitted(
                     "root_returncode": status, "waited_returncode": waited_returncode,
                     "job_member_pids": sorted(pids), "owned_pids": sorted(owned)}
             try:
-                if clock() - started >= policy.deadline_seconds:
+                if deadline_reached():
                     raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
                 # The root exit and an empty owned tree are both required. Recheck
                 # files here because the child can write between the loop's first
@@ -1337,7 +1351,7 @@ def _run_admitted(
             # Windows ownership is a Job, not a POSIX process group.
             on_spawn(child.pid, None if job is not None else child.pid)
             while True:
-                if clock() - started >= policy.deadline_seconds:
+                if deadline_reached():
                     raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
                 check_artifact_caps()
                 status = child.poll()
@@ -1419,7 +1433,7 @@ def _run_admitted(
                                 getattr(probe, "last_tree_breakdown", None))
                             raise error
                     for state in devices:
-                        if multi_cuda and clock() - started >= policy.deadline_seconds:
+                        if (multi_cuda or claim_deadline_monotonic is not None) and deadline_reached():
                             raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
                         device, sampler = state.policy, state.probe
                         failures = state.failed if multi_cuda else failed_gpu_ticks
@@ -1481,7 +1495,10 @@ def _run_admitted(
                                 "globalUpperBoundSampleCount": state.global_upper_bound_samples,
                             }
                             raise error
-                time.sleep(policy.poll_millis / 1000)
+                pause = policy.poll_millis / 1000
+                if claim_deadline_monotonic is not None:
+                    pause = min(pause, max(0., claim_deadline_monotonic - clock()))
+                time.sleep(pause)
         except BaseException:
             try:
                 if job is not None:

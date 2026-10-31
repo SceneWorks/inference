@@ -1,5 +1,7 @@
 """Shared CUDA admission contracts with synthetic snapshots only; no driver/model work."""
 import copy
+import contextlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -24,6 +26,12 @@ POLICY = SimpleNamespace(cuda_device_uuid=UUID, deadline_seconds=1800, poll_mill
                          child_gpu_cap_bytes=8 * 1024**3, gpu_free_reserve_bytes=2 * 1024**3)
 
 
+class FakeClock:
+    def __init__(self): self.now = 0.
+    def monotonic(self): return self.now
+    def sleep(self, seconds): self.now += seconds
+
+
 class SharedHeadroom(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -34,7 +42,7 @@ class SharedHeadroom(unittest.TestCase):
         return dict({'uuid': UUID, 'index': 1, 'total_mib': 97887, 'used_mib': 4996,
                      'free_mib': 92891, 'utilization_percent': utilization}, **changes)
 
-    def claim(self, snapshots, body=None, policy=POLICY, owned_completion=True, unlock_failure=False):
+    def claim(self, snapshots, body=None, policy=POLICY, owned_completion=True, unlock_failure=False, clock=None):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner', 'CUDA_VISIBLE_DEVICES': UUID}
@@ -46,7 +54,8 @@ class SharedHeadroom(unittest.TestCase):
             with patch.object(resources, 'os', fake_os), patch.dict(sys.modules, {'msvcrt': fake_lock}), \
                     patch.object(guard, 'inventory', side_effect=snapshots) as inventory, \
                     patch.object(proof, 'load_registry', return_value=(self.source,)), \
-                    patch.object(guard.time, 'sleep'):
+                    (patch.object(resources.time, 'monotonic', side_effect=clock.monotonic) if clock else contextlib.nullcontext()), \
+                    patch.object(guard.time, 'sleep', side_effect=clock.sleep if clock else None):
                 with resources.execution_claim('candle-cuda', policy, output, environment,
                                                constraints=self.configured) as receipt:
                     self.assertFalse(receipt['post_execution_verified'])
@@ -60,6 +69,39 @@ class SharedHeadroom(unittest.TestCase):
                 self.assertTrue(receipt['post_execution_verified'])
                 self.assertTrue(all(call.kwargs.get('selected_uuid') == UUID for call in inventory.call_args_list))
                 return receipt, inventory.call_count
+
+    def test_shared_headroom_waits_before_body_and_restarts_five_samples_without_other_veto(self):
+        policy = SimpleNamespace(**{**vars(POLICY),'child_gpu_cap_bytes':91*1024**3,'deadline_seconds':20})
+        busy = self.card(100, used_mib=20875, free_mib=76564)
+        ready = self.card(100, used_mib=2186, free_mib=95253)
+        observations = [([busy], [])]*2 + [([ready], [])]*11
+        seen=[]
+        receipt, count = self.claim(observations, policy=policy, clock=FakeClock(), body=lambda r:seen.append(r))
+        self.assertEqual(count, 13)
+        self.assertEqual(receipt['admission_wait']['headroom_shortfalls'], 2)
+        self.assertEqual(receipt['admission_wait']['headroom_wait_seconds'], .002)
+        self.assertEqual(len(seen), 1)
+        # Headroom can disappear during admission sampling: discard that partial pass,
+        # await readiness and still require a complete fresh five-sample pass.
+        snapshots = [([ready], []),([ready], []),([busy], []),([busy], []),([ready], [])]+[([ready], [])]*10
+        receipt, _ = self.claim(snapshots, policy=policy, clock=FakeClock())
+        self.assertEqual(receipt['admission_wait']['stable_sample_restarts'], 1)
+        self.assertEqual(receipt['admission_background_activity']['sample_count'], 5)
+        self.assertEqual(receipt['claim_deadline_monotonic'], 20.)
+
+    def test_shared_wait_timeout_invalid_metadata_and_query_failures_never_enter_body(self):
+        busy = self.card(100, used_mib=87648, free_mib=10239)
+        policy = SimpleNamespace(**{**vars(POLICY),'deadline_seconds':.003})
+        with self.assertRaises(resources.CudaClaimRejected) as caught:
+            self.claim(itertools.repeat(([busy], [])), policy=policy, clock=FakeClock(),
+                       body=lambda _:self.fail('deadline wait reached body'))
+        self.assertIn('original CUDA claim deadline expired', caught.exception.diagnostic['admission_error'])
+        self.assertGreaterEqual(caught.exception.diagnostic['admission_wait']['headroom_shortfalls'], 1)
+        for invalid in (self.card(uuid=OTHER), self.card(index=0), self.card(used_mib=float('nan'))):
+            with self.subTest(invalid=invalid),self.assertRaises(resources.CudaClaimRejected):
+                self.claim([([busy], []),([invalid], [])],clock=FakeClock())
+        with self.assertRaises(resources.CudaClaimRejected):
+            self.claim([([busy], []),TimeoutError('MOCK primary query failed')],clock=FakeClock())
 
     def test_shared_activity_and_changing_foreign_contexts_are_diagnostic_in_both_phases(self):
         # CI_IMPACT: synthetic claim + five admission + five release snapshots, no real processes.
@@ -129,7 +171,7 @@ class SharedHeadroom(unittest.TestCase):
     def test_memory_and_physical_identity_refusals_never_enter_body(self):
         # CI_IMPACT: pure snapshots exercise initial and later phase failures, not model computation.
         invalid = [self.card(uuid=OTHER), self.card(index=0), self.card(total_mib='97887'),
-                   self.card(used_mib=-1), self.card(free_mib=97888), self.card(free_mib=10239, used_mib=87648),
+                   self.card(used_mib=-1), self.card(free_mib=97888),
                    self.card(used_mib=9000), self.card(free_mib=True),
                    self.card(total_mib=None), self.card(used_mib=float('nan')),
                    self.card(free_mib=float('inf'))]
@@ -165,8 +207,8 @@ class SharedHeadroom(unittest.TestCase):
         self.assertTrue(all(sample['post_owned_exit_primary_metadata_valid'] for sample in diagnostics['samples']))
         self.assertTrue(all(not sample['predicates']['free_memory_above_policy_headroom'] for sample in diagnostics['samples']))
         with self.assertRaises(resources.CudaClaimRejected):
-            self.claim([([release], [])], policy=policy,
-                       body=lambda _: self.fail('release snapshot admitted new work'))
+            self.claim(itertools.repeat(([release], [])), policy=SimpleNamespace(**{**vars(policy),'deadline_seconds':3}),
+                       clock=FakeClock(), body=lambda _: self.fail('release snapshot admitted new work'))
         for low_free in (self.card(100, used_mib=97439, free_mib=0),
                          self.card(None, used_mib=97887, free_mib=0)):
             self.claim([([admission], [])] * 6 + [([low_free], [])] * 5, policy=policy)
@@ -234,7 +276,8 @@ class SharedHeadroom(unittest.TestCase):
     def test_release_seal_joins_exact_supervisor_owned_completion_and_lease(self):
         record, _ = self.claim([([self.card()], [])] * 11)
         body = {'argv': ['cargo', 'test'], 'supervision': {
-            'pid': 1234, 'returncode': 0, 'owned_completion': record['owned_execution_completion']}}
+            'pid': 1234, 'returncode': 0, 'owned_completion': record['owned_execution_completion'],
+            'admission':{'originalClaimDeadlineMonotonic':record['claim_deadline_monotonic']}}}
         resources.validate_shared_release_record(record, [body], self.configured)
         for mutation in (lambda r, c: r.update(lease_released=False),
                          lambda r, c: r.update(post_execution_verified=False),

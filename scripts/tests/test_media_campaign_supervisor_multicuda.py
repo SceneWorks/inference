@@ -182,6 +182,29 @@ class MultiCudaSupervisorTests(unittest.TestCase):
         self.assertEqual(caught.exception.owned_completion,
                          {'scope':'supervisor-no-child-created','creation_attempted':False})
 
+    def test_original_shared_claim_deadline_does_not_restart_after_admission_wait(self):
+        policy=dataclasses.replace(self.policies[0],backend='windows-cuda')
+        refused=Timeline()
+        with self.assertRaises(safety.SupervisionError) as caught:
+            self.run_fake(refused,[DeviceProbe(policy,refused,0)],[policy],
+                          retain_owned_completion=True,claim_deadline_monotonic=0.)
+        self.assertFalse(refused.spawned)
+        self.assertEqual(caught.exception.owned_completion,
+                         {'scope':'supervisor-no-child-created','creation_attempted':False})
+        running=Timeline(root_exit=20,empty=30)
+        with self.assertRaises(safety.SupervisionError) as caught:
+            self.run_fake(running,[DeviceProbe(policy,running,0)],[policy],
+                          retain_owned_completion=True,claim_deadline_monotonic=.03)
+        self.assertEqual(caught.exception.reason,'deadline')
+        self.assertTrue(running.spawned)
+        self.assertTrue(running.stopped)
+        self.assertFalse(hasattr(caught.exception,'owned_completion'))
+        done=Timeline(root_exit=1,empty=2)
+        result=self.run_fake(done,[DeviceProbe(policy,done,0)],[policy],
+                            retain_owned_completion=True,claim_deadline_monotonic=.1)
+        self.assertEqual(result.admission['originalClaimDeadlineMonotonic'],.1)
+        self.assertEqual(result.admission['remainingClaimSecondsAtSupervisorEntry'],.1)
+
     def test_single_device_failure_retains_sample_and_usage_basis(self):
         for basis in ('owned-process-attributed', 'global-used-upper-bound'):
             for breach in ('cap', 'reserve'):

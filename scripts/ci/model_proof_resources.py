@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -116,7 +117,10 @@ def validate_shared_release_record(record: dict, commands: list[dict], constrain
             or record['owned_execution_completion'].get('scope') != 'supervisor-owned-windows-job'
             or body[0].get('owned_completion') != record['owned_execution_completion']
             or body[0].get('pid') != record['owned_execution_completion']['root_pid']
-            or body[0].get('returncode') != 0):
+            or body[0].get('returncode') != 0
+            or type(record.get('claim_deadline_monotonic')) not in (int, float)
+            or not math.isfinite(record['claim_deadline_monotonic'])
+            or body[0].get('admission', {}).get('originalClaimDeadlineMonotonic') != record.get('claim_deadline_monotonic')):
         raise ValueError('shared CUDA release lacks its actual owned Job completion/unlock seal')
 
 
@@ -385,6 +389,71 @@ def metadata_policy_payload(policy: dict) -> dict:
     return result
 
 
+def _shared_admission_wait(reader, output: Path, uuid: str, physical_index: int,
+                           policy, deadline: float, observation: dict):
+    """Wait only for valid selected-card cap+reserve headroom before any body exists."""
+    while True:
+        if time.monotonic() >= deadline:
+            raise CudaClaimRejected({**observation.get('last_diagnostic', {}),
+                'admission_error': 'original CUDA claim deadline expired waiting for headroom',
+                'admission_wait': dict(observation)})
+        try:
+            devices, processes = reader(output, 'model-proof-claimed-device', deadline)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            raise CudaClaimRejected({'requested_uuid': uuid, 'admission_error': str(error),
+                                     'admission_wait': dict(observation)}) from error
+        observation['primary_polls'] += 1
+        diagnostic = cuda_claim_diagnostic(uuid, devices, processes, policy,
+                                           activity_profile=SHARED_CUDA_HEADROOM_ACTIVITY)
+        observation['last_diagnostic'] = diagnostic
+        matches = [device for device in devices if device.get('uuid') == uuid]
+        # Identity/counter sanity only: the unchanged cap+reserve check below
+        # remains the sole readiness decision; release policy never admits work.
+        if len(matches) != 1 or not proof_cuda_shared_release(
+                matches[0], uuid, physical_index,
+                observation.get('admitted_total_mib', matches[0].get('total_mib'))):
+            raise CudaClaimRejected({**diagnostic, 'admission_error': 'invalid selected primary identity/metadata',
+                                     'admission_wait': dict(observation)})
+        observation.setdefault('admitted_total_mib', matches[0]['total_mib'])
+        if time.monotonic() >= deadline:
+            raise CudaClaimRejected({**diagnostic, 'admission_error': 'original CUDA claim deadline expired after primary query',
+                                     'admission_wait': dict(observation)})
+        if proof_cuda_idle(matches[0], processes, policy, activity_profile=SHARED_CUDA_HEADROOM_ACTIVITY):
+            return devices, processes
+        observation['headroom_shortfalls'] += 1
+        observation.setdefault('first_shortfall', diagnostic)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            continue
+        pause = min(policy.poll_millis / 1000, remaining)
+        time.sleep(pause)
+        observation['headroom_wait_seconds'] += pause
+
+
+def _shared_admission_samples(probe, reader, output: Path, uuid: str, physical_index: int,
+                              policy, baseline: dict, deadline: float, observation: dict):
+    """Restart five fresh samples only for valid headroom loss, within the same deadline."""
+    while True:
+        try:
+            return settled_cuda_samples(probe, output, 'model-proof-admission', uuid, physical_index,
+                policy, baseline, deadline, activity_profile=SHARED_CUDA_HEADROOM_ACTIVITY)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            facts = cuda_sample_diagnostic(output, 'model-proof-admission', uuid, physical_index,
+                                           policy, baseline, activity_profile=SHARED_CUDA_HEADROOM_ACTIVITY)
+            samples = facts.get('samples', [])
+            last = samples[-1] if samples else {}
+            card = last.get('selected_card') or {}
+            valid = (last.get('predicates', {}).get('unique_uuid') is True
+                     and last.get('selected_index_matches_admission') is True
+                     and proof_cuda_shared_release({**card, 'uuid': uuid}, uuid, physical_index,
+                                                   baseline['admitted_total_mib']))
+            if (str(error) != 'physical GPU occupied during model-proof-admission' or not valid
+                    or last.get('predicates', {}).get('free_memory_above_policy_headroom') is not False):
+                raise
+            observation['stable_sample_restarts'] += 1
+            _shared_admission_wait(reader, output, uuid, physical_index, policy, deadline, observation)
+
+
 @contextmanager
 def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, constraints: dict | None = None):
     """Claim only during execution. CUDA reuses Veda's host-global UUID lock namespace.
@@ -477,8 +546,11 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
         shared_headroom = activity_profile == SHARED_CUDA_HEADROOM_ACTIVITY
         inventory_reader = (lambda out, label, deadline: veda_cuda_guard.inventory(
             out, label, min(deadline, started + policy.deadline_seconds), selected_uuid=uuid)) if shared_headroom else veda_cuda_guard.inventory
-        devices, processes = (inventory_reader(output, 'model-proof-claimed-device', started + policy.deadline_seconds)
-                              if shared_headroom else veda_cuda_guard.inventory(output, 'model-proof-claimed-device'))
+        admission_wait = {'primary_polls': 0, 'headroom_shortfalls': 0,
+                          'stable_sample_restarts': 0, 'headroom_wait_seconds': 0.0}
+        devices, processes = (_shared_admission_wait(inventory_reader, output, uuid,
+            constraints['required_cuda_physical_index'], policy, started + policy.deadline_seconds, admission_wait)
+            if shared_headroom else veda_cuda_guard.inventory(output, 'model-proof-claimed-device'))
         matched = [device for device in devices if device['uuid'] == uuid]
         required_index = constraints.get('required_cuda_physical_index')
         if len(matched) == 1 and required_index is not None and matched[0]['index'] != required_index:
@@ -500,6 +572,8 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
                                          'background utilization and contexts are diagnostic only')
             record['isolated_benchmark_claim'] = False
             record['lease_released'] = False
+            record['claim_deadline_monotonic'] = started + policy.deadline_seconds
+            record['admission_wait'] = admission_wait
             record['release_policy'] = 'verified-owned-Job-exit; exact selected primary metadata; headroom/activity diagnostic only'
         elif activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY:
             record['activity_policy'] = ('non-isolated correctness, stable selected-card G/C+G contexts when utilization '
@@ -518,22 +592,27 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
             context_baseline['admitted_total_mib'] = matched[0]['total_mib']
         identity_key = lambda selected_uuid, rows: proof_cuda_contexts(
             selected_uuid, rows, activity_profile=activity_profile)
-        settle_deadline = min(started + policy.deadline_seconds, time.monotonic() + 30)
+        settle_deadline = (started + policy.deadline_seconds if shared_headroom
+                           else min(started + policy.deadline_seconds, time.monotonic() + 30))
+        probe = lambda: veda_cuda_guard.sample_baseline(
+            matched[0], output, 'model-proof-admission', context_baseline, idle_check=idle_check,
+            identity_key=identity_key, permit_bounded_growth=True,
+            require_stable_contexts=not shared_headroom, inventory_reader=inventory_reader)
         try:
-            selected, baseline = settled_cuda_samples(
-                lambda: veda_cuda_guard.sample_baseline(
-                    matched[0], output, 'model-proof-admission', context_baseline, idle_check=idle_check,
-                    identity_key=identity_key, permit_bounded_growth=True,
-                    require_stable_contexts=not shared_headroom, inventory_reader=inventory_reader),
-                output, 'model-proof-admission', uuid, matched[0]['index'], policy, context_baseline,
-                settle_deadline, activity_profile=activity_profile)
+            if shared_headroom:
+                selected, baseline = _shared_admission_samples(probe, inventory_reader, output, uuid,
+                    matched[0]['index'], policy, context_baseline, settle_deadline, admission_wait)
+            else:
+                selected, baseline = settled_cuda_samples(probe, output, 'model-proof-admission', uuid,
+                    matched[0]['index'], policy, context_baseline, settle_deadline, activity_profile=activity_profile)
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
             diagnostic = cuda_sample_diagnostic(output, 'model-proof-admission', uuid, matched[0]['index'], policy,
                                                 context_baseline, activity_profile=activity_profile)
             raise CudaClaimRejected({**cuda_claim_diagnostic(uuid, devices, processes, policy,
                                                               activity_profile=activity_profile),
                                      'admission_samples': cuda_settle_refusal(error, diagnostic),
-                                     'admission_error': str(error)}) from error
+                                     'admission_error': str(error),
+                                     **({'admission_wait': admission_wait} if shared_headroom else {})}) from error
         record['post_execution_verified'] = False
         record['admission_baseline'] = baseline
         if activity_profile in (IRIS_CUDA_CORRECTNESS_ACTIVITY, SHARED_CUDA_HEADROOM_ACTIVITY):

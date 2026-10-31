@@ -421,6 +421,8 @@ class Collector(unittest.TestCase):
                 'test result: ok. 1 passed; 0 failed; 0 ignored;\n'
                 'MODEL_INFERENCE_BODY_COMPLETED ' + row['fqn'] + '\n'
                 'MODEL_INFERENCE_DEVICE ' + row['fqn'] + (' candle-cuda\n' if backend == 'candle-cuda' else ' mlx-cpu\n') + input_body)
+            if not discovery and getattr(fail, 'owned_completion', {}).get('scope') == 'supervisor-no-child-created':
+                text = ''
             if discovery and row.get('cargo_target_metadata') is not None:
                 text += json.dumps({'reason':'compiler-artifact','profile':{'test':True},'executable':'MOCK-never-executed.exe',
                     'target':row['cargo_target_metadata'],'package_id':'MOCK only','features':[]})+'\n'
@@ -433,12 +435,12 @@ class Collector(unittest.TestCase):
             completion = {'scope':'supervisor-owned-windows-job','root_pid':42,
                 'root_returncode':0,'waited_returncode':0,'job_member_pids':[],'owned_pids':[]}
             if isinstance(fail, safety.SupervisionError) and not discovery:
-                if backend == 'candle-cuda':
+                if backend == 'candle-cuda' and not hasattr(fail, 'owned_completion'):
                     fail.owned_completion = {**completion, 'root_returncode':1,'waited_returncode':1}
                 raise fail
             if backend == 'candle-cuda' and not discovery:
                 self.assertTrue(kwargs['retain_owned_completion'])
-                return source_safety.OwnedCudaRunResult(42, 0, 1024, None, 1000000000, None, .01, (), {'mode':'mock'}, completion)
+                return source_safety.OwnedCudaRunResult(42, 0, 1024, None, 1000000000, None, .01, (), {'mode':'mock','originalClaimDeadlineMonotonic':kwargs['claim_deadline_monotonic']}, completion)
             return safety.RunResult(42, 1 if fail and not discovery else 0, 1024, None,
                                     1000000000, None, 0.01, (), {'mode': 'mock'})
         @contextlib.contextmanager
@@ -457,7 +459,8 @@ class Collector(unittest.TestCase):
         def shared_controller(*_args, **_kwargs):
             physical = {'activity_profile': resources.SHARED_CUDA_HEADROOM_ACTIVITY,
                 'device_uuid':row['required_cuda_device_uuid'],'physical_index':1,
-                'post_execution_verified':False,'lease_released':False}
+                'post_execution_verified':False,'lease_released':False,
+                'claim_deadline_monotonic':100000000000.0}
             try:
                 yield physical
             finally:
@@ -507,6 +510,24 @@ class Collector(unittest.TestCase):
                     self.assertTrue(verified['accepted_model_run'])
                 else:
                     self.assertIn('child-exit', receipt['cases'][0]['error'])
+
+    def test_paired_precreation_zero_is_joined_to_actual_source_observation_not_launch_attempt_flag(self):
+        source = next(row for row in proof.load_registry() if row.get('fqn') == 'trainer_e2e::krea_bounded_acceleration_profile')
+        row = proof.configured_case(source, 'fixed_cuda_paired_comparison')
+        for none_created in (True, False):
+            error = safety.SupervisionError('preflight-memory' if none_created else 'child-exit','MOCK refusal')
+            if none_created:
+                error.owned_completion = {'scope':'supervisor-no-child-created','creation_attempted':False}
+            with self.subTest(none_created=none_created), tempfile.TemporaryDirectory() as temporary, \
+                    patch.dict(os.environ, {'KREA_RAW_DIR':'MOCK path; no files opened'}):
+                status,receipt,_,_,_=self._mock_run(Path(temporary).resolve(),row_override=row,
+                    backend='candle-cuda',fail=error)
+                case=receipt['cases'][0]
+                self.assertEqual(status,1)
+                self.assertFalse(case['accepted'])
+                self.assertTrue(case['krea_paired_supervisor_invocation_attempted'])
+                self.assertNotIn('krea_paired_body_launched',case)
+                self.assertEqual(case['krea_paired_update_accounting']['conservative_new_charge'],0 if none_created else 12)
 
     def test_isolated_cli_import_preserves_owned_completion_value_protocol(self):
         # Same isolated Python import setup as the workflow's -I entry point; mocks only.

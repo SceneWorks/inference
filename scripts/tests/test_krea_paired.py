@@ -168,7 +168,53 @@ class KreaPairedProtocol(unittest.TestCase):
         self.assertEqual((counted['observed_starts'],counted['observed_commits'],counted['observed_uncommitted_starts']),(2,1,1))
         self.assertEqual(counted['conservative_new_charge'],12)
         self.assertEqual(paired.update_accounting(None,body_launched=True,accepted=False)['conservative_new_charge'],12)
-        self.assertEqual(paired.update_accounting(None,body_launched=False,accepted=False)['conservative_new_charge'],0)
+        self.assertEqual(paired.update_accounting(None,body_launched=False,accepted=False)['conservative_new_charge'],12)
+
+    def test_affirmative_no_creation_zero_differs_from_plain_flags_unknown_or_partial_work(self):
+        proof_none = {'scope':'supervisor-no-child-created','creation_attempted':False}
+        count = paired.update_accounting(None,body_launched=True,accepted=False,no_creation_evidence=proof_none)
+        self.assertEqual(count['conservative_new_charge'],0)
+        self.assertEqual(count['actual_body_creation'],'source-proven-none')
+        self.assertTrue(count['collector_body_scope_entered'])
+        for invalid in (None,{},dict(proof_none,creation_attempted=0),
+                        {'scope':'supervisor-owned-windows-job','root_pid':42,'job_member_pids':[]}):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(paired.update_accounting(None,body_launched=False,accepted=False,
+                    no_creation_evidence=invalid)['conservative_new_charge'],12)
+        text='KREA_PROFILE_BOUNDARY phase=update-start physical_update=1 segment=0 logical_step=1\n'
+        count=paired.update_accounting(text,body_launched=True,accepted=False,no_creation_evidence=proof_none)
+        self.assertEqual(count['conservative_new_charge'],12)
+        self.assertTrue(count['no_creation_evidence_conflicts_with_updates'])
+        self.assertEqual(paired.update_accounting('',body_launched=True,accepted=True,
+            no_creation_evidence=proof_none)['conservative_new_charge'],12)
+        self.assertEqual(paired.update_accounting('MODEL_INFERENCE_BODY_COMPLETED '+recovery.FQN,
+            body_launched=True,accepted=False,no_creation_evidence=proof_none)['conservative_new_charge'],12)
+
+    def test_prebody_refusal_requires_source_protocol_not_just_missing_logs_or_zero_flags(self):
+        row,*_=fixture()
+        text=(row['fqn']+': test\n\n1 test, 0 benchmarks\n'+json.dumps({
+            'reason':'compiler-artifact','profile':{'test':True},'executable':'MOCK-only.exe',
+            'target':row['cargo_target_metadata'],'package_id':'MOCK; no executable invoked','features':[]})+'\n')
+        case={'declared':row,'binding':proof.identity(row),'accepted':False,'body_proof_accepted':False,
+            'resource_verification_pending':True,'physical_execution':{'mechanism':'metadata-only discovery; no model execution'},
+            'error':'claimed CUDA UUID is absent or occupied; no model execution','cuda_claim_diagnostic':{'requested_uuid':row['required_cuda_device_uuid']},
+            'actual_devices':[],'commands':[{'argv':proof.command(row,True),'supervision':{
+                'returncode':0,'admission':{'backend':'windows-cpu'}}}],
+            'compiled_target':proof.verify_discovery(row,text),
+            'outputs':[{'path':'00000/discovery.stdout.log'},{'path':'00000/discovery.stderr.log'}]}
+        evidence=paired.verify_prebody_refusal(row,case,text)
+        self.assertEqual(paired.update_accounting(None,body_launched=False,accepted=False,
+            no_creation_evidence=evidence)['conservative_new_charge'],0)
+        for key,value in {'accepted':True,'body_proof_accepted':True,'actual_devices':['candle-cuda'],
+            'krea_paired_body_launched':True,'krea_paired_supervisor_invocation_attempted':True,
+            'physical_execution':{},'compiled_target':{},'cuda_claim_diagnostic':{},
+            'commands':[],'error':'unknown failure','outputs':[{'path':'00000/body.stderr.log'}]}.items():
+            with self.subTest(key=key),self.assertRaises(ValueError):
+                paired.verify_prebody_refusal(row,{**case,key:value},text)
+        model_command=copy.deepcopy(case);model_command['commands'][0]['argv']=proof.command(row,False)
+        with self.assertRaises(ValueError):paired.verify_prebody_refusal(row,model_command,text)
+        with self.assertRaises(ValueError):paired.verify_prebody_refusal(row,case,
+            text+'KREA_PROFILE_BOUNDARY phase=update-start physical_update=1 segment=0 logical_step=1\n')
 
     def test_source_admission_and_restoration_precede_work_and_no_tail_update_is_hidden(self):
         source=(ROOT/'crates/media/candle-gen/candle-gen/src/train/flow_match.rs').read_text(encoding='utf-8')
