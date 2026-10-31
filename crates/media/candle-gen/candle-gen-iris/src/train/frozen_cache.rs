@@ -50,6 +50,14 @@ fn refuse(message: impl Into<String>) -> Error {
 fn io<T>(value: std::io::Result<T>) -> Result<T> {
     value.map_err(|e| refuse(e.to_string()))
 }
+// Windows FlushFileBuffers requires write access; a read-only reopen cannot
+// durably publish the converted cache even when serialization succeeded.
+fn sync_staged_file(path: &Path) -> Result<()> {
+    io(OpenOptions::new().write(true).open(path))?
+        .sync_all()
+        .map_err(|e| refuse(e.to_string()))
+}
+
 fn read_json(path: &Path) -> Result<Value> {
     serde_json::from_slice(&io(fs::read(path))?).map_err(|e| refuse(e.to_string()))
 }
@@ -257,9 +265,7 @@ pub(super) fn load(
         }
         safetensors::serialize_to_file(map.iter().map(|(n, t)| (n.as_str(), t)), None, &staged)
             .map_err(|e| refuse(e.to_string()))?;
-        io(File::open(&staged))?
-            .sync_all()
-            .map_err(|e| refuse(e.to_string()))?;
+        sync_staged_file(&staged)?;
         let manifest = json!({"schema_version":1,"format":"iris-native-frozen-v1","role":role,
             "owner":owner,"original":original,"cache_sha256":sha256_file(&staged).map_err(|e| refuse(e.to_string()))?,
             "cache_bytes":io(fs::metadata(&staged))?.len(),"tensors":tensors});
@@ -344,6 +350,23 @@ pub(super) fn load(
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
+    #[test]
+    fn staged_file_sync_preserves_bytes_and_publishability() {
+        // File metadata/bytes only: never decode a checkpoint or construct a Tensor.
+        let root = tempfile::tempdir().unwrap();
+        let staged = root.path().join("cache.tmp");
+        let published = root.path().join("cache.published");
+        let contents = b"metadata-only staged cache regression";
+        fs::write(&staged, contents).unwrap();
+        sync_staged_file(&staged).unwrap();
+        fs::rename(&staged, &published).unwrap();
+        assert_eq!(
+            fs::metadata(&published).unwrap().len(),
+            contents.len() as u64
+        );
+        assert_eq!(fs::read(&published).unwrap(), contents);
+    }
+
     #[test]
     fn frozen_cache_owner_is_exact_source_run_and_case() {
         let expected = expected_owner(&"a".repeat(40), "123", "1", &"b".repeat(64));
