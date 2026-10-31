@@ -979,7 +979,10 @@ impl MageTrainer {
             last_loss = losses.total;
             let grads = loss.backward()?;
             #[cfg(feature = "model-inference-proof")]
-            if step == 1 && candle_gen::train::profile::cohort_active() {
+            if step == 1
+                && candle_gen::train::profile::cohort_active()
+                && candle_gen::train::comparison::active_stage().is_none()
+            {
                 assert!(
                     aux.is_none(),
                     "bounded caption parity uses the plain flow loss"

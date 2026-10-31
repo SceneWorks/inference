@@ -49,6 +49,25 @@ fn streamed_linear(
 }
 
 fn rms(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    if candle_gen::train::comparison::legacy_e1() {
+        candle_gen::train::profile::cohort_reuse("mage:comparison-legacy-rms");
+        // Exact pre-epic primitive chain (3e374b5271^); do not substitute the
+        // inference-only no-backward RMS kernel or leave a new autograd owner.
+        let norm = x
+            .to_dtype(DType::F32)?
+            .sqr()?
+            .mean_keepdim(D::Minus1)?
+            .affine(1., NORM_EPS)?
+            .sqrt()?;
+        return x
+            .to_dtype(DType::F32)?
+            .broadcast_div(&norm)?
+            .broadcast_mul(&weight.to_dtype(DType::F32)?)?
+            .to_dtype(x.dtype());
+    }
+    if candle_gen::train::comparison::active_stage().is_some() {
+        candle_gen::train::profile::cohort_reuse("mage:comparison-shared-rms");
+    }
     candle_gen::train::norm::rms_norm_diff(x, &weight.to_dtype(DType::F32)?, NORM_EPS)
 }
 
@@ -579,6 +598,9 @@ pub struct MageTransformer {
 impl MageTransformer {
     /// Retained geometry and initial-conditioning base outputs, priced before allocation.
     pub(crate) fn training_preparation_bytes(&self, inputs: &[(&Tensor, &PackLayout)]) -> u64 {
+        if !candle_gen::train::comparison::cache_enabled() {
+            return 0;
+        }
         let mut layouts = Vec::new();
         let mut ids = std::collections::HashSet::new();
         let mut bytes = 0usize;
@@ -610,6 +632,9 @@ impl MageTransformer {
         &self,
         inputs: &[(&Tensor, &PackLayout)],
     ) -> u64 {
+        if !candle_gen::train::comparison::cache_enabled() {
+            return 0;
+        }
         inputs
             .iter()
             .map(|(text, layout)| {
@@ -634,27 +659,32 @@ impl MageTransformer {
     }
 
     pub(crate) fn prepare_training(&mut self, inputs: &[(&Tensor, &PackLayout)]) -> Result<()> {
-        if let MageBlocks::Resident(blocks) = &mut self.blocks {
-            for block in blocks {
-                let a = &mut block.attention;
-                if a.image_pack.is_none() {
-                    a.image_pack = FrozenProjectionPack::prepare_adapt(&mut [
-                        &mut a.to_q,
-                        &mut a.to_k,
-                        &mut a.to_v,
-                    ])?;
-                }
-                if a.text_pack.is_none() {
-                    a.text_pack = FrozenProjectionPack::prepare_adapt(&mut [
-                        &mut a.add_q,
-                        &mut a.add_k,
-                        &mut a.add_v,
-                    ])?;
+        if candle_gen::train::comparison::projection_enabled() {
+            if let MageBlocks::Resident(blocks) = &mut self.blocks {
+                for block in blocks {
+                    let a = &mut block.attention;
+                    if a.image_pack.is_none() {
+                        a.image_pack = FrozenProjectionPack::prepare_adapt(&mut [
+                            &mut a.to_q,
+                            &mut a.to_k,
+                            &mut a.to_v,
+                        ])?;
+                    }
+                    if a.text_pack.is_none() {
+                        a.text_pack = FrozenProjectionPack::prepare_adapt(&mut [
+                            &mut a.add_q,
+                            &mut a.add_k,
+                            &mut a.add_v,
+                        ])?;
+                    }
                 }
             }
         }
         self.training_rope.clear();
         self.training_text.clear();
+        if !candle_gen::train::comparison::cache_enabled() {
+            return Ok(());
+        }
         for (text, layout) in inputs {
             if !self.training_rope.iter().any(|(key, _)| key == *layout) {
                 self.training_rope.push((

@@ -456,23 +456,37 @@ fn flux3_bounded_acceleration_acceptance() {
     };
     use gen_core_flux3::training::options::OPTIONS_KEY;
     let root = bounded_root();
+    let comparison = candle_gen::train::comparison::requested_stage().is_some();
+    let cadence = candle_gen::train::comparison::ComparisonCadence::Ordinary;
+    let steps = if comparison { cadence.updates() } else { 4 };
+    // One source-owned representative workload, never a resolution grid. The
+    // controller must admit the worst legacy arm before executing any stage.
+    let resolution = if comparison { 512 } else { 64 };
     let base = env_dir("FLUX3_BASE_PACKAGE_DIR");
     let input = root.join("input.png");
-    image::RgbImage::from_pixel(64, 64, image::Rgb([80, 140, 210]))
-        .save(&input)
-        .unwrap();
+    image::RgbImage::from_pixel(
+        resolution as u32,
+        resolution as u32,
+        image::Rgb([80, 140, 210]),
+    )
+    .save(&input)
+    .unwrap();
     let reference = root.join("reference.png");
-    image::RgbImage::from_pixel(64, 64, image::Rgb([210, 160, 30]))
-        .save(&reference)
-        .unwrap();
+    image::RgbImage::from_pixel(
+        resolution as u32,
+        resolution as u32,
+        image::Rgb([210, 160, 30]),
+    )
+    .save(&reference)
+    .unwrap();
     let mut item = TrainingItem::captioned(input, "a blue tile".into());
     item.reference_image_paths.push(reference);
     let mut config = TrainingConfig {
         rank: 2,
         alpha: 2.,
         learning_rate: 1e-3,
-        steps: 4,
-        resolution: 64,
+        steps,
+        resolution,
         batch_size: 1,
         gradient_accumulation: 1,
         optimizer: "adamw".into(),
@@ -489,38 +503,61 @@ fn flux3_bounded_acceleration_acceptance() {
         serde_json::json!({"mode":"edit", "caption_dropout":0., "random_flip":false}),
     );
     let spec = LoadSpec::new(WeightsSource::Dir(base));
-    let sampler = candle_gen::testkit::PeakSampler::start_rendered();
-    let output = candle_gen::train::profile::with_bounded_cohort_for(
-        &root.join("metrics.json"),
-        &[
-            "flux3:geometry-storage-hit",
-            "flux3:frozen-caption-projection-consumed",
-            "flux3:frozen-projection-pack",
-        ],
-        || {
-            let mut trainer = candle_gen_flux3::provider_registry()
-                .unwrap()
-                .load_trainer(BASE_MODEL_ID, &spec)
-                .unwrap();
-            let output = trainer
-                .train(
-                    &TrainingRequest {
-                        items: vec![item],
-                        config,
-                        output_dir: root.join("out"),
-                        file_name: "adapter.safetensors".into(),
-                        trigger_words: vec![],
-                        cancel: CancelFlag::new(),
-                    },
-                    &mut |_| {},
-                )
-                .unwrap();
-            assert_eq!(output.steps, 4);
-            assert!(output.final_loss.is_finite());
-            output
-        },
-    );
-    bounded_peak(sampler, &root);
+    let items = vec![item];
+    let sampler = (!comparison).then(candle_gen::testkit::PeakSampler::start_rendered);
+    // A new child owns a fresh native trainer/Run, initial parameters, native
+    // optimizer, EMA/data cursors and (restoration) critic/SN state. No quality
+    // render or adapter reload is repeated by this timing-only supplement.
+    let run = || {
+        if comparison {
+            comparison_initialization(&config, &items, &spec);
+        }
+        let mut trainer = candle_gen_flux3::provider_registry()
+            .unwrap()
+            .load_trainer(BASE_MODEL_ID, &spec)
+            .unwrap();
+        let output = trainer
+            .train(
+                &TrainingRequest {
+                    items,
+                    config,
+                    output_dir: root.join("out"),
+                    file_name: "adapter.safetensors".into(),
+                    trigger_words: vec![],
+                    cancel: CancelFlag::new(),
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(output.steps, steps);
+        assert!(output.final_loss.is_finite());
+        output
+    };
+    let output = if comparison {
+        candle_gen::train::comparison::with_stage(
+            &root.join("comparison_metrics.json"),
+            "flux3",
+            cadence,
+            run,
+        )
+    } else {
+        candle_gen::train::profile::with_bounded_cohort_for(
+            &root.join("metrics.json"),
+            &[
+                "flux3:geometry-storage-hit",
+                "flux3:frozen-caption-projection-consumed",
+                "flux3:frozen-projection-pack",
+            ],
+            run,
+        )
+    };
+    if comparison {
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::flux3_bounded_acceleration_acceptance"
+        );
+        return;
+    }
+    bounded_peak(sampler.expect("ordinary fixture sampler"), &root);
     let tensors = candle_gen::candle_core::safetensors::load(
         &output.adapter_path,
         &candle_gen::candle_core::Device::Cpu,
@@ -551,8 +588,12 @@ fn flux3_bounded_acceleration_acceptance() {
                     image: candle_gen::gen_core::Image {
                         width: 64,
                         height: 64,
-                        pixels: image::RgbImage::from_pixel(64, 64, image::Rgb([210, 160, 30]))
-                            .into_raw(),
+                        pixels: image::RgbImage::from_pixel(
+                            resolution as u32,
+                            resolution as u32,
+                            image::Rgb([210, 160, 30]),
+                        )
+                        .into_raw(),
                     },
                     strength: None,
                 }],
@@ -571,4 +612,41 @@ fn flux3_bounded_acceleration_acceptance() {
     println!(
         "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::flux3_bounded_acceleration_acceptance"
     );
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn comparison_input_sha256(path: &std::path::Path) -> String {
+    use sha2::Digest;
+    format!(
+        "{:x}",
+        sha2::Sha256::digest(std::fs::read(path).expect("comparison input"))
+    )
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn comparison_initialization(
+    config: &candle_gen::gen_core::TrainingConfig,
+    items: &[candle_gen::gen_core::TrainingItem],
+    spec: &candle_gen::gen_core::LoadSpec,
+) {
+    let data = items.iter().map(|item| {
+        let sidecars = item.model_options.iter().map(|(key,value)| {
+            let value = if let Some(path) = value.as_str().filter(|path| std::path::Path::new(path).is_file()) {
+                serde_json::json!({"file_sha256":comparison_input_sha256(std::path::Path::new(path))})
+            } else { value.clone() };
+            (key.clone(),value)
+        }).collect::<serde_json::Map<String,serde_json::Value>>();
+        serde_json::json!({"image_sha256":comparison_input_sha256(&item.image_path),
+            "caption":item.caption,"sidecars":sidecars,
+            "references":item.reference_image_paths.iter().map(|path|comparison_input_sha256(path)).collect::<Vec<_>>(),
+            "control":item.control_image_path.as_deref().map(comparison_input_sha256),
+            "subject_mask":item.subject_mask_path.as_deref().map(comparison_input_sha256)})
+    }).collect::<Vec<_>>();
+    candle_gen::train::comparison::record_initialization(&serde_json::json!({
+        "training_config":format!("{config:?}"),"source_spec":format!("{spec:?}"),
+        "seed":config.seed,"resolution":config.resolution,"batch_size":config.batch_size,
+        "gradient_accumulation":config.gradient_accumulation,"data":data,
+        "factory":"fresh native trainer in one comparison child; no resumed mutable run",
+        "claim_limit":"content/configuration witnesses; not a claim of whole checkpoint bytes or tensor equality from source flags"
+    }));
 }

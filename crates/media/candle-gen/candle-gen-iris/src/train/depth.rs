@@ -800,6 +800,33 @@ impl Run {
         // before its first publish (retention and `latest` see only this run's) — once the resume
         // source was validated, so a refused resume leaves the root as it was.
         retire_foreign_checkpoints(&ckpt_root, resume_src.as_deref())?;
+        if candle_gen::train::comparison::active_stage().is_some() {
+            assert_eq!(step, 0, "comparison requires a pristine native run");
+            assert_eq!(sched_step, 0, "comparison scheduler starts at zero");
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner":"iris-depth-native-run","step":step,"schedule_step":sched_step,
+                "lr":lr,"nan_count":nan_count,"epoch":epoch,"position":pos,
+                "ema_present":ema.is_some(),"data_seed":req.config.seed,
+                "factory":"Run::prepare/fresh native DataWalk"
+            }));
+            candle_gen::train::comparison::record_initial_tensors(
+                "iris-depth-params",
+                params
+                    .iter()
+                    .map(|(name, var)| (name.as_str(), var.as_tensor())),
+            )?;
+            let slots = opt.state_tensors()?;
+            candle_gen::train::comparison::record_initial_tensors(
+                "iris-depth-optimizer",
+                slots.iter().map(|(name, tensor)| (name.as_str(), tensor)),
+            )?;
+            if let Some(ema) = &ema {
+                candle_gen::train::comparison::record_initial_tensors(
+                    "iris-depth-ema",
+                    ema.iter().map(|(name, tensor)| (name.as_str(), tensor)),
+                )?;
+            }
+        }
         Ok(Self {
             model: DepthModel {
                 geometry: Default::default(),

@@ -430,6 +430,12 @@ fn bounded_export_receipt(root: &std::path::Path, path: &std::path::Path) {
 #[ignore = "model inference; explicit model-proof workflow"]
 fn iris_restoration_bounded_acceleration_acceptance() {
     let root = bounded_root();
+    let comparison = candle_gen::train::comparison::requested_stage().is_some();
+    let cadence = candle_gen::train::comparison::ComparisonCadence::IrisRestoration;
+    let steps = if comparison { cadence.updates() } else { 4 };
+    // One source-owned representative workload, never a resolution grid. The
+    // controller must admit the worst legacy arm before executing any stage.
+    let resolution = if comparison { 512 } else { 256 };
     let items = dataset(&root);
     let (input, _) = restore_case();
     let mut spec = LoadSpec::new(WeightsSource::Dir(env_path("IRIS_UPSCALER_DIR")));
@@ -448,8 +454,8 @@ fn iris_restoration_bounded_acceleration_acceptance() {
         alpha: 8.,
         learning_rate: 1e-5,
         weight_decay: 0.01,
-        steps: 4,
-        resolution: 256,
+        steps,
+        resolution,
         batch_size: 1,
         gradient_accumulation: 1,
         save_every: 0,
@@ -461,40 +467,93 @@ fn iris_restoration_bounded_acceleration_acceptance() {
     config
         .model_options
         .insert(OPTIONS_KEY.into(), serde_json::json!({"ema_decay":0.5}));
-    let sampler = candle_gen::testkit::PeakSampler::start_rendered();
-    let output = candle_gen::train::profile::with_bounded_cohort_for(
-        &root.join("metrics.json"),
-        &[
-            "iris:geometry-storage-hit",
-            "iris:frozen-GQA-projection-pack",
-        ],
-        || {
-            let mut trainer = candle_gen_iris::provider_registry()
-                .unwrap()
-                .load_trainer("iris_3b_restore", &spec)
-                .unwrap();
-            let output = trainer
-                .train(
-                    &TrainingRequest {
-                        items,
-                        config,
-                        output_dir: bounded_runtime().join("restoration"),
-                        file_name: "restorer.safetensors".into(),
-                        trigger_words: vec![],
-                        cancel: CancelFlag::new(),
-                    },
-                    &mut |_| {},
-                )
-                .unwrap();
-            assert_eq!(output.steps, 4);
-            assert!(output.final_loss.is_finite());
-            output
-        },
-    );
-    bounded_peak(sampler, &root);
+    let sampler = (!comparison).then(candle_gen::testkit::PeakSampler::start_rendered);
+    // A new child owns a fresh native trainer/Run, initial parameters, native
+    // optimizer, EMA/data cursors and (restoration) critic/SN state. No quality
+    // render or adapter reload is repeated by this timing-only supplement.
+    let run = || {
+        if comparison {
+            comparison_initialization(&config, &items, &spec);
+        }
+        let mut trainer = candle_gen_iris::provider_registry()
+            .unwrap()
+            .load_trainer("iris_3b_restore", &spec)
+            .unwrap();
+        let output = trainer
+            .train(
+                &TrainingRequest {
+                    items,
+                    config,
+                    output_dir: bounded_runtime().join("restoration"),
+                    file_name: "restorer.safetensors".into(),
+                    trigger_words: vec![],
+                    cancel: CancelFlag::new(),
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(output.steps, steps);
+        assert!(output.final_loss.is_finite());
+        output
+    };
+    let output = if comparison {
+        candle_gen::train::comparison::with_stage(
+            &root.join("comparison_metrics.json"),
+            "iris-restoration",
+            cadence,
+            run,
+        )
+    } else {
+        candle_gen::train::profile::with_bounded_cohort_for(
+            &root.join("metrics.json"),
+            &[
+                "iris:geometry-storage-hit",
+                "iris:frozen-GQA-projection-pack",
+            ],
+            run,
+        )
+    };
+    if comparison {
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_real_weights::iris_restoration_bounded_acceleration_acceptance");
+        return;
+    }
+    bounded_peak(sampler.expect("ordinary fixture sampler"), &root);
     let sample = restore(output.adapter_path.parent().unwrap(), &input);
     assert!(sample.pixels.iter().any(|v| *v != 0));
     save_image_png(&root.join("adapter_sample.png"), &sample);
     bounded_export_receipt(&root, &output.adapter_path);
     println!("\nMODEL_INFERENCE_BODY_COMPLETED restoration_train_real_weights::iris_restoration_bounded_acceleration_acceptance");
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn comparison_input_sha256(path: &std::path::Path) -> String {
+    gen_core_iris::restoration_train::sha256_file(path).expect("comparison input")
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn comparison_initialization(
+    config: &candle_gen::gen_core::TrainingConfig,
+    items: &[candle_gen::gen_core::TrainingItem],
+    spec: &candle_gen::gen_core::LoadSpec,
+) {
+    let data = items.iter().map(|item| {
+        let sidecars = item.model_options.iter().map(|(key,value)| {
+            let value = if let Some(path) = value.as_str().filter(|path| std::path::Path::new(path).is_file()) {
+                serde_json::json!({"file_sha256":comparison_input_sha256(std::path::Path::new(path))})
+            } else { value.clone() };
+            (key.clone(),value)
+        }).collect::<serde_json::Map<String,serde_json::Value>>();
+        serde_json::json!({"image_sha256":comparison_input_sha256(&item.image_path),
+            "caption":item.caption,"sidecars":sidecars,
+            "references":item.reference_image_paths.iter().map(|path|comparison_input_sha256(path)).collect::<Vec<_>>(),
+            "control":item.control_image_path.as_deref().map(comparison_input_sha256),
+            "subject_mask":item.subject_mask_path.as_deref().map(comparison_input_sha256)})
+    }).collect::<Vec<_>>();
+    candle_gen::train::comparison::record_initialization(&serde_json::json!({
+        "training_config":format!("{config:?}"),"source_spec":format!("{spec:?}"),
+        "seed":config.seed,"resolution":config.resolution,"batch_size":config.batch_size,
+        "gradient_accumulation":config.gradient_accumulation,"data":data,
+        "factory":"fresh native trainer in one comparison child; no resumed mutable run",
+        "claim_limit":"content/configuration witnesses; not a claim of whole checkpoint bytes or tensor equality from source flags"
+    }));
 }

@@ -80,7 +80,9 @@ impl TrainingGraph {
                 scale,
             )?;
         }
-        dit.prepare_training_projections()?;
+        if candle_gen::train::comparison::projection_enabled() {
+            dit.prepare_training_projections()?;
+        }
         Ok(Self {
             dit,
             factors,

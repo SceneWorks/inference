@@ -756,6 +756,66 @@ impl Run {
         // before its first publish (retention and `latest` see only this run's) — once the resume
         // source was validated, so a refused resume leaves the root as it was.
         retire_foreign_checkpoints(&ckpt_root, resume_src.as_deref())?;
+        if candle_gen::train::comparison::active_stage().is_some() {
+            assert_eq!(step, 0, "comparison requires a pristine native run");
+            assert_eq!(sched_step, 0, "comparison scheduler starts at zero");
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner":"iris-restoration-native-run","step":step,"schedule_step":sched_step,
+                "lr":lr,"critic_lr":lr_critic,"nan_count":nan_count,"epoch":epoch,"position":pos,
+                "total_native_steps":total_steps,"ema_present":ema.is_some(),"data_seed":req.config.seed,
+                "factory":"Run::prepare/fresh native DataWalk"
+            }));
+            candle_gen::train::comparison::record_initial_tensors(
+                "iris-restoration-params",
+                params
+                    .iter()
+                    .map(|(name, var)| (name.as_str(), var.as_tensor())),
+            )?;
+            let slots = opt.state_tensors()?;
+            candle_gen::train::comparison::record_initial_tensors(
+                "iris-restoration-optimizer",
+                slots.iter().map(|(name, tensor)| (name.as_str(), tensor)),
+            )?;
+            if let Some(ema) = &ema {
+                candle_gen::train::comparison::record_initial_tensors(
+                    "iris-restoration-ema",
+                    ema.iter().map(|(name, tensor)| (name.as_str(), tensor)),
+                )?;
+            }
+            candle_gen::train::comparison::record_initial_tensors(
+                "iris-restoration-critic-head",
+                head.iter()
+                    .map(|(name, var)| (name.as_str(), var.as_tensor())),
+            )?;
+            let critic_slots = critic_opt.state_tensors()?;
+            candle_gen::train::comparison::record_initial_tensors(
+                "iris-restoration-critic-optimizer",
+                critic_slots
+                    .iter()
+                    .map(|(name, tensor)| (name.as_str(), tensor)),
+            )?;
+            let spectral = sn
+                .iter()
+                .flat_map(|(name, (u, v))| {
+                    [
+                        (format!("{name}.weight_u"), u.clone()),
+                        (format!("{name}.weight_v"), v.clone()),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner":"iris-restoration-spectral-normalization",
+                "tensor_count":spectral.len()
+            }));
+            if !spectral.is_empty() {
+                candle_gen::train::comparison::record_initial_tensors(
+                    "iris-restoration-spectral-normalization",
+                    spectral
+                        .iter()
+                        .map(|(name, tensor)| (name.as_str(), tensor)),
+                )?;
+            }
+        }
         let _ = &mut params;
         Ok(Self {
             plan,

@@ -177,6 +177,9 @@ pub fn provider_residual(kind: AdapterKind, t: &AdapterTarget, p: &Tensors) -> R
 pub fn prepare_adapter_projection_packs(
     base: &mut HashMap<String, Tensor>,
 ) -> Result<BTreeMap<String, candle_gen::train::projection::FrozenProjectionPack>> {
+    if !candle_gen::train::comparison::projection_enabled() {
+        return Ok(BTreeMap::new());
+    }
     let keys = base
         .keys()
         .filter(|key| {
