@@ -127,6 +127,18 @@ pub fn reference_owner_enabled() -> bool {
     )
 }
 
+/// Physical index for the new comparison recipe only. CUDA ordinal remains zero
+/// under its exact one-UUID visibility mapping.
+pub fn required_physical_index() -> Option<usize> {
+    active_stage().map(
+        |_| match std::env::var("MODEL_PROOF_COMPARISON_BINDING").as_deref() {
+            Ok("gpu0") => 0,
+            Ok("gpu1") => 1,
+            _ => panic!("source-owned comparison physical binding required"),
+        },
+    )
+}
+
 /// Append actual canonical configuration/factory facts before any update.
 /// Do not include stage-specific output directories in this cross-stage identity.
 pub fn record_initialization(value: &serde_json::Value) {
@@ -178,6 +190,22 @@ pub fn with_stage<T>(
     }
     STAGE.set(Some(stage));
     let _reset = Reset;
+    let physical = required_physical_index().expect("comparison physical index");
+    let uuid = if physical == 0 {
+        "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
+    } else {
+        "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+    };
+    assert_eq!(
+        std::env::var("CUDA_VISIBLE_DEVICES").as_deref(),
+        Ok(uuid),
+        "comparison requires exact selected physical UUID visibility"
+    );
+    assert_eq!(
+        std::env::var("SCENEWORKS_GPU_ID").as_deref(),
+        Ok(if physical == 0 { "0" } else { "1" }),
+        "comparison sampler physical mapping"
+    );
     let mode = if stage == ComparisonStage::PlusStreaming {
         crate::training_attention::TrainingAttentionMode::StreamingCandidate
     } else {
