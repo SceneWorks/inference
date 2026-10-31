@@ -80,6 +80,23 @@ mod policy_attention_metadata_tests {
             assert_eq!(MODE.get(), TrainingAttentionMode::StreamingCandidate);
         });
         assert_eq!(MODE.get(), TrainingAttentionMode::Reference);
+        #[cfg(feature = "model-inference-proof")]
+        crate::train::comparison::with_metadata_stage_for_test(
+            crate::train::comparison::ComparisonStage::PlusStreaming,
+            || {
+                with_training_attention_mode(TrainingAttentionMode::StreamingCandidate, || {
+                    policy::with_job_policy(job, || {
+                        assert_eq!(MODE.get(), TrainingAttentionMode::StreamingCandidate);
+                        assert!(!policy::legacy_e1());
+                        policy::without_production_profile(|| {
+                            assert_eq!(MODE.get(), TrainingAttentionMode::StreamingCandidate);
+                            assert!(!policy::legacy_e1());
+                        });
+                    });
+                });
+            },
+        );
+        assert_eq!(MODE.get(), TrainingAttentionMode::Reference);
     }
 }
 

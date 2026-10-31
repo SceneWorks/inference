@@ -128,6 +128,18 @@ pub fn reference_owner_enabled() -> bool {
 }
 
 #[cfg(all(test, feature = "model-inference-proof"))]
+pub(crate) fn with_metadata_stage_for_test<T>(stage: ComparisonStage, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<ComparisonStage>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            STAGE.set(self.0);
+        }
+    }
+    let _reset = Reset(STAGE.replace(Some(stage)));
+    f()
+}
+
+#[cfg(all(test, feature = "model-inference-proof"))]
 mod policy_selector_metadata_tests {
     use super::*;
 
