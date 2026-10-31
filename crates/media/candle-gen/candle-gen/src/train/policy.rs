@@ -235,3 +235,175 @@ pub(super) fn record_resume_profile(meta: &mut HashMap<String, String>) {
         );
     }
 }
+
+#[cfg(test)]
+mod selector_metadata_tests {
+    use super::*;
+
+    fn request(dir: &std::path::Path) -> TrainingRequest {
+        TrainingRequest {
+            items: vec![],
+            config: Default::default(),
+            output_dir: dir.into(),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: vec![],
+            cancel: Default::default(),
+        }
+    }
+
+    fn job(profile: TrainingProfile) -> JobTrainingPolicy {
+        JobTrainingPolicy {
+            model: "metadata-test",
+            profile,
+            resumed: false,
+        }
+    }
+
+    #[test]
+    fn exact_descriptors_and_non_cuda_defaults() {
+        for (id, profile) in [
+            ("wan2_2_ti2v_5b", TrainingProfile::WithoutE1),
+            ("kolors", TrainingProfile::WithoutE3),
+            ("ltx_2_5_distilled", TrainingProfile::WithoutE2),
+            ("sd3_5_medium", TrainingProfile::Legacy),
+        ] {
+            assert_eq!(selected_profile(id, true).1, profile);
+            assert_eq!(selected_profile(id, false).1, TrainingProfile::Current);
+        }
+        for id in [
+            "krea",
+            "krea_raw",
+            "wan2_2_t2v_14b",
+            "sd3_5_large",
+            "ltx_2_3",
+            "unknown",
+        ] {
+            assert_eq!(selected_profile(id, true).1, TrainingProfile::Current);
+        }
+    }
+
+    #[test]
+    fn complete_arms_and_all_proof_stages_override() {
+        for (profile, bits) in [
+            (TrainingProfile::Current, (false, true, true, true)),
+            (TrainingProfile::Legacy, (true, false, false, false)),
+            (TrainingProfile::WithoutE1, (true, true, true, true)),
+            (TrainingProfile::WithoutE2, (false, false, true, true)),
+            (TrainingProfile::WithoutE3, (false, true, false, true)),
+        ] {
+            assert_eq!(strategy(None, profile), bits);
+            for stage in ComparisonStage::ALL {
+                assert_eq!(
+                    strategy(Some(stage), profile),
+                    strategy(Some(stage), TrainingProfile::Current)
+                );
+            }
+        }
+        assert_eq!(
+            strategy(
+                Some(ComparisonStage::MinusReferenceOwner),
+                TrainingProfile::Legacy
+            ),
+            (false, true, true, false)
+        );
+        assert_eq!(
+            strategy(
+                Some(ComparisonStage::PlusStreaming),
+                TrainingProfile::Legacy
+            ),
+            (false, true, true, true)
+        );
+    }
+
+    #[test]
+    fn scopes_suspend_restore_unwind_and_isolate_threads() {
+        assert_eq!(active_profile(), TrainingProfile::Current);
+        with_job_policy(job(TrainingProfile::Legacy), || {
+            assert!(legacy_e1());
+            without_production_profile(|| {
+                assert_eq!(active_profile(), TrainingProfile::Current);
+                assert!(!legacy_e1());
+                with_job_policy(
+                    job(TrainingProfile::WithoutE2),
+                    || assert!(!cache_enabled()),
+                );
+                assert_eq!(active_profile(), TrainingProfile::Current);
+            });
+            assert!(legacy_e1());
+            let handle = std::thread::spawn(|| {
+                assert_eq!(active_profile(), TrainingProfile::Current);
+                with_job_policy(job(TrainingProfile::WithoutE3), || {
+                    assert!(!projection_enabled())
+                });
+                assert!(projection_enabled());
+            });
+            handle.join().unwrap();
+            assert!(legacy_e1());
+            let panic = std::panic::catch_unwind(|| {
+                with_job_policy(job(TrainingProfile::WithoutE1), || {
+                    panic!("metadata unwind")
+                })
+            });
+            assert!(panic.is_err());
+            assert_eq!(active_profile(), TrainingProfile::Legacy);
+            let panic = std::panic::catch_unwind(|| {
+                without_production_profile(|| panic!("callback unwind"))
+            });
+            assert!(panic.is_err());
+            assert_eq!(active_profile(), TrainingProfile::Legacy);
+        });
+        assert_eq!(active_profile(), TrainingProfile::Current);
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<JobTrainingPolicy>();
+    }
+
+    // Valid safetensors header only; no tensor payload, device or model creation.
+    fn write_header(dir: &std::path::Path, metadata: serde_json::Value) {
+        let header = serde_json::to_vec(&serde_json::json!({"__metadata__":metadata})).unwrap();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        std::fs::write(dir.join("adapter-step000004.resume.safetensors"), bytes).unwrap();
+    }
+
+    #[test]
+    fn resume_header_selection_preserves_historical_and_rejects_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut req = request(dir.path());
+        assert_eq!(
+            JobTrainingPolicy::resolve("ltx_2_5_distilled", true, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::WithoutE2
+        );
+        req.config.resume = true;
+        write_header(dir.path(), serde_json::json!({}));
+        assert_eq!(
+            JobTrainingPolicy::resolve("ltx_2_5_distilled", true, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+        write_header(
+            dir.path(),
+            serde_json::json!({RESUME_KEY: "measured-reference-v1/minus-e2"}),
+        );
+        assert_eq!(
+            JobTrainingPolicy::resolve("ltx_2_5_distilled", true, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::WithoutE2
+        );
+        assert!(JobTrainingPolicy::resolve("ltx_2_5_distilled", false, &req).is_err());
+        assert!(JobTrainingPolicy::resolve("sd3_5_medium", true, &req).is_err());
+        write_header(
+            dir.path(),
+            serde_json::json!({RESUME_KEY: "measured-reference-v1/plus-streaming"}),
+        );
+        assert!(JobTrainingPolicy::resolve("ltx_2_5_distilled", true, &req).is_err());
+        write_header(
+            dir.path(),
+            serde_json::json!({RESUME_KEY: "future-v2/minus-e2"}),
+        );
+        assert!(JobTrainingPolicy::resolve("ltx_2_5_distilled", true, &req).is_err());
+    }
+}

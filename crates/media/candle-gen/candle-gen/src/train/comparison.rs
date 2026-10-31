@@ -127,6 +127,48 @@ pub fn reference_owner_enabled() -> bool {
     )
 }
 
+#[cfg(all(test, feature = "model-inference-proof"))]
+mod policy_selector_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_proof_scope_wins_over_job_and_callback_suspension() {
+        use crate::gen_core::train::TrainingRequest;
+        use crate::train::policy;
+        let req = TrainingRequest {
+            items: vec![],
+            config: Default::default(),
+            output_dir: "unused".into(),
+            file_name: "out.safetensors".into(),
+            trigger_words: vec![],
+            cancel: Default::default(),
+        };
+        let job = policy::JobTrainingPolicy::resolve("sd3_5_medium", true, &req).unwrap();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                STAGE.set(None);
+            }
+        }
+        let _reset = Reset;
+        for stage in ComparisonStage::ALL {
+            STAGE.set(Some(stage));
+            policy::with_job_policy(job, || {
+                assert_eq!(policy::legacy_e1(), legacy_e1());
+                assert_eq!(policy::cache_enabled(), cache_enabled());
+                assert_eq!(policy::projection_enabled(), projection_enabled());
+                assert_eq!(policy::reference_owner_enabled(), reference_owner_enabled());
+                policy::without_production_profile(|| {
+                    assert_eq!(policy::legacy_e1(), legacy_e1());
+                    assert_eq!(policy::cache_enabled(), cache_enabled());
+                    assert_eq!(policy::projection_enabled(), projection_enabled());
+                    assert_eq!(policy::reference_owner_enabled(), reference_owner_enabled());
+                });
+            });
+        }
+    }
+}
+
 /// Physical index for the new comparison recipe only. CUDA ordinal remains zero
 /// under its exact one-UUID visibility mapping.
 pub fn required_physical_index() -> Option<usize> {

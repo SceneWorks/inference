@@ -16,15 +16,15 @@ thread_local! {
     static TIMES: RefCell<Vec<(String,f64)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Proof-only original arithmetic selector; always false in production builds.
+/// Original arithmetic selected by a measured job profile or existing proof scope.
 pub fn reference_math() -> bool {
     #[cfg(feature = "model-inference-proof")]
     {
-        (ACTIVE.get() && SEGMENT.get() == 0) || super::comparison::legacy_e1()
+        (ACTIVE.get() && SEGMENT.get() == 0) || super::policy::legacy_e1()
     }
     #[cfg(not(feature = "model-inference-proof"))]
     {
-        false
+        super::policy::legacy_e1()
     }
 }
 

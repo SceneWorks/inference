@@ -987,6 +987,10 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     on_progress: &mut dyn FnMut(TrainingProgress),
     warnings: &mut Vec<crate::gen_core::GenerationWarning>,
 ) -> Result<TrainingOutput> {
+    // User callbacks may run unrelated generation synchronously. Never lend
+    // them this training job's arithmetic/preparation selection.
+    let mut progress = |event| super::policy::without_production_profile(|| on_progress(event));
+    let on_progress: &mut dyn FnMut(TrainingProgress) = &mut progress;
     let cfg = &req.config;
     let device = model.device();
     let bounded_profile = super::profile::active();
@@ -1434,7 +1438,9 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
                             break;
                         }
                         let seed = sample_seed(cfg.seed, step, index);
-                        match model.render_sample(&dit, state, index, cfg, seed) {
+                        match super::policy::without_production_profile(|| {
+                            model.render_sample(&dit, state, index, cfg, seed)
+                        }) {
                             Ok(image) => on_progress(TrainingProgress::Sample {
                                 step,
                                 index: index as u32 + 1,

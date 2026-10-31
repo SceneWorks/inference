@@ -66,7 +66,7 @@ pub(crate) fn try_forward(
     if candle_core::backprop::grad_do_not_detach() || mask.is_some() || !eligible(q, k, v, scale) {
         return Ok(None);
     }
-    if !crate::train::comparison::reference_owner_enabled() {
+    if !crate::train::policy::reference_owner_enabled() {
         crate::train::profile::cohort_reuse("comparison:reference-owner:composable");
         return Ok(None);
     }

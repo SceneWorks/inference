@@ -186,7 +186,7 @@ impl FrozenProjectionPack {
     /// for packed bases, live full-training weights, or incompatible dtype/device/input geometry.
     /// Call once during model preparation, never inside the training step or checkpoint replay.
     pub fn prepare_lora(layers: &mut [&mut LoraLinear]) -> candle_core::Result<Option<Self>> {
-        if !super::comparison::projection_enabled() {
+        if !super::policy::projection_enabled() {
             return Ok(None);
         }
         let bases: Option<Vec<_>> = layers.iter().map(|l| l.dense_base().cloned()).collect();
@@ -203,7 +203,7 @@ impl FrozenProjectionPack {
     /// AdaptLinear equivalent, retaining its existing independent residual routing. Packed,
     /// ConvRot, NVFP4, W4A8, external, and full-training bases are left untouched.
     pub fn prepare_adapt(layers: &mut [&mut AdaptLinear]) -> candle_core::Result<Option<Self>> {
-        if !super::comparison::projection_enabled() {
+        if !super::policy::projection_enabled() {
             return Ok(None);
         }
         let bases: Option<Vec<_>> = layers.iter().map(|l| l.dense_base().cloned()).collect();
