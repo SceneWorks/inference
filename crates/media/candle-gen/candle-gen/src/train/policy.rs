@@ -102,6 +102,7 @@ fn selected_profile(model: &str, cuda: bool) -> (&'static str, TrainingProfile) 
     let (model, selected) = match model {
         "wan2_2_ti2v_5b" => ("wan2_2_ti2v_5b", TrainingProfile::WithoutE1),
         "kolors" => ("kolors", TrainingProfile::WithoutE3),
+        "z_image_turbo" => ("z_image_turbo", TrainingProfile::WithoutE3),
         "ltx_2_5_distilled" => ("ltx_2_5_distilled", TrainingProfile::WithoutE2),
         "sd3_5_medium" => ("sd3_5_medium", TrainingProfile::Legacy),
         _ => ("unselected", TrainingProfile::Current),
@@ -264,6 +265,7 @@ mod selector_metadata_tests {
         for (id, profile) in [
             ("wan2_2_ti2v_5b", TrainingProfile::WithoutE1),
             ("kolors", TrainingProfile::WithoutE3),
+            ("z_image_turbo", TrainingProfile::WithoutE3),
             ("ltx_2_5_distilled", TrainingProfile::WithoutE2),
             ("sd3_5_medium", TrainingProfile::Legacy),
         ] {
