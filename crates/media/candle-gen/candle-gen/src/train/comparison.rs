@@ -127,6 +127,30 @@ pub fn reference_owner_enabled() -> bool {
     )
 }
 
+/// Append actual canonical configuration/factory facts before any update.
+/// Do not include stage-specific output directories in this cross-stage identity.
+pub fn record_initialization(value: &serde_json::Value) {
+    #[cfg(feature = "model-inference-proof")]
+    if active_stage().is_some() {
+        super::profile::comparison_initialization(value);
+    }
+    let _ = value;
+}
+
+/// Authenticate private optimizer/EMA/buffer state without publishing tensor arrays.
+/// Call after its fresh constructor and before training, using stable tensor names.
+pub fn record_initial_tensors<'a>(
+    owner: &str,
+    tensors: impl IntoIterator<Item = (&'a str, &'a candle_core::Tensor)>,
+) -> candle_core::Result<()> {
+    #[cfg(feature = "model-inference-proof")]
+    if active_stage().is_some() {
+        return super::profile::comparison_named_initial_tensors(owner, tensors);
+    }
+    let _ = (owner, tensors);
+    Ok(())
+}
+
 /// One child process owns one stage. The closure MUST construct all native mutable
 /// training state afresh; it must not reuse a Run, optimizer, EMA, or packed bases.
 /// Model quality sampling is deliberately outside this timing-only supplement.

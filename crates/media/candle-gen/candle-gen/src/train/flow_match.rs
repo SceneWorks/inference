@@ -1043,6 +1043,12 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         }
     }
     on_progress(TrainingProgress::Preparing);
+    if super::comparison::active_stage().is_some() {
+        device.set_seed(cfg.seed)?;
+        super::comparison::record_initialization(&serde_json::json!({"owner":T::LABEL,
+            "training_config_debug":format!("{cfg:?}"),"seed":cfg.seed,
+            "factory":"fresh native flow-match child; actual device RNG seeded before cache and adapter construction"}));
+    }
     model.preflight(req)?;
     if req.cancel.is_cancelled() {
         return Err(CandleError::Canceled);

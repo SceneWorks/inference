@@ -125,6 +125,13 @@ impl candle_core::CustomOp1 for FrozenPackedInput {
 
 /// Apply a two-dimensional factor without materializing one copy per leading batch.
 pub(crate) fn apply_factor(x: &Tensor, w: &Tensor) -> candle_core::Result<Tensor> {
+    if super::comparison::active_stage().is_some() {
+        super::profile::cohort_reuse(if super::comparison::legacy_e1() {
+            "comparison:e1-factor:legacy"
+        } else {
+            "comparison:e1-factor:current"
+        });
+    }
     if super::profile::reference_math() || w.rank() != 2 || x.rank() <= 2 {
         return x.broadcast_matmul(w);
     }
@@ -179,6 +186,9 @@ impl FrozenProjectionPack {
     /// for packed bases, live full-training weights, or incompatible dtype/device/input geometry.
     /// Call once during model preparation, never inside the training step or checkpoint replay.
     pub fn prepare_lora(layers: &mut [&mut LoraLinear]) -> candle_core::Result<Option<Self>> {
+        if !super::comparison::projection_enabled() {
+            return Ok(None);
+        }
         let bases: Option<Vec<_>> = layers.iter().map(|l| l.dense_base().cloned()).collect();
         let Some(bases) = bases else { return Ok(None) };
         let Some((pack, replacements)) = Self::prepare(&bases)? else {
@@ -193,6 +203,9 @@ impl FrozenProjectionPack {
     /// AdaptLinear equivalent, retaining its existing independent residual routing. Packed,
     /// ConvRot, NVFP4, W4A8, external, and full-training bases are left untouched.
     pub fn prepare_adapt(layers: &mut [&mut AdaptLinear]) -> candle_core::Result<Option<Self>> {
+        if !super::comparison::projection_enabled() {
+            return Ok(None);
+        }
         let bases: Option<Vec<_>> = layers.iter().map(|l| l.dense_base().cloned()).collect();
         let Some(bases) = bases else { return Ok(None) };
         let Some((pack, replacements)) = Self::prepare(&bases)? else {

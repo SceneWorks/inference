@@ -20,7 +20,7 @@ thread_local! {
 pub fn reference_math() -> bool {
     #[cfg(feature = "model-inference-proof")]
     {
-        ACTIVE.get() && SEGMENT.get() == 0
+        (ACTIVE.get() && SEGMENT.get() == 0) || super::comparison::legacy_e1()
     }
     #[cfg(not(feature = "model-inference-proof"))]
     {
@@ -317,6 +317,97 @@ struct CohortObservation {
     initial: std::collections::HashMap<candle_core::TensorId, candle_core::Tensor>,
     reuse: std::collections::BTreeMap<String, u64>,
     probes: std::collections::HashSet<String>,
+    initialization: Vec<serde_json::Value>,
+    optimizer_initialization: Vec<serde_json::Value>,
+    initial_fingerprints: std::collections::HashMap<candle_core::TensorId, String>,
+}
+
+#[cfg(feature = "model-inference-proof")]
+pub(super) fn comparison_initialization(value: &serde_json::Value) {
+    assert!(
+        value.as_object().is_some_and(|v| !v.is_empty()),
+        "initialization requires actual source configuration"
+    );
+    COHORT.with(|state| {
+        let mut state = state.borrow_mut();
+        let state = state.as_mut().expect("comparison observer");
+        assert_eq!(state.updates, 0, "initialization must precede updates");
+        state.initialization.push(value.clone());
+    });
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn comparison_tensor_digest(tensor: &candle_core::Tensor) -> candle_core::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(format!("{:?}:{:?}", tensor.dtype(), tensor.dims()).as_bytes());
+    // Floating trainables/optimizer tensors retain exact bits through f32 for
+    // f32/f16/bf16. This diagnostic never runs inside a timed update.
+    for value in tensor
+        .detach()
+        .to_dtype(candle_core::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?
+    {
+        hash.update(value.to_bits().to_le_bytes());
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+pub(super) fn comparison_optimizer_initialization(
+    opt: &super::optim::TrainOptimizer,
+) -> candle_core::Result<()> {
+    #[cfg(feature = "model-inference-proof")]
+    if super::comparison::active_stage().is_some() {
+        use sha2::{Digest, Sha256};
+        let (tensors, meta) = opt
+            .snapshot()
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        let meta: std::collections::BTreeMap<_, _> = meta.into_iter().collect();
+        let mut state = std::collections::BTreeMap::new();
+        for (key, tensor) in tensors {
+            state.insert(key, comparison_tensor_digest(&tensor)?);
+        }
+        let mut hash = Sha256::new();
+        hash.update(serde_json::to_vec(&(&meta, &state)).expect("optimizer metadata"));
+        let record = serde_json::json!({"metadata":meta,"tensor_count":state.len(),"sha256":format!("{:x}",hash.finalize()),"basis":"actual fresh TrainOptimizer::from_config before any update"});
+        COHORT.with(|s| {
+            let mut s = s.borrow_mut();
+            let s = s.as_mut().expect("comparison observer");
+            assert_eq!(
+                s.updates, 0,
+                "optimizer must be freshly constructed before training"
+            );
+            s.optimizer_initialization.push(record);
+        });
+    }
+    let _ = opt;
+    Ok(())
+}
+
+#[cfg(feature = "model-inference-proof")]
+pub(super) fn comparison_named_initial_tensors<'a>(
+    owner: &str,
+    tensors: impl IntoIterator<Item = (&'a str, &'a candle_core::Tensor)>,
+) -> candle_core::Result<()> {
+    use sha2::{Digest, Sha256};
+    let mut named = std::collections::BTreeMap::new();
+    for (name, tensor) in tensors {
+        if named
+            .insert(name.to_owned(), comparison_tensor_digest(tensor)?)
+            .is_some()
+        {
+            candle_core::bail!("duplicate initial state tensor name");
+        }
+    }
+    if owner.is_empty() || named.is_empty() {
+        candle_core::bail!("missing private initial state");
+    }
+    let mut hash = Sha256::new();
+    hash.update(serde_json::to_vec(&named).expect("named metadata"));
+    comparison_initialization(&serde_json::json!({"kind":"actual-named-initial-tensors",
+        "owner":owner,"tensor_count":named.len(),"sha256":format!("{:x}",hash.finalize())}));
+    Ok(())
 }
 #[cfg(feature = "model-inference-proof")]
 thread_local! {
@@ -396,7 +487,16 @@ fn with_observation<T>(
             "preparation_including_load_cache_seconds": state.preparation_seconds,
             "steps": state.steps, "mechanism_consumption": state.reuse,
             "timing_scope": "synchronized forward/backward/update; first update warmup; diagnostic scalar validation excluded"});
-        if let Some(comparison) = comparison { report["comparison"] = comparison; }
+        if let Some(mut comparison) = comparison {
+            assert!(!state.initialization.is_empty(), "comparison needs actual canonical initialization facts");
+            let mut initial: Vec<_> = state.initial_fingerprints.values().cloned().collect(); initial.sort();
+            assert!(!initial.is_empty(), "comparison needs actual initial trainable tensor fingerprints");
+            comparison["initialization"] = serde_json::json!(state.initialization);
+            comparison["optimizer_initialization"] = serde_json::json!(state.optimizer_initialization);
+            comparison["initial_trainable_fingerprints"] = serde_json::json!(initial);
+            comparison["fingerprint_scope"] = serde_json::json!("multiset of reached trainable dtype/shape/exact f32-representable values; not named weight-byte attestation; fresh native factory covers private state");
+            report["comparison"] = comparison;
+        }
         std::fs::write(output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         eprintln!("COHORT_ACCEPTANCE_METRICS {report}");
     });
@@ -491,6 +591,12 @@ pub fn cohort_capture_initial(vars: &[candle_core::Var]) -> candle_core::Result<
                 state.initial.entry(var.as_tensor().id())
             {
                 entry.insert(var.as_tensor().detach().copy()?);
+                if super::comparison::active_stage().is_some() {
+                    state.initial_fingerprints.insert(
+                        var.as_tensor().id(),
+                        comparison_tensor_digest(var.as_tensor())?,
+                    );
+                }
             }
         }
         Ok(())
@@ -524,6 +630,11 @@ pub fn cohort_before_update(
                 state.initial.entry(tensor.id())
             {
                 entry.insert(tensor.detach().copy()?);
+                if super::comparison::active_stage().is_some() {
+                    state
+                        .initial_fingerprints
+                        .insert(tensor.id(), comparison_tensor_digest(tensor)?);
+                }
             }
         }
         Ok(())

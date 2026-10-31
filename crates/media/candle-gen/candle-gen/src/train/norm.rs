@@ -49,6 +49,16 @@ pub(super) fn supported(x: &Tensor) -> bool {
         && matches!(x.dtype(), DType::F32 | DType::BF16 | DType::F16)
 }
 
+fn comparison_norm_witness() {
+    if super::comparison::active_stage().is_some() {
+        super::profile::cohort_reuse(if super::comparison::legacy_e1() {
+            "comparison:e1-norm:legacy"
+        } else {
+            "comparison:e1-norm:current"
+        });
+    }
+}
+
 pub(super) fn normalize_composable(x: &Tensor, eps: f64, reference: bool) -> Result<Tensor> {
     let xf = x.to_dtype(DType::F32)?;
     let width = xf.dim(D::Minus1)?;
@@ -72,7 +82,11 @@ pub fn rms_normalize_f32(x: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 fn rms_normalize_f32_impl(x: &Tensor, eps: f64, reference: bool) -> Result<Tensor> {
-    if candle_core::backprop::grad_do_not_detach() || !supported(x) {
+    comparison_norm_witness();
+    if super::comparison::legacy_e1()
+        || candle_core::backprop::grad_do_not_detach()
+        || !supported(x)
+    {
         return normalize_composable(x, eps, reference);
     }
     let out = normalize_composable(&x.detach(), eps, reference)?;
@@ -132,6 +146,7 @@ impl CustomOp1 for Normalize {
 }
 
 fn rms_norm_diff_impl(x: &Tensor, weight: &Tensor, eps: f64, reference: bool) -> Result<Tensor> {
+    comparison_norm_witness();
     let broadcast_into_x = weight.rank() <= x.rank()
         && weight
             .dims()
@@ -139,7 +154,8 @@ fn rms_norm_diff_impl(x: &Tensor, weight: &Tensor, eps: f64, reference: bool) ->
             .rev()
             .zip(x.dims().iter().rev())
             .all(|(w, x)| *w == 1 || w == x);
-    if candle_core::backprop::grad_do_not_detach()
+    if super::comparison::legacy_e1()
+        || candle_core::backprop::grad_do_not_detach()
         || !supported(x)
         || weight.dtype() != DType::F32
         || !x.device().same_device(weight.device())
