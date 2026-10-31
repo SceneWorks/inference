@@ -3528,11 +3528,10 @@ impl FlowMatchTrainer for LtxTrainer {
                 let av_cfg = AvConfig::from_bundle(bundle)?;
                 let conn_cfg = ConnectorConfig::from_bundle(bundle)?;
                 let audio_conn_cfg = ConnectorConfig::audio_from_bundle(bundle)?;
-                let connector_path = tier
-                    .file(Ltx25Component::Connector)
-                    .map_err(|error| CandleError::Msg(error.to_string()))?;
-                let connector =
-                    candle_gen::mmap_var_builder(&[connector_path], DType::BF16, device)?;
+                // Generation and training consume the same converted component namespace.
+                // In particular, connector keys retain `to_out.0` / `ff.net.*` while only
+                // their upstream `model.diffusion_model.` prefix is stripped.
+                let connector = tier.connector_vb(DType::BF16, device)?;
                 let connector_root = connector.pp("model.diffusion_model");
                 let encoder = Ltx25TextEncoder::from_bundle_av(
                     bundle,
@@ -3795,7 +3794,7 @@ impl FlowMatchTrainer for LtxTrainer {
                 let av_cfg = AvConfig::from_bundle(bundle)?;
                 // The config-driven `ff_bias` is crucial here: taking `ltx_2_3().video` would
                 // require the absent LTX-2.5 FFN bias tensors and make the QLoRA path unusable.
-                let dit = tier.component_vb(Ltx25Component::Transformer, DType::F32, device)?;
+                let dit = tier.transformer_vb(DType::F32, device)?;
                 Ok(TrainingDiT::Ltx25(Box::new(AvDiT::new(
                     dit.pp("model.diffusion_model"),
                     &av_cfg,
