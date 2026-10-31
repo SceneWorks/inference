@@ -458,6 +458,9 @@ impl JointAttention {
     }
 
     fn prepare_training(&mut self) -> Result<()> {
+        if !candle_gen::train::comparison::projection_enabled() {
+            return Ok(());
+        }
         self.qkv_pack = FrozenProjectionPack::prepare_adapt(&mut [
             &mut self.to_q,
             &mut self.to_k,
@@ -625,6 +628,9 @@ impl SelfAttention {
     }
 
     fn prepare_training(&mut self) -> Result<()> {
+        if !candle_gen::train::comparison::projection_enabled() {
+            return Ok(());
+        }
         self.qkv_pack = FrozenProjectionPack::prepare_adapt(&mut [
             &mut self.to_q,
             &mut self.to_k,
@@ -1031,6 +1037,9 @@ impl Sd3Transformer {
     /// unprojected caption, so preparation retains only the smaller projected stream. Joint
     /// block text states and adapted context embedders always stay live.
     pub fn prepare_training_context(&mut self, context: &Tensor) -> Result<Tensor> {
+        if !candle_gen::train::comparison::cache_enabled() {
+            return Ok(context.clone());
+        }
         let Some(base) = self.context_embedder.dense_base() else {
             return Ok(context.clone());
         };

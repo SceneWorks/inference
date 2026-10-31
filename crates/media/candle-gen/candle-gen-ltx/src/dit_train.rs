@@ -132,6 +132,9 @@ impl TrainAttention {
     }
 
     fn prepare_training(&mut self, self_attention: bool) -> Result<()> {
+        if !candle_gen::train::comparison::projection_enabled() {
+            return Ok(());
+        }
         self.packs = TrainingProjectionPacks::prepare(
             &mut self.to_q,
             &mut self.to_k,
@@ -379,6 +382,9 @@ impl LtxDiT {
     }
 
     pub(crate) fn prepare_training_positions(&mut self, positions: &Tensor) -> Result<()> {
+        if !candle_gen::train::comparison::cache_enabled() {
+            return Ok(());
+        }
         if !self
             .training_rope
             .iter()

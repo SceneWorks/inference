@@ -395,6 +395,33 @@ impl AnimaTrainer {
     ) -> Result<TrainingOutput> {
         let cfg = &req.config;
         let device = &self.device;
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            // Seed the actual native device before cache noise/adapters are constructed.
+            device.set_seed(cfg.seed)?;
+            assert!(
+                !cfg.resume,
+                "comparison stages require a fresh optimizer/run"
+            );
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "anima-native-training",
+                "training_config_debug": format!("{cfg:?}"),
+                "seed": cfg.seed,
+                "optimizer": cfg.optimizer,
+                "learning_rate": cfg.learning_rate,
+                "lr_scheduler": format!("{:?}", cfg.lr_scheduler),
+                "lr_warmup_steps": cfg.lr_warmup_steps,
+                "gradient_checkpointing": cfg.gradient_checkpointing,
+                "cache_latents_requested": cfg.cache_latents,
+                "cache_text_embeddings_requested": cfg.cache_text_embeddings,
+                "actual_preexisting_cache": "native VAE latents and text-encoder outputs cached before updates; retained in every arm",
+                "video_frames": 1,
+                "audio_mode": "none",
+                "model_source": format!("{:?}", self.source),
+                "captions": req.items.iter().map(|item| item.caption.as_str()).collect::<Vec<_>>(),
+                "reset": "fresh native trainer/process; seeded native device; new optimizer/zero accumulation"
+            }));
+        }
         on_progress(TrainingProgress::Preparing);
         // Epic 2123 E7: the depth-anchoring models count against the device budget (no-op with
         // nothing enabled), BEFORE any load or caching.
@@ -505,6 +532,13 @@ impl AnimaTrainer {
                 )?,
             }
         };
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "anima-actual-raw-cache",
+                "entries": cache.iter().map(|(latent, source, target_ids, _)| serde_json::json!({"latent":latent.dims(),"source_caption":source.dims(),"target_caption_ids":target_ids.dims()})).collect::<Vec<_>>()
+            }));
+        }
         let latent_inputs = cache.iter().map(|entry| &entry.0).collect::<Vec<_>>();
         let conditioner_inputs = cache
             .iter()

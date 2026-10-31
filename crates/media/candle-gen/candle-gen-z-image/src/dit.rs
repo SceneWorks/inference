@@ -612,6 +612,9 @@ impl ZImageTransformer2DModel {
     }
 
     pub(crate) fn prepare_training_projections(&mut self) -> Result<()> {
+        if !candle_gen::train::comparison::projection_enabled() {
+            return Ok(());
+        }
         for block in self
             .noise_refiner
             .iter_mut()

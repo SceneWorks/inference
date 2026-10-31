@@ -1027,6 +1027,33 @@ impl WanMoeTrainer {
         validate_flow_match_request(req, LABEL)?;
         let cfg = &req.config;
         let device = &self.device;
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            // Seed the actual native device before cache noise/adapters are constructed.
+            device.set_seed(cfg.seed)?;
+            assert!(
+                !cfg.resume,
+                "comparison stages require a fresh optimizer/run"
+            );
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "wan-native-training",
+                "training_config_debug": format!("{cfg:?}"),
+                "seed": cfg.seed,
+                "optimizer": cfg.optimizer,
+                "learning_rate": cfg.learning_rate,
+                "lr_scheduler": format!("{:?}", cfg.lr_scheduler),
+                "lr_warmup_steps": cfg.lr_warmup_steps,
+                "gradient_checkpointing": cfg.gradient_checkpointing,
+                "cache_latents_requested": cfg.cache_latents,
+                "cache_text_embeddings_requested": cfg.cache_text_embeddings,
+                "actual_preexisting_cache": "native VAE latents and text-encoder outputs cached before updates; retained in every arm",
+                "video_frames": 1,
+                "audio_mode": "none",
+                "model_source": self.root.display().to_string(),
+                "captions": req.items.iter().map(|item| item.caption.as_str()).collect::<Vec<_>>(),
+                "reset": "fresh native trainer/process; seeded native device; new optimizer/zero accumulation"
+            }));
+        }
         on_progress(TrainingProgress::Preparing);
         // sc-2127 — one training edge per resolution bucket (just the floored `resolution` when buckets
         // are off); the preview renders at the largest. Frame count is untouched (stills, T = 1).
@@ -1203,6 +1230,13 @@ impl WanMoeTrainer {
         let expert_count = plans.len() as u32;
         let (expert_schedule_micro, expert_warmup) =
             expert_schedule_inputs(cfg.steps, expert_count, cfg.lr_warmup_steps);
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "wan-actual-raw-cache",
+                "entries": cache.iter().map(|(latent, caption, _)| serde_json::json!({"latent":latent.dims(),"caption":caption.dims()})).collect::<Vec<_>>()
+            }));
+        }
         let mut experts: Vec<ExpertState> = Vec::with_capacity(plans.len());
         for (idx, (sub, suffix, band, _micro)) in plans.into_iter().enumerate() {
             let mut dit = WanTransformerTrain::new(

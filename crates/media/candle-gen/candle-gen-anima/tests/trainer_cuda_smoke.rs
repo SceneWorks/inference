@@ -151,6 +151,68 @@ fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, root: &std::path::Pat
 #[cfg(feature = "model-inference-proof")]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn anima_bounded_acceleration_acceptance() {
+    if let Some(stage) = candle_gen::train::comparison::requested_stage() {
+        use candle_gen::train::comparison::{self, ComparisonCadence, ComparisonStage};
+        assert_ne!(
+            stage,
+            ComparisonStage::MinusReferenceOwner,
+            "Anima uses composable reference attention"
+        );
+        let root = bounded_root();
+        comparison::with_stage(
+            &root.join("comparison_metrics.json"),
+            "anima_base",
+            ComparisonCadence::Ordinary,
+            || {
+                let snapshot = PathBuf::from(
+                    std::env::var_os("ANIMA_TRAIN_SNAPSHOT").expect("installed snapshot"),
+                );
+                let input = root.join("comparison_input.png");
+                image::RgbImage::from_pixel(64, 64, image::Rgb([80, 140, 210]))
+                    .save(&input)
+                    .unwrap();
+                let mut trainer = candle_gen_anima::provider_registry()
+                    .unwrap()
+                    .load_trainer("anima_base", &LoadSpec::new(WeightsSource::Dir(snapshot)))
+                    .unwrap();
+                let output = trainer
+                    .train(
+                        &TrainingRequest {
+                            items: vec![TrainingItem::captioned(input, "a blue tile".into())],
+                            config: TrainingConfig {
+                                rank: 2,
+                                alpha: 2.,
+                                learning_rate: 1e-3,
+                                steps: 4,
+                                resolution: 512,
+                                batch_size: 1,
+                                gradient_accumulation: 1,
+                                lr_warmup_steps: 0,
+                                seed: 7,
+                                train_dtype: "bf16".into(),
+                                gradient_checkpointing: false,
+                                save_every: 0,
+                                sample_every: 0,
+                                resume: false,
+                                ..Default::default()
+                            },
+                            output_dir: root.join("comparison_out"),
+                            file_name: "comparison.safetensors".into(),
+                            trigger_words: vec![],
+                            cancel: CancelFlag::new(),
+                        },
+                        &mut |_| {},
+                    )
+                    .expect("joint DiT/conditioner comparison updates");
+                assert_eq!(output.steps, 4);
+                assert!(output.final_loss.is_finite());
+                assert!(output.adapter_path.is_file());
+            },
+        );
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::anima_bounded_acceleration_acceptance");
+        return;
+    }
+
     let root = bounded_root();
     let snapshot =
         PathBuf::from(std::env::var_os("ANIMA_TRAIN_SNAPSHOT").expect("pinned installed snapshot"));

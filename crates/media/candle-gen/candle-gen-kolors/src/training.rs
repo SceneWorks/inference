@@ -476,6 +476,33 @@ impl KolorsTrainer {
     ) -> Result<TrainingOutput> {
         let cfg = &req.config;
         let device = &self.device;
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            // Seed the actual native device before cache noise/adapters are constructed.
+            device.set_seed(cfg.seed)?;
+            assert!(
+                !cfg.resume,
+                "comparison stages require a fresh optimizer/run"
+            );
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "kolors-native-training",
+                "training_config_debug": format!("{cfg:?}"),
+                "seed": cfg.seed,
+                "optimizer": cfg.optimizer,
+                "learning_rate": cfg.learning_rate,
+                "lr_scheduler": format!("{:?}", cfg.lr_scheduler),
+                "lr_warmup_steps": cfg.lr_warmup_steps,
+                "gradient_checkpointing": cfg.gradient_checkpointing,
+                "cache_latents_requested": cfg.cache_latents,
+                "cache_text_embeddings_requested": cfg.cache_text_embeddings,
+                "actual_preexisting_cache": "native VAE latents and text-encoder outputs cached before updates; retained in every arm",
+                "video_frames": 1,
+                "audio_mode": "none",
+                "model_source": self.root.display().to_string(),
+                "captions": req.items.iter().map(|item| item.caption.as_str()).collect::<Vec<_>>(),
+                "reset": "fresh native trainer/process; seeded native device; new optimizer/zero accumulation"
+            }));
+        }
         let dtype = compute_dtype(&cfg.train_dtype);
         // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off).
         let edges = bucket_edges(cfg);
@@ -560,21 +587,33 @@ impl KolorsTrainer {
                 device,
             )?,
         };
-        let mut contexts = HashMap::<_, Tensor>::new();
-        for (_, context, _, _) in &mut cache {
-            let id = context.id();
-            *context = match contexts.get(&id) {
-                Some(context) => context.clone(),
-                None => {
-                    let projected = __model_proof_output!(
-                        context_projection.forward(&context.to_dtype(dtype)?)
-                    )?;
-                    contexts.insert(id, projected.clone());
-                    projected
-                }
-            };
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "kolors-actual-raw-cache",
+                "entries": cache.iter().map(|(latent, caption, pooled, _)| serde_json::json!({"latent":latent.dims(),"caption":caption.dims(),"pooled":pooled.dims()})).collect::<Vec<_>>()
+            }));
         }
-        drop(context_projection);
+        let mut contexts = HashMap::<_, Tensor>::new();
+        if candle_gen::train::comparison::cache_enabled() {
+            for (_, context, _, _) in &mut cache {
+                let id = context.id();
+                *context = match contexts.get(&id) {
+                    Some(context) => context.clone(),
+                    None => {
+                        let projected = __model_proof_output!(
+                            context_projection.forward(&context.to_dtype(dtype)?)
+                        )?;
+                        contexts.insert(id, projected.clone());
+                        projected
+                    }
+                };
+            }
+        }
+        // Legacy/E2-off evaluates the real Kolors encoder_hid_proj on every step.
+        // Other arms release its weights after replacing the frozen cache entries.
+        let uncached_context_projection =
+            (!candle_gen::train::comparison::cache_enabled()).then_some(context_projection);
         let contexts = contexts.into_values().collect::<Vec<_>>();
         let preparation_bytes = unet.training_preparation_bytes(&contexts)? as u64;
         flow_match::check_preparation_memory(
@@ -644,7 +683,13 @@ impl KolorsTrainer {
             let timestep = rng.random_range(0..NUM_TRAIN_TIMESTEPS);
             let noise = sample_noise(x0.dims(), noise_seed(cfg.seed, step), device)?;
             let (timestep, aux) = plan_timestep(&sample, timestep)?;
-            let projected = context;
+            let projected = uncached_context_projection
+                .as_ref()
+                .map(|projection| {
+                    __model_proof_output!(projection.forward(&context.to_dtype(dtype)?))
+                })
+                .transpose()?;
+            let projected = projected.as_ref().unwrap_or(context);
             let (losses, grads) = kolors_step(
                 &unet,
                 &schedule,

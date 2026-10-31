@@ -2119,6 +2119,33 @@ impl QwenImage21Trainer {
         };
         let cfg = &req.config;
         let device = self.device.clone();
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            // Seed the actual native device before cache noise/adapters are constructed.
+            device.set_seed(cfg.seed)?;
+            assert!(
+                !cfg.resume,
+                "comparison stages require a fresh optimizer/run"
+            );
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "qwen-image-2-1-native-training",
+                "training_config_debug": format!("{cfg:?}"),
+                "seed": cfg.seed,
+                "optimizer": cfg.optimizer,
+                "learning_rate": cfg.learning_rate,
+                "lr_scheduler": format!("{:?}", cfg.lr_scheduler),
+                "lr_warmup_steps": cfg.lr_warmup_steps,
+                "gradient_checkpointing": cfg.gradient_checkpointing,
+                "cache_latents_requested": cfg.cache_latents,
+                "cache_text_embeddings_requested": cfg.cache_text_embeddings,
+                "actual_preexisting_cache": "native VAE latents and text-encoder outputs cached before updates; retained in every arm",
+                "video_frames": 1,
+                "audio_mode": "none",
+                "model_source": self.root.display().to_string(),
+                "captions": req.items.iter().map(|item| item.caption.as_str()).collect::<Vec<_>>(),
+                "reset": "fresh native trainer/process; seeded native device; new optimizer/zero accumulation"
+            }));
+        }
         let targets = self.targets(cfg);
         if targets.is_empty() {
             return Err(Error::Msg(format!(
@@ -2407,6 +2434,13 @@ impl QwenImage21Trainer {
             }
         }
 
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "qwen-image-2-1-actual-raw-cache",
+                "entries": cache.iter().map(|entry| serde_json::json!({"latent":entry.x0.dims(),"caption":entry.text.dims(),"joint_layout":format!("{:?}",entry.layout),"references":entry.references.iter().map(Tensor::dims).collect::<Vec<_>>()})).collect::<Vec<_>>()
+            }));
+        }
         // sc-26857: invariant preparation only after adapter installation and resume.
         let prepared_examples: Vec<_> = cache
             .iter()
