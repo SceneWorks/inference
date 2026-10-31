@@ -69,7 +69,10 @@ impl JobTrainingPolicy {
             profile: selected,
             resumed: false,
         };
-        if req.config.resume {
+        // Only CUDA LTX25 owns this shared snapshot contract. Other native
+        // trainers (including MOSS) own different resume formats; resolving
+        // their unchanged Current policy must not inspect or intercept them.
+        if req.config.resume && is_cuda && model == "ltx_2_5_distilled" {
             if let Some((path, _)) = super::checkpoint::find_latest_resume(
                 &req.output_dir,
                 super::checkpoint::file_stem(&req.file_name),
@@ -395,8 +398,18 @@ mod selector_metadata_tests {
                 .profile(),
             TrainingProfile::WithoutE2
         );
-        assert!(JobTrainingPolicy::resolve("ltx_2_5_distilled", false, &req).is_err());
-        assert!(JobTrainingPolicy::resolve("sd3_5_medium", true, &req).is_err());
+        assert_eq!(
+            JobTrainingPolicy::resolve("ltx_2_5_distilled", false, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+        assert_eq!(
+            JobTrainingPolicy::resolve("sd3_5_medium", true, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Legacy
+        );
         write_header(
             dir.path(),
             serde_json::json!({RESUME_KEY: "measured-reference-v1/plus-streaming"}),
@@ -407,5 +420,64 @@ mod selector_metadata_tests {
             serde_json::json!({RESUME_KEY: "future-v2/minus-e2"}),
         );
         assert!(JobTrainingPolicy::resolve("ltx_2_5_distilled", true, &req).is_err());
+    }
+
+    #[test]
+    fn native_and_non_cuda_resume_owners_do_not_peek_shared_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut req = request(dir.path());
+        req.config.resume = true;
+        // A matching shared snapshot name with an invalid header discriminates
+        // a real read from the required no-interception path. No tensors exist.
+        std::fs::write(
+            dir.path().join("adapter-step000004.resume.safetensors"),
+            b"invalid shared header",
+        )
+        .unwrap();
+        for model in ["moss_image_base", "moss_image_sft", "unknown", "krea"] {
+            for cuda in [false, true] {
+                assert_eq!(
+                    JobTrainingPolicy::resolve(model, cuda, &req)
+                        .unwrap()
+                        .profile(),
+                    TrainingProfile::Current
+                );
+            }
+        }
+        for (model, profile) in [
+            ("wan2_2_ti2v_5b", TrainingProfile::WithoutE1),
+            ("kolors", TrainingProfile::WithoutE3),
+            ("z_image_turbo", TrainingProfile::WithoutE3),
+            ("sd3_5_medium", TrainingProfile::Legacy),
+        ] {
+            assert_eq!(
+                JobTrainingPolicy::resolve(model, true, &req)
+                    .unwrap()
+                    .profile(),
+                profile
+            );
+            assert_eq!(
+                JobTrainingPolicy::resolve(model, false, &req)
+                    .unwrap()
+                    .profile(),
+                TrainingProfile::Current
+            );
+        }
+        assert_eq!(
+            JobTrainingPolicy::resolve("ltx_2_5_distilled", false, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+        assert!(JobTrainingPolicy::resolve("ltx_2_5_distilled", true, &req).is_err());
+        req.output_dir = dir.path().join("nonexistent-native-resume-path");
+        for model in ["moss_image_base", "moss_image_sft", "unknown"] {
+            assert_eq!(
+                JobTrainingPolicy::resolve(model, true, &req)
+                    .unwrap()
+                    .profile(),
+                TrainingProfile::Current
+            );
+        }
     }
 }
