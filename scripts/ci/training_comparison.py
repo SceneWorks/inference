@@ -219,7 +219,8 @@ def apply_stage(row: dict, env: dict) -> None:
             shared = parent / 'comparison-iris-frozen'
             proof.unlinked_path(shared, parent)
             shared.mkdir(exist_ok=True)
-            owner = {'schema_version':1,'protocol':PROTOCOL,'binding':proof.identity(row),
+            owner = {'schema_version':1,'protocol':PROTOCOL,
+                     'binding':{key:row[key] for key in ('package','target','fqn')},
                      'source_revision':source,'github_run_id':run_id,'github_run_attempt':attempt,
                      'parent_marker_sha256':hashlib.sha256(marker_bytes).hexdigest(),
                      'cache_scope':'Iris restoration immutable frozen checkpoint decode; constant all stages, not E2'}

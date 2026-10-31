@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -309,6 +310,23 @@ class ComparisonContract(unittest.TestCase):
         case['physical_execution']['claim_deadline_monotonic']=1400.
         with self.assertRaises(ValueError):comparison.verify_stage_deadline(case,child,1100.)
 
+    def rust_iris_cache_owner(self,source,run,attempt,marker):
+        # Evaluate only the consumer's JSON schema, never Rust/model code. This
+        # cross-language check must not duplicate the Python writer's field list.
+        root=Path(__file__).resolve().parents[2]
+        text=(root/'crates/media/candle-gen/candle-gen-iris/src/train/frozen_cache.rs').read_text(encoding='utf-8')
+        schema=re.search(r'fn expected_owner\([^)]*\) -> Value \{\s*json!\((\{.*?\})\)\s*\}',text,re.S)
+        self.assertIsNotNone(schema,'Rust expected_owner must expose its JSON contract')
+        scope=re.search(r'const CACHE_SCOPE: &str\s*=\s*("(?:\\.|[^"\\])*")\s*;',text)
+        self.assertIsNotNone(scope,'Rust cache scope constant is part of the owner contract')
+        values={'source':source,'run':run,'attempt':attempt,'marker':marker,'CACHE_SCOPE':json.loads(scope[1])}
+        def literal(match):
+            token=match[0]
+            if token.startswith('"'):return token
+            self.assertIn(token,values,'unexpected Rust JSON expression requires an explicit metadata evaluator')
+            return json.dumps(values[token])
+        return json.loads(re.sub(r'"(?:\\.|[^"\\])*"|[A-Za-z_]\w*',literal,schema[1]))
+
     def test_iris_cache_directory_is_same_owned_scope_all_stages(self):
         with tempfile.TemporaryDirectory() as directory:
             parent=Path(directory)/'runtime';parent.mkdir()
@@ -321,7 +339,23 @@ class ComparisonContract(unittest.TestCase):
             self.assertEqual(first[key],second[key])
             owner=json.loads((Path(first[key])/'comparison-cache-owner.json').read_text())
             self.assertEqual(owner['source_revision'],'f'*40)
-            self.assertEqual(owner['binding'],proof.identity(row))
+            expected=self.rust_iris_cache_owner('f'*40,'123','1',hashlib.sha256(marker.read_bytes()).hexdigest())
+            self.assertEqual(owner,expected)
+            owner_path=Path(first[key])/'comparison-cache-owner.json'
+            mutations=(
+                lambda value:value.update(binding=proof.identity(row)),
+                lambda value:value['binding'].update(fqn='other::case'),
+                lambda value:value.update(source_revision='e'*40),
+                lambda value:value.update(github_run_id='124'),
+                lambda value:value.update(github_run_attempt=2),
+                lambda value:value.update(parent_marker_sha256='0'*64),
+            )
+            for mutate in mutations:
+                changed=copy.deepcopy(owner);mutate(changed)
+                owner_path.write_text(json.dumps(changed,sort_keys=True)+'\n')
+                with self.subTest(owner=changed),self.assertRaisesRegex(ValueError,'ownership/source/run binding mismatch'):
+                    proof.apply_configuration(self.row('iris-restoration','minus-e2'),environment())
+            owner_path.write_text(json.dumps(owner,sort_keys=True)+'\n')
             self.assertNotEqual(first['BESPOKE_RUNTIME_DIR'],second['BESPOKE_RUNTIME_DIR'])
             wrong=environment();wrong['GITHUB_SHA']='e'*40
             with self.assertRaises(ValueError):proof.apply_configuration(self.row('iris-restoration','minus-e2'),wrong)
