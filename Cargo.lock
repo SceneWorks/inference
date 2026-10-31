@@ -787,7 +787,9 @@ dependencies = [
  "sceneworks-gen-core-tokenizer",
  "sceneworks-gen-core-train",
  "serde_json",
+ "sha2",
  "tempfile",
+ "zip",
 ]
 
 [[package]]

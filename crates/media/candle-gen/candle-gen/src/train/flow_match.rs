@@ -991,7 +991,14 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     let device = model.device();
     let bounded_profile = super::profile::active();
     let recovery_profile = super::profile::recovery_active();
-    let profile_update_limit = if recovery_profile { 6 } else { 18 };
+    let paired_profile = super::profile::paired_active();
+    let profile_update_limit = if recovery_profile {
+        6
+    } else if paired_profile {
+        12
+    } else {
+        18
+    };
     if bounded_profile
         && (T::LABEL != "krea trainer"
             || cfg.steps != profile_update_limit
@@ -1004,18 +1011,48 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             || cfg.sample_every < cfg.steps
             || cfg.save_every != 0)
     {
-        return Err(CandleError::Msg("bounded Krea profile requires its exact source-owned update limit (18 default or 6 explicit recovery), CUDA,rank16,1024px,accum1,checkpoint OFF,no resume/intermediate save,and existing preview cadence beyond the bounded run".into()));
+        return Err(CandleError::Msg("bounded Krea profile requires its exact source-owned update limit (18 default, 6 recovery or 12 paired), CUDA,rank16,1024px,accum1,checkpoint OFF,no resume/intermediate save,and existing preview cadence beyond the bounded run".into()));
     }
-    if recovery_profile
+    if (recovery_profile || paired_profile)
         && (cfg.alpha != 16.
             || cfg.seed != 7
             || cfg.train_dtype != "bf16"
             || cfg.sample_every != 500
-            || cfg.network_type != NetworkType::Lora)
+            || cfg.network_type != NetworkType::Lora
+            || (paired_profile
+                && (cfg.learning_rate != 0.001_f32
+                    || cfg.batch_size != 1
+                    || cfg.optimizer != "adamw"
+                    || cfg.weight_decay != 0.
+                    || cfg.lr_warmup_steps != 0
+                    || cfg.lr_scheduler != crate::gen_core::train::LrSchedule::Constant)))
     {
-        return Err(CandleError::Msg("six-update Krea recovery requires the unchanged rank16/alpha16 BF16 seed7 LoRA recipe and preview cadence500".into()));
+        return Err(CandleError::Msg("bounded recovery/paired Krea requires the unchanged rank16/alpha16 BF16 seed7 LoRA recipe and preview cadence500".into()));
+    }
+    if paired_profile {
+        let expected = TrainingConfig {
+            steps: 12,
+            learning_rate: 0.001_f32,
+            save_every: 0,
+            seed: 7,
+            sample_every: 500,
+            ..Default::default()
+        };
+        if cfg != &expected || req.items.len() != 2 {
+            return Err(CandleError::Msg("paired Krea requires the complete canonical source recipe and two original swatches".into()));
+        }
     }
     on_progress(TrainingProgress::Preparing);
+    if super::comparison::active_stage().is_some() {
+        device.set_seed(cfg.seed)?;
+        super::comparison::record_initialization(&serde_json::json!({"owner":T::LABEL,
+            "training_config_debug":format!("{cfg:?}"),"seed":cfg.seed,
+            "optimizer":cfg.optimizer,"learning_rate_f32":cfg.learning_rate,
+            "lr_scheduler":format!("{:?}",cfg.lr_scheduler),"lr_warmup_steps":cfg.lr_warmup_steps,
+            "gradient_checkpointing":cfg.gradient_checkpointing,
+            "cache_scope":"pre-existing encoder/VAE caching unchanged; only source-owned frozen-conditioning/geometry optimization is controlled",
+            "factory":"fresh native flow-match child; actual device RNG seeded before cache and adapter construction"}));
+    }
     model.preflight(req)?;
     if req.cancel.is_cancelled() {
         return Err(CandleError::Canceled);
@@ -1140,7 +1177,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         }
         super::profile::cohort_begin_step(device)?;
         let segment = if bounded_profile {
-            if recovery_profile {
+            if recovery_profile || (paired_profile && step > 6) {
                 2
             } else {
                 ((step - 1) / 6) as usize
@@ -1168,7 +1205,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
                     effective_weight_decay(cfg),
                 )?;
                 update_idx = 0;
-                if segment == 1 || recovery_profile {
+                if segment == 1 || recovery_profile || paired_profile {
                     device.synchronize()?;
                     let prepare_start = std::time::Instant::now();
                     model.prepare_training(&mut dit, &mut cache, &mut aux, req, device)?;
@@ -1179,6 +1216,26 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
                     );
                 }
             }
+            if paired_profile && logical_step == 1 {
+                if pending != 0 || accumulated.is_some() || update_idx != 0 || set.vars.len() != 224
+                {
+                    return Err(CandleError::Msg(
+                        "paired initial optimizer/accumulation state mismatch".into(),
+                    ));
+                }
+                for (var, value) in set.vars.iter().zip(&initial) {
+                    let equal = var
+                        .as_tensor()
+                        .eq(value)?
+                        .to_dtype(DType::F64)?
+                        .sum_all()?
+                        .to_scalar::<f64>()?;
+                    if equal != var.as_tensor().elem_count() as f64 {
+                        return Err(CandleError::Msg("paired initial adapter mismatch".into()));
+                    }
+                }
+                eprintln!("KREA_PROFILE_PAIRED_STATE segment={segment} adapter_initial_equal=true parameters=224 optimizer=fresh-zero-moments update_idx=0 rng=stateless-seed7-logical1to6");
+            }
             device.synchronize()?;
             crate::training_attention::take_training_attention_counts();
             super::profile::begin_step(segment, logical_step);
@@ -1186,7 +1243,8 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         if bounded_profile {
             super::profile::boundary(&format!("phase=update-start physical_update={step} segment={segment} logical_step={logical_step}"))?;
         }
-        let step_start = bounded_profile.then(std::time::Instant::now);
+        let original_step_start =
+            (bounded_profile && !paired_profile).then(std::time::Instant::now);
         let sample = step_sample(aux_driver.as_mut(), logical_step, &schedule);
         let cached = &cache[sample.entry];
         let mode = if bounded_profile && segment == 2 {
@@ -1194,6 +1252,17 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         } else {
             crate::training_attention::TrainingAttentionMode::Reference
         };
+        if paired_profile {
+            let original_math = super::profile::reference_math();
+            if original_math != (segment == 0) {
+                return Err(CandleError::Msg(
+                    "paired original/candidate math selector mismatch".into(),
+                ));
+            }
+            eprintln!("KREA_PROFILE_PAIRED_PATH physical_update={step} segment={segment} reference_math={original_math} attention_mode={mode:?}");
+        }
+        let step_start =
+            original_step_start.or_else(|| paired_profile.then(std::time::Instant::now));
         let compute = || {
             model.micro_step(
                 &dit,
@@ -1318,6 +1387,9 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
                 }
                 if recovery_profile {
                     eprintln!("KREA_PROFILE_RECOVERY_ADAPTER changed=true");
+                }
+                if paired_profile {
+                    eprintln!("KREA_PROFILE_PAIRED_ADAPTER segment={segment} changed=true");
                 }
                 if segment == 1 {
                     optimized_final = set
@@ -1469,6 +1541,14 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             &profile_losses[2],
             profile_candidates[2],
         )?;
+    } else if paired_profile {
+        if steps_run != 12 || pending != 0 || accumulated.is_some() {
+            return Err(CandleError::Msg(
+                "paired comparison incomplete or hidden extra update".into(),
+            ));
+        }
+        #[cfg(feature = "model-inference-proof")]
+        super::profile::finish_krea_paired(&profile_times, &profile_losses, profile_candidates[2])?;
     } else if bounded_profile {
         if steps_run != 18 || profile_times.iter().any(|t| t.len() != 4) {
             return Err(CandleError::Msg(

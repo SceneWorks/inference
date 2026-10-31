@@ -26,7 +26,7 @@ from scripts.ci.model_proof_parent_helpers import validate_parent_helpers
 from scripts.ci.model_proof_resources import validate_child_visibility
 from scripts.ci.model_proof_inputs import assess_inputs, receipt_claims, validate_contract
 from scripts.ci import model_proof_multi_cuda as multi_cuda
-from scripts.ci import krea_recovery
+from scripts.ci import krea_recovery, krea_paired, training_comparison
 from scripts.ci.native_darwin_sdk import select_sdk as select_native_darwin_sdk
 from scripts.ci.prepare_iris_quant_proof_assets import validate_receipt as validate_iris_asset_receipt
 from scripts.ci.prepare_bespoke_training_proof_assets import exact_bindings as bespoke_training_bindings
@@ -135,9 +135,39 @@ def validate_source_control_names(row: dict, controls: list[str]) -> None:
     assets = set(row.get('asset_environment_names_in_source', []))
     assets.update(row.get('external_asset_environment', []))
     for name in controls:
+        if name in ('MODEL_PROOF_COMPARISON_BINDING', 'MODEL_PROOF_COMPARISON_STAGE'):
+            # Explicit narrow authority for the source-owned comparison driver,
+            # not a general MODEL_PROOF/process-environment injection exception.
+            comparison_metadata_case(row)
+            continue
         if (not re.fullmatch(r'[A-Z][A-Z0-9_]*', name) or RESERVED_CONFIGURATION_CONTROL.search(name)
                 or SENSITIVE_ENVIRONMENT.search(name) or name in assets):
             raise ValueError('source control cannot inject process/child/asset/credential/device-authority environment: ' + name)
+
+
+def comparison_metadata_case(row: dict) -> None:
+    """Local metadata-only validation also reached by automatic compile planning.
+
+    Do not route this path through the manual comparison process driver. Its
+    source manifest is literal data; ordinary CI only validates/compiles hooks.
+    """
+    cases = json.loads((ROOT / 'scripts/ci/training-comparison-cases.json').read_text(encoding='utf-8'))
+    if not any(all(case[key] == row.get(key) for key in ('package', 'target', 'fqn'))
+               for case in cases['entries']):
+        raise ValueError('comparison controls require an exact source-owned non-Krea case')
+
+
+def comparison_metadata_binding(row: dict, name: str, recipe: dict) -> tuple[str, int]:
+    comparison_metadata_case(row)
+    binding = name.removeprefix('fixed_cuda_comparison_')
+    if binding not in training_comparison.DEVICES:
+        raise ValueError('unknown source comparison binding')
+    uuid, index = training_comparison.DEVICES[binding]
+    if (recipe.get('required_cuda_device_uuid') != uuid or recipe.get('required_cuda_physical_index') != index
+            or recipe.get('comparison_protocol') != 'conditional-v1'
+            or recipe.get('environment') != {'MODEL_PROOF_COMPARISON_BINDING':binding,'MODEL_PROOF_COMPARISON_STAGE':None}):
+        raise ValueError('comparison recipe differs from exact source UUID/index/control binding')
+    return uuid, index
 
 
 def sd35_source_devices(row: dict, environment: dict) -> frozenset[str]:
@@ -248,6 +278,9 @@ def validate_configurations(row: dict, *, root: Path | None = None) -> None:
             raise ValueError('invalid fixed configuration name')
         required = {'source_identity', 'environment', 'backend', 'expected_devices', 'scope', 'required_work', 'cargo_features'}
         optional = {'backend_compatibility', 'source_guard'}
+        comparison_recipe = training_comparison.is_recipe(name)
+        if comparison_recipe:
+            optional |= {'required_cuda_device_uuid', 'comparison_protocol'}
         if feature_only or source_controls:
             optional |= {'execution_lane', 'required_cuda_physical_index', 'cuda_activity_profile'}
         if not isinstance(recipe, dict) or not required <= set(recipe) or not set(recipe) <= required | optional:
@@ -261,6 +294,8 @@ def validate_configurations(row: dict, *, root: Path | None = None) -> None:
         environment = recipe['environment']
         if not isinstance(environment, dict) or set(environment) != set(controls):
             raise ValueError('every declared configuration control requires an exact fixed setting or UNSET')
+        if 'MODEL_PROOF_COMPARISON_STAGE' in controls and not comparison_recipe and any(environment.get(k) is not None for k in ('MODEL_PROOF_COMPARISON_STAGE', 'MODEL_PROOF_COMPARISON_BINDING')):
+            raise ValueError('ordinary recipes must explicitly clear comparison-only controls')
         if source_controls:
             if any(value is not None and (not isinstance(value, str) or len(value) > 4096 or (value and not value.isprintable()))
                    for value in environment.values()):
@@ -292,13 +327,14 @@ def validate_configurations(row: dict, *, root: Path | None = None) -> None:
                                      and identity(row) in IRIS_CUDA_CORRECTNESS_PROOFS
                                      and name in ('source_selected_cuda', 'source_selected_cuda_gpu0') else None)
         shared_headroom = recipe.get('cuda_activity_profile') == SHARED_CUDA_HEADROOM_PROFILE
+        comparison_binding = comparison_metadata_binding(row, name, recipe) if comparison_recipe else None
         if shared_headroom and (expected_activity_profile is not None or route != 'candle-cuda'
-                                or recipe.get('required_cuda_physical_index') != 1
+                                or recipe.get('required_cuda_physical_index') != (comparison_binding[1] if comparison_binding else 1)
                                 or type(recipe.get('required_cuda_physical_index')) is not int
-                                or not isinstance(row.get('required_cuda_device_uuid'), str)
+                                or not isinstance(recipe.get('required_cuda_device_uuid') if comparison_recipe else row.get('required_cuda_device_uuid'), str)
                                 or not re.fullmatch(r'GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}',
-                                                    row['required_cuda_device_uuid'])):
-            raise ValueError('shared CUDA headroom profile requires an explicit GPU1 UUID/index source binding')
+                                                    recipe['required_cuda_device_uuid'] if comparison_recipe else row['required_cuda_device_uuid'])):
+            raise ValueError('shared CUDA headroom profile requires its explicit source-owned UUID/index binding')
         if not shared_headroom and (('cuda_activity_profile' in recipe) != (expected_activity_profile is not None)
                 or recipe.get('cuda_activity_profile') != expected_activity_profile
                 or (expected_activity_profile is not None and route != 'candle-cuda')):
@@ -342,7 +378,10 @@ def configured_case(row: dict, name: str | None = None) -> dict:
         result.pop('required_cuda_physical_index', None)
     if 'execution_lane' in recipe:
         result['execution_lane'] = recipe['execution_lane']
+    if training_comparison.is_recipe(selected):
+        result['required_cuda_device_uuid'] = recipe['required_cuda_device_uuid']
     krea_recovery.validate_binding(result)
+    krea_paired.validate_binding(result)
     return result
 
 
@@ -362,6 +401,10 @@ def apply_configuration(row: dict, env: dict[str, str]) -> None:
             or row.get('required_cuda_physical_index') != declared.get('required_cuda_physical_index')):
         raise ValueError('effective configuration differs from the exact source declaration')
     base = {key: value for key, value in row.items() if key not in ('selected_configuration', 'execution_lane')}
+    if training_comparison.is_recipe(recipe['name']):
+        # Base registry restriction remains GPU1; the selected comparison recipe
+        # is the explicit additional authority for GPU0, never an ambient override.
+        base['required_cuda_device_uuid'] = training_comparison.DEVICES['gpu1'][0]
     default_recipe = row['configurations'].get(row['default_configuration'], {})
     if 'required_cuda_physical_index' not in default_recipe:
         base.pop('required_cuda_physical_index', None)
@@ -378,6 +421,7 @@ def apply_configuration(row: dict, env: dict[str, str]) -> None:
             env.pop(name, None)
         else:
             env[name] = value
+    training_comparison.apply_stage(row, env)
 
 
 def load_registry(path: Path = REGISTRY_PATH, *, root: Path = ROOT) -> tuple[dict, ...]:
@@ -511,8 +555,8 @@ def request(raw: str, backend: str) -> dict:
         raise ValueError('unknown fixed proof backend')
     value = json.loads(raw)
     if (not isinstance(value, dict) or not {'selection', 'policy'} <= set(value)
-            or not set(value) <= {'selection', 'policy', 'runner', 'configuration'} | multi_cuda.FIELDS):
-        raise ValueError('request requires selection and explicit resource policy; only runner/configuration may be optional')
+            or not set(value) <= {'selection', 'policy', 'runner', 'configuration', 'training_comparison'} | multi_cuda.FIELDS):
+        raise ValueError('request requires selection and explicit resource policy; only declared runner/configuration/comparison/resource options may be optional')
     if 'configuration' in value and (not isinstance(value['configuration'], str) or not NAME.fullmatch(value['configuration'])):
         raise ValueError('configuration must select one fixed declared name')
     if value.get('runner', 'hosted') not in ('hosted', 'nax'):
@@ -654,7 +698,8 @@ def verify_execution(row: dict, text: str) -> dict:
         raise ValueError('actual in-scope device SET differs from the case contract: ' + repr(sorted(observed)))
     return {'successful_libtest_summaries': len(results), 'body_completed': 1,
             'parent_completed': 1 if parent is not None else None, 'actual_devices': sorted(observed),
-            **krea_recovery.verify_execution(row, text)}
+            **krea_recovery.verify_execution(row, text),
+            **krea_paired.verify_execution(row, text)}
 
 
 def repository_identity(expected: str) -> dict:
@@ -930,6 +975,15 @@ def configuration_bindings(row: dict, env: dict[str, str]) -> dict:
                    else redact(env[name], env) if name in env else None} for name in sorted(names)}
 
 
+def expected_configuration_environment(row: dict) -> dict:
+    settings = dict(row.get('selected_configuration', {}).get('environment', {}))
+    if row.get('training_comparison_stage'):
+        # The fixed parent recipe clears the stage. Only its exact derived
+        # source-owned child row authorizes this one native stage setting.
+        settings['MODEL_PROOF_COMPARISON_STAGE'] = row['training_comparison_stage']
+    return {name: {'present': value is not None, 'value': value} for name, value in settings.items()}
+
+
 def configure_native_darwin_build(env, rustc, *, root, system):
     """Avoid Apple's malformed proc-macro LINKEDIT output; never configure a cross target.
 
@@ -1062,7 +1116,15 @@ def verified_windows_toolchain(env: dict[str, str], root: Path, declaration: byt
             'cargo_version': cargo_version, 'rustc_version': rustc_version}
 
 
-def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output: Path) -> int:
+def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output: Path,
+        *, comparison_work: Path | None = None, comparison_deadline_monotonic: float | None = None) -> int:
+    if comparison_deadline_monotonic is not None and (backend != 'candle-cuda'
+            or not all(row.get('training_comparison_stage') for row in rows)
+            or type(comparison_deadline_monotonic) not in (int, float) or not math.isfinite(comparison_deadline_monotonic)):
+        raise ValueError('absolute comparison deadline requires an exact bounded CUDA stage')
+    if any(training_comparison.is_recipe(row.get('selected_configuration', {}).get('name'))
+           and row.get('training_comparison_stage') is None for row in rows):
+        raise ValueError('comparison recipe requires the complete bounded stage driver; no ordinary body fallback')
     if any(row.get('parent_only_helper') for row in rows):
         raise ValueError('parent-only helper must execute only through registered parent cases')
     if any(lane(row) != backend for row in rows):
@@ -1070,7 +1132,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
     require_host(backend, dict(os.environ), value.get('runner', 'hosted'))
     source_identity = repository_identity(expected)
     artifact = owned_output(output, Path(os.environ['RUNNER_TEMP']))
-    work = artifact.parent / (artifact.name + '-work')
+    work = comparison_work if comparison_work is not None else artifact.parent / (artifact.name + '-work')
+    unlinked_path(work, Path(os.environ['RUNNER_TEMP']))
     if work.exists() or work.is_symlink():
         raise ValueError('proof working directory must be fresh')
     work.mkdir()
@@ -1113,6 +1176,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
             generated = case_work / 'generated'
             generated.mkdir()
             env = dict(os.environ, MODEL_INFERENCE_CASE_FQN=row['fqn'], MODEL_PROOF_OUTPUT_DIR=str(generated))
+            if row.get('training_comparison_stage') and training_comparison.spec(row)['model'] == 'iris-restoration' and env.get('GITHUB_SHA') != expected:
+                raise ValueError('Iris frozen cache source/run provenance differs from actual expected producer')
             apply_configuration(row, env)
             if identity(row) in IRIS_QUANT_PROOFS and row['fqn'].endswith('real_quantized_renders_track_the_bf16_render_at_512'):
                 env['IRIS_OUT'] = str(generated)
@@ -1130,6 +1195,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                       'accepted': False, 'body_proof_accepted': False, 'resource_verification_pending': True,
                       'commands': [], 'outputs': []}
             result.update(receipt_claims([], False))
+            if comparison_deadline_monotonic is not None:
+                result['comparison_original_deadline_monotonic'] = comparison_deadline_monotonic
             receipt['cases'].append(result)
             started = time.monotonic()
             try:
@@ -1155,12 +1222,34 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                     stdout = case_work / (phase + '.stdout.log')
                     stderr = case_work / (phase + '.stderr.log')
                     argv = command(row, discover)
+                    phase_policy = discovery_policy if discover else policy
+                    if comparison_deadline_monotonic is not None:
+                        now = time.monotonic()
+                        remaining = comparison_deadline_monotonic - now
+                        if remaining <= max(policy.poll_millis, policy.term_grace_millis) / 1000:
+                            raise ValueError('original comparison deadline exhausted before phase; no new child')
+                        if discover:
+                            payload = metadata_policy_payload(value['policy'])
+                            payload['deadlineSeconds'] = remaining
+                            path = case_work / 'comparison-discovery-policy.json'
+                            write_json(path, payload)
+                            phase_policy = load_policy(path)
+                            result['comparison_discovery_started_monotonic'] = now
+                            result['comparison_discovery_policy'] = payload
+                    if not discover and row.get('training_comparison_stage'):
+                        executable = Path(result['compiled_target']['executable'])
+                        if training_comparison.file_digest(executable) != result['comparison_executable_sha256']:
+                            raise ValueError('comparison executable changed after metadata-only compilation')
+                        argv = [str(executable), row['fqn'], '--exact', '--ignored', '--nocapture', '--test-threads=1']
                     if discover:
                         claim = nullcontext({'mechanism': 'metadata-only discovery; no model execution'})
                     elif approved_uuids:
                         claim = multi_cuda.execution_claim(row, cuda_policies, value, case_work, env)
                     else:
-                        claim = execution_claim(backend, policy, case_work, env, constraints=row)
+                        options = {'constraints': row}
+                        if comparison_deadline_monotonic is not None:
+                            options['original_deadline_monotonic'] = comparison_deadline_monotonic
+                        claim = execution_claim(backend, policy, case_work, env, **options)
                     supervision = {}
                     if approved_uuids and not discover:
                         probes = tuple(SystemProbe(item) for item in cuda_policies)
@@ -1168,13 +1257,30 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                                        'additional_cuda_probes': probes[1:]}
                     with claim as physical:
                         result['physical_execution'] = physical
-                        guarded = run_guarded(argv, cwd=ROOT, env=env, policy=discovery_policy if discover else policy,
-                                              stdout_path=stdout, stderr_path=stderr,
-                                              event_path=case_work / (phase + '.events.jsonl'),
-                                              require_gpu_sample=False,
-                                              reap_metadata_descendants=discover and discovery_policy.backend == 'windows-cpu',
-                                              pass_fds=((int(env['SCENEWORKS_METAL_EXECUTION_LOCK_FD']),)
-                                                        if 'SCENEWORKS_METAL_EXECUTION_LOCK_FD' in env else ()), **supervision)
+                        shared_completion = (not discover and backend == 'candle-cuda'
+                                             and physical.get('activity_profile') == SHARED_CUDA_HEADROOM_PROFILE)
+                        if shared_completion:
+                            supervision['retain_owned_completion'] = True
+                            supervision['claim_deadline_monotonic'] = physical['claim_deadline_monotonic']
+                        if not discover and krea_paired.validate_binding(row):
+                            result['krea_paired_supervisor_invocation_attempted'] = True
+                        try:
+                            guarded = run_guarded(argv, cwd=ROOT, env=env, policy=phase_policy,
+                                                  stdout_path=stdout, stderr_path=stderr,
+                                                  event_path=case_work / (phase + '.events.jsonl'),
+                                                  require_gpu_sample=False,
+                                                  reap_metadata_descendants=discover and discovery_policy.backend == 'windows-cpu',
+                                                  pass_fds=((int(env['SCENEWORKS_METAL_EXECUTION_LOCK_FD']),)
+                                                            if 'SCENEWORKS_METAL_EXECUTION_LOCK_FD' in env else ()), **supervision)
+                        except SupervisionError as error:
+                            if shared_completion and isinstance(getattr(error, 'owned_completion', None), dict):
+                                physical['owned_execution_completion'] = error.owned_completion
+                            raise
+                        if shared_completion:
+                            completion = getattr(guarded, 'owned_completion', None)
+                            if not isinstance(completion, dict):
+                                raise ValueError('shared supervisor omitted its owned completion observations')
+                            physical['owned_execution_completion'] = completion
                         result['commands'].append({'argv': argv, 'supervision': asdict(guarded), 'owned_tree_empty': True})
                         if approved_uuids and not discover:
                             result['cuda_devices'] = list(guarded.cuda_devices)
@@ -1188,6 +1294,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                     if not discover:
                         if physical.get('post_execution_verified') is not True:
                             raise ValueError('outer physical controller did not seal resource completion')
+                        from scripts.ci.model_proof_resources import validate_shared_release_record
+                        validate_shared_release_record(physical, result['commands'], row)
                         result['resource_verification_pending'] = False
                     result['gpu_peak_observation'] = gpu_peak_observation(guarded)
                     text = stdout.read_text(encoding='utf-8', errors='replace') + '\n' + stderr.read_text(encoding='utf-8', errors='replace')
@@ -1195,6 +1303,9 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                         raise ValueError('proof child returned nonzero')
                     if discover:
                         result['compiled_target'] = verify_discovery(row, text)
+                        if row.get('training_comparison_stage'):
+                            executable = Path(result['compiled_target']['executable'])
+                            result['comparison_executable_sha256'] = training_comparison.file_digest(executable)
                     else:
                         result.update(verify_execution(row, text))
                     for path, cap in ((stdout, policy.stdout_cap_bytes), (stderr, policy.stderr_cap_bytes),
@@ -1219,6 +1330,14 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                     result['outputs'].append(published)
                 if krea_recovery.applies(row) and krea_recovery.validate_binding(row):
                     krea_recovery.verify_metrics(row, json.loads((generated / 'krea_bounded_acceleration/metrics.json').read_text(encoding='utf-8')), result, expected)
+                if krea_paired.validate_binding(row):
+                    krea_paired.verify_metrics(row, json.loads((generated / 'krea_bounded_acceleration/metrics.json').read_text(encoding='utf-8')), result, expected)
+                if row.get('training_comparison_stage'):
+                    metrics = next(x for x in row['output_artifacts'] if x.endswith('metrics.json'))
+                    body = (case_work / 'body.stdout.log').read_text(encoding='utf-8', errors='replace') + '\n' + (case_work / 'body.stderr.log').read_text(encoding='utf-8', errors='replace')
+                    result['training_comparison'] = training_comparison.verify_metrics(row, json.loads((generated / metrics).read_text(encoding='utf-8')), body)
+                    if training_comparison.file_digest(Path(result['compiled_target']['executable'])) != result['comparison_executable_sha256']:
+                        raise ValueError('comparison executable changed during actual stage')
                 repository_identity(expected)
                 if result['input_grade'] == 'no-input-executed':
                     raise ValueError('external-absent: no input executed; not successful case execution')
@@ -1238,6 +1357,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                     result['supervision_failure'] = {'reason': error.reason, 'admission': error.admission,
                                                      'pid': error.pid, 'watchdog_child_footprint': error.watchdog_child_footprint,
                                                      'watchdog_device_memory': error.watchdog_device_memory}
+                    if isinstance(getattr(error, 'owned_completion', None), dict):
+                        result['supervision_failure']['owned_completion'] = error.owned_completion
                     if approved_uuids:
                         result['cuda_devices'] = list(getattr(error, 'cuda_devices', ()))
                 # Publish only bounded/redacted regular logs from this owned case, even on failure.
@@ -1258,6 +1379,26 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                         result.setdefault('rejected_outputs', []).append(str(invalid))
                 break
             finally:
+                if krea_paired.validate_binding(row):
+                    body_paths = [case_work / ('body.' + stream + '.log') for stream in ('stdout', 'stderr')]
+                    observed_parts = []
+                    for path, cap in zip(body_paths, (policy.stdout_cap_bytes, policy.stderr_cap_bytes)):
+                        if path.is_file() and not path.is_symlink() and path.stat().st_size <= cap:
+                            observed_parts.append(path.read_text(encoding='utf-8', errors='replace'))
+                    observed = '\n'.join(observed_parts) if observed_parts else None
+                    no_creation = result.get('physical_execution', {}).get('owned_execution_completion')
+                    if 'cuda_claim_diagnostic' in result:
+                        discovery_paths = [case_work / ('discovery.' + stream + '.log') for stream in ('stdout', 'stderr')]
+                        if all(path.is_file() and not path.is_symlink() and path.stat().st_size <= cap
+                               for path, cap in zip(discovery_paths, (policy.stdout_cap_bytes, policy.stderr_cap_bytes))):
+                            discovery_text = '\n'.join(path.read_text(encoding='utf-8', errors='replace') for path in discovery_paths)
+                            try:
+                                no_creation = krea_paired.verify_prebody_refusal(row, result, discovery_text)
+                            except ValueError:
+                                no_creation = None
+                    result['krea_paired_update_accounting'] = krea_paired.update_accounting(
+                        observed, body_launched=result.get('krea_paired_supervisor_invocation_attempted', False), accepted=result['accepted'],
+                        no_creation_evidence=no_creation)
                 result['duration_seconds'] = round(time.monotonic() - started, 6)
                 write_json(case_artifact / 'result.json', result, owned=artifact)
                 write_json(artifact / 'receipt.json', receipt, owned=artifact)
@@ -1418,8 +1559,8 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
         recipe = approved_rows[index].get('selected_configuration')
         if recipe is not None:
             recorded = case.get('configuration_environment', {})
-            for name, setting in recipe['environment'].items():
-                if recorded.get(name) != {'present': setting is not None, 'value': setting}:
+            for name, setting in expected_configuration_environment(approved_rows[index]).items():
+                if recorded.get(name) != setting:
                     raise ValueError('effective source control differs from approved fixed configuration: ' + name)
         if type(case.get('accepted')) is not bool:
             raise ValueError('case acceptance must be boolean')
@@ -1485,9 +1626,28 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
             raise ValueError('accepted input claims require their exact bounded body logs')
         body = '\n'.join((root / name).read_text(encoding='utf-8', errors='replace') for name in logs)
         execution = verify_execution(approved_rows[index], body)
+        from scripts.ci.model_proof_resources import validate_shared_release_record
+        validate_shared_release_record(case.get('physical_execution', {}), case.get('commands', []), approved_rows[index])
         if krea_recovery.applies(approved_rows[index]) and krea_recovery.validate_binding(approved_rows[index]):
             metrics = root / f'{index:05d}/generated/krea_bounded_acceleration/metrics.json'
             krea_recovery.verify_metrics(approved_rows[index], json.loads(metrics.read_text(encoding='utf-8')), execution, expected)
+        if krea_paired.validate_binding(approved_rows[index]):
+            metrics = root / f'{index:05d}/generated/krea_bounded_acceleration/metrics.json'
+            krea_paired.verify_metrics(approved_rows[index], json.loads(metrics.read_text(encoding='utf-8')), execution, expected)
+        if approved_rows[index].get('training_comparison_stage'):
+            training_comparison.verify_stage_deadline(case, {'policy':receipt['resource_policy']}, case.get('comparison_original_deadline_monotonic'))
+            relative = next(x for x in approved_rows[index]['output_artifacts'] if x.endswith('metrics.json'))
+            metrics = json.loads((root / f'{index:05d}/generated' / relative).read_text(encoding='utf-8'))
+            actual = training_comparison.verify_metrics(approved_rows[index], metrics, body)
+            if actual != case.get('training_comparison'):
+                raise ValueError('comparison metrics differ from actual stage bodies')
+            executable = case.get('compiled_target', {}).get('executable')
+            commands = case.get('commands', [])
+            if (len(commands) != 2 or commands[0].get('argv') != command(approved_rows[index], True)
+                    or commands[1].get('argv') != [executable, approved_rows[index]['fqn'], '--exact', '--ignored', '--nocapture', '--test-threads=1']
+                    or not isinstance(case.get('comparison_executable_sha256'), str)
+                    or not training_comparison.SHA.fullmatch(case['comparison_executable_sha256'])):
+                raise ValueError('comparison must execute its exact compiled native fixture')
         if any(case.get(key) != value for key, value in execution.items()):
             raise ValueError('accepted execution differs from its actual body logs')
         if approved_uuids:
@@ -1532,10 +1692,14 @@ def main() -> int:
             value = request(raw, args.backend)
         rows = select(load_registry(args.registry), value['selection'], args.backend, value.get('configuration'))
         multi_cuda.bind_rows(rows, value, args.backend)
+        comparison_plan = None
+        if 'training_comparison' in value or training_comparison.is_recipe(value.get('configuration')):
+            comparison_plan = training_comparison.validate_request(rows, value, args.backend)
         if args.verify_artifacts:
             if args.output is None:
                 raise ValueError('owned evidence output is required')
-            print(json.dumps(verify_artifacts(args.output, Path(os.environ['RUNNER_TEMP']), value, args.expected_sha, rows, args.backend)))
+            verifier = training_comparison.verify_artifacts if comparison_plan else verify_artifacts
+            print(json.dumps(verifier(args.output, Path(os.environ['RUNNER_TEMP']), value, args.expected_sha, rows, args.backend)))
             return 0
         if args.plan:
             for row in rows:
@@ -1563,7 +1727,7 @@ def main() -> int:
             from scripts.ci.prepare_cohort_training_proof_assets import BINDINGS as COHORT_TRAINING_BINDINGS
             if (args.backend == 'candle-cuda' and len(rows) == 1
                     and rows[0]['package'] + '/' + rows[0]['fqn'] in COHORT_TRAINING_BINDINGS
-                    and value.get('configuration') == 'fixed_cuda'):
+                    and (value.get('configuration') == 'fixed_cuda' or comparison_plan is not None)):
                 asset_setup = 'cohort-training'
             if bespoke_training_bindings(rows, args.backend) is not None:
                 asset_setup = 'bespoke-training'
@@ -1572,11 +1736,14 @@ def main() -> int:
             configured = {identity(row): row['selected_configuration'] for row in rows if 'selected_configuration' in row}
             if configured:
                 plan['configurations'] = configured
+            if comparison_plan is not None:
+                plan['training_comparison'] = comparison_plan
             print(json.dumps(plan, indent=2))
             return 0
         if args.output is None:
             raise ValueError('an owned workflow output directory is required')
-        return run(rows, args.backend, value, args.expected_sha, args.output)
+        executor = training_comparison.run if comparison_plan else run
+        return executor(rows, args.backend, value, args.expected_sha, args.output)
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         print('model proof rejected: ' + str(error), file=sys.stderr)
         return 1

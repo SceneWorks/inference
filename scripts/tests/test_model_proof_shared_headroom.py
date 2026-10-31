@@ -1,5 +1,7 @@
 """Shared CUDA admission contracts with synthetic snapshots only; no driver/model work."""
 import copy
+import contextlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -24,6 +26,12 @@ POLICY = SimpleNamespace(cuda_device_uuid=UUID, deadline_seconds=1800, poll_mill
                          child_gpu_cap_bytes=8 * 1024**3, gpu_free_reserve_bytes=2 * 1024**3)
 
 
+class FakeClock:
+    def __init__(self): self.now = 0.
+    def monotonic(self): return self.now
+    def sleep(self, seconds): self.now += seconds
+
+
 class SharedHeadroom(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -34,23 +42,78 @@ class SharedHeadroom(unittest.TestCase):
         return dict({'uuid': UUID, 'index': 1, 'total_mib': 97887, 'used_mib': 4996,
                      'free_mib': 92891, 'utilization_percent': utilization}, **changes)
 
-    def claim(self, snapshots, body=None, policy=POLICY):
+    def claim(self, snapshots, body=None, policy=POLICY, owned_completion=True, unlock_failure=False, clock=None,
+              original_deadline_monotonic=None):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner', 'CUDA_VISIBLE_DEVICES': UUID}
             fake_os = SimpleNamespace(name='nt', fstat=os.fstat)
-            fake_lock = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lambda *_: None)
+            def lock(_fd, operation, _count):
+                if operation == 2 and unlock_failure:
+                    raise OSError('MOCK explicit UUID unlock failure')
+            fake_lock = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=lock)
             with patch.object(resources, 'os', fake_os), patch.dict(sys.modules, {'msvcrt': fake_lock}), \
                     patch.object(guard, 'inventory', side_effect=snapshots) as inventory, \
-                    patch.object(guard.time, 'sleep'):
+                    patch.object(proof, 'load_registry', return_value=(self.source,)), \
+                    (patch.object(resources.time, 'monotonic', side_effect=clock.monotonic) if clock else contextlib.nullcontext()), \
+                    patch.object(guard.time, 'sleep', side_effect=clock.sleep if clock else None):
                 with resources.execution_claim('candle-cuda', policy, output, environment,
-                                               constraints=self.configured) as receipt:
+                                               constraints=self.configured,
+                                               original_deadline_monotonic=original_deadline_monotonic) as receipt:
                     self.assertFalse(receipt['post_execution_verified'])
+                    if owned_completion:
+                        receipt['owned_execution_completion'] = {
+                            'scope': 'supervisor-owned-windows-job', 'root_pid': 1234,
+                            'root_returncode': 0, 'waited_returncode': 0,
+                            'job_member_pids': [], 'owned_pids': []}
                     if body is not None:
                         body(receipt)
                 self.assertTrue(receipt['post_execution_verified'])
                 self.assertTrue(all(call.kwargs.get('selected_uuid') == UUID for call in inventory.call_args_list))
                 return receipt, inventory.call_count
+
+    def test_comparison_absolute_deadline_survives_slow_discovery_before_claim(self):
+        # Metadata-only clock: global100+1000 budget, discovery ended402;
+        # body claim must not refresh to402+998 despite its entry policy.
+        clock=FakeClock();clock.now=402.
+        policy=SimpleNamespace(**{**vars(POLICY),'deadline_seconds':998.})
+        receipt,_=self.claim([([self.card()],[])]*11,policy=policy,clock=clock,
+                            original_deadline_monotonic=1100.)
+        self.assertEqual(receipt['claim_deadline_monotonic'],1100.)
+        self.assertTrue(receipt['lease_released'])
+
+    def test_shared_headroom_waits_before_body_and_restarts_five_samples_without_other_veto(self):
+        policy = SimpleNamespace(**{**vars(POLICY),'child_gpu_cap_bytes':91*1024**3,'deadline_seconds':20})
+        busy = self.card(100, used_mib=20875, free_mib=76564)
+        ready = self.card(100, used_mib=2186, free_mib=95253)
+        observations = [([busy], [])]*2 + [([ready], [])]*11
+        seen=[]
+        receipt, count = self.claim(observations, policy=policy, clock=FakeClock(), body=lambda r:seen.append(r))
+        self.assertEqual(count, 13)
+        self.assertEqual(receipt['admission_wait']['headroom_shortfalls'], 2)
+        self.assertEqual(receipt['admission_wait']['headroom_wait_seconds'], .002)
+        self.assertEqual(len(seen), 1)
+        # Headroom can disappear during admission sampling: discard that partial pass,
+        # await readiness and still require a complete fresh five-sample pass.
+        snapshots = [([ready], []),([ready], []),([busy], []),([busy], []),([ready], [])]+[([ready], [])]*10
+        receipt, _ = self.claim(snapshots, policy=policy, clock=FakeClock())
+        self.assertEqual(receipt['admission_wait']['stable_sample_restarts'], 1)
+        self.assertEqual(receipt['admission_background_activity']['sample_count'], 5)
+        self.assertEqual(receipt['claim_deadline_monotonic'], 20.)
+
+    def test_shared_wait_timeout_invalid_metadata_and_query_failures_never_enter_body(self):
+        busy = self.card(100, used_mib=87648, free_mib=10239)
+        policy = SimpleNamespace(**{**vars(POLICY),'deadline_seconds':.003})
+        with self.assertRaises(resources.CudaClaimRejected) as caught:
+            self.claim(itertools.repeat(([busy], [])), policy=policy, clock=FakeClock(),
+                       body=lambda _:self.fail('deadline wait reached body'))
+        self.assertIn('original CUDA claim deadline expired', caught.exception.diagnostic['admission_error'])
+        self.assertGreaterEqual(caught.exception.diagnostic['admission_wait']['headroom_shortfalls'], 1)
+        for invalid in (self.card(uuid=OTHER), self.card(index=0), self.card(used_mib=float('nan'))):
+            with self.subTest(invalid=invalid),self.assertRaises(resources.CudaClaimRejected):
+                self.claim([([busy], []),([invalid], [])],clock=FakeClock())
+        with self.assertRaises(resources.CudaClaimRejected):
+            self.claim([([busy], []),TimeoutError('MOCK primary query failed')],clock=FakeClock())
 
     def test_shared_activity_and_changing_foreign_contexts_are_diagnostic_in_both_phases(self):
         # CI_IMPACT: synthetic claim + five admission + five release snapshots, no real processes.
@@ -99,6 +162,8 @@ class SharedHeadroom(unittest.TestCase):
                                                {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK'},
                                                constraints=self.configured) as receipt:
                     self.assertEqual(receipt['physical_index'], 1)
+                    receipt['owned_execution_completion'] = {'scope': 'supervisor-owned-windows-job', 'root_pid': 1234,
+                        'root_returncode': 0, 'waited_returncode': 0, 'job_member_pids': [], 'owned_pids': []}
                 self.assertTrue(receipt['post_execution_verified'])
                 self.assertEqual(probe.call_count, 11)
                 self.assertEqual(receipt['admission_utilization_percent'], [100] * 5)
@@ -118,7 +183,7 @@ class SharedHeadroom(unittest.TestCase):
     def test_memory_and_physical_identity_refusals_never_enter_body(self):
         # CI_IMPACT: pure snapshots exercise initial and later phase failures, not model computation.
         invalid = [self.card(uuid=OTHER), self.card(index=0), self.card(total_mib='97887'),
-                   self.card(used_mib=-1), self.card(free_mib=97888), self.card(free_mib=10239, used_mib=87648),
+                   self.card(used_mib=-1), self.card(free_mib=97888),
                    self.card(used_mib=9000), self.card(free_mib=True),
                    self.card(total_mib=None), self.card(used_mib=float('nan')),
                    self.card(free_mib=float('inf'))]
@@ -129,12 +194,115 @@ class SharedHeadroom(unittest.TestCase):
             self.claim([], policy=SimpleNamespace(**{**vars(POLICY), 'cuda_device_uuid': OTHER}))
 
     def test_sampling_rechecks_identity_and_headroom_after_claim_and_after_body(self):
-        for invalid in (self.card(index=0), self.card(uuid=OTHER), self.card(free_mib=10239, used_mib=87648)):
+        for invalid in (self.card(index=0), self.card(uuid=OTHER), self.card(free_mib=float('inf'))):
             with self.subTest(phase='admission', card=invalid), self.assertRaises(resources.CudaClaimRejected):
                 self.claim([([self.card()], []), ([invalid], [])],
                            body=lambda _: self.fail('bad sample reached body'))
             with self.subTest(phase='release', card=invalid), self.assertRaises(resources.CudaReleaseRejected):
                 self.claim([([self.card()], [])] * 6 + [([invalid], [])])
+
+    def test_actual_moss_release_shape_passes_after_owned_exit_without_readmitting_91gib(self):
+        # CI_IMPACT: immutable audit scalars copied into synthetic snapshots; no NVML/NN calls.
+        policy = SimpleNamespace(**{**vars(POLICY), 'child_gpu_cap_bytes': 91 * 1024**3})
+        admission = self.card(0, used_mib=2186, free_mib=95253,
+                              process_inventory_status='unknown/not-collected-diagnostic-only')
+        release = self.card(100, used_mib=24531, free_mib=72908,
+                            process_inventory_status='unknown/not-collected-diagnostic-only')
+        self.assertTrue(resources.proof_cuda_idle(admission, [], policy, activity_profile=PROFILE))
+        self.assertFalse(resources.proof_cuda_idle(release, [], policy, activity_profile=PROFILE))
+        receipt, count = self.claim([([admission], [])] * 6 + [([release], [])] * 5, policy=policy)
+        self.assertEqual(count, 11)
+        self.assertTrue(receipt['lease_released'])
+        self.assertTrue(receipt['post_execution_verified'])
+        diagnostics = receipt['release_background_activity']
+        self.assertTrue(diagnostics['admission_headroom_is_diagnostic_only'])
+        self.assertTrue(all(sample['post_owned_exit_primary_metadata_valid'] for sample in diagnostics['samples']))
+        self.assertTrue(all(not sample['predicates']['free_memory_above_policy_headroom'] for sample in diagnostics['samples']))
+        with self.assertRaises(resources.CudaClaimRejected):
+            self.claim(itertools.repeat(([release], [])), policy=SimpleNamespace(**{**vars(policy),'deadline_seconds':3}),
+                       clock=FakeClock(), body=lambda _: self.fail('release snapshot admitted new work'))
+        for low_free in (self.card(100, used_mib=97439, free_mib=0),
+                         self.card(None, used_mib=97887, free_mib=0)):
+            self.claim([([admission], [])] * 6 + [([low_free], [])] * 5, policy=policy)
+
+    def test_shared_release_preserves_counter_rounding_and_failed_closed_scope(self):
+        valid = ([self.card()], [])
+        for overflow in (1, 2):
+            release = self.card(100, used_mib=24531, free_mib=97887-24531+overflow)
+            self.claim([valid] * 6 + [([release], [])] * 5)
+        release = self.card(100, used_mib=24531, free_mib=97887-24531+3)
+        with self.assertRaises(resources.CudaReleaseRejected):
+            self.claim([valid] * 6 + [([release], [])])
+        held = []
+        for completion in ({'scope':'supervisor-no-child-created','creation_attempted':False},
+                           {'scope':'supervisor-owned-windows-job','root_pid':1234,'root_returncode':1,
+                            'waited_returncode':1,'job_member_pids':[],'owned_pids':[]}):
+            def closed(receipt, completion=completion):
+                receipt['owned_execution_completion'] = completion
+                held.append(receipt)
+                raise RuntimeError('MOCK unsuccessful but owned closure proven')
+            with self.assertRaisesRegex(RuntimeError, 'owned closure proven'):
+                self.claim([valid] * 11, body=closed)
+            self.assertTrue(held[-1]['post_execution_verified'])
+            self.assertTrue(held[-1]['lease_released'])
+
+    def test_shared_release_rejects_unproven_or_pending_owned_job_before_inventory(self):
+        valid = ([self.card()], [])
+        with self.assertRaisesRegex(resources.CudaReleaseRejected, 'completion is unverified'):
+            self.claim([valid] * 6, owned_completion=False)
+        for key, value in (('root_returncode', None), ('waited_returncode', None),
+                           ('root_pid', 0), ('job_member_pids', [999]), ('owned_pids', [999]),
+                           ('scope', 'host-process-census')):
+            def pending(receipt, key=key, value=value):
+                receipt['owned_execution_completion'][key] = value
+            with self.subTest(key=key), self.assertRaises(resources.CudaReleaseRejected):
+                self.claim([valid] * 6, body=pending)
+
+    def test_shared_release_metadata_deadline_and_unlock_failures_never_seal(self):
+        valid = ([self.card()], [])
+        for card in (self.card(uuid=OTHER), self.card(index=0), self.card(total_mib=97886),
+                     self.card(used_mib=-1), self.card(used_mib=float('nan')),
+                     self.card(free_mib=float('inf')), self.card(total_mib=True)):
+            with self.subTest(card=card), self.assertRaises(resources.CudaReleaseRejected):
+                self.claim([valid] * 6 + [([card], [])])
+        held = []
+        with self.assertRaisesRegex(OSError, 'unlock failure'):
+            self.claim([valid] * 11, body=lambda receipt: held.append(receipt), unlock_failure=True)
+        self.assertFalse(held[0]['post_execution_verified'])
+        self.assertFalse(held[0]['lease_released'])
+        with patch.object(resources.time, 'monotonic', return_value=100.) as clock:
+            def expire(receipt):
+                held.append(receipt)
+                clock.return_value = 100. + POLICY.deadline_seconds
+            with self.assertRaisesRegex(resources.CudaReleaseRejected, 'deadline expired'):
+                self.claim([valid] * 6, body=expire)
+        self.assertFalse(held[-1]['post_execution_verified'])
+        self.assertTrue(held[-1]['lease_released'])
+
+    def test_legacy_profile_with_unselected_configuration_keeps_its_original_schema(self):
+        legacy = {'activity_profile': resources.STRICT_CUDA_ACTIVITY, 'post_execution_verified': True}
+        self.assertIsNone(resources.validate_shared_release_record(legacy, [], {'selected_configuration': None}))
+        self.assertNotIn('owned_execution_completion', legacy)
+        self.assertNotIn('lease_released', legacy)
+
+    def test_release_seal_joins_exact_supervisor_owned_completion_and_lease(self):
+        record, _ = self.claim([([self.card()], [])] * 11)
+        body = {'argv': ['cargo', 'test'], 'supervision': {
+            'pid': 1234, 'returncode': 0, 'owned_completion': record['owned_execution_completion'],
+            'admission':{'originalClaimDeadlineMonotonic':record['claim_deadline_monotonic']}}}
+        resources.validate_shared_release_record(record, [body], self.configured)
+        for mutation in (lambda r, c: r.update(lease_released=False),
+                         lambda r, c: r.update(post_execution_verified=False),
+                         lambda r, c: r.update(activity_profile=resources.STRICT_CUDA_ACTIVITY),
+                         lambda r, c: r.update(device_uuid=OTHER),
+                         lambda r, c: r.update(physical_index=0),
+                         lambda r, c: c[0]['supervision'].update(pid=999),
+                         lambda r, c: c[0]['supervision'].update(owned_completion={}),
+                         lambda r, c: r['owned_execution_completion'].update(owned_pids=[999])):
+            invalid, commands = copy.deepcopy(record), copy.deepcopy([body])
+            mutation(invalid, commands)
+            with self.assertRaises(ValueError):
+                resources.validate_shared_release_record(invalid, commands, self.configured)
 
     def test_body_failure_propagates_even_when_shared_cleanup_succeeds(self):
         def fail(_):
@@ -146,7 +314,7 @@ class SharedHeadroom(unittest.TestCase):
         # CI_IMPACT: prior successful synthetic samples must not enter strict-profile retry analysis.
         valid = ([self.card()], [])
         for sample_number in (2, 4):
-            for invalid in (self.card(index=0), self.card(free_mib=10239, used_mib=87648)):
+            for invalid in (self.card(index=0), self.card(free_mib=float('inf'))):
                 bad = ([invalid], [])
                 with self.subTest(phase='admission', sample=sample_number, card=invalid):
                     with self.assertRaises(resources.CudaClaimRejected) as caught:

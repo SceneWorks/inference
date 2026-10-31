@@ -66,6 +66,13 @@ pub(crate) fn try_forward(
     if candle_core::backprop::grad_do_not_detach() || mask.is_some() || !eligible(q, k, v, scale) {
         return Ok(None);
     }
+    if !crate::train::comparison::reference_owner_enabled() {
+        crate::train::profile::cohort_reuse("comparison:reference-owner:composable");
+        return Ok(None);
+    }
+    if crate::train::comparison::active_stage().is_some() {
+        crate::train::profile::cohort_reuse("comparison:reference-owner:bounded");
+    }
     // Same per-query standard-softmax arithmetic/dtype. Internal query tiles
     // respect (and can be smaller than) the caller's scratch upper limit.
     let plan = reference_plan(plan);

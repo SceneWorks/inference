@@ -187,6 +187,68 @@ fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, dir: &std::path::Path
 
 #[cfg(feature = "model-inference-proof")]
 fn bounded_run(id: &str, env: &str, kind: NetworkType) {
+    if let Some(stage) = candle_gen::train::comparison::requested_stage() {
+        use candle_gen::train::comparison::{self, ComparisonCadence, ComparisonStage};
+        assert_ne!(
+            stage,
+            ComparisonStage::MinusReferenceOwner,
+            "this trainer uses the composable reference attention"
+        );
+        assert_eq!(kind, NetworkType::Lora);
+        let root = bounded_output_root();
+        comparison::with_stage(
+            &root.join("comparison_metrics.json"),
+            id,
+            ComparisonCadence::Ordinary,
+            || {
+                let snapshot =
+                    PathBuf::from(std::env::var(env).expect("existing installed model snapshot"));
+                let input = root.join("comparison_input.png");
+                image::RgbImage::from_pixel(64, 64, image::Rgb([60, 180, 90]))
+                    .save(&input)
+                    .unwrap();
+                let mut trainer = candle_gen_sd3::provider_registry()
+                    .unwrap()
+                    .load_trainer(id, &LoadSpec::new(WeightsSource::Dir(snapshot)))
+                    .unwrap();
+                let output = trainer
+                    .train(
+                        &TrainingRequest {
+                            items: vec![TrainingItem::captioned(input, "a green tile".into())],
+                            config: TrainingConfig {
+                                network_type: NetworkType::Lora,
+                                rank: 2,
+                                alpha: 2.,
+                                learning_rate: 1e-2,
+                                steps: 4,
+                                seed: 7,
+                                train_dtype: "bf16".into(),
+                                resolution: 512,
+                                batch_size: 1,
+                                gradient_accumulation: 1,
+                                lr_warmup_steps: 0,
+                                save_every: 0,
+                                sample_every: 0,
+                                resume: false,
+                                gradient_checkpointing: false,
+                                ..Default::default()
+                            },
+                            output_dir: root.join("comparison_out"),
+                            file_name: "comparison.safetensors".into(),
+                            trigger_words: vec![],
+                            cancel: CancelFlag::new(),
+                        },
+                        &mut |_| {},
+                    )
+                    .expect("four fresh comparison updates");
+                assert_eq!(output.steps, 4);
+                assert!(output.final_loss.is_finite());
+                assert!(output.adapter_path.is_file());
+            },
+        );
+        return;
+    }
+
     let snapshot = PathBuf::from(std::env::var(env).unwrap_or_else(|_| panic!("set {env}")));
     let sample_spec = sample_load_spec(id);
     let retained = bounded_output_root();

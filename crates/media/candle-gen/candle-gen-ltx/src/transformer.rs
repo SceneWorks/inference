@@ -148,6 +148,9 @@ impl Attention {
     }
 
     fn prepare_training(&mut self, self_attention: bool) -> Result<()> {
+        if !candle_gen::train::comparison::projection_enabled() {
+            return Ok(());
+        }
         if let (Some(q), Some(k), Some(v)) = (
             self.to_q.lora_mut(),
             self.to_k.lora_mut(),

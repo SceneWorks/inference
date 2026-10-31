@@ -340,6 +340,24 @@ impl IrisDiT {
         scale: f32,
         square: bool,
     ) -> Result<Rope> {
+        if !candle_gen::train::comparison::cache_enabled() {
+            if self.training_geometry_admission {
+                candle_gen::train::flow_match::check_preparation_memory(
+                    "Iris geometry",
+                    height as u64 * width as u64 * head as u64 * 4,
+                    0,
+                    candle_gen::train::flow_match::device_training_budget_bytes(
+                        &self.device,
+                        "Iris geometry",
+                    ),
+                )?;
+            }
+            return if slot == 1 {
+                Rope::line_1d(head, width, theta, &self.device)
+            } else {
+                Rope::grid_2d_aspect(head, height, width, theta, scale, square, &self.device)
+            };
+        }
         let key = vec![
             head as u64,
             height as u64,
@@ -731,6 +749,24 @@ impl IrisDiT {
     /// The fixed full-resolution 2D sincos table of `PixelEmbedder` (`[H, W, hidden]` f32), cached.
     fn pixel_pos(&self, height: usize, width: usize) -> Result<Tensor> {
         let dim = self.cfg.pixel.hidden_size;
+        if !candle_gen::train::comparison::cache_enabled() {
+            if self.training_geometry_admission {
+                candle_gen::train::flow_match::check_preparation_memory(
+                    "Iris position",
+                    height as u64 * width as u64 * dim as u64 * 4,
+                    0,
+                    candle_gen::train::flow_match::device_training_budget_bytes(
+                        &self.device,
+                        "Iris position",
+                    ),
+                )?;
+            }
+            return Ok(Tensor::from_vec(
+                iris::pixel_sincos_table(height, width, dim),
+                (height, width, dim),
+                &self.device,
+            )?);
+        }
         let key = vec![height as u64, width as u64, dim as u64];
         let mut cache = candle_gen::lock_recover(&self.geometry.0);
         if let Some((cached, table)) = &cache.position {

@@ -78,7 +78,11 @@ fn config(network_type: NetworkType, steps: u32) -> TrainingConfig {
         alpha: 8.0,
         learning_rate: 1e-3,
         steps,
-        resolution: 64,
+        resolution: if candle_gen::train::comparison::active_stage().is_some() {
+            512
+        } else {
+            64
+        },
         save_every: 0,
         seed: 7,
         network_type,
@@ -534,6 +538,39 @@ fn bounded_render_finite_with_pair(high: &Path, low: &Path, kind: AdapterKind) {
 #[cfg(feature = "model-inference-proof")]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn wan_t2v_14b_bounded_acceleration_acceptance() {
+    if let Some(stage) = candle_gen::train::comparison::requested_stage() {
+        use candle_gen::train::comparison::{self, ComparisonCadence, ComparisonStage};
+        assert_ne!(
+            stage,
+            ComparisonStage::MinusReferenceOwner,
+            "this caller has no bounded Reference attention owner"
+        );
+        let root = bounded_output_root();
+        let cadence = ComparisonCadence::WanDual;
+        let output = comparison::with_stage(
+            &root.join("comparison_metrics.json"),
+            "wan2_2_t2v_14b",
+            cadence,
+            || {
+                comparison::record_initialization(&serde_json::json!({
+                    "model_source": snapshot().display().to_string(),
+                    "dataset": "existing two96px RGB swatches and exact source captions",
+                    "workload": "512px single-bucket training, no previews/resume/intermediate save"
+                }));
+                run(
+                    &root.join("data"),
+                    "comparison.safetensors",
+                    NetworkType::Lora,
+                    cadence.updates(),
+                )
+            },
+        );
+        assert_eq!(output.losses.len() as u32, cadence.updates());
+        assert!(output.high_path.is_file() && output.low_path.is_file());
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::wan_t2v_14b_bounded_acceleration_acceptance");
+        return;
+    }
+
     let tmp = bounded_output_root().join("data");
     // 96 steps ⇒ 48 micro-steps per expert — enough for a clear median fall on each band.
     let retained = bounded_output_root();

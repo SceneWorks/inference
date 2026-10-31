@@ -111,6 +111,9 @@ impl Attention {
     }
 
     fn prepare_training(&mut self, cross: bool) -> Result<()> {
+        if !candle_gen::train::comparison::projection_enabled() {
+            return Ok(());
+        }
         if self.projection_pack.is_none() {
             self.projection_pack = if cross {
                 FrozenProjectionPack::prepare_adapt(&mut [&mut self.k_proj, &mut self.v_proj])?
@@ -256,6 +259,9 @@ impl AnimaTextConditioner {
             block.cross_attn.prepare_training(true)?;
         }
         self.training_rope.clear();
+        if !candle_gen::train::comparison::cache_enabled() {
+            return Ok(());
+        }
         for (source, target) in inputs {
             for length in [source.dim(1)?, target.dim(1)?] {
                 if !self.training_rope.contains_key(&length) {

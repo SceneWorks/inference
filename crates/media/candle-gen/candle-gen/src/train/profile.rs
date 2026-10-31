@@ -1,6 +1,6 @@
 //! Minimal source profiling for the single bounded Krea acceptance invocation.
 //! No production setting or preview cadence is changed. A proof-only scope
-//! enables three matched six-update segments (18 TOTAL), never a second job.
+//! selects fixed18, historical recovery6, or original/candidate paired12 updates.
 
 #[cfg(feature = "model-inference-proof")]
 use std::cell::{Cell, RefCell};
@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 #[cfg(feature = "model-inference-proof")]
 thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static PAIRED: Cell<bool> = const { Cell::new(false) };
     static RECOVERY: Cell<bool> = const { Cell::new(false) };
     static RECOVERY_REPORT: RefCell<Option<serde_json::Value>> = const { RefCell::new(None) };
     static SEGMENT: Cell<usize> = const { Cell::new(0) };
@@ -19,7 +20,7 @@ thread_local! {
 pub fn reference_math() -> bool {
     #[cfg(feature = "model-inference-proof")]
     {
-        ACTIVE.get() && SEGMENT.get() == 0
+        (ACTIVE.get() && SEGMENT.get() == 0) || super::comparison::legacy_e1()
     }
     #[cfg(not(feature = "model-inference-proof"))]
     {
@@ -50,6 +51,7 @@ pub fn with_bounded_krea_profile<T>(f: impl FnOnce() -> T) -> T {
         fn drop(&mut self) {
             ACTIVE.set(false);
             RECOVERY.set(false);
+            PAIRED.set(false);
             RECOVERY_REPORT.with(|report| *report.borrow_mut() = None);
             SEGMENT.set(0);
             ATTRIBUTION.set(false);
@@ -72,6 +74,75 @@ pub fn recovery_active() -> bool {
     {
         false
     }
+}
+
+/// Exact original-Reference versus full candidate comparison; no shared segment.
+pub fn paired_active() -> bool {
+    #[cfg(feature = "model-inference-proof")]
+    {
+        PAIRED.get()
+    }
+    #[cfg(not(feature = "model-inference-proof"))]
+    {
+        false
+    }
+}
+
+#[cfg(feature = "model-inference-proof")]
+pub fn with_bounded_krea_paired<T>(f: impl FnOnce() -> T) -> (T, Option<serde_json::Value>) {
+    with_bounded_krea_profile(|| {
+        PAIRED.set(true);
+        let result = f();
+        let report = RECOVERY_REPORT.with(|report| report.borrow_mut().take());
+        (result, report)
+    })
+}
+
+/// Complete same-process observations only; retain the candidate even on NO-GO.
+#[cfg(feature = "model-inference-proof")]
+pub(crate) fn finish_krea_paired(
+    times: &[Vec<f64>; 3],
+    losses: &[Vec<f32>; 3],
+    dispatches: u64,
+) -> candle_core::Result<()> {
+    if !paired_active()
+        || !times[1].is_empty()
+        || !losses[1].is_empty()
+        || [0, 2].iter().any(|&i| {
+            times[i].len() != 4
+                || losses[i].len() != 6
+                || times[i].iter().any(|t| !t.is_finite() || *t <= 0.)
+                || losses[i].iter().any(|l| !l.is_finite())
+        })
+    {
+        candle_core::bail!("incomplete twelve-update Krea paired comparison");
+    }
+    let reference = times[0].iter().sum::<f64>() / 4.;
+    let candidate = times[2].iter().sum::<f64>() / 4.;
+    let parity = losses[0]
+        .iter()
+        .zip(&losses[2])
+        .all(|(a, b)| (a - b).abs() <= 0.01 * a.abs().max(1.));
+    let go = dispatches == 168 && parity && candidate < reference;
+    let report = serde_json::json!({
+        "schema_version":1, "new_optimizer_updates":12, "segment_order":[0,2],
+        "warmup_updates_per_segment":2,"steady_updates_per_segment":4,
+        "prior_conservative_update_charge":20,"hard_update_cap":32,"remaining_updates_after_success":0,
+        "reference_steady_seconds":times[0],"candidate_steady_seconds":times[2],
+        "reference_losses":losses[0],"candidate_losses":losses[2],
+        "reference_mean_seconds":reference,"candidate_mean_seconds":candidate,
+        "candidate_dispatches":dispatches,"loss_parity":parity,"candidate_go":go,
+        "candidate_reduction_vs_original":1.-candidate/reference,
+        "candidate_latency_ratio":candidate/reference,
+        "candidate_seconds_saved_per_update":reference-candidate,
+        "target_met":go && candidate<=0.75*reference,
+        "saved_adapter_role":"actual-paired-candidate-even-on-no-go",
+        "comparison":"same-process-original-reference-vs-full-candidate",
+        "claim_limit":"One serial shared-GPU invocation, not an isolated benchmark. Original Reference0 then fully prepared candidate2; segment1 skipped. Identical deep initial factors, fresh zero-state optimizer and stateless seeded logical inputs; shared frozen weights/cache. Two counted warmups each. Preparation and diagnostics excluded from synchronized steady timing. Smoke, adoption, >=25percent target and convergence are separate; no weight byte attestation."
+    });
+    eprintln!("KREA_PROFILE_PAIRED_RESULT {report}");
+    RECOVERY_REPORT.with(|state| *state.borrow_mut() = Some(report));
+    Ok(())
 }
 
 /// Immutable audited scalar observations, never executable artifact content.
@@ -235,6 +306,8 @@ pub(crate) fn finish_attribution(segment: usize) {
 #[cfg(feature = "model-inference-proof")]
 #[derive(Default)]
 struct CohortObservation {
+    expected_updates: u32,
+    warmups: usize,
     started: Option<std::time::Instant>,
     step_started: Option<std::time::Instant>,
     preparation_seconds: f64,
@@ -244,6 +317,116 @@ struct CohortObservation {
     initial: std::collections::HashMap<candle_core::TensorId, candle_core::Tensor>,
     reuse: std::collections::BTreeMap<String, u64>,
     probes: std::collections::HashSet<String>,
+    initialization: Vec<serde_json::Value>,
+    optimizer_initialization: Vec<serde_json::Value>,
+    initial_fingerprints: std::collections::HashMap<candle_core::TensorId, String>,
+    reuse_before: std::collections::BTreeMap<String, u64>,
+    starts: u32,
+    shared_optimizer_attempts: u32,
+}
+
+#[cfg(feature = "model-inference-proof")]
+pub(super) fn comparison_initialization(value: &serde_json::Value) {
+    assert!(
+        value.as_object().is_some_and(|v| !v.is_empty()),
+        "initialization requires actual source configuration"
+    );
+    COHORT.with(|state| {
+        let mut state = state.borrow_mut();
+        let state = state.as_mut().expect("comparison observer");
+        assert_eq!(state.updates, 0, "initialization must precede updates");
+        state.initialization.push(value.clone());
+    });
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn comparison_tensor_digest(tensor: &candle_core::Tensor) -> candle_core::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(format!("{:?}:{:?}", tensor.dtype(), tensor.dims()).as_bytes());
+    // Floating trainables/optimizer tensors retain exact bits through f32 for
+    // f32/f16/bf16. This diagnostic never runs inside a timed update.
+    for value in tensor
+        .detach()
+        .to_dtype(candle_core::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?
+    {
+        hash.update(value.to_bits().to_le_bytes());
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+pub(super) fn comparison_optimizer_initialization(
+    opt: &super::optim::TrainOptimizer,
+) -> candle_core::Result<()> {
+    #[cfg(feature = "model-inference-proof")]
+    if super::comparison::active_stage().is_some() {
+        use sha2::{Digest, Sha256};
+        let (tensors, meta) = opt
+            .snapshot()
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        let meta: std::collections::BTreeMap<_, _> = meta.into_iter().collect();
+        let mut state = std::collections::BTreeMap::new();
+        for (key, tensor) in tensors {
+            state.insert(key, comparison_tensor_digest(&tensor)?);
+        }
+        let mut hash = Sha256::new();
+        hash.update(serde_json::to_vec(&(&meta, &state)).expect("optimizer metadata"));
+        let record = serde_json::json!({"metadata":meta,"tensor_count":state.len(),"sha256":format!("{:x}",hash.finalize()),"basis":"actual fresh TrainOptimizer::from_config before any update"});
+        COHORT.with(|s| {
+            let mut s = s.borrow_mut();
+            let s = s.as_mut().expect("comparison observer");
+            assert_eq!(
+                s.updates, 0,
+                "optimizer must be freshly constructed before training"
+            );
+            s.optimizer_initialization.push(record);
+        });
+    }
+    let _ = opt;
+    Ok(())
+}
+
+pub(super) fn comparison_optimizer_step() -> candle_core::Result<()> {
+    #[cfg(feature = "model-inference-proof")]
+    if super::comparison::active_stage().is_some() {
+        COHORT.with(|s| {
+            let mut s = s.borrow_mut();
+            let s = s.as_mut().expect("comparison observer");
+            if s.step_started.is_none() || s.shared_optimizer_attempts >= s.expected_updates {
+                candle_core::bail!("unobserved or extra comparison optimizer attempt");
+            }
+            s.shared_optimizer_attempts += 1;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "model-inference-proof")]
+pub(super) fn comparison_named_initial_tensors<'a>(
+    owner: &str,
+    tensors: impl IntoIterator<Item = (&'a str, &'a candle_core::Tensor)>,
+) -> candle_core::Result<()> {
+    use sha2::{Digest, Sha256};
+    let mut named = std::collections::BTreeMap::new();
+    for (name, tensor) in tensors {
+        if named
+            .insert(name.to_owned(), comparison_tensor_digest(tensor)?)
+            .is_some()
+        {
+            candle_core::bail!("duplicate initial state tensor name");
+        }
+    }
+    if owner.is_empty() || named.is_empty() {
+        candle_core::bail!("missing private initial state");
+    }
+    let mut hash = Sha256::new();
+    hash.update(serde_json::to_vec(&named).expect("named metadata"));
+    comparison_initialization(&serde_json::json!({"kind":"actual-named-initial-tensors",
+        "owner":owner,"tensor_count":named.len(),"sha256":format!("{:x}",hash.finalize())}));
+    Ok(())
 }
 #[cfg(feature = "model-inference-proof")]
 thread_local! {
@@ -265,9 +448,44 @@ pub fn cohort_active() -> bool {
 /// source-owned, and cancelled/partial/missing observer work cannot report PASS.
 #[cfg(feature = "model-inference-proof")]
 pub fn with_bounded_cohort<T>(output: &std::path::Path, f: impl FnOnce() -> T) -> T {
+    with_observation(output, 4, 1, None, f)
+}
+
+#[cfg(feature = "model-inference-proof")]
+pub(super) fn with_comparison_observation<T>(
+    output: &std::path::Path,
+    model_id: &str,
+    stage: super::comparison::ComparisonStage,
+    cadence: super::comparison::ComparisonCadence,
+    f: impl FnOnce() -> T,
+) -> T {
+    let comparison = serde_json::json!({"schema_version":1, "model":model_id,
+        "stage":stage.id(), "cadence":cadence.id(), "state_reset":"fresh-native-child-process",
+        "cuda_visible_devices":std::env::var("CUDA_VISIBLE_DEVICES").expect("comparison UUID"),
+        "physical_index":super::comparison::required_physical_index().expect("comparison physical index"),
+        "claim_limit":"Conditional ablations, serial shared GPU; one warmup per owner; three timed ordinary or restoration cycles, two timed updates per Wan expert; no isolated timing or convergence claim"});
+    with_observation(
+        output,
+        cadence.updates(),
+        cadence.warmups(),
+        Some(comparison),
+        f,
+    )
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn with_observation<T>(
+    output: &std::path::Path,
+    expected_updates: u32,
+    warmups: usize,
+    comparison: Option<serde_json::Value>,
+    f: impl FnOnce() -> T,
+) -> T {
     assert!(!active() && !cohort_active(), "nested bounded proof scope");
     COHORT.with(|state| {
         *state.borrow_mut() = Some(CohortObservation {
+            expected_updates,
+            warmups,
             started: Some(std::time::Instant::now()),
             ..Default::default()
         })
@@ -283,13 +501,27 @@ pub fn with_bounded_cohort<T>(output: &std::path::Path, f: impl FnOnce() -> T) -
     COHORT.with(|state| {
         let state = state.borrow();
         let state = state.as_ref().unwrap();
-        assert_eq!(state.updates, 4, "one invocation must complete four actual optimizer updates");
-        assert_eq!(state.steps.len(), 4, "all four bodies must finish");
-        assert!(!state.reuse.is_empty(), "prepared mechanism consumption must be observed");
-        let report = serde_json::json!({"optimizer_updates": state.updates,
+        assert_eq!(state.updates, expected_updates, "source-owned actual optimizer update count");
+        assert_eq!(state.steps.len(), expected_updates as usize, "all physical bodies must finish");
+        if comparison.is_none() { assert!(!state.reuse.is_empty(), "prepared mechanism consumption must be observed"); }
+        let mut report = serde_json::json!({"optimizer_updates": state.updates,
             "preparation_including_load_cache_seconds": state.preparation_seconds,
             "steps": state.steps, "mechanism_consumption": state.reuse,
             "timing_scope": "synchronized forward/backward/update; first update warmup; diagnostic scalar validation excluded"});
+        if let Some(mut comparison) = comparison {
+            assert_eq!(state.starts, expected_updates, "all actual starts must close");
+            assert!(!state.initialization.is_empty(), "comparison needs actual canonical initialization facts");
+            let mut initial: Vec<_> = state.initial_fingerprints.values().cloned().collect(); initial.sort();
+            assert!(!initial.is_empty(), "comparison needs actual initial trainable tensor fingerprints");
+            comparison["initialization"] = serde_json::json!(state.initialization);
+            comparison["optimizer_initialization"] = serde_json::json!(state.optimizer_initialization);
+            comparison["initial_trainable_fingerprints"] = serde_json::json!(initial);
+            comparison["physical_starts"] = serde_json::json!(state.starts);
+            comparison["physical_commits"] = serde_json::json!(state.updates);
+            comparison["actual_shared_optimizer_attempts"] = serde_json::json!(state.shared_optimizer_attempts);
+            comparison["fingerprint_scope"] = serde_json::json!("multiset of reached trainable dtype/shape/exact f32-representable values; not named weight-byte attestation; fresh native factory covers private state");
+            report["comparison"] = comparison;
+        }
         std::fs::write(output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         eprintln!("COHORT_ACCEPTANCE_METRICS {report}");
     });
@@ -310,6 +542,11 @@ pub fn cohort_reuse(mechanism: &str) {
 
 /// Claim one bounded reference probe during the first excluded warmup only.
 pub(crate) fn cohort_claim_probe(mechanism: &str) -> bool {
+    // Historical acceptance already owns these reference/model probes. The
+    // timing supplement consumes only its counted native training bodies.
+    if super::comparison::active_stage().is_some() {
+        return false;
+    }
     #[cfg(feature = "model-inference-proof")]
     {
         COHORT.with(|state| {
@@ -360,6 +597,12 @@ pub fn cohort_begin_step(device: &candle_core::Device) -> candle_core::Result<()
         let mut state = state.borrow_mut();
         let state = state.as_mut().unwrap();
         assert!(device.is_cuda(), "bounded cohort requires actual CUDA");
+        assert!(
+            state.step_started.is_none() && state.starts < state.expected_updates,
+            "unexpected extra or nested physical update"
+        );
+        state.starts += 1;
+        state.reuse_before = state.reuse.clone();
         if let Some(started) = state.started.take() {
             state.preparation_seconds = started.elapsed().as_secs_f64();
         }
@@ -384,6 +627,12 @@ pub fn cohort_capture_initial(vars: &[candle_core::Var]) -> candle_core::Result<
                 state.initial.entry(var.as_tensor().id())
             {
                 entry.insert(var.as_tensor().detach().copy()?);
+                if super::comparison::active_stage().is_some() {
+                    state.initial_fingerprints.insert(
+                        var.as_tensor().id(),
+                        comparison_tensor_digest(var.as_tensor())?,
+                    );
+                }
             }
         }
         Ok(())
@@ -404,8 +653,8 @@ pub fn cohort_before_update(
         let Some(state) = state.as_mut() else {
             return Ok(());
         };
-        if state.updates >= 20 {
-            candle_core::bail!("bounded proof exceeded twenty optimizer updates");
+        if state.updates >= state.expected_updates {
+            candle_core::bail!("bounded proof exceeded source-owned optimizer update count");
         }
         for var in vars {
             let tensor = var.as_tensor();
@@ -417,6 +666,11 @@ pub fn cohort_before_update(
                 state.initial.entry(tensor.id())
             {
                 entry.insert(tensor.detach().copy()?);
+                if super::comparison::active_stage().is_some() {
+                    state
+                        .initial_fingerprints
+                        .insert(tensor.id(), comparison_tensor_digest(tensor)?);
+                }
             }
         }
         Ok(())
@@ -468,10 +722,17 @@ pub fn cohort_end_step(
             changed |= delta > 0.;
         }
         if !changed || nonzero_gradients == 0 { candle_core::bail!("cohort optimizer produced no actual adapter update"); }
-        let warmup = state.steps.is_empty();
-        state.steps.push(serde_json::json!({"update":state.updates,"owner":owner,"warmup":warmup,
+        let warmup = state.steps.len() < state.warmups;
+        let mechanisms: std::collections::BTreeMap<_, _> = state.reuse.iter()
+            .filter_map(|(key, count)| {
+                let delta = count - state.reuse_before.get(key).copied().unwrap_or(0);
+                (delta > 0).then_some((key.clone(), delta))
+            }).collect();
+        let mut step = serde_json::json!({"update":state.updates,"owner":owner,"warmup":warmup,
             "seconds":seconds,"loss":loss,"finite_gradients":gradient_count,"nonzero_gradients":nonzero_gradients,
-            "adapter_changed":changed,"attention_candidate":attention.0,"attention_reference":attention.1}));
+            "adapter_changed":changed,"attention_candidate":attention.0,"attention_reference":attention.1});
+        if super::comparison::active_stage().is_some() { step["mechanism_consumption"] = serde_json::json!(mechanisms); }
+        state.steps.push(step);
         Ok(())
     })?;
     let _ = (loss, vars, owner);

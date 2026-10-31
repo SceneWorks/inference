@@ -100,52 +100,57 @@ impl CandleSession {
                 ));
             }
         }
-        let mut geometry = Vec::new();
-        let mut prepared_text: std::collections::HashMap<
-            candle_gen::candle_core::TensorId,
-            Tensor,
-        > = std::collections::HashMap::new();
-        for example in &mut examples {
-            let image = scaled_image_ids(
-                &latent_ids(example.grid.0, example.grid.1),
-                IMAGE_ROPE_SCALE,
-            );
-            let condition = if example.reference.is_some() {
-                training_condition_ids(example.grid.0, example.grid.1).map_err(Error::from)?
-            } else {
-                Vec::new()
-            };
-            geometry.push(image.clone());
-            geometry.push(condition.clone());
-            geometry.push(example.text_ids.clone());
-            geometry.push([image, condition, example.text_ids.clone()].concat());
-            for text in std::iter::once(&mut example.text).chain(example.empty_text.iter_mut()) {
-                let id = text.id();
-                let projected = match prepared_text.get(&id) {
-                    Some(value) => value.clone(),
-                    None => {
-                        let value = graph.dit.prepare_training_text(text)?;
-                        prepared_text.insert(id, value.clone());
-                        value
-                    }
+        // E2-off must retain raw input-width text: the normal preparation
+        // replaces these host cache entries with hidden-width projections.
+        if candle_gen::train::comparison::cache_enabled() {
+            let mut geometry = Vec::new();
+            let mut prepared_text: std::collections::HashMap<
+                candle_gen::candle_core::TensorId,
+                Tensor,
+            > = std::collections::HashMap::new();
+            for example in &mut examples {
+                let image = scaled_image_ids(
+                    &latent_ids(example.grid.0, example.grid.1),
+                    IMAGE_ROPE_SCALE,
+                );
+                let condition = if example.reference.is_some() {
+                    training_condition_ids(example.grid.0, example.grid.1).map_err(Error::from)?
+                } else {
+                    Vec::new()
                 };
-                *text = projected;
+                geometry.push(image.clone());
+                geometry.push(condition.clone());
+                geometry.push(example.text_ids.clone());
+                geometry.push([image, condition, example.text_ids.clone()].concat());
+                for text in std::iter::once(&mut example.text).chain(example.empty_text.iter_mut())
+                {
+                    let id = text.id();
+                    let projected = match prepared_text.get(&id) {
+                        Some(value) => value.clone(),
+                        None => {
+                            let value = graph.dit.prepare_training_text(text)?;
+                            prepared_text.insert(id, value.clone());
+                            value
+                        }
+                    };
+                    *text = projected;
+                }
             }
-        }
-        let geometry_bytes = geometry
-            .iter()
-            .map(|ids| ids.len() * (graph.dit.config().hidden / graph.dit.config().heads) * 4)
-            .sum::<usize>() as u64;
-        candle_gen::train::flow_match::check_aux_memory(
-            "flux3 training geometry",
-            0,
-            geometry_bytes,
-            candle_gen::train::flow_match::device_training_budget_bytes(
-                graph.dit.device(),
+            let geometry_bytes = geometry
+                .iter()
+                .map(|ids| ids.len() * (graph.dit.config().hidden / graph.dit.config().heads) * 4)
+                .sum::<usize>() as u64;
+            candle_gen::train::flow_match::check_aux_memory(
                 "flux3 training geometry",
-            ),
-        )?;
-        graph.dit.prepare_training_geometry(&geometry)?;
+                0,
+                geometry_bytes,
+                candle_gen::train::flow_match::device_training_budget_bytes(
+                    graph.dit.device(),
+                    "flux3 training geometry",
+                ),
+            )?;
+            graph.dit.prepare_training_geometry(&geometry)?;
+        }
         Ok(Self {
             graph,
             optimizer,

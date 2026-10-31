@@ -1,0 +1,1736 @@
+{
+  "schema_version": 1,
+  "protocol": "conditional-v1",
+  "entries": [
+    {
+      "package": "candle-gen-lens",
+      "target": "integration",
+      "fqn": "trainer_e2e::lens_bounded_acceleration_acceptance",
+      "model_id": "lens",
+      "owner": "lens trainer",
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e1",
+        "minus-e2",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner",
+        "minus-e3"
+      ],
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 20,
+      "workload": {
+        "resolution": 512,
+        "rank": 8,
+        "alpha": 8,
+        "train_dtype": "bf16",
+        "gradient_checkpointing": true,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "samples": 0,
+        "resume": false,
+        "optimizer": "adamw",
+        "learning_rate": 0.001,
+        "lr_scheduler": "Constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "actual_preexisting_cache": "Native VAE latents and text-encoder outputs cached once before updates; held constant in every stage. E2 onlynew frozen projection/geometry cache.",
+        "caption_policy": "Exact existing source strings; native pinned tokenizer; actual raw context/token shapes captured in initialization records; full native TrainingConfig Debug snapshot retained.",
+        "video_frames": 1,
+        "audio_mode": "none",
+        "checkpoint_owner": "Lens per-block segmented backward always; others native requested checkpoint flag",
+        "measured_admission": "UNMEASURED new512/256 workload except originalLTX25sameknown256AV; rootmustrecord admission before manual dispatch, no grid."
+      },
+      "metrics": "cohort_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "lens-trainer-model-components",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "lens-trainer-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::tokenizer::TextTokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [
+        "lens-trainer-installed-adapter",
+        "lens-trainer-roundtrip-tensor-files"
+      ],
+      "constant_repairs": []
+    },
+    {
+      "package": "candle-gen-z-image",
+      "target": "integration",
+      "fqn": "trainer_e2e::z_image_bounded_acceleration_acceptance",
+      "model_id": "z_image_turbo",
+      "owner": "z_image trainer",
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e1",
+        "minus-e2",
+        "minus-e3"
+      ],
+      "not_applicable": [
+        "minus-reference-owner",
+        "plus-streaming"
+      ],
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 20,
+      "workload": {
+        "resolution": 512,
+        "rank": 8,
+        "alpha": 8,
+        "train_dtype": "bf16",
+        "gradient_checkpointing": true,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "samples": 0,
+        "resume": false,
+        "optimizer": "adamw",
+        "learning_rate": 0.001,
+        "lr_scheduler": "Constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "actual_preexisting_cache": "Native VAE latents and text-encoder outputs cached once before updates; held constant in every stage. E2 onlynew frozen projection/geometry cache.",
+        "caption_policy": "Exact existing source strings; native pinned tokenizer; actual raw context/token shapes captured in initialization records; full native TrainingConfig Debug snapshot retained.",
+        "video_frames": 1,
+        "audio_mode": "none",
+        "checkpoint_owner": "Native provider checkpoint path, actual full TrainingConfig retained",
+        "measured_admission": "UNMEASURED new512/256 workload except originalLTX25sameknown256AV; rootmustrecord admission before manual dispatch, no grid."
+      },
+      "metrics": "cohort_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "zimage-trainer-model-components",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "zimage-trainer-retained-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::ValidatedTokenizerSource::read_unchanged"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [
+        "actual-retained-file-batch-postchecked"
+      ],
+      "constant_repairs": [],
+      "input_scope_note": "LoadSpec::read_files_unchanged is generator-only lib.rs:527, not lazy trainer::load_trainer; timing-only stage omits generation."
+    },
+    {
+      "package": "candle-gen-qwen-image-2-1",
+      "target": "integration",
+      "fqn": "train_peak_real_weights::qwen21_bounded_acceleration_acceptance",
+      "model_id": "qwen_image_2_1",
+      "owner": "qwen-image-2-1",
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e1",
+        "minus-e2",
+        "minus-e3",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner"
+      ],
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 24,
+      "workload": {
+        "resolution": 512,
+        "rank": 4,
+        "alpha": 4,
+        "train_dtype": "bf16",
+        "gradient_checkpointing": true,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "samples": 0,
+        "resume": false,
+        "optimizer": "adamw",
+        "learning_rate": 0.001,
+        "lr_scheduler": "Constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "actual_preexisting_cache": "Native VAE latents and text-encoder outputs cached once before updates; held constant in every stage. E2 onlynew frozen projection/geometry cache.",
+        "caption_policy": "Exact existing source strings; native pinned tokenizer; actual raw context/token shapes captured in initialization records; full native TrainingConfig Debug snapshot retained.",
+        "video_frames": 1,
+        "audio_mode": "none",
+        "checkpoint_owner": "Native provider checkpoint path, actual full TrainingConfig retained",
+        "measured_admission": "UNMEASURED new512/256 workload except originalLTX25sameknown256AV; rootmustrecord admission before manual dispatch, no grid."
+      },
+      "metrics": "cohort_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "qwen21-trainer-model-components",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "qwen21-trainer-component-configs",
+          "role": "artifact-input",
+          "readers": [
+            "crates/media/candle-gen/candle-gen-qwen-image-2-1/src/config.rs::read_json::std::fs::read@4341"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "qwen21-trainer-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::tokenizer::TextTokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [],
+      "constant_repairs": []
+    },
+    {
+      "package": "candle-gen-wan",
+      "target": "integration",
+      "fqn": "trainer_e2e::wan_t2v_14b_bounded_acceleration_acceptance",
+      "model_id": "wan2_2_t2v_14b",
+      "owner": [
+        "wan-expert-0",
+        "wan-expert-1"
+      ],
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e1",
+        "minus-e2",
+        "minus-e3",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner"
+      ],
+      "updates_per_stage": 6,
+      "warmups_per_stage": 2,
+      "max_new_updates": 36,
+      "workload": {
+        "resolution": 512,
+        "rank": 8,
+        "alpha": 8,
+        "train_dtype": "bf16",
+        "gradient_checkpointing": true,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "samples": 0,
+        "resume": false,
+        "optimizer": "adamw",
+        "learning_rate": 0.001,
+        "lr_scheduler": "Constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "actual_preexisting_cache": "Native VAE latents and text-encoder outputs cached once before updates; held constant in every stage. E2 onlynew frozen projection/geometry cache.",
+        "caption_policy": "Exact existing source strings; native pinned tokenizer; actual raw context/token shapes captured in initialization records; full native TrainingConfig Debug snapshot retained.",
+        "video_frames": 1,
+        "audio_mode": "none",
+        "checkpoint_owner": "Native provider checkpoint path, actual full TrainingConfig retained",
+        "video_scope": "Current native training uses single-image/single-frame latents, no multi-frame throughput claim; expertband scheduling preserved.",
+        "measured_admission": "UNMEASURED new512/256 workload except originalLTX25sameknown256AV; rootmustrecord admission before manual dispatch, no grid."
+      },
+      "metrics": "cohort_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "wan-trainer-actual-model-components",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "wan-trainer-umt5-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::tokenizer::TextTokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [
+        "wan-actual-produced-adapter-tensors",
+        "wan-actual-adapter-install"
+      ],
+      "constant_repairs": []
+    },
+    {
+      "package": "candle-gen-wan",
+      "target": "integration",
+      "fqn": "training_modes_cuda::wan_ti2v_5b_bounded_acceleration_acceptance",
+      "model_id": "wan2_2_ti2v_5b",
+      "owner": "wan-expert-0",
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e1",
+        "minus-e2",
+        "minus-e3",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner"
+      ],
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 24,
+      "workload": {
+        "resolution": 512,
+        "rank": 2,
+        "alpha": 2,
+        "train_dtype": "bf16",
+        "gradient_checkpointing": true,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "samples": 0,
+        "resume": false,
+        "optimizer": "adamw",
+        "learning_rate": 0.01,
+        "lr_scheduler": "Constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "actual_preexisting_cache": "Native VAE latents and text-encoder outputs cached once before updates; held constant in every stage. E2 onlynew frozen projection/geometry cache.",
+        "caption_policy": "Exact existing source strings; native pinned tokenizer; actual raw context/token shapes captured in initialization records; full native TrainingConfig Debug snapshot retained.",
+        "video_frames": 1,
+        "audio_mode": "none",
+        "checkpoint_owner": "Native provider checkpoint path, actual full TrainingConfig retained",
+        "video_scope": "Current native training uses single-image/single-frame latents, no multi-frame throughput claim; expertband scheduling preserved.",
+        "measured_admission": "UNMEASURED new512/256 workload except originalLTX25sameknown256AV; rootmustrecord admission before manual dispatch, no grid."
+      },
+      "metrics": "cohort_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "wan-trainer-actual-model-components",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "wan-trainer-umt5-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::tokenizer::TextTokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [
+        "wan-actual-produced-adapter-tensors",
+        "wan-actual-adapter-install"
+      ],
+      "constant_repairs": []
+    },
+    {
+      "package": "candle-gen-ltx",
+      "target": "integration",
+      "fqn": "trainer_e2e::ltx23_bounded_acceleration_acceptance",
+      "model_id": "ltx_2_3",
+      "owner": "ltx trainer",
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e1",
+        "minus-e2",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner",
+        "minus-e3"
+      ],
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 20,
+      "workload": {
+        "resolution": 256,
+        "rank": 4,
+        "alpha": 4,
+        "train_dtype": "f32",
+        "gradient_checkpointing": true,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "samples": 0,
+        "resume": false,
+        "optimizer": "adamw",
+        "learning_rate": 0.001,
+        "lr_scheduler": "Constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "actual_preexisting_cache": "Native VAE latents and text-encoder outputs cached once before updates; held constant in every stage. E2 onlynew frozen projection/geometry cache.",
+        "caption_policy": "Exact existing source strings; native pinned tokenizer; actual raw context/token shapes captured in initialization records; full native TrainingConfig Debug snapshot retained.",
+        "video_frames": 1,
+        "audio_mode": "none",
+        "checkpoint_owner": "Native provider checkpoint path, actual full TrainingConfig retained",
+        "measured_admission": "UNMEASURED new512/256 workload except originalLTX25sameknown256AV; rootmustrecord admission before manual dispatch, no grid."
+      },
+      "metrics": "cohort_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "ltx23-trainer-runtime-reader-0",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "ltx23-actual-cache-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "candle-gen-ltx::training::LtxTrainer::cache/ltx23-tokenizer"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "ltx23-actual-cache-quantization-config",
+          "role": "configuration",
+          "readers": [
+            "candle-gen-ltx::tier::TierPaths::packed_config/configuration"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [
+        "ltx-generated-adapter-roundtrip"
+      ],
+      "constant_repairs": []
+    },
+    {
+      "package": "candle-gen-ltx",
+      "target": "integration",
+      "fqn": "trainer_e2e::ltx25_bounded_acceleration_acceptance",
+      "model_id": "ltx_2_5",
+      "owner": "ltx trainer",
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e1",
+        "minus-e2",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner",
+        "minus-e3"
+      ],
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 20,
+      "workload": {
+        "resolution": 256,
+        "rank": 4,
+        "alpha": 4,
+        "train_dtype": "f32",
+        "gradient_checkpointing": false,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "samples": 0,
+        "resume": false,
+        "optimizer": "adamw",
+        "learning_rate": 0.001,
+        "lr_scheduler": "Constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "actual_preexisting_cache": "Native VAE latents and text-encoder outputs cached once before updates; held constant in every stage. E2 onlynew frozen projection/geometry cache.",
+        "caption_policy": "Exact existing source strings; native pinned tokenizer; actual raw context/token shapes captured in initialization records; full native TrainingConfig Debug snapshot retained.",
+        "video_frames": 9,
+        "audio_mode": "joint-prepared-latent-video-and-audio",
+        "checkpoint_owner": "Native provider checkpoint path, actual full TrainingConfig retained",
+        "fps": 24,
+        "video_duration_seconds": 0.375,
+        "video_latent_shape": [
+          1,
+          128,
+          2,
+          8,
+          8
+        ],
+        "audio_latent_shape": [
+          1,
+          8,
+          9,
+          16
+        ],
+        "audio_latent_sample_rate_hz": 16000,
+        "audio_latent_frames_per_second": 25,
+        "audio_latent_duration_seconds": 0.36,
+        "audio_scope": "Prepared latent training; no waveform input/resampling/vocoder in comparison.25latentframes/s native mappinground(9/24*25)=9.",
+        "workflow": "t2v_lora; actualjoint AV loss and adapter target routing preserved",
+        "measured_admission": "UNMEASURED new512/256 workload except originalLTX25sameknown256AV; rootmustrecord admission before manual dispatch, no grid."
+      },
+      "metrics": "cohort_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "ltx25-real-model-components",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "ltx25-native-Gemma4-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "candle-gen-ltx::training::LtxTrainer::cache/ltx25-tokenizer"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "ltx25-prepared-schema-shapes-fps",
+          "role": "configuration",
+          "readers": [
+            "candle-gen-ltx::training::validate_prepared_ltx25_bundle/header-configuration"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "ltx25-real-ltx23-target-provenance",
+          "role": "tensor-input",
+          "readers": [
+            "candle-gen-ltx::trainer_e2e::real_ltx25_prepared_item/real-ltx23-target-data"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "ltx25-packed-tier-manifest",
+          "role": "artifact-input",
+          "readers": [
+            "crates/media/candle-gen/candle-gen-ltx/src/tier.rs::read_manifest_json::std::fs::read_to_string@74840"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [
+        "ltx25-prepared-tensors-and-runtime-adapter",
+        "ltx25-produced-adapter-factors"
+      ],
+      "constant_repairs": [
+        "bounded packed frozen-input VJP all arms"
+      ]
+    },
+    {
+      "package": "candle-gen-sdxl",
+      "target": "integration",
+      "fqn": "trainer_e2e::sdxl_bounded_acceleration_acceptance",
+      "model_id": "sdxl",
+      "owner": "sdxl",
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e1",
+        "minus-e2",
+        "minus-e3",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner"
+      ],
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 24,
+      "workload": {
+        "resolution": 512,
+        "rank": 8,
+        "alpha": 8,
+        "train_dtype": "f32",
+        "gradient_checkpointing": true,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "samples": 0,
+        "resume": false,
+        "optimizer": "adamw",
+        "learning_rate": 0.001,
+        "lr_scheduler": "Constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "actual_preexisting_cache": "Native VAE latents and text-encoder outputs cached once before updates; held constant in every stage. E2 onlynew frozen projection/geometry cache.",
+        "caption_policy": "Exact existing source strings; native pinned tokenizer; actual raw context/token shapes captured in initialization records; full native TrainingConfig Debug snapshot retained.",
+        "video_frames": 1,
+        "audio_mode": "none",
+        "checkpoint_owner": "Native provider checkpoint path, actual full TrainingConfig retained",
+        "measured_admission": "UNMEASURED new512/256 workload except originalLTX25sameknown256AV; rootmustrecord admission before manual dispatch, no grid."
+      },
+      "metrics": "cohort_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "sdxl-trainer-model-checkpoints",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "sdxl-trainer-clip-body-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "sdxl-actual-trainer-tokenizer-pair",
+          "role": "tokenizer",
+          "readers": [
+            "candle-gen-sdxl::training::DualClip::load/tokenizers"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 2,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [
+        "sdxl-produced-adapter-tensor-validation",
+        "sdxl-actual-adapter-merge"
+      ],
+      "constant_repairs": [
+        "Differentiable centered F32 LayerNorm with original activation-cast then affine weight/bias order (4ff8e159e6654e9bbae39f0619bcada9f320c759) stays constant in EVERY arm; old contiguous affine nn::LayerNorm routes apply_op3_no_bwd and must not be restored for training."
+      ],
+      "E1_norm_scope": "N/A: centered differentiable LayerNorm is a necessary correctness repair, unchanged across stages; E1 conditional measures shared LoRA arithmetic ONLY, not LayerNorm speed.",
+      "E1_norm_source_basis": {
+        "provider_path": "crates/media/candle-gen/candle-gen-sdxl/src/unet/attention.rs:10-26",
+        "introduced_by": "4ff8e159e6654e9bbae39f0619bcada9f320c759",
+        "shared_nn_revision": "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d",
+        "shared_nn_paths": [
+          "candle-nn/src/layer_norm.rs:116-121",
+          "candle-nn/src/ops.rs:889-901"
+        ],
+        "source_fact": "Contiguous centered affine LayerNorm::forward -> ops::layer_norm -> xs.apply_op3_no_bwd; upstream learned activation gradients would be detached."
+      }
+    },
+    {
+      "package": "candle-gen-kolors",
+      "target": "integration",
+      "fqn": "trainer_cuda_smoke::kolors_bounded_acceleration_acceptance",
+      "model_id": "kolors",
+      "owner": "kolors",
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e1",
+        "minus-e2",
+        "minus-e3",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner"
+      ],
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 24,
+      "workload": {
+        "resolution": 512,
+        "rank": 2,
+        "alpha": 2,
+        "train_dtype": "bf16",
+        "gradient_checkpointing": false,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "samples": 0,
+        "resume": false,
+        "optimizer": "adamw",
+        "learning_rate": 0.01,
+        "lr_scheduler": "Constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "actual_preexisting_cache": "Native VAE latents and text-encoder outputs cached once before updates; held constant in every stage. E2 onlynew frozen projection/geometry cache.",
+        "caption_policy": "Exact existing source strings; native pinned tokenizer; actual raw context/token shapes captured in initialization records; full native TrainingConfig Debug snapshot retained.",
+        "video_frames": 1,
+        "audio_mode": "none",
+        "checkpoint_owner": "Native provider checkpoint path, actual full TrainingConfig retained",
+        "measured_admission": "UNMEASURED new512/256 workload except originalLTX25sameknown256AV; rootmustrecord admission before manual dispatch, no grid."
+      },
+      "metrics": "cohort_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "kolors-actual-model-components",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "kolors-actual-chatglm-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "crates/media/candle-gen/candle-gen-kolors/src/tokenizer.rs::from_file::Tokenizer::from_file@2953"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [
+        "kolors-produced-adapter-tensor-check",
+        "kolors-actual-runtime-adapter-install"
+      ],
+      "constant_repairs": [
+        "Differentiable centered F32 LayerNorm with original activation-cast then affine weight/bias order (4ff8e159e6654e9bbae39f0619bcada9f320c759) stays constant in EVERY arm; old contiguous affine nn::LayerNorm routes apply_op3_no_bwd and must not be restored for training."
+      ],
+      "E2_scope": "New frozen encoder_hid_proj hoist PLUS shared cross-attention base K/V cache; legacy/minus-e2 retains actual projectionweights and recomputes historical expression perstep. Other stagesdrop projectionweights aftercache.",
+      "E1_norm_scope": "N/A: centered differentiable LayerNorm is a necessary correctness repair, unchanged across stages; E1 conditional measures shared LoRA arithmetic ONLY, not LayerNorm speed.",
+      "E1_norm_source_basis": {
+        "provider_path": "crates/media/candle-gen/candle-gen-sdxl/src/unet/attention.rs:10-26",
+        "introduced_by": "4ff8e159e6654e9bbae39f0619bcada9f320c759",
+        "shared_nn_revision": "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d",
+        "shared_nn_paths": [
+          "candle-nn/src/layer_norm.rs:116-121",
+          "candle-nn/src/ops.rs:889-901"
+        ],
+        "source_fact": "Contiguous centered affine LayerNorm::forward -> ops::layer_norm -> xs.apply_op3_no_bwd; upstream learned activation gradients would be detached."
+      }
+    },
+    {
+      "package": "candle-gen-sd3",
+      "target": "integration",
+      "fqn": "trainer_cuda_smoke::sd35_medium_bounded_acceleration_acceptance",
+      "model_id": "sd3_5_medium",
+      "owner": "sd3",
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e1",
+        "minus-e2",
+        "minus-e3",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner"
+      ],
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 24,
+      "workload": {
+        "resolution": 512,
+        "rank": 2,
+        "alpha": 2,
+        "train_dtype": "bf16",
+        "gradient_checkpointing": false,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "samples": 0,
+        "resume": false,
+        "optimizer": "adamw",
+        "learning_rate": 0.01,
+        "lr_scheduler": "Constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "actual_preexisting_cache": "Native VAE latents and text-encoder outputs cached once before updates; held constant in every stage. E2 onlynew frozen projection/geometry cache.",
+        "caption_policy": "Exact existing source strings; native pinned tokenizer; actual raw context/token shapes captured in initialization records; full native TrainingConfig Debug snapshot retained.",
+        "video_frames": 1,
+        "audio_mode": "none",
+        "checkpoint_owner": "Native provider checkpoint path, actual full TrainingConfig retained",
+        "measured_admission": "UNMEASURED new512/256 workload except originalLTX25sameknown256AV; rootmustrecord admission before manual dispatch, no grid."
+      },
+      "metrics": "cohort_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "sd35-trainer-shared-model-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 2,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "sd35-trainer-clip-body-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "sd35-trainer-t5-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "crates/media/candle-gen/candle-gen-sd3/src/conditioning.rs::load::Tokenizer::from_file@15308"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "sd35-trainer-t5-configuration",
+          "role": "artifact-input",
+          "readers": [
+            "crates/media/candle-gen/candle-gen-sd3/src/conditioning.rs::load::std::fs::read_to_string@16073"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "sd35-actual-clip-tokenizer-source",
+          "role": "tokenizer",
+          "readers": [
+            "crates/media/candle-gen/candle-gen-sd3/src/clip_tokenizer.rs::load_clip_tokenizer::Tokenizer::from_file@3310",
+            "candle-gen-sd3::clip_tokenizer::synthesize_clip_tokenizer/tokenizer-pair"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [
+        "sd35-trainer-produced-adapter-tensors",
+        "sd35-trainer-actual-adapter-install"
+      ],
+      "constant_repairs": []
+    },
+    {
+      "package": "candle-gen-anima",
+      "target": "integration",
+      "fqn": "trainer_cuda_smoke::anima_bounded_acceleration_acceptance",
+      "model_id": "anima_base",
+      "owner": "anima trainer",
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e1",
+        "minus-e2",
+        "minus-e3",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner"
+      ],
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 24,
+      "workload": {
+        "resolution": 512,
+        "rank": 2,
+        "alpha": 2,
+        "train_dtype": "bf16",
+        "gradient_checkpointing": false,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "samples": 0,
+        "resume": false,
+        "optimizer": "adamw",
+        "learning_rate": 0.001,
+        "lr_scheduler": "Constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "actual_preexisting_cache": "Native VAE latents and text-encoder outputs cached once before updates; held constant in every stage. E2 onlynew frozen projection/geometry cache.",
+        "caption_policy": "Exact existing source strings; native pinned tokenizer; actual raw context/token shapes captured in initialization records; full native TrainingConfig Debug snapshot retained.",
+        "video_frames": 1,
+        "audio_mode": "none",
+        "checkpoint_owner": "Native provider checkpoint path, actual full TrainingConfig retained",
+        "measured_admission": "UNMEASURED new512/256 workload except originalLTX25sameknown256AV; rootmustrecord admission before manual dispatch, no grid."
+      },
+      "metrics": "bespoke_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "anima-component-mmap-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [
+        "anima-decoder-weights",
+        "anima-trainer-roundtrip-tensors",
+        "anima-generated-adapter-install"
+      ],
+      "constant_repairs": []
+    },
+    {
+      "package": "candle-gen-moss-image",
+      "target": "integration",
+      "fqn": "real_weights::moss_bounded_acceleration_acceptance",
+      "model_id": "moss",
+      "owners": [
+        "moss-image"
+      ],
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e1",
+        "minus-e2",
+        "minus-e3",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner"
+      ],
+      "not_applicable_reasons": {
+        "minus-reference-owner": "N-A: provider plain composable fallback or preexisting Irisfold3; no new shared bounded ReferenceOwner is called."
+      },
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 24,
+      "workload": {
+        "resolution": 512,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "train_dtype": "bf16",
+        "resume": false,
+        "samples": 0,
+        "learning_rate": 0.001,
+        "rank": 2,
+        "alpha": 2,
+        "gradient_checkpointing": false,
+        "optimizer": "adamw",
+        "weight_decay": 0.0,
+        "lr_scheduler": "constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "native_cache_policy": "Requested true/true; existing frozen VAE latents and Qwen conditioning remain cached in EVERY stage. E2 controls only newly added transformer geometry/conditioning preparation.",
+        "video_frames": null,
+        "audio_mode": null,
+        "modality": "image",
+        "optimizer_betas": [
+          0.9,
+          0.999
+        ],
+        "optimizer_epsilon": 1e-08,
+        "loss_type": "mse"
+      },
+      "metrics": "bespoke_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "moss-actual-native-model-files",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen-moss-image::loader::load_weights_cancellable"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "moss-actual-parsed-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "candle-gen-moss-image::text_encoder::tokenizer"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [
+        "moss-saved-adapter-roundtrip"
+      ],
+      "constant_repairs": [
+        "Existing current correctness/reader/device/safety bounds remain common."
+      ],
+      "initial_state_basis": "Fresh same-binary child/native factory. Actual configuration/data hashes plus shared optimizer/parameter initialization receipts; Iris also hashes privateparams/EMA/optimizer/critic/SN buffers before any update.",
+      "runtime_directory": "Iris requires new owned BESPOKE_RUNTIME_DIR subdirectory with authoritative .sc-26850-owned-runtime marker; no stage reuses prior checkpoints.",
+      "claim_limit": "512px worst-legacy admission UNMEASURED; no localNN/fit claim. Eligible E4 requires actualnativecandidate dispatch, not mere opt-in. Original functional proofs and MOSS consumerproduct scope unchanged.",
+      "owner": "moss-image",
+      "candidate_required_owners": [
+        "moss-image"
+      ],
+      "case_deadline_seconds": 3600
+    },
+    {
+      "package": "candle-gen-mage",
+      "target": "integration",
+      "fqn": "trainer_cuda_smoke::mage_bounded_acceleration_acceptance",
+      "model_id": "mage-adapter",
+      "owners": [
+        "mage_flow_base trainer"
+      ],
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e1",
+        "minus-e2",
+        "minus-e3",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner"
+      ],
+      "not_applicable_reasons": {
+        "minus-reference-owner": "N-A: provider plain composable fallback or preexisting Irisfold3; no new shared bounded ReferenceOwner is called."
+      },
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 24,
+      "workload": {
+        "resolution": 512,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "train_dtype": "bf16",
+        "resume": false,
+        "samples": 0,
+        "learning_rate": 0.001,
+        "rank": 2,
+        "alpha": 2,
+        "gradient_checkpointing": false,
+        "full_finetune": false,
+        "Full_performance": "UNMEASURED/N-A; no mode grid",
+        "optimizer": "adamw",
+        "weight_decay": 0.0,
+        "lr_scheduler": "constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "native_cache_policy": "Native cache_samples always prepares frozen VAE latents and text per item/bucket in EVERY stage; generic true/true flags do not disable this preexisting cache. E2 controls only newly added transformer preparation.",
+        "video_frames": null,
+        "audio_mode": null,
+        "modality": "image",
+        "optimizer_betas": [
+          0.9,
+          0.999
+        ],
+        "optimizer_epsilon": 1e-08,
+        "loss_type": "mse"
+      },
+      "metrics": "bespoke_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "mage-actual-private-model-tensor-source",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "mage-actual-text-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "candle-gen-mage::text_encoder::MageTextEncoder::load_inner/tokenizer"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "mage-training-transformer-configuration",
+          "role": "configuration",
+          "readers": [
+            "gen-core::model_input_proof::read_configuration_to_string#candle-gen-mage::training::MageTrainer::train_impl"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "mage-optional-training-packed-configuration",
+          "role": "configuration",
+          "readers": [
+            "gen-core::model_input_proof::read_configuration_to_string#candle-gen-mage::training::packed_component"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case",
+          "when": "external-present"
+        },
+        {
+          "slot": "mage-generated-source-training-png",
+          "role": "reference",
+          "readers": [
+            "crates/media/candle-gen/candle-gen/src/train/dataset.rs::decode_square::image::open@2345"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case",
+          "case_generated_write_read": {
+            "case_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs",
+            "case_source_sha256": "d1f346791904fa2ff509b9dbe0923b9459d47d8480db0ba19a1911214a380121",
+            "writer": "trainer_cuda_smoke::mage_bounded_acceleration_acceptance: RgbImage::from_pixel(...).save(&input) -> TrainingItem::captioned(input) -> production trainer cache_samples -> observed decode_square/item image reader"
+          }
+        }
+      ],
+      "dropped_quality_only_slots": [
+        "mage-actual-oracle-or-produced-output-tensors",
+        "mage-generated-render-transformer-configuration",
+        "mage-installed-produced-adapter"
+      ],
+      "constant_repairs": [
+        "Current dtype/reader/safety/cancellation/device bounds remain common; A23 Mage BF16 caption identity fix not reverted."
+      ],
+      "initial_state_basis": "Fresh same-binary child/native factory. Actual configuration/data hashes plus shared optimizer/parameter initialization receipts; Iris also hashes privateparams/EMA/optimizer/critic/SN buffers before any update.",
+      "runtime_directory": "Iris requires new owned BESPOKE_RUNTIME_DIR subdirectory with authoritative .sc-26850-owned-runtime marker; no stage reuses prior checkpoints.",
+      "claim_limit": "512px worst-legacy admission UNMEASURED; no localNN/fit claim. Eligible E4 requires actualnativecandidate dispatch, not mere opt-in. Original functional proofs and MOSS consumerproduct scope unchanged.",
+      "owner": "mage_flow_base trainer",
+      "candidate_required_owners": [
+        "mage_flow_base trainer"
+      ],
+      "case_deadline_seconds": 3600
+    },
+    {
+      "package": "candle-gen-flux3",
+      "target": "integration",
+      "fqn": "real_weights::flux3_bounded_acceleration_acceptance",
+      "model_id": "flux3",
+      "owners": [
+        "flux3"
+      ],
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e1",
+        "minus-e2",
+        "minus-e3",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner"
+      ],
+      "not_applicable_reasons": {
+        "minus-reference-owner": "N-A: provider plain composable fallback or preexisting Irisfold3; no new shared bounded ReferenceOwner is called."
+      },
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 24,
+      "workload": {
+        "resolution": 512,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "train_dtype": "bf16",
+        "resume": false,
+        "samples": 0,
+        "learning_rate": 0.001,
+        "rank": 2,
+        "alpha": 2,
+        "gradient_checkpointing": false,
+        "mode": "paired-edit",
+        "caption_dropout": 0,
+        "random_flip": false,
+        "optimizer": "adamw",
+        "weight_decay": 0.0,
+        "lr_scheduler": "constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "native_cache_policy": "Native prepared CPU AE/text/teacher cache remains in EVERY stage. E2 controls only new hidden-width text replacement and transformer geometry preparation; disabled stages retain original input-width text.",
+        "video_frames": null,
+        "audio_mode": null,
+        "modality": "image",
+        "optimizer_betas": [
+          0.9,
+          0.999
+        ],
+        "optimizer_epsilon": 1e-08,
+        "loss_type": "mse"
+      },
+      "metrics": "bespoke_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "flux3-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-text-config",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/config.rs::from_dir::std::fs::read_to_string@50697"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "flux3-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::tokenizer::TextTokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [],
+      "constant_repairs": [
+        "Existing current correctness/reader/device/safety bounds remain common."
+      ],
+      "initial_state_basis": "Fresh same-binary child/native factory. Actual configuration/data hashes plus shared optimizer/parameter initialization receipts; Iris also hashes privateparams/EMA/optimizer/critic/SN buffers before any update.",
+      "runtime_directory": "Iris requires new owned BESPOKE_RUNTIME_DIR subdirectory with authoritative .sc-26850-owned-runtime marker; no stage reuses prior checkpoints.",
+      "claim_limit": "512px worst-legacy admission UNMEASURED; no localNN/fit claim. Eligible E4 requires actualnativecandidate dispatch, not mere opt-in. Original functional proofs and MOSS consumerproduct scope unchanged.",
+      "owner": "flux3",
+      "candidate_required_owners": [
+        "flux3"
+      ],
+      "case_deadline_seconds": 3600
+    },
+    {
+      "package": "candle-gen-iris",
+      "target": "integration",
+      "fqn": "train_real_weights::iris_generation_bounded_acceleration_acceptance",
+      "model_id": "iris-generation",
+      "owners": [
+        "iris-generation"
+      ],
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e2",
+        "minus-e3",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner",
+        "minus-e1"
+      ],
+      "not_applicable_reasons": {
+        "minus-reference-owner": "N-A: provider plain composable fallback or preexisting Irisfold3; no new shared bounded ReferenceOwner is called.",
+        "minus-e1": "N-A/preexisting factor scale and differentiable fold3 norm retained."
+      },
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 20,
+      "workload": {
+        "resolution": 512,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "train_dtype": "bf16",
+        "resume": false,
+        "samples": 0,
+        "learning_rate": 0.0001,
+        "rank": 8,
+        "alpha": 8,
+        "gradient_checkpointing": false,
+        "ema_decay": 0.5,
+        "optimizer": "adamw",
+        "weight_decay": 0.0,
+        "lr_scheduler": "constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "native_cache_policy": "Native text_conditioning=cached explicitly: caption variants remembered before updates, frozen encoder then dropped. Existing image data pipeline/native encoding retained; generic latent-cache request is not evidence of a persistent latent cache. E2 toggles only new DiT RoPE/pixel-position tables.",
+        "video_frames": null,
+        "audio_mode": null,
+        "modality": "image",
+        "optimizer_betas": [
+          0.9,
+          0.95
+        ],
+        "optimizer_epsilon": 1e-08,
+        "loss_type": "mse",
+        "native_optimizer": "private IrisOptimizer AdamW; full fresh moments/counters fingerprinted before update",
+        "auto_lr": "none",
+        "auto_lr_base_batch_size": 256,
+        "export_weights": "ema",
+        "text_conditioning": "cached"
+      },
+      "metrics": "bespoke_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "iris-trainer-initial-model",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-trainer-generation-config",
+          "role": "configuration",
+          "readers": [
+            "gen-core::iris::IrisConfig::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-trainer-text-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-trainer-text-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::tokenizer::TextTokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-trainer-text-config",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/config.rs::from_dir::std::fs::read_to_string@50697"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [
+        "iris-trained-adapter-install"
+      ],
+      "constant_repairs": [
+        "Existing current correctness/reader/device/safety bounds remain common."
+      ],
+      "initial_state_basis": "Fresh same-binary child/native factory. Actual configuration/data hashes plus shared optimizer/parameter initialization receipts; Iris also hashes privateparams/EMA/optimizer/critic/SN buffers before any update.",
+      "runtime_directory": "Iris requires new owned BESPOKE_RUNTIME_DIR subdirectory with authoritative .sc-26850-owned-runtime marker; no stage reuses prior checkpoints.",
+      "claim_limit": "512px worst-legacy admission UNMEASURED; no localNN/fit claim. Eligible E4 requires actualnativecandidate dispatch, not mere opt-in. Original functional proofs and MOSS consumerproduct scope unchanged.",
+      "owner": "iris-generation",
+      "candidate_required_owners": [
+        "iris-generation"
+      ],
+      "case_deadline_seconds": 3600
+    },
+    {
+      "package": "candle-gen-iris",
+      "target": "integration",
+      "fqn": "depth_train_real_weights::iris_depth_bounded_acceleration_acceptance",
+      "model_id": "iris-depth",
+      "owners": [
+        "iris-depth"
+      ],
+      "stages": [
+        "legacy",
+        "current",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner",
+        "minus-e1",
+        "minus-e3",
+        "minus-e2"
+      ],
+      "not_applicable_reasons": {
+        "minus-reference-owner": "N-A: provider plain composable fallback or preexisting Irisfold3; no new shared bounded ReferenceOwner is called.",
+        "minus-e1": "N-A/preexisting factor scale and differentiable fold3 norm retained.",
+        "minus-e3": "N-A: full tracked backbone/reducer cannot frozenpack.",
+        "minus-e2": "IDENTICAL legacy: E1/E3/newRefOwner N-A, only newE2 differs; deduplicate to legacy."
+      },
+      "updates_per_stage": 4,
+      "warmups_per_stage": 1,
+      "max_new_updates": 12,
+      "workload": {
+        "resolution": 512,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "train_dtype": "bf16",
+        "resume": false,
+        "samples": 0,
+        "learning_rate": 3e-05,
+        "full_finetune": true,
+        "weight_decay": 0.01,
+        "loss": "l1",
+        "hflip_prob": 0,
+        "optimizer": "adamw",
+        "lr_scheduler": "constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "native_cache_policy": "Depth native fixed empty-prompt conditioning loaded once; image/depth data pipeline retained. Generic cache flags do not imply VAE/text-encoder caches in this pixel-space full-weight task. E2 toggles only new DiT RoPE/pixel-position tables.",
+        "video_frames": null,
+        "audio_mode": null,
+        "modality": "image",
+        "gradient_checkpointing": false,
+        "optimizer_betas": [
+          0.9,
+          0.999
+        ],
+        "optimizer_epsilon": 1e-08,
+        "loss_type": "l1",
+        "native_optimizer": "private IrisOptimizer AdamW; full fresh moments/counters fingerprinted before update",
+        "auto_lr": "none",
+        "auto_lr_base_batch_size": 256
+      },
+      "metrics": "bespoke_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "iris-depth-training-actual-tensor-files",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::load"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-actual-export-configuration",
+          "role": "configuration",
+          "readers": [
+            "gen-core::iris::downstream::TaskExport::from_dir_impl"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-actual-export-conditioning",
+          "role": "tensor-input",
+          "readers": [
+            "gen-core::iris::downstream::EmptyPrompt::read"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [
+        "iris-depth-export-roundtrip-model"
+      ],
+      "constant_repairs": [
+        "Existing current correctness/reader/device/safety bounds remain common."
+      ],
+      "initial_state_basis": "Fresh same-binary child/native factory. Actual configuration/data hashes plus shared optimizer/parameter initialization receipts; Iris also hashes privateparams/EMA/optimizer/critic/SN buffers before any update.",
+      "runtime_directory": "Iris requires new owned BESPOKE_RUNTIME_DIR subdirectory with authoritative .sc-26850-owned-runtime marker; no stage reuses prior checkpoints.",
+      "claim_limit": "512px worst-legacy admission UNMEASURED; no localNN/fit claim. Eligible E4 requires actualnativecandidate dispatch, not mere opt-in. Original functional proofs and MOSS consumerproduct scope unchanged.",
+      "owner": "iris-depth",
+      "candidate_required_owners": [
+        "iris-depth"
+      ],
+      "case_deadline_seconds": 3600
+    },
+    {
+      "package": "candle-gen-iris",
+      "target": "integration",
+      "fqn": "restoration_train_real_weights::iris_restoration_bounded_acceleration_acceptance",
+      "model_id": "iris-restoration",
+      "owners": [
+        "iris-restoration-generator",
+        "iris-restoration-critic"
+      ],
+      "stages": [
+        "legacy",
+        "current",
+        "minus-e2",
+        "minus-e3",
+        "plus-streaming"
+      ],
+      "not_applicable": [
+        "minus-reference-owner",
+        "minus-e1"
+      ],
+      "not_applicable_reasons": {
+        "minus-reference-owner": "N-A: provider plain composable fallback or preexisting Irisfold3; no new shared bounded ReferenceOwner is called.",
+        "minus-e1": "N-A/preexisting factor scale and differentiable fold3 norm retained."
+      },
+      "updates_per_stage": 8,
+      "warmups_per_stage": 2,
+      "max_new_updates": 40,
+      "workload": {
+        "resolution": 512,
+        "batch_size": 1,
+        "gradient_accumulation": 1,
+        "seed": 7,
+        "train_dtype": "bf16",
+        "resume": false,
+        "samples": 0,
+        "learning_rate": 1e-05,
+        "rank": 8,
+        "alpha": 8,
+        "ema_decay": 0.5,
+        "weight_decay": 0.01,
+        "owner_physical_updates_per_stage": {
+          "generator": 4,
+          "critic": 4
+        },
+        "timed_cycles": 3,
+        "warmup_cycles": 1,
+        "optimizer": "adamw",
+        "lr_scheduler": "constant",
+        "lr_warmup_steps": 0,
+        "cache_latents_requested": true,
+        "cache_text_embeddings_requested": true,
+        "native_cache_policy": "Native frozen feature/conditioning networks and paired/synthetic data pipeline retained unchanged; generic true/true flags do not establish persistent VAE/text caches. E2 toggles only new DiT RoPE/pixel-position tables. Comparison bootstrap now shares only verified immutable raw ConvNeXt/LPIPS checkpoint decode across children; not an E2 control or a measured preparation speedup.",
+        "video_frames": null,
+        "audio_mode": null,
+        "modality": "image",
+        "gradient_checkpointing": false,
+        "optimizer_betas": [
+          0.9,
+          0.999
+        ],
+        "optimizer_epsilon": 1e-08,
+        "loss_type": "native HYPIR restoration generator/critic objective (generic TrainingConfig.loss_type=mse)",
+        "native_optimizer": "private IrisOptimizer AdamW; full fresh moments/counters fingerprinted before update",
+        "critic_optimizer": {
+          "name": "adamw",
+          "learning_rate": 1e-05,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "weight_decay": 0.01,
+          "epsilon": 1e-08,
+          "gradient_clip": 1.0,
+          "lr_scheduler": "constant",
+          "lr_warmup_steps": 0
+        },
+        "generator_gradient_clip": 1.0,
+        "physical_update_cadence": "8 total per stage: warm G+D plus three timed G+D cycles; 4 generator+4 critic, all charged"
+      },
+      "metrics": "bespoke_acceptance/comparison_metrics.json",
+      "surviving_input_requirements": [
+        {
+          "slot": "iris-restore-training-model",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-restore-training-vgg",
+          "role": "tensor-input",
+          "readers": [
+            "candle-gen-iris::train::frozen_cache::vgg_native_store"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-restore-training-lpips",
+          "role": "tensor-input",
+          "readers": [
+            "candle-gen-iris::train::frozen_cache::lpips_native_store"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-restore-training-critic",
+          "role": "tensor-input",
+          "readers": [
+            "candle-gen-iris::train::frozen_cache::convnext_native_store"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-actual-export-configuration",
+          "role": "configuration",
+          "readers": [
+            "gen-core::iris::downstream::TaskExport::from_dir_impl"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-actual-export-conditioning",
+          "role": "tensor-input",
+          "readers": [
+            "gen-core::iris::downstream::EmptyPrompt::read"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ],
+      "dropped_quality_only_slots": [],
+      "constant_repairs": [
+        "Existing current correctness/reader/device/safety bounds remain common.",
+        "Comparison-only source/run/case-owned immutable raw ConvNeXt/LPIPS decoding bootstrap identical in all five arms, independent of E2. No mutable Run/optimizer/EMA/critic/SN or stage-dependent projection/geometry pack is reused. Original noncomparison frozen readers remain unchanged."
+      ],
+      "initial_state_basis": "Fresh same-binary child/native factory. Actual configuration/data hashes plus shared optimizer/parameter initialization receipts; Iris also hashes privateparams/EMA/optimizer/critic/SN buffers before any update.",
+      "runtime_directory": "Iris requires new owned BESPOKE_RUNTIME_DIR subdirectory with authoritative .sc-26850-owned-runtime marker; no stage reuses prior checkpoints.",
+      "claim_limit": "512px worst-legacy admission UNMEASURED; no localNN/fit claim. Eligible E4 requires actualnativecandidate dispatch, not mere opt-in. Original functional proofs and MOSS consumerproduct scope unchanged.",
+      "candidate_required_owners": [
+        "iris-restoration-generator"
+      ],
+      "e4_critic_scope": "N-A: criticCNN has no SDPA; fakegenerator uses detached parameters, so do not requirecandidate on criticupdates or force an alteredgraph.",
+      "immutable_frozen_bootstrap": {
+        "env": "MODEL_PROOF_IRIS_FROZEN_CACHE_DIR",
+        "scope": "common parentBESPOKE_RUNTIME_DIR/comparison-iris-frozen outside uploaded artifact, source/run/attempt/case/marker joined",
+        "raw_tensors": "original native dtype/name/shape/content SHA; original pinned file SHA+fingerprint and immutable store SHA",
+        "build": "one checkpoint metadata parse plus one payload ZIP archive per resource, atomic store+manifest, actual native roundtrip required before publication",
+        "mutable_state": "fresh in each native child; existing private params/optimizer/EMA/critic/SN initial fingerprints unchanged",
+        "stable_initialization": "source/cache/role/owner/readstage/tensor signatures only; cache_hit/bootstrap/nativecast durations are separate log observations",
+        "reader_labels": [
+          "candle-gen-iris::train::frozen_cache::convnext_native_store",
+          "candle-gen-iris::train::frozen_cache::vgg_native_store",
+          "candle-gen-iris::train::frozen_cache::lpips_native_store"
+        ],
+        "maximum_store_bytes_each": 8589934592,
+        "raw_store_uploaded": false,
+        "local_conversion_executed": false,
+        "measured_bootstrap_speedup": null,
+        "whole_model_byte_attestation": false
+      },
+      "case_deadline_seconds": 7200,
+      "deadline_scope": "ONE absolute model-case deadline including readiness/first bootstrap/all five children/finalization; never reset per stage"
+    }
+  ]
+}

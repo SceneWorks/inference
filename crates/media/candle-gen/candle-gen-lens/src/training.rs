@@ -693,6 +693,16 @@ impl FlowMatchTrainer for LensTrainer {
         _req: &TrainingRequest,
         _device: &Device,
     ) -> Result<()> {
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "lens-actual-raw-cache",
+                "entries": cache.iter().map(|(latent, features, grid, _)| serde_json::json!({"latent":latent.dims(),"caption_feature_layers":features.iter().map(Tensor::dims).collect::<Vec<_>>(),"latent_grid":grid,"video_frames":1,"audio_mode":"none"})).collect::<Vec<_>>()
+            }));
+        }
+        if !candle_gen::train::comparison::cache_enabled() {
+            return Ok(());
+        }
         let mut captions = std::collections::HashMap::<Vec<_>, Vec<Tensor>>::new();
         for (_, features, (h, w), _) in cache {
             let key = features.iter().map(Tensor::id).collect::<Vec<_>>();

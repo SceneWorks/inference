@@ -266,7 +266,22 @@ impl Norm {
         Ok(Self(t))
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let normalized = candle_gen::train::norm::rms_normalize_f32(x, 1e-6)?;
+        // The comparison's legacy arm is the pre-epic composable operator sequence
+        // (bfc367a631^), including its activation/FP32-island rounding below.
+        let normalized = if candle_gen::train::comparison::legacy_e1() {
+            candle_gen::train::profile::cohort_reuse("moss:comparison-legacy-rms");
+            let f = x.to_dtype(DType::F32)?;
+            f.broadcast_mul(
+                &((f.sqr()?.mean_keepdim(candle_gen::candle_core::D::Minus1)? + 1e-6)?
+                    .sqrt()?
+                    .recip()?),
+            )?
+        } else {
+            if candle_gen::train::comparison::active_stage().is_some() {
+                candle_gen::train::profile::cohort_reuse("moss:comparison-shared-rms");
+            }
+            candle_gen::train::norm::rms_normalize_f32(x, 1e-6)?
+        };
         // PyTorch promotes the normalized activation when the norm weight is an FP32 island.
         let dtype = if x.dtype() == DType::F32 || self.0.dtype() == DType::F32 {
             DType::F32
@@ -384,6 +399,9 @@ fn attention(q: &Tensor, k: &Tensor, v: &Tensor, r: &Tensor, heads: usize) -> Re
             .to_dtype(output_dtype)?
             .transpose(1, 2)?
             .reshape((b, s, d))?);
+    }
+    if candle_gen::train::comparison::active_stage().is_some() {
+        candle_gen::train::profile::cohort_reuse("moss:preexisting-composable-reference-attention");
     }
     let scores = (qh.matmul(&kt)? / ((d / heads) as f64).sqrt())?;
     // The optimized inference kernel uses apply_op1_no_bwd and severs every Q/K adapter
@@ -609,6 +627,9 @@ pub(crate) struct Transformer {
 }
 impl Transformer {
     pub(crate) fn training_preparation_bytes(&self, inputs: &[(&Tensor, usize, usize)]) -> u64 {
+        if !candle_gen::train::comparison::cache_enabled() {
+            return 0;
+        }
         let mut ids = std::collections::HashSet::new();
         let mut geometry = std::collections::HashSet::new();
         let mut bytes = 0usize;
@@ -629,14 +650,22 @@ impl Transformer {
     /// Called once after adapter installation/resume, only for existing cached captions.
     /// Uncached text remains uncached; previews and misses never extend run residency.
     pub(crate) fn prepare_training(&mut self, inputs: &[(&Tensor, usize, usize)]) -> Result<()> {
-        for block in &mut self.layers {
-            if block.projection_pack.is_none() {
-                block.projection_pack =
-                    Linear::prepare_frozen_group(&mut [&mut block.q, &mut block.k, &mut block.v])?;
+        if candle_gen::train::comparison::projection_enabled() {
+            for block in &mut self.layers {
+                if block.projection_pack.is_none() {
+                    block.projection_pack = Linear::prepare_frozen_group(&mut [
+                        &mut block.q,
+                        &mut block.k,
+                        &mut block.v,
+                    ])?;
+                }
             }
         }
         self.training_context.clear();
         self.training_rope.clear();
+        if !candle_gen::train::comparison::cache_enabled() {
+            return Ok(());
+        }
         for (context, h, w) in inputs {
             let tokens = context.dim(1)?;
             let key = (*h, *w, tokens, self.video.dtype());

@@ -29,6 +29,8 @@
 pub mod critic;
 pub mod depth;
 pub mod dist;
+#[cfg(feature = "model-inference-proof")]
+mod frozen_cache;
 pub mod lpips;
 pub mod model;
 pub mod optim;
@@ -1193,6 +1195,38 @@ impl Run {
             writes_checkpoints,
             log_window: Vec::new(),
         };
+        if candle_gen::train::comparison::active_stage().is_some() {
+            assert_eq!(run.step, 0, "comparison requires a pristine native run");
+            assert_eq!(run.sched_step, 0, "comparison scheduler starts at zero");
+            assert_eq!(
+                run.plan.dist.world.world_size, 1,
+                "comparison is one native rank"
+            );
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner":"iris-generation-native-run", "step":run.step,
+                "schedule_step":run.sched_step,"lr":run.lr,"nan_count":run.nan_count,
+                "first_epoch":run.first_epoch,"resume_position":run.resume_position,
+                "ema_present":run.ema.is_some(),"scaler_present":run.scaler.is_some(),
+                "data_seed":req.config.seed,"factory":"Run::prepare/fresh native DataPipeline"
+            }));
+            candle_gen::train::comparison::record_initial_tensors(
+                "iris-generation-params",
+                run.params
+                    .iter()
+                    .map(|(name, var)| (name.as_str(), var.as_tensor())),
+            )?;
+            let slots = run.opt.state_tensors()?;
+            candle_gen::train::comparison::record_initial_tensors(
+                "iris-generation-optimizer",
+                slots.iter().map(|(name, tensor)| (name.as_str(), tensor)),
+            )?;
+            if let Some(ema) = &run.ema {
+                candle_gen::train::comparison::record_initial_tensors(
+                    "iris-generation-ema",
+                    ema.iter().map(|(name, tensor)| (name.as_str(), tensor)),
+                )?;
+            }
+        }
         if run.topo.is_main() {
             run.write_metrics_header()?;
         }

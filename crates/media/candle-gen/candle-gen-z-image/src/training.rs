@@ -698,7 +698,17 @@ impl FlowMatchTrainer for ZImageTrainer {
         req: &TrainingRequest,
         _device: &Device,
     ) -> Result<()> {
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "z-image-actual-raw-cache",
+                "entries": cache.iter().map(|(latent, caption, _)| serde_json::json!({"latent":latent.dims(),"caption":caption.dims(),"video_frames":1,"audio_mode":"none"})).collect::<Vec<_>>()
+            }));
+        }
         dit.prepare_training_projections()?;
+        if !candle_gen::train::comparison::cache_enabled() {
+            return Ok(());
+        }
         let dtype = flow_match::parse_compute_dtype(&req.config.train_dtype);
         let mut captions = std::collections::HashMap::<_, Tensor>::new();
         for (x0, caption, _) in cache {

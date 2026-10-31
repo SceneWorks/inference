@@ -3710,6 +3710,9 @@ impl FlowMatchTrainer for LtxTrainer {
                     Ok(())
                 })?;
                 dit.prepare_training()?;
+                if !candle_gen::train::comparison::cache_enabled() {
+                    return Ok(());
+                }
                 let mut position_interner = crate::rope::TrainingPositionInterner::default();
                 for item in cache {
                     if let TrainingCached::Ltx25(example) = item {

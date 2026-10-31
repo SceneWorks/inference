@@ -317,7 +317,11 @@ fn qwen21_bounded_acceleration_acceptance() {
             gradient_accumulation: 1,
             gradient_checkpointing: true,
             train_dtype: "bf16".into(),
-            resolution: 64,
+            resolution: if candle_gen::train::comparison::requested_stage().is_some() {
+                512
+            } else {
+                64
+            },
             save_every: 0,
             sample_every: 0,
             sample_prompts: vec![],
@@ -333,6 +337,32 @@ fn qwen21_bounded_acceleration_acceptance() {
         trigger_words: vec![],
         cancel: CancelFlag::new(),
     };
+    if let Some(stage) = candle_gen::train::comparison::requested_stage() {
+        use candle_gen::train::comparison::{self, ComparisonCadence, ComparisonStage};
+        assert_ne!(
+            stage,
+            ComparisonStage::MinusReferenceOwner,
+            "Qwen uses the composable budgeted reference"
+        );
+        comparison::with_stage(
+            &root.join("comparison_metrics.json"),
+            "qwen_image_2_1",
+            ComparisonCadence::Ordinary,
+            || {
+                let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
+                spec.precision = Precision::Bf16;
+                let mut trainer =
+                    QwenImage21Trainer::load(&spec).expect("fresh Qwen comparison trainer");
+                let output = trainer
+                    .train(&req, &mut |_| {})
+                    .expect("four matched updates");
+                assert_eq!(output.steps, 4);
+                assert!(output.final_loss.is_finite());
+            },
+        );
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED train_peak_real_weights::qwen21_bounded_acceleration_acceptance");
+        return;
+    }
     let sampler = PeakSampler::start_rendered();
     let output = with_bounded_cohort_for(
         &root.join("metrics.json"),

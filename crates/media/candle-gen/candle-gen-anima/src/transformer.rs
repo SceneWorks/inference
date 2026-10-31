@@ -352,6 +352,9 @@ impl Attention {
     }
 
     fn prepare_training(&mut self, cross: bool) -> Result<()> {
+        if !candle_gen::train::comparison::projection_enabled() {
+            return Ok(());
+        }
         if self.projection_pack.is_none() {
             self.projection_pack = if cross {
                 FrozenProjectionPack::prepare_adapt(&mut [&mut self.to_k, &mut self.to_v])?
@@ -540,6 +543,9 @@ impl CosmosDiT {
             block.attn2.prepare_training(true)?;
         }
         self.training_rope.clear();
+        if !candle_gen::train::comparison::cache_enabled() {
+            return Ok(());
+        }
         for latent in latents {
             let request = PreparedRopeRequest::new(self.load_id, latent, self.cfg.patch_size)?
                 .with_compute_dtype(dtype);

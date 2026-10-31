@@ -650,7 +650,12 @@ impl Residual {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gemm = gemm_dtype(x);
         Ok(match self {
-            Residual::Lora { a, b } => to(x, DType::F32)?.matmul(a)?.matmul(b)?,
+            Residual::Lora { a, b } => {
+                if candle_gen::train::comparison::active_stage().is_some() {
+                    candle_gen::train::profile::cohort_reuse("iris:preexisting-factor-scaled-lora");
+                }
+                to(x, DType::F32)?.matmul(a)?.matmul(b)?
+            }
             Residual::Kron(f) => to(&f.residual(&to(x, gemm)?)?, x.dtype())?,
             Residual::LowRank { a, b } => {
                 let h = to(&to(x, gemm)?.matmul(&to(a, gemm)?)?, a.dtype())?;
@@ -852,6 +857,9 @@ impl RmsNorm {
             // One tape node (sc-25690): the chain reads `x` twice — the quotient, which the plain
             // backward reaches first, then the mean square.
             let eps = self.eps as f64;
+            if candle_gen::train::comparison::active_stage().is_some() {
+                candle_gen::train::profile::cohort_reuse("iris:preexisting-fold3-rms");
+            }
             return Ok(__model_proof_output!(crate::tape::fold3(
                 "iris-rms-norm",
                 &x,
@@ -1010,6 +1018,9 @@ pub fn attention(
         // node wraps whichever kernel the request scope selects, so its chunks (query rows, and
         // batch groups under a bounded scope) are all inside it: q, k and v keep one reader.
         let cancel = scope.as_ref().map(|s| s.cancel.clone());
+        if candle_gen::train::comparison::active_stage().is_some() {
+            candle_gen::train::profile::cohort_reuse("iris:preexisting-fold3-reference-attention");
+        }
         let folded = crate::tape::fold3("iris-sdpa", &q, &k, &v, move |q, k, v| {
             let composable = |s: &Tensor| softmax(s, D::Minus1);
             attention_kernel(q, k, v, scale, mask.as_ref(), &composable, scope.as_ref())
