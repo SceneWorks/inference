@@ -1,0 +1,237 @@
+//! Immutable, job-owned selections of complete measured Reference training arms.
+//!
+//! This is an internal CUDA policy, not a user configuration or proof environment
+//! switch. Bind it on the synchronous training thread before preparing a fresh
+//! model. Suspend it around callbacks and preview inference. Worker threads must
+//! explicitly receive and bind their own value; scopes never propagate implicitly.
+
+use std::cell::Cell;
+use std::collections::HashMap;
+
+use crate::gen_core::train::TrainingRequest;
+use crate::{CandleError, Result};
+
+use super::comparison::ComparisonStage;
+
+const RESUME_KEY: &str = "training_execution_profile";
+const VERSION: &str = "measured-reference-v1";
+
+/// Only complete arms actually present in the comparison protocol are selectable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TrainingProfile {
+    #[default]
+    Current,
+    Legacy,
+    WithoutE1,
+    WithoutE2,
+    WithoutE3,
+}
+
+impl TrainingProfile {
+    pub const fn measured_arm(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Legacy => "legacy",
+            Self::WithoutE1 => "minus-e1",
+            Self::WithoutE2 => "minus-e2",
+            Self::WithoutE3 => "minus-e3",
+        }
+    }
+
+    fn from_arm(value: &str) -> Option<Self> {
+        [
+            Self::Current,
+            Self::Legacy,
+            Self::WithoutE1,
+            Self::WithoutE2,
+            Self::WithoutE3,
+        ]
+        .into_iter()
+        .find(|profile| profile.measured_arm() == value)
+    }
+}
+
+/// Private fields prevent arbitrary mixed strategy bits or model rebinding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobTrainingPolicy {
+    model: &'static str,
+    profile: TrainingProfile,
+    resumed: bool,
+}
+
+impl JobTrainingPolicy {
+    /// Resolve before any model preparation. Untagged historical resumes retain
+    /// Current; a tagged resume must match this model's supported complete arm.
+    pub fn resolve(model_id: &str, is_cuda: bool, req: &TrainingRequest) -> Result<Self> {
+        let (model, selected) = selected_profile(model_id, is_cuda);
+        let mut result = Self {
+            model,
+            profile: selected,
+            resumed: false,
+        };
+        if req.config.resume {
+            if let Some((path, _)) = super::checkpoint::find_latest_resume(
+                &req.output_dir,
+                super::checkpoint::file_stem(&req.file_name),
+            ) {
+                let metadata = crate::gen_core::safetensors_file_metadata(&path)?
+                    .into_iter()
+                    .collect();
+                let saved = resume_profile(&metadata)?;
+                if saved != TrainingProfile::Current && saved != selected {
+                    return Err(CandleError::Msg(
+                        "resume: execution profile is incompatible with this model/backend".into(),
+                    ));
+                }
+                result.profile = saved;
+                result.resumed = true;
+            }
+        }
+        Ok(result)
+    }
+
+    pub const fn profile(self) -> TrainingProfile {
+        self.profile
+    }
+    pub const fn model(self) -> &'static str {
+        self.model
+    }
+}
+
+fn selected_profile(model: &str, cuda: bool) -> (&'static str, TrainingProfile) {
+    let (model, selected) = match model {
+        "wan2_2_ti2v_5b" => ("wan2_2_ti2v_5b", TrainingProfile::WithoutE1),
+        "kolors" => ("kolors", TrainingProfile::WithoutE3),
+        "ltx_2_5_distilled" => ("ltx_2_5_distilled", TrainingProfile::WithoutE2),
+        "sd3_5_medium" => ("sd3_5_medium", TrainingProfile::Legacy),
+        _ => ("unselected", TrainingProfile::Current),
+    };
+    (
+        model,
+        if cuda {
+            selected
+        } else {
+            TrainingProfile::Current
+        },
+    )
+}
+
+thread_local! {
+    static JOB: Cell<Option<JobTrainingPolicy>> = const { Cell::new(None) };
+}
+
+fn scoped<T>(policy: Option<JobTrainingPolicy>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<JobTrainingPolicy>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            JOB.set(self.0);
+        }
+    }
+    let _restore = Restore(JOB.replace(policy));
+    // Explicit proof stages own attention selection, including PlusStreaming.
+    if super::comparison::active_stage().is_some() {
+        f()
+    } else {
+        crate::training_attention::with_training_attention_mode(
+            crate::training_attention::TrainingAttentionMode::Reference,
+            f,
+        )
+    }
+}
+
+/// Bind this immutable selection for synchronous preparation/training/checkpoint
+/// replay. Nested calls and unwinding restore the previous job's selection.
+pub fn with_job_policy<T>(policy: JobTrainingPolicy, f: impl FnOnce() -> T) -> T {
+    eprintln!("training execution profile: version={VERSION} model={} arm={} resume={} proof_override={:?}",
+        policy.model, policy.profile.measured_arm(), policy.resumed, super::comparison::active_stage());
+    scoped(Some(policy), f)
+}
+
+/// Prevent a job's arithmetic/preparation choices leaking into user callbacks or
+/// preview inference. Explicit proof controls remain authoritative.
+pub fn without_production_profile<T>(f: impl FnOnce() -> T) -> T {
+    scoped(None, f)
+}
+
+pub fn active_profile() -> TrainingProfile {
+    JOB.get()
+        .map_or(TrainingProfile::Current, |job| job.profile)
+}
+
+fn strategy(stage: Option<ComparisonStage>, profile: TrainingProfile) -> (bool, bool, bool, bool) {
+    if let Some(stage) = stage {
+        return (
+            matches!(stage, ComparisonStage::Legacy | ComparisonStage::MinusE1),
+            !matches!(stage, ComparisonStage::Legacy | ComparisonStage::MinusE2),
+            !matches!(stage, ComparisonStage::Legacy | ComparisonStage::MinusE3),
+            !matches!(
+                stage,
+                ComparisonStage::Legacy | ComparisonStage::MinusReferenceOwner
+            ),
+        );
+    }
+    (
+        matches!(
+            profile,
+            TrainingProfile::Legacy | TrainingProfile::WithoutE1
+        ),
+        !matches!(
+            profile,
+            TrainingProfile::Legacy | TrainingProfile::WithoutE2
+        ),
+        !matches!(
+            profile,
+            TrainingProfile::Legacy | TrainingProfile::WithoutE3
+        ),
+        profile != TrainingProfile::Legacy,
+    )
+}
+
+fn resolved() -> (bool, bool, bool, bool) {
+    strategy(super::comparison::active_stage(), active_profile())
+}
+pub fn legacy_e1() -> bool {
+    resolved().0
+}
+pub fn cache_enabled() -> bool {
+    resolved().1
+}
+pub fn projection_enabled() -> bool {
+    resolved().2
+}
+pub fn reference_owner_enabled() -> bool {
+    resolved().3
+}
+
+pub(super) fn resume_profile(meta: &HashMap<String, String>) -> Result<TrainingProfile> {
+    match meta.get(RESUME_KEY) {
+        None => Ok(TrainingProfile::Current),
+        Some(value) => value
+            .strip_prefix(&format!("{VERSION}/"))
+            .and_then(TrainingProfile::from_arm)
+            .ok_or_else(|| CandleError::Msg("resume: unsupported execution profile".into())),
+    }
+}
+
+/// Current retains the historical fingerprint byte-for-byte. Profile binding in
+/// the existing config fingerprint makes old loaders reject non-Current bundles.
+pub(super) fn bind_resume_fingerprint(base: &str, profile: TrainingProfile) -> String {
+    if profile == TrainingProfile::Current {
+        base.into()
+    } else {
+        format!(
+            "{base};execution_profile={VERSION}/{}",
+            profile.measured_arm()
+        )
+    }
+}
+
+pub(super) fn record_resume_profile(meta: &mut HashMap<String, String>) {
+    let profile = active_profile();
+    if profile != TrainingProfile::Current {
+        meta.insert(
+            RESUME_KEY.into(),
+            format!("{VERSION}/{}", profile.measured_arm()),
+        );
+    }
+}
