@@ -542,6 +542,22 @@ impl Adapter {
 }
 
 impl LoraLinear {
+    /// First-order QLoRA forward with bounded frozen-weight tape ownership. The
+    /// packed base is decoded per projection in both directions; only its input
+    /// cotangent is needed, while live adapter factors keep ordinary autograd.
+    /// Other packed operators and graph-retaining backward keep their native path.
+    pub fn forward_bounded_packed(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let y = match &self.base {
+            LoraBase::Packed(QLinear::Quantized {
+                weight: crate::quant::QuantWeight::Dequant(weight),
+                bias,
+                ..
+            }) => super::projection::frozen_packed_forward(x, weight, bias.as_ref())?,
+            _ => self.base.forward(x)?,
+        };
+        self.apply_residuals(x, y)
+    }
+
     /// Dense base inspection without dequantizing packed weights.
     pub fn dense_base(&self) -> Option<&Linear> {
         match &self.base {

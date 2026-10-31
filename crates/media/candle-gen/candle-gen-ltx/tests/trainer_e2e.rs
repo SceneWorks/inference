@@ -437,6 +437,8 @@ fn ltx25_bounded_acceleration_acceptance() {
             "ltx25:differentiable-QK-RMS",
             "ltx25:exact-grid-rope-storage-hit",
             "ltx25:native-incompatible-projection-fallback",
+            "ltx:bounded-packed-frozen-input-vjp",
+            "ltx:packed-frozen-vjp-reference-parity",
         ],
         || {
             let mut trainer = candle_gen_ltx::provider_registry()

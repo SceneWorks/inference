@@ -3702,6 +3702,13 @@ impl FlowMatchTrainer for LtxTrainer {
                 }
             }
             TrainingDiT::Ltx25(dit) => {
+                // Immutable packed weights must not all expand onto the eager
+                // backward tape. This is production QLoRA ownership, not a
+                // bounded-proof math mode; preserve the 2.3 training path above.
+                dit.visit_adaptable_mut(&mut |_, projection| {
+                    projection.enable_bounded_packed_training();
+                    Ok(())
+                })?;
                 dit.prepare_training()?;
                 let mut position_interner = crate::rope::TrainingPositionInterner::default();
                 for item in cache {

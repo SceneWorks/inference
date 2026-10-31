@@ -175,10 +175,15 @@ pub(crate) fn begin_step(segment: usize, logical_step: u32) {
 /// A start without a commit conservatively consumes one attempted update.
 pub(crate) fn boundary(detail: &str) -> candle_core::Result<()> {
     #[cfg(feature = "model-inference-proof")]
-    if active() {
+    if active() || cohort_active() {
         use std::io::Write;
         let mut stderr = std::io::stderr().lock();
-        writeln!(stderr, "KREA_PROFILE_BOUNDARY {detail}").map_err(candle_core::Error::wrap)?;
+        let prefix = if active() {
+            "KREA_PROFILE_BOUNDARY"
+        } else {
+            "COHORT_PROFILE_BOUNDARY"
+        };
+        writeln!(stderr, "{prefix} {detail}").map_err(candle_core::Error::wrap)?;
         stderr.flush().map_err(candle_core::Error::wrap)?;
     }
     let _ = detail;
@@ -238,6 +243,7 @@ struct CohortObservation {
     gradients: Vec<candle_core::Tensor>,
     initial: std::collections::HashMap<candle_core::TensorId, candle_core::Tensor>,
     reuse: std::collections::BTreeMap<String, u64>,
+    probes: std::collections::HashSet<String>,
 }
 #[cfg(feature = "model-inference-proof")]
 thread_local! {
@@ -302,6 +308,28 @@ pub fn cohort_reuse(mechanism: &str) {
     let _ = mechanism;
 }
 
+/// Claim one bounded reference probe during the first excluded warmup only.
+pub(crate) fn cohort_claim_probe(mechanism: &str) -> bool {
+    #[cfg(feature = "model-inference-proof")]
+    {
+        COHORT.with(|state| {
+            let mut state = state.borrow_mut();
+            let Some(state) = state.as_mut() else {
+                return false;
+            };
+            if state.updates != 0 || !state.steps.is_empty() {
+                return false;
+            }
+            state.probes.insert(mechanism.into())
+        })
+    }
+    #[cfg(not(feature = "model-inference-proof"))]
+    {
+        let _ = mechanism;
+        false
+    }
+}
+
 pub fn cohort_begin_step(device: &candle_core::Device) -> candle_core::Result<()> {
     if !cohort_active() {
         return Ok(());
@@ -315,6 +343,7 @@ pub fn cohort_begin_step(device: &candle_core::Device) -> candle_core::Result<()
         if let Some(started) = state.started.take() {
             state.preparation_seconds = started.elapsed().as_secs_f64();
         }
+        eprintln!("COHORT_UPDATE_START attempted_update={}", state.updates + 1);
         state.step_started = Some(std::time::Instant::now());
         crate::training_attention::take_training_attention_counts();
     });
@@ -399,6 +428,8 @@ pub fn cohort_end_step(
     COHORT.with(|state| -> candle_core::Result<()> {
         let mut state = state.borrow_mut(); let state = state.as_mut().unwrap();
         let seconds = state.step_started.take().expect("step started").elapsed().as_secs_f64();
+        // Durable count after synchronization and after closing the timed span.
+        eprintln!("COHORT_UPDATE_COMMITTED optimizer_updates={}", state.updates);
         let attention = crate::training_attention::take_training_attention_counts();
         if !loss.is_finite() { candle_core::bail!("non-finite cohort loss"); }
         let mut nonzero_gradients = 0;
