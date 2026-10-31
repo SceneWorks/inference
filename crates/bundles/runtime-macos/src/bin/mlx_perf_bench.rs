@@ -1230,6 +1230,7 @@ impl PhaseRecorder {
             Progress::Loading(_)
             | Progress::PromptUpsamplingComplete
             | Progress::PromptEncodingComplete
+            | Progress::PostProcessing
             | Progress::ConditioningComplete
             | Progress::Upsampling { .. } => {}
         }

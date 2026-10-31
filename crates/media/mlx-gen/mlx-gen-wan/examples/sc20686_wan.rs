@@ -422,6 +422,7 @@ fn main() -> Result<()> {
         Progress::Loading(phase) => eprintln!("[sc20686-wan] loading {phase:?}"),
         Progress::PromptUpsamplingComplete
         | Progress::PromptEncodingComplete
+        | Progress::PostProcessing
         | Progress::ConditioningComplete => {}
         Progress::Upsampling { tokens, max_tokens } => {
             eprintln!("[sc20686-wan] upsampling {tokens}/{max_tokens}")

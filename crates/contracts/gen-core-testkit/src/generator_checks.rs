@@ -489,9 +489,9 @@ pub fn check_progress_with(
 /// 2. **Reaches `total`.** The final `Step.current` equals `Step.total` — the bar is never frozen
 ///    below completion (the F-030 PiD-early-stop class where a truncated schedule never reaches its
 ///    advertised total).
-/// 3. **`Decoding` exactly once.** The terminal `Progress::Decoding` phase is emitted once — not zero
+/// 3. **`Decoding` exactly once.** The `Progress::Decoding` phase is emitted once — not zero
 ///    times (frozen through the longest stage — F-030) and not once-per-output (the restarting-bar
-///    class — F-136/F-162).
+///    class — F-136/F-162). Optional `PostProcessing` may follow without another step or decode.
 ///
 /// This is deliberately *laxer than* [`check_progress`] on the `Step` axis (non-decreasing with
 /// repeats allowed, rather than exactly `1..=total`) so it fits multi-stage / folded-bar pipelines,
@@ -521,6 +521,7 @@ pub fn check_progress_contract_with(
         Progress::Decoding => decoding_count += 1,
         Progress::PromptUpsamplingComplete
         | Progress::PromptEncodingComplete
+        | Progress::PostProcessing
         | Progress::ConditioningComplete
         | Progress::Loading(_)
         | Progress::Upsampling { .. } => {}

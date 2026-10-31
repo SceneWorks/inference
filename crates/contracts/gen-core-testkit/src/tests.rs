@@ -26,6 +26,8 @@ struct Behavior {
     emit_progress: bool,
     /// Number of `Progress::Decoding` events emitted after the step loop (contract requires exactly 1).
     decoding_events: u32,
+    /// Emit separate output processing after decoding, without inventing a step or extra decode.
+    postprocess_output: bool,
     /// Emit `Step.current` up to `2*total` — the F-050 multi-eval-sampler overrun (>100%).
     overrun_steps: bool,
     /// Stop emitting `Step` at `total - 1` while still advertising `total` — the F-030 frozen-below-total
@@ -53,6 +55,7 @@ impl Behavior {
             honest_validate: true,
             emit_progress: true,
             decoding_events: 1,
+            postprocess_output: false,
             overrun_steps: false,
             freeze_below_total: false,
             honor_cancel: true,
@@ -299,6 +302,9 @@ impl Generator for Stub {
         }
         for _ in 0..self.behavior.decoding_events {
             on_progress(Progress::Decoding);
+        }
+        if self.behavior.postprocess_output {
+            on_progress(Progress::PostProcessing);
         }
         // sc-17418, the CFG-off contract. `cfg_off` is "this request has classifier-free guidance
         // switched off" — the fork every engine hand-writes, and the one sc-14195 got wrong.
@@ -577,6 +583,37 @@ fn repeated_decoding_fails_progress_contract() {
     );
     let err = check_progress_contract(&g, &cheap()).unwrap_err();
     assert!(err.contains("emitted 3 times"), "got: {err}");
+}
+
+#[test]
+fn post_processing_preserves_step_and_single_decoding_contract() {
+    for decoding_events in [0, 1, 2] {
+        let g = Stub::new(
+            STUB_ID,
+            Behavior {
+                decoding_events,
+                postprocess_output: true,
+                ..Behavior::good()
+            },
+        );
+        let result = check_progress_contract(&g, &cheap());
+        assert_eq!(
+            result.is_ok(),
+            decoding_events == 1,
+            "postprocessing cannot substitute for or duplicate decoding: {result:?}"
+        );
+        let mut events = Vec::new();
+        g.generate(&base_request(&cheap()), &mut |p| events.push(p))
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|p| matches!(p, Progress::Step { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(events.last(), Some(&Progress::PostProcessing));
+    }
 }
 
 #[test]
