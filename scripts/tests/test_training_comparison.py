@@ -211,8 +211,8 @@ class ComparisonContract(unittest.TestCase):
                         comparison_discovery_started_monotonic=phase_start,comparison_discovery_policy=payload,
                         commands=[{'supervision':{'admission':{'policySha256':digest}}}],
                         physical_execution={'claim_deadline_monotonic':comparison_deadline_monotonic})
-            (destination/'receipt.json').write_text(json.dumps({'accepted':not fail_first,'cases':[case]}))
-            (destination/'00000/body.stdout.log').write_text(text if not fail_first else '')
+            (destination/'receipt.json').write_text(json.dumps({'accepted':not fail_first,'cases':[case]}),encoding='utf-8')
+            (destination/'00000/body.stdout.log').write_text(text if not fail_first else '',encoding='utf-8')
             return 1 if fail_first else 0
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)/'proof'
@@ -223,7 +223,7 @@ class ComparisonContract(unittest.TestCase):
                  patch.object(proof,'verify_artifacts',return_value={}), \
                  patch.object(comparison.time,'monotonic',side_effect=lambda:next(clock)):
                 code=comparison.run((base,),'candle-cuda',value,'f'*40,root)
-            receipt=json.loads((root/'receipt.json').read_text())
+            receipt=json.loads((root/'receipt.json').read_text(encoding='utf-8'))
             self.assertEqual(receipt['artifacts'],comparison._inventory(root))
             if inspect is not None:
                 inspect(root,value,base,receipt)
@@ -280,14 +280,14 @@ class ComparisonContract(unittest.TestCase):
                     lambda x:x.update(terminal_model_evidence=True),
                 ):
                     changed=copy.deepcopy(receipt); mutate(changed)
-                    (root/'receipt.json').write_text(json.dumps(changed))
+                    (root/'receipt.json').write_text(json.dumps(changed),encoding='utf-8')
                     with self.assertRaises(ValueError):verify()
-                (root/'receipt.json').write_text(json.dumps(receipt))
-                extra=root/'stages'/'unexpected.txt';extra.write_text('unapproved')
+                (root/'receipt.json').write_text(json.dumps(receipt),encoding='utf-8')
+                extra=root/'stages'/'unexpected.txt';extra.write_text('unapproved',encoding='utf-8')
                 with self.assertRaises(ValueError):verify()
                 extra.unlink()
                 child=root/receipt['stage_records'][0]['artifact']/'receipt.json'
-                child.write_text(child.read_text()+'\n')
+                child.write_text(child.read_text(encoding='utf-8')+'\n',encoding='utf-8')
                 with self.assertRaises(ValueError):verify()
         code,_,_=self.mocked_driver(inspect=inspect)
         self.assertEqual(code,0)
@@ -331,13 +331,13 @@ class ComparisonContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             parent=Path(directory)/'runtime';parent.mkdir()
             row=self.row('iris-restoration')
-            marker=parent/'.sc-26850-owned-runtime';marker.write_text(proof.identity(row)+'\n')
+            marker=parent/'.sc-26850-owned-runtime';marker.write_text(proof.identity(row)+'\n',encoding='utf-8')
             def environment():return {'BESPOKE_RUNTIME_DIR':str(parent),'GITHUB_SHA':'f'*40,'GITHUB_RUN_ID':'123','GITHUB_RUN_ATTEMPT':'1'}
             first=environment();proof.apply_configuration(row,first)
             second=environment();proof.apply_configuration(self.row('iris-restoration','legacy'),second)
             key='MODEL_PROOF_IRIS_FROZEN_CACHE_DIR'
             self.assertEqual(first[key],second[key])
-            owner=json.loads((Path(first[key])/'comparison-cache-owner.json').read_text())
+            owner=json.loads((Path(first[key])/'comparison-cache-owner.json').read_text(encoding='utf-8'))
             self.assertEqual(owner['source_revision'],'f'*40)
             expected=self.rust_iris_cache_owner('f'*40,'123','1',hashlib.sha256(marker.read_bytes()).hexdigest())
             self.assertEqual(owner,expected)
@@ -352,10 +352,10 @@ class ComparisonContract(unittest.TestCase):
             )
             for mutate in mutations:
                 changed=copy.deepcopy(owner);mutate(changed)
-                owner_path.write_text(json.dumps(changed,sort_keys=True)+'\n')
+                owner_path.write_text(json.dumps(changed,sort_keys=True)+'\n',encoding='utf-8')
                 with self.subTest(owner=changed),self.assertRaisesRegex(ValueError,'ownership/source/run binding mismatch'):
                     proof.apply_configuration(self.row('iris-restoration','minus-e2'),environment())
-            owner_path.write_text(json.dumps(owner,sort_keys=True)+'\n')
+            owner_path.write_text(json.dumps(owner,sort_keys=True)+'\n',encoding='utf-8')
             self.assertNotEqual(first['BESPOKE_RUNTIME_DIR'],second['BESPOKE_RUNTIME_DIR'])
             wrong=environment();wrong['GITHUB_SHA']='e'*40
             with self.assertRaises(ValueError):proof.apply_configuration(self.row('iris-restoration','minus-e2'),wrong)
