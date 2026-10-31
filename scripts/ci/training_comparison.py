@@ -116,6 +116,8 @@ def spec(row: dict) -> dict:
             'constant_repairs': provider['constant_repairs'],
             'e1_norm_scope': provider.get('E1_norm_scope', 'Combined arithmetic/norm group where applicable; pre-existing mechanisms remain common'),
             'workload': provider['workload'],
+            'case_deadline_seconds': provider.get('case_deadline_seconds', 3600),
+            'immutable_frozen_bootstrap': provider.get('immutable_frozen_bootstrap'),
             'source_manifest_sha256': file_digest(Path(__file__).with_name('training-comparison-cases.json')),
             'baseline_scope': 'legacy optimization control with constant correctness repairs; not a historical whole binary',
             'sample_scope': 'zero new quality samples; existing quality evidence remains separate',
@@ -156,6 +158,10 @@ def validate_request(rows: tuple[dict, ...], value: dict, backend: str) -> dict:
     uuid, index = recipe_binding(row, value['configuration'], row['selected_configuration'])
     if value['policy'].get('cudaDeviceUuid') != uuid or row.get('required_cuda_device_uuid') != uuid or row.get('required_cuda_physical_index') != index:
         raise ValueError('comparison policy/case physical UUID/index mismatch')
+    if (value['policy'].get('childGpuCapBytes') != 91 * 1024**3
+            or value['policy'].get('gpuFreeReserveBytes') != 2 * 1024**3
+            or value['policy'].get('deadlineSeconds') != plan['case_deadline_seconds']):
+        raise ValueError('comparison requires unchanged91GiB+2GiB and its source-declared overall deadline')
     if value.get('additional_cuda_policies') or value.get('cuda_devices'):
         raise ValueError('comparison has exactly one selected physical device')
     return {**plan, 'device_binding': RECIPES[value['configuration']], 'cuda_uuid': uuid, 'physical_index': index}
@@ -168,6 +174,8 @@ def stage_row(row: dict, stage: str) -> dict:
     result = copy.deepcopy(row)
     result['training_comparison_stage'] = stage
     result['training_comparison_plan'] = plan
+    if plan['model'] == 'iris-restoration':
+        result['optional_environment'] = sorted(set(result.get('optional_environment', [])) | {'MODEL_PROOF_IRIS_FROZEN_CACHE_DIR'})
     provider = case_manifest(row)
     result['output_artifacts'] = [provider['metrics']]
     result.pop('generated_adapter_artifacts', None)
@@ -191,6 +199,7 @@ def apply_stage(row: dict, env: dict) -> None:
         raise ValueError('stage physical mapping differs')
     env['MODEL_PROOF_COMPARISON_STAGE'] = stage
     env['SCENEWORKS_GPU_ID'] = str(index)
+    env.pop('MODEL_PROOF_IRIS_FROZEN_CACHE_DIR', None)
     # Existing native asset fixtures may write large recovery exports. Keep each
     # fresh child in its own owned external runtime subdirectory.
     if env.get('BESPOKE_RUNTIME_DIR'):
@@ -199,9 +208,33 @@ def apply_stage(row: dict, env: dict) -> None:
         from scripts.ci import model_inference_proofs as proof
         if proof.linked(marker) or not marker.is_file() or marker.stat().st_nlink != 1 or marker.stat().st_size > 4096:
             raise ValueError('comparison runtime requires its actual parent owned marker')
+        marker_bytes = marker.read_bytes()
+        if marker_bytes.decode('utf-8').strip() != proof.identity(row):
+            raise ValueError('comparison runtime parent marker belongs to another exact case')
+        if plan['model'] == 'iris-restoration':
+            source = env.get('GITHUB_SHA', '')
+            run_id, attempt = env.get('GITHUB_RUN_ID', ''), env.get('GITHUB_RUN_ATTEMPT', '')
+            if not re.fullmatch(r'[0-9a-f]{40}', source) or not re.fullmatch(r'[0-9]+', run_id) or not re.fullmatch(r'[0-9]+', attempt):
+                raise ValueError('Iris frozen cache requires source/run-bound Actions provenance')
+            shared = parent / 'comparison-iris-frozen'
+            proof.unlinked_path(shared, parent)
+            shared.mkdir(exist_ok=True)
+            owner = {'schema_version':1,'protocol':PROTOCOL,'binding':proof.identity(row),
+                     'source_revision':source,'github_run_id':run_id,'github_run_attempt':attempt,
+                     'parent_marker_sha256':hashlib.sha256(marker_bytes).hexdigest(),
+                     'cache_scope':'Iris restoration immutable frozen checkpoint decode; constant all stages, not E2'}
+            for path, data in ((shared / marker.name, marker_bytes),
+                               (shared / 'comparison-cache-owner.json', (json.dumps(owner,sort_keys=True)+'\n').encode())):
+                proof.unlinked_path(path, parent)
+                if path.exists():
+                    if not path.is_file() or path.stat().st_nlink != 1 or path.read_bytes() != data:
+                        raise ValueError('Iris frozen cache ownership/source/run binding mismatch')
+                else:
+                    path.write_bytes(data)
+            env['MODEL_PROOF_IRIS_FROZEN_CACHE_DIR'] = str(shared)
         runtime = parent / ('comparison-' + stage)
         runtime.mkdir(exist_ok=False)
-        (runtime / marker.name).write_bytes(marker.read_bytes())
+        (runtime / marker.name).write_bytes(marker_bytes)
         env['BESPOKE_RUNTIME_DIR'] = str(runtime)
 
 
@@ -302,10 +335,14 @@ def verify_metrics(row: dict, metrics: dict, text: str) -> dict:
     owner_timings = {owner: {'warmup_seconds': [x['seconds'] for x in steps if x['owner'] == owner and x['warmup']],
                              'timed_seconds': [x['seconds'] for x in steps if x['owner'] == owner and not x['warmup']]}
                      for owner in unique}
+    for timings in owner_timings.values():
+        timings['mean_seconds'] = statistics.mean(timings['timed_seconds'])
+        timings['sample_stdev_seconds'] = statistics.stdev(timings['timed_seconds'])
     return {'stage': stage, 'physical_updates': n, 'owners': owners,
             'timed_seconds': timed, 'mean_seconds': statistics.mean(timed),
             'median_seconds': statistics.median(timed), 'min_seconds': min(timed),
             'max_seconds': max(timed), 'sample_stdev_seconds': statistics.stdev(timed),
+            'sample_stdev_scope': 'Timed physical updates; multi-owner stages mix different operations. Per-owner samples are separate; no statistical confidence claim',
             'per_owner_timings': owner_timings,
             'preparation_seconds': metrics['preparation_including_load_cache_seconds'],
             'warmup_seconds': [x['seconds'] for x in steps if x['warmup']],
@@ -342,6 +379,7 @@ def aggregate(plan: dict, stages: list[dict]) -> dict:
                 'observed_setup_plus_counted_updates_seconds_saved': short_delta,
                 'observed_short_run_outcome': 'win' if short_delta > 0 else 'loss' if short_delta < 0 else 'tie',
                 'short_run_limit': 'Includes proof initialization diagnostics, excludes compile/admission/export; report separately from steady update timing',
+                'common_bootstrap_limit': 'First stage may build the common immutable frozen store; later stages reuse its exact bytes. Setup differences are not attributable to E2 or another strategy' if plan['immutable_frozen_bootstrap'] else None,
                 'measured_outcome': 'win' if delta > 0 else 'loss' if delta < 0 else 'tie',
                 'scalar_loss_trajectory_parity': parity,
                 'numerical_scope': 'matched scalar losses at relative-to-max(1,loss) tolerance0.001; finite reached gradients, not full gradient parity/convergence',
@@ -432,6 +470,31 @@ def update_accounting(row: dict, case: dict, text: str) -> dict:
             'basis': 'affirmative authenticated pre-creation refusal' if zero else 'started/unknown/partial reserves full stage; no automatic retry'}
 
 
+def verify_stage_deadline(case: dict, child_request: dict, original_deadline: float) -> None:
+    from scripts.ci.model_proof_resources import metadata_policy_payload
+    if not _finite(original_deadline) or case.get('comparison_original_deadline_monotonic') != original_deadline:
+        raise ValueError('stage lost/refreshed the original absolute comparison deadline')
+    payload = case.get('comparison_discovery_policy')
+    if payload is None:
+        if case.get('accepted') is True or case.get('commands'):
+            raise ValueError('actual discovery omitted original remaining-deadline policy')
+        return  # An incomplete pre-discovery failure cannot become accepted.
+    start = case.get('comparison_discovery_started_monotonic')
+    if not _finite(start) or not 0 < original_deadline-start <= child_request['policy']['deadlineSeconds']:
+        raise ValueError('discovery did not consume the same original remaining budget')
+    expected = metadata_policy_payload(child_request['policy'])
+    expected['deadlineSeconds'] = original_deadline-start
+    if payload != expected:
+        raise ValueError('discovery changed resource settings or refreshed deadline')
+    commands = case.get('commands', [])
+    if commands:
+        digest = hashlib.sha256((json.dumps(payload,sort_keys=True,separators=(',',':'))+'\n').encode()).hexdigest()
+        if commands[0].get('supervision', {}).get('admission', {}).get('policySha256') != digest:
+            raise ValueError('actual metadata supervisor used another deadline policy')
+    if case.get('accepted') is True and case.get('physical_execution', {}).get('claim_deadline_monotonic') != original_deadline:
+        raise ValueError('body admission refreshed the post-discovery deadline')
+
+
 def _inventory(root: Path) -> dict:
     from scripts.ci import model_inference_proofs as proof
     result = {}
@@ -468,6 +531,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                'acceptance_scope': 'controlled-training-timing-supplement',
                'checkpoint_byte_integrity_attested': False, 'verified_named_revision': False,
                'terminal_model_evidence': False}
+    receipt['comparison_started_monotonic'] = started
+    receipt['comparison_deadline_monotonic'] = started + value['policy']['deadlineSeconds']
     results = []
     inherited_target = os.environ.get('CARGO_TARGET_DIR')
     # One fresh owned compile namespace for the whole model comparison. Later
@@ -490,7 +555,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                       'remaining_original_deadline_seconds': remaining}
             receipt['stage_records'].append(record)
             code = proof.run((selected,), backend, child_value, expected, destination,
-                             comparison_work=work / stage)
+                             comparison_work=work / stage,
+                             comparison_deadline_monotonic=receipt['comparison_deadline_monotonic'])
             record['returncode'] = code
             child_receipt = json.loads((destination / 'receipt.json').read_text(encoding='utf-8'))
             case = child_receipt.get('cases', [{}])[0]
@@ -547,6 +613,11 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
             or any(receipt.get(k) is not False for k in ('checkpoint_byte_integrity_attested', 'verified_named_revision', 'terminal_model_evidence'))):
         raise ValueError('comparison source/request/plan binding mismatch')
     records = receipt.get('stage_records')
+    original_start = receipt.get('comparison_started_monotonic')
+    original_deadline = receipt.get('comparison_deadline_monotonic')
+    if (not _finite(original_start) or not _finite(original_deadline)
+            or original_deadline != original_start + value['policy']['deadlineSeconds']):
+        raise ValueError('comparison original absolute deadline binding mismatch')
     if not isinstance(records, list) or not records or [r.get('stage') for r in records] != plan['execution_order'][:len(records)]:
         raise ValueError('comparison stage order/duplicate/unexpected stage mismatch')
     measurements, charge, binaries = [], 0, []
@@ -569,6 +640,7 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
         proof.verify_artifacts(destination, temporary, child, expected, (selected,), backend)
         child_receipt = json.loads((destination / 'receipt.json').read_text(encoding='utf-8'))
         case = child_receipt.get('cases', [{}])[0]
+        verify_stage_deadline(case, child, original_deadline)
         text = '\n'.join(p.read_text(encoding='utf-8', errors='replace') for p in
                          (destination / '00000/body.stdout.log', destination / '00000/body.stderr.log') if p.is_file())
         accounting = update_accounting(selected, case, text)

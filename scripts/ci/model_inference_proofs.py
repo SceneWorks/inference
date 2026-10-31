@@ -1117,7 +1117,11 @@ def verified_windows_toolchain(env: dict[str, str], root: Path, declaration: byt
 
 
 def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output: Path,
-        *, comparison_work: Path | None = None) -> int:
+        *, comparison_work: Path | None = None, comparison_deadline_monotonic: float | None = None) -> int:
+    if comparison_deadline_monotonic is not None and (backend != 'candle-cuda'
+            or not all(row.get('training_comparison_stage') for row in rows)
+            or type(comparison_deadline_monotonic) not in (int, float) or not math.isfinite(comparison_deadline_monotonic)):
+        raise ValueError('absolute comparison deadline requires an exact bounded CUDA stage')
     if any(training_comparison.is_recipe(row.get('selected_configuration', {}).get('name'))
            and row.get('training_comparison_stage') is None for row in rows):
         raise ValueError('comparison recipe requires the complete bounded stage driver; no ordinary body fallback')
@@ -1172,6 +1176,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
             generated = case_work / 'generated'
             generated.mkdir()
             env = dict(os.environ, MODEL_INFERENCE_CASE_FQN=row['fqn'], MODEL_PROOF_OUTPUT_DIR=str(generated))
+            if row.get('training_comparison_stage') and training_comparison.spec(row)['model'] == 'iris-restoration' and env.get('GITHUB_SHA') != expected:
+                raise ValueError('Iris frozen cache source/run provenance differs from actual expected producer')
             apply_configuration(row, env)
             if identity(row) in IRIS_QUANT_PROOFS and row['fqn'].endswith('real_quantized_renders_track_the_bf16_render_at_512'):
                 env['IRIS_OUT'] = str(generated)
@@ -1189,6 +1195,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                       'accepted': False, 'body_proof_accepted': False, 'resource_verification_pending': True,
                       'commands': [], 'outputs': []}
             result.update(receipt_claims([], False))
+            if comparison_deadline_monotonic is not None:
+                result['comparison_original_deadline_monotonic'] = comparison_deadline_monotonic
             receipt['cases'].append(result)
             started = time.monotonic()
             try:
@@ -1214,6 +1222,20 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                     stdout = case_work / (phase + '.stdout.log')
                     stderr = case_work / (phase + '.stderr.log')
                     argv = command(row, discover)
+                    phase_policy = discovery_policy if discover else policy
+                    if comparison_deadline_monotonic is not None:
+                        now = time.monotonic()
+                        remaining = comparison_deadline_monotonic - now
+                        if remaining <= max(policy.poll_millis, policy.term_grace_millis) / 1000:
+                            raise ValueError('original comparison deadline exhausted before phase; no new child')
+                        if discover:
+                            payload = metadata_policy_payload(value['policy'])
+                            payload['deadlineSeconds'] = remaining
+                            path = case_work / 'comparison-discovery-policy.json'
+                            write_json(path, payload)
+                            phase_policy = load_policy(path)
+                            result['comparison_discovery_started_monotonic'] = now
+                            result['comparison_discovery_policy'] = payload
                     if not discover and row.get('training_comparison_stage'):
                         executable = Path(result['compiled_target']['executable'])
                         if training_comparison.file_digest(executable) != result['comparison_executable_sha256']:
@@ -1224,7 +1246,10 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                     elif approved_uuids:
                         claim = multi_cuda.execution_claim(row, cuda_policies, value, case_work, env)
                     else:
-                        claim = execution_claim(backend, policy, case_work, env, constraints=row)
+                        options = {'constraints': row}
+                        if comparison_deadline_monotonic is not None:
+                            options['original_deadline_monotonic'] = comparison_deadline_monotonic
+                        claim = execution_claim(backend, policy, case_work, env, **options)
                     supervision = {}
                     if approved_uuids and not discover:
                         probes = tuple(SystemProbe(item) for item in cuda_policies)
@@ -1240,7 +1265,7 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                         if not discover and krea_paired.validate_binding(row):
                             result['krea_paired_supervisor_invocation_attempted'] = True
                         try:
-                            guarded = run_guarded(argv, cwd=ROOT, env=env, policy=discovery_policy if discover else policy,
+                            guarded = run_guarded(argv, cwd=ROOT, env=env, policy=phase_policy,
                                                   stdout_path=stdout, stderr_path=stderr,
                                                   event_path=case_work / (phase + '.events.jsonl'),
                                                   require_gpu_sample=False,
@@ -1610,6 +1635,7 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
             metrics = root / f'{index:05d}/generated/krea_bounded_acceleration/metrics.json'
             krea_paired.verify_metrics(approved_rows[index], json.loads(metrics.read_text(encoding='utf-8')), execution, expected)
         if approved_rows[index].get('training_comparison_stage'):
+            training_comparison.verify_stage_deadline(case, {'policy':receipt['resource_policy']}, case.get('comparison_original_deadline_monotonic'))
             relative = next(x for x in approved_rows[index]['output_artifacts'] if x.endswith('metrics.json'))
             metrics = json.loads((root / f'{index:05d}/generated' / relative).read_text(encoding='utf-8'))
             actual = training_comparison.verify_metrics(approved_rows[index], metrics, body)

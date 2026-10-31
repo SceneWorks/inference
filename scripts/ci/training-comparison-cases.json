@@ -1058,7 +1058,8 @@
       "owner": "moss-image",
       "candidate_required_owners": [
         "moss-image"
-      ]
+      ],
+      "case_deadline_seconds": 3600
     },
     {
       "package": "candle-gen-mage",
@@ -1194,7 +1195,8 @@
       "owner": "mage_flow_base trainer",
       "candidate_required_owners": [
         "mage_flow_base trainer"
-      ]
+      ],
+      "case_deadline_seconds": 3600
     },
     {
       "package": "candle-gen-flux3",
@@ -1300,7 +1302,8 @@
       "owner": "flux3",
       "candidate_required_owners": [
         "flux3"
-      ]
+      ],
+      "case_deadline_seconds": 3600
     },
     {
       "package": "candle-gen-iris",
@@ -1433,7 +1436,8 @@
       "owner": "iris-generation",
       "candidate_required_owners": [
         "iris-generation"
-      ]
+      ],
+      "case_deadline_seconds": 3600
     },
     {
       "package": "candle-gen-iris",
@@ -1544,7 +1548,8 @@
       "owner": "iris-depth",
       "candidate_required_owners": [
         "iris-depth"
-      ]
+      ],
+      "case_deadline_seconds": 3600
     },
     {
       "package": "candle-gen-iris",
@@ -1597,7 +1602,7 @@
         "lr_warmup_steps": 0,
         "cache_latents_requested": true,
         "cache_text_embeddings_requested": true,
-        "native_cache_policy": "Native frozen feature/conditioning networks and paired/synthetic data pipeline retained unchanged; generic true/true flags do not establish persistent VAE/text caches. E2 toggles only new DiT RoPE/pixel-position tables.",
+        "native_cache_policy": "Native frozen feature/conditioning networks and paired/synthetic data pipeline retained unchanged; generic true/true flags do not establish persistent VAE/text caches. E2 toggles only new DiT RoPE/pixel-position tables. Comparison bootstrap now shares only verified immutable raw ConvNeXt/LPIPS checkpoint decode across children; not an E2 control or a measured preparation speedup.",
         "video_frames": null,
         "audio_mode": null,
         "modality": "image",
@@ -1639,11 +1644,21 @@
           "scope": "case"
         },
         {
-          "slot": "iris-restore-training-perceptual-files",
+          "slot": "iris-restore-training-vgg",
           "role": "tensor-input",
           "readers": [
-            "candle-core::safetensors::load",
-            "candle-core::pickle::read_all_with_key"
+            "candle-gen-iris::train::frozen_cache::vgg_native_store"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "iris-restore-training-lpips",
+          "role": "tensor-input",
+          "readers": [
+            "candle-gen-iris::train::frozen_cache::lpips_native_store"
           ],
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -1654,7 +1669,7 @@
           "slot": "iris-restore-training-critic",
           "role": "tensor-input",
           "readers": [
-            "candle-core::PthTensors::get"
+            "candle-gen-iris::train::frozen_cache::convnext_native_store"
           ],
           "minimum_collections": 1,
           "minimum_items": 1,
@@ -1686,7 +1701,8 @@
       ],
       "dropped_quality_only_slots": [],
       "constant_repairs": [
-        "Existing current correctness/reader/device/safety bounds remain common."
+        "Existing current correctness/reader/device/safety bounds remain common.",
+        "Comparison-only source/run/case-owned immutable raw ConvNeXt/LPIPS decoding bootstrap identical in all five arms, independent of E2. No mutable Run/optimizer/EMA/critic/SN or stage-dependent projection/geometry pack is reused. Original noncomparison frozen readers remain unchanged."
       ],
       "initial_state_basis": "Fresh same-binary child/native factory. Actual configuration/data hashes plus shared optimizer/parameter initialization receipts; Iris also hashes privateparams/EMA/optimizer/critic/SN buffers before any update.",
       "runtime_directory": "Iris requires new owned BESPOKE_RUNTIME_DIR subdirectory with authoritative .sc-26850-owned-runtime marker; no stage reuses prior checkpoints.",
@@ -1694,7 +1710,27 @@
       "candidate_required_owners": [
         "iris-restoration-generator"
       ],
-      "e4_critic_scope": "N-A: criticCNN has no SDPA; fakegenerator uses detached parameters, so do not requirecandidate on criticupdates or force an alteredgraph."
+      "e4_critic_scope": "N-A: criticCNN has no SDPA; fakegenerator uses detached parameters, so do not requirecandidate on criticupdates or force an alteredgraph.",
+      "immutable_frozen_bootstrap": {
+        "env": "MODEL_PROOF_IRIS_FROZEN_CACHE_DIR",
+        "scope": "common parentBESPOKE_RUNTIME_DIR/comparison-iris-frozen outside uploaded artifact, source/run/attempt/case/marker joined",
+        "raw_tensors": "original native dtype/name/shape/content SHA; original pinned file SHA+fingerprint and immutable store SHA",
+        "build": "one checkpoint metadata parse plus one payload ZIP archive per resource, atomic store+manifest, actual native roundtrip required before publication",
+        "mutable_state": "fresh in each native child; existing private params/optimizer/EMA/critic/SN initial fingerprints unchanged",
+        "stable_initialization": "source/cache/role/owner/readstage/tensor signatures only; cache_hit/bootstrap/nativecast durations are separate log observations",
+        "reader_labels": [
+          "candle-gen-iris::train::frozen_cache::convnext_native_store",
+          "candle-gen-iris::train::frozen_cache::vgg_native_store",
+          "candle-gen-iris::train::frozen_cache::lpips_native_store"
+        ],
+        "maximum_store_bytes_each": 8589934592,
+        "raw_store_uploaded": false,
+        "local_conversion_executed": false,
+        "measured_bootstrap_speedup": null,
+        "whole_model_byte_attestation": false
+      },
+      "case_deadline_seconds": 7200,
+      "deadline_scope": "ONE absolute model-case deadline including readiness/first bootstrap/all five children/finalization; never reset per stage"
     }
   ]
 }

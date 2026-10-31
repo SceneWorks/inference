@@ -458,8 +458,18 @@ def _shared_admission_samples(probe, reader, output: Path, uuid: str, physical_i
             _shared_admission_wait(reader, output, uuid, physical_index, policy, deadline, observation)
 
 
+def effective_claim_deadline(started: float, policy, original_deadline_monotonic: float | None = None) -> float:
+    deadline = started + policy.deadline_seconds
+    if original_deadline_monotonic is not None:
+        if type(original_deadline_monotonic) not in (int, float) or not math.isfinite(original_deadline_monotonic):
+            raise ValueError('original comparison deadline must be finite')
+        deadline = min(deadline, original_deadline_monotonic)
+    return deadline
+
+
 @contextmanager
-def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, constraints: dict | None = None):
+def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, constraints: dict | None = None,
+                    original_deadline_monotonic: float | None = None):
     """Claim only during execution. CUDA reuses Veda's host-global UUID lock namespace.
 
     A hosted Mac/Linux worker is an isolated Actions execution environment. The provisioned
@@ -536,24 +546,27 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
             handle.write(b'0')
             handle.flush()
         started = time.monotonic()
+        claim_deadline = effective_claim_deadline(started, policy, original_deadline_monotonic)
+        if started >= claim_deadline:
+            raise ValueError('original comparison deadline expired before physical-device claim')
         while not claimed:
             handle.seek(0)
             try:
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                 claimed = True
             except OSError:
-                if time.monotonic() - started >= policy.deadline_seconds:
+                if time.monotonic() >= claim_deadline:
                     raise ValueError('approved wait deadline expired before physical-device claim')
                 time.sleep(policy.poll_millis / 1000)
         from scripts.release import veda_cuda_guard
         activity_profile = bound_cuda_activity_profile(constraints)
         shared_headroom = activity_profile == SHARED_CUDA_HEADROOM_ACTIVITY
         inventory_reader = (lambda out, label, deadline: veda_cuda_guard.inventory(
-            out, label, min(deadline, started + policy.deadline_seconds), selected_uuid=uuid)) if shared_headroom else veda_cuda_guard.inventory
+            out, label, min(deadline, claim_deadline), selected_uuid=uuid)) if shared_headroom else veda_cuda_guard.inventory
         admission_wait = {'primary_polls': 0, 'headroom_shortfalls': 0,
                           'stable_sample_restarts': 0, 'headroom_wait_seconds': 0.0}
         devices, processes = (_shared_admission_wait(inventory_reader, output, uuid,
-            constraints['required_cuda_physical_index'], policy, started + policy.deadline_seconds, admission_wait)
+            constraints['required_cuda_physical_index'], policy, claim_deadline, admission_wait)
             if shared_headroom else veda_cuda_guard.inventory(output, 'model-proof-claimed-device'))
         matched = [device for device in devices if device['uuid'] == uuid]
         required_index = constraints.get('required_cuda_physical_index')
@@ -576,7 +589,7 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
                                          'background utilization and contexts are diagnostic only')
             record['isolated_benchmark_claim'] = False
             record['lease_released'] = False
-            record['claim_deadline_monotonic'] = started + policy.deadline_seconds
+            record['claim_deadline_monotonic'] = claim_deadline
             record['admission_wait'] = admission_wait
             record['release_policy'] = 'verified-owned-Job-exit; exact selected primary metadata; headroom/activity diagnostic only'
         elif activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY:
@@ -588,7 +601,7 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
             record['idle_policy'] = 'stable typed contexts, zero selected-card utilization, policy cap plus reserve free'
         if constraints.get('child_cuda_visibility') is not None:
             record['child_visibility_binding'] = child_visibility_binding(
-                constraints, env, uuid, policy.deadline_seconds - (time.monotonic() - started))
+                constraints, env, uuid, claim_deadline - time.monotonic())
         # Reuse five fresh samples, with this proof's actual free reserve and child cap.
         context_baseline = {'uuid': uuid, 'reserved_baseline_mib': matched[0]['used_mib'],
                             'process_identities': proof_cuda_contexts(uuid, processes, activity_profile=activity_profile)}
@@ -596,8 +609,8 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
             context_baseline['admitted_total_mib'] = matched[0]['total_mib']
         identity_key = lambda selected_uuid, rows: proof_cuda_contexts(
             selected_uuid, rows, activity_profile=activity_profile)
-        settle_deadline = (started + policy.deadline_seconds if shared_headroom
-                           else min(started + policy.deadline_seconds, time.monotonic() + 30))
+        settle_deadline = (claim_deadline if shared_headroom
+                           else min(claim_deadline, time.monotonic() + 30))
         probe = lambda: veda_cuda_guard.sample_baseline(
             matched[0], output, 'model-proof-admission', context_baseline, idle_check=idle_check,
             identity_key=identity_key, permit_bounded_growth=True,
@@ -641,7 +654,7 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
                         identity_key=identity_key, permit_bounded_growth=True,
                         require_stable_contexts=not shared_headroom, inventory_reader=inventory_reader),
                     output, 'model-proof-release', uuid, matched[0]['index'], policy, baseline,
-                    min(started + policy.deadline_seconds, time.monotonic() + 30),
+                    min(claim_deadline, time.monotonic() + 30),
                     activity_profile=activity_profile)
             except (RuntimeError, OSError, subprocess.SubprocessError) as error:
                 raise CudaReleaseRejected('CUDA post-idle verification failed: ' + str(error),

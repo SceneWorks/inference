@@ -1,5 +1,6 @@
 """Pure metadata/mocks: never construct tensors or launch a model/GPU query."""
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,7 +10,8 @@ from unittest.mock import patch
 
 from scripts.ci import model_inference_proofs as proof
 from scripts.ci import training_comparison as comparison
-from scripts.ci.model_proof_resources import bound_cuda_activity_profile
+from scripts.ci.model_proof_resources import bound_cuda_activity_profile, effective_claim_deadline, metadata_policy_payload
+from types import SimpleNamespace
 
 
 class ComparisonContract(unittest.TestCase):
@@ -27,7 +29,9 @@ class ComparisonContract(unittest.TestCase):
         base = proof.configured_case(self.cases[model], 'fixed_cuda_comparison_gpu0')
         plan = comparison.spec(base)
         return base, {'selection': proof.identity(base), 'configuration': 'fixed_cuda_comparison_gpu0',
-                      'policy': {'backend': 'windows-cuda', 'cudaDeviceUuid': comparison.DEVICES['gpu0'][0]},
+                      'policy': {'backend': 'windows-cuda', 'cudaDeviceUuid': comparison.DEVICES['gpu0'][0],
+                                 'childGpuCapBytes':91*1024**3,'gpuFreeReserveBytes':2*1024**3,
+                                 'deadlineSeconds':plan['case_deadline_seconds']},
                       'training_comparison': {k: plan[k] for k in ('protocol', 'stages', 'max_physical_updates')}}
 
     def fixture(self, row):
@@ -187,9 +191,9 @@ class ComparisonContract(unittest.TestCase):
 
     def mocked_driver(self, *, fail_first=False, inspect=None):
         base,value=self.request()
-        value['policy'].update(deadlineSeconds=1000.,pollMillis=100,termGraceMillis=100)
+        value['policy'].update(pollMillis=100,termGraceMillis=100)
         observed=[]
-        def native_mock(rows,backend,child,expected,destination,*,comparison_work):
+        def native_mock(rows,backend,child,expected,destination,*,comparison_work,comparison_deadline_monotonic):
             row=rows[0]
             observed.append((row['training_comparison_stage'],child['policy']['deadlineSeconds'],str(comparison_work)))
             destination.mkdir(parents=True)
@@ -198,6 +202,14 @@ class ComparisonContract(unittest.TestCase):
             result=comparison.verify_metrics(row,metrics,text)
             case={'accepted':not fail_first,'training_comparison':result,
                   'comparison_executable_sha256':'e'*64}
+            phase_start=comparison_deadline_monotonic-child['policy']['deadlineSeconds']+1.
+            payload=metadata_policy_payload(child['policy'])
+            payload['deadlineSeconds']=comparison_deadline_monotonic-phase_start
+            digest=hashlib.sha256((json.dumps(payload,sort_keys=True,separators=(',',':'))+'\n').encode()).hexdigest()
+            case.update(comparison_original_deadline_monotonic=comparison_deadline_monotonic,
+                        comparison_discovery_started_monotonic=phase_start,comparison_discovery_policy=payload,
+                        commands=[{'supervision':{'admission':{'policySha256':digest}}}],
+                        physical_execution={'claim_deadline_monotonic':comparison_deadline_monotonic})
             (destination/'receipt.json').write_text(json.dumps({'accepted':not fail_first,'cases':[case]}))
             (destination/'00000/body.stdout.log').write_text(text if not fail_first else '')
             return 1 if fail_first else 0
@@ -223,7 +235,7 @@ class ComparisonContract(unittest.TestCase):
         self.assertEqual(len(set(x[2] for x in observed)),len(observed))
         self.assertTrue(all(a[1]>b[1] for a,b in zip(observed,observed[1:])))
         for record in receipt['stage_records']:
-            self.assertEqual(record['remaining_original_deadline_seconds'],1000.-record['elapsed_before_stage_seconds'])
+            self.assertEqual(record['remaining_original_deadline_seconds'],3600.-record['elapsed_before_stage_seconds'])
         self.assertEqual(receipt['conservative_updates_charged'],24)
 
     def test_driver_stops_and_reserves_failed_unknown_stage_without_retry(self):
@@ -278,6 +290,41 @@ class ComparisonContract(unittest.TestCase):
                 with self.assertRaises(ValueError):verify()
         code,_,_=self.mocked_driver(inspect=inspect)
         self.assertEqual(code,0)
+
+    def test_slow_discovery_cannot_refresh_body_deadline(self):
+        # Stage entered at102 with998s remaining, then Cargo discovery used300s.
+        # Body started at402 must still stop at1100, not402+998=1400.
+        policy=SimpleNamespace(deadline_seconds=998.)
+        self.assertEqual(effective_claim_deadline(402.,policy,1100.),1100.)
+        self.assertEqual(effective_claim_deadline(402.,policy),1400.)
+        self.assertEqual(effective_claim_deadline(1099.,policy,1100.),1100.)
+        for invalid in (float('nan'),float('inf'),True,'1100'):
+            with self.assertRaises(ValueError):effective_claim_deadline(402.,policy,invalid)
+        child={'policy':{'backend':'windows-cuda','deadlineSeconds':998.,'cudaDeviceUuid':'GPU-x'}}
+        payload=metadata_policy_payload(child['policy']);payload['deadlineSeconds']=698.
+        case={'accepted':True,'comparison_original_deadline_monotonic':1100.,
+              'comparison_discovery_started_monotonic':402.,'comparison_discovery_policy':payload,
+              'physical_execution':{'claim_deadline_monotonic':1100.}}
+        comparison.verify_stage_deadline(case,child,1100.)
+        case['physical_execution']['claim_deadline_monotonic']=1400.
+        with self.assertRaises(ValueError):comparison.verify_stage_deadline(case,child,1100.)
+
+    def test_iris_cache_directory_is_same_owned_scope_all_stages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent=Path(directory)/'runtime';parent.mkdir()
+            row=self.row('iris-restoration')
+            marker=parent/'.sc-26850-owned-runtime';marker.write_text(proof.identity(row)+'\n')
+            def environment():return {'BESPOKE_RUNTIME_DIR':str(parent),'GITHUB_SHA':'f'*40,'GITHUB_RUN_ID':'123','GITHUB_RUN_ATTEMPT':'1'}
+            first=environment();proof.apply_configuration(row,first)
+            second=environment();proof.apply_configuration(self.row('iris-restoration','legacy'),second)
+            key='MODEL_PROOF_IRIS_FROZEN_CACHE_DIR'
+            self.assertEqual(first[key],second[key])
+            owner=json.loads((Path(first[key])/'comparison-cache-owner.json').read_text())
+            self.assertEqual(owner['source_revision'],'f'*40)
+            self.assertEqual(owner['binding'],proof.identity(row))
+            self.assertNotEqual(first['BESPOKE_RUNTIME_DIR'],second['BESPOKE_RUNTIME_DIR'])
+            wrong=environment();wrong['GITHUB_SHA']='e'*40
+            with self.assertRaises(ValueError):proof.apply_configuration(self.row('iris-restoration','minus-e2'),wrong)
 
 
 if __name__ == '__main__':

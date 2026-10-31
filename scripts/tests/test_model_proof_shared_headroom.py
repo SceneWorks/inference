@@ -42,7 +42,8 @@ class SharedHeadroom(unittest.TestCase):
         return dict({'uuid': UUID, 'index': 1, 'total_mib': 97887, 'used_mib': 4996,
                      'free_mib': 92891, 'utilization_percent': utilization}, **changes)
 
-    def claim(self, snapshots, body=None, policy=POLICY, owned_completion=True, unlock_failure=False, clock=None):
+    def claim(self, snapshots, body=None, policy=POLICY, owned_completion=True, unlock_failure=False, clock=None,
+              original_deadline_monotonic=None):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             environment = {'PUBLIC': str(output), 'RUNNER_NAME': 'MOCK runner', 'CUDA_VISIBLE_DEVICES': UUID}
@@ -57,7 +58,8 @@ class SharedHeadroom(unittest.TestCase):
                     (patch.object(resources.time, 'monotonic', side_effect=clock.monotonic) if clock else contextlib.nullcontext()), \
                     patch.object(guard.time, 'sleep', side_effect=clock.sleep if clock else None):
                 with resources.execution_claim('candle-cuda', policy, output, environment,
-                                               constraints=self.configured) as receipt:
+                                               constraints=self.configured,
+                                               original_deadline_monotonic=original_deadline_monotonic) as receipt:
                     self.assertFalse(receipt['post_execution_verified'])
                     if owned_completion:
                         receipt['owned_execution_completion'] = {
@@ -69,6 +71,16 @@ class SharedHeadroom(unittest.TestCase):
                 self.assertTrue(receipt['post_execution_verified'])
                 self.assertTrue(all(call.kwargs.get('selected_uuid') == UUID for call in inventory.call_args_list))
                 return receipt, inventory.call_count
+
+    def test_comparison_absolute_deadline_survives_slow_discovery_before_claim(self):
+        # Metadata-only clock: global100+1000 budget, discovery ended402;
+        # body claim must not refresh to402+998 despite its entry policy.
+        clock=FakeClock();clock.now=402.
+        policy=SimpleNamespace(**{**vars(POLICY),'deadline_seconds':998.})
+        receipt,_=self.claim([([self.card()],[])]*11,policy=policy,clock=clock,
+                            original_deadline_monotonic=1100.)
+        self.assertEqual(receipt['claim_deadline_monotonic'],1100.)
+        self.assertTrue(receipt['lease_released'])
 
     def test_shared_headroom_waits_before_body_and_restarts_five_samples_without_other_veto(self):
         policy = SimpleNamespace(**{**vars(POLICY),'child_gpu_cap_bytes':91*1024**3,'deadline_seconds':20})
