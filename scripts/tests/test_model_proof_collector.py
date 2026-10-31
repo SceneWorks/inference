@@ -387,23 +387,31 @@ class Collector(unittest.TestCase):
                 proof.publish_file(source, destination / 'hard.png', root, 100)
             self.assertEqual(victim.read_bytes(), b'private')
 
-    def _mock_run(self, root, *, fail=False, missing=False, preseal=None, row_override=None, input_body='', observer_events=True, generated_outputs=None):
+    def _mock_run(self, root, *, fail=False, missing=False, preseal=None, row_override=None, input_body='', observer_events=True, generated_outputs=None, backend='mlx', supervisor_module=None):
         row = case() if row_override is None else row_override
         if missing:
             row['required_environment'] = ['MODEL_PROOF_TEST_PREREQUISITE_ABSENT']
-        (root / 'case.rs').write_text('// test fixture; no actual Rust execution', encoding="utf-8")
+        source = root / row['source']
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text('// test fixture; no actual Rust execution', encoding='utf-8')
+        mock_request = request('windows-cuda' if backend == 'candle-cuda' else 'darwin-mlx')
+        if backend == 'candle-cuda':
+            mock_request['policy'].update(cudaDeviceUuid=row['required_cuda_device_uuid'], gpuFreeReserveBytes=100, childGpuCapBytes=1000000)
+        source_safety = supervisor_module or safety
         def toolchain(env, **_kwargs):
-            self.assertEqual(env['MACOSX_DEPLOYMENT_TARGET'], row.get('deployment_target', '15.0'))
+            if backend == 'mlx':
+                self.assertEqual(env['MACOSX_DEPLOYMENT_TARGET'], row.get('deployment_target', '15.0'))
             env['CARGO_ENCODED_RUSTFLAGS'] = 'MOCK_NATIVE_LINKER_FLAGS'
             return {'toolchain': 'MOCK; no compiler invoked'}
         def preparation(_row, env):
-            self.assertEqual(env['MACOSX_DEPLOYMENT_TARGET'], row.get('deployment_target', '15.0'))
+            if backend == 'mlx':
+                self.assertEqual(env['MACOSX_DEPLOYMENT_TARGET'], row.get('deployment_target', '15.0'))
             self.assertEqual(env['CARGO_ENCODED_RUSTFLAGS'], 'MOCK_NATIVE_LINKER_FLAGS')
             return {'prebuilt': 'MOCK; not executed'}
         def guarded(argv, **kwargs):
             self.assertEqual(kwargs['env']['CARGO_ENCODED_RUSTFLAGS'], 'MOCK_NATIVE_LINKER_FLAGS')
-            self.assertFalse(kwargs['reap_metadata_descendants'])  # macOS metadata and model bodies keep their lifetime.
             discovery = '--list' in argv
+            self.assertEqual(kwargs['reap_metadata_descendants'], discovery and backend == 'candle-cuda')
             if not discovery:
                 for name, payload in (generated_outputs or {}).items():
                     generated = Path(kwargs['env']['MODEL_PROOF_OUTPUT_DIR']) / name
@@ -412,15 +420,25 @@ class Collector(unittest.TestCase):
             text = (row['fqn'] + ': test\n\n1 test, 0 benchmarks\n') if discovery else (
                 'test result: ok. 1 passed; 0 failed; 0 ignored;\n'
                 'MODEL_INFERENCE_BODY_COMPLETED ' + row['fqn'] + '\n'
-                'MODEL_INFERENCE_DEVICE ' + row['fqn'] + ' mlx-cpu\n' + input_body)
+                'MODEL_INFERENCE_DEVICE ' + row['fqn'] + (' candle-cuda\n' if backend == 'candle-cuda' else ' mlx-cpu\n') + input_body)
+            if discovery and row.get('cargo_target_metadata') is not None:
+                text += json.dumps({'reason':'compiler-artifact','profile':{'test':True},'executable':'MOCK-never-executed.exe',
+                    'target':row['cargo_target_metadata'],'package_id':'MOCK only','features':[]})+'\n'
             kwargs['stdout_path'].write_text(text, encoding="utf-8")
             kwargs['stderr_path'].write_text('', encoding="utf-8")
             if observer_events == 'broken-symlink':
                 kwargs['event_path'].symlink_to(root / 'missing-observer-events')
             elif observer_events:
                 kwargs['event_path'].write_text('{"mock":true}\n', encoding="utf-8")
+            completion = {'scope':'supervisor-owned-windows-job','root_pid':42,
+                'root_returncode':0,'waited_returncode':0,'job_member_pids':[],'owned_pids':[]}
             if isinstance(fail, safety.SupervisionError) and not discovery:
+                if backend == 'candle-cuda':
+                    fail.owned_completion = {**completion, 'root_returncode':1,'waited_returncode':1}
                 raise fail
+            if backend == 'candle-cuda' and not discovery:
+                self.assertTrue(kwargs['retain_owned_completion'])
+                return source_safety.OwnedCudaRunResult(42, 0, 1024, None, 1000000000, None, .01, (), {'mode':'mock'}, completion)
             return safety.RunResult(42, 1 if fail and not discovery else 0, 1024, None,
                                     1000000000, None, 0.01, (), {'mode': 'mock'})
         @contextlib.contextmanager
@@ -435,9 +453,23 @@ class Collector(unittest.TestCase):
                 raise resources.CudaReleaseRejected('MOCK release refusal',
                                                     {'status': 'retained-existing-samples', 'sample_count': 1})
             raise ValueError('MOCK controller post-idle failure')
-        claim_patch = patch.object(resources, 'execution_claim', side_effect=incomplete_controller) if preseal else contextlib.nullcontext()
+        @contextlib.contextmanager
+        def shared_controller(*_args, **_kwargs):
+            physical = {'activity_profile': resources.SHARED_CUDA_HEADROOM_ACTIVITY,
+                'device_uuid':row['required_cuda_device_uuid'],'physical_index':1,
+                'post_execution_verified':False,'lease_released':False}
+            try:
+                yield physical
+            finally:
+                if not resources.shared_owned_completion(physical):
+                    raise resources.CudaReleaseRejected('MOCK unproven owned completion', {})
+                physical['lease_released'] = True
+                physical['post_execution_verified'] = True
+        claim_patch = (patch.object(resources, 'execution_claim', side_effect=shared_controller) if backend == 'candle-cuda'
+                       else patch.object(resources, 'execution_claim', side_effect=incomplete_controller) if preseal
+                       else contextlib.nullcontext())
         expected = '1' * 40
-        env = {'RUNNER_TEMP': str(root), 'RUNNER_OS': 'macOS', 'RUNNER_NAME': 'mock-hosted',
+        env = {'RUNNER_TEMP': str(root), 'RUNNER_OS': 'Windows' if backend == 'candle-cuda' else 'macOS', 'RUNNER_NAME': 'mock-hosted',
                'GITHUB_EVENT_NAME': 'workflow_dispatch', 'MODEL_PROOF_RUNNER_ENVIRONMENT': 'github-hosted'}
         with patch.dict(os.environ, env), patch.object(proof, 'ROOT', root), \
                 patch.object(proof, 'repository_identity', return_value={'revision': expected, 'tree': '2' * 40}), \
@@ -446,12 +478,45 @@ class Collector(unittest.TestCase):
                 patch.object(safety, 'run_guarded', side_effect=guarded) as guard, claim_patch:
             output = root / 'evidence'
             try:
-                status = proof.run((row,), 'mlx', request(), expected, output)
+                status = proof.run((row,), backend, mock_request, expected, output)
             except KeyboardInterrupt:
                 status = 130
-            verified = proof.verify_artifacts(output, root, request(), expected, (row,))
+            verified = proof.verify_artifacts(output, root, mock_request, expected, (row,))
             receipt = json.loads((output / 'receipt.json').read_text(encoding="utf-8"))
             return status, receipt, verified, guard.call_count, output
+
+    def test_shared_owned_result_cross_module_identity_and_failed_closed_body(self):
+        # The real collector loader imports canonical scripts.media_campaign_supervisor;
+        # a distinct loaded class must survive dataclass/asdict and release value validation.
+        alternate = load('collector_alternate_supervisor', ROOT / 'scripts/media_campaign_supervisor.py')
+        self.assertIsNot(alternate.OwnedCudaRunResult, safety.OwnedCudaRunResult)
+        fqn = 'train::projection::tests::cuda_bf16_packed_qkvg_preserves_outputs_and_every_adapter_gradient'
+        source = next(row for row in proof.load_registry() if row['fqn'] == fqn)
+        row = proof.configured_case(source, 'fixed_cuda')
+        for failure in (False, safety.SupervisionError('child-exit', 'MOCK closed root returned1')):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                status, receipt, verified, _, _ = self._mock_run(Path(temporary).resolve(),
+                    row_override=row, backend='candle-cuda', supervisor_module=alternate, fail=failure)
+                physical = receipt['cases'][0]['physical_execution']
+                self.assertTrue(physical['post_execution_verified'])
+                self.assertTrue(physical['lease_released'])
+                self.assertEqual(physical['owned_execution_completion']['scope'], 'supervisor-owned-windows-job')
+                self.assertEqual(status, 1 if failure else 0)
+                self.assertEqual(receipt['accepted'], not bool(failure))
+                if not failure:
+                    self.assertTrue(verified['accepted_model_run'])
+                else:
+                    self.assertIn('child-exit', receipt['cases'][0]['error'])
+
+    def test_isolated_cli_import_preserves_owned_completion_value_protocol(self):
+        # Same isolated Python import setup as the workflow's -I entry point; mocks only.
+        script = ("import sys,unittest; sys.path.insert(0,sys.argv[1]); "
+                  "suite=unittest.defaultTestLoader.loadTestsFromName("
+                  "'scripts.tests.test_model_proof_collector.Collector.test_shared_owned_result_cross_module_identity_and_failed_closed_body'); "
+                  "result=unittest.TextTestRunner(verbosity=0).run(suite); raise SystemExit(not result.wasSuccessful())")
+        result = subprocess.run([sys.executable, '-I', '-c', script, str(ROOT)],
+                                capture_output=True, text=True, encoding='utf-8', timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_full_mock_collector_records_body_device_events_and_safe_upload(self):
         with tempfile.TemporaryDirectory() as temporary:

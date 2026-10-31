@@ -1074,6 +1074,12 @@ class RunResult:
 
 
 @dataclass(frozen=True)
+class OwnedCudaRunResult(RunResult):
+    # Opt-in actual Windows Job observations; legacy result fields remain unchanged.
+    owned_completion: dict[str, object]
+
+
+@dataclass(frozen=True)
 class MultiCudaRunResult(RunResult):
     # The legacy result constructor/fields/asdict stay exactly unchanged for a single device.
     cuda_devices: tuple[dict[str, object], ...]
@@ -1091,6 +1097,7 @@ def run_guarded(
     additional_cuda_policies: tuple[SafetyPolicy, ...] = (),
     additional_cuda_probes: tuple[object, ...] = (),
     reap_metadata_descendants: bool = False,
+    retain_owned_completion: bool = False,
 ) -> RunResult:
     """Run one row under runtime-guarded, estimate-plus-reserve admission.
 
@@ -1103,9 +1110,17 @@ def run_guarded(
     if (type(reap_metadata_descendants) is not bool or
             (reap_metadata_descendants and (policy.backend != "windows-cpu" or require_gpu_sample))):
         raise SupervisionError("invalid-policy", "metadata descendant reaping requires an explicit Windows CPU-only discovery")
+    if (type(retain_owned_completion) is not bool or
+            (retain_owned_completion and (policy.backend != "windows-cuda" or additional_cuda_policies))):
+        raise SupervisionError("invalid-policy", "owned completion receipts require explicit single-device Windows CUDA")
     admission = None
     cuda_states: tuple[_CudaWatch, ...] = ()
     spawned: list[int] = []
+    creation_attempted = False
+
+    def record_creation_attempt() -> None:
+        nonlocal creation_attempted
+        creation_attempted = True
 
     def record_spawn(pid: int, pgid: int | None) -> None:
         spawned.append(pid)
@@ -1135,8 +1150,12 @@ def run_guarded(
             probe=probe, clock=clock, on_spawn=record_spawn, require_gpu_sample=require_gpu_sample, pass_fds=pass_fds,
             cuda_states=cuda_states,
             reap_metadata_descendants=reap_metadata_descendants,
+            retain_owned_completion=retain_owned_completion,
+            on_creation_attempt=record_creation_attempt if retain_owned_completion else None,
         )
     except SupervisionError as error:
+        if retain_owned_completion and not creation_attempted:
+            error.owned_completion = {'scope': 'supervisor-no-child-created', 'creation_attempted': False}
         error.admission = admission
         error.pid = spawned[0] if spawned else None
         if cuda_states:
@@ -1151,6 +1170,8 @@ def _run_admitted(
     on_spawn: Callable[[int, int | None], None], require_gpu_sample: bool = True,
     pass_fds: tuple[int, ...] = (), cuda_states: tuple[_CudaWatch, ...] = (),
     reap_metadata_descendants: bool = False,
+    retain_owned_completion: bool = False,
+    on_creation_attempt: Callable[[], None] | None = None,
 ) -> RunResult:
     if (not isinstance(pass_fds, tuple) or any(type(fd) is not int or fd < 3 for fd in pass_fds)
             or (os.name == 'nt' and pass_fds)):
@@ -1214,6 +1235,8 @@ def _run_admitted(
             try:
                 job = windows.WindowsJob()
                 # CREATE_SUSPENDED: no descendant can start before Job ownership is installed.
+                if on_creation_attempt is not None:
+                    on_creation_attempt()
                 child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr,
                                          creationflags=0x00000004)
                 try:
@@ -1228,6 +1251,8 @@ def _run_admitted(
                 raise SupervisionError("spawn-failure", str(error)) from error
         else:
             try:
+                if on_creation_attempt is not None:
+                    on_creation_attempt()
                 child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr,
                                          start_new_session=True, pass_fds=pass_fds)
             except OSError as error:
@@ -1266,20 +1291,33 @@ def _run_admitted(
         def finished_result(status: int | None, pids: set[int], owned: set[int]) -> RunResult | None:
             if status is None or pids or owned:
                 return None
-            if clock() - started >= policy.deadline_seconds:
-                raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
-            # The root exit and an empty owned tree are both required. Recheck
-            # files here because the child can write between the loop's first
-            # cap check and this terminal observation.
-            check_artifact_caps()
-            if status != 0:
-                raise SupervisionError("child-exit", f"child exited with status {status}")
-            if policy.backend == "windows-cuda" and require_gpu_sample:
-                missing = [state for state in devices if state.peak <= 0]
-                if missing:
-                    label = f" on {missing[0].policy.cuda_device_uuid}" if multi_cuda else ""
-                    raise SupervisionError("probe-failure", f"CUDA child had no attributable GPU-memory sample{label}")
-            child.wait()
+            completion = None
+            if retain_owned_completion:
+                waited_returncode = child.wait()
+                completion = {
+                    "scope": "supervisor-owned-windows-job", "root_pid": child.pid,
+                    "root_returncode": status, "waited_returncode": waited_returncode,
+                    "job_member_pids": sorted(pids), "owned_pids": sorted(owned)}
+            try:
+                if clock() - started >= policy.deadline_seconds:
+                    raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
+                # The root exit and an empty owned tree are both required. Recheck
+                # files here because the child can write between the loop's first
+                # cap check and this terminal observation.
+                check_artifact_caps()
+                if status != 0:
+                    raise SupervisionError("child-exit", f"child exited with status {status}")
+                if policy.backend == "windows-cuda" and require_gpu_sample:
+                    missing = [state for state in devices if state.peak <= 0]
+                    if missing:
+                        label = f" on {missing[0].policy.cuda_device_uuid}" if multi_cuda else ""
+                        raise SupervisionError("probe-failure", f"CUDA child had no attributable GPU-memory sample{label}")
+                if not retain_owned_completion:
+                    child.wait()
+            except SupervisionError as error:
+                if completion is not None:
+                    error.owned_completion = completion
+                raise
             # Explicit model-test proofs attest the actual in-scope device separately. A fast
             # successful test may end between GPU polling ticks: report UNKNOWN, never a fake
             # zero measurement. Existing campaign callers retain their strict/default behavior.
@@ -1290,6 +1328,9 @@ def _run_admitted(
                       host_free, gpu_free, clock() - started, tuple(samples), admission)
             if multi_cuda:
                 return MultiCudaRunResult(*fields, tuple(state.evidence() for state in devices))
+            if retain_owned_completion:
+                # Source observations survived the existing Job/stdio cleanup before return.
+                return OwnedCudaRunResult(*fields, completion)
             return RunResult(*fields)
 
         try:

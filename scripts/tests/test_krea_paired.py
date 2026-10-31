@@ -171,7 +171,7 @@ class KreaPairedProtocol(unittest.TestCase):
         self.assertEqual(paired.update_accounting(None,body_launched=False,accepted=False)['conservative_new_charge'],0)
 
     def test_source_admission_and_restoration_precede_work_and_no_tail_update_is_hidden(self):
-        source=(ROOT/'crates/media/candle-gen/candle-gen/src/train/flow_match.rs').read_text()
+        source=(ROOT/'crates/media/candle-gen/candle-gen/src/train/flow_match.rs').read_text(encoding='utf-8')
         self.assertLess(source.index('cfg != &expected || req.items.len() != 2'),source.index('model.cache(req, device, on_progress)?'))
         self.assertIn('steps: 12',source);self.assertIn('learning_rate: 0.001_f32',source)
         self.assertIn('if recovery_profile || (paired_profile && step > 6)',source)
@@ -184,7 +184,7 @@ class KreaPairedProtocol(unittest.TestCase):
         self.assertIn('step_sample(aux_driver.as_mut(), logical_step, &schedule)',source)
         self.assertIn('segment_cfg.steps = 6;',source)
         self.assertIn('if bounded_profile { 6 } else { cfg.steps }',source)
-        trainer=(ROOT/'crates/media/candle-gen/candle-gen-krea/src/training.rs').read_text()
+        trainer=(ROOT/'crates/media/candle-gen/candle-gen-krea/src/training.rs').read_text(encoding='utf-8')
         self.assertIn('flow_match::timestep_seed(cfg.seed, step)',trainer)
         self.assertIn('flow_match::noise_seed(cfg.seed, step)',trainer)
 

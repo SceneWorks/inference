@@ -125,7 +125,7 @@ class MultiCudaSupervisorTests(unittest.TestCase):
             assign_and_resume=lambda child: timeline.job_assignments.append(child.pid),
             terminate_and_reap=lambda child, grace: timeline.stopped.append((child.pid, grace)),
             close=close_job)
-        with patch.object(safety.os, "name", "nt" if is_windows else os.name), \
+        with patch.object(safety.os, "name", "nt" if is_windows else "posix"), \
              patch.object(safety.windows, "WindowsJob", return_value=timeline.job), \
              patch.object(safety.subprocess, "Popen", side_effect=timeline.spawn), \
              patch.object(safety.PosixTree, "snapshot", lambda owner: timeline.snapshot(owner)), \
@@ -138,6 +138,49 @@ class MultiCudaSupervisorTests(unittest.TestCase):
                 stdout_path=directory / "out", stderr_path=directory / "err", probe=probes[0],
                 clock=timeline.clock, additional_cuda_policies=tuple(policies[1:]),
                 additional_cuda_probes=tuple(probes[1:]), **kwargs)
+
+    def test_opt_in_windows_owned_completion_retains_actual_job_snapshot_only_after_exit(self):
+        policy = dataclasses.replace(self.policies[0], backend='windows-cuda')
+        timeline = Timeline(root_exit=2, empty=7)
+        probe = DeviceProbe(policy, timeline, 0)
+        result = self.run_fake(timeline, [probe], [policy], retain_owned_completion=True)
+        self.assertIsInstance(result, safety.OwnedCudaRunResult)
+        self.assertGreaterEqual(timeline.tick, timeline.empty)
+        self.assertEqual(result.owned_completion, {
+            'scope': 'supervisor-owned-windows-job', 'root_pid': 1000,
+            'root_returncode': 0, 'waited_returncode': 0,
+            'job_member_pids': [], 'owned_pids': []})
+        self.assertTrue(timeline.job_closes)
+        legacy = self.run_fake(Timeline(), policies=[policy])
+        self.assertNotIn('owned_completion', dataclasses.asdict(legacy))
+        # Pending owned descendants never yield a completion receipt, even after root exit.
+        pending = Timeline(root_exit=2, empty=10000)
+        with self.assertRaises(safety.SupervisionError):
+            self.run_fake(pending, [DeviceProbe(policy, pending, 0)], [policy], retain_owned_completion=True)
+        self.assertTrue(pending.stopped)
+        for policies in (self.policies[:1], self.policies[:2]):
+            with self.assertRaises(safety.SupervisionError):
+                self.run_fake(policies=policies, retain_owned_completion=True)
+
+    def test_owned_completion_survives_failed_closed_body_and_no_creation_is_distinct(self):
+        policy = dataclasses.replace(self.policies[0], backend='windows-cuda')
+        timeline = Timeline(root_exit=2, empty=7)
+        timeline.child.poll = lambda: 1 if timeline.tick >= timeline.root_exit else None
+        timeline.child.wait = lambda timeout=None: 1
+        with self.assertRaises(safety.SupervisionError) as caught:
+            self.run_fake(timeline, [DeviceProbe(policy, timeline, 0)], [policy], retain_owned_completion=True)
+        self.assertEqual(caught.exception.reason, 'child-exit')
+        completion = caught.exception.owned_completion
+        self.assertEqual((completion['root_returncode'], completion['waited_returncode']), (1, 1))
+        self.assertEqual(completion['job_member_pids'], [])
+        self.assertEqual(completion['owned_pids'], [])
+        refused = Timeline()
+        probe = DeviceProbe(policy, refused, 0, breach=('before', 'reserve'))
+        with self.assertRaises(safety.SupervisionError) as caught:
+            self.run_fake(refused, [probe], [policy], retain_owned_completion=True)
+        self.assertFalse(refused.spawned)
+        self.assertEqual(caught.exception.owned_completion,
+                         {'scope':'supervisor-no-child-created','creation_attempted':False})
 
     def test_single_device_failure_retains_sample_and_usage_basis(self):
         for basis in ('owned-process-attributed', 'global-used-upper-bound'):

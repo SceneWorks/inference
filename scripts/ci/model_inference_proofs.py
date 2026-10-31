@@ -1170,15 +1170,29 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                                        'additional_cuda_probes': probes[1:]}
                     with claim as physical:
                         result['physical_execution'] = physical
+                        shared_completion = (not discover and backend == 'candle-cuda'
+                                             and physical.get('activity_profile') == SHARED_CUDA_HEADROOM_PROFILE)
+                        if shared_completion:
+                            supervision['retain_owned_completion'] = True
                         if not discover and krea_paired.validate_binding(row):
                             result['krea_paired_body_launched'] = True
-                        guarded = run_guarded(argv, cwd=ROOT, env=env, policy=discovery_policy if discover else policy,
-                                              stdout_path=stdout, stderr_path=stderr,
-                                              event_path=case_work / (phase + '.events.jsonl'),
-                                              require_gpu_sample=False,
-                                              reap_metadata_descendants=discover and discovery_policy.backend == 'windows-cpu',
-                                              pass_fds=((int(env['SCENEWORKS_METAL_EXECUTION_LOCK_FD']),)
-                                                        if 'SCENEWORKS_METAL_EXECUTION_LOCK_FD' in env else ()), **supervision)
+                        try:
+                            guarded = run_guarded(argv, cwd=ROOT, env=env, policy=discovery_policy if discover else policy,
+                                                  stdout_path=stdout, stderr_path=stderr,
+                                                  event_path=case_work / (phase + '.events.jsonl'),
+                                                  require_gpu_sample=False,
+                                                  reap_metadata_descendants=discover and discovery_policy.backend == 'windows-cpu',
+                                                  pass_fds=((int(env['SCENEWORKS_METAL_EXECUTION_LOCK_FD']),)
+                                                            if 'SCENEWORKS_METAL_EXECUTION_LOCK_FD' in env else ()), **supervision)
+                        except SupervisionError as error:
+                            if shared_completion and isinstance(getattr(error, 'owned_completion', None), dict):
+                                physical['owned_execution_completion'] = error.owned_completion
+                            raise
+                        if shared_completion:
+                            completion = getattr(guarded, 'owned_completion', None)
+                            if not isinstance(completion, dict):
+                                raise ValueError('shared supervisor omitted its owned completion observations')
+                            physical['owned_execution_completion'] = completion
                         result['commands'].append({'argv': argv, 'supervision': asdict(guarded), 'owned_tree_empty': True})
                         if approved_uuids and not discover:
                             result['cuda_devices'] = list(guarded.cuda_devices)
@@ -1192,6 +1206,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                     if not discover:
                         if physical.get('post_execution_verified') is not True:
                             raise ValueError('outer physical controller did not seal resource completion')
+                        from scripts.ci.model_proof_resources import validate_shared_release_record
+                        validate_shared_release_record(physical, result['commands'], row)
                         result['resource_verification_pending'] = False
                     result['gpu_peak_observation'] = gpu_peak_observation(guarded)
                     text = stdout.read_text(encoding='utf-8', errors='replace') + '\n' + stderr.read_text(encoding='utf-8', errors='replace')
@@ -1244,6 +1260,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                     result['supervision_failure'] = {'reason': error.reason, 'admission': error.admission,
                                                      'pid': error.pid, 'watchdog_child_footprint': error.watchdog_child_footprint,
                                                      'watchdog_device_memory': error.watchdog_device_memory}
+                    if isinstance(getattr(error, 'owned_completion', None), dict):
+                        result['supervision_failure']['owned_completion'] = error.owned_completion
                     if approved_uuids:
                         result['cuda_devices'] = list(getattr(error, 'cuda_devices', ()))
                 # Publish only bounded/redacted regular logs from this owned case, even on failure.
@@ -1498,6 +1516,8 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
             raise ValueError('accepted input claims require their exact bounded body logs')
         body = '\n'.join((root / name).read_text(encoding='utf-8', errors='replace') for name in logs)
         execution = verify_execution(approved_rows[index], body)
+        from scripts.ci.model_proof_resources import validate_shared_release_record
+        validate_shared_release_record(case.get('physical_execution', {}), case.get('commands', []), approved_rows[index])
         if krea_recovery.applies(approved_rows[index]) and krea_recovery.validate_binding(approved_rows[index]):
             metrics = root / f'{index:05d}/generated/krea_bounded_acceleration/metrics.json'
             krea_recovery.verify_metrics(approved_rows[index], json.loads(metrics.read_text(encoding='utf-8')), execution, expected)

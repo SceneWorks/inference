@@ -69,6 +69,57 @@ def proof_cuda_idle(device: dict, processes: list[list[str]], policy,
                and row[3] in allowed_types for row in selected)
 
 
+def proof_cuda_shared_release(device: dict, uuid: str, physical_index: int, total_mib: int) -> bool:
+    """Post-owned-exit primary metadata check; admission headroom is diagnostic only."""
+    total, used, free = (device.get(key) for key in ('total_mib', 'used_mib', 'free_mib'))
+    return (device.get('uuid') == uuid and type(device.get('index')) is int
+            and device['index'] == physical_index and type(total_mib) is int
+            and all(type(value) is int for value in (total, used, free))
+            and total == total_mib and total > 0 and 0 <= used <= total
+            and 0 <= free <= total and used + free <= total + 2)
+
+
+def shared_owned_completion(record: dict) -> bool:
+    """Validate observations retained from run_guarded's existing owned Job completion."""
+    observed = record.get('owned_execution_completion')
+    if (isinstance(observed, dict) and set(observed) == {'scope', 'creation_attempted'}
+            and observed.get('scope') == 'supervisor-no-child-created'
+            and observed.get('creation_attempted') is False):
+        return True
+    return (isinstance(observed, dict)
+            and set(observed) == {'scope', 'root_pid', 'root_returncode', 'waited_returncode',
+                                  'job_member_pids', 'owned_pids'}
+            and observed['scope'] == 'supervisor-owned-windows-job'
+            and type(observed['root_pid']) is int and 0 < observed['root_pid'] <= 2**32 - 1
+            and type(observed['root_returncode']) is int
+            and type(observed['waited_returncode']) is int
+            and observed['waited_returncode'] == observed['root_returncode']
+            and observed['job_member_pids'] == [] and observed['owned_pids'] == [])
+
+
+def validate_shared_release_record(record: dict, commands: list[dict], constraints: dict | None = None) -> None:
+    """Join a shared release seal to the actual supervised body's retained observations."""
+    recipe = (constraints or {}).get('selected_configuration')
+    expected_shared = isinstance(recipe, dict) and recipe.get('cuda_activity_profile') == SHARED_CUDA_HEADROOM_ACTIVITY
+    if not expected_shared and record.get('activity_profile') != SHARED_CUDA_HEADROOM_ACTIVITY:
+        return
+    if constraints is not None and (not expected_shared
+            or record.get('activity_profile') != SHARED_CUDA_HEADROOM_ACTIVITY
+            or record.get('device_uuid') != constraints.get('required_cuda_device_uuid')
+            or type(record.get('physical_index')) is not int
+            or record['physical_index'] != constraints.get('required_cuda_physical_index')):
+        raise ValueError('shared CUDA release differs from its exact source-bound device/profile')
+    body = [item.get('supervision', {}) for item in commands
+            if '--list' not in item.get('argv', [])]
+    if (len(body) != 1 or not shared_owned_completion(record)
+            or record.get('lease_released') is not True or record.get('post_execution_verified') is not True
+            or record['owned_execution_completion'].get('scope') != 'supervisor-owned-windows-job'
+            or body[0].get('owned_completion') != record['owned_execution_completion']
+            or body[0].get('pid') != record['owned_execution_completion']['root_pid']
+            or body[0].get('returncode') != 0):
+        raise ValueError('shared CUDA release lacks its actual owned Job completion/unlock seal')
+
+
 def bound_cuda_activity_profile(constraints: dict) -> str:
     """Only exact source-owned registry recipes may select non-default admission."""
     recipe = constraints.get('selected_configuration')
@@ -198,8 +249,17 @@ def cuda_sample_diagnostic(output: Path, phase: str, uuid: str, physical_index: 
 
 def cuda_release_diagnostic(output: Path, uuid: str, physical_index: int, policy, baseline: dict,
                             *, activity_profile: str = STRICT_CUDA_ACTIVITY) -> dict:
-    return cuda_sample_diagnostic(output, 'model-proof-release', uuid, physical_index, policy, baseline,
-                                  activity_profile=activity_profile)
+    facts = cuda_sample_diagnostic(output, 'model-proof-release', uuid, physical_index, policy, baseline,
+                                   activity_profile=activity_profile)
+    if activity_profile == SHARED_CUDA_HEADROOM_ACTIVITY:
+        facts['release_policy'] = 'verified-owned-Job-exit; exact selected primary metadata; headroom/activity diagnostic only'
+        facts['admission_headroom_is_diagnostic_only'] = True
+        for sample in facts.get('samples', []):
+            card = sample.get('selected_card') or {}
+            sample['post_owned_exit_primary_metadata_valid'] = proof_cuda_shared_release(
+                {**card, 'uuid': uuid} if sample['predicates']['unique_uuid'] else card,
+                uuid, physical_index, baseline.get('admitted_total_mib'))
+    return facts
 
 
 def accepted_utilization_samples(output: Path, phase: str, uuid: str, physical_index: int,
@@ -393,6 +453,8 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
         raise ValueError('physical lock may not be a symlink')
     handle = path.open('a+b')
     claimed = False
+    record = None
+    shared_release_verified = False
     try:
         info = os.fstat(handle.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -414,7 +476,7 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
         activity_profile = bound_cuda_activity_profile(constraints)
         shared_headroom = activity_profile == SHARED_CUDA_HEADROOM_ACTIVITY
         inventory_reader = (lambda out, label, deadline: veda_cuda_guard.inventory(
-            out, label, deadline, selected_uuid=uuid)) if shared_headroom else veda_cuda_guard.inventory
+            out, label, min(deadline, started + policy.deadline_seconds), selected_uuid=uuid)) if shared_headroom else veda_cuda_guard.inventory
         devices, processes = (inventory_reader(output, 'model-proof-claimed-device', started + policy.deadline_seconds)
                               if shared_headroom else veda_cuda_guard.inventory(output, 'model-proof-claimed-device'))
         matched = [device for device in devices if device['uuid'] == uuid]
@@ -437,6 +499,8 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
             record['activity_policy'] = ('non-isolated correctness; exact-card identity and policy cap plus reserve free; '
                                          'background utilization and contexts are diagnostic only')
             record['isolated_benchmark_claim'] = False
+            record['lease_released'] = False
+            record['release_policy'] = 'verified-owned-Job-exit; exact selected primary metadata; headroom/activity diagnostic only'
         elif activity_profile == IRIS_CUDA_CORRECTNESS_ACTIVITY:
             record['activity_policy'] = ('non-isolated correctness, stable selected-card G/C+G contexts when utilization '
                                          'is nonzero; C also permitted at zero; below '
@@ -450,6 +514,8 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
         # Reuse five fresh samples, with this proof's actual free reserve and child cap.
         context_baseline = {'uuid': uuid, 'reserved_baseline_mib': matched[0]['used_mib'],
                             'process_identities': proof_cuda_contexts(uuid, processes, activity_profile=activity_profile)}
+        if shared_headroom:
+            context_baseline['admitted_total_mib'] = matched[0]['total_mib']
         identity_key = lambda selected_uuid, rows: proof_cuda_contexts(
             selected_uuid, rows, activity_profile=activity_profile)
         settle_deadline = min(started + policy.deadline_seconds, time.monotonic() + 30)
@@ -482,9 +548,13 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
             yield record
         finally:
             try:
+                if shared_headroom and not shared_owned_completion(record):
+                    raise RuntimeError('supervisor-owned Windows Job completion is unverified; no release seal')
+                release_check = (lambda device, rows: proof_cuda_shared_release(
+                    device, uuid, matched[0]['index'], baseline['admitted_total_mib'])) if shared_headroom else idle_check
                 settled_cuda_samples(
                     lambda: veda_cuda_guard.verify_idle(
-                        selected, output, 'model-proof-release', baseline, idle_check=idle_check,
+                        selected, output, 'model-proof-release', baseline, idle_check=release_check,
                         identity_key=identity_key, permit_bounded_growth=True,
                         require_stable_contexts=not shared_headroom, inventory_reader=inventory_reader),
                     output, 'model-proof-release', uuid, matched[0]['index'], policy, baseline,
@@ -501,9 +571,25 @@ def execution_claim(backend: str, policy, output: Path, env: dict[str, str], *, 
             if shared_headroom:
                 record['release_background_activity'] = cuda_release_diagnostic(
                     output, uuid, matched[0]['index'], policy, baseline, activity_profile=activity_profile)
-            record['post_execution_verified'] = True
+            if shared_headroom:
+                shared_release_verified = True
+            else:
+                record['post_execution_verified'] = True
     finally:
-        if claimed:
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        handle.close()
+        shared_record = record is not None and record.get('activity_profile') == SHARED_CUDA_HEADROOM_ACTIVITY
+        if not shared_record:
+            # Preserve the original release behavior for all other profiles.
+            if claimed:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            handle.close()
+        else:
+            try:
+                if claimed:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    record['lease_released'] = True
+            finally:
+                handle.close()
+            if shared_release_verified:
+                record['post_execution_verified'] = True
