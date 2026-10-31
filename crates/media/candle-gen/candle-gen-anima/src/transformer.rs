@@ -67,6 +67,14 @@ struct PreparedRopeRequest {
 }
 
 impl PreparedRopeRequest {
+    /// The dataset cache can retain F32 latents while the DiT consumes BF16 noisy
+    /// latents. Bind preparation to that consuming representation without making
+    /// a temporary converted tensor (or retaining any step's autograd graph).
+    fn with_compute_dtype(mut self, dtype: DType) -> Self {
+        self.latent.dtype = dtype;
+        self
+    }
+
     fn new(
         model_load_id: u64,
         latents: &Tensor,
@@ -509,11 +517,12 @@ impl CosmosDiT {
         })
     }
 
-    pub(crate) fn training_geometry_bytes(&self, latents: &[&Tensor]) -> Result<u64> {
+    pub(crate) fn training_geometry_bytes(&self, latents: &[&Tensor], dtype: DType) -> Result<u64> {
         let mut requests = Vec::new();
         let mut bytes = 0;
         for latent in latents {
-            let request = PreparedRopeRequest::new(self.load_id, latent, self.cfg.patch_size)?;
+            let request = PreparedRopeRequest::new(self.load_id, latent, self.cfg.patch_size)?
+                .with_compute_dtype(dtype);
             if !requests.contains(&request) {
                 let (t, h, w) = request.patch_geometry;
                 bytes += (t * h * w * self.cfg.attention_head_dim * 8) as u64;
@@ -525,16 +534,17 @@ impl CosmosDiT {
 
     /// Job-owned preparation after residual installation. Only invariant geometry is cached;
     /// the bundled trainable conditioner is evaluated on every micro-step.
-    pub(crate) fn prepare_training(&mut self, latents: &[&Tensor]) -> Result<()> {
+    pub(crate) fn prepare_training(&mut self, latents: &[&Tensor], dtype: DType) -> Result<()> {
         for block in &mut self.blocks {
             block.attn1.prepare_training(false)?;
             block.attn2.prepare_training(true)?;
         }
         self.training_rope.clear();
         for latent in latents {
-            let request = PreparedRopeRequest::new(self.load_id, latent, self.cfg.patch_size)?;
+            let request = PreparedRopeRequest::new(self.load_id, latent, self.cfg.patch_size)?
+                .with_compute_dtype(dtype);
             if !self.training_rope.iter().any(|p| p.request == request) {
-                self.training_rope.push(self.prepare_rope(latent)?);
+                self.training_rope.push(self.prepare_rope_request(request)?);
             }
         }
         Ok(())
@@ -616,21 +626,40 @@ impl CosmosDiT {
         encoder: &Tensor,
         dtype: DType,
     ) -> Result<Tensor> {
-        if let Some(prepared) = self.training_rope.iter().find(|p| {
-            p.request
-                .validate(self.load_id, latents, self.cfg.patch_size)
-                .is_ok()
-        }) {
+        if let Some(prepared) = self.training_rope_for(latents) {
             candle_gen::train::profile::cohort_reuse("anima:geometry-storage-hit");
             return self.forward_prepared(latents, sigma, encoder, dtype, prepared);
         }
+        self.forward_unprepared(latents, sigma, encoder, dtype)
+    }
+
+    /// Original per-forward construction, also the bounded proof's numerical reference.
+    pub(crate) fn forward_unprepared(
+        &self,
+        latents: &Tensor,
+        sigma: &Tensor,
+        encoder: &Tensor,
+        dtype: DType,
+    ) -> Result<Tensor> {
         let prepared = self.prepare_rope(latents)?;
         self.forward_prepared(latents, sigma, encoder, dtype, &prepared)
+    }
+
+    pub(crate) fn training_rope_for(&self, latents: &Tensor) -> Option<&PreparedRope> {
+        self.training_rope.iter().find(|p| {
+            p.request
+                .validate(self.load_id, latents, self.cfg.patch_size)
+                .is_ok()
+        })
     }
 
     /// Prepare the geometry-derived tables once before entering a denoise loop.
     pub(crate) fn prepare_rope(&self, latents: &Tensor) -> Result<PreparedRope> {
         let request = PreparedRopeRequest::new(self.load_id, latents, self.cfg.patch_size)?;
+        self.prepare_rope_request(request)
+    }
+
+    fn prepare_rope_request(&self, request: PreparedRopeRequest) -> Result<PreparedRope> {
         let (pe_t, pe_h, pe_w) = request.patch_geometry;
         Ok(PreparedRope {
             rope: cosmos_image_rope(&self.cfg, pe_t, pe_h, pe_w, &self.device)?,
@@ -701,6 +730,33 @@ mod tests {
     use candle_gen::quant::MLX_GROUP_SIZE;
     use candle_gen::testkit::tensor_cosine;
     use std::collections::HashMap;
+
+    #[test]
+    fn training_rope_identity_binds_compute_dtype_without_changing_other_scopes() {
+        // Metadata only: dataset storage is F32, while every noisy DiT input is BF16.
+        let stored = PreparedRopeRequest {
+            model_load_id: 31,
+            latent: TensorSpec {
+                shape: vec![1, 16, 1, 8, 8],
+                dtype: DType::F32,
+                device: DeviceLocation::Cuda { gpu_id: 1 },
+            },
+            patch_geometry: (1, 4, 4),
+        };
+        let prepared = stored.clone().with_compute_dtype(DType::BF16);
+        assert_ne!(prepared, stored, "F32 storage cannot key a BF16 forward");
+        assert_eq!(prepared.latent.dtype, DType::BF16);
+        assert_eq!(prepared.model_load_id, stored.model_load_id);
+        assert_eq!(prepared.latent.shape, stored.latent.shape);
+        assert_eq!(prepared.latent.device, stored.latent.device);
+        assert_eq!(prepared.patch_geometry, stored.patch_geometry);
+        assert_eq!(
+            prepared.clone().with_compute_dtype(DType::BF16),
+            prepared,
+            "repeat preparation keeps the same strict request identity"
+        );
+        assert_ne!(prepared.clone().with_compute_dtype(DType::F16), prepared);
+    }
 
     #[test]
     fn prepared_rope_request_reuses_once_and_rejects_stale_identity() -> Result<()> {
