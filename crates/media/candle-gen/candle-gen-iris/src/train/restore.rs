@@ -121,6 +121,34 @@ fn pinned_networks(res: &RestoreTrainResources) -> NetsProvider {
     );
     Box::new(move |compute, device| {
         let trunk_cfg = ConvNextConfig::xxlarge();
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            use contract::{CRITIC_TRUNK_RESOURCE, LPIPS_LIN_RESOURCE, VGG16_RESOURCE};
+            let frozen_start = std::time::Instant::now();
+            let names = trunk_cfg
+                .tensor_shapes()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<std::collections::BTreeSet<_>>();
+            let trunk_map =
+                super::frozen_cache::load("convnext", &trunk, &CRITIC_TRUNK_RESOURCE, &|name| {
+                    names.contains(name)
+                })?;
+            let vgg_map = super::frozen_cache::load("vgg", &vgg, &VGG16_RESOURCE, &|name| {
+                name.starts_with("features.")
+            })?;
+            let lin_map = super::frozen_cache::load("lpips", &lin, &LPIPS_LIN_RESOURCE, &|_| true)?;
+            let native_start = std::time::Instant::now();
+            let frozen = FrozenNets {
+                trunk: ConvNextTrunk::from_map(&trunk_map, &trunk_cfg, compute, device)?,
+                lpips: Lpips::from_maps(&vgg_map, &lin_map, contract::VGG16_WIDTHS, device)?,
+                trunk_cfg,
+                head_width: CRITIC_HEAD_WIDTH,
+            };
+            eprintln!("IRIS_COMPARISON_FROZEN_NATIVE_CONSTRUCTOR native_cast_transfer_seconds={} frozen_bootstrap_including_hash_decode_read_seconds={}",
+                native_start.elapsed().as_secs_f64(), frozen_start.elapsed().as_secs_f64());
+            return Ok(frozen);
+        }
         Ok(FrozenNets {
             trunk: ConvNextTrunk::load(&trunk, &trunk_cfg, compute, device)?,
             lpips: Lpips::load(&vgg, &lin, device)?,

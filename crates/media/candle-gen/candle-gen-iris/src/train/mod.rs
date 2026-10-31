@@ -29,6 +29,8 @@
 pub mod critic;
 pub mod depth;
 pub mod dist;
+#[cfg(feature = "model-inference-proof")]
+mod frozen_cache;
 pub mod lpips;
 pub mod model;
 pub mod optim;
