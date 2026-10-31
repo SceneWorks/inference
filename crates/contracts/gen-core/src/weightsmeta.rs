@@ -284,8 +284,15 @@ pub fn read_safetensors_header(
 /// safetensors file is allowed to carry none.
 pub fn safetensors_file_metadata(path: impl AsRef<Path>) -> Result<BTreeMap<String, String>> {
     let path = path.as_ref();
-    let mut file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
+    let source = load_progress::reader::SourceProgress::new_with_phase(
+        path,
+        Some(file_len),
+        load_progress::LoadActivityPhase::Checking,
+    );
+    let mut file = source.reader(file)?;
+    file.begin();
     let (header, _data_start) = read_safetensors_header(&mut file, file_len, path)?;
     crate::__model_input_result!(
         safetensors_metadata_from_json(path, &header),
@@ -339,6 +346,28 @@ pub fn safetensors_metadata_from_json(
         out.insert(key.clone(), text.to_string());
     }
     Ok(out)
+}
+
+/// Read and SHA-256 hash the same owned source buffer without reopening its path.
+/// File reads report Loading; only the actual incremental hash reports Verifying.
+pub fn read_hashed_file(path: impl AsRef<Path>) -> Result<(Vec<u8>, [u8; 32])> {
+    use sha2::{Digest, Sha256};
+    let path = path.as_ref();
+    let bytes = load_progress::reader::read(path)?;
+    let mut hash = Sha256::new();
+    let source = load_progress::reader::SourceProgress::new_with_phase(
+        path,
+        Some(bytes.len() as u64),
+        load_progress::LoadActivityPhase::Verifying,
+    );
+    let operation = source.operation();
+    let mut offset = 0u64;
+    for chunk in bytes.chunks(1024 * 1024) {
+        hash.update(chunk);
+        operation.record(offset, chunk.len() as u64);
+        offset += chunk.len() as u64;
+    }
+    Ok((bytes, hash.finalize().into()))
 }
 
 // =================================================================================================
@@ -429,7 +458,17 @@ impl CheckpointMeta {
         // for lazy random-access tensor reads. This is intended for adapter-sized checkpoints; calling
         // `from_dir` on a multi-GB *base-model* dir would hold every file resident (host RAM). An mmap
         // backing (page on demand) is the efficiency follow-up if base-model use is ever needed (F-038).
-        self.add_buffer(std::fs::read(path)?, path)
+        let file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        let source = load_progress::reader::SourceProgress::new(path, Some(size));
+        let mut reader = source.reader(file)?;
+        reader.begin();
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(size)
+                .map_err(|_| Error::Msg("checkpoint exceeds address space".into()))?,
+        );
+        reader.read_to_end(&mut bytes)?;
+        self.add_buffer(bytes, path)
     }
 
     fn add_buffer(&mut self, buf: Vec<u8>, path: &Path) -> Result<()> {
@@ -668,8 +707,15 @@ fn file_tensor_locations_impl(
     path: &Path,
     observer: Option<&mut SourceMetadataObserver<'_>>,
 ) -> Result<SafetensorsFileLayout> {
-    let mut file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
+    let source = load_progress::reader::SourceProgress::new_with_phase(
+        path,
+        Some(file_len),
+        load_progress::LoadActivityPhase::Checking,
+    );
+    let mut file = source.reader(file)?;
+    file.begin();
     reader_tensor_locations_impl(&mut file, file_len, path, observer)
 }
 
@@ -883,7 +929,10 @@ pub fn read_safetensors_tensor_payloads(
 
     let path = path.as_ref();
     let layout = safetensors_file_tensor_locations(path)?;
-    let mut file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
+    let source = load_progress::reader::SourceProgress::new(path, Some(file.metadata()?.len()));
+    let mut file = source.reader(file)?;
+    file.begin();
     let mut payloads = BTreeMap::new();
     for location in layout.tensors {
         if !select(&location.header) {
@@ -1739,6 +1788,51 @@ mod tests {
         bytes.extend_from_slice(header.as_bytes());
         bytes.extend_from_slice(&0_f32.to_le_bytes());
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn owned_source_hash_reports_loading_then_actual_verification() {
+        use sha2::{Digest, Sha256};
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("model.safetensors");
+        let bytes = vec![47; 2 * 1024 * 1024 + 11];
+        std::fs::write(&file, &bytes).unwrap();
+        let expected: [u8; 32] = Sha256::digest(&bytes).into();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let _observer =
+            crate::LoadActivityObserver::new(move |event| output.lock().unwrap().push(event));
+        let (read, digest) = read_hashed_file(&file).unwrap();
+        assert_eq!(read, bytes);
+        assert_eq!(digest, expected);
+        let events = events.lock().unwrap();
+        for phase in [
+            crate::LoadActivityPhase::Loading,
+            crate::LoadActivityPhase::Verifying,
+        ] {
+            assert_eq!(
+                events
+                    .iter()
+                    .flatten()
+                    .filter(|event| event.phase == phase)
+                    .map(|event| event.bytes_read)
+                    .max(),
+                Some(bytes.len() as u64)
+            );
+        }
+        let reports: Vec<_> = events.iter().flatten().collect();
+        let verifying = reports
+            .iter()
+            .position(|event| event.phase == crate::LoadActivityPhase::Verifying)
+            .unwrap();
+        assert!(reports[..verifying]
+            .iter()
+            .all(|event| event.phase == crate::LoadActivityPhase::Loading));
+        assert!(reports[verifying..]
+            .iter()
+            .all(|event| event.phase == crate::LoadActivityPhase::Verifying));
+        assert_eq!(events.last(), Some(&None));
     }
 
     #[test]

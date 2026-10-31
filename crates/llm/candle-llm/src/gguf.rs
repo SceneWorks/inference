@@ -80,7 +80,7 @@ impl GgufCheckpoint {
         let path = path.as_ref();
         let mut file = std::fs::File::open(path)
             .map_err(|e| Error::Msg(format!("gguf: open {}: {e}", path.display())))?;
-        let content = Content::read(&mut file)
+        let content = Content::read_with_path(&mut file, path)
             .map_err(|e| Error::Msg(format!("gguf: parse {}: {e}", path.display())))?;
         let meta = &content.metadata;
 
@@ -284,8 +284,9 @@ pub fn is_gguf_path(source: &str) -> bool {
 /// provider's `can_load` uses it to confirm a `.gguf`'s architecture before claiming the file,
 /// mirroring the safetensors path's `config.json` probe (story 7420).
 pub fn gguf_architecture(path: impl AsRef<Path>) -> Option<String> {
+    let path = path.as_ref();
     let mut file = std::fs::File::open(path).ok()?;
-    let content = Content::read(&mut file).ok()?;
+    let content = Content::read_with_path(&mut file, path).ok()?;
     meta_str(&content.metadata, "general.architecture").map(str::to_string)
 }
 

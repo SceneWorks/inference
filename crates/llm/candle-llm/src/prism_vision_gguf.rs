@@ -28,7 +28,7 @@ impl PrismVisionGguf {
         let Ok(mut file) = File::open(path) else {
             return false;
         };
-        let Ok(content) = Content::read(&mut file) else {
+        let Ok(content) = Content::read_with_path(&mut file, path) else {
             return false;
         };
         meta_str(&content, "general.architecture").ok() == Some("clip")
@@ -39,7 +39,7 @@ impl PrismVisionGguf {
 
     pub fn open(path: &Path, device: &Device, language_hidden_size: usize) -> Result<Self> {
         let mut file = File::open(path)?;
-        let content = Content::read(&mut file)?;
+        let content = Content::read_with_path(&mut file, path)?;
         let cfg = validate_metadata(&content, language_hidden_size)?;
         let expected = expected_tensors(&cfg);
         let actual = content

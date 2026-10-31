@@ -324,6 +324,11 @@ pub enum Progress {
     /// Resident owners may remain cached. This Rust callback event is not a wire message,
     /// denoising step, or terminal generation result; consumers not pricing phases may ignore it.
     PromptUpsamplingComplete,
+    /// The preceding `Loading(EncodingPrompt)` stage yielded control back to its caller.
+    /// This logical boundary does not force lazy device work or imply synchronization, successful
+    /// full conditioning, or a denoising step. Further reference conditioning may follow.
+    /// Supplied/reused conditioning that skips the encoding stage emits neither boundary.
+    PromptEncodingComplete,
     /// Optional exact phase boundary: all text and reference conditioning has been materialized
     /// and its device work successfully synchronized, before the first denoiser forward. Emitted
     /// once per request by adopting providers, on resident and staged paths. This is not a step,
@@ -333,11 +338,9 @@ pub enum Progress {
     Step { current: u32, total: u32 },
     /// VAE decode underway (post-denoise).
     Decoding,
-    /// A heavy model component is (re)loading (epic 10765, sc-11126). Emitted only under
-    /// [`OffloadPolicy::Sequential`], where the residency seam load→use→drops each component *inside*
-    /// `generate` — a multi-second, multi-GB step during which no `Step`/`Decoding` event fires, so
-    /// without this the UI would freeze silently while a component streams from disk (F-179). The
-    /// [`Resident`](OffloadPolicy::Resident) path loads everything before `generate` and never emits it.
+    /// A component load or prompt-encoding phase is starting. Component phases describe actual
+    /// construction; `EncodingPrompt` is computation and is paired with `PromptEncodingComplete`
+    /// even when a request reuses resident model components.
     Loading(LoadPhase),
     /// The optional prompt-upsampling stage is decoding (sc-26238): `tokens` content tokens of
     /// at most `max_tokens` generated so far, emitted once at `0` when the stage starts and once
@@ -352,9 +355,69 @@ pub enum Progress {
 /// heavy render bundle (transformer/U-Net + VAE + any control/PiD overlay).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadPhase {
+    /// Prompt/reference encoding is executing; emitted by the shared residency driver after I/O.
+    EncodingPrompt,
     /// The phase-A prompt encoder (text or vision-language), loaded first and dropped before the
     /// render bundle materializes.
     TextEncoder,
     /// The heavy render bundle — the transformer/U-Net, the VAE, and any control/PiD overlay.
     Renderer,
+}
+
+/// Bracket a logical prompt-encoding call without evaluating, synchronizing, or altering its result.
+/// The closing event also clears the stage when the encoder returns an error or cancellation.
+pub fn with_prompt_encoding<T, E>(
+    on_progress: &mut dyn FnMut(Progress),
+    encode: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    on_progress(Progress::Loading(LoadPhase::EncodingPrompt));
+    let result = encode();
+    on_progress(Progress::PromptEncodingComplete);
+    result
+}
+
+#[cfg(test)]
+mod prompt_progress_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn logical_encoding_closes_on_success_error_and_cancellation_without_extra_work() {
+        for outcome in [
+            Ok(7),
+            Err(crate::Error::Canceled),
+            Err(crate::Error::Msg("encode".into())),
+        ] {
+            let active = Cell::new(false);
+            let calls = Cell::new(0);
+            let ends = Cell::new(0);
+            let result = with_prompt_encoding(
+                &mut |event| match event {
+                    Progress::Loading(LoadPhase::EncodingPrompt) => assert!(!active.replace(true)),
+                    Progress::PromptEncodingComplete => {
+                        assert!(active.replace(false));
+                        ends.set(ends.get() + 1);
+                    }
+                    _ => panic!("unexpected encoding event: {event:?}"),
+                },
+                || {
+                    assert!(
+                        active.get(),
+                        "the callback executes within the encoding stage"
+                    );
+                    calls.set(calls.get() + 1);
+                    outcome
+                },
+            );
+            assert!(!active.get());
+            assert_eq!(calls.get(), 1);
+            assert_eq!(ends.get(), 1);
+            match result {
+                Ok(value) => assert_eq!(value, 7),
+                Err(crate::Error::Canceled) => {}
+                Err(crate::Error::Msg(message)) => assert_eq!(message, "encode"),
+                other => panic!("result changed: {other:?}"),
+            }
+        }
+    }
 }

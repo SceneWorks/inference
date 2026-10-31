@@ -988,8 +988,14 @@ impl Bernini {
         // --- Stage 2: UMT5 text encode + concat_with_zero_init for the 4 renderer streams ---
         // UMT5 encoder + tokenizer are cached components (F-097), not reloaded per generate.
         let (t5_pos, t5_neg) = {
-            let pos = umt5_encode(&comps.te, &comps.tok, &req.prompt, dev)?;
-            let neg = umt5_encode(&comps.te, &comps.tok, &neg, dev)?;
+            let (pos, neg) = candle_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, candle_gen::CandleError> {
+                    let pos = umt5_encode(&comps.te, &comps.tok, &req.prompt, dev)?;
+                    let neg = umt5_encode(&comps.te, &comps.tok, &neg, dev)?;
+                    Ok((pos, neg))
+                },
+            )?;
             (pos, neg)
         };
         let pe_wtxt_wvit = concat_with_zero_init(&t5_pos, &s_wtxt_wvit, max_seq)?;

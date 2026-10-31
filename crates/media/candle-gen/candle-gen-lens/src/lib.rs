@@ -667,16 +667,21 @@ impl Pipeline {
         let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
         let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
 
-        let (features, mask) = self.encode_prompt(
-            &comps.text,
-            &req.prompt,
-            negative,
-            DEFAULT_DATE,
-            guided,
-            None,
-            &req.cancel,
+        let (features, mask) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let (features, mask) = self.encode_prompt(
+                    &comps.text,
+                    &req.prompt,
+                    negative,
+                    DEFAULT_DATE,
+                    guided,
+                    None,
+                    &req.cancel,
+                )?;
+                Ok((features, mask))
+            },
         )?;
-
         // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
         // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
         // else `None` → the native Flux2Vae decode. Shared across `count` images (same prompt).
@@ -773,14 +778,20 @@ impl Pipeline {
         } else {
             self.load_resident_text_components()?
         };
-        let (features, mask) = self.encode_prompt(
-            &text,
-            &req.prompt,
-            negative,
-            DEFAULT_DATE,
-            guided,
-            window,
-            &req.cancel,
+        let (features, mask) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let (features, mask) = self.encode_prompt(
+                    &text,
+                    &req.prompt,
+                    negative,
+                    DEFAULT_DATE,
+                    guided,
+                    window,
+                    &req.cancel,
+                )?;
+                Ok((features, mask))
+            },
         )?;
         drop(text);
         self.device.synchronize()?;

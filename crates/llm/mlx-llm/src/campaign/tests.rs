@@ -6666,7 +6666,14 @@ fn repository_and_pmetal_lock_identities_are_exact() {
             .map(|identity| identity != INFERENCE_REPOSITORY)
             .unwrap_or(true));
     }
-    let identity = locked_mlx_identity(include_bytes!("../../../../../Cargo.lock")).unwrap();
+    // Parse a controlled lock entry so an ordinary dependency update does not
+    // turn this parser regression into a repository-pin currency requirement.
+    let lock = br#"[[package]]
+name = "pmetal-mlx-rs"
+version = "0.25.8"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=355e2ae4e81c13032233a4244e956bc3547f49e4#355e2ae4e81c13032233a4244e956bc3547f49e4"
+"#;
+    let identity = locked_mlx_identity(lock).unwrap();
     assert_eq!(identity.version, "0.25.8");
     assert_eq!(
         identity.revision,

@@ -82,6 +82,7 @@ impl TextLlm for LlamaProvider {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
     ) -> CoreResult<TextLlmOutput> {
+        let _progress = req.install_progress();
         // Request start: a request that fails or is cancelled (anywhere below, before the record
         // is written on success) must not leave the previous request's record readable.
         *self
@@ -312,11 +313,13 @@ impl TextLlm for LlamaProvider {
         // Encode + splice the visuals and compute M-RoPE positions (the placeholder-expanded prompt
         // becomes the effective sequence). `None` on the text-only path.
         let mm = if multimodal && !gemma4_mm_request {
+            core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
             Some(self.prepare_multimodal(&prompt_ids, &req.messages)?)
         } else {
             None
         };
         let g4 = if gemma4_mm_request {
+            core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
             Some(self.prepare_gemma4(&prompt_ids, &req.messages)?)
         } else {
             None

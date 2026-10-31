@@ -565,18 +565,23 @@ impl KolorsControl {
 
         // CFG batch is [neg, pos] = uncond-first (the Kolors txt2img convention); without guidance only
         // the positive branch is built. Shared CFG-concat (sc-9001); the ChatGLM3 encode stays local.
-        let (context, pooled, batch) = common::cfg_batch_context(
-            &req.prompt,
-            &req.negative,
-            use_guide,
-            // sc-18317: this provider is driven directly by the worker through its own
-            // `KolorsControlRequest`, which carries no `GenerationMemory` and therefore no execution
-            // selection — so the mode is this lane's fixed convention, stated rather than
-            // implied. `cfg_batch_context` still refuses anything else.
-            candle_gen::gen_core::CfgBatching::Batched,
-            |p| Self::encode_with(&resident.conditioning, p),
+        let (context, pooled, batch) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let (context, pooled, batch) = common::cfg_batch_context(
+                    &req.prompt,
+                    &req.negative,
+                    use_guide,
+                    // sc-18317: this provider is driven directly by the worker through its own
+                    // `KolorsControlRequest`, which carries no `GenerationMemory` and therefore no execution
+                    // selection — so the mode is this lane's fixed convention, stated rather than
+                    // implied. `cfg_batch_context` still refuses anything else.
+                    candle_gen::gen_core::CfgBatching::Batched,
+                    |p| Self::encode_with(&resident.conditioning, p),
+                )?;
+                Ok((context, pooled, batch))
+            },
         )?;
-
         // Two SEPARATE ChatGLM3 → cross-attention projections: the UNet's `encoder_hid_proj` feeds the
         // base cross-attentions; the ControlNet's own (separately-trained) `encoder_hid_proj` feeds the
         // control branch's. Both project the raw 4096-wide context to 2048 up front. (This dual
@@ -736,12 +741,18 @@ impl KolorsControl {
             },
             self.device.clone(),
         );
-        let (context, pooled, batch) = common::cfg_batch_context(
-            &req.prompt,
-            &req.negative,
-            use_guide,
-            candle_gen::gen_core::CfgBatching::Batched,
-            |prompt| Self::encode_with(&conditioning, prompt),
+        let (context, pooled, batch) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let (context, pooled, batch) = common::cfg_batch_context(
+                    &req.prompt,
+                    &req.negative,
+                    use_guide,
+                    candle_gen::gen_core::CfgBatching::Batched,
+                    |prompt| Self::encode_with(&conditioning, prompt),
+                )?;
+                Ok((context, pooled, batch))
+            },
         )?;
         let time_ids = common::build_time_ids(&self.device, batch, req.height, req.width)?;
         conditioning.release()?;

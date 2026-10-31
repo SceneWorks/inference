@@ -1,0 +1,9 @@
+[package]
+name = "sceneworks-load-progress"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Tensor-neutral request-local progress from shared model file readers"
+
+[lib]
+name = "load_progress"

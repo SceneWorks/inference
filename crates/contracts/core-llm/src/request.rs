@@ -510,6 +510,9 @@ pub struct TextLlmRequest {
     pub stop: Vec<String>,
     /// Cooperative cancellation handle.
     pub cancel: CancelFlag,
+    /// Optional request-scoped observations from actual tokenization and prefill/decode seams.
+    /// Callbacks must enqueue/coalesce; `None` clears activity at completion or failure.
+    pub progress: Option<crate::GenerationProgressObserver>,
     /// Opt-in for the compressed KV cache (sc-20679). [`KvCompressionPolicy::Off`] (the default)
     /// keeps every generation dense; [`KvCompressionPolicy::Qualified`] runs compressed only where
     /// [`crate::KV_COMPRESSION_QUALIFICATIONS`] admits the request. Either way a reporting provider

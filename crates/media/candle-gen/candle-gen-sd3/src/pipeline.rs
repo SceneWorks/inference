@@ -585,8 +585,13 @@ impl Pipeline {
 
         // Conditioning is seed- and image-independent: encode once for the whole batch. `cfg_scale`
         // gates the uncond encode — at 1.0 the CFG blend collapses to cond, so it's skipped (sc-8993).
-        let (cond, uncond) = self.conditioning(&components.encoders, req, cfg_scale)?;
-
+        let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let (cond, uncond) = self.conditioning(&components.encoders, req, cfg_scale)?;
+                Ok((cond, uncond))
+            },
+        )?;
         // Per-step latent preview (epic 16948, sc-16958). Opting in is the sc-16949 projector hook and
         // nothing else: the driver owns frame numbering, the multi-eval dedup and the swallow-on-failure
         // contract, so neither this loop nor `render_core` changes shape. The hook is built once and
@@ -662,7 +667,13 @@ impl Pipeline {
             self.device.clone(),
             "triple text encoders",
         );
-        let (cond, uncond) = self.conditioning(&text, req, cfg_scale)?;
+        let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let (cond, uncond) = self.conditioning(&text, req, cfg_scale)?;
+                Ok((cond, uncond))
+            },
+        )?;
         text.release()?;
 
         let reference = resolve_reference(req)?;

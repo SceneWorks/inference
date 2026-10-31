@@ -545,6 +545,7 @@ fn veda_ab_render() {
             Progress::Decoding => decode_tick = Some(gen_started.elapsed()),
             Progress::Loading(_)
             | Progress::PromptUpsamplingComplete
+            | Progress::PromptEncodingComplete
             | Progress::ConditioningComplete
             | Progress::Upsampling { .. } => {}
         })

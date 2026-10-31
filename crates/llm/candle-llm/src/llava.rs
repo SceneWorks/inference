@@ -554,6 +554,7 @@ impl TextLlm for LlavaProvider {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
     ) -> CoreResult<TextLlmOutput> {
+        let _progress = req.install_progress();
         self.validate(req)?;
         if req.cancel.is_cancelled() {
             return Err(CoreError::Canceled);
@@ -569,6 +570,7 @@ impl TextLlm for LlavaProvider {
         )
         .len() as u32;
 
+        core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
         let features = self
             .model
             .image_features(&image.pixels, image.width as usize, image.height as usize)

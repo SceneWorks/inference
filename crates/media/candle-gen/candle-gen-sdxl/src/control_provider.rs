@@ -463,7 +463,9 @@ impl Generator for SdxlControlGenerator {
                 |_| self.load_conditioner(),
                 |conditioner, state| {
                     candle_gen::residency::check_cancel(&req.cancel)?;
-                    state.0 = Some(conditioner.encode(&req.prompt, negative, cfg_on)?);
+                    state.0 = Some(candle_gen::gen_core::with_prompt_encoding(state.2, || {
+                        conditioner.encode(&req.prompt, negative, cfg_on)
+                    })?);
                     Ok(())
                 },
                 |_| {
@@ -490,7 +492,10 @@ impl Generator for SdxlControlGenerator {
             let conditioner = candle_gen::cached(&self.conditioner, || self.load_conditioner())?;
             let components = self.components()?;
             let result = (|| -> Result<_> {
-                let (conditioning, pooled) = conditioner.encode(&req.prompt, negative, cfg_on)?;
+                let (conditioning, pooled) =
+                    candle_gen::gen_core::with_prompt_encoding(on_progress, || {
+                        conditioner.encode(&req.prompt, negative, cfg_on)
+                    })?;
                 let latents = self.denoise_images(
                     req,
                     &conditioning,

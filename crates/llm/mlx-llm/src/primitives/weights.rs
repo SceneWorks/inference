@@ -107,7 +107,7 @@ impl Weights {
     /// Load every tensor from a single `.safetensors` file.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let tensors = Array::load_safetensors(path)
+        let tensors = crate::load_progress::load(path)
             .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", path.display())))?;
         #[cfg(feature = "model-inference-proof")]
         crate::model_input_proof::record_reader_paths(
@@ -134,9 +134,10 @@ impl Weights {
         shards.sort();
         #[cfg(feature = "model-inference-proof")]
         let __input_paths = shards.clone(); // deterministic merge order
+        crate::load_progress::register_files(&shards);
         let mut tensors = HashMap::new();
         for shard in shards {
-            let part = Array::load_safetensors(&shard)
+            let part = crate::load_progress::load(&shard)
                 .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", shard.display())))?;
             tensors.extend(part);
         }

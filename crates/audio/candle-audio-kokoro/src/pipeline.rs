@@ -115,6 +115,20 @@ impl KokoroPipeline {
         stage: StageSink<'_>,
         cancel: crate::decoder::CancelProbe<'_>,
     ) -> Result<Vec<f32>> {
+        self.synthesize_with_prompt_progress(tokens, ref_s, speed, seed, stage, cancel, &mut |_| {})
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_with_prompt_progress(
+        &self,
+        tokens: &[u32],
+        ref_s: &[f32],
+        speed: f32,
+        seed: u64,
+        stage: StageSink<'_>,
+        cancel: crate::decoder::CancelProbe<'_>,
+        on_prompt_progress: &mut dyn FnMut(candle_audio::gen_core::Progress),
+    ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(AudioError::Msg(
                 "kokoro: no phonemes survived tokenization (unsupported script?)".into(),
@@ -142,10 +156,13 @@ impl KokoroPipeline {
         ids.push(0);
         let t = ids.len();
         let input_ids = Tensor::from_vec(ids, (1, t), &self.device)?;
-        let bert_dur = self.bert.forward(&input_ids)?; // [1, T, 768]
-        let d_en = __model_proof_output!(self.bert_encoder.forward(&bert_dur))? // [1, T, 512]
-            .transpose(1, 2)?
-            .contiguous()?; // [1, 512, T]
+        let d_en = candle_audio::gen_core::with_prompt_encoding(on_prompt_progress, || {
+            let bert_dur = self.bert.forward(&input_ids)?; // [1, T, 768]
+            let d_en = __model_proof_output!(self.bert_encoder.forward(&bert_dur))? // [1, T, 512]
+                .transpose(1, 2)?
+                .contiguous()?; // [1, 512, T]
+            Ok::<_, candle_audio::AudioError>(d_en)
+        })?;
         stage(1)?;
 
         // Stage 2: durations.
@@ -172,9 +189,12 @@ impl KokoroPipeline {
         stage(3)?;
 
         // Stage 4: text encoding + alignment.
-        let t_en = self.text_encoder.forward(&input_ids)?; // [1, 512, T]
-        let t_en_rows = t_en.i(0)?.t()?.to_vec2::<f32>()?; // [T][512]
-        let asr = gather_frames(&t_en_rows, &frame_token, &self.device)?; // [1, 512, F]
+        let asr = candle_audio::gen_core::with_prompt_encoding(on_prompt_progress, || {
+            let t_en = self.text_encoder.forward(&input_ids)?; // [1, 512, T]
+            let t_en_rows = t_en.i(0)?.t()?.to_vec2::<f32>()?; // [T][512]
+            let asr = gather_frames(&t_en_rows, &frame_token, &self.device)?; // [1, 512, F]
+            Ok::<_, candle_audio::AudioError>(asr)
+        })?;
         stage(4)?;
 
         // Stage 5: decoder + vocoder (cancellation probed inside — the dominant-cost stage).

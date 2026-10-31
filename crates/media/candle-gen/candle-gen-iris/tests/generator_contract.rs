@@ -99,6 +99,8 @@ fn progress_is_steps_then_one_decoding_and_output_is_rgb8() {
     assert_eq!(
         events,
         [
+            "Loading(EncodingPrompt)",
+            "PromptEncodingComplete",
             "Step { current: 1, total: 3 }",
             "Step { current: 2, total: 3 }",
             "Step { current: 3, total: 3 }",

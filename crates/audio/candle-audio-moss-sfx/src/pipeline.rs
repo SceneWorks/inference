@@ -109,10 +109,33 @@ fn crop_decoded_audio(mut samples: Vec<f32>, requested_samples: usize) -> Vec<f3
 /// progress sink is borrowed exactly once).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineProgress {
+    /// Text conditioning is about to be encoded.
+    EncodingPrompt,
+    /// The logical text-encoding call returned without forcing lazy device work.
+    PromptEncodingComplete,
     /// Solver step `k` of the run just completed (`k = 1..=steps`).
     Step(usize),
     /// The terminal VAE decode is about to run (fires exactly once).
     Decoding,
+}
+
+/// Adapt the universal prompt lifecycle to this pipeline's existing progress callback.
+pub(crate) fn with_prompt_encoding<T>(
+    progress: &mut dyn FnMut(PipelineProgress),
+    encode: impl FnOnce() -> candle_audio::Result<T>,
+) -> candle_audio::Result<T> {
+    candle_audio::gen_core::with_prompt_encoding(
+        &mut |event| match event {
+            candle_audio::gen_core::Progress::Loading(
+                candle_audio::gen_core::LoadPhase::EncodingPrompt,
+            ) => progress(PipelineProgress::EncodingPrompt),
+            candle_audio::gen_core::Progress::PromptEncodingComplete => {
+                progress(PipelineProgress::PromptEncodingComplete)
+            }
+            _ => unreachable!("prompt lifecycle helper emits only prompt boundaries"),
+        },
+        encode,
+    )
 }
 
 /// The loaded pipeline (all components resident, f32).
@@ -263,17 +286,20 @@ impl MossSfxPipeline {
 
         // Text conditioning: positive prompt carries the duration suffix; the negative prompt
         // is passed through as-is (reference behavior).
-        let positive = with_duration_suffix(prompt, seconds);
-        let ctx_pos = self.dit.embed_context(&self.encode_context(&positive)?)?;
-        let use_cfg = params.cfg_scale != 1.0;
-        let ctx_neg = if use_cfg {
-            Some(
-                self.dit
-                    .embed_context(&self.encode_context(&params.negative_prompt)?)?,
-            )
-        } else {
-            None
-        };
+        let (ctx_pos, ctx_neg) = with_prompt_encoding(on_progress, || {
+            let positive = with_duration_suffix(prompt, seconds);
+            let ctx_pos = self.dit.embed_context(&self.encode_context(&positive)?)?;
+            let use_cfg = params.cfg_scale != 1.0;
+            let ctx_neg = if use_cfg {
+                Some(
+                    self.dit
+                        .embed_context(&self.encode_context(&params.negative_prompt)?)?,
+                )
+            } else {
+                None
+            };
+            Ok((ctx_pos, ctx_neg))
+        })?;
 
         let schedule =
             FlowMatchSchedule::new(&self.config.scheduler, params.steps, params.sigma_shift);
@@ -443,5 +469,39 @@ mod tests {
         let cropped = crop_decoded_audio(decoded, 4 * 48_000);
         assert_eq!(cropped.len(), 4 * 48_000);
         assert_eq!(cropped.as_ptr(), allocation, "crop must truncate in place");
+    }
+}
+
+#[cfg(test)]
+mod prompt_progress_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_stage_yields_before_following_conditioning_on_success_and_cancel() {
+        use std::cell::RefCell;
+        for canceled in [false, true] {
+            let trace = RefCell::new(Vec::new());
+            let mut progress = |event| {
+                trace.borrow_mut().push(match event {
+                    PipelineProgress::EncodingPrompt => "encoding",
+                    PipelineProgress::PromptEncodingComplete => "yielded",
+                    _ => panic!("prompt stage must not emit generation steps"),
+                })
+            };
+            let result = with_prompt_encoding(&mut progress, || {
+                trace.borrow_mut().push("encoder-call");
+                if canceled {
+                    Err(candle_audio::AudioError::Canceled)
+                } else {
+                    Ok(())
+                }
+            });
+            trace.borrow_mut().push("next-conditioner");
+            assert_eq!(result.is_err(), canceled);
+            assert_eq!(
+                *trace.borrow(),
+                ["encoding", "encoder-call", "yielded", "next-conditioner"]
+            );
+        }
     }
 }

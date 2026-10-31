@@ -1279,6 +1279,7 @@ impl StableAudio3Pipeline {
                 None,
                 ReferenceInputValidation::Required,
                 hooks,
+                &mut |_| {},
             )?
             .0)
     }
@@ -1309,6 +1310,7 @@ impl StableAudio3Pipeline {
             None,
             ReferenceInputValidation::Required,
             hooks,
+            &mut |_| {},
         )
     }
 
@@ -1347,6 +1349,7 @@ impl StableAudio3Pipeline {
             conditioning,
             ReferenceInputValidation::Required,
             hooks,
+            &mut |_| {},
         )
     }
 
@@ -1357,12 +1360,14 @@ impl StableAudio3Pipeline {
         request: SynthesisRequest<'_>,
         conditioning: ValidatedForwardedConditioning<'_>,
         hooks: SynthesisHooks<'_>,
+        on_encoding: &mut dyn FnMut(candle_audio::gen_core::Progress),
     ) -> Result<Vec<f32>> {
         self.synthesize_conditioned_with_validation(
             request,
             conditioning.into_inner(),
             ReferenceInputValidation::Complete,
             hooks,
+            on_encoding,
         )
     }
 
@@ -1372,13 +1377,21 @@ impl StableAudio3Pipeline {
         conditioning: ForwardedConditioning<'_>,
         reference_validation: ReferenceInputValidation,
         hooks: SynthesisHooks<'_>,
+        on_encoding: &mut dyn FnMut(candle_audio::gen_core::Progress),
     ) -> Result<Vec<f32>> {
         conditioning.check()?;
         let ForwardedConditioning {
             reference, edit, ..
         } = conditioning;
         Ok(self
-            .synthesize_traced(request, reference, edit, reference_validation, hooks)?
+            .synthesize_traced(
+                request,
+                reference,
+                edit,
+                reference_validation,
+                hooks,
+                on_encoding,
+            )?
             .0)
     }
 
@@ -1397,6 +1410,7 @@ impl StableAudio3Pipeline {
             Some(edit),
             ReferenceInputValidation::Required,
             hooks,
+            &mut |_| {},
         )
     }
 
@@ -1412,6 +1426,7 @@ impl StableAudio3Pipeline {
         edit: Option<AudioEdit<'_>>,
         reference_validation: ReferenceInputValidation,
         mut hooks: SynthesisHooks<'_>,
+        on_encoding: &mut dyn FnMut(candle_audio::gen_core::Progress),
     ) -> Result<(Vec<f32>, Option<ReferenceDrawOrder>)> {
         let parameters = request.parameters;
         let is_canceled = hooks.is_canceled;
@@ -1527,6 +1542,7 @@ impl StableAudio3Pipeline {
             },
             &mut noise,
             &mut hooks,
+            on_encoding,
         )?;
         canceled(is_canceled)?;
         (hooks.on_decoding)();
@@ -1655,6 +1671,7 @@ impl StableAudio3Pipeline {
             },
             &mut noise,
             &mut hooks,
+            &mut |_| {},
         )?;
         if noise.draws() != parameters.steps {
             return Err(AudioError::Msg(format!(
@@ -1734,6 +1751,7 @@ impl StableAudio3Pipeline {
 
     /// `source.reference` is the request's reference itself rather than a pre-computed `strength`,
     /// on purpose — see `sampler_strength_for`.
+    #[allow(clippy::too_many_arguments)]
     fn sample<N: NoiseSource>(
         &self,
         request: &SynthesisRequest<'_>,
@@ -1742,6 +1760,7 @@ impl StableAudio3Pipeline {
         source: SampleSource<'_>,
         noise: &mut N,
         hooks: &mut SynthesisHooks<'_>,
+        on_encoding: &mut dyn FnMut(candle_audio::gen_core::Progress),
     ) -> Result<(Tensor, Tensor)> {
         let &SynthesisRequest {
             prompt,
@@ -1762,17 +1781,21 @@ impl StableAudio3Pipeline {
         // source is still encoded, strength becomes `1.0`, and the restyle silently degrades to
         // plain text-to-audio. This makes both halves fail closed instead.
         reference_halves_agree(init_latents.is_some(), reference.is_some())?;
-        let positive = self
-            .conditioner
-            .encode_with_cancel(&[prompt.to_owned()], is_canceled)?;
-        canceled(is_canceled)?;
-        let negative = negative_prompt
-            .map(|prompt| {
-                self.conditioner
-                    .encode_with_cancel(&[prompt.to_owned()], is_canceled)
-            })
-            .transpose()?;
-        canceled(is_canceled)?;
+        let (positive, negative) =
+            candle_audio::gen_core::with_prompt_encoding(on_encoding, || {
+                let positive = self
+                    .conditioner
+                    .encode_with_cancel(&[prompt.to_owned()], is_canceled)?;
+                canceled(is_canceled)?;
+                let negative = negative_prompt
+                    .map(|prompt| {
+                        self.conditioner
+                            .encode_with_cancel(&[prompt.to_owned()], is_canceled)
+                    })
+                    .transpose()?;
+                canceled(is_canceled)?;
+                Ok::<_, AudioError>((positive, negative))
+            })?;
 
         let seconds = Tensor::new(&[parameters.duration_secs], &self.device)?;
         if local.dims() != [1, 1 + LATENT_CHANNELS, geometry.latent_length] {

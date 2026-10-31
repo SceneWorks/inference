@@ -204,6 +204,7 @@ pub(super) fn render_once(recipe: &RenderRecipe<'_>) -> RenderReceipt {
             Progress::Decoding => decoding_at = Some(Instant::now()),
             Progress::Loading(_)
             | Progress::PromptUpsamplingComplete
+            | Progress::PromptEncodingComplete
             | Progress::ConditioningComplete
             | Progress::Upsampling { .. } => {}
         })

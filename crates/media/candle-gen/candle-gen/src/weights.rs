@@ -49,10 +49,12 @@ pub struct Weights {
 /// Decode a little-endian F32 plane into its `f32` values, for value-validating native scale and
 /// codebook operands directly off the mmap without materializing a `Tensor` copy.
 fn f32_le_planes(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]))
-        .collect()
+    cst::read_source_bytes(bytes, |bytes| {
+        bytes
+            .chunks_exact(4)
+            .map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+            .collect()
+    })
 }
 impl Weights {
     /// The device this weight set is resident on — every constructor loads all tensors onto one
@@ -339,8 +341,9 @@ impl Weights {
         for (key, (di, _, _)) in headers.iter().filter(|(k, _)| k.ends_with(".comfy_quant")) {
             let base = key.trim_end_matches(".comfy_quant");
             let payload = stores[*di].get(key)?;
-            let declared: serde_json::Value = serde_json::from_slice(payload.data())
-                .map_err(|e| CandleError::Msg(format!("{key}: {e}")))?;
+            let declared: serde_json::Value =
+                cst::read_tensor_bytes(&payload, |bytes| serde_json::from_slice(bytes))
+                    .map_err(|e| CandleError::Msg(format!("{key}: {e}")))?;
             let is_w4a8 = declared.get("format").and_then(serde_json::Value::as_str)
                 == Some("asym_w4a8_int8");
             if is_w4a8 {
@@ -382,12 +385,14 @@ impl Weights {
                         "{key}: contradictory affine / ConvRot / W4A8 operands"
                     )));
                 }
-                let descriptor =
-                    gen_core::w4a8_int8::W4A8Int8::parse(payload.data(), ws, srs, scs, cbs)
-                        .map_err(CandleError::Msg)?;
-                descriptor
-                    .validate_s_rel(stores[*sri].get(&s_rel)?.data())
-                    .map_err(CandleError::Msg)?;
+                let descriptor = cst::read_tensor_bytes(&payload, |data| {
+                    gen_core::w4a8_int8::W4A8Int8::parse(data, ws, srs, scs, cbs)
+                })
+                .map_err(CandleError::Msg)?;
+                cst::read_tensor_bytes(&stores[*sri].get(&s_rel)?, |bytes| {
+                    descriptor.validate_s_rel(bytes)
+                })
+                .map_err(CandleError::Msg)?;
                 descriptor
                     .validate_s_channel(&f32_le_planes(stores[*sci].get(&s_channel)?.data()))
                     .map_err(CandleError::Msg)?;
@@ -416,8 +421,10 @@ impl Weights {
                     "{key}: contradictory affine and ConvRot operands"
                 )));
             }
-            let descriptor = gen_core::convrot_int8::ConvRotInt8::parse(payload.data(), ws, ss)
-                .map_err(CandleError::Msg)?;
+            let descriptor = cst::read_tensor_bytes(&payload, |data| {
+                gen_core::convrot_int8::ConvRotInt8::parse(data, ws, ss)
+            })
+            .map_err(CandleError::Msg)?;
             let scales = stores[*si].get(&scale)?;
             descriptor
                 .validate_scale_values(f32_le_planes(scales.data()))

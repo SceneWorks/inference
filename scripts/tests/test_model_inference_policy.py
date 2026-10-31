@@ -88,11 +88,72 @@ fn lifetime<'a>(x: &'a str) -> &'a str { x }
 
 
 class WorkflowPolicy(unittest.TestCase):
+    def test_direct_backend_defaults_listing_and_compact_selector_bypasses_are_rejected(self):
+        for command in (
+            'cargo test --lib --tests',
+            'cargo test -p mlx-gen -- --list',
+            'cargo test -p candle-gen',
+            'cargo test -p core-llm --package=mlx-gen',
+            'cargo test -p core-llm -pmlx-gen',
+            'cargo test -p core-llm --manifest-path=other/Cargo.toml',
+            'cargo test -p core-llm --workspace',
+            'cargo test --doc -p runtime-ios --workspace',
+            'cargo test --doc -p runtime-ios --manifest-path=other/Cargo.toml',
+            'cargo run --bin MODEL -- --no-run',
+            'cargo test -p mlx-gen -- --no-run',
+            'cargo rustc -p mlx-gen --lib -- --test -o /tmp/model; /tmp/model --list',
+            'cargo rustc -p mlx-gen --lib -- --test -o /tmp/model; /tmp/model',
+        ):
+            with self.subTest(command=command):
+                workflow = {'on': {'pull_request': None}, 'jobs': {'test': {'steps': [{'run': command}]}}}
+                self.assertTrue(policy.workflow_errors(workflow, 'ci.yml'))
+
+    def test_backend_suite_exemption_accepts_only_exact_safe_source_table_and_mode(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / 'scripts/ci'
+            target.mkdir(parents=True)
+            for name in ('test_suites.py', 'safe_controls.json'):
+                (target / name).write_bytes((ROOT / 'scripts/ci' / name).read_bytes())
+            def findings(mode):
+                graph = policy.RunGraph(root)
+                graph.command(['python3', 'scripts/ci/test_suites.py', mode, '--', 'cargo', 'test', '--lib', '-p', 'mlx-gen'])
+                return [kind for kind, _ in graph.findings if kind != 'ordinary']
+            self.assertEqual(findings('audited-safe'), [])
+            for mode in ('routine', 'exhaustive'):
+                self.assertTrue(findings(mode))
+            for name in ('test_suites.py', 'safe_controls.json'):
+                original = (target / name).read_bytes()
+                (target / name).write_bytes(original + b'\n')
+                self.assertTrue(findings('audited-safe'))
+                (target / name).write_bytes(original)
+
+    def test_backend_compiler_artifacts_cannot_reuse_neutral_harness_provenance(self):
+        source = '''import json
+import subprocess
+result = subprocess.run(["cargo", "test", "-p", "PACKAGE", "--no-run", "--message-format=json"], capture_output=True, text=True)
+for line in result.stdout.splitlines():
+    message = json.loads(line)
+    if message.get("reason") == "compiler-artifact" and message.get("profile", {}).get("test") and message.get("executable"):
+        subprocess.run([message["executable"], "--list"])
+'''
+        graph = policy.RunGraph(ROOT)
+        graph.python(source.replace('PACKAGE', 'core-llm'), ('neutral-fixture',))
+        self.assertFalse([kind for kind, _ in graph.findings if kind != 'ordinary'])
+        graph.findings.clear()
+        graph.python(source.replace('PACKAGE', 'mlx-gen'), ('backend-fixture',))
+        self.assertTrue([kind for kind, _ in graph.findings if kind != 'ordinary'])
+        mixed = source.replace('PACKAGE', 'core-llm').replace('for line', 'subprocess.run(["cargo", "test", "-p", "mlx-gen", "--no-run", "--message-format=json"])\nfor line')
+        graph = policy.RunGraph(ROOT)
+        graph.python(mixed, ('mixed-fixture',))
+        self.assertTrue([kind for kind, _ in graph.findings if kind != 'ordinary'])
+
     def test_ordinary_ci_cannot_override_model_ignores(self):
         for flag in ('--ignored', '--include-ignored', '--run-ignored all'):
             workflow = {'on': {'pull_request': None}, 'jobs': {'test': {'steps': [{'run': 'cargo test -- ' + flag}]}}}
             self.assertTrue(policy.workflow_errors(workflow, 'ci.yml'))
-        ordinary = {'on': {'push': None, 'pull_request': None}, 'jobs': {'test': {'steps': [{'run': 'cargo test --locked --lib --tests'}]}}}
+        ordinary = {'on': {'push': None, 'pull_request': None}, 'jobs': {'test': {'steps': [{'run': 'cargo test --locked --lib --tests -p core-llm'}]}}}
         self.assertEqual(policy.workflow_errors(ordinary, 'ci.yml'), [])
 
     def test_model_workflow_is_manual_only_and_does_not_replace_pending_dispatches(self):
@@ -257,7 +318,7 @@ class WorkflowExecutionGraph(unittest.TestCase):
 
     def test_metadata_build_lint_listing_and_ordinary_tests_pass(self):
         for command in ('cargo metadata --no-deps', 'cargo build --all-targets', 'cargo clippy --all-targets',
-                        'cargo test --locked --lib', 'cargo test -- --list --ignored', 'cargo test --no-run -- --ignored'):
+                        'cargo test --locked --lib -p core-llm', 'cargo test --no-run -- --list --ignored', 'cargo test --no-run -- --ignored'):
             with self.subTest(command=command):
                 self.assertEqual(self.errors(self.workflow(command)), [])
         self.script('scripts/metadata.py', 'import subprocess\nsubprocess.run(["cargo", "metadata", "--no-deps"])\n')

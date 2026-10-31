@@ -98,8 +98,31 @@ pub const COVER_SFT_STEPS: usize = 24;
 /// Pipeline-level progress events, mapped by the provider onto `gen_core::Progress`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineProgress {
+    /// Text conditioning is about to be encoded.
+    EncodingPrompt,
+    /// The logical text-encoding call returned without forcing lazy device work.
+    PromptEncodingComplete,
     Step(usize),
     Decoding,
+}
+
+/// Adapt the universal prompt lifecycle to this pipeline's existing progress callback.
+pub(crate) fn with_prompt_encoding<T>(
+    progress: &mut dyn FnMut(PipelineProgress),
+    encode: impl FnOnce() -> candle_audio::Result<T>,
+) -> candle_audio::Result<T> {
+    candle_audio::gen_core::with_prompt_encoding(
+        &mut |event| match event {
+            candle_audio::gen_core::Progress::Loading(
+                candle_audio::gen_core::LoadPhase::EncodingPrompt,
+            ) => progress(PipelineProgress::EncodingPrompt),
+            candle_audio::gen_core::Progress::PromptEncodingComplete => {
+                progress(PipelineProgress::PromptEncodingComplete)
+            }
+            _ => unreachable!("prompt lifecycle helper emits only prompt boundaries"),
+        },
+        encode,
+    )
 }
 
 /// Which ACE-Step region-edit task a prompted edit drives (sc-12847). The gen-core
@@ -344,9 +367,12 @@ impl AceStepPipeline {
             return Err(AudioError::Canceled);
         }
 
-        let ctx_raw =
-            self.encode_context(prompt, &params.lyrics, &params.metadata, params.seconds)?;
-        let ctx = self.dit.embed_context(&ctx_raw)?;
+        let ctx = with_prompt_encoding(on_progress, || {
+            let ctx_raw =
+                self.encode_context(prompt, &params.lyrics, &params.metadata, params.seconds)?;
+            let ctx = self.dit.embed_context(&ctx_raw)?;
+            Ok(ctx)
+        })?;
 
         // Text-to-music context latents: [src_latents(silence) | chunk_mask(ones)].
         let src_latents = self
@@ -518,13 +544,16 @@ impl AceStepPipeline {
             Tensor::cat(&[&src_full, &mask], candle_audio::candle_core::D::Minus1)?;
 
         // 5. Condition context (prompt + lyrics + metadata) — identical to text-to-music.
-        let ctx_raw = self.encode_context(
-            prompt,
-            &params.base.lyrics,
-            &params.base.metadata,
-            params.base.seconds,
-        )?;
-        let ctx = self.dit.embed_context(&ctx_raw)?;
+        let ctx = with_prompt_encoding(on_progress, || {
+            let ctx_raw = self.encode_context(
+                prompt,
+                &params.base.lyrics,
+                &params.base.metadata,
+                params.base.seconds,
+            )?;
+            let ctx = self.dit.embed_context(&ctx_raw)?;
+            Ok(ctx)
+        })?;
 
         // 6. Denoise + decode (turbo DiT — Inpaint/Repaint/Extend keep the fast distilled path).
         let latents = self
@@ -645,9 +674,12 @@ impl AceStepPipeline {
         // 4. Condition context from the NEW prompt (special-token timbre, like text-to-music). The
         //    context is embedded by the sft cover DiT (its `condition_embedder` weights differ from
         //    turbo's), then consumed by that same DiT below.
-        let ctx_raw =
-            self.encode_context(prompt, &params.lyrics, &params.metadata, params.seconds)?;
-        let ctx = cover_dit.embed_context(&ctx_raw)?;
+        let ctx = with_prompt_encoding(on_progress, || {
+            let ctx_raw =
+                self.encode_context(prompt, &params.lyrics, &params.metadata, params.seconds)?;
+            let ctx = cover_dit.embed_context(&ctx_raw)?;
+            Ok(ctx)
+        })?;
 
         // 5. Denoise through the non-distilled sft cover DiT (guidance 1, multi-step — the reference's
         //    actual cover model, which preserves the source's melodic content the distilled 8-step
@@ -1119,6 +1151,40 @@ mod tests {
             } else {
                 assert_eq!((out[f * 2], out[f * 2 + 1]), (f as f32, f as f32));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod prompt_progress_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_stage_yields_before_following_conditioning_on_success_and_cancel() {
+        use std::cell::RefCell;
+        for canceled in [false, true] {
+            let trace = RefCell::new(Vec::new());
+            let mut progress = |event| {
+                trace.borrow_mut().push(match event {
+                    PipelineProgress::EncodingPrompt => "encoding",
+                    PipelineProgress::PromptEncodingComplete => "yielded",
+                    _ => panic!("prompt stage must not emit generation steps"),
+                })
+            };
+            let result = with_prompt_encoding(&mut progress, || {
+                trace.borrow_mut().push("encoder-call");
+                if canceled {
+                    Err(candle_audio::AudioError::Canceled)
+                } else {
+                    Ok(())
+                }
+            });
+            trace.borrow_mut().push("next-conditioner");
+            assert_eq!(result.is_err(), canceled);
+            assert_eq!(
+                *trace.borrow(),
+                ["encoding", "encoder-call", "yielded", "next-conditioner"]
+            );
         }
     }
 }

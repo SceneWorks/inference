@@ -460,18 +460,24 @@ impl IpAdapterKolors {
         // CFG batch is [neg, pos] = uncond-first (the Kolors txt2img convention); without guidance only
         // the positive branch is built. Shared CFG-concat (sc-9001); the ChatGLM3 encode stays local
         // (its immutable `&self` borrow ends before the `&mut self.unet` call below).
-        let (context, pooled, batch) = common::cfg_batch_context(
-            &req.prompt,
-            &req.negative,
-            use_guide,
-            // sc-18317: this provider is driven directly by the worker through its own
-            // `IpAdapterKolorsRequest`, which carries no `GenerationMemory` and therefore no execution
-            // selection — so the mode is this lane's fixed convention, stated rather than
-            // implied. `cfg_batch_context` still refuses anything else.
-            candle_gen::gen_core::CfgBatching::Batched,
-            |p| Self::encode_with(&resident.conditioning, p),
+        let (context, pooled, batch) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let (context, pooled, batch) = common::cfg_batch_context(
+                    &req.prompt,
+                    &req.negative,
+                    use_guide,
+                    // sc-18317: this provider is driven directly by the worker through its own
+                    // `IpAdapterKolorsRequest`, which carries no `GenerationMemory` and therefore no execution
+                    // selection — so the mode is this lane's fixed convention, stated rather than
+                    // implied. `cfg_batch_context` still refuses anything else.
+                    candle_gen::gen_core::CfgBatching::Batched,
+                    |p| Self::encode_with(&resident.conditioning, p),
+                )?;
+                // Project the ChatGLM3 context to the cross-attention width once up front — the vendored UNet
+                Ok((context, pooled, batch))
+            },
         )?;
-        // Project the ChatGLM3 context to the cross-attention width once up front — the vendored UNet
         // (unlike `KolorsUNet`) has no `encoder_hid_proj`, so its context must already be 2048-wide.
         let projected = resident.denoise.encoder_hid_proj.forward(&context)?;
         let time_ids = common::build_time_ids(&self.device, batch, req.height, req.width)?;
@@ -605,12 +611,18 @@ impl IpAdapterKolors {
             },
             self.device.clone(),
         );
-        let (context, pooled, batch) = common::cfg_batch_context(
-            &req.prompt,
-            &req.negative,
-            use_guide,
-            candle_gen::gen_core::CfgBatching::Batched,
-            |prompt| Self::encode_with(&conditioning, prompt),
+        let (context, pooled, batch) = candle_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, candle_gen::CandleError> {
+                let (context, pooled, batch) = common::cfg_batch_context(
+                    &req.prompt,
+                    &req.negative,
+                    use_guide,
+                    candle_gen::gen_core::CfgBatching::Batched,
+                    |prompt| Self::encode_with(&conditioning, prompt),
+                )?;
+                Ok((context, pooled, batch))
+            },
         )?;
         let time_ids = common::build_time_ids(&self.device, batch, req.height, req.width)?;
         let ip_tokens = Self::ip_tokens_with(&conditioning, reference, use_guide, &self.device)?;

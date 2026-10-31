@@ -1401,6 +1401,27 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             self.assertIn('#![cfg(feature = "metal")]', source, name)
             self.assertIn("#[test]", source, name)
 
+    def test_raw_metal_reduction_remains_an_exact_automatic_feature_control(self) -> None:
+        root = WORKFLOW.parents[2]
+        controls = json.loads((root / 'scripts/ci/safe_controls.json').read_text(encoding='utf-8'))['controls']
+        raw = 'metal_strided_reduce::rank_5_and_6_reductions_on_metal_match_the_cpu'
+        entries = [control for control in controls if control['test'].startswith('metal_strided_reduce::')]
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual((entry['package'], entry['kind'], entry['target'], entry['test']),
+                         ('candle-gen', 'test', 'integration', raw))
+        self.assertEqual(entry['features'], ['metal'])
+        self.assertEqual(entry['platforms'], ['darwin'])
+        self.assertEqual(entry['protocol'], 'libtest')
+        self.assertEqual(entry['source'], 'crates/media/candle-gen/candle-gen/tests/metal_strided_reduce.rs')
+        self.assertFalse(any(control['test'].startswith('metal_reference_latents::') for control in controls))
+        job = yaml.safe_load(WORKFLOW.read_text(encoding='utf-8'))['jobs']['macos-metal']
+        run = next(step['run'] for step in job['steps'] if step.get('name') == 'Test Candle Metal reduce pins')
+        self.assertIn('test_suites.py audited-safe -- cargo test', run)
+        self.assertIn('-p candle-gen -p candle-gen-qwen-image-2-1 --features metal', run)
+        self.assertIn('--test integration', run)
+        self.assertNotIn('--ignored', run)
+
     def test_macos_metal_builds_one_target_generation_without_cargo_clean(self) -> None:
         # Until 2026-08-23 this lane ran `cargo clean` twice mid-job because the full-debuginfo test
         # graph grew `target/` to 35 GB. Each clean discarded the cache-restored `pmetal-mlx-sys`
@@ -1444,7 +1465,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         ]
         indices = [names.index(name) for name in order]
         self.assertEqual(indices, sorted(indices))
-        self.assert_candle_metal_pins_select_real_modules(steps[names.index(order[-1])]["run"])
+        automatic = steps[names.index(order[-1])]["run"]
+        self.assertIn("audited-safe -- cargo test", automatic)
+        self.assertIn("--test integration", automatic)
+        manual = yaml.safe_load((WORKFLOW.parent / "model-test-suites.yml").read_text(encoding="utf-8"))
+        baseline = next(step for step in manual["jobs"]["mlx-metal"]["steps"] if step.get("name") == "Run former Metal, runtime and iOS host baselines")
+        pins = next(line for line in baseline["run"].splitlines() if "metal_strided_reduce::" in line)
+        self.assert_candle_metal_pins_select_real_modules(pins)
         # The image-payload prune still runs, but in the background: inline it was 3.6 minutes on
         # the critical path. It must start before the cache restore so the I/O overlaps the build.
         reclaim = "Reclaim runner disk (background)"
@@ -4407,7 +4434,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(smoke["shell"], "cmd")
         self.assertEqual(
             smoke["run"],
-            r'"%REVIEWED_PYTHON%" -m unittest scripts.tests.test_media_campaign_supervisor.WindowsSupervisorTests -v',
+            r'"%REVIEWED_PYTHON%" -m unittest scripts.tests.test_media_campaign_supervisor.WindowsSupervisorTests scripts.tests.test_model_proof_supervision.WindowsMetadataDiscovery -v',
         )
         self.assertFalse(smoke.get("continue-on-error", False))
 
@@ -4502,7 +4529,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(len(tests), 1, tests)
         # The whole-device smoke drives Metal; the shared hosted runner runs only the
         # weights-free tests. MLX has no CPU-default switch, so the skip is the guard.
-        self.assertIn("--features media --lib -- --skip smoke_passes_on_the_host", tests[0])
+        self.assertIn("test_suites.py audited-safe -- cargo --config", tests[0])
+        self.assertIn("--features media --lib", tests[0])
+        self.assertNotIn("--skip", tests[0])
+        manual = yaml.safe_load((WORKFLOW.parent / "model-test-suites.yml").read_text(encoding="utf-8"))
+        baseline = next(step for step in manual["jobs"]["mlx-metal"]["steps"] if step.get("name") == "Run former Metal, runtime and iOS host baselines")
+        self.assertIn("--features media --lib -- --skip smoke_passes_on_the_host", baseline["run"])
         # The device-capture surface is tested and linted on the host lane.
         self.assertTrue(
             any("cargo test --locked --no-fail-fast --lib -p runtime-ios --features device-capture" in run for run in metal)

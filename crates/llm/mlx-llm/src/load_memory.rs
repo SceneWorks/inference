@@ -407,7 +407,11 @@ pub(crate) fn safetensors_headers(dir: &Path) -> Result<Vec<Value>> {
         if path.extension().and_then(|s| s.to_str()) != Some("safetensors") {
             continue;
         }
-        let mut file = File::open(&path).map_err(|e| Error::Load(e.to_string()))?;
+        let mut file = load_progress::reader::open_with_phase(
+            &path,
+            load_progress::LoadActivityPhase::Checking,
+        )
+        .map_err(|e| Error::Load(e.to_string()))?;
         let mut prefix = [0u8; 8];
         file.read_exact(&mut prefix)
             .map_err(|e| Error::Load(e.to_string()))?;
@@ -782,7 +786,8 @@ fn materialized_bound(headers: &[Value], quant: Option<QuantSpec>) -> Result<u64
 }
 
 fn gguf_bytes(path: &Path, projector: bool) -> Result<u64> {
-    let file = crate::gguf::GgufFile::open(path).map_err(|e| Error::Load(e.to_string()))?;
+    let file =
+        crate::gguf::GgufFile::open_metadata(path).map_err(|e| Error::Load(e.to_string()))?;
     let mut retained = 0u64;
     let mut staging = 0u64;
     for tensor in &file.tensors {
@@ -844,6 +849,34 @@ mod tests {
     const H: u64 = 64 * 1024 * 1024 + MLX_DRIVER_WAKE_BYTES;
 
     /// A load's host heap: 24 bytes per `tokenizer.json` byte plus the fixed allowance.
+    #[test]
+    fn safetensors_admission_headers_report_checks_without_payload_credit() {
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        let header = br#"{"w":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&[0; 8]);
+        std::fs::write(path, &bytes).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let _observer = load_progress::LoadActivityObserver::new(move |event| {
+            output.lock().unwrap().push(event)
+        });
+        assert_eq!(safetensors_headers(dir.path()).unwrap().len(), 1);
+        let events = events.lock().unwrap();
+        assert!(events
+            .iter()
+            .flatten()
+            .all(|event| event.phase == load_progress::LoadActivityPhase::Checking));
+        assert_eq!(
+            events.iter().flatten().map(|event| event.bytes_read).max(),
+            Some(bytes.len() as u64 - 8)
+        );
+        assert_eq!(events.last(), Some(&None));
+    }
+
     #[test]
     fn a_load_is_charged_its_tokenizer_heap_and_a_fixed_host_allowance() {
         let (dir, payload) = snapshot(

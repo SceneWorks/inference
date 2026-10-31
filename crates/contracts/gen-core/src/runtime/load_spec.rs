@@ -514,6 +514,53 @@ impl LoadSpec {
         Ok(())
     }
 
+    /// Request progress attribution for every configured source, without provider knowledge.
+    pub fn load_activity_context(&self) -> crate::LoadActivityContext {
+        let mut slots = Vec::new();
+        let mut add = |source: &WeightsSource, name: &str| {
+            let path = match source {
+                WeightsSource::File(p) | WeightsSource::Dir(p) => p,
+            };
+            slots.push((path.clone(), name.to_owned()));
+        };
+        // A primary directory is a snapshot: preserve its component subdirectories. A primary
+        // file has no narrower slot, so its filename remains the fallback.
+        if let Some(source) = &self.control {
+            add(source, "control");
+        }
+        for source in &self.extra_controls {
+            add(source, "control");
+        }
+        if let Some(source) = &self.ip_adapter {
+            add(source, "ip adapter");
+        }
+        if let Some(source) = &self.text_encoder {
+            add(source, "text encoder");
+        }
+        if let Some(pid) = &self.pid {
+            add(&pid.checkpoint, "pid");
+            add(&pid.gemma, "text encoder");
+        }
+        if let Some(identity) = &self.identity {
+            if let Some(source) = &identity.encoder {
+                add(source, "identity encoder");
+            }
+            if let Some(source) = &identity.eva {
+                add(source, "vision encoder");
+            }
+            if let Some(source) = &identity.face_dir {
+                add(source, "face encoder");
+            }
+        }
+        for (name, source) in &self.components {
+            add(source, name);
+        }
+        for adapter in &self.adapters {
+            slots.push((adapter.path.clone(), "adapter".into()));
+        }
+        crate::LoadActivityContext::capture().with_components(slots)
+    }
+
     pub(crate) fn visit_source_paths<'a>(&'a self, mut visit: impl FnMut(&'a Path, bool)) {
         fn source<'a>(value: &'a WeightsSource, visit: &mut impl FnMut(&'a Path, bool)) {
             match value {

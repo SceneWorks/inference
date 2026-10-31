@@ -81,6 +81,7 @@ pub struct StepReporter<'a> {
     /// Whether this reporter's denoise loop opens the request's decode phase (`Decoding` after its
     /// last step). See the type docs.
     opens_decode: bool,
+    prompt_encoding: bool,
 }
 
 impl<'a> StepReporter<'a> {
@@ -93,6 +94,21 @@ impl<'a> StepReporter<'a> {
             total_override: None,
             opens_denoise: true,
             opens_decode: true,
+            prompt_encoding: false,
+        }
+    }
+
+    /// Bracket the Generator's prompt prefills; cached denoise-only callers leave this unarmed.
+    pub(crate) fn with_prompt_encoding(mut self) -> Self {
+        (self.on_progress)(Progress::Loading(LoadPhase::EncodingPrompt));
+        self.prompt_encoding = true;
+        self
+    }
+
+    fn finish_prompt_encoding(&mut self) {
+        if self.prompt_encoding {
+            self.prompt_encoding = false;
+            (self.on_progress)(Progress::PromptEncodingComplete);
         }
     }
 
@@ -122,6 +138,7 @@ impl<'a> StepReporter<'a> {
             total_override: Some(total),
             opens_denoise: true,
             opens_decode: true,
+            prompt_encoding: false,
         }
     }
 
@@ -153,6 +170,7 @@ impl<'a> StepReporter<'a> {
     /// that boundary (sc-22738). Called by the denoise loops after every prefill and before their
     /// first step.
     fn open_denoise_phase(&mut self) {
+        self.finish_prompt_encoding();
         if self.opens_denoise {
             (self.on_progress)(Progress::Loading(LoadPhase::Renderer));
         }
@@ -164,6 +182,12 @@ impl<'a> StepReporter<'a> {
         if self.opens_decode {
             open_decode_phase(self.on_progress);
         }
+    }
+}
+
+impl Drop for StepReporter<'_> {
+    fn drop(&mut self) {
+        self.finish_prompt_encoding();
     }
 }
 
@@ -1393,6 +1417,31 @@ impl T2iModel {
         opts: &T2iOptions,
         cancel: Option<&CancelFlag>,
     ) -> Result<String> {
+        self.vqa_with_options_and_progress(
+            tokenizer,
+            question,
+            images,
+            max_new_tokens,
+            sampler,
+            opts,
+            cancel,
+            &mut |_| {},
+        )
+    }
+
+    /// Progress-capable sibling preserving the original entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vqa_with_options_and_progress(
+        &self,
+        tokenizer: &TextTokenizer,
+        question: &str,
+        images: &[Array],
+        max_new_tokens: usize,
+        sampler: Sampler,
+        opts: &T2iOptions,
+        cancel: Option<&CancelFlag>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<String> {
         // Preprocess any source images.
         let mut pv_parts = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len());
@@ -1427,12 +1476,19 @@ impl T2iModel {
             self.build_it2i_query_ids(tokenizer, &base, &grids)?
         };
 
-        let (mut cache, last_logits, t_idx) = self.prefill_it2i_logits_budgeted(
-            &ids,
-            pixel_values.as_ref(),
-            &grids,
-            attention_plan(opts, cancel),
+        let (mut cache, last_logits, t_idx) = mlx_gen::gen_core::with_prompt_encoding(
+            on_progress,
+            || -> std::result::Result<_, mlx_gen::Error> {
+                let (cache, last_logits, t_idx) = self.prefill_it2i_logits_budgeted(
+                    &ids,
+                    pixel_values.as_ref(),
+                    &grids,
+                    attention_plan(opts, cancel),
+                )?;
+                Ok((cache, last_logits, t_idx))
+            },
         )?;
+        on_progress(Progress::ConditioningComplete);
         let tokens = self.decode_text_budgeted(
             &last_logits,
             &mut cache,
@@ -1591,35 +1647,49 @@ impl T2iModel {
         } else {
             self.build_it2i_query_ids(tokenizer, &cond_query, &grids)?
         };
-        let (mut cache_cond, cond_logits, mut t_cond) = self.prefill_it2i_logits_budgeted(
-            &cond_ids,
-            pixel_values.as_ref(),
-            &grids,
-            attention_plan(opts, Some(cancel)),
-        )?;
+        let (mut cache_cond, cond_logits, mut t_cond, mut cache_tu, mut t_tu, mut cache_iu, iu_max) =
+            mlx_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, mlx_gen::Error> {
+                    let (cache_cond, cond_logits, t_cond) = self.prefill_it2i_logits_budgeted(
+                        &cond_ids,
+                        pixel_values.as_ref(),
+                        &grids,
+                        attention_plan(opts, Some(cancel)),
+                    )?;
 
-        let tu_query = build_neo1_query(&"<image>".repeat(input_images.len()), "");
-        let tu_ids = if input_images.is_empty() {
-            tokenizer.encode_ids(&tu_query, true)?
-        } else {
-            self.build_it2i_query_ids(tokenizer, &tu_query, &grids)?
-        };
-        let (mut cache_tu, _, mut t_tu) = self.prefill_it2i_logits_budgeted(
-            &tu_ids,
-            pixel_values.as_ref(),
-            &grids,
-            attention_plan(opts, Some(cancel)),
-        )?;
+                    let tu_query = build_neo1_query(&"<image>".repeat(input_images.len()), "");
+                    let tu_ids = if input_images.is_empty() {
+                        tokenizer.encode_ids(&tu_query, true)?
+                    } else {
+                        self.build_it2i_query_ids(tokenizer, &tu_query, &grids)?
+                    };
+                    let (cache_tu, _, t_tu) = self.prefill_it2i_logits_budgeted(
+                        &tu_ids,
+                        pixel_values.as_ref(),
+                        &grids,
+                        attention_plan(opts, Some(cancel)),
+                    )?;
 
-        let iu_query = format!("{}<img>", build_neo1_query("", ""));
-        let iu_ids = tokenizer.encode_ids(&iu_query, true)?;
-        let (mut cache_iu, _, iu_max) = self.prefill_it2i_logits_budgeted(
-            &iu_ids,
-            None,
-            &[],
-            attention_plan(opts, Some(cancel)),
-        )?;
-
+                    let iu_query = format!("{}<img>", build_neo1_query("", ""));
+                    let iu_ids = tokenizer.encode_ids(&iu_query, true)?;
+                    let (cache_iu, _, iu_max) = self.prefill_it2i_logits_budgeted(
+                        &iu_ids,
+                        None,
+                        &[],
+                        attention_plan(opts, Some(cancel)),
+                    )?;
+                    Ok((
+                        cache_cond,
+                        cond_logits,
+                        t_cond,
+                        cache_tu,
+                        t_tu,
+                        cache_iu,
+                        iu_max,
+                    ))
+                },
+            )?;
         let mut text = String::new();
         let mut images = Vec::new();
         let mut total_tokens = 0usize;
@@ -1627,6 +1697,7 @@ impl T2iModel {
         let mut segment_logits = cond_logits;
 
         loop {
+            on_progress(Progress::ConditioningComplete);
             // ---- Text generation on the condition cache ----
             // One segment is the shared engine's greedy token-at-a-time rollout (epic sc-24432 E8):
             // the first token is the host argmax of the segment's row, every later one the argmax
@@ -1713,24 +1784,30 @@ impl T2iModel {
             let image = traj.into_iter().last().expect("at least one step");
 
             // Re-encode the generated image back into the condition + text-uncondition caches.
-            let (cond_next, nt_cond) = self.append_generated_image_budgeted(
-                &image,
-                token_h,
-                token_w,
-                t_cond,
-                &mut cache_cond,
-                attention_plan(opts, Some(cancel)),
+            let cond_next = mlx_gen::gen_core::with_prompt_encoding(
+                on_progress,
+                || -> std::result::Result<_, mlx_gen::Error> {
+                    let (cond_next, nt_cond) = self.append_generated_image_budgeted(
+                        &image,
+                        token_h,
+                        token_w,
+                        t_cond,
+                        &mut cache_cond,
+                        attention_plan(opts, Some(cancel)),
+                    )?;
+                    t_cond = nt_cond;
+                    let (_, nt_tu) = self.append_generated_image_budgeted(
+                        &image,
+                        token_h,
+                        token_w,
+                        t_tu,
+                        &mut cache_tu,
+                        attention_plan(opts, Some(cancel)),
+                    )?;
+                    t_tu = nt_tu;
+                    Ok(cond_next)
+                },
             )?;
-            t_cond = nt_cond;
-            let (_, nt_tu) = self.append_generated_image_budgeted(
-                &image,
-                token_h,
-                token_w,
-                t_tu,
-                &mut cache_tu,
-                attention_plan(opts, Some(cancel)),
-            )?;
-            t_tu = nt_tu;
             images.push(image);
             segment_logits = cond_next;
         }
@@ -2206,6 +2283,42 @@ mod tests {
                 let got = slice(&gaussian(shape, seed).unwrap());
                 assert_eq!(got, reference(shape, seed), "shape={shape:?} seed={seed}");
             }
+        }
+    }
+
+    #[test]
+    fn armed_prompt_reporter_closes_at_denoise_or_early_return_and_cached_denoise_stays_silent() {
+        for denoise in [false, true] {
+            let cancel = CancelFlag::new();
+            let mut events = Vec::new();
+            {
+                let mut sink = |event| events.push(event);
+                let mut reporter = StepReporter::new(&cancel, &mut sink)
+                    .with_phase_bounds(false, false)
+                    .with_prompt_encoding();
+                if denoise {
+                    reporter.open_denoise_phase();
+                    reporter.open_denoise_phase();
+                }
+            }
+            assert_eq!(
+                events,
+                [
+                    Progress::Loading(LoadPhase::EncodingPrompt),
+                    Progress::PromptEncodingComplete
+                ]
+            );
+            events.clear();
+            {
+                let mut sink = |event| events.push(event);
+                let mut cached =
+                    StepReporter::new(&cancel, &mut sink).with_phase_bounds(false, false);
+                cached.open_denoise_phase();
+            }
+            assert!(
+                events.is_empty(),
+                "precomputed conditioning must not claim encoding"
+            );
         }
     }
 

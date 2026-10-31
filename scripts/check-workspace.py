@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 129
+EXPECTED_MEMBER_COUNT = 130
 INTERNAL_PACKAGES = {
     "candle-audio",
     "candle-audio-catalog",
@@ -29,6 +29,7 @@ INTERNAL_PACKAGES = {
     "mlx-llm",
     "candle-llm",
     "sceneworks-gen-core",
+    "sceneworks-load-progress",
     "sceneworks-gen-core-checkpoint",
     "sceneworks-gen-core-dist",
     "sceneworks-gen-core-family",
@@ -50,8 +51,8 @@ INTERNAL_PACKAGES = {
     "runtime-cuda",
 }
 PINNED_WORKSPACE_DEPENDENCIES = {
-    "mlx-rs": ("pmetal-mlx-rs", "355e2ae4e81c13032233a4244e956bc3547f49e4"),
-    "mlx-sys": ("pmetal-mlx-sys", "355e2ae4e81c13032233a4244e956bc3547f49e4"),
+    "mlx-rs": ("pmetal-mlx-rs", "11d0ff7c81e628beaa548e1872db974c10529efe"),
+    "mlx-sys": ("pmetal-mlx-sys", "11d0ff7c81e628beaa548e1872db974c10529efe"),
     "candle-core": ("candle-core", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-nn": ("candle-nn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-transformers": ("candle-transformers", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),

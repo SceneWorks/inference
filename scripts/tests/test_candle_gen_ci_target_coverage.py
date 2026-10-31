@@ -1,4 +1,9 @@
-"""Enforce that `candle-gen*` integration targets execute in an automatic CI lane.
+"""Enforce automatic integration-target compilation and explicit baseline execution.
+
+The closed audited-safe automatic runner compiles the original full target graph.
+The separately dispatched baseline retains full routine execution, package globs
+and all assertions. The historical automatic-execution defect below explains why
+both target selection and meaningful execution remain covered independently.
 
 sc-19447. Every `candle-gen*` integration target used to compile in three lanes and execute in
 none of them: `candle-cpu-test` ran `--lib` only, `candle-cpu-lint` reached them through
@@ -514,12 +519,17 @@ class CandleGenCiTargetCoverageTests(unittest.TestCase):
             f"the {STEP_NAME!r} step no longer passes --tests, so every candle-gen integration "
             "target compiles in lint lanes and executes nowhere automatic again (sc-19447).",
         )
-        self.assertNotRegex(
-            run_block,
-            r"--no-run\b",
-            f"the {STEP_NAME!r} step must EXECUTE its test binaries; --no-run reproduces the "
-            "windows-cuda-check hole this step exists to close.",
-        )
+        self.assertIn("audited-safe -- cargo test", run_block)
+        import yaml
+        manual = yaml.safe_load((WORKFLOW.parent / "model-test-suites.yml").read_text(encoding="utf-8"))
+        job = manual["jobs"]["candle-cpu"]
+        self.assertIn("github.event_name == 'workflow_dispatch'", job["if"])
+        gen = next(row for row in job["strategy"]["matrix"]["include"] if row["group"] == "gen")
+        self.assertEqual(gen["targets"], "--lib --tests")
+        self.assertEqual(gen["packages"], "-p candle-gen*")
+        run = next(step["run"] for step in job["steps"] if step.get("name") == "Run selected CPU suite")
+        self.assertIn('if [ "$TEST_SUITE" = baseline ]; then mode=routine; fi', run)
+        self.assertIn('"$mode" -- cargo test', run)
 
     def test_the_step_runs_in_an_automatic_required_job(self) -> None:
         """A correct command line in a job that never runs is the same hole in a new place."""

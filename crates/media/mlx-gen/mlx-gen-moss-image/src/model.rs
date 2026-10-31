@@ -20,6 +20,17 @@ use mlx_gen_flux2::vae::{Flux2Vae, Flux2VaeDecoderConfig};
 use mlx_rs::Array;
 use std::{collections::BTreeMap, sync::Mutex};
 
+fn needs_prompt_encoding(
+    inputs: MossImageAdvancedInputs<'_>,
+    acceleration: MossImageAcceleration,
+    guidance: f32,
+) -> bool {
+    inputs.positive.is_none()
+        || (acceleration == MossImageAcceleration::Off
+            && guidance != 1.0
+            && inputs.negative.is_none())
+}
+
 fn incremental_peak(peak: u64, owned: u64, committed: u64) -> u64 {
     peak.saturating_sub(owned.min(committed))
 }
@@ -435,8 +446,13 @@ impl MossImage {
         if state.release_for_request(resolved.acceleration, edit.is_some()) {
             self.sources.drain_cache()?;
         }
+        let encode = || self.encode_conditioning(request, inputs, &resolved);
         let (positive, negative, conditioning) =
-            self.encode_conditioning(request, inputs, &resolved)?;
+            if needs_prompt_encoding(inputs, resolved.acceleration, resolved.guidance) {
+                mlx_gen::gen_core::with_prompt_encoding(progress, encode)?
+            } else {
+                encode()?
+            };
         check(&request.cancel)?;
         let (edit_renderer, edit_references) = self.prepare_renderer(
             state,
@@ -1105,6 +1121,42 @@ pub(crate) fn verify_numerical_renderer_transitions(
 #[cfg(test)]
 mod cpu_tests {
     use super::*;
+    #[test]
+    fn prompt_encoding_is_required_only_for_missing_active_embeddings() {
+        let values = vec![0.0; 4096];
+        let supplied = MossImageEmbeddings {
+            values: &values,
+            batch: 1,
+            sequence: 1,
+            mask: None,
+        };
+        for positive in [None, Some(supplied)] {
+            for negative in [None, Some(supplied)] {
+                let inputs = MossImageAdvancedInputs {
+                    positive,
+                    negative,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    needs_prompt_encoding(inputs, MossImageAcceleration::Off, 1.0),
+                    positive.is_none()
+                );
+                assert_eq!(
+                    needs_prompt_encoding(inputs, MossImageAcceleration::Off, 2.0),
+                    positive.is_none() || negative.is_none()
+                );
+                assert_eq!(
+                    needs_prompt_encoding(
+                        inputs,
+                        MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16),
+                        2.0
+                    ),
+                    positive.is_none()
+                );
+            }
+        }
+    }
+
     #[test]
     fn pin_failure_clears_ordinary_and_edit_receipts_before_execution() {
         let root = tempfile::tempdir().unwrap();

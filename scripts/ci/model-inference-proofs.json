@@ -175537,7 +175537,7 @@
               "minimum_collections": 1,
               "minimum_items": 1,
               "readers": [
-                "mlx-gen::logical_weights::load_with_rewritten_header"
+                "mlx-gen::logical_weights::load_planned_file"
               ],
               "required_grade": "reader-binding",
               "role": "model-weights",
