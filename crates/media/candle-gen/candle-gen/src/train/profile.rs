@@ -306,6 +306,8 @@ pub(crate) fn finish_attribution(segment: usize) {
 #[cfg(feature = "model-inference-proof")]
 #[derive(Default)]
 struct CohortObservation {
+    expected_updates: u32,
+    warmups: usize,
     started: Option<std::time::Instant>,
     step_started: Option<std::time::Instant>,
     preparation_seconds: f64,
@@ -336,9 +338,42 @@ pub fn cohort_active() -> bool {
 /// source-owned, and cancelled/partial/missing observer work cannot report PASS.
 #[cfg(feature = "model-inference-proof")]
 pub fn with_bounded_cohort<T>(output: &std::path::Path, f: impl FnOnce() -> T) -> T {
+    with_observation(output, 4, 1, None, f)
+}
+
+#[cfg(feature = "model-inference-proof")]
+pub(super) fn with_comparison_observation<T>(
+    output: &std::path::Path,
+    model_id: &str,
+    stage: super::comparison::ComparisonStage,
+    cadence: super::comparison::ComparisonCadence,
+    f: impl FnOnce() -> T,
+) -> T {
+    let comparison = serde_json::json!({"schema_version":1, "model":model_id,
+        "stage":stage.id(), "cadence":cadence.id(), "state_reset":"fresh-native-child-process",
+        "claim_limit":"Conditional ablations, serial shared GPU; one warmup per owner; three timed ordinary or restoration cycles, two timed updates per Wan expert; no isolated timing or convergence claim"});
+    with_observation(
+        output,
+        cadence.updates(),
+        cadence.warmups(),
+        Some(comparison),
+        f,
+    )
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn with_observation<T>(
+    output: &std::path::Path,
+    expected_updates: u32,
+    warmups: usize,
+    comparison: Option<serde_json::Value>,
+    f: impl FnOnce() -> T,
+) -> T {
     assert!(!active() && !cohort_active(), "nested bounded proof scope");
     COHORT.with(|state| {
         *state.borrow_mut() = Some(CohortObservation {
+            expected_updates,
+            warmups,
             started: Some(std::time::Instant::now()),
             ..Default::default()
         })
@@ -354,13 +389,14 @@ pub fn with_bounded_cohort<T>(output: &std::path::Path, f: impl FnOnce() -> T) -
     COHORT.with(|state| {
         let state = state.borrow();
         let state = state.as_ref().unwrap();
-        assert_eq!(state.updates, 4, "one invocation must complete four actual optimizer updates");
-        assert_eq!(state.steps.len(), 4, "all four bodies must finish");
-        assert!(!state.reuse.is_empty(), "prepared mechanism consumption must be observed");
-        let report = serde_json::json!({"optimizer_updates": state.updates,
+        assert_eq!(state.updates, expected_updates, "source-owned actual optimizer update count");
+        assert_eq!(state.steps.len(), expected_updates as usize, "all physical bodies must finish");
+        if comparison.is_none() { assert!(!state.reuse.is_empty(), "prepared mechanism consumption must be observed"); }
+        let mut report = serde_json::json!({"optimizer_updates": state.updates,
             "preparation_including_load_cache_seconds": state.preparation_seconds,
             "steps": state.steps, "mechanism_consumption": state.reuse,
             "timing_scope": "synchronized forward/backward/update; first update warmup; diagnostic scalar validation excluded"});
+        if let Some(comparison) = comparison { report["comparison"] = comparison; }
         std::fs::write(output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         eprintln!("COHORT_ACCEPTANCE_METRICS {report}");
     });
@@ -475,8 +511,8 @@ pub fn cohort_before_update(
         let Some(state) = state.as_mut() else {
             return Ok(());
         };
-        if state.updates >= 20 {
-            candle_core::bail!("bounded proof exceeded twenty optimizer updates");
+        if state.updates >= state.expected_updates {
+            candle_core::bail!("bounded proof exceeded source-owned optimizer update count");
         }
         for var in vars {
             let tensor = var.as_tensor();
@@ -539,7 +575,7 @@ pub fn cohort_end_step(
             changed |= delta > 0.;
         }
         if !changed || nonzero_gradients == 0 { candle_core::bail!("cohort optimizer produced no actual adapter update"); }
-        let warmup = state.steps.is_empty();
+        let warmup = state.steps.len() < state.warmups;
         state.steps.push(serde_json::json!({"update":state.updates,"owner":owner,"warmup":warmup,
             "seconds":seconds,"loss":loss,"finite_gradients":gradient_count,"nonzero_gradients":nonzero_gradients,
             "adapter_changed":changed,"attention_candidate":attention.0,"attention_reference":attention.1}));
