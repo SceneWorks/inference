@@ -330,6 +330,26 @@ pub(crate) fn cohort_claim_probe(mechanism: &str) -> bool {
     }
 }
 
+/// A first-warmup reference comparison completes once, unlike a mechanism that
+/// must be consumed repeatedly across training steps. Require both its claim and
+/// its successful comparison receipt without manufacturing a repeated count.
+#[cfg(feature = "model-inference-proof")]
+pub fn require_cohort_probe_success(mechanism: &str) {
+    COHORT.with(|state| {
+        let state = state.borrow();
+        let state = state.as_ref().expect("bounded cohort probe scope");
+        assert!(
+            state.probes.contains(mechanism),
+            "bounded probe was not claimed: {mechanism}"
+        );
+        assert_eq!(
+            state.reuse.get(mechanism).copied(),
+            Some(1),
+            "bounded probe must complete exactly once: {mechanism}"
+        );
+    });
+}
+
 pub fn cohort_begin_step(device: &candle_core::Device) -> candle_core::Result<()> {
     if !cohort_active() {
         return Ok(());
