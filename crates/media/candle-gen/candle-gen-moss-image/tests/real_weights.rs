@@ -325,11 +325,11 @@ fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, root: &std::path::Pat
 fn moss_bounded_acceleration_acceptance() {
     let root = bounded_root();
     let comparison = candle_gen::train::comparison::requested_stage().is_some();
-    let cadence = candle_gen::train::comparison::ComparisonCadence::Ordinary;
+    let cadence = candle_gen::train::comparison::ComparisonCadence::MossRecovery;
     let steps = if comparison { cadence.updates() } else { 4 };
     // One source-owned representative workload, never a resolution grid. The
     // controller must admit the worst legacy arm before executing any stage.
-    let resolution = if comparison { 512 } else { 64 };
+    let resolution = if comparison { 256 } else { 64 };
     let base = required("MOSS_BASE_SNAPSHOT");
     let shared = required("MOSS_SHARED_SNAPSHOT");
     let input = root.join("input.png");

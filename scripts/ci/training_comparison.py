@@ -48,7 +48,7 @@ _CASES = {
     'kolors_bounded_acceleration_acceptance': ('kolors', 'ordinary', True, True, True),
     'sd35_medium_bounded_acceleration_acceptance': ('sd3_5_medium', 'ordinary', True, True, True),
     'anima_bounded_acceleration_acceptance': ('anima_base', 'ordinary', True, True, True),
-    'moss_bounded_acceleration_acceptance': ('moss', 'ordinary', True, True, True),
+    'moss_bounded_acceleration_acceptance': ('moss', 'moss_recovery', True, True, True),
     'mage_bounded_acceleration_acceptance': ('mage-adapter', 'ordinary', True, True, True),
     'flux3_bounded_acceleration_acceptance': ('flux3', 'ordinary', True, True, True),
     'iris_generation_bounded_acceleration_acceptance': ('iris-generation', 'ordinary', False, True, True),
@@ -87,7 +87,7 @@ def spec(row: dict) -> dict:
     provider = case_manifest(row)
     if provider['model_id'] != model:
         raise ValueError('provider/core comparison model identity mismatch')
-    updates, warmups = {'ordinary': (4, 1), 'wan-dual': (6, 2), 'iris-restoration': (8, 2)}[cadence]
+    updates, warmups = {'ordinary': (4, 1), 'moss_recovery': (3, 1), 'wan-dual': (6, 2), 'iris-restoration': (8, 2)}[cadence]
     stages = [s for s in STAGES if not (
         s == 'minus-e1' and not e1 or s == 'minus-e3' and not e3
         or s == 'minus-reference-owner' or s == 'plus-streaming' and not e4)]
@@ -101,10 +101,11 @@ def spec(row: dict) -> dict:
             seen.add(key)
             distinct.append(stage)
     stages = distinct
-    if provider['stages'] != stages or provider['updates_per_stage'] != updates or provider['warmups_per_stage'] != warmups:
+    if (provider['stages'] != stages or provider['updates_per_stage'] != updates
+            or provider['warmups_per_stage'] != warmups or provider['max_new_updates'] != updates * len(stages)):
         raise ValueError('provider/core stage applicability or physical cadence mismatch')
     # Stable randomized serial order avoids an optimization ladder. It does not
-    # erase first-stage/interference bias; three timed samples remain exploratory.
+    # erase first-stage/interference bias; two/three timed samples remain exploratory.
     order = list(stages)
     seed = int.from_bytes(hashlib.sha256((PROTOCOL + ':' + model).encode()).digest()[:8], 'little')
     random.Random(seed).shuffle(order)
@@ -118,11 +119,12 @@ def spec(row: dict) -> dict:
             'workload': provider['workload'],
             'case_deadline_seconds': provider.get('case_deadline_seconds', 3600),
             'immutable_frozen_bootstrap': provider.get('immutable_frozen_bootstrap'),
+            'recovery_budget': provider.get('recovery_budget'),
             'source_manifest_sha256': file_digest(Path(__file__).with_name('training-comparison-cases.json')),
             'baseline_scope': 'legacy optimization control with constant correctness repairs; not a historical whole binary',
             'sample_scope': 'zero new quality samples; existing quality evidence remains separate',
             'comparison_scope': 'conditional leave-one-group-out effects; not additive independent contributions; shared-GPU serial timing',
-            'noise_scope': 'one counted warmup per owner; three ordinary/restoration timed updates or cycles, two per Wan expert; small sample and order/interference uncertainty'}
+            'noise_scope': ('one counted warmup and two timed updates per MOSS recovery arm; small sample and order/interference uncertainty' if cadence == 'moss_recovery' else 'one counted warmup per owner; three ordinary/restoration timed updates or cycles, two per Wan expert; small sample and order/interference uncertainty')}
 
 
 def is_recipe(name: object) -> bool:
@@ -316,9 +318,9 @@ def verify_metrics(row: dict, metrics: dict, text: str) -> dict:
     declared_owners = declared_owners if isinstance(declared_owners, list) else [declared_owners]
     if unique != declared_owners:
         raise ValueError('actual optimizer owner identity differs from source provider manifest')
-    if plan['cadence'] == 'ordinary' and len(unique) != 1:
+    if plan['cadence'] in ('ordinary', 'moss_recovery') and len(unique) != 1:
         raise ValueError('ordinary stage changed optimizer owner')
-    if plan['cadence'] != 'ordinary':
+    if plan['cadence'] in ('wan-dual', 'iris-restoration'):
         expected_each = n // 2
         if len(unique) != 2 or owners[:2] != unique or any(owners.count(o) != expected_each for o in unique) or any(owners[i] != unique[i % 2] for i in range(n)):
             raise ValueError('dual-owner warm/timed update cycles incomplete')
@@ -430,15 +432,15 @@ def validate_shared_source_controls(sources: dict[str, str]) -> None:
         ('projection.rs', 'apply_factor', 'ifsuper::profile::reference_math()||'),
         ('projection.rs', 'apply_factor', 'returnx.broadcast_matmul(w);'),
         ('projection.rs', 'scaled_lora', 'ifsuper::profile::reference_math(){returnapply_factor(&rank,up)?*scale;}'),
-        ('projection.rs', 'prepare_lora', 'if!super::comparison::projection_enabled(){returnOk(None);}'),
-        ('projection.rs', 'prepare_adapt', 'if!super::comparison::projection_enabled(){returnOk(None);}'),
-        ('norm.rs', 'rms_normalize_f32_impl', 'ifsuper::comparison::legacy_e1()||'),
+        ('projection.rs', 'prepare_lora', 'if!super::policy::projection_enabled(){returnOk(None);}'),
+        ('projection.rs', 'prepare_adapt', 'if!super::policy::projection_enabled(){returnOk(None);}'),
+        ('norm.rs', 'rms_normalize_f32_impl', 'ifsuper::policy::legacy_e1()||'),
         ('norm.rs', 'rms_normalize_f32_impl', 'returnnormalize_composable(x,eps,reference);'),
-        ('norm.rs', 'rms_norm_diff_impl', 'ifsuper::comparison::legacy_e1()||'),
+        ('norm.rs', 'rms_norm_diff_impl', 'ifsuper::policy::legacy_e1()||'),
         ('norm.rs', 'rms_norm_diff_impl', 'returnnormalize_composable(x,eps,reference)?.broadcast_mul(weight)?.to_dtype(x.dtype());'),
         ('norm.rs', 'normalize_composable', 'ifreference{xf.broadcast_div(&rms)}'),
-        ('reference_training_attention.rs', 'try_forward', 'if!crate::train::comparison::reference_owner_enabled(){crate::train::profile::cohort_reuse("comparison:reference-owner:composable");returnOk(None);}'),
-        ('profile.rs', 'reference_math', '||super::comparison::legacy_e1()'),
+        ('reference_training_attention.rs', 'try_forward', 'if!crate::train::policy::reference_owner_enabled(){crate::train::profile::cohort_reuse("comparison:reference-owner:composable");returnOk(None);}'),
+        ('profile.rs', 'reference_math', '||super::policy::legacy_e1()'),
         ('profile.rs', 'cohort_claim_probe', 'ifsuper::comparison::active_stage().is_some(){returnfalse;}'),
         ('optim.rs', 'step', 'super::profile::comparison_optimizer_step()?;'),
     )

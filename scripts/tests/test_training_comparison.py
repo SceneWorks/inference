@@ -72,14 +72,62 @@ class ComparisonContract(unittest.TestCase):
             lines += [f'COHORT_UPDATE_START attempted_update={i}', f'COHORT_UPDATE_COMMITTED optimizer_updates={i}']
         return value, '\n'.join(lines) + '\n'
 
-    def test_exact_seventeen_plans_and_404_cap(self):
+    def test_exact_seventeen_plans_and_398_new_cap(self):
         self.assertEqual(len(self.cases), 17)
         plans = [comparison.spec(r) for r in self.cases.values()]
-        self.assertEqual(sum(x['max_physical_updates'] for x in plans), 404)
+        self.assertEqual(sum(x['max_physical_updates'] for x in plans), 398)
         self.assertFalse(any('minus-reference-owner' in p['stages'] for p in plans))
         self.assertEqual(comparison.spec(self.cases['iris-depth'])['stages'], ['legacy', 'current', 'plus-streaming'])
         self.assertNotIn('minus-e3', comparison.spec(self.cases['lens'])['stages'])
         self.assertNotIn('plus-streaming', comparison.spec(self.cases['z_image_turbo'])['stages'])
+
+    def test_moss_recovery_keeps_six_short_single_owner_arms(self):
+        base,request=self.request('moss')
+        plan=comparison.validate_request((base,),request,'candle-cuda')
+        self.assertEqual((plan['cadence'],plan['updates_per_stage'],plan['warmups_per_stage'],plan['max_physical_updates']),('moss_recovery',3,1,18))
+        self.assertEqual(plan['workload']['resolution'],256)
+        self.assertEqual(len(plan['stages']),6)
+        self.assertIn('two timed',plan['noise_scope'])
+        self.assertEqual(4+plan['max_physical_updates'],22)
+        self.assertEqual(plan['recovery_budget']['retained_conservative_charge'],4)
+        for stage in plan['stages']:
+            row=self.row('moss',stage);metrics,text=self.fixture(row)
+            self.assertEqual(comparison.verify_metrics(row,metrics,text)['physical_updates'],3)
+            for change in (lambda m:m['comparison'].update(physical_starts=4),
+                           lambda m:m['comparison'].update(physical_commits=4),
+                           lambda m:m['comparison'].update(cadence='ordinary'),
+                           lambda m:m['steps'][1].update(warmup=True),
+                           lambda m:m['steps'][1].update(owner='other')):
+                wrong=copy.deepcopy(metrics);change(wrong)
+                with self.assertRaises(ValueError):comparison.verify_metrics(row,wrong,text)
+            with self.assertRaises(ValueError):comparison.verify_metrics(row,metrics,text+'COHORT_UPDATE_START attempted_update=4\n')
+        provider=copy.deepcopy(comparison.case_manifest(base));provider['max_new_updates']=24
+        with patch.object(comparison,'case_manifest',return_value=provider),self.assertRaises(ValueError):comparison.spec(base)
+        for cap in (24,22,19,17):
+            wrong=copy.deepcopy(request);wrong['training_comparison']['max_physical_updates']=cap
+            with self.assertRaises(ValueError):comparison.validate_request((base,),wrong,'candle-cuda')
+
+    def test_moss_native_policy_gates_scope_and_recovery_factory(self):
+        root=Path(__file__).resolve().parents[2]
+        provider=root/'crates/media/candle-gen/candle-gen-moss-image'
+        transformer=(provider/'src/transformer.rs').read_text(encoding='utf-8')
+        for gate in ('legacy_e1','cache_enabled','projection_enabled'):
+            self.assertIn('candle_gen::train::policy::'+gate+'()',transformer)
+            self.assertNotIn('candle_gen::train::comparison::'+gate+'()',transformer)
+        training=(provider/'src/training.rs').read_text(encoding='utf-8')
+        entry=training.split('    fn train(\n',1)[1].split('    fn train_scoped(',1)[0]
+        self.assertLess(entry.index('JobTrainingPolicy::resolve'),entry.index('with_job_policy'))
+        self.assertLess(entry.index('with_job_policy'),entry.index('self.train_scoped'))
+        self.assertIn('self.descriptor.id,',entry)
+        self.assertIn('self.device.is_cuda(),',entry)
+        self.assertIn('without_production_profile(|| progress(event))',entry)
+        self.assertIn('letpreview=candle_gen::train::policy::without_production_profile(',re.sub(r'\s+','',training))
+        fixture=(provider/'tests/real_weights.rs').read_text(encoding='utf-8')
+        self.assertIn('ComparisonCadence::MossRecovery',fixture)
+        self.assertIn('let steps = if comparison { cadence.updates() } else { 4 };',fixture)
+        self.assertIn('let resolution = if comparison { 256 } else { 64 };',fixture)
+        book=comparison.case_manifest(self.cases['moss'])
+        self.assertEqual((book['recovery_budget']['retained_conservative_charge'],book['recovery_budget']['cumulative_model_max'],book['recovery_budget']['original_model_cap']),(4,22,24))
 
     def test_every_source_stage_and_owner_cadence(self):
         for model, base in self.cases.items():

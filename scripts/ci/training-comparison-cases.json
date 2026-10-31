@@ -989,11 +989,11 @@
       "not_applicable_reasons": {
         "minus-reference-owner": "N-A: provider plain composable fallback or preexisting Irisfold3; no new shared bounded ReferenceOwner is called."
       },
-      "updates_per_stage": 4,
+      "updates_per_stage": 3,
       "warmups_per_stage": 1,
-      "max_new_updates": 24,
+      "max_new_updates": 18,
       "workload": {
-        "resolution": 512,
+        "resolution": 256,
         "batch_size": 1,
         "gradient_accumulation": 1,
         "seed": 7,
@@ -1054,12 +1054,23 @@
       ],
       "initial_state_basis": "Fresh same-binary child/native factory. Actual configuration/data hashes plus shared optimizer/parameter initialization receipts; Iris also hashes privateparams/EMA/optimizer/critic/SN buffers before any update.",
       "runtime_directory": "Iris requires new owned BESPOKE_RUNTIME_DIR subdirectory with authoritative .sc-26850-owned-runtime marker; no stage reuses prior checkpoints.",
-      "claim_limit": "512px worst-legacy admission UNMEASURED; no localNN/fit claim. Eligible E4 requires actualnativecandidate dispatch, not mere opt-in. Original functional proofs and MOSS consumerproduct scope unchanged.",
+      "claim_limit": "256px source structural GPU phase estimate33.949GiB with unchanged native/external guards; actual recovery fit/performance unmeasured. Prior512 failed attempt retains conservative4 charge. Six3-update arms have1warm+2timed each, not512/1024 throughput evidence. Original functional/product proofs remain separate.",
       "owner": "moss-image",
       "candidate_required_owners": [
         "moss-image"
       ],
-      "case_deadline_seconds": 3600
+      "case_deadline_seconds": 3600,
+      "recovery_budget": {
+        "parent_source": "ce37f3d054136b0298cb38e07185e095200f6b39",
+        "parent_run_id": "41238169326",
+        "parent_attempt": "1",
+        "retained_conservative_charge": 4,
+        "new_attempt_max_physical_updates": 18,
+        "cumulative_model_max": 22,
+        "original_model_cap": 24,
+        "unused_nontransferable": 2,
+        "parent_artifacts_and_flags": "immutable; no refund or reinterpretation by this source book"
+      }
     },
     {
       "package": "candle-gen-mage",

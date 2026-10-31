@@ -268,7 +268,7 @@ impl Norm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // The comparison's legacy arm is the pre-epic composable operator sequence
         // (bfc367a631^), including its activation/FP32-island rounding below.
-        let normalized = if candle_gen::train::comparison::legacy_e1() {
+        let normalized = if candle_gen::train::policy::legacy_e1() {
             candle_gen::train::profile::cohort_reuse("moss:comparison-legacy-rms");
             let f = x.to_dtype(DType::F32)?;
             f.broadcast_mul(
@@ -627,7 +627,7 @@ pub(crate) struct Transformer {
 }
 impl Transformer {
     pub(crate) fn training_preparation_bytes(&self, inputs: &[(&Tensor, usize, usize)]) -> u64 {
-        if !candle_gen::train::comparison::cache_enabled() {
+        if !candle_gen::train::policy::cache_enabled() {
             return 0;
         }
         let mut ids = std::collections::HashSet::new();
@@ -650,7 +650,7 @@ impl Transformer {
     /// Called once after adapter installation/resume, only for existing cached captions.
     /// Uncached text remains uncached; previews and misses never extend run residency.
     pub(crate) fn prepare_training(&mut self, inputs: &[(&Tensor, usize, usize)]) -> Result<()> {
-        if candle_gen::train::comparison::projection_enabled() {
+        if candle_gen::train::policy::projection_enabled() {
             for block in &mut self.layers {
                 if block.projection_pack.is_none() {
                     block.projection_pack = Linear::prepare_frozen_group(&mut [
@@ -663,7 +663,7 @@ impl Transformer {
         }
         self.training_context.clear();
         self.training_rope.clear();
-        if !candle_gen::train::comparison::cache_enabled() {
+        if !candle_gen::train::policy::cache_enabled() {
             return Ok(());
         }
         for (context, h, w) in inputs {
