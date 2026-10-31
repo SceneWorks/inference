@@ -320,6 +320,9 @@ struct CohortObservation {
     initialization: Vec<serde_json::Value>,
     optimizer_initialization: Vec<serde_json::Value>,
     initial_fingerprints: std::collections::HashMap<candle_core::TensorId, String>,
+    reuse_before: std::collections::BTreeMap<String, u64>,
+    starts: u32,
+    shared_optimizer_attempts: u32,
 }
 
 #[cfg(feature = "model-inference-proof")]
@@ -385,6 +388,22 @@ pub(super) fn comparison_optimizer_initialization(
     Ok(())
 }
 
+pub(super) fn comparison_optimizer_step() -> candle_core::Result<()> {
+    #[cfg(feature = "model-inference-proof")]
+    if super::comparison::active_stage().is_some() {
+        COHORT.with(|s| {
+            let mut s = s.borrow_mut();
+            let s = s.as_mut().expect("comparison observer");
+            if s.step_started.is_none() || s.shared_optimizer_attempts >= s.expected_updates {
+                candle_core::bail!("unobserved or extra comparison optimizer attempt");
+            }
+            s.shared_optimizer_attempts += 1;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "model-inference-proof")]
 pub(super) fn comparison_named_initial_tensors<'a>(
     owner: &str,
@@ -442,6 +461,8 @@ pub(super) fn with_comparison_observation<T>(
 ) -> T {
     let comparison = serde_json::json!({"schema_version":1, "model":model_id,
         "stage":stage.id(), "cadence":cadence.id(), "state_reset":"fresh-native-child-process",
+        "cuda_visible_devices":std::env::var("CUDA_VISIBLE_DEVICES").expect("comparison UUID"),
+        "physical_index":super::comparison::required_physical_index().expect("comparison physical index"),
         "claim_limit":"Conditional ablations, serial shared GPU; one warmup per owner; three timed ordinary or restoration cycles, two timed updates per Wan expert; no isolated timing or convergence claim"});
     with_observation(
         output,
@@ -488,12 +509,16 @@ fn with_observation<T>(
             "steps": state.steps, "mechanism_consumption": state.reuse,
             "timing_scope": "synchronized forward/backward/update; first update warmup; diagnostic scalar validation excluded"});
         if let Some(mut comparison) = comparison {
+            assert_eq!(state.starts, expected_updates, "all actual starts must close");
             assert!(!state.initialization.is_empty(), "comparison needs actual canonical initialization facts");
             let mut initial: Vec<_> = state.initial_fingerprints.values().cloned().collect(); initial.sort();
             assert!(!initial.is_empty(), "comparison needs actual initial trainable tensor fingerprints");
             comparison["initialization"] = serde_json::json!(state.initialization);
             comparison["optimizer_initialization"] = serde_json::json!(state.optimizer_initialization);
             comparison["initial_trainable_fingerprints"] = serde_json::json!(initial);
+            comparison["physical_starts"] = serde_json::json!(state.starts);
+            comparison["physical_commits"] = serde_json::json!(state.updates);
+            comparison["actual_shared_optimizer_attempts"] = serde_json::json!(state.shared_optimizer_attempts);
             comparison["fingerprint_scope"] = serde_json::json!("multiset of reached trainable dtype/shape/exact f32-representable values; not named weight-byte attestation; fresh native factory covers private state");
             report["comparison"] = comparison;
         }
@@ -517,6 +542,11 @@ pub fn cohort_reuse(mechanism: &str) {
 
 /// Claim one bounded reference probe during the first excluded warmup only.
 pub(crate) fn cohort_claim_probe(mechanism: &str) -> bool {
+    // Historical acceptance already owns these reference/model probes. The
+    // timing supplement consumes only its counted native training bodies.
+    if super::comparison::active_stage().is_some() {
+        return false;
+    }
     #[cfg(feature = "model-inference-proof")]
     {
         COHORT.with(|state| {
@@ -567,6 +597,12 @@ pub fn cohort_begin_step(device: &candle_core::Device) -> candle_core::Result<()
         let mut state = state.borrow_mut();
         let state = state.as_mut().unwrap();
         assert!(device.is_cuda(), "bounded cohort requires actual CUDA");
+        assert!(
+            state.step_started.is_none() && state.starts < state.expected_updates,
+            "unexpected extra or nested physical update"
+        );
+        state.starts += 1;
+        state.reuse_before = state.reuse.clone();
         if let Some(started) = state.started.take() {
             state.preparation_seconds = started.elapsed().as_secs_f64();
         }
@@ -687,9 +723,16 @@ pub fn cohort_end_step(
         }
         if !changed || nonzero_gradients == 0 { candle_core::bail!("cohort optimizer produced no actual adapter update"); }
         let warmup = state.steps.len() < state.warmups;
-        state.steps.push(serde_json::json!({"update":state.updates,"owner":owner,"warmup":warmup,
+        let mechanisms: std::collections::BTreeMap<_, _> = state.reuse.iter()
+            .filter_map(|(key, count)| {
+                let delta = count - state.reuse_before.get(key).copied().unwrap_or(0);
+                (delta > 0).then_some((key.clone(), delta))
+            }).collect();
+        let mut step = serde_json::json!({"update":state.updates,"owner":owner,"warmup":warmup,
             "seconds":seconds,"loss":loss,"finite_gradients":gradient_count,"nonzero_gradients":nonzero_gradients,
-            "adapter_changed":changed,"attention_candidate":attention.0,"attention_reference":attention.1}));
+            "adapter_changed":changed,"attention_candidate":attention.0,"attention_reference":attention.1});
+        if super::comparison::active_stage().is_some() { step["mechanism_consumption"] = serde_json::json!(mechanisms); }
+        state.steps.push(step);
         Ok(())
     })?;
     let _ = (loss, vars, owner);

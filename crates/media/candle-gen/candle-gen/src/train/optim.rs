@@ -185,6 +185,7 @@ impl TrainOptimizer {
 
     /// Apply one optimizer step from the (already clipped) gradients.
     pub fn step(&mut self, grads: &GradStore) -> Result<()> {
+        super::profile::comparison_optimizer_step()?;
         match self {
             Self::Adam(a) => a.step(grads),
             Self::Rose(r) => r.step(grads),

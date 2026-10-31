@@ -1047,6 +1047,10 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         device.set_seed(cfg.seed)?;
         super::comparison::record_initialization(&serde_json::json!({"owner":T::LABEL,
             "training_config_debug":format!("{cfg:?}"),"seed":cfg.seed,
+            "optimizer":cfg.optimizer,"learning_rate_f32":cfg.learning_rate,
+            "lr_scheduler":format!("{:?}",cfg.lr_scheduler),"lr_warmup_steps":cfg.lr_warmup_steps,
+            "gradient_checkpointing":cfg.gradient_checkpointing,
+            "cache_scope":"pre-existing encoder/VAE caching unchanged; only source-owned frozen-conditioning/geometry optimization is controlled",
             "factory":"fresh native flow-match child; actual device RNG seeded before cache and adapter construction"}));
     }
     model.preflight(req)?;
