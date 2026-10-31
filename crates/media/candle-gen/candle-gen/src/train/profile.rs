@@ -1,6 +1,6 @@
 //! Minimal source profiling for the single bounded Krea acceptance invocation.
 //! No production setting or preview cadence is changed. A proof-only scope
-//! enables three matched six-update segments (18 TOTAL), never a second job.
+//! selects fixed18, historical recovery6, or original/candidate paired12 updates.
 
 #[cfg(feature = "model-inference-proof")]
 use std::cell::{Cell, RefCell};
@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 #[cfg(feature = "model-inference-proof")]
 thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static PAIRED: Cell<bool> = const { Cell::new(false) };
     static RECOVERY: Cell<bool> = const { Cell::new(false) };
     static RECOVERY_REPORT: RefCell<Option<serde_json::Value>> = const { RefCell::new(None) };
     static SEGMENT: Cell<usize> = const { Cell::new(0) };
@@ -50,6 +51,7 @@ pub fn with_bounded_krea_profile<T>(f: impl FnOnce() -> T) -> T {
         fn drop(&mut self) {
             ACTIVE.set(false);
             RECOVERY.set(false);
+            PAIRED.set(false);
             RECOVERY_REPORT.with(|report| *report.borrow_mut() = None);
             SEGMENT.set(0);
             ATTRIBUTION.set(false);
@@ -72,6 +74,75 @@ pub fn recovery_active() -> bool {
     {
         false
     }
+}
+
+/// Exact original-Reference versus full candidate comparison; no shared segment.
+pub fn paired_active() -> bool {
+    #[cfg(feature = "model-inference-proof")]
+    {
+        PAIRED.get()
+    }
+    #[cfg(not(feature = "model-inference-proof"))]
+    {
+        false
+    }
+}
+
+#[cfg(feature = "model-inference-proof")]
+pub fn with_bounded_krea_paired<T>(f: impl FnOnce() -> T) -> (T, Option<serde_json::Value>) {
+    with_bounded_krea_profile(|| {
+        PAIRED.set(true);
+        let result = f();
+        let report = RECOVERY_REPORT.with(|report| report.borrow_mut().take());
+        (result, report)
+    })
+}
+
+/// Complete same-process observations only; retain the candidate even on NO-GO.
+#[cfg(feature = "model-inference-proof")]
+pub(crate) fn finish_krea_paired(
+    times: &[Vec<f64>; 3],
+    losses: &[Vec<f32>; 3],
+    dispatches: u64,
+) -> candle_core::Result<()> {
+    if !paired_active()
+        || !times[1].is_empty()
+        || !losses[1].is_empty()
+        || [0, 2].iter().any(|&i| {
+            times[i].len() != 4
+                || losses[i].len() != 6
+                || times[i].iter().any(|t| !t.is_finite() || *t <= 0.)
+                || losses[i].iter().any(|l| !l.is_finite())
+        })
+    {
+        candle_core::bail!("incomplete twelve-update Krea paired comparison");
+    }
+    let reference = times[0].iter().sum::<f64>() / 4.;
+    let candidate = times[2].iter().sum::<f64>() / 4.;
+    let parity = losses[0]
+        .iter()
+        .zip(&losses[2])
+        .all(|(a, b)| (a - b).abs() <= 0.01 * a.abs().max(1.));
+    let go = dispatches == 168 && parity && candidate < reference;
+    let report = serde_json::json!({
+        "schema_version":1, "new_optimizer_updates":12, "segment_order":[0,2],
+        "warmup_updates_per_segment":2,"steady_updates_per_segment":4,
+        "prior_conservative_update_charge":20,"hard_update_cap":32,"remaining_updates_after_success":0,
+        "reference_steady_seconds":times[0],"candidate_steady_seconds":times[2],
+        "reference_losses":losses[0],"candidate_losses":losses[2],
+        "reference_mean_seconds":reference,"candidate_mean_seconds":candidate,
+        "candidate_dispatches":dispatches,"loss_parity":parity,"candidate_go":go,
+        "candidate_reduction_vs_original":1.-candidate/reference,
+        "candidate_latency_ratio":candidate/reference,
+        "candidate_seconds_saved_per_update":reference-candidate,
+        "target_met":go && candidate<=0.75*reference,
+        "saved_adapter_role":"actual-paired-candidate-even-on-no-go",
+        "comparison":"same-process-original-reference-vs-full-candidate",
+        "claim_limit":"One serial shared-GPU invocation, not an isolated benchmark. Original Reference0 then fully prepared candidate2; segment1 skipped. Identical deep initial factors, fresh zero-state optimizer and stateless seeded logical inputs; shared frozen weights/cache. Two counted warmups each. Preparation and diagnostics excluded from synchronized steady timing. Smoke, adoption, >=25percent target and convergence are separate; no weight byte attestation."
+    });
+    eprintln!("KREA_PROFILE_PAIRED_RESULT {report}");
+    RECOVERY_REPORT.with(|state| *state.borrow_mut() = Some(report));
+    Ok(())
 }
 
 /// Immutable audited scalar observations, never executable artifact content.

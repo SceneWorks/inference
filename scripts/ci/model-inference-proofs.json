@@ -49845,14 +49845,14 @@
       "cuda",
       "model-inference-proof"
     ],
-    "fixture_identity": "Krea 2 Raw BF16 with actual external model/tokenizer/configuration readers and two source-generated swatches; matched reference/shared/candidate segments totaling 18 optimizer updates, selected adapter reload/apply and one generated sample. Provisioned path/layout is not content-integrity or named-revision attestation. Explicit fixed_cuda_candidate_recovery instead executes six NEW candidate updates with separately identified audited original reference scalar evidence; no baseline replay.",
+    "fixture_identity": "Krea 2 Raw BF16 with actual external model/tokenizer/configuration readers and two source-generated swatches; matched reference/shared/candidate segments totaling 18 optimizer updates, selected adapter reload/apply and one generated sample. Provisioned path/layout is not content-integrity or named-revision attestation. Explicit fixed_cuda_candidate_recovery instead executes six NEW candidate updates with separately identified audited original reference scalar evidence; no baseline replay. Named fixed_cuda_paired_comparison selects exactly12 new updates: original0 and full candidate2, six each, skipping shared1 in one process.",
     "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs::trainer_e2e::krea_bounded_acceleration_profile",
     "required_environment": [
       "KREA_RAW_DIR",
       "MODEL_PROOF_OUTPUT_DIR"
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
-    "output_contract": "Exactly one successful libtest summary, one late actual-FQN BODY and actual learned candle-cuda DEVICE witnesses; required input receipts retain their declared grades. Retain the three declared generated files plus body stdout/stderr. metrics.json records completed updates, fixed configuration, losses, selected adapter final loss and training/preparation device peak; body.stderr.log carries synchronized attribution, warmup/steady timings, dispatch counts, candidate go/no-go and the unchanged >=25% target result. A successful smoke body is not a speed-target PASS or convergence evidence. Recovery configuration additionally requires exact six candidate starts/commits/step/224gradient records and a validated source-bound KREA_PROFILE_RECOVERY_RESULT; always actual candidate adapter onNO-GO, adoption and25percent remain separate decisions.",
+    "output_contract": "Exactly one successful libtest summary, one late actual-FQN BODY and actual learned candle-cuda DEVICE witnesses; required input receipts retain their declared grades. Retain the three declared generated files plus body stdout/stderr. metrics.json records completed updates, fixed configuration, losses, selected adapter final loss and training/preparation device peak; body.stderr.log carries synchronized attribution, warmup/steady timings, dispatch counts, candidate go/no-go and the unchanged >=25% target result. A successful smoke body is not a speed-target PASS or convergence evidence. Recovery configuration additionally requires exact six candidate starts/commits/step/224gradient records and a validated source-bound KREA_PROFILE_RECOVERY_RESULT; always actual candidate adapter onNO-GO, adoption and25percent remain separate decisions. Paired configuration requires exact ordered twelve starts/commits/steps/224gradient records, initial-state witnesses for0/2, changed adapters, per-path attribution and one preparation, recomputed same-process result and current source identity; actual candidate saved even onNO-GO.",
     "configuration_controls": [
       "KREA_PROFILE_CANDIDATE_RECOVERY"
     ],
@@ -49906,6 +49906,30 @@
         "required_cuda_physical_index": 1,
         "cuda_activity_profile": "non-isolated-correctness-headroom",
         "source_guard": "candidate-only-six-new-updates;prior-conservative-charge14;hard-cap20;no-reference-replay"
+      },
+      "fixed_cuda_paired_comparison": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/trainer_e2e.rs::trainer_e2e::krea_bounded_acceleration_profile/fixed_cuda_paired_comparison",
+        "environment": {
+          "KREA_PROFILE_CANDIDATE_RECOVERY": "paired-12"
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Exactly TWELVE NEW updates in ONE invocation: original Reference segment0 six (2warm+4timed), then full optimized FlashBackwardCandidate segment2 six (2warm+4timed). Shared segment1 is skipped. Prior conservative charge20+new12=hard32. Canonical original seed7/rank16/alpha16/LRcanonicalf32/BF16/1024/batch1/accum1/checkpointOFF/cadence500. Actual candidate save/reload/apply and exactly one1024RGB/28denoise/seed7sample even onNO-GO.",
+        "required_work": [
+          "Before any work require exact source-owned selector/12-step complete canonical configuration. Same process/frozen weights/cached swatches/device. Deep initial factors restored exactly; fresh zero-state optimizer/update_idx0 and stateless logical1..6 seed7 noise/timestep/item schedule. No hidden optimizer/parity/warmup runs; every partial/failed/warmup attempt counts.",
+          "Original0 six then candidate2 six ONLY. Two counted excluded warmups and four synchronized steady timings each; first-update inclusive attribution/optimizer span each, single candidate preparation outside step timing, actual28 attention reference/candidate dispatches per path, all224 finite gradients each, changed adapters each.",
+          "Compare ALL SIX original0/candidate2 losses with inherited absdiff<=.01*max(abs(original),1). GO requires all168 candidate dispatches/parity and strictly faster candidate mean; unchanged>=25percent criterion compares candidate mean to original0 mean. Shared-GPU serial ordering/interference and cache warmness prevent an isolated benchmark claim; smoke/convergence/adoption/target are distinct.",
+          "Always save/reopen/apply ACTUAL candidate even onNO-GO and generate exactly ONE1024RGB28denoise seed7sample. Retain full counts/errors, logs/metrics/source/run identity and original model/input provenance grades. Old measurements/failures/source identities remain untouched; no cross-run ratio substituted for this comparison."
+        ],
+        "required_cuda_physical_index": 1,
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "source_guard": "original0-six;candidate2-six;skip-shared1;prior-charge20;hard-cap32;one-invocation"
       }
     },
     "configuration_kind": "source-controls",

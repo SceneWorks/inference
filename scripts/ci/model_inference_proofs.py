@@ -26,7 +26,7 @@ from scripts.ci.model_proof_parent_helpers import validate_parent_helpers
 from scripts.ci.model_proof_resources import validate_child_visibility
 from scripts.ci.model_proof_inputs import assess_inputs, receipt_claims, validate_contract
 from scripts.ci import model_proof_multi_cuda as multi_cuda
-from scripts.ci import krea_recovery
+from scripts.ci import krea_recovery, krea_paired
 from scripts.ci.native_darwin_sdk import select_sdk as select_native_darwin_sdk
 from scripts.ci.prepare_iris_quant_proof_assets import validate_receipt as validate_iris_asset_receipt
 from scripts.ci.prepare_bespoke_training_proof_assets import exact_bindings as bespoke_training_bindings
@@ -343,6 +343,7 @@ def configured_case(row: dict, name: str | None = None) -> dict:
     if 'execution_lane' in recipe:
         result['execution_lane'] = recipe['execution_lane']
     krea_recovery.validate_binding(result)
+    krea_paired.validate_binding(result)
     return result
 
 
@@ -654,7 +655,8 @@ def verify_execution(row: dict, text: str) -> dict:
         raise ValueError('actual in-scope device SET differs from the case contract: ' + repr(sorted(observed)))
     return {'successful_libtest_summaries': len(results), 'body_completed': 1,
             'parent_completed': 1 if parent is not None else None, 'actual_devices': sorted(observed),
-            **krea_recovery.verify_execution(row, text)}
+            **krea_recovery.verify_execution(row, text),
+            **krea_paired.verify_execution(row, text)}
 
 
 def repository_identity(expected: str) -> dict:
@@ -1168,6 +1170,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                                        'additional_cuda_probes': probes[1:]}
                     with claim as physical:
                         result['physical_execution'] = physical
+                        if not discover and krea_paired.validate_binding(row):
+                            result['krea_paired_body_launched'] = True
                         guarded = run_guarded(argv, cwd=ROOT, env=env, policy=discovery_policy if discover else policy,
                                               stdout_path=stdout, stderr_path=stderr,
                                               event_path=case_work / (phase + '.events.jsonl'),
@@ -1219,6 +1223,8 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                     result['outputs'].append(published)
                 if krea_recovery.applies(row) and krea_recovery.validate_binding(row):
                     krea_recovery.verify_metrics(row, json.loads((generated / 'krea_bounded_acceleration/metrics.json').read_text(encoding='utf-8')), result, expected)
+                if krea_paired.validate_binding(row):
+                    krea_paired.verify_metrics(row, json.loads((generated / 'krea_bounded_acceleration/metrics.json').read_text(encoding='utf-8')), result, expected)
                 repository_identity(expected)
                 if result['input_grade'] == 'no-input-executed':
                     raise ValueError('external-absent: no input executed; not successful case execution')
@@ -1258,6 +1264,13 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                         result.setdefault('rejected_outputs', []).append(str(invalid))
                 break
             finally:
+                if krea_paired.validate_binding(row):
+                    body_log = case_work / 'body.stderr.log'
+                    observed = None
+                    if body_log.is_file() and not body_log.is_symlink() and body_log.stat().st_size <= policy.stderr_cap_bytes:
+                        observed = body_log.read_text(encoding='utf-8', errors='replace')
+                    result['krea_paired_update_accounting'] = krea_paired.update_accounting(
+                        observed, body_launched=result.get('krea_paired_body_launched', False), accepted=result['accepted'])
                 result['duration_seconds'] = round(time.monotonic() - started, 6)
                 write_json(case_artifact / 'result.json', result, owned=artifact)
                 write_json(artifact / 'receipt.json', receipt, owned=artifact)
@@ -1488,6 +1501,9 @@ def verify_artifacts(output: Path, temporary: Path, value: dict, expected: str,
         if krea_recovery.applies(approved_rows[index]) and krea_recovery.validate_binding(approved_rows[index]):
             metrics = root / f'{index:05d}/generated/krea_bounded_acceleration/metrics.json'
             krea_recovery.verify_metrics(approved_rows[index], json.loads(metrics.read_text(encoding='utf-8')), execution, expected)
+        if krea_paired.validate_binding(approved_rows[index]):
+            metrics = root / f'{index:05d}/generated/krea_bounded_acceleration/metrics.json'
+            krea_paired.verify_metrics(approved_rows[index], json.loads(metrics.read_text(encoding='utf-8')), execution, expected)
         if any(case.get(key) != value for key, value in execution.items()):
             raise ValueError('accepted execution differs from its actual body logs')
         if approved_uuids:
