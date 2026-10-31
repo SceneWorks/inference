@@ -432,6 +432,7 @@ fn veda_ab_render_one_cell() {
             Progress::Loading(_)
             | Progress::PromptUpsamplingComplete
             | Progress::PromptEncodingComplete
+            | Progress::PostProcessing
             | Progress::ConditioningComplete
             | Progress::Upsampling { .. } => {}
         })

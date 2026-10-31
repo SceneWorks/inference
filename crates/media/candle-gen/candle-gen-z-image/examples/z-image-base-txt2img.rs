@@ -107,6 +107,7 @@ fn main() -> Result<()> {
         Progress::Loading(phase) => println!("\n[base smoke] loading {phase:?}"),
         Progress::PromptUpsamplingComplete
         | Progress::PromptEncodingComplete
+        | Progress::PostProcessing
         | Progress::ConditioningComplete
         | Progress::Upsampling { .. } => {}
     };

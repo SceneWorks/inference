@@ -121,6 +121,7 @@ fn main() -> Result<()> {
         Progress::Loading(_)
         | Progress::PromptUpsamplingComplete
         | Progress::PromptEncodingComplete
+        | Progress::PostProcessing
         | Progress::ConditioningComplete
         | Progress::Upsampling { .. } => {}
     };

@@ -730,6 +730,7 @@ pub fn observe_progress(progress: &Progress) {
         // prompt; it is part of the conditioning window, not a phase of its own here.
         Progress::PromptUpsamplingComplete
         | Progress::PromptEncodingComplete
+        | Progress::PostProcessing
         | Progress::ConditioningComplete
         | Progress::Upsampling { .. } => {}
     });

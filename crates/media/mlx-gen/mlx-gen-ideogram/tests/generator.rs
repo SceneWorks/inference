@@ -85,6 +85,7 @@ fn generates_via_registry() {
             Progress::Loading(_)
             | Progress::PromptUpsamplingComplete
             | Progress::PromptEncodingComplete
+            | Progress::PostProcessing
             | Progress::ConditioningComplete
             | Progress::Upsampling { .. } => {}
         })

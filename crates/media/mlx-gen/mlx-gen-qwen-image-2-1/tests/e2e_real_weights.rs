@@ -797,6 +797,7 @@ fn validation_render_at(
                             "prompt-upsampling-complete".to_owned()
                         }
                         Progress::PromptEncodingComplete => "prompt-encoding-complete".to_owned(),
+                        Progress::PostProcessing => "post-processing".to_owned(),
                         Progress::ConditioningComplete => "conditioning-complete".to_owned(),
                         Progress::Decoding => "before decode".to_owned(),
                         Progress::Upsampling { tokens, max_tokens } => {

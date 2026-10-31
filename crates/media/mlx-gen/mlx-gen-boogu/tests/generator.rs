@@ -78,6 +78,7 @@ fn run(g: &dyn mlx_gen::Generator, req: &GenerationRequest) -> (GenerationOutput
             Progress::Loading(_)
             | Progress::PromptUpsamplingComplete
             | Progress::PromptEncodingComplete
+            | Progress::PostProcessing
             | Progress::ConditioningComplete
             | Progress::Upsampling { .. } => {}
         })

@@ -248,6 +248,7 @@ fn main() -> Result<()> {
         Progress::Loading(phase) => eprintln!("[sc20686-flux2] loading {phase:?}"),
         Progress::PromptUpsamplingComplete
         | Progress::PromptEncodingComplete
+        | Progress::PostProcessing
         | Progress::ConditioningComplete => {}
         Progress::Upsampling { tokens, max_tokens } => {
             eprintln!("[sc20686-flux2] upsampling {tokens}/{max_tokens}")
