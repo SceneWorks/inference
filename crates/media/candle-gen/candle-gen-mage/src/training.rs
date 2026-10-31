@@ -495,11 +495,13 @@ fn step_loss(
     compute_dtype: DType,
     mae: bool,
     aux: Option<&AuxStep<'_>>,
-) -> Result<(Tensor, StepLosses)> {
+) -> Result<(Tensor, StepLosses, Tensor)> {
     let (x_t, target) = build_training_batch(&sample.latent, noise, sigma, compute_dtype)?;
     let sigma_tensor = Tensor::new(&[sigma as f32], noise.device())?;
     let prediction = transformer.forward(
         &x_t,
+        // Production cache entries already own this dtype, so this is an identity-
+        // preserving no-op there. Direct callers retain the same cast boundary.
         &sample.text.to_dtype(compute_dtype)?,
         &sigma_tensor,
         &sample.layout,
@@ -528,7 +530,8 @@ fn step_loss(
         }
         _ => None,
     };
-    combine_terms(diffusion, aux_term)
+    let (loss, losses) = combine_terms(diffusion, aux_term)?;
+    Ok((loss, losses, prediction))
 }
 
 /// The square latent grid side of a cached sample (`[1, grid², C]` tokens).
@@ -567,7 +570,7 @@ fn run_step(
     compute_dtype: DType,
     mae: bool,
     device: &Device,
-) -> Result<(Tensor, StepLosses)> {
+) -> Result<(Tensor, StepLosses, Tensor)> {
     let picked = step_sample(aux, step, schedule);
     let sample = &cache[picked.entry];
     let raw_sigma = flow_match::sample_unit_timestep(
@@ -587,6 +590,111 @@ fn run_step(
         mae,
         plan.as_ref(),
     )
+}
+
+/// The bounded case's first, excluded warmup also checks the newly consumed frozen
+/// caption path against an actual identity-cache miss. Both graphs use the same
+/// sample/noise/sigma and live adapter variables. This reference does no updates.
+#[cfg(feature = "model-inference-proof")]
+#[allow(clippy::too_many_arguments)]
+fn verify_bounded_caption_warmup(
+    transformer: &MageTransformer,
+    cache: &[CachedSample],
+    schedule: &BucketSchedule,
+    cfg: &gen_core::train::TrainingConfig,
+    compute_dtype: DType,
+    mae: bool,
+    device: &Device,
+    cached_loss: f32,
+    cached_prediction: &Tensor,
+    cached_grads: &candle_core::backprop::GradStore,
+    vars: &[Var],
+) -> Result<()> {
+    assert!(
+        cache
+            .iter()
+            .all(|sample| sample.text.dtype() == compute_dtype),
+        "caption cache must own the compute dtype before preparation"
+    );
+    let fallback = cache
+        .iter()
+        .map(|sample| {
+            let text = sample.text.copy()?;
+            assert_ne!(
+                text.id(),
+                sample.text.id(),
+                "reference must miss caption identity"
+            );
+            Ok(CachedSample {
+                latent: sample.latent.clone(),
+                text,
+                layout: sample.layout.clone(),
+                mask_weight: sample.mask_weight.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (loss, losses, prediction) = run_step(
+        transformer,
+        &fallback,
+        schedule,
+        None,
+        cfg,
+        1,
+        compute_dtype,
+        mae,
+        device,
+    )?;
+    assert!(cached_loss.is_finite() && losses.total.is_finite());
+    let loss_error = (cached_loss - losses.total).abs();
+    assert!(loss_error < 1e-5, "cached/fallback loss parity");
+    let magnitude = cached_prediction
+        .to_dtype(DType::F32)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+    let error = cached_prediction
+        .to_dtype(DType::F32)?
+        .sub(&prediction.to_dtype(DType::F32)?)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+    assert!(magnitude.is_finite() && error.is_finite());
+    assert!(
+        error <= magnitude * 2e-5 + 1e-7,
+        "cached/fallback prediction: {error}/{magnitude}"
+    );
+    let prediction_error = error;
+    let fallback_grads = loss.backward()?;
+    let mut nonzero = 0;
+    let mut max_gradient_error = 0f32;
+    for var in vars {
+        let a = cached_grads
+            .get(var.as_tensor())
+            .expect("cached adapter gradient");
+        let b = fallback_grads
+            .get(var.as_tensor())
+            .expect("fallback adapter gradient");
+        let magnitude = a
+            .to_dtype(DType::F32)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        let difference = a.to_dtype(DType::F32)?.sub(&b.to_dtype(DType::F32)?)?;
+        // The finite sum also rejects an isolated NaN that a max reduction on
+        // some backends could otherwise discard.
+        assert!(difference.sqr()?.sum_all()?.to_scalar::<f32>()?.is_finite());
+        let error = difference.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(magnitude.is_finite() && error.is_finite());
+        assert!(
+            error <= magnitude * 2e-5 + 1e-7,
+            "cached/fallback gradient: {error}/{magnitude}"
+        );
+        max_gradient_error = max_gradient_error.max(error);
+        nonzero += usize::from(magnitude > 0.);
+    }
+    assert!(nonzero > 0, "parity must witness a live adapter graph");
+    eprintln!("MAGE_CACHED_CAPTION_WARMUP_PARITY dtype={compute_dtype:?} gradients={} nonzero={nonzero} prediction_max_abs_error={prediction_error} loss_abs_error={loss_error} gradient_max_abs_error={max_gradient_error} fallback_caption_identity=distinct reference_optimizer_updates=0", vars.len());
+    Ok(())
 }
 
 /// The packed latent grid side and the single-image generation layout for one bucket `edge` and a
@@ -611,6 +719,7 @@ fn cache_samples(
     // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are off);
     // each bucket packs its own latent grid.
     let edges = bucket_edges(&req.config);
+    let compute_dtype = flow_match::parse_compute_dtype(&req.config.train_dtype);
     // Item-major: `cache[item * edges.len() + bucket]` (sc-2127).
     let mut cache = Vec::with_capacity(req.items.len() * edges.len());
     for (index, item) in req.items.iter().enumerate() {
@@ -621,7 +730,14 @@ fn cache_samples(
             current: index as u32 + 1,
             total: req.items.len() as u32,
         });
-        let text = text_encoder.encode(&item.caption)?.detach();
+        // The encoder returns F32 even with BF16 weights. Canonicalize once, before
+        // prepare_training keys its frozen base by TensorId; a per-step conversion
+        // would create a fresh identity and miss that cache on every BF16 update.
+        // Retain the original rounding boundary for Full's F32 transformer too.
+        let text = text_encoder
+            .encode(&item.caption)?
+            .to_dtype(compute_dtype)?
+            .detach();
         // sc-24828: the item's subject mask is read + checked once, then resampled per bucket onto
         // that bucket's latent grid (`None` when masked loss is off).
         let mask = PreparedSubjectMask::load_if_enabled(
@@ -849,7 +965,7 @@ impl MageTrainer {
                 break;
             }
             candle_gen::train::profile::cohort_begin_step(&self.device)?;
-            let (loss, losses) = run_step(
+            let (loss, losses, prediction) = run_step(
                 &transformer,
                 &cache,
                 &schedule,
@@ -862,6 +978,27 @@ impl MageTrainer {
             )?;
             last_loss = losses.total;
             let grads = loss.backward()?;
+            #[cfg(feature = "model-inference-proof")]
+            if step == 1 && candle_gen::train::profile::cohort_active() {
+                assert!(
+                    aux.is_none(),
+                    "bounded caption parity uses the plain flow loss"
+                );
+                verify_bounded_caption_warmup(
+                    &transformer,
+                    &cache,
+                    &schedule,
+                    &req.config,
+                    compute_dtype,
+                    mae,
+                    &self.device,
+                    last_loss,
+                    &prediction,
+                    &grads,
+                    &vars,
+                )?;
+            }
+            drop(prediction);
             accumulate_grads(&mut accumulated, grads, &vars)?;
             steps_run = step;
             if step % accum == 0 || step == req.config.steps {
@@ -1418,6 +1555,37 @@ mod tests {
             after.to_bits(),
             "cached conditioning base must keep txt_in residuals live"
         );
+
+        // A caller may supply live conditioning too. Preparation must retain only
+        // geometry in that case, and every call must rebuild its caption graph.
+        let live = Var::from_tensor(&source.text).unwrap();
+        let mut live_sample = masked_sample(None);
+        live_sample.text = live.as_tensor().clone();
+        adapter
+            .prepare_training(&[(&live_sample.text, &live_sample.layout)])
+            .unwrap();
+        assert_eq!(
+            adapter.training_preparation_bytes(&[(&live_sample.text, &live_sample.layout)]),
+            (live_sample.layout.image_tokens() * config::HEAD_DIM * DType::F32.size_in_bytes())
+                as u64,
+            "live conditioning must not retain frozen caption outputs"
+        );
+        for _ in 0..2 {
+            let loss = step_loss(&adapter, &live_sample, &noise, 0.5, DType::F32, false, None)
+                .unwrap()
+                .0;
+            let grads = loss.backward().unwrap();
+            let grad = grads.get(live.as_tensor()).expect("live caption gradient");
+            assert!(
+                grad.abs()
+                    .unwrap()
+                    .max_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap()
+                    > 0.
+            );
+        }
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED training::tests::subject_mask_weight_reaches_adapter_and_full_step_loss");
     }
@@ -1750,7 +1918,7 @@ mod tests {
             aux: Option<&mut AuxDriver>,
             n: u32,
         ) -> (Tensor, StepLosses) {
-            run_step(
+            let (loss, losses, _) = run_step(
                 &f.model,
                 cache,
                 sched,
@@ -1761,7 +1929,8 @@ mod tests {
                 false,
                 &Device::Cpu,
             )
-            .unwrap()
+            .unwrap();
+            (loss, losses)
         }
 
         /// AC1: a depth step has no diffusion term, total == aux, and the LoRA factors get a nonzero
@@ -1862,7 +2031,7 @@ mod tests {
                 perceptual_footprint_bytes(&c, &candle_gen_perceptual::DecoderSpec::None, 1024, 4),
                 0
             );
-            let (loss, off) = run_step(
+            let (loss, off, _) = run_step(
                 &f.model,
                 &cache,
                 &sched,

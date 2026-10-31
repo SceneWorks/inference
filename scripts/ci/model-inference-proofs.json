@@ -305585,7 +305585,7 @@
       "cuda",
       "model-inference-proof"
     ],
-    "fixture_identity": "64px BF16 adapter mode checkpoint OFF, default image attention targets; shared full/adaptation loop has retained focused Full ownership fixture; one 512px 1-step production sample. Real pinned installed model inputs, existing production trainer/dataset helpers. Header/path provisioning is not runtime content/named-revision attestation.",
+    "fixture_identity": "64px BF16 adapter mode checkpoint OFF, default image attention targets; shared full/adaptation loop has retained focused Full ownership fixture; first excluded warmup compares cached caption versus distinct-identity fallback prediction/loss/all optimizer-owned gradients with zero reference optimizer updates; one 512px 1-step production sample. Real pinned installed model inputs, existing production trainer/dataset helpers. Header/path provisioning is not runtime content/named-revision attestation.",
     "configuration_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::mage_bounded_acceleration_acceptance",
     "required_environment": [
       "MAGE_BASE_TRAIN_SNAPSHOT",

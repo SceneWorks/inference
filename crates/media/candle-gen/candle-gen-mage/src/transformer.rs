@@ -587,7 +587,7 @@ impl MageTransformer {
                 layouts.push(*layout);
                 bytes += layout.image_tokens() * HEAD_DIM * self.dtype.size_in_bytes();
             }
-            if !self.text_norm.track_op() && ids.insert(text.id()) {
+            if !text.track_op() && !self.text_norm.track_op() && ids.insert(text.id()) {
                 if let Some(base) = self
                     .text_in
                     .dense_base()
@@ -614,7 +614,8 @@ impl MageTransformer {
             .iter()
             .map(|(text, layout)| {
                 let rope = layout.image_tokens() as u64 * (HEAD_DIM / 2) as u64 * 8;
-                let norm = if !self.text_norm.track_op()
+                let norm = if !text.track_op()
+                    && !self.text_norm.track_op()
                     && self.text_in.dense_base().is_some_and(|base| {
                         !base.weight().track_op() && !base.bias().is_some_and(Tensor::track_op)
                     }) {
@@ -661,7 +662,8 @@ impl MageTransformer {
                     RopeTable::build(layout, self.dtype, text.device())?,
                 ));
             }
-            if !self.text_norm.track_op()
+            if !text.track_op()
+                && !self.text_norm.track_op()
                 && !self.training_text.iter().any(|(id, ..)| *id == text.id())
             {
                 if let Some(base) = self
