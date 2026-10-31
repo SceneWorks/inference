@@ -612,7 +612,7 @@ impl ZImageTransformer2DModel {
     }
 
     pub(crate) fn prepare_training_projections(&mut self) -> Result<()> {
-        if !candle_gen::train::comparison::projection_enabled() {
+        if !candle_gen::train::policy::projection_enabled() {
             return Ok(());
         }
         for block in self

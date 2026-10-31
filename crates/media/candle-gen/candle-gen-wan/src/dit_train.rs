@@ -103,7 +103,7 @@ impl TrainAttention {
     }
 
     fn prepare_training(&mut self, self_attention: bool) -> Result<()> {
-        if !candle_gen::train::comparison::projection_enabled() {
+        if !candle_gen::train::policy::projection_enabled() {
             return Ok(());
         }
         self.projection_pack = if self_attention {
@@ -387,7 +387,7 @@ impl WanTransformerTrain {
 
     /// Each expert prepares its own caption projection: their frozen text embedders differ.
     pub fn prepare_training_context(&mut self, prompt_embeds: &Tensor) -> Result<Tensor> {
-        if !candle_gen::train::comparison::cache_enabled() {
+        if !candle_gen::train::policy::cache_enabled() {
             return Ok(prompt_embeds.clone());
         }
         let context = self.embed_text(prompt_embeds)?;

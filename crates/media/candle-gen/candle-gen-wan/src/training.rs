@@ -1011,8 +1011,21 @@ impl Trainer for WanMoeTrainer {
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
+        // Resolve the complete CUDA training arm before creating any model, cache or optimizer.
+        // Comparison proofs keep their explicit stage; product callbacks and previews stay outside
+        // the production training scope.
+        let policy = candle_gen::train::policy::JobTrainingPolicy::resolve(
+            self.descriptor.id,
+            self.device.is_cuda(),
+            req,
+        )?;
         let mut warnings = Vec::new();
-        let output = self.train_impl(req, on_progress, &mut warnings)?;
+        let output = candle_gen::train::policy::with_job_policy(policy, || {
+            let mut progress = |event| {
+                candle_gen::train::policy::without_production_profile(|| on_progress(event));
+            };
+            self.train_impl(req, &mut progress, &mut warnings)
+        })?;
         Ok(TrainingReport { output, warnings })
     }
 }
@@ -1404,7 +1417,9 @@ impl WanMoeTrainer {
                             break;
                         }
                         let seed = flow_match::sample_seed(cfg.seed, step, i);
-                        match render_one_preview(&experts, state, i, cfg, seed, device) {
+                        match candle_gen::train::policy::without_production_profile(|| {
+                            render_one_preview(&experts, state, i, cfg, seed, device)
+                        }) {
                             Ok(image) => on_progress(TrainingProgress::Sample {
                                 step,
                                 index: i as u32 + 1,
@@ -1502,6 +1517,42 @@ mod tests {
     use candle_gen::gen_core::Quant;
     use candle_gen::train::lora::build_lora_targets;
     use candle_gen::train::optim::clip_grad_norm;
+
+    #[test]
+    fn production_profile_binds_only_measured_cuda_variant() {
+        use candle_gen::gen_core::runtime::CancelFlag;
+        use candle_gen::train::policy::{JobTrainingPolicy, TrainingProfile};
+
+        let req = TrainingRequest {
+            items: Vec::new(),
+            config: TrainingConfig::default(),
+            output_dir: PathBuf::from("unused-policy-output"),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: Vec::new(),
+            cancel: CancelFlag::new(),
+        };
+        for variant in [
+            TrainVariant::T2v14b,
+            TrainVariant::I2v14b,
+            TrainVariant::Ti2v5b,
+        ] {
+            let id = variant.descriptor().id;
+            let cuda = JobTrainingPolicy::resolve(id, true, &req).unwrap();
+            let expected = if matches!(variant, TrainVariant::Ti2v5b) {
+                TrainingProfile::WithoutE1
+            } else {
+                TrainingProfile::Current
+            };
+            assert_eq!(cuda.profile(), expected, "{id}");
+            assert_eq!(
+                JobTrainingPolicy::resolve(id, false, &req)
+                    .unwrap()
+                    .profile(),
+                TrainingProfile::Current,
+                "CPU/Metal {id}"
+            );
+        }
+    }
 
     /// A tiny Wan-shaped DiT (z16, head_dim 128, 1 head, 1 layer) — exercises the real flow-match
     /// forward+backward on CPU.

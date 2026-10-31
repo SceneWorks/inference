@@ -191,7 +191,18 @@ impl Trainer for KolorsTrainer {
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let policy = candle_gen::train::policy::JobTrainingPolicy::resolve(
+            self.descriptor.id,
+            self.device.is_cuda(),
+            req,
+        )?;
+        candle_gen::train::policy::with_job_policy(policy, || {
+            let mut progress = |event| {
+                candle_gen::train::policy::without_production_profile(|| on_progress(event));
+            };
+            self.train_impl(req, &mut progress)
+        })
+        .map_err(Into::into)
     }
 }
 
@@ -595,7 +606,7 @@ impl KolorsTrainer {
             }));
         }
         let mut contexts = HashMap::<_, Tensor>::new();
-        if candle_gen::train::comparison::cache_enabled() {
+        if candle_gen::train::policy::cache_enabled() {
             for (_, context, _, _) in &mut cache {
                 let id = context.id();
                 *context = match contexts.get(&id) {
@@ -613,7 +624,7 @@ impl KolorsTrainer {
         // Legacy/E2-off evaluates the real Kolors encoder_hid_proj on every step.
         // Other arms release its weights after replacing the frozen cache entries.
         let uncached_context_projection =
-            (!candle_gen::train::comparison::cache_enabled()).then_some(context_projection);
+            (!candle_gen::train::policy::cache_enabled()).then_some(context_projection);
         let contexts = contexts.into_values().collect::<Vec<_>>();
         let preparation_bytes = unet.training_preparation_bytes(&contexts)? as u64;
         flow_match::check_preparation_memory(
@@ -760,6 +771,33 @@ mod tests {
     use candle_gen::gen_core::train::{TrainingConfig, TrainingItem};
 
     use super::*;
+
+    #[test]
+    fn production_profile_binds_exact_cuda_descriptor() {
+        use candle_gen::train::policy::{JobTrainingPolicy, TrainingProfile};
+
+        let req = TrainingRequest {
+            items: Vec::new(),
+            config: TrainingConfig::default(),
+            output_dir: PathBuf::from("unused-policy-output"),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: Vec::new(),
+            cancel: CancelFlag::new(),
+        };
+        let id = trainer_descriptor().id;
+        assert_eq!(
+            JobTrainingPolicy::resolve(id, true, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::WithoutE3
+        );
+        assert_eq!(
+            JobTrainingPolicy::resolve(id, false, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+    }
 
     struct SentinelChatGlm<'a> {
         called: &'a Cell<bool>,

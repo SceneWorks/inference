@@ -1876,8 +1876,15 @@ impl Trainer for LtxTrainer {
         }
         gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
+        let policy = candle_gen::train::policy::JobTrainingPolicy::resolve(
+            self.descriptor.id,
+            self.device.is_cuda(),
+            req,
+        )?;
         let mut warnings = Vec::new();
-        let output = run_flow_match_training(self, req, on_progress, &mut warnings)?;
+        let output = candle_gen::train::policy::with_job_policy(policy, || {
+            run_flow_match_training(self, req, on_progress, &mut warnings)
+        })?;
         Ok(TrainingReport { output, warnings })
     }
 }
@@ -3710,7 +3717,7 @@ impl FlowMatchTrainer for LtxTrainer {
                     Ok(())
                 })?;
                 dit.prepare_training()?;
-                if !candle_gen::train::comparison::cache_enabled() {
+                if !candle_gen::train::policy::cache_enabled() {
                     return Ok(());
                 }
                 let mut position_interner = crate::rope::TrainingPositionInterner::default();
@@ -4091,6 +4098,34 @@ mod tests {
             file_name: "ltx.safetensors".into(),
             trigger_words: vec![],
             cancel: CancelFlag::new(),
+        }
+    }
+
+    #[test]
+    fn production_profile_binds_only_measured_cuda_variant() {
+        use candle_gen::train::policy::{JobTrainingPolicy, TrainingProfile};
+
+        let req = request();
+        for (descriptor, expected) in [
+            (trainer_descriptor(), TrainingProfile::Current),
+            (trainer_descriptor_25(), TrainingProfile::WithoutE2),
+        ] {
+            assert_eq!(
+                JobTrainingPolicy::resolve(descriptor.id, true, &req)
+                    .unwrap()
+                    .profile(),
+                expected,
+                "{}",
+                descriptor.id
+            );
+            assert_eq!(
+                JobTrainingPolicy::resolve(descriptor.id, false, &req)
+                    .unwrap()
+                    .profile(),
+                TrainingProfile::Current,
+                "CPU/Metal {}",
+                descriptor.id
+            );
         }
     }
 

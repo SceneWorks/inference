@@ -217,7 +217,18 @@ impl Trainer for Sd3Trainer {
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let policy = candle_gen::train::policy::JobTrainingPolicy::resolve(
+            self.descriptor.id,
+            self.device.is_cuda(),
+            req,
+        )?;
+        candle_gen::train::policy::with_job_policy(policy, || {
+            let mut progress = |event| {
+                candle_gen::train::policy::without_production_profile(|| on_progress(event));
+            };
+            self.train_impl(req, &mut progress)
+        })
+        .map_err(Into::into)
     }
 }
 
@@ -730,6 +741,35 @@ mod tests {
             file_name: "adapter.safetensors".into(),
             trigger_words: Vec::new(),
             cancel: CancelFlag::new(),
+        }
+    }
+
+    #[test]
+    fn production_profile_binds_only_measured_cuda_variant() {
+        use candle_gen::train::policy::{JobTrainingPolicy, TrainingProfile};
+
+        let req = request();
+        for variant in [Variant::Medium, Variant::Large] {
+            let id = descriptor_for(variant).id;
+            let expected = if matches!(variant, Variant::Medium) {
+                TrainingProfile::Legacy
+            } else {
+                TrainingProfile::Current
+            };
+            assert_eq!(
+                JobTrainingPolicy::resolve(id, true, &req)
+                    .unwrap()
+                    .profile(),
+                expected,
+                "{id}"
+            );
+            assert_eq!(
+                JobTrainingPolicy::resolve(id, false, &req)
+                    .unwrap()
+                    .profile(),
+                TrainingProfile::Current,
+                "CPU/Metal {id}"
+            );
         }
     }
 
