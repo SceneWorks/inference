@@ -6,6 +6,123 @@ use candle_nn::{Linear, Module};
 use super::lora::LoraLinear;
 use crate::quant::AdaptLinear;
 
+/// Keep an immutable quantized base packed on the autograd tape. Ordinary
+/// dequantize + matmul retains every decoded weight for the input gradient,
+/// expanding an entire QLoRA trunk to f32 before backward can release anything.
+/// Decode just this projection again when its input cotangent is requested.
+pub(crate) fn frozen_packed_forward(
+    x: &Tensor,
+    weight: &std::sync::Arc<candle_core::quantized::QTensor>,
+    bias: Option<&Tensor>,
+) -> candle_core::Result<Tensor> {
+    let composable = |input: &Tensor| {
+        let w = weight.dequantize(input.device())?.to_dtype(input.dtype())?;
+        let bias = bias.map(|b| b.to_dtype(input.dtype())).transpose()?;
+        Linear::new(w, bias).forward(input)
+    };
+    if !x.track_op()
+        || candle_core::backprop::grad_do_not_detach()
+        || !super::norm::supported(x)
+        || bias.is_some_and(Tensor::track_op)
+    {
+        return composable(x);
+    }
+    // Identical forward arithmetic, with no inner graph retaining the decoded
+    // weight. Output owns only its detached allocation, not this temporary graph.
+    let out = composable(&x.detach())?;
+    super::profile::cohort_reuse("ltx:bounded-packed-frozen-input-vjp");
+    x.apply_op1(FrozenPackedInput {
+        output: super::norm::Output::new(out)?,
+        weight: weight.clone(),
+        probe_bias: super::profile::cohort_claim_probe("ltx:packed-frozen-vjp-reference-parity")
+            .then(|| bias.cloned()),
+    })
+}
+
+struct FrozenPackedInput {
+    output: super::norm::Output,
+    weight: std::sync::Arc<candle_core::quantized::QTensor>,
+    // Only the first excluded warmup's selected projection retains this handle.
+    probe_bias: Option<Option<Tensor>>,
+}
+
+impl candle_core::CustomOp1 for FrozenPackedInput {
+    fn name(&self) -> &'static str {
+        "frozen-packed-input-vjp"
+    }
+    fn cpu_fwd(
+        &self,
+        _: &candle_core::CpuStorage,
+        _: &candle_core::Layout,
+    ) -> candle_core::Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        self.output.cpu()
+    }
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        _: &candle_core::CudaStorage,
+        _: &candle_core::Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, candle_core::Shape)> {
+        self.output.cuda()
+    }
+    fn bwd(
+        &self,
+        x: &Tensor,
+        result: &Tensor,
+        grad: &Tensor,
+    ) -> candle_core::Result<Option<Tensor>> {
+        let w = self.weight.dequantize(x.device())?.to_dtype(x.dtype())?;
+        let grad = grad.detach();
+        // Match Linear's contiguous 3D/4D flattening and its broadcast fallback.
+        let dx = if x.is_contiguous() && matches!(x.rank(), 3 | 4) {
+            let rows = grad.elem_count() / grad.dim(D::Minus1)?;
+            grad.reshape((rows, grad.dim(D::Minus1)?))?
+                .matmul(&w)?
+                .reshape(x.shape())?
+        } else {
+            grad.broadcast_matmul(&w)?
+        };
+        // One real projection in the first excluded cohort warmup compares this
+        // VJP with the old composable backward. No reference optimizer update or
+        // whole-trunk dense graph is constructed, and steady steps do no probes.
+        if let Some(bias) = &self.probe_bias {
+            let input = candle_core::Var::from_tensor(&x.detach())?;
+            let bias = bias.as_ref().map(|b| b.to_dtype(x.dtype())).transpose()?;
+            let y = Linear::new(w, bias).forward(input.as_tensor())?;
+            let forward_error = (result.to_dtype(DType::F32)? - y.to_dtype(DType::F32)?)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            if forward_error != 0.0 {
+                candle_core::bail!(
+                    "packed frozen forward reference mismatch: max_abs={forward_error}"
+                );
+            }
+            let reference = (y * &grad)?.sum_all()?.backward()?;
+            let expected = reference.get(input.as_tensor()).ok_or_else(|| {
+                candle_core::Error::Msg("packed input VJP reference gradient missing".into())
+            })?;
+            let error = (&dx.to_dtype(DType::F32)? - &expected.to_dtype(DType::F32)?)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            let scale = expected
+                .to_dtype(DType::F32)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            if !error.is_finite() || !scale.is_finite() || error > 1e-6 * scale.max(1.0) {
+                candle_core::bail!(
+                    "packed input VJP reference mismatch: max_abs={error}, reference_scale={scale}"
+                );
+            }
+            super::profile::cohort_reuse("ltx:packed-frozen-vjp-reference-parity");
+            eprintln!("COHORT_PACKED_INPUT_VJP_PARITY forward_max_abs={forward_error} input_vjp_max_abs={error} reference_scale={scale} frozen_bias={}", self.probe_bias.as_ref().is_some_and(Option::is_some));
+        }
+        Ok(Some(dx))
+    }
+}
+
 /// Apply a two-dimensional factor without materializing one copy per leading batch.
 pub(crate) fn apply_factor(x: &Tensor, w: &Tensor) -> candle_core::Result<Tensor> {
     if super::profile::reference_math() || w.rank() != 2 || x.rank() <= 2 {

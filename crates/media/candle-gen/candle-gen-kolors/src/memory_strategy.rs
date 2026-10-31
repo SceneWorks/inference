@@ -30,6 +30,9 @@ pub const IP_PROVIDER_ID: &str = "candle_kolors_ipadapter";
 pub const CONTROL_PROVIDER_ID: &str = "candle_kolors_control";
 pub const KOLORS_REPOSITORY: &str = "SceneWorks/kolors-mlx";
 pub const KOLORS_REVISION: &str = "aadbd49f53b66a33ef1be09384eac409cbc44061";
+/// Dense upstream source used by Kolors training and adapter sample reloads.
+pub const KOLORS_DIFFUSERS_REPOSITORY: &str = "Kwai-Kolors/Kolors-diffusers";
+pub const KOLORS_DIFFUSERS_REVISION: &str = "7e091c75199e910a26cd1b51ed52c28de5db3711";
 pub const IP_REPOSITORY: &str = "Kwai-Kolors/Kolors-IP-Adapter-Plus";
 pub const IP_REVISION: &str = "5c72aa86cd8d9d23ff406d293c5473820e09e1d9";
 pub const CONTROL_REPOSITORY: &str = "Kwai-Kolors/Kolors-ControlNet-Pose";
@@ -96,11 +99,11 @@ impl KolorsLoadSeal {
         contract: MemoryProviderContract,
         load_shape: gen_core::LoadShape,
     ) -> gen_core::Result<Self> {
-        validate_base_source(root)?;
+        let source = validate_base_source(root)?;
         if let Some((_, _, path, repository, revision, namespace)) = auxiliary {
             validate_immutable_component_source(path, repository, revision, namespace)?;
         }
-        let tier = physical_tier(root)?;
+        let tier = source.physical_tier(root)?;
         validate_float_tensor_inventory(&root.join("vae"), "vae")?;
         let mut inventories = vec![Self::capture_inventory("base", root)?];
         if let Some((_, _, path, _, _, _)) = auxiliary {
@@ -570,9 +573,9 @@ fn sealed_contract(
     pid: Option<&PidWeights>,
     load_shape: gen_core::LoadShape,
 ) -> gen_core::Result<MemoryProviderContract> {
-    validate_base_source(root)?;
+    let source = validate_base_source(root)?;
     // sc-22732: the proven tier is the production calibration key, not a discarded side effect.
-    let tier = physical_tier(root)?;
+    let tier = source.physical_tier(root)?;
     let conditioning_tokenizer = receipt_for("kolors-tokenizer", &root.join("tokenizer"))?;
     let conditioning_text = receipt_for("kolors-chatglm", &root.join("text_encoder"))?;
     let transformer = receipt_for("kolors-unet", &root.join("unet"))?;
@@ -584,8 +587,8 @@ fn sealed_contract(
         ));
     }
     let mut physical = Sha256::new();
-    update_framed(&mut physical, KOLORS_REPOSITORY.as_bytes());
-    update_framed(&mut physical, KOLORS_REVISION.as_bytes());
+    update_framed(&mut physical, source.repository().as_bytes());
+    update_framed(&mut physical, source.revision().as_bytes());
     update_framed(&mut physical, &conditioning_tokenizer.digest.finalize());
     update_framed(&mut physical, &conditioning_text.digest.finalize());
     update_framed(&mut physical, &transformer.digest.finalize());
@@ -640,7 +643,12 @@ fn sealed_contract(
     let mut contract = provider_contract_for(
         provider_id,
         load_shape,
-        production_calibration_identity(provider_id, tier.quant, adapters, pid, load_shape),
+        // The published cells belong to the rehost, not an uncalibrated upstream snapshot.
+        if matches!(source, BaseSource::Rehost(_)) {
+            production_calibration_identity(provider_id, tier.quant, adapters, pid, load_shape)
+        } else {
+            None
+        },
     );
     // The seal is the only path that has proven a materialized snapshot, so it is the only one that
     // may publish architecture axes; `provider_contract_for` stays the empty weights-free surface.
@@ -681,22 +689,79 @@ fn path_has_suffix(path: &Path, suffix: &[&str]) -> bool {
     )
 }
 
-fn validate_base_source(root: &Path) -> gen_core::Result<PathBuf> {
+/// Source provenance and declared packing are separate from the physical header proof. In
+/// particular, an upstream snapshot's revision leaf is never interpreted as a numeric tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BaseSource {
+    Rehost(Option<Quant>),
+    Diffusers,
+}
+
+impl BaseSource {
+    fn repository(self) -> &'static str {
+        match self {
+            Self::Rehost(_) => KOLORS_REPOSITORY,
+            Self::Diffusers => KOLORS_DIFFUSERS_REPOSITORY,
+        }
+    }
+
+    fn revision(self) -> &'static str {
+        match self {
+            Self::Rehost(_) => KOLORS_REVISION,
+            Self::Diffusers => KOLORS_DIFFUSERS_REVISION,
+        }
+    }
+
+    fn physical_tier(self, root: &Path) -> gen_core::Result<MemoryNumericTier> {
+        let tier = physical_tier(root)?;
+        let expected = match self {
+            Self::Rehost(quant) => quant,
+            Self::Diffusers => None,
+        };
+        if tier.quant != expected {
+            return Err(gen_core::Error::Unsupported(format!(
+                "kolors: {}@{} source packing disagrees with physical tensor tier",
+                self.repository(),
+                self.revision()
+            )));
+        }
+        Ok(tier)
+    }
+}
+
+fn validate_base_source(root: &Path) -> gen_core::Result<BaseSource> {
     let canonical = std::fs::canonicalize(root).map_err(|error| {
         gen_core::Error::Msg(format!(
             "kolors cannot canonicalize source {}: {error}",
             root.display()
         ))
     })?;
-    let tier = canonical
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| gen_core::Error::Unsupported("kolors source has no UTF-8 tier".into()))?;
-    if !matches!(tier, "q4" | "q8" | "bf16") {
-        return Err(gen_core::Error::Unsupported(format!(
-            "kolors exact source tier must be q4, q8, or bf16, got {tier}"
-        )));
+    if path_has_suffix(
+        &canonical,
+        &[
+            "models--Kwai-Kolors--Kolors-diffusers",
+            "snapshots",
+            KOLORS_DIFFUSERS_REVISION,
+        ],
+    ) || path_has_suffix(
+        &canonical,
+        &["Kwai-Kolors__Kolors-diffusers", KOLORS_DIFFUSERS_REVISION],
+    ) || path_has_suffix(&canonical, &["Kolors-diffusers", KOLORS_DIFFUSERS_REVISION])
+    {
+        return Ok(BaseSource::Diffusers);
     }
+    let tier = canonical.file_name().and_then(|name| name.to_str());
+    let quant = match tier {
+        Some("q4") => Some(Quant::Q4),
+        Some("q8") => Some(Quant::Q8),
+        Some("bf16") => None,
+        _ => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "kolors source must resolve to exact immutable {KOLORS_REPOSITORY}@{KOLORS_REVISION}/{{q4,q8,bf16}} or {KOLORS_DIFFUSERS_REPOSITORY}@{KOLORS_DIFFUSERS_REVISION}"
+            )))
+        }
+    };
+    let tier = tier.expect("matched a UTF-8 tier");
     let valid = path_has_suffix(
         &canonical,
         &[
@@ -714,7 +779,7 @@ fn validate_base_source(root: &Path) -> gen_core::Result<PathBuf> {
             "kolors source must resolve to exact immutable {KOLORS_REPOSITORY}@{KOLORS_REVISION}/{tier}"
         )));
     }
-    Ok(canonical)
+    Ok(BaseSource::Rehost(quant))
 }
 
 fn validate_immutable_component_source(
@@ -907,7 +972,8 @@ const FINGERPRINTS: gen_core::MemoryFingerprintTable = gen_core::MemoryFingerpri
     pins: &[],
 };
 
-/// The identity a sealed Kolors contract publishes, bound to the artifact it opened.
+/// The identity a sealed rehost Kolors contract publishes, bound to the artifact it opened.
+/// The caller withholds this table for the upstream diffusers source: no rehost cell certifies it.
 ///
 /// The tier comes from [`physical_tier`], which cross-checks each component's `config.json` marker
 /// against the real safetensors header dtypes, shapes and packed-triple geometry and refuses a
@@ -1178,9 +1244,10 @@ pub fn physical_tier(root: &Path) -> gen_core::Result<MemoryNumericTier> {
         ));
     }
     let quant = text.map(|(bits, _)| if bits == 4 { Quant::Q4 } else { Quant::Q8 });
-    // The canonical bf16 snapshot executes Candle's exact F32 loader recipe and F32 VAE.  The
-    // numeric identity stays BF16 (physical bytes), while execution precision is documented by the
-    // provider's receipt/phase implementation rather than pretending the source artifact is F32.
+    // `Precision::Bf16` is the contract's native-dense sentinel, not a literal storage dtype.
+    // Both the rehost's `bf16` directory and upstream F16 shards use the exact F32 loader/VAE
+    // recipe. Source provenance and physical bytes remain in the receipt; upstream never borrows
+    // a rehost calibration identity merely because both resolve to this native-dense tier.
     Ok(MemoryNumericTier {
         precision: Precision::Bf16,
         quant,
@@ -2209,7 +2276,7 @@ mod tests {
 
     /// One canonical Kolors snapshot at an advertised tier (sc-22732).
     ///
-    /// `validate_base_source` requires the leaf directory to be spelled exactly `q4`/`q8`/`bf16`,
+    /// The rehost source requires the leaf directory to be spelled exactly `q4`/`q8`/`bf16`,
     /// and `inspect_component_tier` cross-checks the `quantization` marker against the real tensor
     /// headers — so a packed tier writes the packed triple AND the matching marker, and `bf16`
     /// writes dense BF16 tensors under an empty config.
@@ -2226,6 +2293,13 @@ mod tests {
             .join("snapshots")
             .join(KOLORS_REVISION)
             .join(tier);
+        write_base_inventory(&root, bits);
+        root
+    }
+
+    // Serialized safetensors metadata/zero payload only: these fixtures are never loaded as
+    // tensors or passed to a learned module, optimizer, or generator.
+    fn write_base_inventory(root: &Path, bits: Option<u8>) {
         for component in ["text_encoder", "unet", "vae"] {
             let path = root.join(component).join("model.safetensors");
             let heavy = component != "vae";
@@ -2241,7 +2315,116 @@ mod tests {
         }
         std::fs::create_dir_all(root.join("tokenizer")).unwrap();
         std::fs::write(root.join("tokenizer/tokenizer.json"), "{}").unwrap();
+    }
+
+    fn upstream_base(temp: &tempfile::TempDir) -> PathBuf {
+        let root = temp
+            .path()
+            .join("models--Kwai-Kolors--Kolors-diffusers")
+            .join("snapshots")
+            .join(KOLORS_DIFFUSERS_REVISION);
+        write_base_inventory(&root, None);
+        // The actual pinned upstream storage is F16, including its sharded ChatGLM inventory.
+        for component in ["text_encoder", "unet", "vae"] {
+            write_tensor(
+                &root.join(component).join("model.safetensors"),
+                "F16",
+                &[2, 3],
+            );
+        }
         root
+    }
+
+    #[test]
+    fn metadata_upstream_adapter_sample_seal_keeps_source_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let upstream = upstream_base(&temp);
+        let shape = gen_core::LoadShape::EagerMaterialization;
+        let clean = KolorsLoadSeal::capture_load(&upstream, &[], None, shape).unwrap();
+        assert_eq!(clean.tier().quant, None);
+        assert!(clean.contract().calibration.is_none());
+
+        let rehost = canonical_base_tier(&temp, "bf16");
+        // Identical bytes still belong to distinct immutable source repositories/revisions.
+        for component in ["text_encoder", "unet", "vae"] {
+            write_tensor(
+                &rehost.join(component).join("model.safetensors"),
+                "F16",
+                &[2, 3],
+            );
+        }
+        let rehost = KolorsLoadSeal::capture_load(&rehost, &[], None, shape).unwrap();
+        assert!(rehost.contract().calibration.is_some());
+        let physical = |seal: &KolorsLoadSeal| {
+            seal.contract()
+                .resident_components()
+                .iter()
+                .find(|component| component.id.starts_with(PHYSICAL_RECEIPT_PREFIX))
+                .unwrap()
+                .id
+                .clone()
+        };
+        assert_ne!(physical(&clean), physical(&rehost));
+
+        let adapter = temp.path().join("adapter.safetensors");
+        write_tensor(&adapter, "F32", &[2, 3]);
+        let adapted = KolorsLoadSeal::capture_load(
+            &upstream,
+            &[AdapterSpec::new(adapter.clone(), 1.0, AdapterKind::Lora)],
+            None,
+            shape,
+        )
+        .unwrap();
+        assert_eq!(physical(&clean), physical(&adapted));
+        assert!(adapted.contract().calibration.is_none());
+        assert!(adapted
+            .contract()
+            .resident_components()
+            .iter()
+            .any(|component| component.id.starts_with(ADAPTER_RECEIPT_PREFIX)));
+        adapted.ensure_unchanged().unwrap();
+        std::fs::write(&adapter, b"replaced adapter").unwrap();
+        assert!(adapted.ensure_unchanged().is_err());
+    }
+
+    #[test]
+    fn metadata_base_source_refuses_wrong_revision_or_physical_packing() {
+        let temp = tempfile::tempdir().unwrap();
+        let upstream = upstream_base(&temp);
+        assert_eq!(
+            validate_base_source(&upstream).unwrap(),
+            BaseSource::Diffusers
+        );
+        for relative in [
+            "models--Kwai-Kolors--Kolors-diffusers/snapshots/main".to_owned(),
+            format!("models--Kwai-Kolors--Kolors-diffusers/snapshots/{KOLORS_REVISION}"),
+            format!("models--Other--Kolors-diffusers/snapshots/{KOLORS_DIFFUSERS_REVISION}"),
+            format!(
+                "models--Kwai-Kolors--Kolors-diffusers/snapshots/{KOLORS_DIFFUSERS_REVISION}/bf16"
+            ),
+        ] {
+            let wrong = temp.path().join(relative);
+            std::fs::create_dir_all(&wrong).unwrap();
+            assert!(validate_base_source(&wrong).is_err(), "{}", wrong.display());
+        }
+        // A path cannot confer a tier: both headers and config must prove the declared source.
+        write_base_inventory(&upstream, Some(4));
+        assert!(provider_contract_for_load(
+            &upstream,
+            &[],
+            None,
+            gen_core::LoadShape::EagerMaterialization
+        )
+        .is_err());
+        let rehost = canonical_base_tier(&temp, "q4");
+        write_base_inventory(&rehost, None);
+        assert!(provider_contract_for_load(
+            &rehost,
+            &[],
+            None,
+            gen_core::LoadShape::EagerMaterialization
+        )
+        .is_err());
     }
 
     fn canonical_pid(temp: &tempfile::TempDir) -> (PidWeights, PathBuf, PathBuf) {

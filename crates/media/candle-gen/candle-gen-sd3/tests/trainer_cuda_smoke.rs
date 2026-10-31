@@ -7,8 +7,33 @@ use candle_gen::gen_core::{
     NetworkType, TrainingConfig, TrainingItem, TrainingRequest, WeightsSource,
 };
 
+/// Training accepts upstream diffusers snapshots; generation admits only the exact shipped
+/// SceneWorks turnkey. Keep their source identities separate rather than relabelling the trainer
+/// snapshot as a production artifact. The production receipt checks the route, revision, tier,
+/// inventory and physical headers before any optimizer update can be consumed.
+fn sample_load_spec(id: &str) -> LoadSpec {
+    let (route, sample_env) = match id {
+        "sd3_5_medium" => (
+            candle_gen_sd3::memory_strategy::Sd35Route::Medium,
+            "SD35_MEDIUM_SAMPLE_SNAPSHOT",
+        ),
+        "sd3_5_large" => (
+            candle_gen_sd3::memory_strategy::Sd35Route::Large,
+            "SD35_LARGE_SAMPLE_SNAPSHOT",
+        ),
+        other => panic!("unsupported SD3.5 training sample route {other}"),
+    };
+    let snapshot =
+        PathBuf::from(std::env::var_os(sample_env).unwrap_or_else(|| panic!("set {sample_env}")));
+    let spec = LoadSpec::new(WeightsSource::Dir(snapshot)).with_resolved_route(route.provider_id());
+    candle_gen_sd3::memory_strategy::Sd35LoadReceipt::capture(route, &spec)
+        .expect("sample must satisfy the production route contract before training");
+    spec
+}
+
 fn run(id: &str, env: &str, kind: NetworkType) {
     let snapshot = PathBuf::from(std::env::var(env).unwrap_or_else(|_| panic!("set {env}")));
+    let sample_spec = sample_load_spec(id);
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("input.png");
     image::RgbImage::from_pixel(64, 64, image::Rgb([60, 180, 90]))
@@ -80,18 +105,16 @@ fn run(id: &str, env: &str, kind: NetworkType) {
         };
         images[0].pixels.clone()
     };
-    let base = render(LoadSpec::new(WeightsSource::Dir(snapshot.clone())));
+    let base = render(sample_spec.clone());
     let runtime_kind = match kind {
         NetworkType::Lora => AdapterKind::Lora,
         NetworkType::Lokr => AdapterKind::Lokr,
     };
-    let adapted = render(
-        LoadSpec::new(WeightsSource::Dir(snapshot)).with_adapters(vec![AdapterSpec::new(
-            output.adapter_path,
-            1.0,
-            runtime_kind,
-        )]),
-    );
+    let adapted = render(sample_spec.with_adapters(vec![AdapterSpec::new(
+        output.adapter_path,
+        1.0,
+        runtime_kind,
+    )]));
     assert_ne!(
         base, adapted,
         "production-installed adapter must change output"
@@ -165,6 +188,7 @@ fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, dir: &std::path::Path
 #[cfg(feature = "model-inference-proof")]
 fn bounded_run(id: &str, env: &str, kind: NetworkType) {
     let snapshot = PathBuf::from(std::env::var(env).unwrap_or_else(|_| panic!("set {env}")));
+    let sample_spec = sample_load_spec(id);
     let retained = bounded_output_root();
     let sampler = candle_gen::testkit::PeakSampler::start_rendered();
     let temp = &retained;
@@ -259,13 +283,11 @@ fn bounded_run(id: &str, env: &str, kind: NetworkType) {
         NetworkType::Lora => AdapterKind::Lora,
         NetworkType::Lokr => AdapterKind::Lokr,
     };
-    let adapted = render(
-        LoadSpec::new(WeightsSource::Dir(snapshot)).with_adapters(vec![AdapterSpec::new(
-            output.adapter_path,
-            1.0,
-            runtime_kind,
-        )]),
-    );
+    let adapted = render(sample_spec.with_adapters(vec![AdapterSpec::new(
+        output.adapter_path,
+        1.0,
+        runtime_kind,
+    )]));
     assert!(adapted.iter().any(|value| *value != 0));
 }
 #[test]

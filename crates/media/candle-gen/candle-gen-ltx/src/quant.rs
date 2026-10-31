@@ -93,6 +93,7 @@ pub struct QLinear {
     in_features: usize,
     out_features: usize,
     attestation: String,
+    bounded_packed_training: bool,
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -131,6 +132,9 @@ impl QLinear {
     /// shared [`LoraLinear`].
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let output = match &self.base {
+            QLinearBase::Adapt(linear) if self.bounded_packed_training => {
+                __model_proof_output!(linear.forward_bounded_packed(x))
+            }
             QLinearBase::Adapt(linear) => __model_proof_output!(linear.forward(x)),
             QLinearBase::ConvRot(linear) => __model_proof_output!(linear.forward(x)),
             QLinearBase::Nvfp4(linear) => __model_proof_output!(linear.forward(x)),
@@ -245,6 +249,12 @@ impl QLinear {
             QLinearBase::ConvRot(_) | QLinearBase::Nvfp4(_) => None,
         }
     }
+
+    /// Selected once by the full AV QLoRA trainer, independently of proof mode.
+    /// Legacy LTX-2.3 video training and ordinary generators keep their old route.
+    pub(crate) fn enable_bounded_packed_training(&mut self) {
+        self.bounded_packed_training = true;
+    }
 }
 
 impl Module for QLinear {
@@ -354,6 +364,7 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
                 in_features,
                 out_features,
                 attestation,
+                bounded_packed_training: false,
             });
         }
         source.refuse_undeclared_advanced_tensor(&path)?;
@@ -385,6 +396,7 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
             in_features,
             out_features,
             attestation: "mlx-affine-triple".into(),
+            bounded_packed_training: false,
         });
     }
     // Dense path, byte-identical to the legacy `linear`: read `{key}.weight` [+ `.bias`], cast to the
@@ -412,6 +424,7 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
         in_features,
         out_features,
         attestation: "dense-weight".into(),
+        bounded_packed_training: false,
     })
 }
 
@@ -603,6 +616,7 @@ mod tests {
             in_features: in_dim,
             out_features: out_dim,
             attestation: "dense-weight".into(),
+            bounded_packed_training: false,
         };
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let base = packed.forward(&x)?;

@@ -437,15 +437,20 @@ fn ltx25_bounded_acceleration_acceptance() {
             "ltx25:differentiable-QK-RMS",
             "ltx25:exact-grid-rope-storage-hit",
             "ltx25:native-incompatible-projection-fallback",
+            "ltx:bounded-packed-frozen-input-vjp",
         ],
         || {
             let mut trainer = candle_gen_ltx::provider_registry()
                 .unwrap()
                 .load_trainer(candle_gen_ltx::MODEL_25_ID, &spec)
                 .expect("strict real Dev/q4 trainer");
-            trainer
+            let output = trainer
                 .train(&request, &mut |_| {})
-                .expect("four joint AV optimizer updates")
+                .expect("four joint AV optimizer updates");
+            candle_gen::train::profile::require_cohort_probe_success(
+                "ltx:packed-frozen-vjp-reference-parity",
+            );
+            output
         },
     );
     bounded_peak(sampler, &root);

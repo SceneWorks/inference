@@ -152,7 +152,11 @@ def verify_metrics(row: dict, metrics: dict, execution: dict, expected_source: s
     report = execution['krea_recovery']
     identity = execution['krea_candidate_execution']
     config = metrics.get('configuration', {})
-    expected_config = {'rank': 16, 'alpha': 16.0, 'learning_rate': .001, 'resolution': 1024,
+    # Rust stores the recipe as f32; serde_json emits that value promoted to
+    # f64. Compare its exact wire value, without rounding untrusted metadata
+    # (which would also admit other doubles) or weakening the fixed recipe.
+    learning_rate = struct.unpack('!f', struct.pack('!f', .001))[0]
+    expected_config = {'rank': 16, 'alpha': 16.0, 'learning_rate': learning_rate, 'resolution': 1024,
                        'train_dtype': 'bf16', 'gradient_accumulation': 1,
                        'gradient_checkpointing': False, 'seed': 7, 'sample_every': 500, 'save_every': 0}
     if (metrics.get('completed_optimizer_updates') != 6 or metrics.get('recovery') != report

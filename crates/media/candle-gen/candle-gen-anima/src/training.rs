@@ -225,13 +225,57 @@ fn compute_step_loss_grads(
     dtype: DType,
     aux: Option<&AuxStep<'_>>,
 ) -> Result<(StepLosses, GradStore)> {
+    compute_step_loss_grads_with_rope(
+        dit,
+        conditioner,
+        x0,
+        source,
+        target_ids,
+        sigma,
+        noise,
+        mask_weight,
+        mae,
+        dtype,
+        aux,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_step_loss_grads_with_rope(
+    dit: &CosmosDiT,
+    conditioner: &AnimaTextConditioner,
+    x0: &Tensor,
+    source: &Tensor,
+    target_ids: &Tensor,
+    sigma: f64,
+    noise: &Tensor,
+    mask_weight: Option<&Tensor>,
+    mae: bool,
+    dtype: DType,
+    aux: Option<&AuxStep<'_>>,
+    prepared_rope: bool,
+) -> Result<(StepLosses, GradStore)> {
     let device = x0.device();
     let (x_t, target) = flow_match::build_batch(x0, noise, sigma)?;
     let encoder = conditioner.forward(source, target_ids, dtype)?;
     let sigma_tensor = Tensor::new(&[sigma as f32], device)?.to_dtype(dtype)?;
-    let prediction = dit
-        .forward(&x_t.to_dtype(dtype)?, &sigma_tensor, &encoder, dtype)?
-        .to_dtype(DType::F32)?;
+    let compute_latent = x_t.to_dtype(dtype)?;
+    #[cfg(feature = "model-inference-proof")]
+    if prepared_rope
+        && candle_gen::train::profile::cohort_active()
+        && dit.training_rope_for(&compute_latent).is_none()
+    {
+        return Err(CandleError::Msg(
+            "anima: training RoPE was not prepared for the compute latent".into(),
+        ));
+    }
+    let prediction = if prepared_rope {
+        dit.forward(&compute_latent, &sigma_tensor, &encoder, dtype)?
+    } else {
+        dit.forward_unprepared(&compute_latent, &sigma_tensor, &encoder, dtype)?
+    }
+    .to_dtype(DType::F32)?;
     let (diffusion_on, aux_on) = step_terms(aux);
     let diffusion = if diffusion_on {
         Some(weighted_velocity_loss(
@@ -466,7 +510,7 @@ impl AnimaTrainer {
             .iter()
             .map(|entry| (&entry.1, &entry.2))
             .collect::<Vec<_>>();
-        let geometry_bytes = dit.training_geometry_bytes(&latent_inputs)?
+        let geometry_bytes = dit.training_geometry_bytes(&latent_inputs, dtype)?
             + conditioner.training_geometry_bytes(&conditioner_inputs)?;
         flow_match::check_preparation_memory(
             LABEL,
@@ -474,7 +518,7 @@ impl AnimaTrainer {
             0,
             flow_match::device_training_budget_bytes(device, LABEL),
         )?;
-        dit.prepare_training(&cache.iter().map(|entry| &entry.0).collect::<Vec<_>>())?;
+        dit.prepare_training(&latent_inputs, dtype)?;
         conditioner.prepare_training(
             &cache
                 .iter()
@@ -550,6 +594,48 @@ impl AnimaTrainer {
                 dtype,
                 aux.as_ref(),
             )?;
+            // The existing four-update manual case proves adoption and numerical
+            // equivalence in its excluded warmup, with no reference optimizer update.
+            #[cfg(feature = "model-inference-proof")]
+            if step == 1 && candle_gen::train::profile::cohort_active() {
+                let (reference, reference_grads) = compute_step_loss_grads_with_rope(
+                    &dit,
+                    &conditioner,
+                    x0,
+                    source,
+                    target_ids,
+                    sigma,
+                    &noise,
+                    mask_weight.as_ref(),
+                    flow_match::is_mae(cfg),
+                    dtype,
+                    aux.as_ref(),
+                    false,
+                )?;
+                if !reference.total.is_finite() || (losses.total - reference.total).abs() > 1e-5 {
+                    return Err(CandleError::Msg(
+                        "anima: prepared/fallback RoPE loss mismatch".into(),
+                    ));
+                }
+                let mut max_error = 0f32;
+                for (name, var) in set.named_vars() {
+                    let actual = grads.get(var.as_tensor()).ok_or_else(|| {
+                        CandleError::Msg(format!("anima: missing prepared gradient {name}"))
+                    })?;
+                    let expected = reference_grads.get(var.as_tensor()).ok_or_else(|| {
+                        CandleError::Msg(format!("anima: missing fallback gradient {name}"))
+                    })?;
+                    let error = actual.sub(expected)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                    let magnitude = expected.abs()?.max_all()?.to_scalar::<f32>()?;
+                    if !error.is_finite() || error > 2e-5 * magnitude + 1e-7 {
+                        return Err(CandleError::Msg(format!(
+                            "anima: prepared/fallback RoPE gradient mismatch {name}: {error}/{magnitude}"
+                        )));
+                    }
+                    max_error = max_error.max(error);
+                }
+                eprintln!("ANIMA_ROPE_PARITY dtype={dtype:?} loss_error={} max_gradient_error={max_error} reference_optimizer_updates=0", (losses.total - reference.total).abs());
+            }
             last_loss = losses.total;
             accumulate_grads(&mut accumulated, grads, &set.vars)?;
             if step.is_multiple_of(accum) {
@@ -1101,7 +1187,7 @@ mod depth_anchoring_tests {
             .unwrap();
         }
         let (raw, raw_grads) = step(&f, 0.5, None);
-        f.dit.prepare_training(&[&f.x0]).unwrap();
+        f.dit.prepare_training(&[&f.x0], DType::F32).unwrap();
         f.cond.prepare_training(&[(&f.source, &f.ids)]).unwrap();
         let (prepared, prepared_grads) = step(&f, 0.5, None);
         assert!((raw.total - prepared.total).abs() <= 1e-5);

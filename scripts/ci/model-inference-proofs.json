@@ -93398,7 +93398,10 @@
     "cargo_features": [],
     "fixture_identity": "Production BF16 SD3.5 render/img2img/preview or real one-step native trainer; crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_large_lokr_real_cuda",
     "configuration_source": "crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_large_lokr_real_cuda",
-    "required_environment": [],
+    "required_environment": [
+      "SD35_LARGE_TRAIN_SNAPSHOT",
+      "SD35_LARGE_SAMPLE_SNAPSHOT"
+    ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "configuration_controls": [],
@@ -93544,7 +93547,10 @@
     "cargo_features": [],
     "fixture_identity": "Production BF16 SD3.5 render/img2img/preview or real one-step native trainer; crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_large_lora_real_cuda",
     "configuration_source": "crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_large_lora_real_cuda",
-    "required_environment": [],
+    "required_environment": [
+      "SD35_LARGE_TRAIN_SNAPSHOT",
+      "SD35_LARGE_SAMPLE_SNAPSHOT"
+    ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "configuration_controls": [],
@@ -93690,7 +93696,10 @@
     "cargo_features": [],
     "fixture_identity": "Production BF16 SD3.5 render/img2img/preview or real one-step native trainer; crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_medium_lokr_real_cuda",
     "configuration_source": "crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_medium_lokr_real_cuda",
-    "required_environment": [],
+    "required_environment": [
+      "SD35_MEDIUM_TRAIN_SNAPSHOT",
+      "SD35_MEDIUM_SAMPLE_SNAPSHOT"
+    ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "configuration_controls": [],
@@ -93836,7 +93845,10 @@
     "cargo_features": [],
     "fixture_identity": "Production BF16 SD3.5 render/img2img/preview or real one-step native trainer; crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_medium_lora_real_cuda",
     "configuration_source": "crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_medium_lora_real_cuda",
-    "required_environment": [],
+    "required_environment": [
+      "SD35_MEDIUM_TRAIN_SNAPSHOT",
+      "SD35_MEDIUM_SAMPLE_SNAPSHOT"
+    ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
     "configuration_controls": [],
@@ -295467,10 +295479,11 @@
     "backend": null,
     "expected_devices": [],
     "cargo_features": [],
-    "fixture_identity": "One source-owned four-update seed7 CUDA LoRA smoke/throughput; no convergence claim; pinned installed assets; crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_medium_bounded_acceleration_acceptance",
+    "fixture_identity": "One source-owned four-update seed7 CUDA LoRA smoke/throughput; no convergence claim; distinct pinned upstream stabilityai training and exact SceneWorks BF16 production-generation assets; crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_medium_bounded_acceleration_acceptance",
     "configuration_source": "crates/media/candle-gen/candle-gen-sd3/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::sd35_medium_bounded_acceleration_acceptance",
     "required_environment": [
-      "SD35_MEDIUM_TRAIN_SNAPSHOT"
+      "SD35_MEDIUM_TRAIN_SNAPSHOT",
+      "SD35_MEDIUM_SAMPLE_SNAPSHOT"
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary and one exact late BODY; actual learned CUDA device/input readers; four real optimizer updates and retained metrics, device peak, generated LoRA and one adapted sample; no missing-work events",
@@ -295488,7 +295501,7 @@
         "expected_devices": [
           "candle-cuda"
         ],
-        "scope": "one complete bounded trainer invocation and one saved-adapter sample",
+        "scope": "one complete bounded trainer invocation on the upstream snapshot and one saved-adapter sample on the separate exact SceneWorks BF16 turnkey",
         "required_work": [
           "Exactly four actual optimizer updates total (dual Wan alternates two per expert); finite loss/every adapter gradient and actual factor update; prepared mechanism consumption; synchronized preparation/warmup/steady timing and selected device peak; save/reload/apply and one generated sample"
         ],
@@ -295507,7 +295520,7 @@
           "readers": [
             "candle-gen::loader::mmap_var_builder"
           ],
-          "minimum_collections": 1,
+          "minimum_collections": 2,
           "minimum_items": 1,
           "required_grade": "reader-binding",
           "scope": "case"
@@ -305572,7 +305585,7 @@
       "cuda",
       "model-inference-proof"
     ],
-    "fixture_identity": "64px BF16 adapter mode checkpoint OFF, default image attention targets; shared full/adaptation loop has retained focused Full ownership fixture; one 512px 1-step production sample. Real pinned installed model inputs, existing production trainer/dataset helpers. Header/path provisioning is not runtime content/named-revision attestation.",
+    "fixture_identity": "64px BF16 adapter mode checkpoint OFF, default image attention targets; shared full/adaptation loop has retained focused Full ownership fixture; first excluded warmup compares cached caption versus distinct-identity fallback prediction/loss/all optimizer-owned gradients with zero reference optimizer updates; one 512px 1-step production sample. Real pinned installed model inputs, existing production trainer/dataset helpers. Header/path provisioning is not runtime content/named-revision attestation.",
     "configuration_source": "crates/media/candle-gen/candle-gen-mage/tests/trainer_cuda_smoke.rs::trainer_cuda_smoke::mage_bounded_acceleration_acceptance",
     "required_environment": [
       "MAGE_BASE_TRAIN_SNAPSHOT",

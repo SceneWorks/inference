@@ -176,13 +176,22 @@ class KreaRecoveryProtocol(unittest.TestCase):
         metrics = {'completed_optimizer_updates': 6, 'recovery': report, 'candidate_execution': identity,
                    'losses_by_physical_update': report['candidate_losses'], 'saved_adapter_role': recovery.ADAPTER_ROLE,
                    'graph_retaining_backward': False, 'selected_adapter_final_loss': report['candidate_losses'][-1],
-                   'configuration': {'rank':16, 'alpha':16., 'learning_rate':.001, 'resolution':1024,
+                   # Literal observed in the Rust/serde_json recovery artifact;
+                   # deliberately independent of the validator's conversion.
+                   'configuration': {'rank':16, 'alpha':16., 'learning_rate':0.0010000000474974513, 'resolution':1024,
                    'train_dtype':'bf16', 'gradient_accumulation':1, 'gradient_checkpointing':False,
                    'seed':7, 'sample_every':500, 'save_every':0}}
         recovery.verify_metrics(row, metrics, result, identity['source'])
         for mutate in (lambda m: m.update(completed_optimizer_updates=18),
                        lambda m: m.update(saved_adapter_role='reference'),
                        lambda m: m['configuration'].update(sample_every=0),
+                       lambda m: m['configuration'].update(learning_rate=.001),
+                       lambda m: m['configuration'].update(learning_rate=.002),
+                       # Adjacent f32 values on either side of the fixed recipe.
+                       lambda m: m['configuration'].update(learning_rate=0.0009999999310821295),
+                       lambda m: m['configuration'].update(learning_rate=0.0010000001639127731),
+                       lambda m: m['configuration'].update(learning_rate=float('nan')),
+                       lambda m: m['configuration'].update(learning_rate='0.0010000000474974513'),
                        lambda m: m['candidate_execution'].update(source='2' * 40)):
             invalid = copy.deepcopy(metrics); mutate(invalid)
             with self.assertRaises(ValueError):

@@ -1017,8 +1017,9 @@ impl Ltx25Tier {
 
     /// A plain mmap [`VarBuilder`] over `component`'s file, rooted at the file root.
     ///
-    /// No key remap: unlike the 2.3 tier, the 2.5 converter emits each component under the key
-    /// spelling this crate's loaders already ask for.
+    /// No key remap. Use [`Self::transformer_vb`] or [`Self::connector_vb`] for the DiT and text
+    /// conditioning: those loaders ask for the upstream namespace, while converted files use
+    /// component-root keys and, for the DiT, sanitized projection names.
     pub fn component_vb(
         &self,
         component: Ltx25Component,
@@ -1029,6 +1030,11 @@ impl Ltx25Tier {
         candle_gen::mmap_var_builder(&[path], dtype, device)
     }
 
+    /// The DiT builder with the same converted-tier key contract used by generation.
+    pub fn transformer_vb(&self, dtype: DType, device: &Device) -> CResult<VarBuilder<'static>> {
+        ltx25_transformer_vb(&self.file(Ltx25Component::Transformer)?, dtype, device)
+    }
+
     /// The connector + text-projection builder over the tier's `connector.safetensors`.
     ///
     /// The tier roots the connectors and the text projection at the **file root**, already in this
@@ -1037,8 +1043,7 @@ impl Ltx25Tier {
     /// [`TierPaths::connector_vb`] does — only that prefix is stripped. The transformer projection
     /// renames must **not** be applied here; the connector file does not use the DiT's spelling.
     pub fn connector_vb(&self, dtype: DType, device: &Device) -> CResult<VarBuilder<'static>> {
-        let inner = self.component_vb(Ltx25Component::Connector, dtype, device)?;
-        Ok(rename_vb(inner, dtype, device, strip_diffusion_prefix))
+        ltx25_connector_vb(&self.file(Ltx25Component::Connector)?, dtype, device)
     }
 
     /// The two builders [`crate::diff_vae::NaDiffusionDecoder::load_quantized`] takes, over the
@@ -1934,6 +1939,68 @@ mod tests {
             strip_diffusion_prefix("text_embedding_projection.video_aggregate_embed.weight"),
             "text_embedding_projection.video_aggregate_embed.weight"
         );
+    }
+
+    /// Model-free regression for training's two converted weight entry points. A raw component
+    /// builder can pass manifest/header validation but cannot resolve the upstream loader names.
+    #[test]
+    fn ltx25_training_routes_converted_weight_names() {
+        let source = include_str!("training.rs");
+        let cache = source.split("fn cache(").nth(1).unwrap();
+        let cache = cache.split("fn build_dit(").next().unwrap();
+        let cache25 = cache
+            .split("TrainingRoute::Ltx25 { bundle, tier, .. } =>")
+            .nth(1)
+            .unwrap();
+        let encoder = cache25
+            .split("let encoder = Ltx25TextEncoder::from_bundle_av(")
+            .next()
+            .unwrap();
+        assert!(encoder.contains("tier.connector_vb(DType::BF16, device)?"));
+        assert!(!encoder.contains("mmap_var_builder"));
+
+        let build = source.split("fn build_dit(").nth(1).unwrap();
+        let build = build.split("fn micro_step(").next().unwrap();
+        let build25 = build
+            .split("TrainingRoute::Ltx25 { bundle, tier, .. } =>")
+            .nth(1)
+            .unwrap();
+        assert!(build25.contains("tier.transformer_vb(DType::F32, device)?"));
+        assert!(!build25.contains("component_vb("));
+
+        // The installed Dev/q4 header packs both towers and the aggregate projections. The
+        // packed detector must see each sibling under exactly the same rewritten base key.
+        for suffix in ["weight", "scales", "biases", "bias"] {
+            for tower in ["video", "audio"] {
+                for layer in 0..8 {
+                    for projection in ["attn1.to_q", "attn1.to_out.0", "ff.net.0.proj", "ff.net.2"]
+                    {
+                        let stored = format!("{tower}_embeddings_connector.transformer_1d_blocks.{layer}.{projection}.{suffix}");
+                        assert_eq!(
+                            strip_diffusion_prefix(&format!("model.diffusion_model.{stored}")),
+                            stored
+                        );
+                    }
+                }
+                let stored = format!("text_embedding_projection.{tower}_aggregate_embed.{suffix}");
+                assert_eq!(strip_diffusion_prefix(&stored), stored);
+            }
+            for layer in 0..48 {
+                for (upstream, stored) in [
+                    ("attn1.to_out.0", "attn1.to_out"),
+                    ("audio_attn1.to_out.0", "audio_attn1.to_out"),
+                    ("ff.net.0.proj", "ff.proj_in"),
+                    ("audio_ff.net.2", "audio_ff.proj_out"),
+                ] {
+                    assert_eq!(
+                        remap_transformer_key(&format!(
+                            "model.diffusion_model.transformer_blocks.{layer}.{upstream}.{suffix}"
+                        )),
+                        format!("transformer_blocks.{layer}.{stored}.{suffix}")
+                    );
+                }
+            }
+        }
     }
 
     /// The VAE remap drops the `vae.`/`vae.decoder.` wrapper, renames the stats, and flags conv weights

@@ -1768,14 +1768,7 @@ fn ltx25_video_grid(
     let mut max = (0, 0, 0);
     for item in items {
         let path = PathBuf::from(required_prepared_path(item)?);
-        let metadata = candle_gen::gen_core::__model_input_reader!(
-            safetensors_file_metadata(&path),
-            "candle-gen-ltx::training::validate_prepared_ltx25_bundle/header-configuration",
-            Configuration,
-            &path,
-            |actual_path| safetensors_file_metadata(actual_path)
-        )
-        .map_err(|error| {
+        let metadata = safetensors_file_metadata(&path).map_err(|error| {
             CandleError::Msg(format!(
                 "{MODEL_25_ID} trainer: could not read prepared bundle header `{}`: {error}",
                 path.display()
@@ -2392,7 +2385,14 @@ fn validate_prepared_ltx25_bundle(
     conditioning: &Ltx25ConditioningPlan,
 ) -> Result<()> {
     let path = PathBuf::from(required_prepared_path(item)?);
-    let metadata = safetensors_file_metadata(&path).map_err(|error| {
+    let metadata = candle_gen::gen_core::__model_input_reader!(
+        safetensors_file_metadata(&path),
+        "candle-gen-ltx::training::validate_prepared_ltx25_bundle/header-configuration",
+        Configuration,
+        &path,
+        |actual_path| safetensors_file_metadata(actual_path)
+    )
+    .map_err(|error| {
         CandleError::Msg(format!(
             "ltx_2_5 trainer: could not read prepared bundle header `{}`: {error}",
             path.display()
@@ -3528,11 +3528,10 @@ impl FlowMatchTrainer for LtxTrainer {
                 let av_cfg = AvConfig::from_bundle(bundle)?;
                 let conn_cfg = ConnectorConfig::from_bundle(bundle)?;
                 let audio_conn_cfg = ConnectorConfig::audio_from_bundle(bundle)?;
-                let connector_path = tier
-                    .file(Ltx25Component::Connector)
-                    .map_err(|error| CandleError::Msg(error.to_string()))?;
-                let connector =
-                    candle_gen::mmap_var_builder(&[connector_path], DType::BF16, device)?;
+                // Generation and training consume the same converted component namespace.
+                // In particular, connector keys retain `to_out.0` / `ff.net.*` while only
+                // their upstream `model.diffusion_model.` prefix is stripped.
+                let connector = tier.connector_vb(DType::BF16, device)?;
                 let connector_root = connector.pp("model.diffusion_model");
                 let encoder = Ltx25TextEncoder::from_bundle_av(
                     bundle,
@@ -3703,6 +3702,13 @@ impl FlowMatchTrainer for LtxTrainer {
                 }
             }
             TrainingDiT::Ltx25(dit) => {
+                // Immutable packed weights must not all expand onto the eager
+                // backward tape. This is production QLoRA ownership, not a
+                // bounded-proof math mode; preserve the 2.3 training path above.
+                dit.visit_adaptable_mut(&mut |_, projection| {
+                    projection.enable_bounded_packed_training();
+                    Ok(())
+                })?;
                 dit.prepare_training()?;
                 let mut position_interner = crate::rope::TrainingPositionInterner::default();
                 for item in cache {
@@ -3795,7 +3801,7 @@ impl FlowMatchTrainer for LtxTrainer {
                 let av_cfg = AvConfig::from_bundle(bundle)?;
                 // The config-driven `ff_bias` is crucial here: taking `ltx_2_3().video` would
                 // require the absent LTX-2.5 FFN bias tensors and make the QLoRA path unusable.
-                let dit = tier.component_vb(Ltx25Component::Transformer, DType::F32, device)?;
+                let dit = tier.transformer_vb(DType::F32, device)?;
                 Ok(TrainingDiT::Ltx25(Box::new(AvDiT::new(
                     dit.pp("model.diffusion_model"),
                     &av_cfg,

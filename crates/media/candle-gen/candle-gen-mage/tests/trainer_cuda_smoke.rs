@@ -195,6 +195,8 @@ fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, root: &std::path::Pat
 
 /// One source-owned invocation: four TOTAL updates (one warmup, three timed),
 /// one config/seed/device, then ONE production-generated saved-adapter sample.
+/// The first excluded warmup checks cached/fallback prediction, loss and all
+/// optimizer-owned gradients too, with zero reference optimizer updates.
 #[test]
 #[cfg(feature = "model-inference-proof")]
 #[ignore = "model inference; explicit model-proof workflow"]
