@@ -47,6 +47,9 @@ pub enum ComparisonCadence {
     IrisRestoration,
     /// Failed-only MOSS recovery: one counted warmup and two timed updates.
     MossRecovery,
+    OrdinaryShort,
+    DepthRecovery,
+    RestRecovery,
 }
 
 impl ComparisonCadence {
@@ -56,12 +59,14 @@ impl ComparisonCadence {
             Self::WanDual => 6,
             Self::IrisRestoration => 8,
             Self::MossRecovery => 3,
+            Self::OrdinaryShort | Self::DepthRecovery => 2,
+            Self::RestRecovery => 6,
         }
     }
     pub fn warmups(self) -> usize {
         match self {
-            Self::Ordinary | Self::MossRecovery => 1,
-            Self::WanDual | Self::IrisRestoration => 2,
+            Self::Ordinary | Self::MossRecovery | Self::OrdinaryShort | Self::DepthRecovery => 1,
+            Self::WanDual | Self::IrisRestoration | Self::RestRecovery => 2,
         }
     }
     pub fn id(self) -> &'static str {
@@ -70,12 +75,48 @@ impl ComparisonCadence {
             Self::WanDual => "wan-dual",
             Self::IrisRestoration => "iris-restoration",
             Self::MossRecovery => "moss_recovery",
+            Self::OrdinaryShort => "ordinary_short",
+            Self::DepthRecovery => "depth_recovery",
+            Self::RestRecovery => "rest_recovery",
         }
     }
 
     /// The shorter recovery cannot reduce another model's registered cadence.
     pub fn allows_model(self, model_id: &str) -> bool {
-        self != Self::MossRecovery || model_id == "moss"
+        match self {
+            Self::MossRecovery => model_id == "moss",
+            Self::OrdinaryShort => matches!(model_id, "anima_base" | "flux3"),
+            Self::DepthRecovery => model_id == "iris-depth",
+            Self::RestRecovery => model_id == "iris-restoration",
+            _ => true,
+        }
+    }
+
+    /// Recovery owner sequences are source-owned physical optimizer bodies,
+    /// including counted warmups. Ordinary historical cadence behavior is intact.
+    pub fn expected_recovery_owners(self, model_id: &str) -> Option<&'static [&'static str]> {
+        match (self, model_id) {
+            (Self::MossRecovery, "moss") => Some(&["moss-image"; 3]),
+            (Self::OrdinaryShort, "anima_base") => Some(&["anima trainer"; 2]),
+            (Self::OrdinaryShort, "flux3") => Some(&["flux3"; 2]),
+            (Self::DepthRecovery, "iris-depth") => Some(&["iris-depth"; 2]),
+            (Self::RestRecovery, "iris-restoration") => Some(&[
+                "iris-restoration-generator",
+                "iris-restoration-critic",
+                "iris-restoration-generator",
+                "iris-restoration-critic",
+                "iris-restoration-generator",
+                "iris-restoration-critic",
+            ]),
+            _ => None,
+        }
+    }
+
+    pub fn recovery_owners_valid(self, model_id: &str, observed: &[&str]) -> bool {
+        self.allows_model(model_id)
+            && self
+                .expected_recovery_owners(model_id)
+                .is_none_or(|expected| expected == observed)
     }
 }
 
@@ -96,6 +137,9 @@ mod cadence_metadata_tests {
                 6,
             ),
             (ComparisonCadence::MossRecovery, "moss_recovery", 3, 1, 2),
+            (ComparisonCadence::OrdinaryShort, "ordinary_short", 2, 1, 1),
+            (ComparisonCadence::DepthRecovery, "depth_recovery", 2, 1, 1),
+            (ComparisonCadence::RestRecovery, "rest_recovery", 6, 2, 4),
         ] {
             assert_eq!(cadence.id(), id);
             assert_eq!(cadence.updates(), updates);
@@ -107,6 +151,41 @@ mod cadence_metadata_tests {
         // The original failed arm stays charged four; no refund or transfer.
         assert_eq!(4 + 6 * recovery.updates(), 22);
         assert_eq!(24 - (4 + 6 * recovery.updates()), 2);
+    }
+
+    #[test]
+    fn recovery_owner_order_counts_and_family_caps_are_exact() {
+        for (cadence, model) in [
+            (ComparisonCadence::MossRecovery, "moss"),
+            (ComparisonCadence::OrdinaryShort, "anima_base"),
+            (ComparisonCadence::OrdinaryShort, "flux3"),
+            (ComparisonCadence::DepthRecovery, "iris-depth"),
+            (ComparisonCadence::RestRecovery, "iris-restoration"),
+        ] {
+            let expected = cadence.expected_recovery_owners(model).unwrap();
+            assert_eq!(expected.len(), cadence.updates() as usize);
+            assert!(cadence.recovery_owners_valid(model, expected));
+            assert!(!cadence.recovery_owners_valid(model, &expected[1..]));
+            assert!(!cadence.recovery_owners_valid("unknown", expected));
+            let mut extra = expected.to_vec();
+            extra.push(expected[0]);
+            assert!(!cadence.recovery_owners_valid(model, &extra));
+            let wrong = vec!["borrowed-owner"; expected.len()];
+            assert!(!cadence.recovery_owners_valid(model, &wrong));
+        }
+        let cadence = ComparisonCadence::RestRecovery;
+        let mut swapped = cadence
+            .expected_recovery_owners("iris-restoration")
+            .unwrap()
+            .to_vec();
+        swapped.swap(0, 1);
+        assert!(!cadence.recovery_owners_valid("iris-restoration", &swapped));
+        let duplicate = ["iris-restoration-generator"; 6];
+        assert!(!cadence.recovery_owners_valid("iris-restoration", &duplicate));
+        assert_eq!(6 * ComparisonCadence::OrdinaryShort.updates(), 12);
+        assert_eq!(2 * ComparisonCadence::DepthRecovery.updates(), 4);
+        assert_eq!(5 * ComparisonCadence::RestRecovery.updates(), 30);
+        assert_eq!(316 + 12 + 12 + 4 + 30 + 18, 392);
     }
 
     #[test]
@@ -295,7 +374,10 @@ pub fn with_stage<T>(
         !model_id.is_empty() && !model_id.to_ascii_lowercase().contains("krea"),
         "Krea budget is excluded"
     );
-    assert!(cadence.allows_model(model_id), "MOSS-only recovery cadence");
+    assert!(
+        cadence.allows_model(model_id),
+        "source-owned recovery model/cadence"
+    );
     assert!(
         active_stage().is_none() && !super::profile::active() && !super::profile::cohort_active(),
         "nested comparison scope"

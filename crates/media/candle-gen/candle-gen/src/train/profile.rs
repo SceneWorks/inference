@@ -459,10 +459,11 @@ pub(super) fn with_comparison_observation<T>(
     cadence: super::comparison::ComparisonCadence,
     f: impl FnOnce() -> T,
 ) -> T {
-    let claim_limit = if cadence == super::comparison::ComparisonCadence::MossRecovery {
-        "Conditional ablations, serial shared GPU; MOSS-only failed recovery with one counted warmup and two timed single-owner updates; original failed four-update charge retained; small-sample timing, no isolated timing or convergence claim"
-    } else {
-        "Conditional ablations, serial shared GPU; one warmup per owner; three timed ordinary or restoration cycles, two timed updates per Wan expert; no isolated timing or convergence claim"
+    let claim_limit = match cadence {
+        super::comparison::ComparisonCadence::MossRecovery => "Conditional ablations, serial shared GPU; MOSS-only failed recovery with one counted warmup and two timed single-owner updates; original failed four-update charge retained; small-sample timing, no isolated timing or convergence claim",
+        super::comparison::ComparisonCadence::OrdinaryShort | super::comparison::ComparisonCadence::DepthRecovery => "Failed-only recovery, serial shared GPU; one counted single-owner warmup and one timed update per arm; original failure charges retained; descriptive single-sample timing, no variance, isolated timing or convergence claim",
+        super::comparison::ComparisonCadence::RestRecovery => "Failed-only restoration recovery, serial shared GPU; one counted G+D warmup cycle and two timed G+D cycles per arm; original failure charges retained; small-sample timing, no isolated timing or convergence claim",
+        _ => "Conditional ablations, serial shared GPU; one warmup per owner; three timed ordinary or restoration cycles, two timed updates per Wan expert; no isolated timing or convergence claim",
     };
     let comparison = serde_json::json!({"schema_version":1, "model":model_id,
         "stage":stage.id(), "cadence":cadence.id(), "state_reset":"fresh-native-child-process",
@@ -474,7 +475,25 @@ pub(super) fn with_comparison_observation<T>(
         cadence.updates(),
         cadence.warmups(),
         Some(comparison),
-        f,
+        || {
+            let result = f();
+            if cadence.expected_recovery_owners(model_id).is_some() {
+                COHORT.with(|state| {
+                    let state = state.borrow();
+                    let state = state.as_ref().unwrap();
+                    let owners: Vec<_> = state
+                        .steps
+                        .iter()
+                        .map(|row| row["owner"].as_str().unwrap_or(""))
+                        .collect();
+                    assert!(
+                        cadence.recovery_owners_valid(model_id, &owners),
+                        "exact recovery physical owner order/count"
+                    );
+                });
+            }
+            result
+        },
     )
 }
 
