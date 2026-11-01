@@ -1516,6 +1516,12 @@ impl QwenImage21Transformer {
         available_bytes: u64,
     ) -> Result<()> {
         self.training_preparation = TrainingPreparation::default();
+        // Cache-off retains original text/layout inputs; packing remains independently selectable.
+        let examples = if candle_gen::train::comparison::cache_enabled() {
+            examples
+        } else {
+            &[]
+        };
         let text_stage = (0..=2)
             .rev()
             .find(|&stage| self.frozen_text_identity(stage).is_some());
@@ -1624,7 +1630,8 @@ impl QwenImage21Transformer {
             }
         }
         for block in &mut self.blocks {
-            if block.attn.qkv_pack.is_none() {
+            if candle_gen::train::comparison::projection_enabled() && block.attn.qkv_pack.is_none()
+            {
                 block.attn.qkv_pack = FrozenProjectionPack::prepare_adapt(&mut [
                     &mut block.attn.to_q,
                     &mut block.attn.to_k,

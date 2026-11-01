@@ -541,8 +541,15 @@ impl Trainer for ZImageTrainer {
         // Every other `validate` floor too (control / full fine-tune / edit / flow-match knobs), so
         // a caller that skips `validate` cannot train a request it would refuse.
         self.validate(req)?;
+        let policy = candle_gen::train::policy::JobTrainingPolicy::resolve(
+            self.descriptor.id,
+            self.device.is_cuda(),
+            req,
+        )?;
         let mut warnings = Vec::new();
-        let output = run_flow_match_training(self, req, on_progress, &mut warnings)?;
+        let output = candle_gen::train::policy::with_job_policy(policy, || {
+            run_flow_match_training(self, req, on_progress, &mut warnings)
+        })?;
         Ok(TrainingReport { output, warnings })
     }
 }
@@ -698,7 +705,17 @@ impl FlowMatchTrainer for ZImageTrainer {
         req: &TrainingRequest,
         _device: &Device,
     ) -> Result<()> {
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "z-image-actual-raw-cache",
+                "entries": cache.iter().map(|(latent, caption, _)| serde_json::json!({"latent":latent.dims(),"caption":caption.dims(),"video_frames":1,"audio_mode":"none"})).collect::<Vec<_>>()
+            }));
+        }
         dit.prepare_training_projections()?;
+        if !candle_gen::train::policy::cache_enabled() {
+            return Ok(());
+        }
         let dtype = flow_match::parse_compute_dtype(&req.config.train_dtype);
         let mut captions = std::collections::HashMap::<_, Tensor>::new();
         for (x0, caption, _) in cache {
@@ -887,6 +904,34 @@ mod tests {
     use candle_gen::train::optim::{clip_grad_norm, TrainOptimizer};
     use candle_nn::{VarBuilder, VarMap};
     use candle_transformers::models::z_image::transformer::Config;
+
+    #[test]
+    fn production_profile_binds_exact_cuda_descriptor() {
+        use candle_gen::gen_core::runtime::CancelFlag;
+        use candle_gen::train::policy::{JobTrainingPolicy, TrainingProfile};
+
+        let req = TrainingRequest {
+            items: Vec::new(),
+            config: TrainingConfig::default(),
+            output_dir: PathBuf::from("unused-policy-output"),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: Vec::new(),
+            cancel: CancelFlag::new(),
+        };
+        let id = trainer_descriptor().id;
+        assert_eq!(
+            JobTrainingPolicy::resolve(id, true, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::WithoutE3
+        );
+        assert_eq!(
+            JobTrainingPolicy::resolve(id, false, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+    }
 
     /// The smallest valid Z-Image DiT (head_dim locked to 128 by `axes_dims`), 1 main layer + 1
     /// refiner each, tiny caption dim — exercises the real flow-match forward + backward on CPU.

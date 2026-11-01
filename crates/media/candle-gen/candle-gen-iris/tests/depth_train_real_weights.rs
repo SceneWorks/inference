@@ -295,14 +295,20 @@ fn bounded_export_receipt(root: &std::path::Path, path: &std::path::Path) {
 #[ignore = "model inference; explicit model-proof workflow"]
 fn iris_depth_bounded_acceleration_acceptance() {
     let root = bounded_root();
+    let comparison = candle_gen::train::comparison::requested_stage().is_some();
+    let cadence = candle_gen::train::comparison::ComparisonCadence::DepthRecovery;
+    let steps = if comparison { cadence.updates() } else { 4 };
+    // One source-owned representative workload, never a resolution grid. The
+    // controller must admit the worst legacy arm before executing any stage.
+    let resolution = if comparison { 512 } else { 128 };
     // Real upstream depth backbone and existing photo/aligned nonconstant ramp helper.
-    let (item, image) = example(&root.join("data"), 128);
+    let (item, image) = example(&root.join("data"), resolution as usize);
     let mut config = TrainingConfig {
         full_finetune: true,
         learning_rate: 3e-5,
         weight_decay: 0.01,
-        steps: 4,
-        resolution: 128,
+        steps,
+        resolution,
         batch_size: 1,
         gradient_accumulation: 1,
         save_every: 0,
@@ -315,44 +321,155 @@ fn iris_depth_bounded_acceleration_acceptance() {
     config
         .model_options
         .insert(OPTIONS_KEY.into(), serde_json::json!({"hflip_prob":0.0}));
-    let sampler = candle_gen::testkit::PeakSampler::start_rendered();
-    let output = candle_gen::train::profile::with_bounded_cohort_for(
-        &root.join("metrics.json"),
-        &[
-            "iris:geometry-storage-hit",
-            "iris:separate-GQA-projection-fallback",
-        ],
-        || {
-            let mut trainer = candle_gen_iris::provider_registry()
-                .unwrap()
-                .load_trainer(
-                    "iris_3b_depth",
-                    &LoadSpec::new(WeightsSource::Dir(env_dir("IRIS_DEPTH_DIR"))),
-                )
-                .unwrap();
-            let output = trainer
-                .train(
-                    &TrainingRequest {
-                        items: vec![item],
-                        config,
-                        output_dir: bounded_runtime().join("depth"),
-                        file_name: "depth.safetensors".into(),
-                        trigger_words: vec![],
-                        cancel: CancelFlag::new(),
-                    },
-                    &mut |_| {},
-                )
-                .unwrap();
-            assert_eq!(output.steps, 4);
-            assert!(output.final_loss.is_finite());
-            output
-        },
-    );
-    bounded_peak(sampler, &root);
+    let spec = LoadSpec::new(WeightsSource::Dir(env_dir("IRIS_DEPTH_DIR")));
+    let items = vec![item];
+    let sampler = (!comparison).then(candle_gen::testkit::PeakSampler::start_rendered);
+    // A new child owns a fresh native trainer/Run, initial parameters, native
+    // optimizer, EMA/data cursors and (restoration) critic/SN state. No quality
+    // render or adapter reload is repeated by this timing-only supplement.
+    let run = || {
+        if comparison {
+            comparison_initialization(&config, &items, &spec);
+        }
+        let mut trainer = candle_gen_iris::provider_registry()
+            .unwrap()
+            .load_trainer("iris_3b_depth", &spec)
+            .unwrap();
+        let output = trainer
+            .train(
+                &TrainingRequest {
+                    items,
+                    config,
+                    output_dir: bounded_runtime().join("depth"),
+                    file_name: "depth.safetensors".into(),
+                    trigger_words: vec![],
+                    cancel: CancelFlag::new(),
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(output.steps, steps);
+        assert!(output.final_loss.is_finite());
+        output
+    };
+    let output = if comparison {
+        candle_gen::train::comparison::with_stage(
+            &root.join("comparison_metrics.json"),
+            "iris-depth",
+            cadence,
+            run,
+        )
+    } else {
+        candle_gen::train::profile::with_bounded_cohort_for(
+            &root.join("metrics.json"),
+            &[
+                "iris:geometry-storage-hit",
+                "iris:separate-GQA-projection-fallback",
+            ],
+            run,
+        )
+    };
+    if comparison {
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_real_weights::iris_depth_bounded_acceleration_acceptance");
+        return;
+    }
+    bounded_peak(sampler.expect("ordinary fixture sampler"), &root);
     let prediction = estimate(output.adapter_path.parent().unwrap(), &image);
     assert_eq!(prediction.len(), 128 * 128);
     assert!(prediction.iter().all(|v| v.is_finite()));
     save_preview(&prediction, 128, &root.join("adapter_sample.png"));
     bounded_export_receipt(&root, &output.adapter_path);
     println!("\nMODEL_INFERENCE_BODY_COMPLETED depth_train_real_weights::iris_depth_bounded_acceleration_acceptance");
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn comparison_input_sha256(path: &std::path::Path) -> String {
+    gen_core_iris::restoration_train::sha256_file(path).expect("comparison input")
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn comparison_sidecar_with(
+    value: &serde_json::Value,
+    fingerprint: &impl Fn(&str) -> Option<String>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(path) => fingerprint(path)
+            .map(|sha| serde_json::json!({"file_sha256":sha}))
+            .unwrap_or_else(|| value.clone()),
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), comparison_sidecar_with(value, fingerprint)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| comparison_sidecar_with(item, fingerprint))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn comparison_sidecar(value: &serde_json::Value) -> serde_json::Value {
+    comparison_sidecar_with(value, &|path| {
+        std::path::Path::new(path)
+            .is_file()
+            .then(|| comparison_input_sha256(std::path::Path::new(path)))
+    })
+}
+
+// Pure nested metadata; no tensor, model, device, optimizer or file conversion.
+#[test]
+#[cfg(feature = "model-inference-proof")]
+fn comparison_depth_sidecar_preserves_nested_content_and_options() {
+    let sha = "a".repeat(64);
+    let fingerprint = |path: &str| match path {
+        "stage-a/depth.npy" | "stage-b/depth.npy" => Some(sha.clone()),
+        "changed/depth.npy" => Some("b".repeat(64)),
+        _ => None,
+    };
+    let item = |path: &str, scale: u32| serde_json::json!({"depth":{"path":path,"scale":scale},"other":["native",7]});
+    let a = comparison_sidecar_with(&item("stage-a/depth.npy", 1), &fingerprint);
+    assert_eq!(
+        a,
+        comparison_sidecar_with(&item("stage-b/depth.npy", 1), &fingerprint)
+    );
+    assert_ne!(
+        a,
+        comparison_sidecar_with(&item("changed/depth.npy", 1), &fingerprint)
+    );
+    assert_ne!(
+        a,
+        comparison_sidecar_with(&item("stage-a/depth.npy", 2), &fingerprint)
+    );
+    assert_eq!(a["other"], serde_json::json!(["native", 7]));
+    assert_eq!(a["depth"]["path"]["file_sha256"], sha);
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn comparison_initialization(
+    config: &candle_gen::gen_core::TrainingConfig,
+    items: &[candle_gen::gen_core::TrainingItem],
+    spec: &candle_gen::gen_core::LoadSpec,
+) {
+    let data = items.iter().map(|item| {
+        let sidecars = item.model_options.iter().map(|(key,value)| {
+            (key.clone(),comparison_sidecar(value))
+        }).collect::<serde_json::Map<String,serde_json::Value>>();
+        serde_json::json!({"image_sha256":comparison_input_sha256(&item.image_path),
+            "caption":item.caption,"sidecars":sidecars,
+            "references":item.reference_image_paths.iter().map(|path|comparison_input_sha256(path)).collect::<Vec<_>>(),
+            "control":item.control_image_path.as_deref().map(comparison_input_sha256),
+            "subject_mask":item.subject_mask_path.as_deref().map(comparison_input_sha256)})
+    }).collect::<Vec<_>>();
+    candle_gen::train::comparison::record_initialization(&serde_json::json!({
+        "training_config":format!("{config:?}"),"source_spec":format!("{spec:?}"),
+        "seed":config.seed,"resolution":config.resolution,"batch_size":config.batch_size,
+        "gradient_accumulation":config.gradient_accumulation,"data":data,
+        "factory":"fresh native trainer in one comparison child; no resumed mutable run",
+        "claim_limit":"content/configuration witnesses; not a claim of whole checkpoint bytes or tensor equality from source flags"
+    }));
 }

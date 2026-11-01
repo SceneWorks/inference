@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "source_contract_sha256": "ba071f78c7ddbcdab6ab215e4664b19dde52f6ebef0a7680a4dd05937b6b3602",
-  "scope": "Current source-declared API role/grade registry; not runtime evidence; replace only from final frozen source contract",
+  "source_contract_sha256": "2d2352eb4e8657458e778d9dc24318748c2dddf5acb867ff5d4252b405d0056e",
+  "scope": "Source-declared API role/grade registry plus exact Iris frozen-cache source extension; cumulative contract hash binds base contract SHA and extension source. Not runtime evidence.",
   "supporting_not_consumption": [
     "candle-audio-yue2::snapshot::verify_component"
   ],
@@ -3879,7 +3879,45 @@
       "grades": [
         "reader-binding"
       ]
+    },
+    "candle-gen-iris::train::frozen_cache::convnext_native_store": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-iris::train::frozen_cache::lpips_native_store": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
+    },
+    "candle-gen-iris::train::frozen_cache::vgg_native_store": {
+      "role": "tensor-input",
+      "grades": [
+        "reader-binding"
+      ]
     }
   },
-  "ordered_record_source_facts_sha256": "888da778962d6902bcf54ab53b83436e5677abc22668902d3421a23b67506f44"
+  "ordered_record_source_facts_sha256": "888da778962d6902bcf54ab53b83436e5677abc22668902d3421a23b67506f44",
+  "source_contract_extension": {
+    "base_source_contract_sha256": "ba071f78c7ddbcdab6ab215e4664b19dde52f6ebef0a7680a4dd05937b6b3602",
+    "exact_successful_boundaries": {
+      "candle-gen-iris::train::frozen_cache::convnext_native_store": {
+        "source": "crates/media/candle-gen/candle-gen-iris/src/train/frozen_cache.rs",
+        "source_sha256": "b6065893ecfe39dddf2f3edb25d1a5757375c9a6ee47ea7c66a805a1ebf5795c",
+        "boundary": "__model_input_result!(store_read(&path, &manifest), exact reader, TensorInput, &[source, path.as_path()])"
+      },
+      "candle-gen-iris::train::frozen_cache::vgg_native_store": {
+        "source": "crates/media/candle-gen/candle-gen-iris/src/train/frozen_cache.rs",
+        "source_sha256": "b6065893ecfe39dddf2f3edb25d1a5757375c9a6ee47ea7c66a805a1ebf5795c",
+        "boundary": "__model_input_result!(store_read(&path, &manifest), exact reader, TensorInput, &[source, path.as_path()])"
+      },
+      "candle-gen-iris::train::frozen_cache::lpips_native_store": {
+        "source": "crates/media/candle-gen/candle-gen-iris/src/train/frozen_cache.rs",
+        "source_sha256": "b6065893ecfe39dddf2f3edb25d1a5757375c9a6ee47ea7c66a805a1ebf5795c",
+        "boundary": "__model_input_result!(store_read(&path, &manifest), exact reader, TensorInput, &[source, path.as_path()])"
+      }
+    }
+  }
 }

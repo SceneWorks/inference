@@ -56,6 +56,14 @@ def sample_contract_errors(source):
             errors.append("sample admission must precede trainer load: " + name)
         if "sample_spec.with_adapters(" not in body:
             errors.append("adapter sample must use the admitted production spec: " + name)
+    comparison = rust_mask(function(source, "comparison_run"))
+    if "comparison::with_stage(" not in comparison:
+        errors.append("timing-only training must retain its guarded comparison scope")
+    if "sample_every: 0" not in comparison or any(
+        operation in comparison for operation in
+        ("sample_load_spec(", ".generate(", "sample_spec.with_adapters(")
+    ):
+        errors.append("timing-only comparison must not perform or claim sample work")
     return errors
 
 
@@ -75,6 +83,31 @@ class Sd3TrainingSampleRoute(unittest.TestCase):
         for mutation in mutations:
             with self.subTest(mutation=mutations.index(mutation)):
                 self.assertNotEqual(sample_contract_errors(mutation), [])
+
+    def test_both_sampling_routes_reject_admission_after_trainer_load(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        preflight = "let sample_spec = sample_load_spec(id);"
+        for name in ("run", "bounded_run"):
+            body = function(source, name)
+            late = body.replace(preflight, "")
+            late = late[:-1] + "\n" + preflight + "\n}"
+            with self.subTest(route=name):
+                errors = sample_contract_errors(source.replace(body, late, 1))
+                self.assertIn("sample admission must precede trainer load: " + name, errors)
+
+    def test_timing_only_scope_rejects_preview_or_generation_work(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        body = function(source, "comparison_run")
+        mutations = [
+            body.replace("sample_every: 0", "sample_every: 1"),
+            body[:-1] + "\ngenerator.generate(&request, &mut |_| {});\n}",
+            body.replace("comparison::with_stage(", "unguarded_training(", 1),
+            body.replace("comparison::with_stage(", "unguarded_training(", 1)[:-1]
+                + "\n// comparison::with_stage( must not count as a guarded call\n}",
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutations.index(mutation)):
+                self.assertNotEqual(sample_contract_errors(source.replace(body, mutation, 1)), [])
 
     def test_registry_declares_distinct_training_and_generation_inputs(self):
         rows = json.loads((ROOT / "scripts/ci/model-inference-proofs.json").read_text(encoding="utf-8"))

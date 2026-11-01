@@ -51,9 +51,11 @@ pub mod vae_anchor;
 pub mod tae;
 pub mod taehv;
 
+pub mod comparison;
 pub mod krea_ops;
 /// Differentiable normalization with explicit reference casting order.
 pub mod norm;
+pub mod policy;
 pub mod profile;
 /// Run-owned frozen same-input projection packing.
 pub mod projection;

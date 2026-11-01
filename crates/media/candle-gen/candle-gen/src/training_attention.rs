@@ -483,3 +483,58 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod policy_attention_metadata_tests {
+    use super::*;
+    use crate::gen_core::train::TrainingRequest;
+    use crate::train::policy;
+
+    #[test]
+    fn job_and_callback_scopes_use_reference_and_restore_outer_attention() {
+        let req = TrainingRequest {
+            items: vec![],
+            config: Default::default(),
+            output_dir: "unused".into(),
+            file_name: "out.safetensors".into(),
+            trigger_words: vec![],
+            cancel: Default::default(),
+        };
+        let job = policy::JobTrainingPolicy::resolve("sd3_5_medium", true, &req).unwrap();
+        with_training_attention_mode(TrainingAttentionMode::StreamingCandidate, || {
+            policy::with_job_policy(job, || {
+                assert_eq!(MODE.get(), TrainingAttentionMode::Reference);
+                assert!(policy::legacy_e1());
+                policy::without_production_profile(|| {
+                    assert_eq!(MODE.get(), TrainingAttentionMode::Reference);
+                    assert!(!policy::legacy_e1());
+                });
+                assert!(policy::legacy_e1());
+            });
+            assert_eq!(MODE.get(), TrainingAttentionMode::StreamingCandidate);
+            let panic = std::panic::catch_unwind(|| {
+                policy::with_job_policy(job, || panic!("metadata unwind"))
+            });
+            assert!(panic.is_err());
+            assert_eq!(MODE.get(), TrainingAttentionMode::StreamingCandidate);
+        });
+        assert_eq!(MODE.get(), TrainingAttentionMode::Reference);
+        #[cfg(feature = "model-inference-proof")]
+        crate::train::comparison::with_metadata_stage_for_test(
+            crate::train::comparison::ComparisonStage::PlusStreaming,
+            || {
+                with_training_attention_mode(TrainingAttentionMode::StreamingCandidate, || {
+                    policy::with_job_policy(job, || {
+                        assert_eq!(MODE.get(), TrainingAttentionMode::StreamingCandidate);
+                        assert!(!policy::legacy_e1());
+                        policy::without_production_profile(|| {
+                            assert_eq!(MODE.get(), TrainingAttentionMode::StreamingCandidate);
+                            assert!(!policy::legacy_e1());
+                        });
+                    });
+                });
+            },
+        );
+        assert_eq!(MODE.get(), TrainingAttentionMode::Reference);
+    }
+}

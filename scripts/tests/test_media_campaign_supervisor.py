@@ -1,6 +1,7 @@
 """CPU-only fail-closed process supervision tests; no model or GPU is started."""
 
 import dataclasses
+import errno
 import json
 import os
 import sys
@@ -137,6 +138,88 @@ class PublishedFixturePidTests(unittest.TestCase):
             case._deadline_reaps_root_and_grandchild_after_root_exit()
         self.assertEqual(read.call_count, 2)
         self.assertEqual(observed, [1234, 5678])
+
+
+class FaultedJobCompletionTests(unittest.TestCase):
+    """Fake child/Job only; never spawn a process, tensor or GPU probe."""
+    def fixture(self, *, waited=-9, polled=-9, members=()):
+        calls=[]
+        class Child:
+            pid=1234
+            def wait(self, **kwargs):calls.append('wait');return waited
+            def poll(self):calls.append('poll');return polled
+        class Job:
+            def terminate_and_reap(self, child, grace):calls.append('terminate/reap')
+            def members(self):calls.append('members');return set(members)
+        return Child(),Job(),calls
+
+    def test_only_observed_root_exit_and_empty_job_seal_fault_cleanup(self):
+        from scripts.ci.model_proof_resources import shared_owned_completion
+        child,job,calls=self.fixture()
+        completion=safety._reap_faulted_job(child,job,.01,retain_completion=True)
+        self.assertEqual(calls,['terminate/reap','wait','poll','members'])
+        self.assertTrue(shared_owned_completion({'owned_execution_completion':completion}))
+        self.assertEqual(completion['root_returncode'],-9)
+        for kwargs in ({'waited':None},{'polled':None},{'polled':0},{'members':(999,)}):
+            child,job,_=self.fixture(**kwargs)
+            with self.assertRaisesRegex(safety.SupervisionError,'completion is unverified'):
+                safety._reap_faulted_job(child,job,.01,retain_completion=True)
+
+    def test_failed_reap_cannot_publish_completion_or_hide_primary_identity(self):
+        child,job,_=self.fixture()
+        job.terminate_and_reap=lambda *args: (_ for _ in ()).throw(OSError('reap failed'))
+        with self.assertRaisesRegex(OSError,'reap failed'):
+            safety._reap_faulted_job(child,job,.01,retain_completion=True)
+        child,job,_=self.fixture()
+        job.members=lambda:None
+        with self.assertRaisesRegex(safety.SupervisionError,'completion is unverified'):
+            safety._reap_faulted_job(child,job,.01,retain_completion=True)
+        primary=safety.SupervisionError('device-memory','actual original cap sample')
+        self.assertEqual(safety._failure_identity(primary),{'type':'SupervisionError','reason':'device-memory','detail':str(primary)})
+
+    def test_actual_fault_path_preserves_primary_and_only_verified_completion(self):
+        from types import SimpleNamespace
+        policy=SimpleNamespace(backend='windows-cpu',deadline_seconds=10,host_free_reserve_bytes=0,
+                               term_grace_millis=10,stdout_cap_bytes=1000,stderr_cap_bytes=1000,event_cap_bytes=1000)
+        for bad_members in ((),(999,)):
+            child,job,calls=self.fixture(members=bad_members)
+            job.assign_and_resume=lambda child:None
+            job.close=lambda:None
+            primary=safety.SupervisionError('device-memory','original watchdog failure')
+            def fail(pid,pgid):raise primary
+            with tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)
+                with patch.object(safety.os,'name','nt'), \
+                     patch.object(safety.windows,'WindowsJob',return_value=job), \
+                     patch.object(safety.subprocess,'Popen',return_value=child) as popen:
+                    with self.assertRaises(safety.SupervisionError) as caught:
+                        safety._run_admitted(['fake-executable'],cwd=root,env={},policy=policy,
+                            admission={'hostEstimateBytes':0,'hostEstimateSource':'mock'},
+                            stdout_path=root/'stdout',stderr_path=root/'stderr',event_path=None,
+                            probe=Probe(),clock=lambda:0.,on_spawn=fail,retain_owned_completion=True)
+                    popen.assert_called_once()
+            if bad_members:
+                self.assertEqual(caught.exception.reason,'cleanup-failure')
+                self.assertEqual(caught.exception.primary_failure['reason'],'device-memory')
+                self.assertFalse(hasattr(caught.exception,'owned_completion'))
+            else:
+                self.assertIs(caught.exception,primary)
+                self.assertEqual(primary.owned_completion['owned_pids'],[])
+                self.assertEqual(primary.reason,'device-memory')
+
+    def test_fault_handler_and_primary_receipt_are_connected_to_actual_controller(self):
+        # Source join guards helper disconnection, while fake-process tests above
+        # independently discriminate the observations needed to seal cleanup.
+        import inspect
+        source=inspect.getsource(safety._run_admitted)
+        fault=source.split('except BaseException as primary:',1)[1]
+        self.assertIn('_reap_faulted_job(',fault)
+        self.assertIn('primary.owned_completion = completion',fault)
+        self.assertIn('error.primary_failure = _failure_identity(primary)',fault)
+        from scripts.ci import model_inference_proofs as proof
+        controller=inspect.getsource(proof)
+        start=controller.index("result['primary_supervision_failure'] =")
+        self.assertLess(start,controller.index("physical['owned_execution_completion'] = error.owned_completion",start))
 
 
 class Probe:
@@ -1325,8 +1408,19 @@ class OperatorStopTests(unittest.TestCase):
             self.assertEqual(json.loads(caught.exception.record.read_bytes())["stopFiles"],
                              [str(root / "elsewhere" / "halt")])
             blocked = (root / "elsewhere" / "halt" / "STOP",)  # ENOTDIR, not "absent"
-            with self.assertRaises(OSError):
-                safety.check_operator_stop(blocked, logs, kind="k", before="row-a", index=0, total=2)
+            if os.name == "posix":
+                with self.assertRaises(OSError):
+                    safety.check_operator_stop(blocked, logs, kind="k", before="row-a", index=0, total=2)
+            # Windows lstat(file/child) reports FileNotFoundError here rather
+            # than POSIX ENOTDIR. Exercise non-absence failures explicitly on
+            # every platform; never change the production missing-path rule.
+            for error in (NotADirectoryError(errno.ENOTDIR, "synthetic ENOTDIR"),
+                          PermissionError(errno.EACCES, "synthetic access denial")):
+                with self.subTest(error=type(error).__name__), \
+                     patch.object(safety.os, "lstat", side_effect=error):
+                    with self.assertRaises(type(error)) as caught:
+                        safety.check_operator_stop(blocked, logs, kind="k", before="row-a", index=0, total=2)
+                    self.assertIs(caught.exception, error)
 
 
 class WindowsJobCleanupTests(unittest.TestCase):

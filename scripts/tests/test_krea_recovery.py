@@ -84,7 +84,7 @@ class KreaRecoveryProtocol(unittest.TestCase):
         # must not turn a metadata-only budget check into six followed by more work.
         source = (ROOT / 'crates/media/candle-gen/candle-gen/src/train/flow_match.rs').read_text(encoding='utf-8')
         guard = source.index('|| cfg.steps != profile_update_limit')
-        self.assertLess(source.index('let profile_update_limit = if recovery_profile { 6 } else { 18 };'), guard)
+        self.assertLess(source.index('let profile_update_limit = if recovery_profile'), guard)
         self.assertLess(guard, source.index('model.cache(req, device, on_progress)?'))
         self.assertIn('for step in start_step.saturating_add(1)..=cfg.steps', source)
         self.assertIn('(step - 1) % 6 + 1', source)

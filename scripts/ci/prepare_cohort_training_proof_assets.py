@@ -2,7 +2,10 @@
 from __future__ import annotations
 import json
 import os
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 CACHE = Path("E:/huggingface/hub")
 def snapshot(repo: str, revision: str, subdir: str = "") -> Path:
@@ -49,7 +52,8 @@ def selected_binding(selection: str) -> dict[str, Path]:
 
 def main() -> None:
     request = json.loads(os.environ["MODEL_PROOF_REQUEST"])
-    if request.get("configuration") != "fixed_cuda":
+    from scripts.ci.training_comparison import is_recipe
+    if request.get("configuration") != "fixed_cuda" and not is_recipe(request.get("configuration")):
         raise ValueError("bounded cohort setup requires fixed_cuda")
     paths = selected_binding(request["selection"])
     for name, path in paths.items():

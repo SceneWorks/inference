@@ -31,6 +31,10 @@ def validate_binding(row: dict) -> bool:
     if not applies(row):
         return False
     recipe = row.get('selected_configuration', {})
+    if recipe.get('name') == 'fixed_cuda_paired_comparison':
+        from scripts.ci import krea_paired
+        krea_paired.validate_binding(row)
+        return False
     recovery = recipe.get('name') == CONFIGURATION
     if (row.get('configuration_kind') != 'source-controls'
             or row.get('configuration_controls') != [CONTROL]

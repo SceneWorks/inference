@@ -157,8 +157,32 @@ impl Trainer for AnimaTrainer {
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let policy = anima_training_policy(self.descriptor.id, self.device.is_cuda(), req)?;
+        candle_gen::train::policy::with_job_policy(policy, || {
+            let mut progress = |event| {
+                candle_gen::train::policy::without_production_profile(|| on_progress(event))
+            };
+            self.train_impl(req, &mut progress)
+        })
+        .map_err(Into::into)
     }
+}
+
+// Resolve once before conditioner/model/cache preparation. This recovery is
+// Base LoRA only; LoKr remains Current and native resume stays unsupported.
+fn anima_training_policy(
+    model_id: &str,
+    is_cuda: bool,
+    req: &TrainingRequest,
+) -> Result<candle_gen::train::policy::JobTrainingPolicy> {
+    let policy = candle_gen::train::policy::JobTrainingPolicy::resolve(model_id, is_cuda, req)?;
+    Ok(
+        if req.config.network_type == NetworkType::Lora && !req.config.full_finetune {
+            policy
+        } else {
+            policy.for_unmeasured_mode()
+        },
+    )
 }
 
 struct AnimaTrainHost<'a> {
@@ -237,7 +261,7 @@ fn compute_step_loss_grads(
         mae,
         dtype,
         aux,
-        true,
+        candle_gen::train::policy::cache_enabled(),
     )
 }
 
@@ -395,6 +419,33 @@ impl AnimaTrainer {
     ) -> Result<TrainingOutput> {
         let cfg = &req.config;
         let device = &self.device;
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            // Seed the actual native device before cache noise/adapters are constructed.
+            device.set_seed(cfg.seed)?;
+            assert!(
+                !cfg.resume,
+                "comparison stages require a fresh optimizer/run"
+            );
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "anima-native-training",
+                "training_config_debug": format!("{cfg:?}"),
+                "seed": cfg.seed,
+                "optimizer": cfg.optimizer,
+                "learning_rate": cfg.learning_rate,
+                "lr_scheduler": format!("{:?}", cfg.lr_scheduler),
+                "lr_warmup_steps": cfg.lr_warmup_steps,
+                "gradient_checkpointing": cfg.gradient_checkpointing,
+                "cache_latents_requested": cfg.cache_latents,
+                "cache_text_embeddings_requested": cfg.cache_text_embeddings,
+                "actual_preexisting_cache": "native VAE latents and text-encoder outputs cached before updates; retained in every arm",
+                "video_frames": 1,
+                "audio_mode": "none",
+                "model_source": format!("{:?}", self.source),
+                "captions": req.items.iter().map(|item| item.caption.as_str()).collect::<Vec<_>>(),
+                "reset": "fresh native trainer/process; seeded native device; new optimizer/zero accumulation"
+            }));
+        }
         on_progress(TrainingProgress::Preparing);
         // Epic 2123 E7: the depth-anchoring models count against the device budget (no-op with
         // nothing enabled), BEFORE any load or caching.
@@ -505,6 +556,13 @@ impl AnimaTrainer {
                 )?,
             }
         };
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "anima-actual-raw-cache",
+                "entries": cache.iter().map(|(latent, source, target_ids, _)| serde_json::json!({"latent":latent.dims(),"source_caption":source.dims(),"target_caption_ids":target_ids.dims()})).collect::<Vec<_>>()
+            }));
+        }
         let latent_inputs = cache.iter().map(|entry| &entry.0).collect::<Vec<_>>();
         let conditioner_inputs = cache
             .iter()
@@ -725,6 +783,55 @@ mod tests {
             source: WeightsSource::Dir("/unused".into()),
             device: Device::Cpu,
         }
+    }
+
+    // Metadata only: never construct a Device/Tensor/trainer or call train.
+    #[test]
+    fn anima_measured_lora_preserves_unmeasured_modes_and_callback_scope() {
+        use candle_gen::train::policy::{self, JobTrainingPolicy, TrainingProfile};
+        let mut req = request();
+        let id = trainer_descriptor().id;
+        assert_eq!(id, "anima_base");
+        let job = anima_training_policy(id, true, &req).unwrap();
+        assert_eq!(job.model(), id);
+        assert_eq!(job.profile(), TrainingProfile::WithoutE1);
+        let outer = JobTrainingPolicy::resolve("ltx_2_5_distilled", true, &req).unwrap();
+        policy::with_job_policy(outer, || {
+            assert!(!policy::cache_enabled());
+            policy::with_job_policy(job, || {
+                assert_eq!(policy::active_profile(), TrainingProfile::WithoutE1);
+                assert!(policy::legacy_e1());
+                assert!(policy::cache_enabled() && policy::projection_enabled());
+                policy::without_production_profile(|| {
+                    assert_eq!(policy::active_profile(), TrainingProfile::Current);
+                    assert!(!policy::legacy_e1());
+                });
+                assert_eq!(policy::active_profile(), TrainingProfile::WithoutE1);
+            });
+            assert_eq!(policy::active_profile(), outer.profile());
+        });
+        assert_eq!(
+            anima_training_policy(id, false, &req).unwrap().profile(),
+            TrainingProfile::Current
+        );
+        req.config.full_finetune = true;
+        assert_eq!(
+            anima_training_policy(id, true, &req).unwrap().profile(),
+            TrainingProfile::Current
+        );
+        req.config.full_finetune = false;
+        req.config.network_type = NetworkType::Lokr;
+        assert_eq!(
+            anima_training_policy(id, true, &req).unwrap().profile(),
+            TrainingProfile::Current
+        );
+        req.config.network_type = NetworkType::Lora;
+        assert_eq!(
+            anima_training_policy("unmeasured-anima-variant", true, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
     }
 
     #[test]

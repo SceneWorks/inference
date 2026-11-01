@@ -202,13 +202,23 @@ fn bounded_peak(sampler: candle_gen::testkit::PeakSampler, root: &std::path::Pat
 #[ignore = "model inference; explicit model-proof workflow"]
 fn mage_bounded_acceleration_acceptance() {
     let root = bounded_root();
+    let comparison = candle_gen::train::comparison::requested_stage().is_some();
+    let cadence = candle_gen::train::comparison::ComparisonCadence::Ordinary;
+    let steps = if comparison { cadence.updates() } else { 4 };
+    // One source-owned representative workload, never a resolution grid. The
+    // controller must admit the worst legacy arm before executing any stage.
+    let resolution = if comparison { 512 } else { 64 };
     let snapshot = PathBuf::from(
         std::env::var_os("MAGE_BASE_TRAIN_SNAPSHOT").expect("pinned installed snapshot"),
     );
     let input = root.join("input.png");
-    image::RgbImage::from_pixel(64, 64, image::Rgb([210, 160, 30]))
-        .save(&input)
-        .unwrap();
+    image::RgbImage::from_pixel(
+        resolution as u32,
+        resolution as u32,
+        image::Rgb([210, 160, 30]),
+    )
+    .save(&input)
+    .unwrap();
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot.clone()))
         .with_component(
             candle_gen_mage::COMPONENT_TEXT_ENCODER,
@@ -222,48 +232,70 @@ fn mage_bounded_acceleration_acceptance() {
                 std::env::var_os("MAGE_TRAIN_VAE").expect("pinned shared VAE"),
             )),
         );
-    let sampler = candle_gen::testkit::PeakSampler::start_rendered();
-    let output = candle_gen::train::profile::with_bounded_cohort_for(
-        &root.join("metrics.json"),
-        &[
-            "mage:geometry-storage-hit",
-            "mage:frozen-caption-base-hit-live-residual",
-            "mage:frozen-projection-pack",
-        ],
-        || {
-            let mut trainer = candle_gen_mage::provider_registry()
-                .unwrap()
-                .load_trainer("mage_flow_base", &spec)
-                .unwrap();
-            let req = TrainingRequest {
-                items: vec![TrainingItem::captioned(input, "a gold tile".into())],
-                config: TrainingConfig {
-                    rank: 2,
-                    alpha: 2.,
-                    learning_rate: 1e-3,
-                    steps: 4,
-                    resolution: 64,
-                    batch_size: 1,
-                    gradient_accumulation: 1,
-                    lr_warmup_steps: 0,
-                    save_every: 0,
-                    seed: 7,
-                    train_dtype: "bf16".into(),
-                    gradient_checkpointing: false,
-                    ..Default::default()
-                },
-                output_dir: root.join("out"),
-                file_name: "adapter.safetensors".into(),
-                trigger_words: vec![],
-                cancel: CancelFlag::new(),
-            };
-            let output = trainer.train(&req, &mut |_| {}).unwrap();
-            assert_eq!(output.steps, 4);
-            assert!(output.final_loss.is_finite());
-            output
-        },
-    );
-    bounded_peak(sampler, &root);
+    let config = TrainingConfig {
+        rank: 2,
+        alpha: 2.,
+        learning_rate: 1e-3,
+        steps,
+        resolution,
+        batch_size: 1,
+        gradient_accumulation: 1,
+        lr_warmup_steps: 0,
+        save_every: 0,
+        seed: 7,
+        train_dtype: "bf16".into(),
+        gradient_checkpointing: false,
+        ..Default::default()
+    };
+    let items = vec![TrainingItem::captioned(input, "a gold tile".into())];
+    let sampler = (!comparison).then(candle_gen::testkit::PeakSampler::start_rendered);
+    // A new child owns a fresh native trainer/Run, initial parameters, native
+    // optimizer, EMA/data cursors and (restoration) critic/SN state. No quality
+    // render or adapter reload is repeated by this timing-only supplement.
+    let run = || {
+        if comparison {
+            comparison_initialization(&config, &items, &spec);
+        }
+        let mut trainer = candle_gen_mage::provider_registry()
+            .unwrap()
+            .load_trainer("mage_flow_base", &spec)
+            .unwrap();
+        let req = TrainingRequest {
+            items,
+            config,
+            output_dir: root.join("out"),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: vec![],
+            cancel: CancelFlag::new(),
+        };
+        let output = trainer.train(&req, &mut |_| {}).unwrap();
+        assert_eq!(output.steps, steps);
+        assert!(output.final_loss.is_finite());
+        output
+    };
+    let output = if comparison {
+        candle_gen::train::comparison::with_stage(
+            &root.join("comparison_metrics.json"),
+            "mage-adapter",
+            cadence,
+            run,
+        )
+    } else {
+        candle_gen::train::profile::with_bounded_cohort_for(
+            &root.join("metrics.json"),
+            &[
+                "mage:geometry-storage-hit",
+                "mage:frozen-caption-base-hit-live-residual",
+                "mage:frozen-projection-pack",
+            ],
+            run,
+        )
+    };
+    if comparison {
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::mage_bounded_acceleration_acceptance");
+        return;
+    }
+    bounded_peak(sampler.expect("ordinary fixture sampler"), &root);
     let reopened =
         candle_gen::candle_core::safetensors::load(&output.adapter_path, &Device::Cpu).unwrap();
     assert!(!reopened.is_empty());
@@ -302,4 +334,41 @@ fn mage_bounded_acceleration_acceptance() {
     println!(
         "\nMODEL_INFERENCE_BODY_COMPLETED trainer_cuda_smoke::mage_bounded_acceleration_acceptance"
     );
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn comparison_input_sha256(path: &std::path::Path) -> String {
+    use sha2::Digest;
+    format!(
+        "{:x}",
+        sha2::Sha256::digest(std::fs::read(path).expect("comparison input"))
+    )
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn comparison_initialization(
+    config: &candle_gen::gen_core::TrainingConfig,
+    items: &[candle_gen::gen_core::TrainingItem],
+    spec: &candle_gen::gen_core::LoadSpec,
+) {
+    let data = items.iter().map(|item| {
+        let sidecars = item.model_options.iter().map(|(key,value)| {
+            let value = if let Some(path) = value.as_str().filter(|path| std::path::Path::new(path).is_file()) {
+                serde_json::json!({"file_sha256":comparison_input_sha256(std::path::Path::new(path))})
+            } else { value.clone() };
+            (key.clone(),value)
+        }).collect::<serde_json::Map<String,serde_json::Value>>();
+        serde_json::json!({"image_sha256":comparison_input_sha256(&item.image_path),
+            "caption":item.caption,"sidecars":sidecars,
+            "references":item.reference_image_paths.iter().map(|path|comparison_input_sha256(path)).collect::<Vec<_>>(),
+            "control":item.control_image_path.as_deref().map(comparison_input_sha256),
+            "subject_mask":item.subject_mask_path.as_deref().map(comparison_input_sha256)})
+    }).collect::<Vec<_>>();
+    candle_gen::train::comparison::record_initialization(&serde_json::json!({
+        "training_config":format!("{config:?}"),"source_spec":format!("{spec:?}"),
+        "seed":config.seed,"resolution":config.resolution,"batch_size":config.batch_size,
+        "gradient_accumulation":config.gradient_accumulation,"data":data,
+        "factory":"fresh native trainer in one comparison child; no resumed mutable run",
+        "claim_limit":"content/configuration witnesses; not a claim of whole checkpoint bytes or tensor equality from source flags"
+    }));
 }

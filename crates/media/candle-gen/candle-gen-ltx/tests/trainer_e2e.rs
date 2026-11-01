@@ -247,6 +247,76 @@ fn bounded_render(adapter: Option<&Path>) -> Vec<u8> {
 #[cfg(feature = "model-inference-proof")]
 #[ignore = "model inference; explicit model-proof workflow"]
 fn ltx23_bounded_acceleration_acceptance() {
+    if let Some(stage) = candle_gen::train::comparison::requested_stage() {
+        use candle_gen::train::comparison::{self, ComparisonCadence, ComparisonStage};
+        assert_ne!(
+            stage,
+            ComparisonStage::MinusE3,
+            "installed q4 tier uses separate native projections"
+        );
+        assert_ne!(
+            stage,
+            ComparisonStage::MinusReferenceOwner,
+            "LTX uses composable reference attention"
+        );
+        let root = bounded_output_root();
+        comparison::with_stage(
+            &root.join("comparison_metrics.json"),
+            "ltx_2_3",
+            ComparisonCadence::Ordinary,
+            || {
+                comparison::record_initialization(&serde_json::json!({
+                    "model_source": required_dir("LTX_TRAINING_TIER").display().to_string(),
+                    "text_encoder_source": required_dir("LTX_GEMMA_DIR").display().to_string(),
+                    "dataset": "existing64px red swatch and exact caption, VAE-encoded at256px",
+                    "video_frames": 1, "audio_mode": "none",
+                "qualification": "single-image256px case; no dense projection packing on q4"
+                }));
+                let mut trainer = candle_gen_ltx::provider_registry()
+                    .unwrap()
+                    .load_trainer(candle_gen_ltx::config::TRAINER_ID, &load_spec(Vec::new()))
+                    .unwrap();
+                let output = trainer
+                    .train(
+                        &TrainingRequest {
+                            items: vec![make_item(&root.join("data"))],
+                            config: TrainingConfig {
+                                rank: 4,
+                                alpha: 4.,
+                                learning_rate: 1e-3,
+                                steps: 4,
+                                resolution: 256,
+                                batch_size: 1,
+                                gradient_accumulation: 1,
+                                lr_warmup_steps: 0,
+                                seed: 7,
+                                network_type: NetworkType::Lora,
+                                train_dtype: "f32".into(),
+                                gradient_checkpointing: true,
+                                save_every: 0,
+                                sample_every: 0,
+                                resume: false,
+                                ..Default::default()
+                            },
+                            output_dir: root.join("comparison_out"),
+                            file_name: "comparison.safetensors".into(),
+                            trigger_words: vec![],
+                            cancel: CancelFlag::new(),
+                        },
+                        &mut |_| {},
+                    )
+                    .expect("four native LTX2.3 comparison updates");
+                assert_eq!(output.steps, 4);
+                assert!(output.final_loss.is_finite());
+                assert!(output.adapter_path.is_file());
+            },
+        );
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::ltx23_bounded_acceleration_acceptance"
+        );
+        return;
+    }
+
     assert_eq!(candle_gen_ltx::config::TRAINER_ID, "ltx_2_3");
     assert_eq!(candle_gen_ltx::config::MODEL_ID, "ltx_2_3_distilled");
 
@@ -430,6 +500,51 @@ fn ltx25_bounded_acceleration_acceptance() {
         trigger_words: vec![],
         cancel: CancelFlag::new(),
     };
+    if let Some(stage) = candle_gen::train::comparison::requested_stage() {
+        use candle_gen::train::comparison::{self, ComparisonCadence, ComparisonStage};
+        assert_ne!(
+            stage,
+            ComparisonStage::MinusE3,
+            "Dev/q4 uses native separate projections"
+        );
+        assert_ne!(
+            stage,
+            ComparisonStage::MinusReferenceOwner,
+            "AV attention uses the composable reference"
+        );
+        comparison::with_stage(
+            &root.join("comparison_metrics.json"),
+            "ltx_2_5",
+            ComparisonCadence::Ordinary,
+            || {
+                comparison::record_initialization(&serde_json::json!({
+                    "model_source": required_dir("LTX25_TRAINING_TIER").display().to_string(),
+                    "dataset": "source-owned ltx_av_e2e_golden video[1,128,2,8,8],audio[1,8,9,16],9frames24fps",
+                    "video_frames": 9, "fps": 24, "duration_seconds": 9.0 / 24.0,
+                "video_latent_shape": [1,128,2,8,8], "audio_latent_shape": [1,8,9,16],
+                "audio_mode": "joint video/audio prepared latent training; no waveform encoding or vocoder",
+                "audio_latent_sample_rate_hz": candle_gen_ltx::config::AUDIO_LATENT_SAMPLE_RATE,
+                "audio_latent_frames_per_second": candle_gen_ltx::config::AUDIO_LATENTS_PER_SECOND,
+                "audio_latent_duration_seconds": 9.0 / candle_gen_ltx::config::AUDIO_LATENTS_PER_SECOND,
+                "constant_repair": "bounded packed frozen-input VJP ownership enabled in EVERY arm; legacy optimization control, not literal old binary"
+                }));
+                let mut trainer = candle_gen_ltx::provider_registry()
+                    .unwrap()
+                    .load_trainer(candle_gen_ltx::MODEL_25_ID, &spec)
+                    .unwrap();
+                let output = trainer
+                    .train(&request, &mut |_| {})
+                    .expect("four native joint AV comparison updates");
+                assert_eq!(output.steps, 4);
+                assert!(output.final_loss.is_finite());
+                assert!(output.adapter_path.is_file());
+            },
+        );
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED trainer_e2e::ltx25_bounded_acceleration_acceptance"
+        );
+        return;
+    }
     let sampler = candle_gen::testkit::PeakSampler::start_rendered();
     let output = candle_gen::train::profile::with_bounded_cohort_for(
         &root.join("metrics.json"),

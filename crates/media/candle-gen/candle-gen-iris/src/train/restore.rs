@@ -121,6 +121,34 @@ fn pinned_networks(res: &RestoreTrainResources) -> NetsProvider {
     );
     Box::new(move |compute, device| {
         let trunk_cfg = ConvNextConfig::xxlarge();
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            use contract::{CRITIC_TRUNK_RESOURCE, LPIPS_LIN_RESOURCE, VGG16_RESOURCE};
+            let frozen_start = std::time::Instant::now();
+            let names = trunk_cfg
+                .tensor_shapes()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<std::collections::BTreeSet<_>>();
+            let trunk_map =
+                super::frozen_cache::load("convnext", &trunk, &CRITIC_TRUNK_RESOURCE, &|name| {
+                    names.contains(name)
+                })?;
+            let vgg_map = super::frozen_cache::load("vgg", &vgg, &VGG16_RESOURCE, &|name| {
+                name.starts_with("features.")
+            })?;
+            let lin_map = super::frozen_cache::load("lpips", &lin, &LPIPS_LIN_RESOURCE, &|_| true)?;
+            let native_start = std::time::Instant::now();
+            let frozen = FrozenNets {
+                trunk: ConvNextTrunk::from_map(&trunk_map, &trunk_cfg, compute, device)?,
+                lpips: Lpips::from_maps(&vgg_map, &lin_map, contract::VGG16_WIDTHS, device)?,
+                trunk_cfg,
+                head_width: CRITIC_HEAD_WIDTH,
+            };
+            eprintln!("IRIS_COMPARISON_FROZEN_NATIVE_CONSTRUCTOR native_cast_transfer_seconds={} frozen_bootstrap_including_hash_decode_read_seconds={}",
+                native_start.elapsed().as_secs_f64(), frozen_start.elapsed().as_secs_f64());
+            return Ok(frozen);
+        }
         Ok(FrozenNets {
             trunk: ConvNextTrunk::load(&trunk, &trunk_cfg, compute, device)?,
             lpips: Lpips::load(&vgg, &lin, device)?,
@@ -201,9 +229,81 @@ impl Trainer for IrisRestoreTrainer {
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
         self.floors(req)?;
-        let run = Run::prepare(self, req, on_progress)?;
-        run.execute(req, on_progress).map_err(Into::into)
+        let plan = self.plan(req, &[])?;
+        let policy = restore_training_policy(
+            req,
+            self.device.is_cuda(),
+            &plan.artifact,
+            plan.resume_from.as_deref(),
+            plan.resume,
+        )?;
+        candle_gen::train::policy::with_job_policy(policy, || {
+            let mut progress = |event| {
+                candle_gen::train::policy::without_production_profile(|| on_progress(event))
+            };
+            Run::prepare(self, req, &mut progress).and_then(|run| run.execute(req, &mut progress))
+        })
+        .map_err(Into::into)
     }
+}
+
+// Header/profile resolution is CPU metadata only and precedes every model,
+// optimizer, EMA (and restoration critic/SN) construction in Run::prepare.
+fn restore_resume_directory(
+    req: &TrainingRequest,
+    resume_from: Option<&Path>,
+    resume: bool,
+) -> Result<Option<PathBuf>> {
+    let root = checkpoint_root(&req.output_dir, &req.file_name);
+    match (resume_from, resume) {
+        (Some(path), _) => Ok(Some(if path.join(CKPT_STATE).is_file() {
+            path.to_path_buf()
+        } else {
+            latest_checkpoint(path).ok_or_else(|| {
+                Error::Msg(format!(
+                    "iris restore resume: {} holds no complete checkpoint",
+                    path.display()
+                ))
+            })?
+        })),
+        (None, true) => Ok(latest_checkpoint(&root)),
+        (None, false) => Ok(None),
+    }
+}
+
+fn restore_training_policy(
+    req: &TrainingRequest,
+    is_cuda: bool,
+    artifact: &RestoreArtifact,
+    resume_from: Option<&Path>,
+    resume: bool,
+) -> Result<candle_gen::train::policy::JobTrainingPolicy> {
+    use candle_gen::train::policy::{profile_from_state_identity, JobTrainingPolicy};
+    let mut policy = JobTrainingPolicy::resolve(TRAINER_ID, is_cuda, req)?;
+    // Only the measured LoRA G+D recipe is eligible; never inherit a
+    // generation profile or apply it to restoration Full/LoKr.
+    if !matches!(artifact, RestoreArtifact::Lora { .. }) {
+        policy = policy.for_unmeasured_mode();
+    }
+    if let Some(path) = restore_resume_directory(req, resume_from, resume)? {
+        let saved = read_checkpoint_state(&path)?;
+        policy = policy
+            .with_native_resume_profile(profile_from_state_identity(&saved.state_identity)?)?;
+    }
+    Ok(policy)
+}
+
+fn checked_restore_state_identity(saved: &str, expected_private_state: &str) -> Result<String> {
+    let expected = candle_gen::train::policy::bind_state_identity(
+        expected_private_state,
+        candle_gen::train::policy::active_profile(),
+    );
+    if saved != expected {
+        return Err(Error::Msg(
+            "iris restore resume: private execution-profile/state identity differs".into(),
+        ));
+    }
+    Ok(expected_private_state.into())
 }
 
 fn adamw_plan(lr: f64, betas: (f64, f64), weight_decay: f64) -> OptimizerPlan {
@@ -704,24 +804,16 @@ impl Run {
             0usize,
         );
         let mut losses = [f64::NAN; 5];
-        let resume_dir = match (&plan.resume_from, plan.resume) {
-            (Some(p), _) => Some(if p.join(CKPT_STATE).is_file() {
-                p.clone()
-            } else {
-                latest_checkpoint(p).ok_or_else(|| {
-                    Error::Msg(format!(
-                        "iris restore resume: {} holds no complete checkpoint",
-                        p.display()
-                    ))
-                })?
-            }),
-            (None, true) => latest_checkpoint(&ckpt_root),
-            (None, false) => None,
-        };
+        let resume_dir = restore_resume_directory(req, plan.resume_from.as_deref(), plan.resume)?;
         let resume_src = resume_dir.clone();
         if let Some(dir) = resume_dir {
             let saved = read_checkpoint_state(&dir)?;
-            check_resume(&saved, &plan, &dataset_fingerprint, &base_identity)?;
+            // Normalize only a clone for the existing native contract checker;
+            // retain the actual header/tag and every base/data/cursor identity.
+            let mut compatible = saved.clone();
+            compatible.state_identity =
+                checked_restore_state_identity(&saved.state_identity, &plan.state_identity())?;
+            check_resume(&compatible, &plan, &dataset_fingerprint, &base_identity)?;
             let restored = load_tensors(&dir.join(CKPT_TRAINABLE), &device)?;
             if restored.len() != params.len() || params.keys().any(|k| !restored.contains_key(k)) {
                 return Err(Error::Msg(
@@ -756,6 +848,66 @@ impl Run {
         // before its first publish (retention and `latest` see only this run's) — once the resume
         // source was validated, so a refused resume leaves the root as it was.
         retire_foreign_checkpoints(&ckpt_root, resume_src.as_deref())?;
+        if candle_gen::train::comparison::active_stage().is_some() {
+            assert_eq!(step, 0, "comparison requires a pristine native run");
+            assert_eq!(sched_step, 0, "comparison scheduler starts at zero");
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner":"iris-restoration-native-run","step":step,"schedule_step":sched_step,
+                "lr":lr,"critic_lr":lr_critic,"nan_count":nan_count,"epoch":epoch,"position":pos,
+                "total_native_steps":total_steps,"ema_present":ema.is_some(),"data_seed":req.config.seed,
+                "factory":"Run::prepare/fresh native DataWalk"
+            }));
+            candle_gen::train::comparison::record_initial_tensors(
+                "iris-restoration-params",
+                params
+                    .iter()
+                    .map(|(name, var)| (name.as_str(), var.as_tensor())),
+            )?;
+            let slots = opt.state_tensors()?;
+            candle_gen::train::comparison::record_initial_tensors(
+                "iris-restoration-optimizer",
+                slots.iter().map(|(name, tensor)| (name.as_str(), tensor)),
+            )?;
+            if let Some(ema) = &ema {
+                candle_gen::train::comparison::record_initial_tensors(
+                    "iris-restoration-ema",
+                    ema.iter().map(|(name, tensor)| (name.as_str(), tensor)),
+                )?;
+            }
+            candle_gen::train::comparison::record_initial_tensors(
+                "iris-restoration-critic-head",
+                head.iter()
+                    .map(|(name, var)| (name.as_str(), var.as_tensor())),
+            )?;
+            let critic_slots = critic_opt.state_tensors()?;
+            candle_gen::train::comparison::record_initial_tensors(
+                "iris-restoration-critic-optimizer",
+                critic_slots
+                    .iter()
+                    .map(|(name, tensor)| (name.as_str(), tensor)),
+            )?;
+            let spectral = sn
+                .iter()
+                .flat_map(|(name, (u, v))| {
+                    [
+                        (format!("{name}.weight_u"), u.clone()),
+                        (format!("{name}.weight_v"), v.clone()),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner":"iris-restoration-spectral-normalization",
+                "tensor_count":spectral.len()
+            }));
+            if !spectral.is_empty() {
+                candle_gen::train::comparison::record_initial_tensors(
+                    "iris-restoration-spectral-normalization",
+                    spectral
+                        .iter()
+                        .map(|(name, tensor)| (name.as_str(), tensor)),
+                )?;
+            }
+        }
         let _ = &mut params;
         Ok(Self {
             plan,
@@ -975,7 +1127,9 @@ impl Run {
                             if plan.preview_every > 0
                                 && self.step.is_multiple_of(plan.preview_every as u64)
                             {
-                                self.render_preview(req, on_progress)?;
+                                candle_gen::train::policy::without_production_profile(|| {
+                                    self.render_preview(req, on_progress)
+                                })?;
                             }
                             if self.step >= plan.max_steps as u64 {
                                 finished = true;
@@ -1036,7 +1190,10 @@ impl Run {
             ema_decay: self.plan.ema,
             seed: self.plan.seed,
             backend: BACKEND.into(),
-            state_identity: self.plan.state_identity(),
+            state_identity: candle_gen::train::policy::bind_state_identity(
+                &self.plan.state_identity(),
+                candle_gen::train::policy::active_profile(),
+            ),
             data_identity: self.plan.data_identity(),
             dataset_fingerprint: self.dataset_fingerprint.clone(),
             base_identity: self.base_identity.clone(),
@@ -1199,5 +1356,200 @@ pub fn adapter_delta(kind: AdapterKind, t: &AdapterTarget, p: &Tensors) -> Resul
             1.0,
             (t.out_f, t.in_f),
         ),
+    }
+}
+
+#[cfg(test)]
+mod production_policy_metadata_tests {
+    use super::*;
+    use candle_gen::train::policy::{self, TrainingProfile};
+
+    fn request(output: &Path) -> TrainingRequest {
+        TrainingRequest {
+            items: vec![],
+            config: Default::default(),
+            output_dir: output.into(),
+            file_name: "restore.safetensors".into(),
+            trigger_words: vec![],
+            cancel: Default::default(),
+        }
+    }
+    fn lora() -> RestoreArtifact {
+        RestoreArtifact::Lora {
+            rank: 8,
+            alpha: 8.,
+            targets: vec![],
+        }
+    }
+    fn header() -> RestoreCheckpointState {
+        RestoreCheckpointState {
+            step: 4,
+            epoch: 1,
+            batches_consumed: 4,
+            scheduler_step: 4,
+            lr: 1e-5,
+            lr_critic: 1e-5,
+            nan_count: 0,
+            losses: [1.; 5],
+            artifact: "lora".into(),
+            ema_decay: Some(0.5),
+            seed: 7,
+            backend: BACKEND.into(),
+            state_identity: "private-restore-config".into(),
+            data_identity: "degradation-options".into(),
+            dataset_fingerprint: "dataset".into(),
+            base_identity: "original-base".into(),
+        }
+    }
+
+    // Native JSON/G+D counters only; no Tensor/Device/optimizer/cache conversion.
+    #[test]
+    fn restore_measured_lora_preserves_historical_current_and_unmeasured_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let req = request(temp.path());
+        let dir = checkpoint_root(&req.output_dir, &req.file_name).join("step_000004");
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = header();
+        let original = serde_json::to_vec(&saved.to_json()).unwrap();
+        std::fs::write(dir.join(CKPT_STATE), &original).unwrap();
+        let job = restore_training_policy(&req, true, &lora(), None, true).unwrap();
+        assert_eq!(job.model(), "iris_3b_restore");
+        assert_eq!(job.profile(), TrainingProfile::Current);
+        assert_eq!(
+            restore_resume_directory(&req, Some(&dir), false).unwrap(),
+            Some(dir.clone())
+        );
+        policy::with_job_policy(job, || {
+            let mut compatible = saved.clone();
+            compatible.state_identity =
+                checked_restore_state_identity(&saved.state_identity, "private-restore-config")
+                    .unwrap();
+            assert_eq!(serde_json::to_vec(&compatible.to_json()).unwrap(), original);
+            assert_eq!(
+                policy::bind_state_identity(&saved.state_identity, policy::active_profile()),
+                saved.state_identity
+            );
+            assert_eq!(compatible.lr_critic, saved.lr_critic);
+            assert!(checked_restore_state_identity(&saved.state_identity, "other-config").is_err());
+            policy::without_production_profile(|| {
+                assert_eq!(policy::active_profile(), TrainingProfile::Current)
+            });
+        });
+        for artifact in [
+            RestoreArtifact::Full,
+            RestoreArtifact::Lokr {
+                rank: 8,
+                alpha: 8.,
+                decompose_factor: -1,
+                targets: vec![],
+            },
+        ] {
+            assert_eq!(
+                restore_training_policy(&req, true, &artifact, None, false)
+                    .unwrap()
+                    .profile(),
+                TrainingProfile::Current
+            );
+        }
+        assert_eq!(
+            restore_training_policy(&req, false, &lora(), None, false)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+    }
+
+    #[test]
+    fn restore_selected_joint_lora_binds_only_private_resume_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let req = request(temp.path());
+        let job = restore_training_policy(&req, true, &lora(), None, false).unwrap();
+        assert_eq!(job.model(), "iris_3b_restore");
+        assert_eq!(job.profile(), TrainingProfile::WithoutE3);
+        let original = header();
+        let original_bytes = serde_json::to_vec(&original.to_json()).unwrap();
+        let tagged = policy::with_job_policy(job, || {
+            assert!(!policy::projection_enabled());
+            assert!(policy::cache_enabled());
+            let mut saved = original.clone();
+            saved.state_identity =
+                policy::bind_state_identity(&saved.state_identity, policy::active_profile());
+            assert_eq!(
+                saved.state_identity,
+                "private-restore-config;execution_profile=measured-reference-v1/minus-e3"
+            );
+            let mut compatible = saved.clone();
+            compatible.state_identity =
+                checked_restore_state_identity(&saved.state_identity, &original.state_identity)
+                    .unwrap();
+            // Compare every native JSON field, including base/data/seed and
+            // joint G+D counters/losses: only the private state tag differs.
+            assert_eq!(
+                serde_json::to_vec(&compatible.to_json()).unwrap(),
+                original_bytes
+            );
+            policy::without_production_profile(|| {
+                assert_eq!(policy::active_profile(), TrainingProfile::Current);
+                assert!(policy::projection_enabled());
+            });
+            assert_eq!(policy::active_profile(), TrainingProfile::WithoutE3);
+            saved
+        });
+        assert_eq!(
+            serde_json::to_vec(&original.to_json()).unwrap(),
+            original_bytes
+        );
+        std::fs::write(
+            temp.path().join(CKPT_STATE),
+            serde_json::to_vec(&tagged.to_json()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            restore_training_policy(&req, true, &lora(), Some(temp.path()), false)
+                .unwrap()
+                .profile(),
+            TrainingProfile::WithoutE3
+        );
+        assert!(restore_training_policy(&req, false, &lora(), Some(temp.path()), false).is_err());
+        for unmeasured in [
+            RestoreArtifact::Full,
+            RestoreArtifact::Lokr {
+                rank: 8,
+                alpha: 8.,
+                decompose_factor: -1,
+                targets: vec![],
+            },
+        ] {
+            assert!(
+                restore_training_policy(&req, true, &unmeasured, Some(temp.path()), false).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn restore_native_header_rejects_foreign_and_proof_profiles_before_prepare() {
+        let temp = tempfile::tempdir().unwrap();
+        let req = request(temp.path());
+        for tag in [
+            "measured-reference-v1/legacy",
+            "measured-reference-v1/minus-e1",
+            "measured-reference-v1/minus-e2",
+            "comparison-proof-v1/minus-e3",
+            "comparison-proof-v1/plus-streaming",
+            "unknown-v9/current",
+        ] {
+            let mut saved = header();
+            saved.state_identity = format!("private-restore-config;execution_profile={tag}");
+            std::fs::write(
+                temp.path().join(CKPT_STATE),
+                serde_json::to_vec(&saved.to_json()).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                restore_training_policy(&req, true, &lora(), Some(temp.path()), false).is_err(),
+                "{tag}"
+            );
+        }
+        assert!(restore_resume_directory(&req, Some(&temp.path().join("absent")), false).is_err());
     }
 }

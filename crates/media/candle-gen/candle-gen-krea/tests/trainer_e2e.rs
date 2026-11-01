@@ -203,12 +203,21 @@ fn krea_bounded_acceleration_profile() {
     {
         // Only the exact registered recovery recipe can set this fixed selector.
         // An inherited selector is explicitly unset by the default proof recipe.
+        let selector = std::env::var("KREA_PROFILE_CANDIDATE_RECOVERY");
+        let paired = selector.as_deref() == Ok("paired-12");
         let recovery = match std::env::var("KREA_PROFILE_CANDIDATE_RECOVERY").as_deref() {
             Ok("1") => true,
+            Ok("paired-12") => false,
             Err(std::env::VarError::NotPresent) => false,
-            _ => panic!("Krea recovery selector must be the exact registered literal1 or UNSET"),
+            _ => panic!("Krea selector must be registered literal1, paired-12 or UNSET"),
         };
-        let expected_updates = if recovery { 6 } else { 18 };
+        let expected_updates = if recovery {
+            6
+        } else if paired {
+            12
+        } else {
+            18
+        };
         let graph_retaining_backward = candle_gen::candle_core::backprop::grad_do_not_detach();
         assert!(
             !graph_retaining_backward,
@@ -256,6 +265,8 @@ fn krea_bounded_acceleration_profile() {
         };
         let (result, recovery_report) = if recovery {
             candle_gen::train::profile::with_bounded_krea_recovery(&mut train)
+        } else if paired {
+            candle_gen::train::profile::with_bounded_krea_paired(&mut train)
         } else {
             (
                 candle_gen::train::profile::with_bounded_krea_profile(&mut train),
@@ -265,8 +276,8 @@ fn krea_bounded_acceleration_profile() {
         let out = result.expect("bounded matched profile or explicit candidate recovery succeeds");
         assert_eq!(
             recovery_report.is_some(),
-            recovery,
-            "complete recovery report required"
+            recovery || paired,
+            "complete selected bounded report required"
         );
         drop(trainer);
         let peak_mib = sampler.stop();
@@ -352,7 +363,37 @@ fn krea_bounded_acceleration_profile() {
             "profile_records": ["KREA_PROFILE_BOUNDARY", "KREA_PROFILE_STEP", "KREA_PROFILE_ATTRIBUTION", "KREA_PROFILE_OPTIMIZER", "KREA_PROFILE_RESULT"],
             "claim_limit": "Bounded smoke and throughput only; four steady updates per segment. Device peak includes preparation and is not a per-process allocation measurement. Provisioned snapshot path/layout does not attest weight integrity; actual input receipts and learned-device witnesses are separate."
         });
-        if let Some(report) = recovery_report {
+        if paired {
+            metrics["configuration"]["batch_size"] = serde_json::json!(req.config.batch_size);
+            metrics["paired_comparison"] = recovery_report.clone().expect("complete paired report");
+            metrics["sample_configuration"] = serde_json::json!({"width":1024,"height":1024,"count":1,"seed":7,"denoise_steps":28});
+            metrics["paired_execution"] = serde_json::json!({
+                "source": std::env::var("GITHUB_SHA").expect("manual workflow source identity"),
+                "run": std::env::var("GITHUB_RUN_ID").expect("manual workflow run identity"),
+                "attempt": std::env::var("GITHUB_RUN_ATTEMPT").expect("manual workflow attempt identity")
+            });
+            eprintln!(
+                "KREA_PROFILE_PAIRED_EXECUTION {}",
+                metrics["paired_execution"]
+            );
+            metrics["saved_adapter_role"] =
+                serde_json::json!("actual-paired-candidate-even-on-no-go");
+            metrics["profile_records"] = serde_json::json!([
+                "KREA_PROFILE_BOUNDARY",
+                "KREA_PROFILE_STEP",
+                "KREA_PROFILE_GRADIENTS",
+                "KREA_PROFILE_ATTRIBUTION",
+                "KREA_PROFILE_OPTIMIZER",
+                "KREA_PROFILE_PREPARATION",
+                "KREA_PROFILE_PAIRED_STATE",
+                "KREA_PROFILE_PAIRED_PATH",
+                "KREA_PROFILE_PAIRED_ADAPTER",
+                "KREA_PROFILE_PAIRED_RESULT",
+                "KREA_PROFILE_PAIRED_EXECUTION"
+            ]);
+            metrics["claim_limit"] = metrics["paired_comparison"]["claim_limit"].clone();
+        }
+        if let Some(report) = recovery_report.filter(|_| recovery) {
             metrics["recovery"] = report;
             metrics["candidate_execution"] = serde_json::json!({
                 "source": std::env::var("GITHUB_SHA").expect("manual workflow source identity"),

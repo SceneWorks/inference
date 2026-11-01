@@ -34,11 +34,14 @@ serde_json = { workspace = true }
 # candle-core's own `save` cannot write — candle's own `safetensors` version (0.7) so the `View`
 # impl applies.
 safetensors = "0.7"
+# Comparison-only immutable frozen-checkpoint bootstrap; already locked dependencies.
+sha2 = { workspace = true, optional = true }
+zip = { version = "9.0.0", default-features = false, features = ["deflate-flate2"], optional = true }
 # Header-only image validation in the training dataset pass (decode lives in gen_core::iris::train).
 image = { workspace = true }
 
 [features]
-model-inference-proof = ["candle-gen/model-inference-proof", "candle-llm/model-inference-proof", "sceneworks-gen-core-iris/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
+model-inference-proof = ["dep:sha2", "dep:zip", "candle-gen/model-inference-proof", "candle-llm/model-inference-proof", "sceneworks-gen-core-iris/model-inference-proof", "sceneworks-gen-core-tokenizer/model-inference-proof", "sceneworks-gen-core-train/model-inference-proof"]
 # Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda` on
 # this provider crate selects the matching candle backend everywhere.
 default = []

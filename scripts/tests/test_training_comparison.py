@@ -1,0 +1,515 @@
+"""Pure metadata/mocks: never construct tensors or launch a model/GPU query."""
+import copy
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from scripts.ci import model_inference_proofs as proof
+from scripts.ci import training_comparison as comparison
+from scripts.ci.model_proof_resources import bound_cuda_activity_profile, effective_claim_deadline, metadata_policy_payload
+from types import SimpleNamespace
+
+
+class ComparisonContract(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.rows = proof.load_registry()
+        cls.cases = {comparison.spec(r)['model']: r for r in cls.rows
+                     if r['fqn'].split('::')[-1] in comparison._CASES}
+
+    def row(self, model='sdxl', stage='current', binding='gpu0'):
+        base = proof.configured_case(self.cases[model], 'fixed_cuda_comparison_' + binding)
+        return comparison.stage_row(base, stage)
+
+    def request(self, model='sdxl'):
+        base = proof.configured_case(self.cases[model], 'fixed_cuda_comparison_gpu0')
+        plan = comparison.spec(base)
+        return base, {'selection': proof.identity(base), 'configuration': 'fixed_cuda_comparison_gpu0',
+                      'policy': {'backend': 'windows-cuda', 'cudaDeviceUuid': comparison.DEVICES['gpu0'][0],
+                                 'childGpuCapBytes':91*1024**3,'gpuFreeReserveBytes':2*1024**3,
+                                 'deadlineSeconds':plan['case_deadline_seconds']},
+                      'training_comparison': {k: plan[k] for k in ('protocol', 'stages', 'max_physical_updates')}}
+
+    def fixture(self, row):
+        plan = comparison.spec(row)
+        stage, n, warm = row['training_comparison_stage'], plan['updates_per_stage'], plan['warmups_per_stage']
+        provider = comparison.case_manifest(row)
+        owners = provider.get('owners') or provider.get('owner')
+        owners = owners if isinstance(owners, list) else [owners]
+        private = plan['model'].startswith('iris-')
+        initialization = [{'seed': 7, 'config': 'actual source canonical fixture mock'}]
+        if private:
+            initialization.append({'kind': 'actual-named-initial-tensors', 'owner': 'private-optimizer', 'sha256': 'c'*64, 'tensor_count': 1})
+        value = {'optimizer_updates': n, 'preparation_including_load_cache_seconds': 1.,
+                 'comparison': {'schema_version': 1, 'model': plan['model'], 'stage': stage,
+                                'cadence': plan['cadence'], 'state_reset': 'fresh-native-child-process',
+                                'cuda_visible_devices': row['required_cuda_device_uuid'],
+                                'physical_index': row['required_cuda_physical_index'],
+                                'physical_starts': n, 'physical_commits': n,
+                                'initialization': initialization, 'initial_trainable_fingerprints': ['a'*64],
+                                'optimizer_initialization': [] if private else [{'sha256': 'b'*64}],
+                                'actual_shared_optimizer_attempts': 0 if private else n}, 'steps': []}
+        lines = [f'TRAINING_COMPARISON_STAGE model={plan["model"]} stage={stage} cadence={plan["cadence"]} updates={n}']
+        for i in range(1, n+1):
+            mechanism = {}
+            if plan['applicability']['e1_combined_arithmetic_norm']:
+                path = 'legacy' if stage in ('legacy', 'minus-e1') else 'current'
+                mechanism['comparison:e1-factor:' + path] = 2
+            for group, witnesses in zip(('e2', 'e3'), comparison._WITNESSES[plan['model']], strict=True):
+                if witnesses and plan['applicability'][group] and stage not in ('legacy', 'minus-' + group):
+                    mechanism[witnesses[0]] = 2
+            candidate = int(stage == 'plus-streaming' and not (plan['cadence'] in ('iris-restoration', 'rest_recovery') and i % 2 == 0))
+            value['steps'].append({'update': i, 'owner': owners[(i-1) % len(owners)], 'warmup': i <= warm,
+                                   'seconds': 10., 'loss': 1. + i/100., 'finite_gradients': 3,
+                                   'nonzero_gradients': 2, 'adapter_changed': True,
+                                   'attention_candidate': candidate, 'attention_reference': int(candidate == 0),
+                                   'mechanism_consumption': mechanism})
+            lines += [f'COHORT_UPDATE_START attempted_update={i}', f'COHORT_UPDATE_COMMITTED optimizer_updates={i}']
+        return value, '\n'.join(lines) + '\n'
+
+    def test_exact_seventeen_plans_and_350_proposed_sourcebook_updates(self):
+        self.assertEqual(len(self.cases), 17)
+        plans = [comparison.spec(r) for r in self.cases.values()]
+        self.assertEqual(sum(x['max_physical_updates'] for x in plans), 350)
+        self.assertEqual(350 + (16 + 22 + 10 + 8 + 8), 414)
+        self.assertFalse(any('minus-reference-owner' in p['stages'] for p in plans))
+        self.assertEqual(comparison.spec(self.cases['iris-depth'])['stages'], ['legacy', 'current'])
+        self.assertNotIn('minus-e3', comparison.spec(self.cases['lens'])['stages'])
+        self.assertNotIn('plus-streaming', comparison.spec(self.cases['z_image_turbo'])['stages'])
+
+    def test_failed_case_recovery_budgets_and_strict_owner_cadences(self):
+        for model,cadence,count,warm,cap,retained,total in [
+            ('anima_base','ordinary_short',2,1,12,8,20),
+            ('flux3','ordinary_short',2,1,12,22,34),
+            ('iris-depth','depth_recovery',2,1,4,10,14),
+            ('iris-restoration','rest_recovery',6,2,30,8,38)]:
+            base,request=self.request(model)
+            plan=comparison.validate_request((base,),request,'candle-cuda')
+            self.assertEqual((plan['cadence'],plan['updates_per_stage'],plan['warmups_per_stage'],plan['max_physical_updates']),(cadence,count,warm,cap))
+            self.assertEqual(plan['recovery_budget']['retained_conservative_charge'],retained)
+            budget=plan['recovery_budget']
+            if model in ('iris-depth','flux3'):
+                self.assertNotIn('cumulative_model_max',budget)
+                expected=(14,12,2) if model=='iris-depth' else (34,24,10)
+                self.assertEqual((budget['proposed_cumulative_model_max'],budget['original_model_cap'],budget['required_additional_family_updates']),expected)
+                self.assertEqual(budget['authorization_status'],'pending-user-authorization')
+                self.assertFalse(budget['dispatch_authorized'])
+            else:
+                self.assertEqual(budget['cumulative_model_max'],total)
+            for stage in plan['stages']:
+                row=self.row(model,stage);metrics,text=self.fixture(row)
+                result=comparison.verify_metrics(row,metrics,text)
+                self.assertEqual(result['physical_updates'],count)
+                if count==2:
+                    self.assertIsNone(result['sample_stdev_seconds'])
+                    self.assertTrue(all(t['sample_stdev_seconds'] is None for t in result['per_owner_timings'].values()))
+                for change in (lambda m:m['comparison'].update(physical_commits=count+1),
+                               lambda m:m['steps'][-1].update(warmup=True),
+                               lambda m:m['steps'][-1].update(owner='foreign-owner')):
+                    wrong=copy.deepcopy(metrics);change(wrong)
+                    with self.assertRaises(ValueError):comparison.verify_metrics(row,wrong,text)
+                with self.assertRaises(ValueError):comparison.verify_metrics(row,metrics,text+f'COHORT_UPDATE_START attempted_update={count+1}\n')
+        depth=comparison.spec(self.cases['iris-depth'])
+        self.assertTrue(depth['applicability']['streaming_candidate'])
+        self.assertEqual(depth['deferred_applicable_stages'],['plus-streaming'])
+        with self.assertRaises(ValueError):self.row('iris-depth','plus-streaming')
+        # Proposed maxima describe counts; they do not authorize family exceptions.
+        self.assertEqual(350 + 64,414)
+
+    def test_flux_fixed_64_edit_workload_rebinds_plan_and_initial_input_witnesses(self):
+        base,request=self.request('flux3')
+        plan=comparison.validate_request((base,),request,'candle-cuda')
+        self.assertEqual(plan['stages'],['legacy','current','minus-e1','minus-e2','minus-e3','plus-streaming'])
+        self.assertEqual((plan['updates_per_stage'],plan['warmups_per_stage'],plan['max_physical_updates']),(2,1,12))
+        workload=plan['workload']
+        self.assertEqual((workload['resolution'],workload['mode'],workload['rank'],workload['alpha'],workload['seed']),(64,'paired-edit',2,2,7))
+        self.assertEqual((workload['optimizer'],workload['learning_rate'],workload['train_dtype'],workload['gradient_checkpointing']),('adamw',0.001,'bf16',False))
+        budget=plan['recovery_budget']
+        self.assertEqual((budget['retained_conservative_charge'],budget['maximum_new_physical_updates'],budget['proposed_cumulative_model_max'],budget['original_model_cap'],budget['remaining_under_original_cap']),(22,12,34,24,2))
+        self.assertNotIn('cumulative_model_max',budget)
+        self.assertEqual(budget['authorization_status'],'pending-user-authorization')
+        self.assertFalse(budget['dispatch_authorized'])
+        campaign=budget['campaign_budget_proposal']
+        self.assertEqual((campaign['original_campaign_cap'],campaign['proposed_campaign_max'],campaign['required_additional_campaign_updates']),(404,414,10))
+        self.assertFalse(campaign['dispatch_authorized'])
+        self.assertEqual((budget['latest_failed_comparison']['run'],budget['latest_failed_comparison']['retained_conservative_charge']),(41276985590,10))
+        self.assertFalse(budget['automatic_retry'])
+        self.assertEqual((budget['prior_failed_recovery']['run'],budget['prior_failed_recovery']['retained_conservative_charge']),(41269133067,4))
+        source=(Path(__file__).resolve().parents[2]/'crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs').read_text(encoding='utf-8')
+        self.assertRegex(source,r'const BOUNDED_TRAINING_RESOLUTION: u32 = 64;\s*let resolution = BOUNDED_TRAINING_RESOLUTION;')
+        self.assertIn('item.reference_image_paths.push(reference);',source)
+        self.assertIn('"mode":"edit"',source)
+        self.assertIn('"resolution":config.resolution',source)
+        self.assertIn('"references":item.reference_image_paths.iter().map',source)
+        row=self.row('flux3');metrics,text=self.fixture(row)
+        metrics['comparison']['initialization'].append({'resolution':64,'mode':'paired-edit','target_sha256':'a'*64,'reference_sha256':'b'*64})
+        observed=comparison.verify_metrics(row,metrics,text)
+        for key,value in [('resolution',512),('mode','captioned'),('target_sha256','c'*64),('reference_sha256','d'*64)]:
+            other=copy.deepcopy(observed)
+            other['initialization'][-1][key]=value
+            with self.assertRaises(ValueError):comparison.verify_matching_states(observed,other)
+
+    def test_iris_frozen_readers_are_exact_successful_source_boundaries(self):
+        from scripts.ci import model_proof_inputs as inputs
+        row=self.row('iris-restoration')
+        inputs.validate_contract(row,required=True)
+        root=Path(__file__).resolve().parents[2]
+        source=root/'crates/media/candle-gen/candle-gen-iris/src/train/frozen_cache.rs'
+        text=source.read_text(encoding='utf-8')
+        catalogue=json.loads((root/'scripts/ci/model-input-readers.json').read_text(encoding='utf-8'))
+        extension=catalogue['source_contract_extension']
+        for role in ('convnext','vgg','lpips'):
+            reader=f'candle-gen-iris::train::frozen_cache::{role}_native_store'
+            self.assertEqual(inputs.READERS[reader],'tensor-input')
+            self.assertIn('"'+reader+'",\n                TensorInput,',text)
+            self.assertEqual(extension['exact_successful_boundaries'][reader]['source_sha256'],hashlib.sha256(source.read_bytes()).hexdigest())
+            wrong=copy.deepcopy(row)
+            slot=next(x for x in wrong['input_contract']['requirements'] if reader in x['readers'])
+            slot['readers']=[reader+'-invented']
+            with self.assertRaisesRegex(ValueError,'exact successful source boundary'):inputs.validate_contract(wrong,required=True)
+
+    def test_moss_recovery_keeps_six_short_single_owner_arms(self):
+        base,request=self.request('moss')
+        plan=comparison.validate_request((base,),request,'candle-cuda')
+        self.assertEqual((plan['cadence'],plan['updates_per_stage'],plan['warmups_per_stage'],plan['max_physical_updates']),('ordinary_short',2,1,12))
+        self.assertEqual(plan['workload']['resolution'],256)
+        self.assertEqual(len(plan['stages']),6)
+        self.assertIn('one timed',plan['noise_scope'])
+        budget=plan['recovery_budget']
+        self.assertEqual((budget['retained_conservative_charge'],budget['original_model_cap'],budget['proposed_cumulative_model_max'],budget['remaining_under_original_cap'],budget['required_additional_family_updates']),(16,24,28,8,4))
+        self.assertNotIn('cumulative_model_max',budget)
+        self.assertFalse(budget['dispatch_authorized'])
+        self.assertFalse(budget['automatic_retry'])
+        self.assertEqual(budget['authorization_status'],'pending-user-authorization')
+        self.assertEqual(16+plan['max_physical_updates'],28)
+        for stage in plan['stages']:
+            row=self.row('moss',stage);metrics,text=self.fixture(row)
+            verified=comparison.verify_metrics(row,metrics,text)
+            self.assertEqual(verified['physical_updates'],2)
+            self.assertIsNone(verified['sample_stdev_seconds'])
+            for change in (lambda m:m['comparison'].update(physical_starts=4),
+                           lambda m:m['comparison'].update(physical_commits=4),
+                           lambda m:m['comparison'].update(cadence='ordinary'),
+                           lambda m:m['steps'][1].update(warmup=True),
+                           lambda m:m['steps'][1].update(owner='other')):
+                wrong=copy.deepcopy(metrics);change(wrong)
+                with self.assertRaises(ValueError):comparison.verify_metrics(row,wrong,text)
+            with self.assertRaises(ValueError):comparison.verify_metrics(row,metrics,text+'COHORT_UPDATE_START attempted_update=4\n')
+        provider=copy.deepcopy(comparison.case_manifest(base));provider['max_new_updates']=24
+        with patch.object(comparison,'case_manifest',return_value=provider),self.assertRaises(ValueError):comparison.spec(base)
+        for cap in (24,22,19,18,17,11):
+            wrong=copy.deepcopy(request);wrong['training_comparison']['max_physical_updates']=cap
+            with self.assertRaises(ValueError):comparison.validate_request((base,),wrong,'candle-cuda')
+
+    def test_moss_native_policy_gates_scope_and_recovery_factory(self):
+        root=Path(__file__).resolve().parents[2]
+        provider=root/'crates/media/candle-gen/candle-gen-moss-image'
+        transformer=(provider/'src/transformer.rs').read_text(encoding='utf-8')
+        for gate in ('legacy_e1','cache_enabled','projection_enabled'):
+            self.assertIn('candle_gen::train::policy::'+gate+'()',transformer)
+            self.assertNotIn('candle_gen::train::comparison::'+gate+'()',transformer)
+        training=(provider/'src/training.rs').read_text(encoding='utf-8')
+        entry=training.split('    fn train(\n',1)[1].split('    fn train_scoped(',1)[0]
+        self.assertLess(entry.index('recovery::job_policy'),entry.index('with_job_policy'))
+        self.assertLess(entry.index('with_job_policy'),entry.index('self.train_scoped'))
+        self.assertIn('self.descriptor.id, self.device.is_cuda(), req',entry)
+        recovery=(provider/'src/training/recovery.rs').read_text(encoding='utf-8')
+        helper=recovery.split('pub(super) fn job_policy(',1)[1].split('pub(super) fn validate_resume_plan(',1)[0]
+        self.assertLess(helper.index('JobTrainingPolicy::resolve'),helper.index('contract::recovery::resume_state'))
+        self.assertIn('job.with_native_resume_profile(saved_profile(&state.effective_identity)?)?',helper)
+        self.assertIn('without_production_profile(|| progress(event))',entry)
+        self.assertIn('letpreview=candle_gen::train::policy::without_production_profile(',re.sub(r'\s+','',training))
+        fixture=(provider/'tests/real_weights.rs').read_text(encoding='utf-8')
+        self.assertIn('ComparisonCadence::OrdinaryShort',fixture)
+        self.assertIn('let steps = if comparison { cadence.updates() } else { 4 };',fixture)
+        self.assertIn('let resolution = if comparison { 256 } else { 64 };',fixture)
+        book=comparison.case_manifest(self.cases['moss'])
+        self.assertEqual((book['recovery_budget']['retained_conservative_charge'],book['recovery_budget']['proposed_cumulative_model_max'],book['recovery_budget']['original_model_cap']),(16,28,24))
+
+    def test_every_source_stage_and_owner_cadence(self):
+        for model, base in self.cases.items():
+            for stage in comparison.spec(base)['stages']:
+                with self.subTest(model=model, stage=stage):
+                    row = self.row(model, stage)
+                    metrics, text = self.fixture(row)
+                    result = comparison.verify_metrics(row, metrics, text)
+                    self.assertEqual(result['physical_updates'], comparison.spec(base)['updates_per_stage'])
+
+    def test_actual_device_bindings_and_old_default(self):
+        for binding in ('gpu0', 'gpu1'):
+            row = self.row(binding=binding)
+            env = {}
+            proof.apply_configuration(row, env)
+            self.assertEqual(env['SCENEWORKS_GPU_ID'], str(comparison.DEVICES[binding][1]))
+            recorded=proof.configuration_bindings(row,env)
+            self.assertTrue(all(recorded.get(k)==v for k,v in proof.expected_configuration_environment(row).items()))
+            self.assertEqual(recorded['MODEL_PROOF_COMPARISON_STAGE'],{'present':True,'value':'current'})
+            self.assertEqual(bound_cuda_activity_profile(row), proof.SHARED_CUDA_HEADROOM_PROFILE)
+        old = proof.configured_case(self.cases['sdxl'], 'fixed_cuda')
+        env = {'MODEL_PROOF_COMPARISON_STAGE': 'legacy', 'MODEL_PROOF_COMPARISON_BINDING': 'gpu0'}
+        proof.apply_configuration(old, env)
+        self.assertNotIn('MODEL_PROOF_COMPARISON_STAGE', env)
+        self.assertEqual(old['required_cuda_physical_index'], 1)
+
+    def test_request_is_exact_not_generic_campaign(self):
+        row, value = self.request()
+        self.assertEqual(comparison.validate_request((row,), value, 'candle-cuda')['max_physical_updates'], 24)
+        mutations = []
+        for key, val in [('max_physical_updates', 28), ('stages', ['current']), ('protocol', 'other')]:
+            changed = copy.deepcopy(value); changed['training_comparison'][key] = val; mutations.append(changed)
+        changed = copy.deepcopy(value); changed['policy']['cudaDeviceUuid'] = comparison.DEVICES['gpu1'][0]; mutations.append(changed)
+        for changed in mutations:
+            with self.assertRaises(ValueError): comparison.validate_request((row,), changed, 'candle-cuda')
+        krea = next(r for r in self.rows if r['package'] == 'candle-gen-krea')
+        with self.assertRaises(ValueError): comparison.spec(krea)
+
+    def test_wrong_path_hidden_extra_and_truncated_body_rejected(self):
+        row = self.row()
+        metrics, text = self.fixture(row)
+        mutations = [text.replace('stage=current', 'stage=legacy'), text + text,
+                     text + 'COHORT_UPDATE_START attempted_update=5\n',
+                     text.replace('COHORT_UPDATE_COMMITTED optimizer_updates=4\n', '')]
+        for changed in mutations:
+            with self.assertRaises(ValueError): comparison.verify_metrics(row, metrics, changed)
+        for mutate in (
+            lambda m: m['steps'].pop(),
+            lambda m: m['steps'][0].update(warmup=False),
+            lambda m: m['steps'][0].update(attention_candidate=1),
+            lambda m: m['steps'][1].update(owner='other'),
+            lambda m: m['steps'][0].update(loss=float('nan')),
+            lambda m: m['steps'][0].update(finite_gradients=0),
+            lambda m: m['comparison'].update(physical_starts=5),
+            lambda m: m['comparison'].update(actual_shared_optimizer_attempts=5),
+            lambda m: m['comparison'].update(initial_trainable_fingerprints=[]),
+            lambda m: m['comparison'].update(optimizer_initialization=[]),
+            lambda m: m['comparison'].update(cuda_visible_devices=comparison.DEVICES['gpu1'][0]),
+        ):
+            changed = copy.deepcopy(metrics); mutate(changed)
+            with self.assertRaises(ValueError): comparison.verify_metrics(row, changed, text)
+
+    def test_actual_off_and_candidate_witnesses_required(self):
+        for stage in ('legacy', 'minus-e1', 'minus-e2', 'minus-e3', 'plus-streaming'):
+            row = self.row(stage=stage); metrics, text = self.fixture(row)
+            if stage == 'plus-streaming':
+                metrics['steps'][0]['attention_candidate'] = 0
+            elif stage in ('legacy', 'minus-e1'):
+                metrics['steps'][0]['mechanism_consumption']['comparison:e1-factor:current'] = 1
+            else:
+                group = 0 if stage == 'minus-e2' else 1
+                metrics['steps'][0]['mechanism_consumption'][comparison._WITNESSES['sdxl'][group][0]] = 1
+            with self.assertRaises(ValueError): comparison.verify_metrics(row, metrics, text)
+
+    def test_dual_owner_missing_cycle_or_swapped_owner_rejected(self):
+        for model in ('wan2_2_t2v_14b', 'iris-restoration'):
+            row = self.row(model); metrics, text = self.fixture(row)
+            metrics['steps'][1]['owner'] = metrics['steps'][0]['owner']
+            with self.assertRaises(ValueError): comparison.verify_metrics(row, metrics, text)
+
+    def test_aggregate_state_order_and_small_gain(self):
+        plan = comparison.spec(self.cases['sdxl'])
+        stages = []
+        for stage in plan['execution_order']:
+            row = self.row(stage=stage); metrics, text = self.fixture(row)
+            if stage == 'legacy':
+                for step in metrics['steps']: step['seconds'] = 10.5
+            stages.append(comparison.verify_metrics(row, metrics, text))
+        result = comparison.aggregate(plan, stages)
+        self.assertEqual(result['comparisons'][0]['measured_outcome'], 'win')
+        self.assertTrue(result['comparisons'][0]['candidate_go'])
+        self.assertLess(result['comparisons'][0]['fractional_time_reduction'], .25)
+        self.assertFalse(result['production_promotion'])
+        for key, value in [('initial_trainable_fingerprints', ['d'*64]), ('initialization', [{'seed':8}]),
+                           ('optimizer_initialization', [{'sha256':'d'*64}])]:
+            changed=copy.deepcopy(stages); changed[0][key]=value
+            with self.assertRaises(ValueError): comparison.aggregate(plan, changed)
+        with self.assertRaises(ValueError): comparison.aggregate(plan, stages[::-1])
+        with self.assertRaises(ValueError): comparison.aggregate(plan, stages[:-1])
+
+    def test_failure_charge_never_infers_zero_from_missing_logs(self):
+        row=self.row()
+        self.assertEqual(comparison.update_accounting(row, {'body_created':False}, '')['conservative_charge'],4)
+        case={'accepted':False,'cuda_claim_diagnostic':{'requested_uuid':row['required_cuda_device_uuid']},
+              'physical_execution':{'mechanism':'metadata-only discovery; no model execution'},
+              'error':'claimed CUDA UUID is absent or occupied; no model execution',
+              'commands':[{'argv':proof.command(row,True),'supervision':{'returncode':0}}]}
+        self.assertTrue(comparison.update_accounting(row,case,'')['zero_source_proven'])
+        self.assertFalse(comparison.update_accounting(row,case,'COHORT_UPDATE_START attempted_update=1\n')['zero_source_proven'])
+
+    def mocked_driver(self, *, fail_first=False, inspect=None):
+        base,value=self.request()
+        value['policy'].update(pollMillis=100,termGraceMillis=100)
+        observed=[]
+        def native_mock(rows,backend,child,expected,destination,*,comparison_work,comparison_deadline_monotonic):
+            row=rows[0]
+            observed.append((row['training_comparison_stage'],child['policy']['deadlineSeconds'],str(comparison_work)))
+            destination.mkdir(parents=True)
+            (destination/'00000').mkdir()
+            metrics,text=self.fixture(row)
+            result=comparison.verify_metrics(row,metrics,text)
+            case={'accepted':not fail_first,'training_comparison':result,
+                  'comparison_executable_sha256':'e'*64}
+            phase_start=comparison_deadline_monotonic-child['policy']['deadlineSeconds']+1.
+            payload=metadata_policy_payload(child['policy'])
+            payload['deadlineSeconds']=comparison_deadline_monotonic-phase_start
+            digest=hashlib.sha256((json.dumps(payload,sort_keys=True,separators=(',',':'))+'\n').encode()).hexdigest()
+            case.update(comparison_original_deadline_monotonic=comparison_deadline_monotonic,
+                        comparison_discovery_started_monotonic=phase_start,comparison_discovery_policy=payload,
+                        commands=[{'supervision':{'admission':{'policySha256':digest}}}],
+                        physical_execution={'claim_deadline_monotonic':comparison_deadline_monotonic})
+            (destination/'receipt.json').write_text(json.dumps({'accepted':not fail_first,'cases':[case]}),encoding='utf-8')
+            (destination/'00000/body.stdout.log').write_text(text if not fail_first else '',encoding='utf-8')
+            return 1 if fail_first else 0
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)/'proof'
+            clock=iter(float(x) for x in range(100,1000,2))
+            with patch.dict(os.environ,{'RUNNER_TEMP':directory}), \
+                 patch.object(proof,'repository_identity',return_value={'revision':'f'*40}), \
+                 patch.object(proof,'run',side_effect=native_mock), \
+                 patch.object(proof,'verify_artifacts',return_value={}), \
+                 patch.object(comparison.time,'monotonic',side_effect=lambda:next(clock)):
+                code=comparison.run((base,),'candle-cuda',value,'f'*40,root)
+            receipt=json.loads((root/'receipt.json').read_text(encoding='utf-8'))
+            self.assertEqual(receipt['artifacts'],comparison._inventory(root))
+            if inspect is not None:
+                inspect(root,value,base,receipt)
+            return code,receipt,observed
+
+    def test_driver_one_fresh_namespace_each_stage_same_original_deadline(self):
+        code,receipt,observed=self.mocked_driver()
+        self.assertEqual(code,0)
+        self.assertEqual([x[0] for x in observed],receipt['plan']['execution_order'])
+        self.assertEqual(len(set(x[2] for x in observed)),len(observed))
+        self.assertTrue(all(a[1]>b[1] for a,b in zip(observed,observed[1:])))
+        for record in receipt['stage_records']:
+            self.assertEqual(record['remaining_original_deadline_seconds'],3600.-record['elapsed_before_stage_seconds'])
+        self.assertEqual(receipt['conservative_updates_charged'],24)
+
+    def test_driver_stops_and_reserves_failed_unknown_stage_without_retry(self):
+        code,receipt,observed=self.mocked_driver(fail_first=True)
+        self.assertEqual(code,1)
+        self.assertEqual(len(observed),1)
+        self.assertFalse(receipt['accepted'])
+        self.assertEqual(receipt['conservative_updates_charged'],4)
+        self.assertNotIn('measurement',receipt)
+
+    def test_shared_source_policy_rejects_math_counter_only_mutations(self):
+        root=Path(__file__).resolve().parents[2]/'crates/media/candle-gen/candle-gen/src'
+        sources={name:(root/('train/' if name!='reference_training_attention.rs' else '')/name).read_text(encoding='utf-8')
+                 for name in ('projection.rs','norm.rs','reference_training_attention.rs','profile.rs','optim.rs')}
+        comparison.validate_shared_source_controls(sources)
+        mutations=(
+            ('projection.rs','return x.broadcast_matmul(w);','return x.matmul(w);'),
+            ('projection.rs','return apply_factor(&rank, up)? * scale;','return apply_factor(&(rank * scale)?, up);'),
+            ('norm.rs','return normalize_composable(x, eps, reference);','return normalize_composable(&x.detach(), eps, reference);'),
+            ('norm.rs','xf.broadcast_div(&rms)','xf.broadcast_mul(&rms.recip()?)'),
+            ('reference_training_attention.rs','reference_owner_enabled()','cache_enabled()'),
+            ('optim.rs','super::profile::comparison_optimizer_step()?;',''),
+        )
+        for name,old,new in mutations:
+            self.assertIn(old,sources[name])
+            changed=dict(sources); changed[name]=changed[name].replace(old,new,1)
+            with self.subTest(file=name,old=old),self.assertRaises(ValueError):
+                comparison.validate_shared_source_controls(changed)
+
+    def test_aggregate_verifier_authenticates_stage_join_deadline_and_inventory(self):
+        def inspect(root,value,base,receipt):
+            def verify():
+                return comparison.verify_artifacts(root,root.parent,value,'f'*40,(base,),'candle-cuda')
+            with patch.object(proof,'verify_artifacts',return_value={}):
+                self.assertTrue(verify()['accepted'])
+                for mutate in (
+                    lambda x:x['stage_records'].pop(),
+                    lambda x:x['stage_records'][0].update(remaining_original_deadline_seconds=1000.),
+                    lambda x:x['stage_records'][0].update(executable_sha256='d'*64),
+                    lambda x:x.update(conservative_updates_charged=0),
+                    lambda x:x.update(terminal_model_evidence=True),
+                ):
+                    changed=copy.deepcopy(receipt); mutate(changed)
+                    (root/'receipt.json').write_text(json.dumps(changed),encoding='utf-8')
+                    with self.assertRaises(ValueError):verify()
+                (root/'receipt.json').write_text(json.dumps(receipt),encoding='utf-8')
+                extra=root/'stages'/'unexpected.txt';extra.write_text('unapproved',encoding='utf-8')
+                with self.assertRaises(ValueError):verify()
+                extra.unlink()
+                child=root/receipt['stage_records'][0]['artifact']/'receipt.json'
+                child.write_text(child.read_text(encoding='utf-8')+'\n',encoding='utf-8')
+                with self.assertRaises(ValueError):verify()
+        code,_,_=self.mocked_driver(inspect=inspect)
+        self.assertEqual(code,0)
+
+    def test_slow_discovery_cannot_refresh_body_deadline(self):
+        # Stage entered at102 with998s remaining, then Cargo discovery used300s.
+        # Body started at402 must still stop at1100, not402+998=1400.
+        policy=SimpleNamespace(deadline_seconds=998.)
+        self.assertEqual(effective_claim_deadline(402.,policy,1100.),1100.)
+        self.assertEqual(effective_claim_deadline(402.,policy),1400.)
+        self.assertEqual(effective_claim_deadline(1099.,policy,1100.),1100.)
+        for invalid in (float('nan'),float('inf'),True,'1100'):
+            with self.assertRaises(ValueError):effective_claim_deadline(402.,policy,invalid)
+        child={'policy':{'backend':'windows-cuda','deadlineSeconds':998.,'cudaDeviceUuid':'GPU-x'}}
+        payload=metadata_policy_payload(child['policy']);payload['deadlineSeconds']=698.
+        case={'accepted':True,'comparison_original_deadline_monotonic':1100.,
+              'comparison_discovery_started_monotonic':402.,'comparison_discovery_policy':payload,
+              'physical_execution':{'claim_deadline_monotonic':1100.}}
+        comparison.verify_stage_deadline(case,child,1100.)
+        case['physical_execution']['claim_deadline_monotonic']=1400.
+        with self.assertRaises(ValueError):comparison.verify_stage_deadline(case,child,1100.)
+
+    def rust_iris_cache_owner(self,source,run,attempt,marker):
+        # Evaluate only the consumer's JSON schema, never Rust/model code. This
+        # cross-language check must not duplicate the Python writer's field list.
+        root=Path(__file__).resolve().parents[2]
+        text=(root/'crates/media/candle-gen/candle-gen-iris/src/train/frozen_cache.rs').read_text(encoding='utf-8')
+        schema=re.search(r'fn expected_owner\([^)]*\) -> Value \{\s*json!\((\{.*?\})\)\s*\}',text,re.S)
+        self.assertIsNotNone(schema,'Rust expected_owner must expose its JSON contract')
+        scope=re.search(r'const CACHE_SCOPE: &str\s*=\s*("(?:\\.|[^"\\])*")\s*;',text)
+        self.assertIsNotNone(scope,'Rust cache scope constant is part of the owner contract')
+        values={'source':source,'run':run,'attempt':attempt,'marker':marker,'CACHE_SCOPE':json.loads(scope[1])}
+        def literal(match):
+            token=match[0]
+            if token.startswith('"'):return token
+            self.assertIn(token,values,'unexpected Rust JSON expression requires an explicit metadata evaluator')
+            return json.dumps(values[token])
+        return json.loads(re.sub(r'"(?:\\.|[^"\\])*"|[A-Za-z_]\w*',literal,schema[1]))
+
+    def test_iris_cache_directory_is_same_owned_scope_all_stages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent=Path(directory)/'runtime';parent.mkdir()
+            row=self.row('iris-restoration')
+            marker=parent/'.sc-26850-owned-runtime';marker.write_text(proof.identity(row)+'\n',encoding='utf-8')
+            def environment():return {'BESPOKE_RUNTIME_DIR':str(parent),'GITHUB_SHA':'f'*40,'GITHUB_RUN_ID':'123','GITHUB_RUN_ATTEMPT':'1'}
+            first=environment();proof.apply_configuration(row,first)
+            second=environment();proof.apply_configuration(self.row('iris-restoration','legacy'),second)
+            key='MODEL_PROOF_IRIS_FROZEN_CACHE_DIR'
+            self.assertEqual(first[key],second[key])
+            owner=json.loads((Path(first[key])/'comparison-cache-owner.json').read_text(encoding='utf-8'))
+            self.assertEqual(owner['source_revision'],'f'*40)
+            expected=self.rust_iris_cache_owner('f'*40,'123','1',hashlib.sha256(marker.read_bytes()).hexdigest())
+            self.assertEqual(owner,expected)
+            owner_path=Path(first[key])/'comparison-cache-owner.json'
+            mutations=(
+                lambda value:value.update(binding=proof.identity(row)),
+                lambda value:value['binding'].update(fqn='other::case'),
+                lambda value:value.update(source_revision='e'*40),
+                lambda value:value.update(github_run_id='124'),
+                lambda value:value.update(github_run_attempt=2),
+                lambda value:value.update(parent_marker_sha256='0'*64),
+            )
+            for mutate in mutations:
+                changed=copy.deepcopy(owner);mutate(changed)
+                owner_path.write_text(json.dumps(changed,sort_keys=True)+'\n',encoding='utf-8')
+                with self.subTest(owner=changed),self.assertRaisesRegex(ValueError,'ownership/source/run binding mismatch'):
+                    proof.apply_configuration(self.row('iris-restoration','minus-e2'),environment())
+            owner_path.write_text(json.dumps(owner,sort_keys=True)+'\n',encoding='utf-8')
+            self.assertNotEqual(first['BESPOKE_RUNTIME_DIR'],second['BESPOKE_RUNTIME_DIR'])
+            wrong=environment();wrong['GITHUB_SHA']='e'*40
+            with self.assertRaises(ValueError):proof.apply_configuration(self.row('iris-restoration','minus-e2'),wrong)
+
+
+if __name__ == '__main__':
+    unittest.main()

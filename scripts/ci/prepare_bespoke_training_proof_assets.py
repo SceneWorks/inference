@@ -9,7 +9,10 @@ import argparse
 import json
 import os
 import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 HUB = Path("E:/huggingface/hub")
 def snapshot(repository: str, revision: str, suffix: str = "") -> Path:
@@ -59,12 +62,13 @@ REQUIRED_FILES = {
 }
 
 def exact_bindings(rows: list[dict], backend: str) -> dict[str, Path] | None:
+    from scripts.ci.training_comparison import is_recipe
     if backend != "candle-cuda" or len(rows) != 1:
         return None
     row = rows[0]
     key = row["package"] + "/" + row["target"] + "/" + row["fqn"]
     selected = row.get("selected_configuration", {})
-    if row.get("target_kind") != "test" or selected.get("name") != "fixed_cuda":
+    if row.get("target_kind") != "test" or (selected.get("name") != "fixed_cuda" and not is_recipe(selected.get("name"))):
         return None
     return BESPOKE_TRAINING_PROOFS.get(key)
 
@@ -77,6 +81,7 @@ def validate_paths(bindings: dict[str, Path]) -> None:
                 raise ValueError(f"missing/empty pinned installed asset {name}: {path}")
 
 def main() -> int:
+    from scripts.ci.training_comparison import is_recipe
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", type=Path, required=True)
     args = parser.parse_args()
@@ -85,7 +90,7 @@ def main() -> int:
     configs = plan.get("configurations", {})
     if (plan.get("backend") != "candle-cuda" or plan.get("selected") != 1
             or len(identities) != 1 or identities[0] not in BESPOKE_TRAINING_PROOFS
-            or configs.get(identities[0], {}).get("name") != "fixed_cuda"):
+            or (configs.get(identities[0], {}).get("name") != "fixed_cuda" and not is_recipe(configs.get(identities[0], {}).get("name")))):
         raise ValueError("bespoke asset setup requires one exact reviewed fixed_cuda case")
     bindings = BESPOKE_TRAINING_PROOFS[identities[0]]
     validate_paths(bindings)
@@ -93,7 +98,7 @@ def main() -> int:
     # Full Iris exports/recovery states and ControlNet weights are not LoRA files.
     run = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
     if not re.fullmatch(r"[0-9]+-[0-9]+", run): raise ValueError("invalid runner run identity")
-    runtime = Path("E:/sceneworks-runtime/model-proofs/sc-26850") / run / identities[0].split("::")[-1]
+    runtime = Path("D:/sceneworks-runtime/model-proofs/sc-26850") / run / identities[0].split("::")[-1]
     runtime.mkdir(parents=True, exist_ok=False)
     (runtime / ".sc-26850-owned-runtime").write_text(identities[0] + "\n", encoding="utf-8")
     with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:

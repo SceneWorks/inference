@@ -156,7 +156,7 @@ impl TrainOptimizer {
     /// Construct the optimizer named `name` over `vars` at learning rate `lr` and weight decay
     /// `weight_decay`. Betas/eps follow the torch/diffusers defaults (0.9, 0.999, 1e-8).
     pub fn from_config(name: &str, vars: Vec<Var>, lr: f32, weight_decay: f32) -> Result<Self> {
-        match normalize(name).as_str() {
+        let optimizer = match normalize(name).as_str() {
             "adamw" => Ok(Self::adam(vars, lr, weight_decay, "adamw")?),
             "adam" => Ok(Self::adam(vars, lr, 0.0, "adam")?),
             "rose" => Ok(Self::Rose(Rose::new(vars, lr, weight_decay))),
@@ -165,7 +165,9 @@ impl TrainOptimizer {
                 "unsupported optimizer {other:?}; supported: {}",
                 SUPPORTED_OPTIMIZERS.join(", ")
             ))),
-        }
+        }?;
+        super::profile::comparison_optimizer_initialization(&optimizer)?;
+        Ok(optimizer)
     }
 
     fn adam(vars: Vec<Var>, lr: f32, weight_decay: f32, kind: &'static str) -> Result<Self> {
@@ -183,6 +185,7 @@ impl TrainOptimizer {
 
     /// Apply one optimizer step from the (already clipped) gradients.
     pub fn step(&mut self, grads: &GradStore) -> Result<()> {
+        super::profile::comparison_optimizer_step()?;
         match self {
             Self::Adam(a) => a.step(grads),
             Self::Rose(r) => r.step(grads),

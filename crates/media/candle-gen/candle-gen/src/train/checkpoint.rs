@@ -80,7 +80,14 @@ pub fn save_resume(
     meta.insert("step".into(), step.to_string());
     meta.insert("update_idx".into(), update_idx.to_string());
     meta.insert("format".into(), "candle-gen-resume-v1".into());
-    meta.insert("training_config".into(), training_fingerprint(cfg));
+    meta.insert(
+        "training_config".into(),
+        super::policy::bind_resume_fingerprint(
+            &training_fingerprint(cfg),
+            super::policy::active_profile(),
+        ),
+    );
+    super::policy::record_resume_profile(&mut meta);
     meta.insert("request_fingerprint".into(), request_fingerprint.into());
     let file_name = resume_snapshot_filename(stem, step);
     let path = dir.join(&file_name);
@@ -140,7 +147,7 @@ pub fn load_resume(
             "resume: unsupported snapshot format".into(),
         ));
     }
-    gen_core_train::resume::check_resume_fingerprints(&meta, cfg, request_fingerprint)?;
+    check_profile_fingerprints(&meta, cfg, request_fingerprint)?;
     let tensors = candle_core::safetensors::load(path, &Device::Cpu)?;
     let factors: HashMap<String, Tensor> = tensors
         .iter()
@@ -159,6 +166,87 @@ pub fn load_resume(
 
 fn training_fingerprint(cfg: &TrainingConfig) -> String {
     gen_core_train::resume::training_config_fingerprint(cfg)
+}
+
+// Validate the execution domain before touching factors or optimizer tensors.
+// The shared contract still owns all config/request comparisons; normalize its
+// config value only after the exact profile-bound value has been authenticated.
+fn check_profile_fingerprints(
+    meta: &HashMap<String, String>,
+    cfg: &TrainingConfig,
+    request_fingerprint: &str,
+) -> Result<()> {
+    let profile = super::policy::resume_profile(meta)?;
+    if profile != super::policy::active_profile() {
+        return Err(CandleError::Msg(
+            "resume: execution profile differs from this job".into(),
+        ));
+    }
+    let base = training_fingerprint(cfg);
+    let expected = super::policy::bind_resume_fingerprint(&base, profile);
+    if meta.get("training_config") != Some(&expected) {
+        return Err(CandleError::Msg(
+            "resume: profile-bound training configuration differs".into(),
+        ));
+    }
+    let mut normalized = meta.clone();
+    normalized.insert("training_config".into(), base);
+    gen_core_train::resume::check_resume_fingerprints(&normalized, cfg, request_fingerprint)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod profile_metadata_tests {
+    use super::*;
+    use crate::gen_core::train::TrainingRequest;
+    use crate::train::policy::{self, JobTrainingPolicy, TrainingProfile};
+
+    #[test]
+    fn resume_profile_domain_preserves_old_contract_and_rejects_mismatch() {
+        let cfg = TrainingConfig::default();
+        let base = training_fingerprint(&cfg);
+        let mut old = HashMap::from([
+            ("training_config".into(), base.clone()),
+            ("request_fingerprint".into(), "actual-input".into()),
+        ]);
+        assert_eq!(
+            policy::bind_resume_fingerprint(&base, TrainingProfile::Current),
+            base
+        );
+        check_profile_fingerprints(&old, &cfg, "actual-input").unwrap();
+        assert!(check_profile_fingerprints(&old, &cfg, "wrong-input").is_err());
+        let req = TrainingRequest {
+            items: vec![],
+            config: cfg.clone(),
+            output_dir: "unused".into(),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: vec![],
+            cancel: Default::default(),
+        };
+        let selected = JobTrainingPolicy::resolve("ltx_2_5_distilled", true, &req).unwrap();
+        policy::with_job_policy(selected, || {
+            assert!(check_profile_fingerprints(&old, &cfg, "actual-input").is_err());
+            old.insert(
+                "training_config".into(),
+                policy::bind_resume_fingerprint(&base, policy::active_profile()),
+            );
+            policy::record_resume_profile(&mut old);
+            check_profile_fingerprints(&old, &cfg, "actual-input").unwrap();
+            // The unchanged old reader must refuse this tagged non-Current bundle.
+            assert!(
+                gen_core_train::resume::check_resume_fingerprints(&old, &cfg, "actual-input")
+                    .is_err()
+            );
+            let mut changed = cfg.clone();
+            changed.seed += 1;
+            assert!(check_profile_fingerprints(&old, &changed, "actual-input").is_err());
+            assert!(check_profile_fingerprints(&old, &cfg, "wrong-input").is_err());
+            let mut forged = old.clone();
+            forged.insert("training_config".into(), base.clone());
+            assert!(check_profile_fingerprints(&forged, &cfg, "actual-input").is_err());
+        });
+        assert!(check_profile_fingerprints(&old, &cfg, "actual-input").is_err());
+    }
 }
 
 #[cfg(test)]

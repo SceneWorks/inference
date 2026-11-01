@@ -42,7 +42,8 @@ pub(crate) struct CandleSession {
     pub optimizer: TrainOptimizer,
     pub examples: Vec<CachedExample>,
     pub options: TrainingOptions,
-    pub identity: ResumeIdentity,
+    pub export_base_identity: ResumeIdentity,
+    resume_identity: ResumeIdentity,
     pub seed: u64,
     pub accumulation: u32,
     pending: Option<GradStore>,
@@ -68,6 +69,10 @@ impl CandleSession {
         seed: u64,
         accumulation: u32,
     ) -> Result<Self> {
+        let resume_identity = super::profile::private_identity(
+            &identity,
+            candle_gen::train::policy::active_profile(),
+        )?;
         if examples.is_empty() || accumulation == 0 {
             return Err(invalid("empty prepared cache or invalid accumulation"));
         }
@@ -100,58 +105,64 @@ impl CandleSession {
                 ));
             }
         }
-        let mut geometry = Vec::new();
-        let mut prepared_text: std::collections::HashMap<
-            candle_gen::candle_core::TensorId,
-            Tensor,
-        > = std::collections::HashMap::new();
-        for example in &mut examples {
-            let image = scaled_image_ids(
-                &latent_ids(example.grid.0, example.grid.1),
-                IMAGE_ROPE_SCALE,
-            );
-            let condition = if example.reference.is_some() {
-                training_condition_ids(example.grid.0, example.grid.1).map_err(Error::from)?
-            } else {
-                Vec::new()
-            };
-            geometry.push(image.clone());
-            geometry.push(condition.clone());
-            geometry.push(example.text_ids.clone());
-            geometry.push([image, condition, example.text_ids.clone()].concat());
-            for text in std::iter::once(&mut example.text).chain(example.empty_text.iter_mut()) {
-                let id = text.id();
-                let projected = match prepared_text.get(&id) {
-                    Some(value) => value.clone(),
-                    None => {
-                        let value = graph.dit.prepare_training_text(text)?;
-                        prepared_text.insert(id, value.clone());
-                        value
-                    }
+        // E2-off must retain raw input-width text: the normal preparation
+        // replaces these host cache entries with hidden-width projections.
+        if candle_gen::train::policy::cache_enabled() {
+            let mut geometry = Vec::new();
+            let mut prepared_text: std::collections::HashMap<
+                candle_gen::candle_core::TensorId,
+                Tensor,
+            > = std::collections::HashMap::new();
+            for example in &mut examples {
+                let image = scaled_image_ids(
+                    &latent_ids(example.grid.0, example.grid.1),
+                    IMAGE_ROPE_SCALE,
+                );
+                let condition = if example.reference.is_some() {
+                    training_condition_ids(example.grid.0, example.grid.1).map_err(Error::from)?
+                } else {
+                    Vec::new()
                 };
-                *text = projected;
+                geometry.push(image.clone());
+                geometry.push(condition.clone());
+                geometry.push(example.text_ids.clone());
+                geometry.push([image, condition, example.text_ids.clone()].concat());
+                for text in std::iter::once(&mut example.text).chain(example.empty_text.iter_mut())
+                {
+                    let id = text.id();
+                    let projected = match prepared_text.get(&id) {
+                        Some(value) => value.clone(),
+                        None => {
+                            let value = graph.dit.prepare_training_text(text)?;
+                            prepared_text.insert(id, value.clone());
+                            value
+                        }
+                    };
+                    *text = projected;
+                }
             }
-        }
-        let geometry_bytes = geometry
-            .iter()
-            .map(|ids| ids.len() * (graph.dit.config().hidden / graph.dit.config().heads) * 4)
-            .sum::<usize>() as u64;
-        candle_gen::train::flow_match::check_aux_memory(
-            "flux3 training geometry",
-            0,
-            geometry_bytes,
-            candle_gen::train::flow_match::device_training_budget_bytes(
-                graph.dit.device(),
+            let geometry_bytes = geometry
+                .iter()
+                .map(|ids| ids.len() * (graph.dit.config().hidden / graph.dit.config().heads) * 4)
+                .sum::<usize>() as u64;
+            candle_gen::train::flow_match::check_aux_memory(
                 "flux3 training geometry",
-            ),
-        )?;
-        graph.dit.prepare_training_geometry(&geometry)?;
+                0,
+                geometry_bytes,
+                candle_gen::train::flow_match::device_training_budget_bytes(
+                    graph.dit.device(),
+                    "flux3 training geometry",
+                ),
+            )?;
+            graph.dit.prepare_training_geometry(&geometry)?;
+        }
         Ok(Self {
             graph,
             optimizer,
             examples,
             options,
-            identity,
+            export_base_identity: identity,
+            resume_identity,
             seed,
             accumulation,
             pending: None,
@@ -179,7 +190,7 @@ impl CandleSession {
             .collect()
     }
     fn export_identity(&self, cursor: &TrainingCursor) -> ResumeIdentity {
-        let mut identity = self.identity.clone();
+        let mut identity = self.export_base_identity.clone();
         identity.configuration.insert(
             "completed_micro_steps".into(),
             cursor.micro_step.to_string(),
@@ -258,7 +269,7 @@ impl CandleSession {
 }
 impl SourceTrainingSession for CandleSession {
     fn identity(&self) -> &ResumeIdentity {
-        &self.identity
+        &self.resume_identity
     }
     fn resume_format(&self) -> &'static str {
         "flux3-native-training-resume-v1"
@@ -272,7 +283,7 @@ impl SourceTrainingSession for CandleSession {
         let state = checkpoint::restore(
             &self.graph,
             &mut self.optimizer,
-            &self.identity,
+            &self.resume_identity,
             policy,
             path,
             flag,
@@ -465,7 +476,7 @@ impl SourceTrainingSession for CandleSession {
                 &self.graph,
                 &self.optimizer,
                 Snapshot {
-                    identity: &self.identity,
+                    identity: &self.resume_identity,
                     cursor,
                     policy,
                     pending: &pending,

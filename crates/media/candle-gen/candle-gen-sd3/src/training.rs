@@ -217,7 +217,18 @@ impl Trainer for Sd3Trainer {
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let policy = candle_gen::train::policy::JobTrainingPolicy::resolve(
+            self.descriptor.id,
+            self.device.is_cuda(),
+            req,
+        )?;
+        candle_gen::train::policy::with_job_policy(policy, || {
+            let mut progress = |event| {
+                candle_gen::train::policy::without_production_profile(|| on_progress(event));
+            };
+            self.train_impl(req, &mut progress)
+        })
+        .map_err(Into::into)
     }
 }
 
@@ -448,6 +459,33 @@ impl Sd3Trainer {
     ) -> Result<TrainingOutput> {
         let cfg = &req.config;
         let device = &self.device;
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            // Seed the actual native device before cache noise/adapters are constructed.
+            device.set_seed(cfg.seed)?;
+            assert!(
+                !cfg.resume,
+                "comparison stages require a fresh optimizer/run"
+            );
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "sd3-native-training",
+                "training_config_debug": format!("{cfg:?}"),
+                "seed": cfg.seed,
+                "optimizer": cfg.optimizer,
+                "learning_rate": cfg.learning_rate,
+                "lr_scheduler": format!("{:?}", cfg.lr_scheduler),
+                "lr_warmup_steps": cfg.lr_warmup_steps,
+                "gradient_checkpointing": cfg.gradient_checkpointing,
+                "cache_latents_requested": cfg.cache_latents,
+                "cache_text_embeddings_requested": cfg.cache_text_embeddings,
+                "actual_preexisting_cache": "native VAE latents and text-encoder outputs cached before updates; retained in every arm",
+                "video_frames": 1,
+                "audio_mode": "none",
+                "model_source": self.root.display().to_string(),
+                "captions": req.items.iter().map(|item| item.caption.as_str()).collect::<Vec<_>>(),
+                "reset": "fresh native trainer/process; seeded native device; new optimizer/zero accumulation"
+            }));
+        }
         on_progress(TrainingProgress::Preparing);
         // Epic 2123 E7 + E8: admit, then load the perceptual models BEFORE caching (a missing
         // checkpoint fails fast; `None` — nothing loaded — when no aux loss is on).
@@ -531,6 +569,13 @@ impl Sd3Trainer {
                 device,
             )?,
         };
+        #[cfg(feature = "model-inference-proof")]
+        if candle_gen::train::comparison::active_stage().is_some() {
+            candle_gen::train::comparison::record_initialization(&serde_json::json!({
+                "owner": "sd3-actual-raw-cache",
+                "entries": cache.iter().map(|(latent, conditioning, _)| serde_json::json!({"latent":latent.dims(),"caption":conditioning.context.dims(),"pooled":conditioning.pooled.dims()})).collect::<Vec<_>>()
+            }));
+        }
         transformer.prepare_training()?;
         let mut prepared_contexts = HashMap::<_, Tensor>::new();
         for (_, conditioning, _) in &mut cache {
@@ -696,6 +741,35 @@ mod tests {
             file_name: "adapter.safetensors".into(),
             trigger_words: Vec::new(),
             cancel: CancelFlag::new(),
+        }
+    }
+
+    #[test]
+    fn production_profile_binds_only_measured_cuda_variant() {
+        use candle_gen::train::policy::{JobTrainingPolicy, TrainingProfile};
+
+        let req = request();
+        for variant in [Variant::Medium, Variant::Large] {
+            let id = descriptor_for(variant).id;
+            let expected = if matches!(variant, Variant::Medium) {
+                TrainingProfile::Legacy
+            } else {
+                TrainingProfile::Current
+            };
+            assert_eq!(
+                JobTrainingPolicy::resolve(id, true, &req)
+                    .unwrap()
+                    .profile(),
+                expected,
+                "{id}"
+            );
+            assert_eq!(
+                JobTrainingPolicy::resolve(id, false, &req)
+                    .unwrap()
+                    .profile(),
+                TrainingProfile::Current,
+                "CPU/Metal {id}"
+            );
         }
     }
 

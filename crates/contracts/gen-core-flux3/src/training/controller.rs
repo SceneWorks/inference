@@ -83,6 +83,56 @@ pub fn find_resume(
     seed: u64,
     flag: &CancelFlag,
 ) -> Result<Option<PathBuf>> {
+    Ok(
+        find_resume_candidate(root, stem, identity, policy, (format, seed), flag, false)?
+            .map(|candidate| candidate.path),
+    )
+}
+
+/// Reserved backend-private trajectory field, never part of adapter identity.
+pub const CANDLE_EXECUTION_PROFILE_KEY: &str = "candle_execution_profile";
+
+#[derive(Debug)]
+pub struct ResumeProfileCandidate {
+    pub path: PathBuf,
+    pub execution_profile: Option<String>,
+}
+
+/// Metadata-only first phase for the Candle native owner. All existing format,
+/// cursor, RNG, policy and other identity checks remain mandatory. Only the
+/// reserved private profile field is returned for finite backend resolution.
+/// The caller MUST run strict `find_resume` with its resolved private identity
+/// before any learned preparation or restore; this is not a relaxed loader.
+pub fn find_resume_profile_candidate(
+    root: &Path,
+    stem: &str,
+    identity: &ResumeIdentity,
+    policy: ResumePolicy,
+    format: &str,
+    seed: u64,
+    flag: &CancelFlag,
+) -> Result<Option<ResumeProfileCandidate>> {
+    if identity
+        .configuration
+        .contains_key(CANDLE_EXECUTION_PROFILE_KEY)
+    {
+        return Err(invalid(
+            "profile selection requires the unchanged export identity",
+        ));
+    }
+    find_resume_candidate(root, stem, identity, policy, (format, seed), flag, true)
+}
+
+fn find_resume_candidate(
+    root: &Path,
+    stem: &str,
+    identity: &ResumeIdentity,
+    policy: ResumePolicy,
+    format_seed: (&str, u64),
+    flag: &CancelFlag,
+    select_profile: bool,
+) -> Result<Option<ResumeProfileCandidate>> {
+    let (format, seed) = format_seed;
     cancel(flag)?;
     if !root.exists() {
         return Ok(None);
@@ -112,7 +162,15 @@ pub fn find_resume(
         if field("format")? != format {
             return Err(invalid("resume backend/container format mismatch"));
         }
-        identity.ensure_matches(&ResumeIdentity::from_metadata(field("identity")?)?)?;
+        let mut saved_identity = ResumeIdentity::from_metadata(field("identity")?)?;
+        let execution_profile = if select_profile {
+            saved_identity
+                .configuration
+                .remove(CANDLE_EXECUTION_PROFILE_KEY)
+        } else {
+            None
+        };
+        identity.ensure_matches(&saved_identity)?;
         if field("policy")? != policy.fingerprint() {
             return Err(invalid(
                 "effective run/sampler/accumulation policy mismatch",
@@ -127,10 +185,16 @@ pub fn find_resume(
         rng::validate_state(&cursor.rng_state, seed, cursor.micro_step)?;
         let key = (cursor.micro_step, cursor.update_step);
         if best.as_ref().is_none_or(|(current, _)| key > *current) {
-            best = Some((key, entry.path()));
+            best = Some((
+                key,
+                ResumeProfileCandidate {
+                    path: entry.path(),
+                    execution_profile,
+                },
+            ));
         }
     }
-    Ok(best.map(|(_, path)| path))
+    Ok(best.map(|(_, candidate)| candidate))
 }
 
 pub fn ensure_new_output(req: &TrainingRequest) -> Result<()> {
@@ -315,4 +379,201 @@ pub fn run<S: SourceTrainingSession>(
         steps: (cursor.micro_step - start) as u32,
         final_loss,
     })
+}
+
+#[cfg(test)]
+mod private_profile_metadata_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn identity() -> ResumeIdentity {
+        ResumeIdentity {
+            base_repo: "synthetic-metadata-only".into(),
+            base_revision: "a".repeat(40),
+            artifacts: BTreeMap::from([("source".into(), "b".repeat(64))]),
+            dataset: "c".repeat(64),
+            preprocessing: "d".repeat(64),
+            configuration: [
+                "optimizer",
+                "learning_rate",
+                "rank",
+                "alpha",
+                "scaling",
+                "precision",
+                "backend",
+                "scheduler",
+                "accumulation",
+                "rng",
+            ]
+            .into_iter()
+            .map(|k| (k.into(), "metadata".into()))
+            .collect(),
+            factors: BTreeMap::from([("factor".into(), vec![2, 3])]),
+        }
+    }
+    fn cursor(step: u64) -> TrainingCursor {
+        TrainingCursor {
+            micro_step: step,
+            update_step: step,
+            accumulation_count: 0,
+            sampler_epoch: step / 4,
+            sampler_cursor: step % 4,
+            rng_state: rng::state_record(7, step),
+            last_loss_bits: Some(0.25f32.to_bits()),
+        }
+    }
+    fn policy() -> ResumePolicy {
+        ResumePolicy {
+            total_micro_steps: 8,
+            accumulation: 1,
+            sampler_len: 4,
+        }
+    }
+    fn write(path: &Path, id: &ResumeIdentity, cursor: &TrainingCursor) {
+        let metadata = BTreeMap::from([
+            ("format", "native-metadata-test".to_owned()),
+            ("identity", id.to_metadata().unwrap()),
+            ("policy", policy().fingerprint()),
+            ("cursor", cursor.to_metadata().unwrap()),
+        ]);
+        // Header-only fixture; no tensor entries/payload or device constructors.
+        let mut header = serde_json::to_vec(&serde_json::json!({"__metadata__":metadata})).unwrap();
+        header.resize(header.len().div_ceil(8) * 8, b' ');
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn profile_probe_preserves_strict_default_and_all_non_profile_identity_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = identity();
+        let mut private = base.clone();
+        private.configuration.insert(
+            CANDLE_EXECUTION_PROFILE_KEY.into(),
+            "finite-private-binding".into(),
+        );
+        let path = dir.path().join("adapter-step000002.resume.safetensors");
+        let cursor = cursor(2);
+        write(&path, &private, &cursor);
+        let bytes = std::fs::read(&path).unwrap();
+        let original = base.to_metadata().unwrap();
+        let rng = cursor.rng_state.clone();
+        assert!(find_resume(
+            dir.path(),
+            "adapter",
+            &base,
+            policy(),
+            "native-metadata-test",
+            7,
+            &CancelFlag::new()
+        )
+        .is_err());
+        let candidate = find_resume_profile_candidate(
+            dir.path(),
+            "adapter",
+            &base,
+            policy(),
+            "native-metadata-test",
+            7,
+            &CancelFlag::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(candidate.path, path);
+        assert_eq!(
+            candidate.execution_profile.as_deref(),
+            Some("finite-private-binding")
+        );
+        assert_eq!(
+            find_resume(
+                dir.path(),
+                "adapter",
+                &private,
+                policy(),
+                "native-metadata-test",
+                7,
+                &CancelFlag::new()
+            )
+            .unwrap(),
+            Some(path.clone())
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(base.to_metadata().unwrap(), original);
+        assert_eq!(cursor.rng_state, rng);
+        let mut wrong = private.clone();
+        wrong.dataset = "e".repeat(64);
+        write(&path, &wrong, &cursor);
+        assert!(find_resume_profile_candidate(
+            dir.path(),
+            "adapter",
+            &base,
+            policy(),
+            "native-metadata-test",
+            7,
+            &CancelFlag::new()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn native_actual_cursor_order_rng_and_bad_owned_candidate_rules_are_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = identity();
+        let misleading = dir.path().join("adapter-step999999.resume.safetensors");
+        write(&misleading, &base, &cursor(2));
+        let newest = dir.path().join("adapter-step000001.resume.safetensors");
+        write(&newest, &base, &cursor(6));
+        let picked = find_resume_profile_candidate(
+            dir.path(),
+            "adapter",
+            &base,
+            policy(),
+            "native-metadata-test",
+            7,
+            &CancelFlag::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(picked.path, newest);
+        assert!(picked.execution_profile.is_none());
+        assert_eq!(
+            find_resume(
+                dir.path(),
+                "adapter",
+                &base,
+                policy(),
+                "native-metadata-test",
+                7,
+                &CancelFlag::new()
+            )
+            .unwrap(),
+            Some(newest.clone())
+        );
+        let mut bad = cursor(6);
+        bad.rng_state = rng::state_record(8, 6);
+        write(&newest, &base, &bad);
+        assert!(find_resume_profile_candidate(
+            dir.path(),
+            "adapter",
+            &base,
+            policy(),
+            "native-metadata-test",
+            7,
+            &CancelFlag::new()
+        )
+        .is_err());
+        write(&newest, &base, &cursor(6));
+        std::fs::write(&misleading, b"bad-owned-header").unwrap();
+        assert!(find_resume_profile_candidate(
+            dir.path(),
+            "adapter",
+            &base,
+            policy(),
+            "native-metadata-test",
+            7,
+            &CancelFlag::new()
+        )
+        .is_err());
+    }
 }

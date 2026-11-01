@@ -242,7 +242,9 @@ impl CrossAttention {
 
     pub(super) fn prepare_training(&mut self, contexts: &[Tensor]) -> Result<()> {
         self.training_kv.clear();
-        self.training_pack = if self.self_attention {
+        self.training_pack = if !candle_gen::train::comparison::projection_enabled() {
+            None
+        } else if self.self_attention {
             FrozenProjectionPack::prepare_lora(&mut [
                 &mut self.to_q,
                 &mut self.to_k,
@@ -251,7 +253,7 @@ impl CrossAttention {
         } else {
             FrozenProjectionPack::prepare_lora(&mut [&mut self.to_k, &mut self.to_v])?
         };
-        if !self.self_attention {
+        if candle_gen::train::comparison::cache_enabled() && !self.self_attention {
             if let (Some(k), Some(v)) = (self.to_k.dense_base(), self.to_v.dense_base()) {
                 if !k.weight().track_op() && !v.weight().track_op() {
                     for context in contexts.iter().filter(|context| !context.track_op()) {

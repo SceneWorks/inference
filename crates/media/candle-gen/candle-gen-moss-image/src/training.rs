@@ -238,11 +238,7 @@ impl MossImageTrainer {
         estimate
             .check_host(host_budget, self.device.is_cpu())
             .map_err(admission_error)?;
-        contract::recovery::validate_resume_plan(
-            req,
-            &self.sources.source_identity(self.variant),
-            &plan,
-        )?;
+        recovery::validate_resume_plan(req, &self.sources.source_identity(self.variant), &plan)?;
         Ok(Preparation {
             plan,
             estimate,
@@ -258,11 +254,29 @@ impl Trainer for MossImageTrainer {
         &self.descriptor
     }
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        self.basic(req)?;
-        self.prepare(req)?;
-        Ok(())
+        let policy = recovery::job_policy(self.descriptor.id, self.device.is_cuda(), req)?;
+        candle_gen::train::policy::with_job_policy(policy, || {
+            self.basic(req)?;
+            self.prepare(req)?;
+            Ok(())
+        })
     }
     fn train(
+        &mut self,
+        req: &TrainingRequest,
+        progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        let policy = recovery::job_policy(self.descriptor.id, self.device.is_cuda(), req)?;
+        candle_gen::train::policy::with_job_policy(policy, || {
+            let mut isolated_progress = |event| {
+                candle_gen::train::policy::without_production_profile(|| progress(event));
+            };
+            self.train_scoped(req, &mut isolated_progress)
+        })
+    }
+}
+impl MossImageTrainer {
+    fn train_scoped(
         &mut self,
         req: &TrainingRequest,
         progress: &mut dyn FnMut(TrainingProgress),
@@ -300,6 +314,7 @@ impl Trainer for MossImageTrainer {
         result.map_err(Into::into)
     }
 }
+
 fn validate_request(
     d: &TrainerDescriptor,
     req: &TrainingRequest,
@@ -1139,25 +1154,26 @@ impl MossImageTrainer {
                         receipts: vec![],
                     };
                     transformer.freeze_residuals(true);
-                    let preview = (|| -> Result<_> {
-                        let sampled = crate::pipeline::sample_graph(
-                            &transformer,
-                            None,
-                            &request,
-                            &resolved,
-                            MossImageAdvancedInputs::default(),
-                            &positive,
-                            Some(&negative),
-                            &mut |_| {},
-                        )?;
-                        let mut images = crate::pipeline::decode(
-                            vae.as_ref().expect("preview retains VAE"),
-                            &sampled.latents,
-                            &request,
-                            &mut |_| {},
-                        )?;
-                        Ok(images.remove(0))
-                    })();
+                    let preview =
+                        candle_gen::train::policy::without_production_profile(|| -> Result<_> {
+                            let sampled = crate::pipeline::sample_graph(
+                                &transformer,
+                                None,
+                                &request,
+                                &resolved,
+                                MossImageAdvancedInputs::default(),
+                                &positive,
+                                Some(&negative),
+                                &mut |_| {},
+                            )?;
+                            let mut images = crate::pipeline::decode(
+                                vae.as_ref().expect("preview retains VAE"),
+                                &sampled.latents,
+                                &request,
+                                &mut |_| {},
+                            )?;
+                            Ok(images.remove(0))
+                        });
                     transformer.freeze_residuals(false);
                     progress(TrainingProgress::Sample {
                         step,
@@ -1275,6 +1291,46 @@ impl MossImageTrainer {
 #[cfg(test)]
 mod control_tests {
     use super::*;
+    #[test]
+    fn unmeasured_moss_descriptors_keep_current_policy_without_device_construction() {
+        use candle_gen::train::policy::TrainingProfile;
+        let temp = tempfile::tempdir().unwrap();
+        let mut req = TrainingRequest {
+            items: Vec::new(),
+            config: TrainingConfig::default(),
+            output_dir: temp.path().into(),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: Vec::new(),
+            cancel: CancelFlag::new(),
+        };
+        // Exercise the native entry resolver: Core's selected arm alone does
+        // not include the measured workload/mode guard.
+        req.config.resolution = 512;
+        for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+            for cuda in [false, true] {
+                let policy = recovery::job_policy(descriptor(variant).id, cuda, &req).unwrap();
+                assert_eq!(policy.profile(), TrainingProfile::Current);
+            }
+        }
+        req.config.resolution = 256;
+        for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+            for cuda in [false, true] {
+                let policy = recovery::job_policy(descriptor(variant).id, cuda, &req).unwrap();
+                let expected = if variant == MossImageVariant::Base && cuda {
+                    TrainingProfile::WithoutE1
+                } else {
+                    TrainingProfile::Current
+                };
+                assert_eq!(policy.profile(), expected);
+                // A real native resume requires a sealed bundle. Header/profile
+                // compatibility is separately covered by recovery metadata tests.
+                req.config.resume = true;
+                assert!(recovery::job_policy(descriptor(variant).id, cuda, &req).is_err());
+                req.config.resume = false;
+            }
+        }
+    }
+
     #[test]
     fn admission_refuses_before_the_real_eager_loading_closure() {
         use std::cell::Cell;
