@@ -66,7 +66,11 @@ impl JobTrainingPolicy {
         let (model, selected) = selected_profile(model_id, is_cuda);
         let mut result = Self {
             model,
-            profile: selected,
+            profile: if historical_current_active() {
+                TrainingProfile::Current
+            } else {
+                selected
+            },
             resumed: false,
         };
         if req.config.full_finetune && matches!(model, "mage_flow_base" | "iris_3b") {
@@ -84,7 +88,7 @@ impl JobTrainingPolicy {
                     .into_iter()
                     .collect();
                 let saved = resume_profile(&metadata)?;
-                if saved != TrainingProfile::Current && saved != selected {
+                if saved != TrainingProfile::Current && saved != result.profile {
                     return Err(CandleError::Msg(
                         "resume: execution profile is incompatible with this model/backend".into(),
                     ));
@@ -150,6 +154,42 @@ thread_local! {
     static JOB: Cell<Option<JobTrainingPolicy>> = const { Cell::new(None) };
 }
 
+#[cfg(feature = "model-inference-proof")]
+thread_local! {
+    static HISTORICAL_CURRENT: Cell<bool> = const { Cell::new(false) };
+}
+
+fn historical_current_active() -> bool {
+    #[cfg(feature = "model-inference-proof")]
+    {
+        HISTORICAL_CURRENT.get()
+    }
+    #[cfg(not(feature = "model-inference-proof"))]
+    {
+        false
+    }
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn historical_current_scope<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HISTORICAL_CURRENT.set(self.0);
+        }
+    }
+    let _restore = Restore(HISTORICAL_CURRENT.replace(enabled));
+    f()
+}
+
+/// Historical non-comparison acceptance helpers prove Current mechanisms, not
+/// the model's independently measured production default. No observer/stage or
+/// attention mode is fabricated here; explicit comparison stages still win.
+#[cfg(feature = "model-inference-proof")]
+pub(crate) fn with_historical_acceptance_current<T>(f: impl FnOnce() -> T) -> T {
+    historical_current_scope(true, f)
+}
+
 fn scoped<T>(policy: Option<JobTrainingPolicy>, f: impl FnOnce() -> T) -> T {
     struct Restore(Option<JobTrainingPolicy>);
     impl Drop for Restore {
@@ -171,7 +211,10 @@ fn scoped<T>(policy: Option<JobTrainingPolicy>, f: impl FnOnce() -> T) -> T {
 
 /// Bind this immutable selection for synchronous preparation/training/checkpoint
 /// replay. Nested calls and unwinding restore the previous job's selection.
-pub fn with_job_policy<T>(policy: JobTrainingPolicy, f: impl FnOnce() -> T) -> T {
+pub fn with_job_policy<T>(mut policy: JobTrainingPolicy, f: impl FnOnce() -> T) -> T {
+    if historical_current_active() {
+        policy = policy.for_unmeasured_mode();
+    }
     eprintln!("training execution profile: version={VERSION} model={} arm={} resume={} proof_override={:?}",
         policy.model, policy.profile.measured_arm(), policy.resumed, super::comparison::active_stage());
     scoped(Some(policy), f)
@@ -180,10 +223,20 @@ pub fn with_job_policy<T>(policy: JobTrainingPolicy, f: impl FnOnce() -> T) -> T
 /// Prevent a job's arithmetic/preparation choices leaking into user callbacks or
 /// preview inference. Explicit proof controls remain authoritative.
 pub fn without_production_profile<T>(f: impl FnOnce() -> T) -> T {
-    scoped(None, f)
+    #[cfg(feature = "model-inference-proof")]
+    {
+        historical_current_scope(false, || scoped(None, f))
+    }
+    #[cfg(not(feature = "model-inference-proof"))]
+    {
+        scoped(None, f)
+    }
 }
 
 pub fn active_profile() -> TrainingProfile {
+    if historical_current_active() {
+        return TrainingProfile::Current;
+    }
     JOB.get()
         .map_or(TrainingProfile::Current, |job| job.profile)
 }
@@ -617,5 +670,187 @@ mod selector_metadata_tests {
                 .with_native_resume_profile(TrainingProfile::WithoutE3)
                 .is_err());
         }
+    }
+}
+
+#[cfg(all(test, feature = "model-inference-proof"))]
+mod historical_acceptance_metadata_tests {
+    use super::*;
+    use crate::train::{comparison, profile};
+    use std::panic::{catch_unwind, panic_any, AssertUnwindSafe};
+
+    #[derive(Debug)]
+    struct MetadataStop;
+
+    fn request() -> TrainingRequest {
+        TrainingRequest {
+            items: vec![],
+            config: Default::default(),
+            output_dir: "unused-current-proof".into(),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: vec![],
+            cancel: Default::default(),
+        }
+    }
+
+    #[test]
+    fn bounded_cohort_resolver_uses_current_without_fabricating_a_comparison_or_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("never-a-real-proof.json");
+        let req = request();
+        let production = JobTrainingPolicy::resolve("z_image_turbo", true, &req).unwrap();
+        assert_eq!(production.profile(), TrainingProfile::WithoutE3);
+        with_job_policy(production, || {
+            for required in [false, true] {
+                let body = || {
+                    assert!(profile::cohort_active());
+                    assert!(historical_current_active());
+                    assert_eq!(comparison::active_stage(), None);
+                    for model in [
+                        "z_image_turbo",
+                        "mage_flow_base",
+                        "kolors",
+                        "iris_3b",
+                        "ltx_2_5_distilled",
+                        "sd3_5_medium",
+                        "wan2_2_ti2v_5b",
+                        "wan2_2_t2v_14b",
+                    ] {
+                        let current = JobTrainingPolicy::resolve(model, true, &req).unwrap();
+                        assert_eq!(current.profile(), TrainingProfile::Current);
+                        with_job_policy(current, || {
+                            assert!(!legacy_e1());
+                            assert!(
+                                cache_enabled()
+                                    && projection_enabled()
+                                    && reference_owner_enabled()
+                            );
+                        });
+                    }
+                    // Even a token resolved before entering this acceptance is clamped.
+                    with_job_policy(production, || assert!(projection_enabled()));
+                    without_production_profile(|| {
+                        assert!(!historical_current_active());
+                        assert_eq!(active_profile(), TrainingProfile::Current);
+                        let callback_job =
+                            JobTrainingPolicy::resolve("z_image_turbo", true, &req).unwrap();
+                        assert_eq!(callback_job.profile(), TrainingProfile::WithoutE3);
+                        with_job_policy(callback_job, || assert!(!projection_enabled()));
+                    });
+                    assert!(historical_current_active() && projection_enabled());
+                    // Stop before any tensor/device/body work. This is not a fake completed proof.
+                    panic_any(MetadataStop);
+                };
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    if required {
+                        profile::with_bounded_cohort_for(&output, &["unreached-mechanism"], body)
+                    } else {
+                        profile::with_bounded_cohort(&output, body)
+                    }
+                }));
+                assert!(result.unwrap_err().is::<MetadataStop>());
+                assert!(!historical_current_active() && !profile::cohort_active());
+                assert_eq!(active_profile(), TrainingProfile::WithoutE3);
+                assert!(!projection_enabled());
+                assert!(!output.exists());
+            }
+        });
+        // The old actual-update assertion still rejects an empty returned body.
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| profile::with_bounded_cohort(
+                &output,
+                || ()
+            )))
+            .is_err()
+        );
+        assert!(!historical_current_active() && !profile::cohort_active());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn historical_override_nests_unwinds_isolates_callbacks_and_yields_to_explicit_stages() {
+        let req = request();
+        with_historical_acceptance_current(|| {
+            assert!(historical_current_active());
+            let inner =
+                catch_unwind(|| with_historical_acceptance_current(|| panic_any(MetadataStop)));
+            assert!(inner.unwrap_err().is::<MetadataStop>());
+            assert!(historical_current_active());
+            let callback = catch_unwind(|| {
+                without_production_profile(|| {
+                    assert!(!historical_current_active());
+                    panic_any(MetadataStop);
+                })
+            });
+            assert!(callback.unwrap_err().is::<MetadataStop>());
+            assert!(historical_current_active());
+            for stage in ComparisonStage::ALL {
+                comparison::with_metadata_stage_for_test(stage, || {
+                    let job = JobTrainingPolicy::resolve("z_image_turbo", true, &req).unwrap();
+                    with_job_policy(job, || {
+                        assert_eq!(legacy_e1(), comparison::legacy_e1());
+                        assert_eq!(cache_enabled(), comparison::cache_enabled());
+                        assert_eq!(projection_enabled(), comparison::projection_enabled());
+                        assert_eq!(
+                            reference_owner_enabled(),
+                            comparison::reference_owner_enabled()
+                        );
+                        let state = bind_state_identity("private", active_profile());
+                        assert!(state.ends_with(&format!("comparison-proof-v1/{}", stage.id())));
+                        without_production_profile(|| {
+                            assert_eq!(projection_enabled(), comparison::projection_enabled())
+                        });
+                    });
+                });
+            }
+            std::thread::spawn(|| {
+                assert!(!historical_current_active());
+                assert_eq!(
+                    JobTrainingPolicy::resolve("z_image_turbo", true, &request())
+                        .unwrap()
+                        .profile(),
+                    TrainingProfile::WithoutE3
+                );
+            })
+            .join()
+            .unwrap();
+        });
+        assert!(!historical_current_active());
+        assert_eq!(
+            JobTrainingPolicy::resolve("z_image_turbo", true, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::WithoutE3
+        );
+    }
+
+    #[test]
+    fn all_krea_historical_helpers_preserve_specialized_segment_math_and_cleanup() {
+        fn body() {
+            assert!(profile::active() && historical_current_active());
+            assert_eq!(comparison::active_stage(), None);
+            assert_eq!(
+                JobTrainingPolicy::resolve("z_image_turbo", true, &request())
+                    .unwrap()
+                    .profile(),
+                TrainingProfile::Current
+            );
+            profile::begin_step(0, 0);
+            assert!(
+                profile::reference_math(),
+                "original Krea reference remains original"
+            );
+            profile::begin_step(2, 0);
+            assert!(
+                !profile::reference_math(),
+                "prepared candidate keeps its specialized math"
+            );
+        }
+        profile::with_bounded_krea_profile(body);
+        assert!(!profile::active() && !historical_current_active());
+        assert!(profile::with_bounded_krea_paired(body).1.is_none());
+        assert!(!profile::active() && !historical_current_active());
+        assert!(profile::with_bounded_krea_recovery(body).1.is_none());
+        assert!(!profile::active() && !historical_current_active());
     }
 }

@@ -60,7 +60,7 @@ pub fn with_bounded_krea_profile<T>(f: impl FnOnce() -> T) -> T {
     }
     let _reset = Reset;
     SEGMENT.set(0);
-    f()
+    super::policy::with_historical_acceptance_current(f)
 }
 
 /// Explicit continuation of the failed M3 experiment. The eighteen-update default
@@ -302,7 +302,8 @@ pub(crate) fn finish_attribution(segment: usize) {
 }
 
 // sc-26857: observations for a single four-update cohort invocation. This scope
-// is independent of Krea's matched 18-update experiment and never selects math.
+// is independent of Krea's matched experiment. Historical acceptance explicitly
+// preserves Current mechanisms; comparison scopes retain their actual stage.
 #[cfg(feature = "model-inference-proof")]
 #[derive(Default)]
 struct CohortObservation {
@@ -448,7 +449,7 @@ pub fn cohort_active() -> bool {
 /// source-owned, and cancelled/partial/missing observer work cannot report PASS.
 #[cfg(feature = "model-inference-proof")]
 pub fn with_bounded_cohort<T>(output: &std::path::Path, f: impl FnOnce() -> T) -> T {
-    with_observation(output, 4, 1, None, f)
+    super::policy::with_historical_acceptance_current(|| with_observation(output, 4, 1, None, f))
 }
 
 #[cfg(feature = "model-inference-proof")]
