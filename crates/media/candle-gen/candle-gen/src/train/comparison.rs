@@ -118,6 +118,28 @@ impl ComparisonCadence {
                 .expected_recovery_owners(model_id)
                 .is_none_or(|expected| expected == observed)
     }
+
+    /// Recovery admits only its source-budgeted distinct arms. In particular,
+    /// depth defers Streaming and restoration has no new E1/Reference-owner arm.
+    pub fn allows_stage(self, stage: ComparisonStage) -> bool {
+        match self {
+            Self::DepthRecovery => {
+                matches!(stage, ComparisonStage::Legacy | ComparisonStage::Current)
+            }
+            Self::RestRecovery => matches!(
+                stage,
+                ComparisonStage::Legacy
+                    | ComparisonStage::Current
+                    | ComparisonStage::MinusE2
+                    | ComparisonStage::MinusE3
+                    | ComparisonStage::PlusStreaming
+            ),
+            Self::MossRecovery | Self::OrdinaryShort => {
+                stage != ComparisonStage::MinusReferenceOwner
+            }
+            _ => true,
+        }
+    }
 }
 
 #[cfg(feature = "model-inference-proof")]
@@ -245,6 +267,10 @@ pub fn with_stage<T>(
         "source-owned recovery model/cadence"
     );
     assert!(
+        cadence.allows_stage(stage),
+        "source-budgeted recovery stage"
+    );
+    assert!(
         active_stage().is_none() && !super::profile::active() && !super::profile::cohort_active(),
         "nested comparison scope"
     );
@@ -354,6 +380,33 @@ mod cadence_metadata_tests {
         assert_eq!(2 * ComparisonCadence::DepthRecovery.updates(), 4);
         assert_eq!(5 * ComparisonCadence::RestRecovery.updates(), 30);
         assert_eq!(316 + 12 + 12 + 4 + 30 + 18, 392);
+        for stage in super::ComparisonStage::ALL {
+            assert_eq!(
+                ComparisonCadence::DepthRecovery.allows_stage(stage),
+                matches!(
+                    stage,
+                    super::ComparisonStage::Legacy | super::ComparisonStage::Current
+                )
+            );
+            assert_eq!(
+                ComparisonCadence::RestRecovery.allows_stage(stage),
+                !matches!(
+                    stage,
+                    super::ComparisonStage::MinusE1 | super::ComparisonStage::MinusReferenceOwner
+                )
+            );
+            assert_eq!(
+                ComparisonCadence::OrdinaryShort.allows_stage(stage),
+                stage != super::ComparisonStage::MinusReferenceOwner
+            );
+            for old in [
+                ComparisonCadence::Ordinary,
+                ComparisonCadence::WanDual,
+                ComparisonCadence::IrisRestoration,
+            ] {
+                assert!(old.allows_stage(stage));
+            }
+        }
     }
 
     #[test]
