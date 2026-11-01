@@ -69,10 +69,10 @@ impl JobTrainingPolicy {
             profile: selected,
             resumed: false,
         };
-        // Only CUDA LTX25 owns this shared snapshot contract. Other native
+        // CUDA LTX25 and ZImage own this shared snapshot contract. Other native
         // trainers (including MOSS) own different resume formats; resolving
         // their unchanged Current policy must not inspect or intercept them.
-        if req.config.resume && is_cuda && model == "ltx_2_5_distilled" {
+        if req.config.resume && is_cuda && matches!(model, "ltx_2_5_distilled" | "z_image_turbo") {
             if let Some((path, _)) = super::checkpoint::find_latest_resume(
                 &req.output_dir,
                 super::checkpoint::file_stem(&req.file_name),
@@ -447,7 +447,6 @@ mod selector_metadata_tests {
         for (model, profile) in [
             ("wan2_2_ti2v_5b", TrainingProfile::WithoutE1),
             ("kolors", TrainingProfile::WithoutE3),
-            ("z_image_turbo", TrainingProfile::WithoutE3),
             ("sd3_5_medium", TrainingProfile::Legacy),
         ] {
             assert_eq!(
@@ -470,6 +469,13 @@ mod selector_metadata_tests {
             TrainingProfile::Current
         );
         assert!(JobTrainingPolicy::resolve("ltx_2_5_distilled", true, &req).is_err());
+        assert!(JobTrainingPolicy::resolve("z_image_turbo", true, &req).is_err());
+        assert_eq!(
+            JobTrainingPolicy::resolve("z_image_turbo", false, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
         req.output_dir = dir.path().join("nonexistent-native-resume-path");
         for model in ["moss_image_base", "moss_image_sft", "unknown"] {
             assert_eq!(
@@ -479,5 +485,40 @@ mod selector_metadata_tests {
                 TrainingProfile::Current
             );
         }
+    }
+
+    #[test]
+    fn z_shared_resume_preserves_historical_current_and_tagged_measured_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut req = request(dir.path());
+        req.config.resume = true;
+        write_header(dir.path(), serde_json::json!({}));
+        assert_eq!(
+            JobTrainingPolicy::resolve("z_image_turbo", true, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+        write_header(
+            dir.path(),
+            serde_json::json!({RESUME_KEY: "measured-reference-v1/minus-e3"}),
+        );
+        assert_eq!(
+            JobTrainingPolicy::resolve("z_image_turbo", true, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::WithoutE3
+        );
+        assert_eq!(
+            JobTrainingPolicy::resolve("z_image_turbo", false, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+        write_header(
+            dir.path(),
+            serde_json::json!({RESUME_KEY: "measured-reference-v1/minus-e2"}),
+        );
+        assert!(JobTrainingPolicy::resolve("z_image_turbo", true, &req).is_err());
     }
 }
