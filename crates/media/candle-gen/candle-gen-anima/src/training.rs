@@ -787,33 +787,49 @@ mod tests {
 
     // Metadata only: never construct a Device/Tensor/trainer or call train.
     #[test]
-    fn anima_neutral_policy_keeps_exact_owner_modes_and_callback_scope() {
+    fn anima_measured_lora_preserves_unmeasured_modes_and_callback_scope() {
         use candle_gen::train::policy::{self, JobTrainingPolicy, TrainingProfile};
         let mut req = request();
         let id = trainer_descriptor().id;
         assert_eq!(id, "anima_base");
         let job = anima_training_policy(id, true, &req).unwrap();
         assert_eq!(job.model(), id);
-        assert_eq!(job.profile(), TrainingProfile::Current);
+        assert_eq!(job.profile(), TrainingProfile::WithoutE1);
         let outer = JobTrainingPolicy::resolve("ltx_2_5_distilled", true, &req).unwrap();
         policy::with_job_policy(outer, || {
             assert!(!policy::cache_enabled());
             policy::with_job_policy(job, || {
-                assert_eq!(policy::active_profile(), TrainingProfile::Current);
+                assert_eq!(policy::active_profile(), TrainingProfile::WithoutE1);
+                assert!(policy::legacy_e1());
                 assert!(policy::cache_enabled() && policy::projection_enabled());
                 policy::without_production_profile(|| {
-                    assert_eq!(policy::active_profile(), TrainingProfile::Current)
+                    assert_eq!(policy::active_profile(), TrainingProfile::Current);
+                    assert!(!policy::legacy_e1());
                 });
+                assert_eq!(policy::active_profile(), TrainingProfile::WithoutE1);
             });
             assert_eq!(policy::active_profile(), outer.profile());
         });
+        assert_eq!(
+            anima_training_policy(id, false, &req).unwrap().profile(),
+            TrainingProfile::Current
+        );
+        req.config.full_finetune = true;
+        assert_eq!(
+            anima_training_policy(id, true, &req).unwrap().profile(),
+            TrainingProfile::Current
+        );
+        req.config.full_finetune = false;
         req.config.network_type = NetworkType::Lokr;
         assert_eq!(
             anima_training_policy(id, true, &req).unwrap().profile(),
             TrainingProfile::Current
         );
+        req.config.network_type = NetworkType::Lora;
         assert_eq!(
-            anima_training_policy(id, false, &req).unwrap().profile(),
+            anima_training_policy("unmeasured-anima-variant", true, &req)
+                .unwrap()
+                .profile(),
             TrainingProfile::Current
         );
     }
