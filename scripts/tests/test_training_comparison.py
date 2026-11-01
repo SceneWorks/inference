@@ -76,7 +76,7 @@ class ComparisonContract(unittest.TestCase):
         self.assertEqual(len(self.cases), 17)
         plans = [comparison.spec(r) for r in self.cases.values()]
         self.assertEqual(sum(x['max_physical_updates'] for x in plans), 350)
-        self.assertEqual(350 + (16 + 12 + 10 + 8 + 8), 404)
+        self.assertEqual(350 + (16 + 22 + 10 + 8 + 8), 414)
         self.assertFalse(any('minus-reference-owner' in p['stages'] for p in plans))
         self.assertEqual(comparison.spec(self.cases['iris-depth'])['stages'], ['legacy', 'current'])
         self.assertNotIn('minus-e3', comparison.spec(self.cases['lens'])['stages'])
@@ -85,7 +85,7 @@ class ComparisonContract(unittest.TestCase):
     def test_failed_case_recovery_budgets_and_strict_owner_cadences(self):
         for model,cadence,count,warm,cap,retained,total in [
             ('anima_base','ordinary_short',2,1,12,8,20),
-            ('flux3','ordinary_short',2,1,12,12,24),
+            ('flux3','ordinary_short',2,1,12,22,34),
             ('iris-depth','depth_recovery',2,1,4,10,14),
             ('iris-restoration','rest_recovery',6,2,30,8,38)]:
             base,request=self.request(model)
@@ -93,9 +93,10 @@ class ComparisonContract(unittest.TestCase):
             self.assertEqual((plan['cadence'],plan['updates_per_stage'],plan['warmups_per_stage'],plan['max_physical_updates']),(cadence,count,warm,cap))
             self.assertEqual(plan['recovery_budget']['retained_conservative_charge'],retained)
             budget=plan['recovery_budget']
-            if model == 'iris-depth':
+            if model in ('iris-depth','flux3'):
                 self.assertNotIn('cumulative_model_max',budget)
-                self.assertEqual((budget['proposed_cumulative_model_max'],budget['original_model_cap'],budget['required_additional_family_updates']),(14,12,2))
+                expected=(14,12,2) if model=='iris-depth' else (34,24,10)
+                self.assertEqual((budget['proposed_cumulative_model_max'],budget['original_model_cap'],budget['required_additional_family_updates']),expected)
                 self.assertEqual(budget['authorization_status'],'pending-user-authorization')
                 self.assertFalse(budget['dispatch_authorized'])
             else:
@@ -118,7 +119,7 @@ class ComparisonContract(unittest.TestCase):
         self.assertEqual(depth['deferred_applicable_stages'],['plus-streaming'])
         with self.assertRaises(ValueError):self.row('iris-depth','plus-streaming')
         # Proposed maxima describe counts; they do not authorize family exceptions.
-        self.assertEqual(350 + 54,404)
+        self.assertEqual(350 + 64,414)
 
     def test_flux_fixed_64_edit_workload_rebinds_plan_and_initial_input_witnesses(self):
         base,request=self.request('flux3')
@@ -129,7 +130,14 @@ class ComparisonContract(unittest.TestCase):
         self.assertEqual((workload['resolution'],workload['mode'],workload['rank'],workload['alpha'],workload['seed']),(64,'paired-edit',2,2,7))
         self.assertEqual((workload['optimizer'],workload['learning_rate'],workload['train_dtype'],workload['gradient_checkpointing']),('adamw',0.001,'bf16',False))
         budget=plan['recovery_budget']
-        self.assertEqual((budget['retained_conservative_charge'],budget['maximum_new_physical_updates'],budget['cumulative_model_max'],budget['original_model_cap'],budget['unused_allowance_nontransferable']),(12,12,24,24,0))
+        self.assertEqual((budget['retained_conservative_charge'],budget['maximum_new_physical_updates'],budget['proposed_cumulative_model_max'],budget['original_model_cap'],budget['remaining_under_original_cap']),(22,12,34,24,2))
+        self.assertNotIn('cumulative_model_max',budget)
+        self.assertEqual(budget['authorization_status'],'pending-user-authorization')
+        self.assertFalse(budget['dispatch_authorized'])
+        campaign=budget['campaign_budget_proposal']
+        self.assertEqual((campaign['original_campaign_cap'],campaign['proposed_campaign_max'],campaign['required_additional_campaign_updates']),(404,414,10))
+        self.assertFalse(campaign['dispatch_authorized'])
+        self.assertEqual((budget['latest_failed_comparison']['run'],budget['latest_failed_comparison']['retained_conservative_charge']),(41276985590,10))
         self.assertFalse(budget['automatic_retry'])
         self.assertEqual((budget['prior_failed_recovery']['run'],budget['prior_failed_recovery']['retained_conservative_charge']),(41269133067,4))
         source=(Path(__file__).resolve().parents[2]/'crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs').read_text(encoding='utf-8')

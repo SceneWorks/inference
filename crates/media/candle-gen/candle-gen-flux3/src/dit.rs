@@ -800,6 +800,13 @@ impl Flux3Dit {
                     );
                     x.to_device(&self.device)?
                 }
+                _ if training => {
+                    // E2-off retains input-width CPU conditioning, including
+                    // matched empty captions. Place it for the frozen txt_in
+                    // projection without preparing/caching that projection.
+                    let x = to(&x, self.txt_in.dtype())?.to_device(&self.device)?;
+                    self.txt_in.forward(&x)?
+                }
                 _ => self.txt_in.forward(&x)?,
             };
             let rope = self.rope(&ids[mode])?;
