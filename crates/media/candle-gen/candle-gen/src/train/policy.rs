@@ -69,6 +69,9 @@ impl JobTrainingPolicy {
             profile: selected,
             resumed: false,
         };
+        if req.config.full_finetune && matches!(model, "mage_flow_base" | "iris_3b") {
+            result = result.for_unmeasured_mode();
+        }
         // CUDA LTX25 and ZImage own this shared snapshot contract. Other native
         // trainers (including MOSS) own different resume formats; resolving
         // their unchanged Current policy must not inspect or intercept them.
@@ -99,11 +102,34 @@ impl JobTrainingPolicy {
     pub const fn model(self) -> &'static str {
         self.model
     }
+
+    /// Preserve the historical default for a native mode outside its measured
+    /// adapter/single-rank scope. Call before preparation, never during a run.
+    pub fn for_unmeasured_mode(mut self) -> Self {
+        self.profile = TrainingProfile::Current;
+        self
+    }
+
+    /// A native checkpoint owner supplies its validated finite header profile;
+    /// only historical Current or this model/mode's selected arm is admissible.
+    pub fn with_native_resume_profile(mut self, saved: TrainingProfile) -> Result<Self> {
+        if saved != TrainingProfile::Current && saved != self.profile {
+            return Err(CandleError::Msg(
+                "resume: native execution profile is incompatible with this model/mode".into(),
+            ));
+        }
+        self.profile = saved;
+        self.resumed = true;
+        Ok(self)
+    }
 }
 
 fn selected_profile(model: &str, cuda: bool) -> (&'static str, TrainingProfile) {
     let (model, selected) = match model {
         "wan2_2_ti2v_5b" => ("wan2_2_ti2v_5b", TrainingProfile::WithoutE1),
+        "wan2_2_t2v_14b" => ("wan2_2_t2v_14b", TrainingProfile::WithoutE3),
+        "mage_flow_base" => ("mage_flow_base", TrainingProfile::WithoutE3),
+        "iris_3b" => ("iris_3b", TrainingProfile::WithoutE3),
         "kolors" => ("kolors", TrainingProfile::WithoutE3),
         "z_image_turbo" => ("z_image_turbo", TrainingProfile::WithoutE3),
         "ltx_2_5_distilled" => ("ltx_2_5_distilled", TrainingProfile::WithoutE2),
@@ -230,6 +256,21 @@ pub(super) fn bind_resume_fingerprint(base: &str, profile: TrainingProfile) -> S
     }
 }
 
+/// Bind only a native private training-state identity, never a base-model or
+/// adapter identity. Older loaders reject a non-Current identity mismatch.
+pub fn bind_state_identity(base: &str, profile: TrainingProfile) -> String {
+    bind_resume_fingerprint(base, profile)
+}
+
+/// Decode the finite suffix in a native private checkpoint's state identity.
+/// Untagged historical state means Current; malformed/future tags fail closed.
+pub fn profile_from_state_identity(identity: &str) -> Result<TrainingProfile> {
+    let Some((_, tag)) = identity.rsplit_once(";execution_profile=") else {
+        return Ok(TrainingProfile::Current);
+    };
+    resume_profile(&HashMap::from([(RESUME_KEY.into(), tag.into())]))
+}
+
 pub(super) fn record_resume_profile(meta: &mut HashMap<String, String>) {
     let profile = active_profile();
     if profile != TrainingProfile::Current {
@@ -267,6 +308,9 @@ mod selector_metadata_tests {
     fn exact_descriptors_and_non_cuda_defaults() {
         for (id, profile) in [
             ("wan2_2_ti2v_5b", TrainingProfile::WithoutE1),
+            ("wan2_2_t2v_14b", TrainingProfile::WithoutE3),
+            ("mage_flow_base", TrainingProfile::WithoutE3),
+            ("iris_3b", TrainingProfile::WithoutE3),
             ("kolors", TrainingProfile::WithoutE3),
             ("z_image_turbo", TrainingProfile::WithoutE3),
             ("ltx_2_5_distilled", TrainingProfile::WithoutE2),
@@ -278,7 +322,7 @@ mod selector_metadata_tests {
         for id in [
             "krea",
             "krea_raw",
-            "wan2_2_t2v_14b",
+            "wan2_2_i2v_14b",
             "sd3_5_large",
             "ltx_2_3",
             "unknown",
@@ -520,5 +564,55 @@ mod selector_metadata_tests {
             serde_json::json!({RESUME_KEY: "measured-reference-v1/minus-e2"}),
         );
         assert!(JobTrainingPolicy::resolve("z_image_turbo", true, &req).is_err());
+    }
+
+    #[test]
+    fn native_profile_modes_and_private_state_identity_are_bounded() {
+        let mut req = request(std::path::Path::new("unused-native-profile"));
+        for model in ["mage_flow_base", "iris_3b"] {
+            let job = JobTrainingPolicy::resolve(model, true, &req).unwrap();
+            assert_eq!(job.profile(), TrainingProfile::WithoutE3);
+            assert_eq!(
+                job.for_unmeasured_mode().profile(),
+                TrainingProfile::Current
+            );
+            assert_eq!(
+                job.with_native_resume_profile(TrainingProfile::Current)
+                    .unwrap()
+                    .profile(),
+                TrainingProfile::Current
+            );
+            assert!(job
+                .with_native_resume_profile(TrainingProfile::WithoutE1)
+                .is_err());
+            let bound = bind_state_identity("native-private-config", job.profile());
+            assert_eq!(
+                profile_from_state_identity(&bound).unwrap(),
+                TrainingProfile::WithoutE3
+            );
+            assert_eq!(
+                bind_state_identity("historical", TrainingProfile::Current),
+                "historical"
+            );
+            assert_eq!(
+                profile_from_state_identity("historical").unwrap(),
+                TrainingProfile::Current
+            );
+            assert!(
+                profile_from_state_identity("x;execution_profile=future/plus-streaming").is_err()
+            );
+            req.config.full_finetune = true;
+            assert_eq!(
+                JobTrainingPolicy::resolve(model, true, &req)
+                    .unwrap()
+                    .profile(),
+                TrainingProfile::Current
+            );
+            req.config.full_finetune = false;
+            assert!(JobTrainingPolicy::resolve(model, false, &req)
+                .unwrap()
+                .with_native_resume_profile(TrainingProfile::WithoutE3)
+                .is_err());
+        }
     }
 }

@@ -1538,10 +1538,10 @@ mod tests {
         ] {
             let id = variant.descriptor().id;
             let cuda = JobTrainingPolicy::resolve(id, true, &req).unwrap();
-            let expected = if matches!(variant, TrainVariant::Ti2v5b) {
-                TrainingProfile::WithoutE1
-            } else {
-                TrainingProfile::Current
+            let expected = match variant {
+                TrainVariant::Ti2v5b => TrainingProfile::WithoutE1,
+                TrainVariant::T2v14b => TrainingProfile::WithoutE3,
+                TrainVariant::I2v14b => TrainingProfile::Current,
             };
             assert_eq!(cuda.profile(), expected, "{id}");
             assert_eq!(

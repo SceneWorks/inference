@@ -340,7 +340,7 @@ impl IrisDiT {
         scale: f32,
         square: bool,
     ) -> Result<Rope> {
-        if !candle_gen::train::comparison::cache_enabled() {
+        if !candle_gen::train::policy::cache_enabled() {
             if self.training_geometry_admission {
                 candle_gen::train::flow_match::check_preparation_memory(
                     "Iris geometry",
@@ -749,7 +749,7 @@ impl IrisDiT {
     /// The fixed full-resolution 2D sincos table of `PixelEmbedder` (`[H, W, hidden]` f32), cached.
     fn pixel_pos(&self, height: usize, width: usize) -> Result<Tensor> {
         let dim = self.cfg.pixel.hidden_size;
-        if !candle_gen::train::comparison::cache_enabled() {
+        if !candle_gen::train::policy::cache_enabled() {
             if self.training_geometry_admission {
                 candle_gen::train::flow_match::check_preparation_memory(
                     "Iris position",

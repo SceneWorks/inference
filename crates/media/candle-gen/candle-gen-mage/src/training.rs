@@ -328,7 +328,18 @@ impl Trainer for MageTrainer {
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let policy = candle_gen::train::policy::JobTrainingPolicy::resolve(
+            self.descriptor.id,
+            self.device.is_cuda(),
+            req,
+        )?;
+        candle_gen::train::policy::with_job_policy(policy, || {
+            let mut progress = |event| {
+                candle_gen::train::policy::without_production_profile(|| on_progress(event))
+            };
+            self.train_impl(req, &mut progress)
+        })
+        .map_err(Into::into)
     }
 }
 
@@ -2233,5 +2244,44 @@ mod tests {
                 candle_gen_perceptual::CustomDecoder::footprint(self, edge, edge)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod production_policy_metadata_tests {
+    use super::*;
+    use candle_gen::train::policy::{JobTrainingPolicy, TrainingProfile};
+
+    #[test]
+    fn actual_mage_descriptor_selects_only_adapter_cuda() {
+        let mut req = TrainingRequest {
+            items: vec![],
+            config: Default::default(),
+            output_dir: "unused-policy".into(),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: vec![],
+            cancel: Default::default(),
+        };
+        let id = trainer_descriptor().id;
+        assert_eq!(id, "mage_flow_base");
+        assert_eq!(
+            JobTrainingPolicy::resolve(id, true, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::WithoutE3
+        );
+        assert_eq!(
+            JobTrainingPolicy::resolve(id, false, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+        req.config.full_finetune = true;
+        assert_eq!(
+            JobTrainingPolicy::resolve(id, true, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
     }
 }

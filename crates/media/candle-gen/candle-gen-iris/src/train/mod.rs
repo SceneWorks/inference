@@ -285,9 +285,15 @@ impl Trainer for IrisTrainer {
     ) -> gen_core::Result<TrainingOutput> {
         self.floors(req)?;
         self.plan(req, &[])?;
+        let policy = generation_training_policy(self, req)?;
         let failure: Rc<RefCell<Option<DistError>>> = Rc::new(RefCell::new(None));
-        let result = Run::prepare(self, req, on_progress, failure.clone())
-            .and_then(|run| run.execute(req, on_progress));
+        let result = candle_gen::train::policy::with_job_policy(policy, || {
+            let mut progress = |event| {
+                candle_gen::train::policy::without_production_profile(|| on_progress(event))
+            };
+            Run::prepare(self, req, &mut progress, failure.clone())
+                .and_then(|run| run.execute(req, &mut progress))
+        });
         match result {
             Ok(out) => Ok(out),
             Err(e) => match failure.borrow_mut().take() {
@@ -296,6 +302,55 @@ impl Trainer for IrisTrainer {
             },
         }
     }
+}
+
+// This is the generation checkpoint owner's header selection, before any model,
+// EMA, optimizer or pack preparation. Full/distributed modes retain Current.
+fn generation_training_policy(
+    trainer: &IrisTrainer,
+    req: &TrainingRequest,
+) -> Result<candle_gen::train::policy::JobTrainingPolicy> {
+    use candle_gen::train::policy::{profile_from_state_identity, JobTrainingPolicy};
+    let plan = trainer.resolve_plan(req, &[])?;
+    let mut policy =
+        JobTrainingPolicy::resolve(trainer.descriptor.id, trainer.device.is_cuda(), req)?;
+    if plan.dist.world.world_size != 1 {
+        policy = policy.for_unmeasured_mode();
+    }
+    let root = checkpoint_root(&req.output_dir, &req.file_name);
+    let resume = match (&plan.resume_from, plan.resume) {
+        (Some(path), _) => Some(if path.join(CKPT_STATE).is_file() {
+            path.clone()
+        } else {
+            latest_checkpoint(path).ok_or_else(|| {
+                Error::Msg(format!(
+                    "iris resume: {} holds no complete checkpoint",
+                    path.display()
+                ))
+            })?
+        }),
+        (None, true) => latest_checkpoint(&root),
+        _ => None,
+    };
+    if let Some(path) = resume {
+        let state = read_checkpoint_state(&path)?;
+        policy = policy
+            .with_native_resume_profile(profile_from_state_identity(&state.state_identity)?)?;
+    }
+    Ok(policy)
+}
+
+fn checked_generation_state_identity(saved: &str, expected_private_state: &str) -> Result<String> {
+    let expected = candle_gen::train::policy::bind_state_identity(
+        expected_private_state,
+        candle_gen::train::policy::active_profile(),
+    );
+    if saved != expected {
+        return Err(Error::Msg(
+            "iris resume: private execution-profile/state identity differs".into(),
+        ));
+    }
+    Ok(expected_private_state.into())
 }
 
 /// A [`Collective`] that records the first typed distributed failure it surfaces.
@@ -1035,7 +1090,10 @@ impl Run {
         let resume_src = resume_dir.clone();
         if let Some(dir) = resume_dir {
             let saved = read_checkpoint_state(&dir)?;
-            check_resume(&saved, &plan, &dataset_fingerprint, &base_identity)?;
+            let mut validated = saved.clone();
+            validated.state_identity =
+                checked_generation_state_identity(&saved.state_identity, &plan.state_identity())?;
+            check_resume(&validated, &plan, &dataset_fingerprint, &base_identity)?;
             let payload = read_checkpoint_members(&dir, &saved, &device)?;
             let core_keys: Vec<&String> = params
                 .keys()
@@ -1561,7 +1619,9 @@ impl Run {
                     && (self.step.is_multiple_of(plan.preview.every as u64)
                         || (plan.preview_at_step_one && self.step == 1));
                 if preview_due {
-                    self.render_previews(req, on_progress)?;
+                    candle_gen::train::policy::without_production_profile(|| {
+                        self.render_previews(req, on_progress)
+                    })?;
                 }
                 if plan.holdout.every > 0
                     && !self.pipeline.holdout.is_empty()
@@ -1882,7 +1942,10 @@ impl Run {
             ema_decay: self.plan.ema,
             seed: self.plan.seed,
             backend: BACKEND.into(),
-            state_identity: self.plan.state_identity(),
+            state_identity: candle_gen::train::policy::bind_state_identity(
+                &self.plan.state_identity(),
+                candle_gen::train::policy::active_profile(),
+            ),
             data_identity: self.plan.data_identity(),
             dataset_fingerprint: self.dataset_fingerprint.clone(),
             base_identity: self.base_identity.clone(),
@@ -2413,4 +2476,78 @@ pub(crate) fn cohort_before_named_update(
     }
     candle_gen::train::profile::cohort_before_update(&observed, &vars)?;
     Ok(vars)
+}
+
+#[cfg(test)]
+mod production_policy_metadata_tests {
+    use super::*;
+    use candle_gen::train::policy::{self, JobTrainingPolicy, TrainingProfile};
+
+    #[test]
+    fn generation_native_state_identity_preserves_old_and_binds_new_profile() {
+        let mut req = TrainingRequest {
+            items: vec![],
+            config: Default::default(),
+            output_dir: "unused-policy".into(),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: vec![],
+            cancel: Default::default(),
+        };
+        let id = trainer_descriptor().id;
+        assert_eq!(id, "iris_3b");
+        let job = JobTrainingPolicy::resolve(id, true, &req).unwrap();
+        assert_eq!(job.profile(), TrainingProfile::WithoutE3);
+        let identity = policy::bind_state_identity("private-training-config", job.profile());
+        policy::with_job_policy(job, || {
+            assert_eq!(
+                checked_generation_state_identity(&identity, "private-training-config").unwrap(),
+                "private-training-config"
+            );
+            assert!(checked_generation_state_identity(
+                "private-training-config",
+                "private-training-config"
+            )
+            .is_err());
+            assert!(checked_generation_state_identity(&identity, "wrong-config").is_err());
+        });
+        let historical = job
+            .with_native_resume_profile(
+                policy::profile_from_state_identity("private-training-config").unwrap(),
+            )
+            .unwrap();
+        policy::with_job_policy(historical, || {
+            assert_eq!(
+                checked_generation_state_identity(
+                    "private-training-config",
+                    "private-training-config"
+                )
+                .unwrap(),
+                "private-training-config"
+            )
+        });
+        let saved = job
+            .with_native_resume_profile(policy::profile_from_state_identity(&identity).unwrap())
+            .unwrap();
+        assert_eq!(saved.profile(), TrainingProfile::WithoutE3);
+        assert!(job
+            .with_native_resume_profile(TrainingProfile::WithoutE1)
+            .is_err());
+        assert_eq!(
+            job.for_unmeasured_mode().profile(),
+            TrainingProfile::Current
+        );
+        req.config.full_finetune = true;
+        assert_eq!(
+            JobTrainingPolicy::resolve(id, true, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+        assert_eq!(
+            JobTrainingPolicy::resolve(id, false, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+    }
 }

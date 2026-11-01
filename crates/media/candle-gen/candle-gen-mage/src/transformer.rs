@@ -598,7 +598,7 @@ pub struct MageTransformer {
 impl MageTransformer {
     /// Retained geometry and initial-conditioning base outputs, priced before allocation.
     pub(crate) fn training_preparation_bytes(&self, inputs: &[(&Tensor, &PackLayout)]) -> u64 {
-        if !candle_gen::train::comparison::cache_enabled() {
+        if !candle_gen::train::policy::cache_enabled() {
             return 0;
         }
         let mut layouts = Vec::new();
@@ -632,7 +632,7 @@ impl MageTransformer {
         &self,
         inputs: &[(&Tensor, &PackLayout)],
     ) -> u64 {
-        if !candle_gen::train::comparison::cache_enabled() {
+        if !candle_gen::train::policy::cache_enabled() {
             return 0;
         }
         inputs
@@ -659,7 +659,7 @@ impl MageTransformer {
     }
 
     pub(crate) fn prepare_training(&mut self, inputs: &[(&Tensor, &PackLayout)]) -> Result<()> {
-        if candle_gen::train::comparison::projection_enabled() {
+        if candle_gen::train::policy::projection_enabled() {
             if let MageBlocks::Resident(blocks) = &mut self.blocks {
                 for block in blocks {
                     let a = &mut block.attention;
@@ -682,7 +682,7 @@ impl MageTransformer {
         }
         self.training_rope.clear();
         self.training_text.clear();
-        if !candle_gen::train::comparison::cache_enabled() {
+        if !candle_gen::train::policy::cache_enabled() {
             return Ok(());
         }
         for (text, layout) in inputs {
