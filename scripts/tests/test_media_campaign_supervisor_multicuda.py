@@ -19,10 +19,11 @@ class Timeline:
         self.root_exit, self.empty, self.escaped = root_exit, empty, escaped
         self.trace, self.stopped = [], []
         self.spawned = False
+        self.fault_reaped = False
         self.child = SimpleNamespace(pid=1000, poll=self.poll, wait=self.wait)
 
     def poll(self):
-        return 0 if self.tick >= self.root_exit else None
+        return 0 if self.fault_reaped or self.tick >= self.root_exit else None
 
     def wait(self, timeout=None):
         return 0
@@ -34,6 +35,8 @@ class Timeline:
         self.tick += 1
 
     def snapshot(self, _owner):
+        if self.fault_reaped:
+            return set(), set()
         if self.tick >= self.empty:
             return set(), set()
         if self.tick >= self.root_exit:
@@ -109,7 +112,7 @@ class MultiCudaSupervisorTests(unittest.TestCase):
             path.write_text(json.dumps(data), encoding="utf-8")
             self.policies.append(safety.load_policy(path))
 
-    def run_fake(self, timeline=None, probes=None, policies=None, **kwargs):
+    def run_fake(self, timeline=None, probes=None, policies=None, *, verified_fault_cleanup=False, **kwargs):
         timeline = timeline or Timeline()
         policies = self.policies[:2] if policies is None else policies
         probes = [DeviceProbe(policy, timeline, role) for role, policy in enumerate(policies)] if probes is None else probes
@@ -120,10 +123,17 @@ class MultiCudaSupervisorTests(unittest.TestCase):
         timeline.job_assignments, timeline.job_closes = [], []
         def close_job():
             timeline.job_closes.append(True)
+        def terminate_and_reap(child, grace):
+            timeline.stopped.append((child.pid, grace))
+            # Opt in only when the fixture models the real Job contract's
+            # positive root-exit/empty-Job observation. A stop request alone
+            # remains unverified and must not fabricate a cleanup receipt.
+            if verified_fault_cleanup:
+                timeline.fault_reaped = True
         timeline.job = SimpleNamespace(
             members=lambda: set.union(*timeline.snapshot(None)),
             assign_and_resume=lambda child: timeline.job_assignments.append(child.pid),
-            terminate_and_reap=lambda child, grace: timeline.stopped.append((child.pid, grace)),
+            terminate_and_reap=terminate_and_reap,
             close=close_job)
         with patch.object(safety.os, "name", "nt" if is_windows else "posix"), \
              patch.object(safety.windows, "WindowsJob", return_value=timeline.job), \
@@ -194,16 +204,34 @@ class MultiCudaSupervisorTests(unittest.TestCase):
         running=Timeline(root_exit=20,empty=30)
         with self.assertRaises(safety.SupervisionError) as caught:
             self.run_fake(running,[DeviceProbe(policy,running,0)],[policy],
-                          retain_owned_completion=True,claim_deadline_monotonic=.03)
+                          retain_owned_completion=True,claim_deadline_monotonic=.03,
+                          verified_fault_cleanup=True)
         self.assertEqual(caught.exception.reason,'deadline')
         self.assertTrue(running.spawned)
         self.assertTrue(running.stopped)
-        self.assertFalse(hasattr(caught.exception,'owned_completion'))
+        self.assertTrue(running.fault_reaped)
+        self.assertEqual(running.tick,3)  # Original .03 claim, not a fresh 2s budget.
+        self.assertEqual(caught.exception.owned_completion, {
+            'scope':'supervisor-owned-windows-job','root_pid':1000,
+            'root_returncode':0,'waited_returncode':0,
+            'job_member_pids':[],'owned_pids':[]})
         done=Timeline(root_exit=1,empty=2)
         result=self.run_fake(done,[DeviceProbe(policy,done,0)],[policy],
                             retain_owned_completion=True,claim_deadline_monotonic=.1)
         self.assertEqual(result.admission['originalClaimDeadlineMonotonic'],.1)
         self.assertEqual(result.admission['remainingClaimSecondsAtSupervisorEntry'],.1)
+
+    def test_original_deadline_with_unverified_fault_cleanup_stays_failed_closed(self):
+        policy=dataclasses.replace(self.policies[0],backend='windows-cuda')
+        running=Timeline(root_exit=20,empty=30)
+        with self.assertRaises(safety.SupervisionError) as caught:
+            self.run_fake(running,[DeviceProbe(policy,running,0)],[policy],
+                          retain_owned_completion=True,claim_deadline_monotonic=.03)
+        self.assertEqual(running.tick,3)
+        self.assertEqual(caught.exception.reason,'cleanup-failure')
+        self.assertEqual(caught.exception.primary_failure['reason'],'deadline')
+        self.assertFalse(running.fault_reaped)
+        self.assertFalse(hasattr(caught.exception,'owned_completion'))
 
     def test_single_device_failure_retains_sample_and_usage_basis(self):
         for basis in ('owned-process-attributed', 'global-used-upper-bound'):

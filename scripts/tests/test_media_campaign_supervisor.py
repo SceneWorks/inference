@@ -1,6 +1,7 @@
 """CPU-only fail-closed process supervision tests; no model or GPU is started."""
 
 import dataclasses
+import errno
 import json
 import os
 import sys
@@ -1407,8 +1408,19 @@ class OperatorStopTests(unittest.TestCase):
             self.assertEqual(json.loads(caught.exception.record.read_bytes())["stopFiles"],
                              [str(root / "elsewhere" / "halt")])
             blocked = (root / "elsewhere" / "halt" / "STOP",)  # ENOTDIR, not "absent"
-            with self.assertRaises(OSError):
-                safety.check_operator_stop(blocked, logs, kind="k", before="row-a", index=0, total=2)
+            if os.name == "posix":
+                with self.assertRaises(OSError):
+                    safety.check_operator_stop(blocked, logs, kind="k", before="row-a", index=0, total=2)
+            # Windows lstat(file/child) reports FileNotFoundError here rather
+            # than POSIX ENOTDIR. Exercise non-absence failures explicitly on
+            # every platform; never change the production missing-path rule.
+            for error in (NotADirectoryError(errno.ENOTDIR, "synthetic ENOTDIR"),
+                          PermissionError(errno.EACCES, "synthetic access denial")):
+                with self.subTest(error=type(error).__name__), \
+                     patch.object(safety.os, "lstat", side_effect=error):
+                    with self.assertRaises(type(error)) as caught:
+                        safety.check_operator_stop(blocked, logs, kind="k", before="row-a", index=0, total=2)
+                    self.assertIs(caught.exception, error)
 
 
 class WindowsJobCleanupTests(unittest.TestCase):
