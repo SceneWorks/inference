@@ -263,6 +263,29 @@ fn perth_component_file(src: &WeightsSource) -> std::path::PathBuf {
     }
 }
 
+// Keep the construction decision and cancellation-to-output boundary independently testable
+// without constructing learned components. The real generator uses these exact decisions.
+fn load_s3gen_if_missing<T>(
+    slot: &mut Option<T>,
+    on_progress: &mut dyn FnMut(Progress),
+    load: impl FnOnce() -> gen_core::Result<T>,
+) -> gen_core::Result<()> {
+    if slot.is_none() {
+        on_progress(Progress::Loading(gen_core::LoadPhase::Renderer));
+        *slot = Some(load()?);
+    }
+    Ok(())
+}
+
+fn begin_post_processing<T>(
+    rendered: Option<T>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> gen_core::Result<T> {
+    let samples = rendered.ok_or(gen_core::Error::Canceled)?;
+    on_progress(Progress::PostProcessing);
+    Ok(samples)
+}
+
 impl ChatterboxGenerator {
     /// Shared public-entry preamble: validate the request, honor pre-cancellation, look up its
     /// reference clip once, and reject malformed interleaving before any model is staged.
@@ -406,14 +429,12 @@ impl ChatterboxGenerator {
 
     /// Lazily assemble the S3Gen token→waveform stack (s3tokenizer + CAMPPlus + flow + HiFTNet) from
     /// the snapshot's `s3gen.safetensors` (sc-13239).
-    fn ensure_s3gen(&self) -> gen_core::Result<()> {
+    fn ensure_s3gen(&self, on_progress: &mut dyn FnMut(Progress)) -> gen_core::Result<()> {
         let mut guard = lock_recover(&self.s3gen);
-        if guard.is_none() {
-            let s3gen = S3Gen::from_snapshot(&self.root)
-                .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: load S3Gen: {e}")))?;
-            *guard = Some(s3gen);
-        }
-        Ok(())
+        load_s3gen_if_missing(&mut guard, on_progress, || {
+            S3Gen::from_snapshot(&self.root)
+                .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: load S3Gen: {e}")))
+        })
     }
 
     /// Apply the PerTh provenance watermark to a rendered 24 kHz clone (sc-13239). The watermarker is
@@ -570,8 +591,7 @@ impl Generator for ChatterboxGenerator {
 
         // S3Gen token→waveform: derive the reference conditioning, run the flow-matching decoder,
         // and vocode with HiFTNet → a real 24 kHz cloned-voice waveform.
-        on_progress(Progress::Decoding);
-        self.ensure_s3gen()?;
+        self.ensure_s3gen(on_progress)?;
         let seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let cancel = req.cancel.clone();
         let should_cancel = move || cancel.is_cancelled();
@@ -582,10 +602,7 @@ impl Generator for ChatterboxGenerator {
                 .render(&real_tokens, reference, seed, on_progress, &should_cancel)
                 .map_err(gen_core::Error::from)?
         };
-        let samples = match rendered {
-            Some(s) => s,
-            None => return Err(gen_core::Error::Canceled),
-        };
+        let samples = begin_post_processing(rendered, on_progress)?;
 
         // Provenance watermark — always applied (the reference behavior; no disable flag).
         let samples = self.watermark(&samples)?;
@@ -694,6 +711,58 @@ mod tests {
             embedding: vec![0.1; 256],
             strength: None,
         }
+    }
+
+    #[test]
+    fn renderer_construction_progress_matches_the_actual_missing_component_decision() {
+        use std::cell::RefCell;
+        let events = RefCell::new(Vec::new());
+        let mut slot = None;
+        load_s3gen_if_missing(&mut slot, &mut |p| events.borrow_mut().push(p), || {
+            assert_eq!(
+                *events.borrow(),
+                [Progress::Loading(gen_core::LoadPhase::Renderer)]
+            );
+            Ok(7u8)
+        })
+        .unwrap();
+        assert_eq!(slot, Some(7));
+        events.borrow_mut().clear();
+        load_s3gen_if_missing(&mut slot, &mut |p| events.borrow_mut().push(p), || {
+            panic!("a resident component must not load again")
+        })
+        .unwrap();
+        assert!(events.borrow().is_empty());
+        let mut missing: Option<u8> = None;
+        let result =
+            load_s3gen_if_missing(&mut missing, &mut |p| events.borrow_mut().push(p), || {
+                Err(gen_core::Error::Canceled)
+            });
+        assert!(matches!(result, Err(gen_core::Error::Canceled)));
+        assert!(missing.is_none());
+        assert_eq!(
+            *events.borrow(),
+            [Progress::Loading(gen_core::LoadPhase::Renderer)]
+        );
+    }
+
+    #[test]
+    fn only_a_completed_waveform_enters_post_processing_without_copying_or_extra_work() {
+        let mut events = Vec::new();
+        let samples = vec![0.125f32, -0.25];
+        let original = samples.as_ptr();
+        let samples = begin_post_processing(Some(samples), &mut |p| events.push(p)).unwrap();
+        assert_eq!(samples.as_ptr(), original);
+        assert_eq!(samples, [0.125, -0.25]);
+        assert_eq!(events, [Progress::PostProcessing]);
+        events.clear();
+        let canceled: gen_core::Result<Vec<f32>> =
+            begin_post_processing(None, &mut |p| events.push(p));
+        assert!(matches!(canceled, Err(gen_core::Error::Canceled)));
+        assert!(
+            events.is_empty(),
+            "canceled synthesis never enters the watermark stage"
+        );
     }
 
     #[test]

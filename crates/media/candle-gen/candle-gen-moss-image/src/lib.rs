@@ -472,9 +472,7 @@ impl MossImageGenerator {
             },
             MossImageOutputKind::Images => {
                 if state.vae.is_none() {
-                    if staged {
-                        on_progress(Progress::Loading(LoadPhase::Renderer));
-                    }
+                    on_progress(Progress::Loading(LoadPhase::Renderer));
                     transformer::check_cancel(&req.cancel)?;
                     state.vae = Some(self.sources.vae(&self.device)?);
                 }

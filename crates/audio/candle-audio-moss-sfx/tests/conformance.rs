@@ -129,6 +129,7 @@ fn moss_sfx_wav_conformance() {
             Progress::Loading(_)
             | Progress::PromptUpsamplingComplete
             | Progress::PromptEncodingComplete
+            | Progress::PostProcessing
             | Progress::ConditioningComplete
             | Progress::Upsampling { .. } => {}
         })

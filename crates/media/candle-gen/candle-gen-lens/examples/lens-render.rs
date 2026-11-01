@@ -114,6 +114,7 @@ fn main() -> Result<()> {
         Progress::Loading(phase) => println!("\n[lens-render] loading {phase:?}"),
         Progress::PromptUpsamplingComplete
         | Progress::PromptEncodingComplete
+        | Progress::PostProcessing
         | Progress::ConditioningComplete
         | Progress::Upsampling { .. } => {}
     };

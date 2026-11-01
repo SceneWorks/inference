@@ -249,6 +249,7 @@ pub(super) fn run(req: &GenerationRequest, expected_chunks: usize, label: &str) 
             Progress::Loading(phase) => println!("  {label}: loading {phase:?}"),
             Progress::PromptUpsamplingComplete
             | Progress::PromptEncodingComplete
+            | Progress::PostProcessing
             | Progress::ConditioningComplete
             | Progress::Upsampling { .. } => {}
         })

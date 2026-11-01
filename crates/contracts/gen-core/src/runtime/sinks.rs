@@ -336,7 +336,7 @@ pub enum Progress {
     ConditioningComplete,
     /// Denoising step `current` of `total` (1-based).
     Step { current: u32, total: u32 },
-    /// VAE decode underway (post-denoise).
+    /// Output decoding is underway (for example, VAE decoding or audio vocoding).
     Decoding,
     /// A component load or prompt-encoding phase is starting. Component phases describe actual
     /// construction; `EncodingPrompt` is computation and is paired with `PromptEncodingComplete`
@@ -348,6 +348,10 @@ pub enum Progress {
     /// read) and never on a request that did not ask for enhancement, so a consumer that does
     /// not know it can ignore it without losing the step contract.
     Upsampling { tokens: u32, max_tokens: u32 },
+    /// Separate output post-processing has begun after decoded media was produced (for example,
+    /// an audio provenance watermark). This is computation, not component I/O, export, success,
+    /// or a device synchronization guarantee. Emit only when that work is actually performed.
+    PostProcessing,
 }
 
 /// Which component the residency seam is loading when it emits [`Progress::Loading`] (sc-11126). The

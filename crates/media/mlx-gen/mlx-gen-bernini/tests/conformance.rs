@@ -189,6 +189,7 @@ fn bernini_full_pipeline_emits_its_declared_phase_boundaries_in_order() {
         Progress::Step { current, .. } => marks.push(format!("step:{current}")),
         Progress::PromptUpsamplingComplete
         | Progress::PromptEncodingComplete
+        | Progress::PostProcessing
         | Progress::ConditioningComplete
         | Progress::Upsampling { .. } => {}
     })

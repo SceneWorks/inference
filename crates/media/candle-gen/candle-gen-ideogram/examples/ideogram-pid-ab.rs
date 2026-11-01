@@ -43,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Progress::Loading(phase) => eprintln!("  loading {phase:?}"),
         Progress::PromptUpsamplingComplete
         | Progress::PromptEncodingComplete
+        | Progress::PostProcessing
         | Progress::ConditioningComplete
         | Progress::Upsampling { .. } => {}
     };

@@ -58,6 +58,48 @@ pub struct S3Gen {
     hift: HiftGenerator,
 }
 
+// The production stage driver accepts plain operations so its event, error and cancellation
+// protocol can be verified without executing any of the learned networks.
+fn render_stages<C, M, W>(
+    speech_tokens: &[u32],
+    on_progress: &mut dyn FnMut(Progress),
+    should_cancel: &dyn Fn() -> bool,
+    reference_conditioning: impl FnOnce() -> Result<C>,
+    flow: impl FnOnce(&C) -> Result<M>,
+    vocode: impl FnOnce(&M) -> Result<W>,
+) -> Result<Option<W>> {
+    if speech_tokens.is_empty() {
+        return Err(AudioError::Msg(
+            "s3gen: T3 produced no speech tokens to render".into(),
+        ));
+    }
+    if should_cancel() {
+        return Ok(None);
+    }
+    on_progress(Progress::Step {
+        current: 1,
+        total: 3,
+    });
+    let conditioning = reference_conditioning()?;
+    if should_cancel() {
+        return Ok(None);
+    }
+    on_progress(Progress::Step {
+        current: 2,
+        total: 3,
+    });
+    let mel = flow(&conditioning)?;
+    if should_cancel() {
+        return Ok(None);
+    }
+    on_progress(Progress::Step {
+        current: 3,
+        total: 3,
+    });
+    on_progress(Progress::Decoding);
+    Ok(Some(vocode(&mel)?))
+}
+
 impl S3Gen {
     /// Load all four S3Gen networks from a Chatterbox snapshot directory (each reads its own
     /// prefix of `s3gen.safetensors`).
@@ -113,7 +155,8 @@ impl S3Gen {
     /// derive the reference conditioning, run the flow-matching token→mel decoder, then vocode the
     /// mel with HiFTNet. `seed` seeds the flow noise and the NSF source (the reproducibility law:
     /// same tokens + reference + seed ⇒ byte-identical samples). Progress is reported over the three
-    /// stages; `should_cancel` is polled between them and returns `Ok(None)` when tripped (mirroring
+    /// stages, with one `Decoding` event immediately before HiFTNet vocoding;
+    /// `should_cancel` is polled between them and returns `Ok(None)` when tripped (mirroring
     /// the T3 stage's cooperative cancellation).
     pub fn render(
         &self,
@@ -123,47 +166,151 @@ impl S3Gen {
         on_progress: &mut dyn FnMut(Progress),
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Option<Vec<f32>>> {
-        if speech_tokens.is_empty() {
-            return Err(AudioError::Msg(
-                "s3gen: T3 produced no speech tokens to render".into(),
-            ));
-        }
-        if should_cancel() {
-            return Ok(None);
-        }
-        // Stage 1/3 — reference conditioning (tokenize + prompt mel + speaker x-vector).
-        on_progress(Progress::Step {
-            current: 1,
-            total: 3,
-        });
-        let (prompt_tokens, prompt_mel, spk_embed) = self.reference_conditioning(reference)?;
-        if should_cancel() {
-            return Ok(None);
-        }
-        // Stage 2/3 — flow-matching token→mel decode.
-        on_progress(Progress::Step {
-            current: 2,
-            total: 3,
-        });
-        let mel =
-            self.flow
-                .inference(speech_tokens, &prompt_tokens, &prompt_mel, &spk_embed, seed)?;
-        if should_cancel() {
-            return Ok(None);
-        }
-        // Stage 3/3 — HiFTNet vocode → 24 kHz waveform.
-        on_progress(Progress::Step {
-            current: 3,
-            total: 3,
-        });
-        let wav = self.hift.decode(&mel, seed)?;
-        Ok(Some(wav.flatten_all()?.to_vec1::<f32>()?))
+        render_stages(
+            speech_tokens,
+            on_progress,
+            should_cancel,
+            || self.reference_conditioning(reference),
+            |(prompt_tokens, prompt_mel, spk_embed)| {
+                self.flow
+                    .inference(speech_tokens, prompt_tokens, prompt_mel, spk_embed, seed)
+            },
+            |mel| {
+                let wav = self.hift.decode(mel, seed)?;
+                Ok(wav.flatten_all()?.to_vec1::<f32>()?)
+            },
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_driver_announces_one_decode_at_the_actual_vocoder_call() {
+        use std::cell::RefCell;
+        #[derive(Debug, PartialEq)]
+        enum Mark {
+            Event(Progress),
+            Body(u8),
+        }
+        let marks = RefCell::new(Vec::new());
+        let out = render_stages(
+            &[1],
+            &mut |p| marks.borrow_mut().push(Mark::Event(p)),
+            &|| false,
+            || {
+                marks.borrow_mut().push(Mark::Body(1));
+                Ok(7u8)
+            },
+            |conditioning| {
+                assert_eq!(*conditioning, 7);
+                marks.borrow_mut().push(Mark::Body(2));
+                Ok(9u8)
+            },
+            |mel| {
+                assert_eq!(*mel, 9);
+                marks.borrow_mut().push(Mark::Body(3));
+                Ok(vec![0.25f32])
+            },
+        )
+        .unwrap();
+        assert_eq!(out, Some(vec![0.25]));
+        assert_eq!(
+            *marks.borrow(),
+            [
+                Mark::Event(Progress::Step {
+                    current: 1,
+                    total: 3
+                }),
+                Mark::Body(1),
+                Mark::Event(Progress::Step {
+                    current: 2,
+                    total: 3
+                }),
+                Mark::Body(2),
+                Mark::Event(Progress::Step {
+                    current: 3,
+                    total: 3
+                }),
+                Mark::Event(Progress::Decoding),
+                Mark::Body(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn stage_driver_keeps_empty_input_cancellation_and_errors_before_unreached_work() {
+        use std::cell::Cell;
+        for cancel_at in 0..3 {
+            let checks = Cell::new(0);
+            let calls = Cell::new(0);
+            let mut events = Vec::new();
+            let out = render_stages(
+                &[1],
+                &mut |p| events.push(p),
+                &|| {
+                    let checkpoint = checks.get();
+                    checks.set(checkpoint + 1);
+                    checkpoint == cancel_at
+                },
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(1u8)
+                },
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(2u8)
+                },
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(3u8)
+                },
+            )
+            .unwrap();
+            assert_eq!(out, None);
+            assert_eq!(calls.get(), cancel_at);
+            assert!(!events.contains(&Progress::Decoding));
+        }
+        let empty: Result<Option<u8>> = render_stages(
+            &[],
+            &mut |_| panic!("empty input emitted progress"),
+            &|| panic!("empty input entered a cancellation checkpoint"),
+            || -> Result<u8> { panic!("empty input entered reference conditioning") },
+            |_| -> Result<u8> { panic!("empty input entered flow") },
+            |_| -> Result<u8> { panic!("empty input entered vocoding") },
+        );
+        assert!(matches!(empty, Err(AudioError::Msg(_))));
+        for fail_at in 1..=3 {
+            let calls = Cell::new(0);
+            let mut body = || {
+                let stage = calls.get() + 1;
+                calls.set(stage);
+                if stage == fail_at {
+                    Err(AudioError::Msg("stage failure".into()))
+                } else {
+                    Ok(stage)
+                }
+            };
+            let body = std::cell::RefCell::new(&mut body);
+            let mut events = Vec::new();
+            let out = render_stages(
+                &[1],
+                &mut |p| events.push(p),
+                &|| false,
+                || (body.borrow_mut())(),
+                |_| (body.borrow_mut())(),
+                |_| (body.borrow_mut())(),
+            );
+            assert!(matches!(out, Err(AudioError::Msg(ref message)) if message == "stage failure"));
+            assert_eq!(calls.get(), fail_at);
+            assert_eq!(
+                events.iter().filter(|p| **p == Progress::Decoding).count(),
+                usize::from(fail_at == 3)
+            );
+        }
+    }
 
     #[test]
     fn all_four_networks_are_ported() {
