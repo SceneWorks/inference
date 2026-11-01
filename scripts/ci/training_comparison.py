@@ -48,7 +48,7 @@ _CASES = {
     'kolors_bounded_acceleration_acceptance': ('kolors', 'ordinary', True, True, True),
     'sd35_medium_bounded_acceleration_acceptance': ('sd3_5_medium', 'ordinary', True, True, True),
     'anima_bounded_acceleration_acceptance': ('anima_base', 'ordinary_short', True, True, True),
-    'moss_bounded_acceleration_acceptance': ('moss', 'moss_recovery', True, True, True),
+    'moss_bounded_acceleration_acceptance': ('moss', 'ordinary_short', True, True, True),
     'mage_bounded_acceleration_acceptance': ('mage-adapter', 'ordinary', True, True, True),
     'flux3_bounded_acceleration_acceptance': ('flux3', 'ordinary_short', True, True, True),
     'iris_generation_bounded_acceleration_acceptance': ('iris-generation', 'ordinary', False, True, True),

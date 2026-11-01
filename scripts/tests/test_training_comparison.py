@@ -72,10 +72,11 @@ class ComparisonContract(unittest.TestCase):
             lines += [f'COHORT_UPDATE_START attempted_update={i}', f'COHORT_UPDATE_COMMITTED optimizer_updates={i}']
         return value, '\n'.join(lines) + '\n'
 
-    def test_exact_seventeen_plans_and_356_sourcebook_cap(self):
+    def test_exact_seventeen_plans_and_350_proposed_sourcebook_updates(self):
         self.assertEqual(len(self.cases), 17)
         plans = [comparison.spec(r) for r in self.cases.values()]
-        self.assertEqual(sum(x['max_physical_updates'] for x in plans), 356)
+        self.assertEqual(sum(x['max_physical_updates'] for x in plans), 350)
+        self.assertEqual(350 + (16 + 12 + 10 + 8 + 8), 404)
         self.assertFalse(any('minus-reference-owner' in p['stages'] for p in plans))
         self.assertEqual(comparison.spec(self.cases['iris-depth'])['stages'], ['legacy', 'current'])
         self.assertNotIn('minus-e3', comparison.spec(self.cases['lens'])['stages'])
@@ -85,13 +86,20 @@ class ComparisonContract(unittest.TestCase):
         for model,cadence,count,warm,cap,retained,total in [
             ('anima_base','ordinary_short',2,1,12,8,20),
             ('flux3','ordinary_short',2,1,12,12,24),
-            ('iris-depth','depth_recovery',2,1,4,8,12),
+            ('iris-depth','depth_recovery',2,1,4,10,14),
             ('iris-restoration','rest_recovery',6,2,30,8,38)]:
             base,request=self.request(model)
             plan=comparison.validate_request((base,),request,'candle-cuda')
             self.assertEqual((plan['cadence'],plan['updates_per_stage'],plan['warmups_per_stage'],plan['max_physical_updates']),(cadence,count,warm,cap))
             self.assertEqual(plan['recovery_budget']['retained_conservative_charge'],retained)
-            self.assertEqual(plan['recovery_budget']['cumulative_model_max'],total)
+            budget=plan['recovery_budget']
+            if model == 'iris-depth':
+                self.assertNotIn('cumulative_model_max',budget)
+                self.assertEqual((budget['proposed_cumulative_model_max'],budget['original_model_cap'],budget['required_additional_family_updates']),(14,12,2))
+                self.assertEqual(budget['authorization_status'],'pending-user-authorization')
+                self.assertFalse(budget['dispatch_authorized'])
+            else:
+                self.assertEqual(budget['cumulative_model_max'],total)
             for stage in plan['stages']:
                 row=self.row(model,stage);metrics,text=self.fixture(row)
                 result=comparison.verify_metrics(row,metrics,text)
@@ -109,7 +117,8 @@ class ComparisonContract(unittest.TestCase):
         self.assertTrue(depth['applicability']['streaming_candidate'])
         self.assertEqual(depth['deferred_applicable_stages'],['plus-streaming'])
         with self.assertRaises(ValueError):self.row('iris-depth','plus-streaming')
-        self.assertEqual(316+18+12+(4+12)+4+30,396)
+        # Proposed maxima describe counts; they do not authorize family exceptions.
+        self.assertEqual(350 + 54,404)
 
     def test_flux_fixed_64_edit_workload_rebinds_plan_and_initial_input_witnesses(self):
         base,request=self.request('flux3')
@@ -159,15 +168,22 @@ class ComparisonContract(unittest.TestCase):
     def test_moss_recovery_keeps_six_short_single_owner_arms(self):
         base,request=self.request('moss')
         plan=comparison.validate_request((base,),request,'candle-cuda')
-        self.assertEqual((plan['cadence'],plan['updates_per_stage'],plan['warmups_per_stage'],plan['max_physical_updates']),('moss_recovery',3,1,18))
+        self.assertEqual((plan['cadence'],plan['updates_per_stage'],plan['warmups_per_stage'],plan['max_physical_updates']),('ordinary_short',2,1,12))
         self.assertEqual(plan['workload']['resolution'],256)
         self.assertEqual(len(plan['stages']),6)
-        self.assertIn('two timed',plan['noise_scope'])
-        self.assertEqual(4+plan['max_physical_updates'],22)
-        self.assertEqual(plan['recovery_budget']['retained_conservative_charge'],4)
+        self.assertIn('one timed',plan['noise_scope'])
+        budget=plan['recovery_budget']
+        self.assertEqual((budget['retained_conservative_charge'],budget['original_model_cap'],budget['proposed_cumulative_model_max'],budget['remaining_under_original_cap'],budget['required_additional_family_updates']),(16,24,28,8,4))
+        self.assertNotIn('cumulative_model_max',budget)
+        self.assertFalse(budget['dispatch_authorized'])
+        self.assertFalse(budget['automatic_retry'])
+        self.assertEqual(budget['authorization_status'],'pending-user-authorization')
+        self.assertEqual(16+plan['max_physical_updates'],28)
         for stage in plan['stages']:
             row=self.row('moss',stage);metrics,text=self.fixture(row)
-            self.assertEqual(comparison.verify_metrics(row,metrics,text)['physical_updates'],3)
+            verified=comparison.verify_metrics(row,metrics,text)
+            self.assertEqual(verified['physical_updates'],2)
+            self.assertIsNone(verified['sample_stdev_seconds'])
             for change in (lambda m:m['comparison'].update(physical_starts=4),
                            lambda m:m['comparison'].update(physical_commits=4),
                            lambda m:m['comparison'].update(cadence='ordinary'),
@@ -178,7 +194,7 @@ class ComparisonContract(unittest.TestCase):
             with self.assertRaises(ValueError):comparison.verify_metrics(row,metrics,text+'COHORT_UPDATE_START attempted_update=4\n')
         provider=copy.deepcopy(comparison.case_manifest(base));provider['max_new_updates']=24
         with patch.object(comparison,'case_manifest',return_value=provider),self.assertRaises(ValueError):comparison.spec(base)
-        for cap in (24,22,19,17):
+        for cap in (24,22,19,18,17,11):
             wrong=copy.deepcopy(request);wrong['training_comparison']['max_physical_updates']=cap
             with self.assertRaises(ValueError):comparison.validate_request((base,),wrong,'candle-cuda')
 
@@ -201,11 +217,11 @@ class ComparisonContract(unittest.TestCase):
         self.assertIn('without_production_profile(|| progress(event))',entry)
         self.assertIn('letpreview=candle_gen::train::policy::without_production_profile(',re.sub(r'\s+','',training))
         fixture=(provider/'tests/real_weights.rs').read_text(encoding='utf-8')
-        self.assertIn('ComparisonCadence::MossRecovery',fixture)
+        self.assertIn('ComparisonCadence::OrdinaryShort',fixture)
         self.assertIn('let steps = if comparison { cadence.updates() } else { 4 };',fixture)
         self.assertIn('let resolution = if comparison { 256 } else { 64 };',fixture)
         book=comparison.case_manifest(self.cases['moss'])
-        self.assertEqual((book['recovery_budget']['retained_conservative_charge'],book['recovery_budget']['cumulative_model_max'],book['recovery_budget']['original_model_cap']),(4,22,24))
+        self.assertEqual((book['recovery_budget']['retained_conservative_charge'],book['recovery_budget']['proposed_cumulative_model_max'],book['recovery_budget']['original_model_cap']),(16,28,24))
 
     def test_every_source_stage_and_owner_cadence(self):
         for model, base in self.cases.items():

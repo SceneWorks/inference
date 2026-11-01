@@ -85,7 +85,7 @@ impl ComparisonCadence {
     pub fn allows_model(self, model_id: &str) -> bool {
         match self {
             Self::MossRecovery => model_id == "moss",
-            Self::OrdinaryShort => matches!(model_id, "anima_base" | "flux3"),
+            Self::OrdinaryShort => matches!(model_id, "anima_base" | "flux3" | "moss"),
             Self::DepthRecovery => model_id == "iris-depth",
             Self::RestRecovery => model_id == "iris-restoration",
             _ => true,
@@ -99,6 +99,7 @@ impl ComparisonCadence {
             (Self::MossRecovery, "moss") => Some(&["moss-image"; 3]),
             (Self::OrdinaryShort, "anima_base") => Some(&["anima trainer"; 2]),
             (Self::OrdinaryShort, "flux3") => Some(&["flux3"; 2]),
+            (Self::OrdinaryShort, "moss") => Some(&["moss-image"; 2]),
             (Self::DepthRecovery, "iris-depth") => Some(&["iris-depth"; 2]),
             (Self::RestRecovery, "iris-restoration") => Some(&[
                 "iris-restoration-generator",
@@ -353,6 +354,7 @@ mod cadence_metadata_tests {
             (ComparisonCadence::MossRecovery, "moss"),
             (ComparisonCadence::OrdinaryShort, "anima_base"),
             (ComparisonCadence::OrdinaryShort, "flux3"),
+            (ComparisonCadence::OrdinaryShort, "moss"),
             (ComparisonCadence::DepthRecovery, "iris-depth"),
             (ComparisonCadence::RestRecovery, "iris-restoration"),
         ] {
@@ -430,6 +432,38 @@ mod cadence_metadata_tests {
                 assert!(cadence.allows_model(model));
             }
         }
+    }
+
+    #[test]
+    fn moss_two_one_proposal_is_single_owner_and_not_a_budget_grant() {
+        let cadence = ComparisonCadence::OrdinaryShort;
+        assert_eq!((cadence.updates(), cadence.warmups()), (2, 1));
+        assert_eq!(
+            cadence.expected_recovery_owners("moss"),
+            Some(["moss-image"; 2].as_slice())
+        );
+        assert!(cadence.recovery_owners_valid("moss", &["moss-image"; 2]));
+        assert!(!cadence.recovery_owners_valid("moss", &["moss-image"; 1]));
+        assert!(!cadence.recovery_owners_valid("moss", &["moss-image"; 3]));
+        assert!(!cadence.recovery_owners_valid("moss", &["foreign-owner"; 2]));
+        assert!(!cadence.allows_model("krea_raw"));
+        let arms = super::ComparisonStage::ALL
+            .into_iter()
+            .filter(|s| cadence.allows_stage(*s))
+            .count();
+        assert_eq!(arms, 6);
+        assert_eq!(arms as u32 * cadence.updates(), 12);
+        // Source cadence counts do not increase the original family authority.
+        let (retained, original_cap) = (16, 24);
+        assert_eq!(retained + arms as u32 * cadence.updates() - original_cap, 4);
+        // Existing first-recovery cadence remains unchanged for old sources.
+        assert_eq!(
+            (
+                ComparisonCadence::MossRecovery.updates(),
+                ComparisonCadence::MossRecovery.warmups()
+            ),
+            (3, 1)
+        );
     }
 }
 
