@@ -546,7 +546,7 @@ mod selector_metadata_tests {
             b"invalid shared header",
         )
         .unwrap();
-        for model in ["moss_image_base", "moss_image_sft", "unknown", "krea"] {
+        for model in ["moss_image_sft", "unknown", "krea"] {
             for cuda in [false, true] {
                 assert_eq!(
                     JobTrainingPolicy::resolve(model, cuda, &req)
@@ -557,6 +557,8 @@ mod selector_metadata_tests {
             }
         }
         for (model, profile) in [
+            ("moss_image_base", TrainingProfile::WithoutE1),
+            ("flux3_klein_base", TrainingProfile::Legacy),
             ("wan2_2_ti2v_5b", TrainingProfile::WithoutE1),
             ("kolors", TrainingProfile::WithoutE3),
             ("sd3_5_medium", TrainingProfile::Legacy),
