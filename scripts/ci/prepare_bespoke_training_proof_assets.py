@@ -98,7 +98,7 @@ def main() -> int:
     # Full Iris exports/recovery states and ControlNet weights are not LoRA files.
     run = os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
     if not re.fullmatch(r"[0-9]+-[0-9]+", run): raise ValueError("invalid runner run identity")
-    runtime = Path("E:/sceneworks-runtime/model-proofs/sc-26850") / run / identities[0].split("::")[-1]
+    runtime = Path("D:/sceneworks-runtime/model-proofs/sc-26850") / run / identities[0].split("::")[-1]
     runtime.mkdir(parents=True, exist_ok=False)
     (runtime / ".sc-26850-owned-runtime").write_text(identities[0] + "\n", encoding="utf-8")
     with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
