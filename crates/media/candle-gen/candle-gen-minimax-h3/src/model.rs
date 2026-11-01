@@ -1067,7 +1067,8 @@ impl MiniMaxH3 {
         if let Some(refs) = &references {
             return self.generate_ref2va(req, refs, task, &geometry, &schedule, seed, on_progress);
         }
-        let anchors = keyframe_anchors(&keyframes, geometry.joint.num_frames)?;
+        let slots = keyframe_slots(&keyframes, geometry.joint.num_frames)?;
+        let anchors = slots.anchors();
         // Fitted ONCE, here, and shared by both keyframe paths. The vision tower and the VAE encode
         // must see the same pixels — resizing separately per path would let a resampling difference
         // put the two conditioning signals fractionally out of register, which is exactly the class
@@ -1075,7 +1076,9 @@ impl MiniMaxH3 {
         let fitted = if anchors.is_empty() {
             Vec::new()
         } else {
-            let images: Vec<&Image> = keyframes.iter().map(|k| k.image).collect();
+            // Packed order (first, then last) — positional with `anchors`, whatever order the
+            // request listed them in.
+            let images: Vec<&Image> = slots.order().iter().map(|&i| keyframes[i].image).collect();
             crate::keyframe::fit_keyframes(&images, geometry.width, geometry.height)?
         };
 
@@ -1893,43 +1896,33 @@ fn reject_keyframe_strength(keyframes: &[candle_gen::gen_core::KeyframeRef<'_>])
     Ok(())
 }
 
-/// Which end of the clip each keyframe anchors, from the request's `frame_idx` values.
+/// Resolve a request's keyframes onto `fl2va`'s two anchor slots, refusing a conditioning strength
+/// first.
 ///
-/// `fl2va` has exactly two slots — the first frame and the last — and the anchors are **positional**
-/// against the fitted keyframe list, so a request that anchors the same end twice, or names a frame
-/// index that is neither end, is a typed error rather than a render that quietly moved it.
+/// The index contract — `0` is the FIRST frame, `num_frames - 1` or `-1` the LAST, anything else a
+/// typed refusal with nothing clamped — is [`gen_core_h3::h3_keyframe::resolve_keyframe_slots`],
+/// shared with the MLX engine (sc-26691: this port used to resolve `frame_idx.max(0)`, which turned
+/// `-1` into the FIRST frame while MLX read it as the LAST).
+pub fn keyframe_slots(
+    keyframes: &[candle_gen::gen_core::KeyframeRef<'_>],
+    num_frames: usize,
+) -> Result<crate::keyframe::KeyframeSlots> {
+    reject_keyframe_strength(keyframes)?;
+    crate::keyframe::resolve_keyframe_slots(keyframes.iter().map(|k| k.frame_idx), num_frames)
+        .map_err(|e| CandleError::Msg(format!("{MODEL_ID}: {e}")))
+}
+
+/// Which end of the clip each keyframe anchors, in packed order (first, then last).
+///
+/// `fl2va` has exactly two slots — the first frame and the last — so a request that anchors the
+/// same end twice, or names a frame index that is neither end, is a typed error rather than a
+/// render that quietly moved it. Positional with [`keyframe_slots`]`.order()`, which says which
+/// request keyframe fills each anchor.
 pub fn keyframe_anchors(
     keyframes: &[candle_gen::gen_core::KeyframeRef<'_>],
     num_frames: usize,
 ) -> Result<Vec<KeyframeAnchor>> {
-    reject_keyframe_strength(keyframes)?;
-    let last = num_frames.saturating_sub(1);
-    let mut out = Vec::with_capacity(keyframes.len());
-    for k in keyframes {
-        let idx = k.frame_idx.max(0) as usize;
-        let anchor = if idx == 0 {
-            KeyframeAnchor::First
-        } else if idx == last {
-            KeyframeAnchor::Last
-        } else {
-            return Err(CandleError::Msg(format!(
-                "{MODEL_ID}: a keyframe anchors frame {idx}, but fl2va has exactly two slots — the \
-                 FIRST frame (0) and the LAST ({last}). An interior keyframe has no conditioning \
-                 row to occupy"
-            )));
-        };
-        out.push(anchor);
-    }
-    // `[First, First]` is arity-legal and semantically impossible; `crate::conditioning` rejects it
-    // too, but catching it here names the request field the caller got wrong.
-    if out.len() == 2 && out[0] == out[1] {
-        return Err(CandleError::Msg(format!(
-            "{MODEL_ID}: both keyframes anchor {:?}; fl2va's two slots are the FIRST and the LAST \
-             frame",
-            out[0]
-        )));
-    }
-    Ok(out)
+    Ok(keyframe_slots(keyframes, num_frames)?.anchors())
 }
 
 /// Map a request's **ordered** conditioning onto `ref2va`'s reference list.
@@ -4616,12 +4609,52 @@ mod tests {
         );
         // An interior frame has no conditioning row to occupy.
         let e = keyframe_anchors(&[kf(60)], 124).unwrap_err().to_string();
-        assert!(e.contains("two slots"), "{e}");
+        assert!(e.contains("interior frame"), "{e}");
         // The same end twice is arity-legal and semantically impossible.
         let e = keyframe_anchors(&[kf(0), kf(0)], 124)
             .unwrap_err()
             .to_string();
-        assert!(e.contains("both keyframes anchor"), "{e}");
+        assert!(e.contains("same end of the clip"), "{e}");
+    }
+
+    /// sc-26691 — `-1` is the LAST frame (MLX's public contract), never clamped to the first, and
+    /// any other negative or out-of-range index is refused. The pre-fix `frame_idx.max(0)` resolved
+    /// `[0, -1]` to `[First, First]` and `[-1]` to `[First]`.
+    #[test]
+    fn keyframe_minus_one_is_the_last_frame_and_bad_indices_are_refused() {
+        let img = Image {
+            width: 32,
+            height: 32,
+            pixels: vec![0; 32 * 32 * 3],
+        };
+        let kf = |idx: i32| candle_gen::gen_core::KeyframeRef {
+            image: &img,
+            frame_idx: idx,
+            strength: 1.0,
+        };
+        assert_eq!(
+            keyframe_anchors(&[kf(-1)], 124).unwrap(),
+            vec![KeyframeAnchor::Last]
+        );
+        assert_eq!(
+            keyframe_anchors(&[kf(0), kf(-1)], 124).unwrap(),
+            vec![KeyframeAnchor::First, KeyframeAnchor::Last]
+        );
+        // Request order does not matter: the packed order is first-then-last, and `order()` maps
+        // each anchor back to its request keyframe.
+        let slots = keyframe_slots(&[kf(-1), kf(0)], 124).unwrap();
+        assert_eq!(
+            slots.anchors(),
+            vec![KeyframeAnchor::First, KeyframeAnchor::Last]
+        );
+        assert_eq!(slots.order(), vec![1, 0]);
+        for bad in [-2, 124, 125] {
+            let e = keyframe_anchors(&[kf(bad)], 124).unwrap_err().to_string();
+            assert!(
+                e.starts_with(MODEL_ID) && e.contains(&bad.to_string()),
+                "{e}"
+            );
+        }
     }
 
     /// sc-19571 — **refuse, do not ignore.** MiniMax-H3 anchors at the checkpoint's trained-in

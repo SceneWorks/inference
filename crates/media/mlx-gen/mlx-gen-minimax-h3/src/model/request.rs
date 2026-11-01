@@ -112,6 +112,9 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
 /// that knows only "the end of the clip" should not have to resolve the frame count first. Any
 /// other index is **rejected**: the model has exactly two anchor slots, and silently snapping a
 /// mid-clip index to the nearest end would condition on something the caller did not ask for.
+/// The convention is the shared [`gen_core_h3::h3_keyframe::resolve_keyframe_anchor`] (sc-26691),
+/// which the candle engine calls too — no negative index other than `-1` is accepted, and nothing
+/// is clamped.
 /// **Refuse a conditioning strength rather than ignore it** (sc-19571).
 ///
 /// `Conditioning::Keyframe` carries a `strength` that its docs define as a `1 − strength` denoise
@@ -145,63 +148,38 @@ pub(crate) fn keyframe_anchors(
     keyframes: &[KeyframeRef<'_>],
     num_frames: i32,
 ) -> Result<Vec<crate::dit::positions::KeyframeAnchor>> {
-    use crate::dit::positions::KeyframeAnchor;
+    Ok(keyframe_slots(keyframes, num_frames)?.anchors())
+}
+
+/// Resolve the keyframes onto the two anchor slots through the **shared** index contract,
+/// [`gen_core_h3::h3_keyframe::resolve_keyframe_slots`] (sc-26691) — the same function the candle
+/// engine calls, so the two backends cannot disagree about which end an index names.
+fn keyframe_slots(
+    keyframes: &[KeyframeRef<'_>],
+    num_frames: i32,
+) -> Result<crate::keyframe::KeyframeSlots> {
     reject_keyframe_strength(keyframes)?;
-    let mut first = None;
-    let mut last = None;
-    for kf in keyframes {
-        let slot = if kf.frame_idx == 0 {
-            &mut first
-        } else if kf.frame_idx == -1 || kf.frame_idx == num_frames - 1 {
-            &mut last
-        } else {
-            return Err(Error::Msg(format!(
-                "{MODEL_ID}: a keyframe must anchor the FIRST frame (index 0) or the LAST (index \
-                 {} or -1); MiniMax-H3 has exactly two anchor slots and no mid-clip conditioning, \
-                 got index {}",
-                num_frames - 1,
-                kf.frame_idx
-            )));
-        };
-        if slot.is_some() {
-            return Err(Error::Msg(format!(
-                "{MODEL_ID}: two keyframes anchor the same end of the clip (index {})",
-                kf.frame_idx
-            )));
-        }
-        *slot = Some(kf.image);
-    }
-    let mut anchors = Vec::with_capacity(2);
-    if first.is_some() {
-        anchors.push(KeyframeAnchor::First);
-    }
-    if last.is_some() {
-        anchors.push(KeyframeAnchor::Last);
-    }
-    Ok(anchors)
+    let frames = usize::try_from(num_frames).map_err(|_| {
+        Error::Msg(format!(
+            "{MODEL_ID}: num_frames must be non-negative, got {num_frames}"
+        ))
+    })?;
+    crate::keyframe::resolve_keyframe_slots(keyframes.iter().map(|kf| kf.frame_idx), frames)
+        .map_err(|e| Error::Msg(format!("{MODEL_ID}: {e}")))
 }
 
 /// The request's keyframe images in packed order — first, then last.
 ///
 /// Positional with [`keyframe_anchors`]: the caller may supply them in any order, and both
 /// functions sort them into the reference's `(first, last)` order so `anchors[i]` always describes
-/// `images[i]`.
+/// `images[i]`. Both go through the same `keyframe_slots` resolution, so they cannot disagree about
+/// what is legal.
 pub(crate) fn keyframe_images<'a>(
     keyframes: &[KeyframeRef<'a>],
     num_frames: i32,
 ) -> Result<Vec<&'a mlx_gen::media::Image>> {
-    let mut first = None;
-    let mut last = None;
-    for kf in keyframes {
-        if kf.frame_idx == 0 {
-            first = Some(kf.image);
-        } else if kf.frame_idx == -1 || kf.frame_idx == num_frames - 1 {
-            last = Some(kf.image);
-        }
-    }
-    // Re-run the validation so the two functions cannot disagree about what is legal.
-    keyframe_anchors(keyframes, num_frames)?;
-    Ok(first.into_iter().chain(last).collect())
+    let slots = keyframe_slots(keyframes, num_frames)?;
+    Ok(slots.order().iter().map(|&i| keyframes[i].image).collect())
 }
 
 /// Map a request's **ordered** conditioning onto `ref2va`'s reference list.
