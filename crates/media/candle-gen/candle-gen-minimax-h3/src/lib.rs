@@ -202,8 +202,8 @@ pub use layout::{
     PUBLISHED_GATED_FFN_LAYOUT,
 };
 pub use model::{
-    descriptor, keyframe_anchors, MiniMaxH3, MiniMaxH3Task, BASE_DIT_PARTITION, DEFAULT_STEPS,
-    MAX_STEPS, OFFLOAD_POLICY, REFERENCE_DIT_PARTITION,
+    descriptor, keyframe_anchors, keyframe_slots, MiniMaxH3, MiniMaxH3Task, BASE_DIT_PARTITION,
+    DEFAULT_STEPS, MAX_STEPS, OFFLOAD_POLICY, REFERENCE_DIT_PARTITION,
 };
 pub use pipeline::{
     align_frames_for_duration, audio_track_to_encoder_input, fit_audio_to_video, fl2va_layout,

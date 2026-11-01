@@ -194,13 +194,10 @@ pub fn audio_position_ids(
 }
 
 /// Which end of the generated video a `fl2va` keyframe conditioning block is anchored to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyframeAnchor {
-    /// Anchored at the first latent frame — the block sits at the video clock's origin.
-    First,
-    /// Anchored at the last latent frame.
-    Last,
-}
+///
+/// Defined in the shared contract (`gen_core_h3::h3_keyframe`, sc-26691) with the `frame_idx`
+/// resolution that produces it, so the candle and MLX engines cannot disagree about it.
+pub use gen_core_h3::h3_keyframe::KeyframeAnchor;
 
 /// The single rotary time every row of a `fl2va` keyframe conditioning block carries.
 ///

@@ -229,6 +229,328 @@ pub fn fit_keyframes(images: &[&Image], width: u32, height: u32) -> Result<Vec<I
         .collect()
 }
 
+// ---------------------------------------------------------------------------------------------
+// The keyframe index contract (sc-26691)
+// ---------------------------------------------------------------------------------------------
+
+/// Which end of the generated video a `fl2va` keyframe conditioning block is anchored to.
+///
+/// Defined here, in the shared contract, so the candle and MLX engines cannot drift on what a
+/// request's `frame_idx` resolves to; each engine re-exports it from `dit::positions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyframeAnchor {
+    /// Anchored at the first latent frame — the block sits at the video clock's origin.
+    First,
+    /// Anchored at the last latent frame.
+    Last,
+}
+
+/// A `Conditioning::Keyframe::frame_idx` that MiniMax-H3 refuses, from [`resolve_keyframe_anchor`]
+/// and [`resolve_keyframe_slots`].
+///
+/// Typed so a caller (and a test) can tell *why* an index was refused; the engines flatten it into
+/// their own error with the model id prefixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyframeIndexError {
+    /// The clip has no frames, so no index can name either end.
+    EmptyClip,
+    /// A negative index other than `-1`. Only `-1` is a "from the end" alias; `-2` is not "the
+    /// second-to-last frame" here (that would be an interior frame anyway) and is never clamped.
+    Negative { frame_idx: i32 },
+    /// An index at or past `num_frames`. Never clamped onto the last frame.
+    OutOfRange { frame_idx: i32, num_frames: usize },
+    /// An in-range index that is neither end. `fl2va` has exactly two anchor slots and no
+    /// mid-clip conditioning row to occupy.
+    Interior { frame_idx: i32, num_frames: usize },
+    /// Two keyframes resolve to the same end of the clip.
+    DuplicateAnchor {
+        anchor: KeyframeAnchor,
+        frame_idx: i32,
+    },
+}
+
+impl std::fmt::Display for KeyframeIndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::EmptyClip => write!(
+                f,
+                "a keyframe was supplied for a clip of 0 frames; there is no first or last frame \
+                 to anchor"
+            ),
+            Self::Negative { frame_idx } => write!(
+                f,
+                "keyframe index {frame_idx} is negative; the only negative index accepted is -1 \
+                 (the LAST frame)"
+            ),
+            Self::OutOfRange {
+                frame_idx,
+                num_frames,
+            } => write!(
+                f,
+                "keyframe index {frame_idx} is out of range for a {num_frames}-frame clip; a \
+                 keyframe must anchor the FIRST frame (0) or the LAST ({} or -1)",
+                num_frames - 1
+            ),
+            Self::Interior {
+                frame_idx,
+                num_frames,
+            } => write!(
+                f,
+                "keyframe index {frame_idx} is an interior frame, but fl2va has exactly two anchor \
+                 slots — the FIRST frame (0) and the LAST ({} or -1); there is no mid-clip \
+                 conditioning row to occupy",
+                num_frames - 1
+            ),
+            Self::DuplicateAnchor { anchor, frame_idx } => write!(
+                f,
+                "two keyframes anchor the same end of the clip ({anchor:?}, index {frame_idx}); \
+                 fl2va's two slots are the FIRST and the LAST frame"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for KeyframeIndexError {}
+
+impl From<KeyframeIndexError> for Error {
+    fn from(e: KeyframeIndexError) -> Self {
+        Error::Msg(format!("minimax-h3 keyframe: {e}"))
+    }
+}
+
+/// Resolve one keyframe `frame_idx` against a clip of `num_frames` frames — **the** MiniMax-H3
+/// keyframe index contract, shared by both engines.
+///
+/// * `0` is the FIRST frame (including on a 1-frame clip, where it is also the last index);
+/// * `num_frames - 1` **or** `-1` is the LAST frame — `-1` so a caller that knows only "the end of
+///   the clip" need not resolve the frame count first;
+/// * every other index is refused with a typed [`KeyframeIndexError`]: a negative index other than
+///   `-1`, an index at or past `num_frames`, or an interior index.
+///
+/// Nothing is clamped. sc-26691: the candle engine used to resolve `frame_idx.max(0)`, so `-1`
+/// silently became the FIRST frame while MLX read it as the LAST — a first+last request rendered
+/// both anchors at the start on CUDA, and a last-only request rendered the last image at the start.
+pub fn resolve_keyframe_anchor(
+    frame_idx: i32,
+    num_frames: usize,
+) -> std::result::Result<KeyframeAnchor, KeyframeIndexError> {
+    if num_frames == 0 {
+        return Err(KeyframeIndexError::EmptyClip);
+    }
+    if frame_idx == 0 {
+        return Ok(KeyframeAnchor::First);
+    }
+    if frame_idx == -1 {
+        return Ok(KeyframeAnchor::Last);
+    }
+    if frame_idx < 0 {
+        return Err(KeyframeIndexError::Negative { frame_idx });
+    }
+    let idx = frame_idx as usize; // non-negative i32 always fits usize on supported targets
+    if idx >= num_frames {
+        Err(KeyframeIndexError::OutOfRange {
+            frame_idx,
+            num_frames,
+        })
+    } else if idx == num_frames - 1 {
+        Ok(KeyframeAnchor::Last)
+    } else {
+        Err(KeyframeIndexError::Interior {
+            frame_idx,
+            num_frames,
+        })
+    }
+}
+
+/// A request's keyframes resolved onto `fl2va`'s two anchor slots, each holding the position of
+/// the keyframe in the **request** that fills it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyframeSlots {
+    /// Request position of the keyframe anchoring the FIRST frame.
+    pub first: Option<usize>,
+    /// Request position of the keyframe anchoring the LAST frame.
+    pub last: Option<usize>,
+}
+
+impl KeyframeSlots {
+    /// The filled anchors in packed order — first, then last — matching the reference's fixed
+    /// `(("first", image), ("last", last_image))` pair filtered by presence.
+    pub fn anchors(&self) -> Vec<KeyframeAnchor> {
+        let mut v = Vec::with_capacity(2);
+        if self.first.is_some() {
+            v.push(KeyframeAnchor::First);
+        }
+        if self.last.is_some() {
+            v.push(KeyframeAnchor::Last);
+        }
+        v
+    }
+
+    /// Request positions in packed order, positional with [`Self::anchors`]: `order()[i]` is the
+    /// request keyframe that `anchors()[i]` describes. The caller may supply keyframes in any
+    /// order; both engines pack them first-then-last so the geometry anchor (`packed[0]`) is the
+    /// same image on either backend.
+    pub fn order(&self) -> Vec<usize> {
+        self.first.into_iter().chain(self.last).collect()
+    }
+
+    /// Whether no keyframe was supplied (`t2va`).
+    pub fn is_empty(&self) -> bool {
+        self.first.is_none() && self.last.is_none()
+    }
+}
+
+/// Resolve every keyframe index of a request (in request order) onto the two anchor slots,
+/// applying [`resolve_keyframe_anchor`] to each and refusing two keyframes on the same end.
+pub fn resolve_keyframe_slots(
+    frame_idxs: impl IntoIterator<Item = i32>,
+    num_frames: usize,
+) -> std::result::Result<KeyframeSlots, KeyframeIndexError> {
+    let mut slots = KeyframeSlots::default();
+    for (pos, frame_idx) in frame_idxs.into_iter().enumerate() {
+        let anchor = resolve_keyframe_anchor(frame_idx, num_frames)?;
+        let slot = match anchor {
+            KeyframeAnchor::First => &mut slots.first,
+            KeyframeAnchor::Last => &mut slots.last,
+        };
+        if slot.is_some() {
+            return Err(KeyframeIndexError::DuplicateAnchor { anchor, frame_idx });
+        }
+        *slot = Some(pos);
+    }
+    Ok(slots)
+}
+
+#[cfg(test)]
+mod keyframe_index_tests {
+    use super::*;
+
+    #[test]
+    fn minus_one_and_n_minus_one_are_last_zero_is_first() {
+        for n in [2usize, 3, 25, 121, 124] {
+            assert_eq!(resolve_keyframe_anchor(-1, n), Ok(KeyframeAnchor::Last));
+            assert_eq!(
+                resolve_keyframe_anchor(n as i32 - 1, n),
+                Ok(KeyframeAnchor::Last)
+            );
+            assert_eq!(resolve_keyframe_anchor(0, n), Ok(KeyframeAnchor::First));
+        }
+    }
+
+    /// sc-26691 mutation guard: restore `frame_idx.max(0)` clamping and these turn green-to-red.
+    #[test]
+    fn other_negatives_and_out_of_range_are_refused_not_clamped() {
+        for n in [2usize, 3, 124] {
+            for bad in [-2, -3, i32::MIN] {
+                assert_eq!(
+                    resolve_keyframe_anchor(bad, n),
+                    Err(KeyframeIndexError::Negative { frame_idx: bad })
+                );
+            }
+            for bad in [n as i32, n as i32 + 1, i32::MAX] {
+                assert_eq!(
+                    resolve_keyframe_anchor(bad, n),
+                    Err(KeyframeIndexError::OutOfRange {
+                        frame_idx: bad,
+                        num_frames: n
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interior_indices_are_refused() {
+        assert_eq!(
+            resolve_keyframe_anchor(60, 124),
+            Err(KeyframeIndexError::Interior {
+                frame_idx: 60,
+                num_frames: 124
+            })
+        );
+        assert_eq!(
+            resolve_keyframe_anchor(1, 3),
+            Err(KeyframeIndexError::Interior {
+                frame_idx: 1,
+                num_frames: 3
+            })
+        );
+    }
+
+    #[test]
+    fn single_frame_and_empty_clips() {
+        // On a 1-frame clip index 0 is both ends; it resolves FIRST, and -1 is the LAST slot.
+        assert_eq!(resolve_keyframe_anchor(0, 1), Ok(KeyframeAnchor::First));
+        assert_eq!(resolve_keyframe_anchor(-1, 1), Ok(KeyframeAnchor::Last));
+        assert_eq!(
+            resolve_keyframe_anchor(0, 0),
+            Err(KeyframeIndexError::EmptyClip)
+        );
+        assert_eq!(
+            resolve_keyframe_anchor(-1, 0),
+            Err(KeyframeIndexError::EmptyClip)
+        );
+    }
+
+    /// The product bug: first + last must land in two DISTINCT slots, whichever spelling of "last"
+    /// the caller uses and in whichever order it lists them.
+    #[test]
+    fn first_and_last_are_distinct_for_several_lengths() {
+        for n in [2usize, 3, 25, 49, 121, 124] {
+            let last = n as i32 - 1;
+            for idxs in [[0, -1], [0, last], [-1, 0], [last, 0]] {
+                let slots = resolve_keyframe_slots(idxs, n).unwrap();
+                assert_eq!(
+                    slots.anchors(),
+                    vec![KeyframeAnchor::First, KeyframeAnchor::Last],
+                    "n={n} idxs={idxs:?}"
+                );
+                let first_pos = idxs.iter().position(|&i| i == 0).unwrap();
+                assert_eq!(slots.order(), vec![first_pos, 1 - first_pos]);
+            }
+            // Last-only is LAST, never moved to the start.
+            for idx in [-1, last] {
+                let slots = resolve_keyframe_slots([idx], n).unwrap();
+                assert_eq!(slots.anchors(), vec![KeyframeAnchor::Last]);
+                assert_eq!(slots.order(), vec![0]);
+            }
+        }
+    }
+
+    #[test]
+    fn slots_refuse_duplicates_and_propagate_index_errors() {
+        assert!(resolve_keyframe_slots([], 124).unwrap().is_empty());
+        assert_eq!(
+            resolve_keyframe_slots([0, 0], 124),
+            Err(KeyframeIndexError::DuplicateAnchor {
+                anchor: KeyframeAnchor::First,
+                frame_idx: 0
+            })
+        );
+        // `-1` and `n - 1` are the same end.
+        assert_eq!(
+            resolve_keyframe_slots([-1, 123], 124),
+            Err(KeyframeIndexError::DuplicateAnchor {
+                anchor: KeyframeAnchor::Last,
+                frame_idx: 123
+            })
+        );
+        assert_eq!(
+            resolve_keyframe_slots([0, -2], 124),
+            Err(KeyframeIndexError::Negative { frame_idx: -2 })
+        );
+        assert_eq!(
+            resolve_keyframe_slots([0, 124], 124),
+            Err(KeyframeIndexError::OutOfRange {
+                frame_idx: 124,
+                num_frames: 124
+            })
+        );
+        let msg = Error::from(KeyframeIndexError::Negative { frame_idx: -2 }).to_string();
+        assert!(msg.contains("-2") && msg.contains("-1"), "{msg}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1451,6 +1451,40 @@ fn a_keyframe_conditioning_strength_is_refused_not_ignored() {
     assert!(keyframe_images(&refs, 124).is_err());
 }
 
+/// sc-26691 — the keyframe index contract is the SHARED one (`gen_core_h3::h3_keyframe`), so this
+/// engine and the candle engine resolve every `frame_idx` identically: `-1` and `n - 1` are the LAST
+/// frame, `0` the FIRST, anything else (another negative, an out-of-range or an interior index) a
+/// refusal; `keyframe_images` packs first-then-last whatever the request order.
+#[test]
+fn keyframe_indices_follow_the_shared_contract() {
+    use crate::dit::positions::KeyframeAnchor::{First, Last};
+    let a = image(32, 32);
+    let b = image(48, 48);
+    let kf = |image, frame_idx| KeyframeRef {
+        image,
+        frame_idx,
+        strength: 1.0,
+    };
+    assert_eq!(keyframe_anchors(&[kf(&a, -1)], 124).unwrap(), vec![Last]);
+    assert_eq!(keyframe_anchors(&[kf(&a, 123)], 124).unwrap(), vec![Last]);
+    assert_eq!(keyframe_anchors(&[kf(&a, 0)], 124).unwrap(), vec![First]);
+    for n in [2, 25, 121, 124] {
+        let refs = [kf(&b, -1), kf(&a, 0)];
+        assert_eq!(keyframe_anchors(&refs, n).unwrap(), vec![First, Last]);
+        let images = keyframe_images(&refs, n).unwrap();
+        assert!(std::ptr::eq(images[0], &a) && std::ptr::eq(images[1], &b));
+    }
+    for bad in [-2, 124, 60] {
+        let e = keyframe_anchors(&[kf(&a, bad)], 124)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(&bad.to_string()), "{e}");
+        assert!(keyframe_images(&[kf(&a, bad)], 124).is_err());
+    }
+    // `-1` and `n - 1` name the same end.
+    assert!(keyframe_anchors(&[kf(&a, -1), kf(&b, 123)], 124).is_err());
+}
+
 /// The reference list keeps **request order** across modalities — order is semantic for
 /// `ref2va`, and re-sorting it would silently rewrite the request.
 #[test]

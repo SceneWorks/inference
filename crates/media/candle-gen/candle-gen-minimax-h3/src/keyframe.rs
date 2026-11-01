@@ -67,7 +67,7 @@ use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::Image;
 use candle_gen::{CandleError, Result};
 
-use crate::dit::positions::KeyframeAnchor;
+// `KeyframeAnchor` arrives through the `h3_keyframe` glob above (shared contract, sc-26691).
 use crate::pipeline::{PIXEL_MEAN, PIXEL_STD};
 
 /// Which anchors a request supplies, in the packed order the reference builds them in.
