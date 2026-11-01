@@ -42,7 +42,8 @@ pub(crate) struct CandleSession {
     pub optimizer: TrainOptimizer,
     pub examples: Vec<CachedExample>,
     pub options: TrainingOptions,
-    pub identity: ResumeIdentity,
+    pub export_base_identity: ResumeIdentity,
+    resume_identity: ResumeIdentity,
     pub seed: u64,
     pub accumulation: u32,
     pending: Option<GradStore>,
@@ -68,6 +69,10 @@ impl CandleSession {
         seed: u64,
         accumulation: u32,
     ) -> Result<Self> {
+        let resume_identity = super::profile::private_identity(
+            &identity,
+            candle_gen::train::policy::active_profile(),
+        )?;
         if examples.is_empty() || accumulation == 0 {
             return Err(invalid("empty prepared cache or invalid accumulation"));
         }
@@ -102,7 +107,7 @@ impl CandleSession {
         }
         // E2-off must retain raw input-width text: the normal preparation
         // replaces these host cache entries with hidden-width projections.
-        if candle_gen::train::comparison::cache_enabled() {
+        if candle_gen::train::policy::cache_enabled() {
             let mut geometry = Vec::new();
             let mut prepared_text: std::collections::HashMap<
                 candle_gen::candle_core::TensorId,
@@ -156,7 +161,8 @@ impl CandleSession {
             optimizer,
             examples,
             options,
-            identity,
+            export_base_identity: identity,
+            resume_identity,
             seed,
             accumulation,
             pending: None,
@@ -184,7 +190,7 @@ impl CandleSession {
             .collect()
     }
     fn export_identity(&self, cursor: &TrainingCursor) -> ResumeIdentity {
-        let mut identity = self.identity.clone();
+        let mut identity = self.export_base_identity.clone();
         identity.configuration.insert(
             "completed_micro_steps".into(),
             cursor.micro_step.to_string(),
@@ -263,7 +269,7 @@ impl CandleSession {
 }
 impl SourceTrainingSession for CandleSession {
     fn identity(&self) -> &ResumeIdentity {
-        &self.identity
+        &self.resume_identity
     }
     fn resume_format(&self) -> &'static str {
         "flux3-native-training-resume-v1"
@@ -277,7 +283,7 @@ impl SourceTrainingSession for CandleSession {
         let state = checkpoint::restore(
             &self.graph,
             &mut self.optimizer,
-            &self.identity,
+            &self.resume_identity,
             policy,
             path,
             flag,
@@ -470,7 +476,7 @@ impl SourceTrainingSession for CandleSession {
                 &self.graph,
                 &self.optimizer,
                 Snapshot {
-                    identity: &self.identity,
+                    identity: &self.resume_identity,
                     cursor,
                     policy,
                     pending: &pending,

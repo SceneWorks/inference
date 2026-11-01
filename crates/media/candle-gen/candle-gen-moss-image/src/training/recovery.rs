@@ -1,6 +1,125 @@
 //! MOSS-only complete-state persistence. The generic legacy trainer checkpoint format is unchanged.
 use super::*;
+use candle_gen::train::policy::{self, JobTrainingPolicy, TrainingProfile};
 use contract::recovery::{bundle, DataPlan, RunState};
+use sha2::{Digest, Sha256};
+
+const PRIVATE_PROFILE_KEY: &str = "_candle_execution_profile";
+const PRIVATE_PROFILE_DOMAIN: &str = "moss-native-private-execution-v1";
+
+// The exported identity is never mutated. Only the native snapshot's private
+// effective controls and digest bind the execution profile. Current is exactly
+// the historical representation, including its original digest and JSON bytes.
+fn private_identity(
+    identity: &contract::recovery::RunIdentity,
+    profile: TrainingProfile,
+) -> Result<contract::recovery::RunIdentity> {
+    let binding = policy::bind_state_identity(PRIVATE_PROFILE_DOMAIN, profile);
+    if binding == PRIVATE_PROFILE_DOMAIN {
+        return Ok(identity.clone());
+    }
+    let mut controls: std::collections::BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(&identity.effective_config)
+            .map_err(|e| CandleError::Msg(format!("MOSS private resume controls: {e}")))?;
+    if controls
+        .insert(
+            PRIVATE_PROFILE_KEY.into(),
+            serde_json::Value::String(binding),
+        )
+        .is_some()
+    {
+        return Err(CandleError::Msg(
+            "MOSS expected an unbound export identity".into(),
+        ));
+    }
+    let mut private = identity.clone();
+    private.effective_config =
+        serde_json::to_string(&controls).map_err(|e| CandleError::Msg(e.to_string()))?;
+    private.digest = format!(
+        "{:x}",
+        Sha256::digest(format!(
+            "{PRIVATE_PROFILE_DOMAIN}:{}:{}",
+            identity.digest, private.effective_config
+        ))
+    );
+    Ok(private)
+}
+
+fn saved_profile(identity: &contract::recovery::RunIdentity) -> Result<TrainingProfile> {
+    let controls: std::collections::BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(&identity.effective_config)
+            .map_err(|e| CandleError::Msg(format!("MOSS private resume controls: {e}")))?;
+    let Some(binding) = controls.get(PRIVATE_PROFILE_KEY) else {
+        return Ok(TrainingProfile::Current);
+    };
+    let binding = binding
+        .as_str()
+        .ok_or_else(|| CandleError::Msg("MOSS malformed private profile".into()))?;
+    if !binding.starts_with(&format!("{PRIVATE_PROFILE_DOMAIN};execution_profile=")) {
+        return Err(CandleError::Msg(
+            "MOSS unknown private profile domain".into(),
+        ));
+    }
+    let profile = policy::profile_from_state_identity(binding)?;
+    if profile == TrainingProfile::Current {
+        return Err(CandleError::Msg(
+            "MOSS noncanonical tagged Current state".into(),
+        ));
+    }
+    Ok(profile)
+}
+
+pub(super) fn job_policy(
+    model: &str,
+    cuda: bool,
+    req: &TrainingRequest,
+) -> Result<JobTrainingPolicy> {
+    let mut job = JobTrainingPolicy::resolve(model, cuda, req)?;
+    if req.config.network_type != gen_core::NetworkType::Lora {
+        job = job.for_unmeasured_mode();
+    }
+    if req.config.resume {
+        // The native reader verifies the complete seal/member hashes, not a bare
+        // untrusted run.json or the unrelated generic resume filename format.
+        let state = contract::recovery::resume_state(&req.output_dir, &req.file_name)?;
+        job = job.with_native_resume_profile(saved_profile(&state.effective_identity)?)?;
+    }
+    Ok(job)
+}
+
+pub(super) fn validate_resume_plan(
+    req: &TrainingRequest,
+    source: &str,
+    plan: &DataPlan,
+) -> Result<()> {
+    if !req.config.resume {
+        return Ok(());
+    }
+    let identity = contract::recovery::effective_identity(req, source, plan)?;
+    let stem = checkpoint::file_stem(&req.file_name);
+    let state = bundle::read(&bundle::latest(&req.output_dir, stem)?)?;
+    checked_state(&state, req, plan, &identity, policy::active_profile())?;
+    Ok(())
+}
+
+fn state_for_profile(state: &RunState, profile: TrainingProfile) -> Result<RunState> {
+    let mut private = state.clone();
+    private.effective_identity = private_identity(&state.effective_identity, profile)?;
+    Ok(private)
+}
+
+fn checked_state(
+    state: &RunState,
+    req: &TrainingRequest,
+    plan: &DataPlan,
+    export_identity: &contract::recovery::RunIdentity,
+    profile: TrainingProfile,
+) -> Result<RunState> {
+    state.validate(req, plan, &private_identity(export_identity, profile)?)?;
+    let mut restored = state.clone();
+    restored.effective_identity = export_identity.clone();
+    Ok(restored)
+}
 
 pub(super) fn save_complete(
     req: &TrainingRequest,
@@ -10,7 +129,8 @@ pub(super) fn save_complete(
     set: &LoraSet,
     window: &GradientWindow,
 ) -> Result<()> {
-    bundle::publish(&req.output_dir, stem, state, |dir| {
+    let private = state_for_profile(state, policy::active_profile())?;
+    bundle::publish(&req.output_dir, stem, &private, |dir| {
         let mut tensors = HashMap::new();
         for (name, var) in set.named_vars() {
             tensors.insert(format!("factor.{name}"), var.as_tensor().clone());
@@ -51,8 +171,15 @@ pub(super) fn load_complete(
     set: &LoraSet,
 ) -> Result<(RunState, GradientWindow)> {
     let path = bundle::latest(&req.output_dir, stem)?;
-    let state = bundle::read(&path)?;
-    state.validate(req, plan, identity)?;
+    let state = checked_state(
+        &bundle::read(&path)?,
+        req,
+        plan,
+        identity,
+        policy::active_profile(),
+    )?;
+    // Cursor/RNG/data and all payload checks are unchanged. Return the original
+    // identity view to the training loop; only persistence owns the private tag.
     let tensors =
         candle_gen::candle_core::safetensors::load(path.join("tensors.safetensors"), &Device::Cpu)?;
     let mut factors = HashMap::new();
@@ -184,4 +311,154 @@ pub(super) fn load_complete(
         tokens: state.accumulated_tokens,
     };
     Ok((state, window))
+}
+
+#[cfg(test)]
+mod native_profile_metadata_tests {
+    use super::*;
+    use candle_gen::gen_core::train::{TrainingConfig, TrainingItem};
+
+    fn fixture() -> (
+        TrainingRequest,
+        DataPlan,
+        contract::recovery::RunIdentity,
+        RunState,
+    ) {
+        let req = TrainingRequest {
+            items: vec![TrainingItem::captioned(
+                "never-read.png".into(),
+                "metadata".into(),
+            )],
+            config: TrainingConfig {
+                steps: 4,
+                resolution: 64,
+                seed: 7,
+                gradient_accumulation: 1,
+                ..Default::default()
+            },
+            output_dir: "unused".into(),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: vec![],
+            cancel: Default::default(),
+        };
+        // Scalar geometry/schedule only: no image read, planner/device or tensors.
+        let plan = DataPlan::new(&req, &[(64, 64)]).unwrap();
+        let identity = contract::recovery::RunIdentity {
+            digest: "a".repeat(64),
+            source_checkpoint: "parent-unchanged".into(),
+            dataset_fingerprint: "dataset-unchanged".into(),
+            effective_config: r#"{"network_type":"lora","seed":7}"#.into(),
+        };
+        let state = RunState::after_step(&req, &plan, &identity, 2, 2, 0, 0.25).unwrap();
+        (req, plan, identity, state)
+    }
+
+    #[test]
+    fn current_bytes_and_export_data_rng_cursor_views_are_unchanged() {
+        let (req, plan, export, state) = fixture();
+        let original = serde_json::to_vec(&state).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&state_for_profile(&state, TrainingProfile::Current).unwrap())
+                .unwrap(),
+            original
+        );
+        let export_bytes = serde_json::to_vec(&export).unwrap();
+        let private = state_for_profile(&state, TrainingProfile::WithoutE3).unwrap();
+        assert_eq!(
+            saved_profile(&private.effective_identity).unwrap(),
+            TrainingProfile::WithoutE3
+        );
+        assert_eq!(
+            private.effective_identity.source_checkpoint,
+            export.source_checkpoint
+        );
+        assert_eq!(
+            private.effective_identity.dataset_fingerprint,
+            export.dataset_fingerprint
+        );
+        assert_eq!(private.effective_identity.digest.len(), 64);
+        assert!(private
+            .effective_identity
+            .digest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(private.effective_identity.digest, export.digest);
+        assert_eq!(serde_json::to_vec(&export).unwrap(), export_bytes);
+        assert!(
+            private.validate(&req, &plan, &export).is_err(),
+            "old Current readers must reject nonCurrent trajectory"
+        );
+        assert_eq!(
+            checked_state(&private, &req, &plan, &export, TrainingProfile::WithoutE3).unwrap(),
+            state
+        );
+        assert!(checked_state(&private, &req, &plan, &export, TrainingProfile::WithoutE1).is_err());
+        let mut wrong = export.clone();
+        wrong.dataset_fingerprint = "changed".into();
+        assert!(checked_state(&private, &req, &plan, &wrong, TrainingProfile::WithoutE3).is_err());
+    }
+
+    #[test]
+    fn finite_native_profile_parser_rejects_experimental_and_malformed_domains() {
+        let (_, _, export, _) = fixture();
+        assert_eq!(saved_profile(&export).unwrap(), TrainingProfile::Current);
+        let mut private = private_identity(&export, TrainingProfile::WithoutE3).unwrap();
+        let mut controls: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(&private.effective_config).unwrap();
+        for value in [
+            "moss-native-private-execution-v1;execution_profile=comparison-proof-v1/plus-streaming",
+            "moss-native-private-execution-v1;execution_profile=future/legacy",
+            "unrelated-domain",
+            "moss-native-private-execution-v1;execution_profile=measured-reference-v1/current",
+        ] {
+            controls.insert(PRIVATE_PROFILE_KEY.into(), value.into());
+            private.effective_config = serde_json::to_string(&controls).unwrap();
+            assert!(saved_profile(&private).is_err());
+        }
+    }
+
+    fn publish_mock(root: &Path, state: &RunState) {
+        // Sealed scalar fixture bytes are deliberately not tensor payloads; no
+        // tensor loader is invoked by profile/header/preflight metadata tests.
+        bundle::publish(root, "adapter", state, |dir| {
+            std::fs::write(dir.join("tensors.safetensors"), b"mock-only").unwrap();
+            std::fs::write(dir.join("optimizer.safetensors"), b"mock-only").unwrap();
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn native_owner_routing_restores_legacy_current_without_selecting_a_profile() {
+        let (mut req, _, _, state) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        req.output_dir = dir.path().into();
+        req.config.resume = true;
+        publish_mock(dir.path(), &state);
+        for id in [
+            MossImageVariant::Base.provider_id(),
+            MossImageVariant::Sft.provider_id(),
+        ] {
+            let job = job_policy(id, true, &req).unwrap();
+            assert_eq!(job.model(), id);
+            assert_eq!(job.profile(), TrainingProfile::Current);
+        }
+        let path = bundle::latest(dir.path(), "adapter").unwrap();
+        std::fs::write(path.join("tensors.safetensors"), b"tampered").unwrap();
+        assert!(job_policy(MossImageVariant::Base.provider_id(), true, &req).is_err());
+    }
+
+    #[test]
+    fn pending_native_selector_refuses_unadopted_tagged_state_before_preparation() {
+        let (mut req, _, _, state) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        req.output_dir = dir.path().into();
+        req.config.resume = true;
+        publish_mock(
+            dir.path(),
+            &state_for_profile(&state, TrainingProfile::WithoutE3).unwrap(),
+        );
+        assert!(job_policy(MossImageVariant::Base.provider_id(), true, &req).is_err());
+        assert!(job_policy(MossImageVariant::Base.provider_id(), false, &req).is_err());
+    }
 }

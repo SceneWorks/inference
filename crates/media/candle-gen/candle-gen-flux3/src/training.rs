@@ -1,6 +1,7 @@
 //! Native trainable FLUX3 DiT seam. Frozen base weights stay in the inference graph;
 //! adapter `Var`s use the shared trainable residual mechanism, not pre-merged deltas.
 pub mod checkpoint;
+pub(crate) mod profile;
 pub(crate) mod runner;
 pub mod trainer;
 
@@ -80,7 +81,7 @@ impl TrainingGraph {
                 scale,
             )?;
         }
-        if candle_gen::train::comparison::projection_enabled() {
+        if candle_gen::train::policy::projection_enabled() {
             dit.prepare_training_projections()?;
         }
         Ok(Self {

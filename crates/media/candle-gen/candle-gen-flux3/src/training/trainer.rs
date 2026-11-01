@@ -192,8 +192,12 @@ fn execute(
     req: &TrainingRequest,
     on_progress: &mut dyn FnMut(TrainingProgress),
 ) -> Result<TrainingOutput> {
+    let mut progress =
+        |event| candle_gen::train::policy::without_production_profile(|| on_progress(event));
+    let on_progress: &mut dyn FnMut(TrainingProgress) = &mut progress;
     check(&req.cancel)?;
     let opts = TrainingOptions::parse(req).map_err(Error::from)?;
+    let device = candle_gen::default_device()?;
     on_progress(TrainingProgress::Preparing);
     check(&req.cancel)?;
     let root = match &spec.weights {
@@ -255,8 +259,9 @@ fn execute(
         },
     )
     .map_err(Error::from)?;
+    let mut job = super::profile::job_policy(device.is_cuda(), opts.workflow, req)?;
     if req.config.resume {
-        controller::find_resume(
+        let candidate = controller::find_resume_profile_candidate(
             &req.output_dir,
             controller::output_stem(&req.file_name).map_err(Error::from)?,
             &identity,
@@ -269,210 +274,234 @@ fn execute(
         .ok_or_else(|| {
             invalid("resume requested but no compatible saved state exists; refusing restart")
         })?;
+        job = job.with_native_resume_profile(super::profile::saved_profile(
+            candidate.execution_profile.as_deref(),
+        )?)?;
     }
-    check(&req.cancel)?;
-    on_progress(TrainingProgress::LoadingModel);
-    check(&req.cancel)?;
-    let device = candle_gen::default_device()?;
-    let dtype = match opts.precision {
-        TrainingPrecision::F32 => DType::F32,
-        TrainingPrecision::Bf16 => DType::BF16,
-    };
-    if device.is_cpu() && dtype == DType::BF16 {
-        return Err(invalid(
-            "BF16 teacher is unsupported on Candle CPU; use F32 or native CUDA",
-        ));
-    }
-    let encoder = FrozenTrainingEncoder::load(&resources.autoencoder_file, dtype, &device)?;
-    let teacher = match Flux3TextEncoder::load_for_training(
-        &resources.text_encoder_dir,
-        &cfg.text_encoder,
-        cfg.dit.text_in_channels,
-        &device,
-        dtype,
-        opts.max_sequence_length,
-    ) {
-        Ok(teacher) => teacher,
-        Err(error) => {
-            let _ = encoder.device().synchronize();
-            drop(encoder);
-            return Err(error);
+    candle_gen::train::policy::with_job_policy(job, || {
+        let resume_identity = super::profile::private_identity(
+            &identity,
+            candle_gen::train::policy::active_profile(),
+        )?;
+        if req.config.resume {
+            controller::find_resume(
+                &req.output_dir,
+                controller::output_stem(&req.file_name).map_err(Error::from)?,
+                &resume_identity,
+                plan.policy(req),
+                "flux3-native-training-resume-v1",
+                req.config.seed,
+                &req.cancel,
+            )
+            .map_err(Error::from)?
+            .ok_or_else(|| {
+                invalid("resume requested but no compatible saved state exists; refusing restart")
+            })?;
         }
-    };
-    let cached = (|| -> Result<Vec<CachedExample>> {
-        let mut windows = req
-            .items
-            .iter()
-            .map(|item| teacher.window(&item.caption))
-            .collect::<Result<Vec<_>>>()?;
-        if req.config.batch_size > 1 {
-            let length = windows
-                .iter()
-                .map(|w| w.length())
-                .max()
-                .ok_or_else(|| invalid("empty caption windows"))?;
-            for window in &mut windows {
-                let truncated = window.truncated_tokens;
-                *window = assemble_window(
-                    &window.input_ids[..window.real],
-                    teacher.pad_id(),
-                    length,
-                    opts.max_sequence_length,
-                )
-                .map_err(Error::from)?;
-                window.truncated_tokens = truncated;
+        check(&req.cancel)?;
+        on_progress(TrainingProgress::LoadingModel);
+        check(&req.cancel)?;
+        let dtype = match opts.precision {
+            TrainingPrecision::F32 => DType::F32,
+            TrainingPrecision::Bf16 => DType::BF16,
+        };
+        if device.is_cpu() && dtype == DType::BF16 {
+            return Err(invalid(
+                "BF16 teacher is unsupported on Candle CPU; use F32 or native CUDA",
+            ));
+        }
+        let encoder = FrozenTrainingEncoder::load(&resources.autoencoder_file, dtype, &device)?;
+        let teacher = match Flux3TextEncoder::load_for_training(
+            &resources.text_encoder_dir,
+            &cfg.text_encoder,
+            cfg.dit.text_in_channels,
+            &device,
+            dtype,
+            opts.max_sequence_length,
+        ) {
+            Ok(teacher) => teacher,
+            Err(error) => {
+                let _ = encoder.device().synchronize();
+                drop(encoder);
+                return Err(error);
             }
-        }
-        let empty = teacher.window("")?;
-        let mut empty_by_window: BTreeMap<usize, Tensor> = BTreeMap::new();
-        let mut captions: BTreeMap<(String, usize), Tensor> = BTreeMap::new();
-        let mut cache = Vec::with_capacity(req.items.len());
-        for (index, ((item, pair), window)) in
-            req.items.iter().zip(&pixels).zip(windows).enumerate()
-        {
-            check(&req.cancel)?;
-            let (latent, grid) = encoder.encode(&host_pixels(&pair.target)?)?;
-            let reference = pair
-                .reference
-                .as_ref()
-                .map(|image| -> Result<Tensor> {
-                    let (tokens, reference_grid) = encoder.encode(&host_pixels(image)?)?;
-                    if reference_grid != grid {
-                        return Err(invalid("paired encoder grids differ"));
-                    }
-                    Ok(tokens.to_device(&Device::Cpu)?)
-                })
-                .transpose()?;
-            let key = (item.caption.clone(), window.length());
-            let text = match captions.get(&key) {
-                Some(text) => text.clone(),
-                None => {
-                    let text = teacher
-                        .encode_window(window.clone())?
-                        .tokens
-                        .to_device(&Device::Cpu)?;
-                    captions.insert(key, text.clone());
-                    text
+        };
+        let cached = (|| -> Result<Vec<CachedExample>> {
+            let mut windows = req
+                .items
+                .iter()
+                .map(|item| teacher.window(&item.caption))
+                .collect::<Result<Vec<_>>>()?;
+            if req.config.batch_size > 1 {
+                let length = windows
+                    .iter()
+                    .map(|w| w.length())
+                    .max()
+                    .ok_or_else(|| invalid("empty caption windows"))?;
+                for window in &mut windows {
+                    let truncated = window.truncated_tokens;
+                    *window = assemble_window(
+                        &window.input_ids[..window.real],
+                        teacher.pad_id(),
+                        length,
+                        opts.max_sequence_length,
+                    )
+                    .map_err(Error::from)?;
+                    window.truncated_tokens = truncated;
                 }
-            };
-            let empty_text = if opts.caption_dropout > 0.0 {
-                let length = window.length();
-                Some(match empty_by_window.get(&length) {
+            }
+            let empty = teacher.window("")?;
+            let mut empty_by_window: BTreeMap<usize, Tensor> = BTreeMap::new();
+            let mut captions: BTreeMap<(String, usize), Tensor> = BTreeMap::new();
+            let mut cache = Vec::with_capacity(req.items.len());
+            for (index, ((item, pair), window)) in
+                req.items.iter().zip(&pixels).zip(windows).enumerate()
+            {
+                check(&req.cancel)?;
+                let (latent, grid) = encoder.encode(&host_pixels(&pair.target)?)?;
+                let reference = pair
+                    .reference
+                    .as_ref()
+                    .map(|image| -> Result<Tensor> {
+                        let (tokens, reference_grid) = encoder.encode(&host_pixels(image)?)?;
+                        if reference_grid != grid {
+                            return Err(invalid("paired encoder grids differ"));
+                        }
+                        Ok(tokens.to_device(&Device::Cpu)?)
+                    })
+                    .transpose()?;
+                let key = (item.caption.clone(), window.length());
+                let text = match captions.get(&key) {
                     Some(text) => text.clone(),
                     None => {
-                        let w = assemble_window(
-                            &empty.input_ids[..empty.real],
-                            teacher.pad_id(),
-                            length,
-                            opts.max_sequence_length,
-                        )
-                        .map_err(Error::from)?;
-                        let text = teacher.encode_window(w)?.tokens.to_device(&Device::Cpu)?;
-                        empty_by_window.insert(length, text.clone());
+                        let text = teacher
+                            .encode_window(window.clone())?
+                            .tokens
+                            .to_device(&Device::Cpu)?;
+                        captions.insert(key, text.clone());
                         text
                     }
-                })
-            } else {
-                None
-            };
-            cache.push(CachedExample {
-                latent: latent.to_device(&Device::Cpu)?,
-                text,
-                text_ids: gen_core_flux3::text_ids(window.length()),
-                empty_text,
-                reference,
-                grid,
-            });
-            on_progress(TrainingProgress::Caching {
-                current: (index + 1) as u32,
-                total: req.items.len() as u32,
-            });
-            check(&req.cancel)?;
-        }
-        Ok(cache)
-    })();
-    let encoder_sync = encoder.device().synchronize();
-    let teacher_sync = teacher.device().synchronize();
-    drop(teacher);
-    drop(encoder);
-    drop(pixels);
-    let examples = match cached {
-        Err(error) => return Err(error),
-        Ok(cache) => {
-            encoder_sync?;
-            teacher_sync?;
-            cache
-        }
-    };
-    check(&req.cancel)?;
-    // Re-read identities before any optimization: mutable input/source replacements
-    // during caching must refuse, never continue under an earlier provenance hash.
-    if gen_core_train::resume::request_fingerprint(req).map_err(Error::from)? != identity.dataset
-        || identity::observe_pinned_resources(&resources, &req.cancel).map_err(Error::from)?
-            != identity.artifacts
-    {
-        return Err(invalid(
-            "dataset/base/component bytes changed during frozen caching; refusing training",
-        ));
-    }
-    let dit = load_training_dit(
-        &resources.package_dir.join(DIT_WEIGHTS_FILE),
-        &cfg.dit,
-        dtype,
-        &device,
-        &req.cancel,
-    )?;
-    let mut initial = BTreeMap::new();
-    for (index, target) in targets.iter().enumerate() {
+                };
+                let empty_text = if opts.caption_dropout > 0.0 {
+                    let length = window.length();
+                    Some(match empty_by_window.get(&length) {
+                        Some(text) => text.clone(),
+                        None => {
+                            let w = assemble_window(
+                                &empty.input_ids[..empty.real],
+                                teacher.pad_id(),
+                                length,
+                                opts.max_sequence_length,
+                            )
+                            .map_err(Error::from)?;
+                            let text = teacher.encode_window(w)?.tokens.to_device(&Device::Cpu)?;
+                            empty_by_window.insert(length, text.clone());
+                            text
+                        }
+                    })
+                } else {
+                    None
+                };
+                cache.push(CachedExample {
+                    latent: latent.to_device(&Device::Cpu)?,
+                    text,
+                    text_ids: gen_core_flux3::text_ids(window.length()),
+                    empty_text,
+                    reference,
+                    grid,
+                });
+                on_progress(TrainingProgress::Caching {
+                    current: (index + 1) as u32,
+                    total: req.items.len() as u32,
+                });
+                check(&req.cancel)?;
+            }
+            Ok(cache)
+        })();
+        let encoder_sync = encoder.device().synchronize();
+        let teacher_sync = teacher.device().synchronize();
+        drop(teacher);
+        drop(encoder);
+        drop(pixels);
+        let examples = match cached {
+            Err(error) => return Err(error),
+            Ok(cache) => {
+                encoder_sync?;
+                teacher_sync?;
+                cache
+            }
+        };
         check(&req.cancel)?;
-        let mut rng = NativeRng::keyed(req.config.seed, "lora-gaussian-init", index as u64);
-        let elements = (req.config.rank as usize)
-            .checked_mul(target.input)
-            .ok_or_else(|| invalid("LoRA initialization size overflow"))?;
-        let values = (0..elements)
-            .map(|_| rng.normal() / req.config.rank as f32)
-            .collect::<Vec<_>>();
-        initial.insert(
-            target.native.clone(),
-            Tensor::from_vec(
-                values,
-                (req.config.rank as usize, target.input),
-                &Device::Cpu,
-            )?
-            .to_device(&device)?,
-        );
-    }
-    let graph = TrainingGraph::new(
-        dit,
-        req.config.rank as usize,
-        req.config.alpha as f64,
-        &req.config.lora_target_modules,
-        initial,
-    )?;
-    let optimizer = TrainOptimizer::from_config(
-        "adamw",
-        graph.vars(),
-        req.config.learning_rate,
-        req.config.weight_decay,
-    )?;
-    let mut session = CandleSession::new(
-        graph,
-        optimizer,
-        examples,
-        opts,
-        identity,
-        req.config.seed,
-        req.config.gradient_accumulation,
-    )?;
-    let result = controller::run(&mut session, req, &plan, on_progress).map_err(Error::from);
-    let sync = device.synchronize();
-    drop(session);
-    match result {
-        Err(error) => Err(error),
-        Ok(output) => {
-            sync?;
-            check(&req.cancel)?;
-            Ok(output)
+        // Re-read identities before any optimization: mutable input/source replacements
+        // during caching must refuse, never continue under an earlier provenance hash.
+        if gen_core_train::resume::request_fingerprint(req).map_err(Error::from)?
+            != identity.dataset
+            || identity::observe_pinned_resources(&resources, &req.cancel).map_err(Error::from)?
+                != identity.artifacts
+        {
+            return Err(invalid(
+                "dataset/base/component bytes changed during frozen caching; refusing training",
+            ));
         }
-    }
+        let dit = load_training_dit(
+            &resources.package_dir.join(DIT_WEIGHTS_FILE),
+            &cfg.dit,
+            dtype,
+            &device,
+            &req.cancel,
+        )?;
+        let mut initial = BTreeMap::new();
+        for (index, target) in targets.iter().enumerate() {
+            check(&req.cancel)?;
+            let mut rng = NativeRng::keyed(req.config.seed, "lora-gaussian-init", index as u64);
+            let elements = (req.config.rank as usize)
+                .checked_mul(target.input)
+                .ok_or_else(|| invalid("LoRA initialization size overflow"))?;
+            let values = (0..elements)
+                .map(|_| rng.normal() / req.config.rank as f32)
+                .collect::<Vec<_>>();
+            initial.insert(
+                target.native.clone(),
+                Tensor::from_vec(
+                    values,
+                    (req.config.rank as usize, target.input),
+                    &Device::Cpu,
+                )?
+                .to_device(&device)?,
+            );
+        }
+        let graph = TrainingGraph::new(
+            dit,
+            req.config.rank as usize,
+            req.config.alpha as f64,
+            &req.config.lora_target_modules,
+            initial,
+        )?;
+        let optimizer = TrainOptimizer::from_config(
+            "adamw",
+            graph.vars(),
+            req.config.learning_rate,
+            req.config.weight_decay,
+        )?;
+        let mut session = CandleSession::new(
+            graph,
+            optimizer,
+            examples,
+            opts,
+            identity,
+            req.config.seed,
+            req.config.gradient_accumulation,
+        )?;
+        let result = controller::run(&mut session, req, &plan, on_progress).map_err(Error::from);
+        let sync = device.synchronize();
+        drop(session);
+        match result {
+            Err(error) => Err(error),
+            Ok(output) => {
+                sync?;
+                check(&req.cancel)?;
+                Ok(output)
+            }
+        }
+    })
 }

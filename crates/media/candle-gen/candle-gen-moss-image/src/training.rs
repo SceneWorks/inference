@@ -238,11 +238,7 @@ impl MossImageTrainer {
         estimate
             .check_host(host_budget, self.device.is_cpu())
             .map_err(admission_error)?;
-        contract::recovery::validate_resume_plan(
-            req,
-            &self.sources.source_identity(self.variant),
-            &plan,
-        )?;
+        recovery::validate_resume_plan(req, &self.sources.source_identity(self.variant), &plan)?;
         Ok(Preparation {
             plan,
             estimate,
@@ -258,11 +254,7 @@ impl Trainer for MossImageTrainer {
         &self.descriptor
     }
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        let policy = candle_gen::train::policy::JobTrainingPolicy::resolve(
-            self.descriptor.id,
-            self.device.is_cuda(),
-            req,
-        )?;
+        let policy = recovery::job_policy(self.descriptor.id, self.device.is_cuda(), req)?;
         candle_gen::train::policy::with_job_policy(policy, || {
             self.basic(req)?;
             self.prepare(req)?;
@@ -274,11 +266,7 @@ impl Trainer for MossImageTrainer {
         req: &TrainingRequest,
         progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
-        let policy = candle_gen::train::policy::JobTrainingPolicy::resolve(
-            self.descriptor.id,
-            self.device.is_cuda(),
-            req,
-        )?;
+        let policy = recovery::job_policy(self.descriptor.id, self.device.is_cuda(), req)?;
         candle_gen::train::policy::with_job_policy(policy, || {
             let mut isolated_progress = |event| {
                 candle_gen::train::policy::without_production_profile(|| progress(event));

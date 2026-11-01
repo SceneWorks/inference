@@ -842,7 +842,7 @@ fn rmsnorm_rope_impl(x: &Tensor, scale: &Tensor, rope: &Rope, training: bool) ->
     let (b, h, l, d) = x.dims4()?;
     let pairs = d / 2;
     let xf = to(x, DType::F32)?.contiguous()?;
-    let normed = if training && candle_gen::train::comparison::legacy_e1() {
+    let normed = if training && candle_gen::train::policy::legacy_e1() {
         candle_gen::train::profile::cohort_reuse("flux3:comparison-legacy-rms");
         // The pre-epic training chain (da5c4c791e^), with its real backward.
         candle_gen::candle_nn::ops::rms_norm_slow(&xf, scale, RMS_EPS)?
