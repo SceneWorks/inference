@@ -591,12 +591,17 @@ mod selector_metadata_tests {
             TrainingProfile::Current
         );
         req.output_dir = dir.path().join("nonexistent-native-resume-path");
-        for model in ["moss_image_base", "moss_image_sft", "unknown"] {
+        for (model, profile) in [
+            ("moss_image_base", TrainingProfile::WithoutE1),
+            ("flux3_klein_base", TrainingProfile::Legacy),
+            ("moss_image_sft", TrainingProfile::Current),
+            ("unknown", TrainingProfile::Current),
+        ] {
             assert_eq!(
                 JobTrainingPolicy::resolve(model, true, &req)
                     .unwrap()
                     .profile(),
-                TrainingProfile::Current
+                profile
             );
         }
     }
