@@ -1293,7 +1293,7 @@ mod control_tests {
     use super::*;
     #[test]
     fn unmeasured_moss_descriptors_keep_current_policy_without_device_construction() {
-        use candle_gen::train::policy::{JobTrainingPolicy, TrainingProfile};
+        use candle_gen::train::policy::TrainingProfile;
         let temp = tempfile::tempdir().unwrap();
         let mut req = TrainingRequest {
             items: Vec::new(),
@@ -1303,14 +1303,30 @@ mod control_tests {
             trigger_words: Vec::new(),
             cancel: CancelFlag::new(),
         };
-        for resume in [false, true] {
-            req.config.resume = resume;
-            for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
-                for cuda in [false, true] {
-                    let policy =
-                        JobTrainingPolicy::resolve(descriptor(variant).id, cuda, &req).unwrap();
-                    assert_eq!(policy.profile(), TrainingProfile::Current);
-                }
+        // Exercise the native entry resolver: Core's selected arm alone does
+        // not include the measured workload/mode guard.
+        req.config.resolution = 512;
+        for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+            for cuda in [false, true] {
+                let policy = recovery::job_policy(descriptor(variant).id, cuda, &req).unwrap();
+                assert_eq!(policy.profile(), TrainingProfile::Current);
+            }
+        }
+        req.config.resolution = 256;
+        for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+            for cuda in [false, true] {
+                let policy = recovery::job_policy(descriptor(variant).id, cuda, &req).unwrap();
+                let expected = if variant == MossImageVariant::Base && cuda {
+                    TrainingProfile::WithoutE1
+                } else {
+                    TrainingProfile::Current
+                };
+                assert_eq!(policy.profile(), expected);
+                // A real native resume requires a sealed bundle. Header/profile
+                // compatibility is separately covered by recovery metadata tests.
+                req.config.resume = true;
+                assert!(recovery::job_policy(descriptor(variant).id, cuda, &req).is_err());
+                req.config.resume = false;
             }
         }
     }
