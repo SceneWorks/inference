@@ -120,98 +120,6 @@ impl ComparisonCadence {
     }
 }
 
-#[cfg(test)]
-mod cadence_metadata_tests {
-    use super::ComparisonCadence;
-
-    #[test]
-    fn recovery_is_exact_three_one_two_without_changing_existing_cadences() {
-        for (cadence, id, updates, warmups, timed) in [
-            (ComparisonCadence::Ordinary, "ordinary", 4, 1, 3),
-            (ComparisonCadence::WanDual, "wan-dual", 6, 2, 4),
-            (
-                ComparisonCadence::IrisRestoration,
-                "iris-restoration",
-                8,
-                2,
-                6,
-            ),
-            (ComparisonCadence::MossRecovery, "moss_recovery", 3, 1, 2),
-            (ComparisonCadence::OrdinaryShort, "ordinary_short", 2, 1, 1),
-            (ComparisonCadence::DepthRecovery, "depth_recovery", 2, 1, 1),
-            (ComparisonCadence::RestRecovery, "rest_recovery", 6, 2, 4),
-        ] {
-            assert_eq!(cadence.id(), id);
-            assert_eq!(cadence.updates(), updates);
-            assert_eq!(cadence.warmups(), warmups);
-            assert_eq!(cadence.updates() as usize - cadence.warmups(), timed);
-        }
-        let recovery = ComparisonCadence::MossRecovery;
-        assert_eq!(6 * recovery.updates(), 18);
-        // The original failed arm stays charged four; no refund or transfer.
-        assert_eq!(4 + 6 * recovery.updates(), 22);
-        assert_eq!(24 - (4 + 6 * recovery.updates()), 2);
-    }
-
-    #[test]
-    fn recovery_owner_order_counts_and_family_caps_are_exact() {
-        for (cadence, model) in [
-            (ComparisonCadence::MossRecovery, "moss"),
-            (ComparisonCadence::OrdinaryShort, "anima_base"),
-            (ComparisonCadence::OrdinaryShort, "flux3"),
-            (ComparisonCadence::DepthRecovery, "iris-depth"),
-            (ComparisonCadence::RestRecovery, "iris-restoration"),
-        ] {
-            let expected = cadence.expected_recovery_owners(model).unwrap();
-            assert_eq!(expected.len(), cadence.updates() as usize);
-            assert!(cadence.recovery_owners_valid(model, expected));
-            assert!(!cadence.recovery_owners_valid(model, &expected[1..]));
-            assert!(!cadence.recovery_owners_valid("unknown", expected));
-            let mut extra = expected.to_vec();
-            extra.push(expected[0]);
-            assert!(!cadence.recovery_owners_valid(model, &extra));
-            let wrong = vec!["borrowed-owner"; expected.len()];
-            assert!(!cadence.recovery_owners_valid(model, &wrong));
-        }
-        let cadence = ComparisonCadence::RestRecovery;
-        let mut swapped = cadence
-            .expected_recovery_owners("iris-restoration")
-            .unwrap()
-            .to_vec();
-        swapped.swap(0, 1);
-        assert!(!cadence.recovery_owners_valid("iris-restoration", &swapped));
-        let duplicate = ["iris-restoration-generator"; 6];
-        assert!(!cadence.recovery_owners_valid("iris-restoration", &duplicate));
-        assert_eq!(6 * ComparisonCadence::OrdinaryShort.updates(), 12);
-        assert_eq!(2 * ComparisonCadence::DepthRecovery.updates(), 4);
-        assert_eq!(5 * ComparisonCadence::RestRecovery.updates(), 30);
-        assert_eq!(316 + 12 + 12 + 4 + 30 + 18, 392);
-    }
-
-    #[test]
-    fn shortened_cadence_is_moss_only_and_old_moss_cadence_remains_valid() {
-        assert!(ComparisonCadence::MossRecovery.allows_model("moss"));
-        assert!(ComparisonCadence::Ordinary.allows_model("moss"));
-        for model in [
-            "mage-adapter",
-            "wan2_2_ti2v_5b",
-            "iris-restoration",
-            "krea",
-            "",
-            "MOSS",
-        ] {
-            assert!(!ComparisonCadence::MossRecovery.allows_model(model));
-            for cadence in [
-                ComparisonCadence::Ordinary,
-                ComparisonCadence::WanDual,
-                ComparisonCadence::IrisRestoration,
-            ] {
-                assert!(cadence.allows_model(model));
-            }
-        }
-    }
-}
-
 #[cfg(feature = "model-inference-proof")]
 thread_local! {
     static STAGE: std::cell::Cell<Option<ComparisonStage>> = const { std::cell::Cell::new(None) };
@@ -279,55 +187,6 @@ pub(crate) fn with_metadata_stage_for_test<T>(stage: ComparisonStage, f: impl Fn
     }
     let _reset = Reset(STAGE.replace(Some(stage)));
     f()
-}
-
-#[cfg(all(test, feature = "model-inference-proof"))]
-mod policy_selector_metadata_tests {
-    use super::*;
-
-    #[test]
-    fn explicit_proof_scope_wins_over_job_and_callback_suspension() {
-        use crate::gen_core::train::TrainingRequest;
-        use crate::train::policy;
-        let req = TrainingRequest {
-            items: vec![],
-            config: Default::default(),
-            output_dir: "unused".into(),
-            file_name: "out.safetensors".into(),
-            trigger_words: vec![],
-            cancel: Default::default(),
-        };
-        let job = policy::JobTrainingPolicy::resolve("sd3_5_medium", true, &req).unwrap();
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                STAGE.set(None);
-            }
-        }
-        let _reset = Reset;
-        for stage in ComparisonStage::ALL {
-            STAGE.set(Some(stage));
-            policy::with_job_policy(job, || {
-                assert_eq!(policy::legacy_e1(), legacy_e1());
-                assert_eq!(policy::cache_enabled(), cache_enabled());
-                assert_eq!(policy::projection_enabled(), projection_enabled());
-                assert_eq!(policy::reference_owner_enabled(), reference_owner_enabled());
-                let identity =
-                    policy::bind_state_identity("private-proof-state", policy::active_profile());
-                assert!(identity.ends_with(&format!("comparison-proof-v1/{}", stage.id())));
-                assert!(
-                    policy::profile_from_state_identity(&identity).is_err(),
-                    "experimental proof checkpoint cannot become a production resume"
-                );
-                policy::without_production_profile(|| {
-                    assert_eq!(policy::legacy_e1(), legacy_e1());
-                    assert_eq!(policy::cache_enabled(), cache_enabled());
-                    assert_eq!(policy::projection_enabled(), projection_enabled());
-                    assert_eq!(policy::reference_owner_enabled(), reference_owner_enabled());
-                });
-            });
-        }
-    }
 }
 
 /// Physical index for the new comparison recipe only. CUDA ordinal remains zero
@@ -427,4 +286,145 @@ pub fn with_stage<T>(
     crate::training_attention::with_training_attention_mode(mode, || {
         super::profile::with_comparison_observation(output, model_id, stage, cadence, f)
     })
+}
+
+#[cfg(test)]
+mod cadence_metadata_tests {
+    use super::ComparisonCadence;
+
+    #[test]
+    fn recovery_is_exact_three_one_two_without_changing_existing_cadences() {
+        for (cadence, id, updates, warmups, timed) in [
+            (ComparisonCadence::Ordinary, "ordinary", 4, 1, 3),
+            (ComparisonCadence::WanDual, "wan-dual", 6, 2, 4),
+            (
+                ComparisonCadence::IrisRestoration,
+                "iris-restoration",
+                8,
+                2,
+                6,
+            ),
+            (ComparisonCadence::MossRecovery, "moss_recovery", 3, 1, 2),
+            (ComparisonCadence::OrdinaryShort, "ordinary_short", 2, 1, 1),
+            (ComparisonCadence::DepthRecovery, "depth_recovery", 2, 1, 1),
+            (ComparisonCadence::RestRecovery, "rest_recovery", 6, 2, 4),
+        ] {
+            assert_eq!(cadence.id(), id);
+            assert_eq!(cadence.updates(), updates);
+            assert_eq!(cadence.warmups(), warmups);
+            assert_eq!(cadence.updates() as usize - cadence.warmups(), timed);
+        }
+        let recovery = ComparisonCadence::MossRecovery;
+        assert_eq!(6 * recovery.updates(), 18);
+        // The original failed arm stays charged four; no refund or transfer.
+        assert_eq!(4 + 6 * recovery.updates(), 22);
+        assert_eq!(24 - (4 + 6 * recovery.updates()), 2);
+    }
+
+    #[test]
+    fn recovery_owner_order_counts_and_family_caps_are_exact() {
+        for (cadence, model) in [
+            (ComparisonCadence::MossRecovery, "moss"),
+            (ComparisonCadence::OrdinaryShort, "anima_base"),
+            (ComparisonCadence::OrdinaryShort, "flux3"),
+            (ComparisonCadence::DepthRecovery, "iris-depth"),
+            (ComparisonCadence::RestRecovery, "iris-restoration"),
+        ] {
+            let expected = cadence.expected_recovery_owners(model).unwrap();
+            assert_eq!(expected.len(), cadence.updates() as usize);
+            assert!(cadence.recovery_owners_valid(model, expected));
+            assert!(!cadence.recovery_owners_valid(model, &expected[1..]));
+            assert!(!cadence.recovery_owners_valid("unknown", expected));
+            let mut extra = expected.to_vec();
+            extra.push(expected[0]);
+            assert!(!cadence.recovery_owners_valid(model, &extra));
+            let wrong = vec!["borrowed-owner"; expected.len()];
+            assert!(!cadence.recovery_owners_valid(model, &wrong));
+        }
+        let cadence = ComparisonCadence::RestRecovery;
+        let mut swapped = cadence
+            .expected_recovery_owners("iris-restoration")
+            .unwrap()
+            .to_vec();
+        swapped.swap(0, 1);
+        assert!(!cadence.recovery_owners_valid("iris-restoration", &swapped));
+        let duplicate = ["iris-restoration-generator"; 6];
+        assert!(!cadence.recovery_owners_valid("iris-restoration", &duplicate));
+        assert_eq!(6 * ComparisonCadence::OrdinaryShort.updates(), 12);
+        assert_eq!(2 * ComparisonCadence::DepthRecovery.updates(), 4);
+        assert_eq!(5 * ComparisonCadence::RestRecovery.updates(), 30);
+        assert_eq!(316 + 12 + 12 + 4 + 30 + 18, 392);
+    }
+
+    #[test]
+    fn shortened_cadence_is_moss_only_and_old_moss_cadence_remains_valid() {
+        assert!(ComparisonCadence::MossRecovery.allows_model("moss"));
+        assert!(ComparisonCadence::Ordinary.allows_model("moss"));
+        for model in [
+            "mage-adapter",
+            "wan2_2_ti2v_5b",
+            "iris-restoration",
+            "krea",
+            "",
+            "MOSS",
+        ] {
+            assert!(!ComparisonCadence::MossRecovery.allows_model(model));
+            for cadence in [
+                ComparisonCadence::Ordinary,
+                ComparisonCadence::WanDual,
+                ComparisonCadence::IrisRestoration,
+            ] {
+                assert!(cadence.allows_model(model));
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "model-inference-proof"))]
+mod policy_selector_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_proof_scope_wins_over_job_and_callback_suspension() {
+        use crate::gen_core::train::TrainingRequest;
+        use crate::train::policy;
+        let req = TrainingRequest {
+            items: vec![],
+            config: Default::default(),
+            output_dir: "unused".into(),
+            file_name: "out.safetensors".into(),
+            trigger_words: vec![],
+            cancel: Default::default(),
+        };
+        let job = policy::JobTrainingPolicy::resolve("sd3_5_medium", true, &req).unwrap();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                STAGE.set(None);
+            }
+        }
+        let _reset = Reset;
+        for stage in ComparisonStage::ALL {
+            STAGE.set(Some(stage));
+            policy::with_job_policy(job, || {
+                assert_eq!(policy::legacy_e1(), legacy_e1());
+                assert_eq!(policy::cache_enabled(), cache_enabled());
+                assert_eq!(policy::projection_enabled(), projection_enabled());
+                assert_eq!(policy::reference_owner_enabled(), reference_owner_enabled());
+                let identity =
+                    policy::bind_state_identity("private-proof-state", policy::active_profile());
+                assert!(identity.ends_with(&format!("comparison-proof-v1/{}", stage.id())));
+                assert!(
+                    policy::profile_from_state_identity(&identity).is_err(),
+                    "experimental proof checkpoint cannot become a production resume"
+                );
+                policy::without_production_profile(|| {
+                    assert_eq!(policy::legacy_e1(), legacy_e1());
+                    assert_eq!(policy::cache_enabled(), cache_enabled());
+                    assert_eq!(policy::projection_enabled(), projection_enabled());
+                    assert_eq!(policy::reference_owner_enabled(), reference_owner_enabled());
+                });
+            });
+        }
+    }
 }
