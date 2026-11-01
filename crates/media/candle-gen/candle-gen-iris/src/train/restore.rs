@@ -229,9 +229,81 @@ impl Trainer for IrisRestoreTrainer {
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
         self.floors(req)?;
-        let run = Run::prepare(self, req, on_progress)?;
-        run.execute(req, on_progress).map_err(Into::into)
+        let plan = self.plan(req, &[])?;
+        let policy = restore_training_policy(
+            req,
+            self.device.is_cuda(),
+            &plan.artifact,
+            plan.resume_from.as_deref(),
+            plan.resume,
+        )?;
+        candle_gen::train::policy::with_job_policy(policy, || {
+            let mut progress = |event| {
+                candle_gen::train::policy::without_production_profile(|| on_progress(event))
+            };
+            Run::prepare(self, req, &mut progress).and_then(|run| run.execute(req, &mut progress))
+        })
+        .map_err(Into::into)
     }
+}
+
+// Header/profile resolution is CPU metadata only and precedes every model,
+// optimizer, EMA (and restoration critic/SN) construction in Run::prepare.
+fn restore_resume_directory(
+    req: &TrainingRequest,
+    resume_from: Option<&Path>,
+    resume: bool,
+) -> Result<Option<PathBuf>> {
+    let root = checkpoint_root(&req.output_dir, &req.file_name);
+    match (resume_from, resume) {
+        (Some(path), _) => Ok(Some(if path.join(CKPT_STATE).is_file() {
+            path.to_path_buf()
+        } else {
+            latest_checkpoint(path).ok_or_else(|| {
+                Error::Msg(format!(
+                    "iris restore resume: {} holds no complete checkpoint",
+                    path.display()
+                ))
+            })?
+        })),
+        (None, true) => Ok(latest_checkpoint(&root)),
+        (None, false) => Ok(None),
+    }
+}
+
+fn restore_training_policy(
+    req: &TrainingRequest,
+    is_cuda: bool,
+    artifact: &RestoreArtifact,
+    resume_from: Option<&Path>,
+    resume: bool,
+) -> Result<candle_gen::train::policy::JobTrainingPolicy> {
+    use candle_gen::train::policy::{profile_from_state_identity, JobTrainingPolicy};
+    let mut policy = JobTrainingPolicy::resolve(TRAINER_ID, is_cuda, req)?;
+    // Only the measured LoRA G+D recipe is eligible; never inherit a
+    // generation profile or apply it to restoration Full/LoKr.
+    if !matches!(artifact, RestoreArtifact::Lora { .. }) {
+        policy = policy.for_unmeasured_mode();
+    }
+    if let Some(path) = restore_resume_directory(req, resume_from, resume)? {
+        let saved = read_checkpoint_state(&path)?;
+        policy = policy
+            .with_native_resume_profile(profile_from_state_identity(&saved.state_identity)?)?;
+    }
+    Ok(policy)
+}
+
+fn checked_restore_state_identity(saved: &str, expected_private_state: &str) -> Result<String> {
+    let expected = candle_gen::train::policy::bind_state_identity(
+        expected_private_state,
+        candle_gen::train::policy::active_profile(),
+    );
+    if saved != expected {
+        return Err(Error::Msg(
+            "iris restore resume: private execution-profile/state identity differs".into(),
+        ));
+    }
+    Ok(expected_private_state.into())
 }
 
 fn adamw_plan(lr: f64, betas: (f64, f64), weight_decay: f64) -> OptimizerPlan {
@@ -732,24 +804,16 @@ impl Run {
             0usize,
         );
         let mut losses = [f64::NAN; 5];
-        let resume_dir = match (&plan.resume_from, plan.resume) {
-            (Some(p), _) => Some(if p.join(CKPT_STATE).is_file() {
-                p.clone()
-            } else {
-                latest_checkpoint(p).ok_or_else(|| {
-                    Error::Msg(format!(
-                        "iris restore resume: {} holds no complete checkpoint",
-                        p.display()
-                    ))
-                })?
-            }),
-            (None, true) => latest_checkpoint(&ckpt_root),
-            (None, false) => None,
-        };
+        let resume_dir = restore_resume_directory(req, plan.resume_from.as_deref(), plan.resume)?;
         let resume_src = resume_dir.clone();
         if let Some(dir) = resume_dir {
             let saved = read_checkpoint_state(&dir)?;
-            check_resume(&saved, &plan, &dataset_fingerprint, &base_identity)?;
+            // Normalize only a clone for the existing native contract checker;
+            // retain the actual header/tag and every base/data/cursor identity.
+            let mut compatible = saved.clone();
+            compatible.state_identity =
+                checked_restore_state_identity(&saved.state_identity, &plan.state_identity())?;
+            check_resume(&compatible, &plan, &dataset_fingerprint, &base_identity)?;
             let restored = load_tensors(&dir.join(CKPT_TRAINABLE), &device)?;
             if restored.len() != params.len() || params.keys().any(|k| !restored.contains_key(k)) {
                 return Err(Error::Msg(
@@ -1063,7 +1127,9 @@ impl Run {
                             if plan.preview_every > 0
                                 && self.step.is_multiple_of(plan.preview_every as u64)
                             {
-                                self.render_preview(req, on_progress)?;
+                                candle_gen::train::policy::without_production_profile(|| {
+                                    self.render_preview(req, on_progress)
+                                })?;
                             }
                             if self.step >= plan.max_steps as u64 {
                                 finished = true;
@@ -1124,7 +1190,10 @@ impl Run {
             ema_decay: self.plan.ema,
             seed: self.plan.seed,
             backend: BACKEND.into(),
-            state_identity: self.plan.state_identity(),
+            state_identity: candle_gen::train::policy::bind_state_identity(
+                &self.plan.state_identity(),
+                candle_gen::train::policy::active_profile(),
+            ),
             data_identity: self.plan.data_identity(),
             dataset_fingerprint: self.dataset_fingerprint.clone(),
             base_identity: self.base_identity.clone(),
@@ -1287,5 +1356,130 @@ pub fn adapter_delta(kind: AdapterKind, t: &AdapterTarget, p: &Tensors) -> Resul
             1.0,
             (t.out_f, t.in_f),
         ),
+    }
+}
+
+#[cfg(test)]
+mod production_policy_metadata_tests {
+    use super::*;
+    use candle_gen::train::policy::{self, TrainingProfile};
+
+    fn request(output: &Path) -> TrainingRequest {
+        TrainingRequest {
+            items: vec![],
+            config: Default::default(),
+            output_dir: output.into(),
+            file_name: "restore.safetensors".into(),
+            trigger_words: vec![],
+            cancel: Default::default(),
+        }
+    }
+    fn lora() -> RestoreArtifact {
+        RestoreArtifact::Lora {
+            rank: 8,
+            alpha: 8.,
+            targets: vec![],
+        }
+    }
+    fn header() -> RestoreCheckpointState {
+        RestoreCheckpointState {
+            step: 4,
+            epoch: 1,
+            batches_consumed: 4,
+            scheduler_step: 4,
+            lr: 1e-5,
+            lr_critic: 1e-5,
+            nan_count: 0,
+            losses: [1.; 5],
+            artifact: "lora".into(),
+            ema_decay: Some(0.5),
+            seed: 7,
+            backend: BACKEND.into(),
+            state_identity: "private-restore-config".into(),
+            data_identity: "degradation-options".into(),
+            dataset_fingerprint: "dataset".into(),
+            base_identity: "original-base".into(),
+        }
+    }
+
+    // Native JSON/G+D counters only; no Tensor/Device/optimizer/cache conversion.
+    #[test]
+    fn restore_neutral_lora_policy_keeps_both_owners_current_and_old_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let req = request(temp.path());
+        let dir = checkpoint_root(&req.output_dir, &req.file_name).join("step_000004");
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = header();
+        let original = serde_json::to_vec(&saved.to_json()).unwrap();
+        std::fs::write(dir.join(CKPT_STATE), &original).unwrap();
+        let job = restore_training_policy(&req, true, &lora(), None, true).unwrap();
+        assert_eq!(job.model(), "iris_3b_restore");
+        assert_eq!(job.profile(), TrainingProfile::Current);
+        assert_eq!(
+            restore_resume_directory(&req, Some(&dir), false).unwrap(),
+            Some(dir.clone())
+        );
+        policy::with_job_policy(job, || {
+            let mut compatible = saved.clone();
+            compatible.state_identity =
+                checked_restore_state_identity(&saved.state_identity, "private-restore-config")
+                    .unwrap();
+            assert_eq!(serde_json::to_vec(&compatible.to_json()).unwrap(), original);
+            assert_eq!(
+                policy::bind_state_identity(&saved.state_identity, policy::active_profile()),
+                saved.state_identity
+            );
+            assert_eq!(compatible.lr_critic, saved.lr_critic);
+            assert!(checked_restore_state_identity(&saved.state_identity, "other-config").is_err());
+            policy::without_production_profile(|| {
+                assert_eq!(policy::active_profile(), TrainingProfile::Current)
+            });
+        });
+        for artifact in [
+            RestoreArtifact::Full,
+            RestoreArtifact::Lokr {
+                rank: 8,
+                alpha: 8.,
+                decompose_factor: -1,
+                targets: vec![],
+            },
+        ] {
+            assert_eq!(
+                restore_training_policy(&req, true, &artifact, None, false)
+                    .unwrap()
+                    .profile(),
+                TrainingProfile::Current
+            );
+        }
+        assert_eq!(
+            restore_training_policy(&req, false, &lora(), None, false)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+    }
+
+    #[test]
+    fn restore_native_header_rejects_foreign_and_proof_profiles_before_prepare() {
+        let temp = tempfile::tempdir().unwrap();
+        let req = request(temp.path());
+        for tag in [
+            "measured-reference-v1/minus-e3",
+            "comparison-proof-v1/plus-streaming",
+            "unknown-v9/current",
+        ] {
+            let mut saved = header();
+            saved.state_identity = format!("private-restore-config;execution_profile={tag}");
+            std::fs::write(
+                temp.path().join(CKPT_STATE),
+                serde_json::to_vec(&saved.to_json()).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                restore_training_policy(&req, true, &lora(), Some(temp.path()), false).is_err(),
+                "{tag}"
+            );
+        }
+        assert!(restore_resume_directory(&req, Some(&temp.path().join("absent")), false).is_err());
     }
 }

@@ -352,7 +352,7 @@ impl Attention {
     }
 
     fn prepare_training(&mut self, cross: bool) -> Result<()> {
-        if !candle_gen::train::comparison::projection_enabled() {
+        if !candle_gen::train::policy::projection_enabled() {
             return Ok(());
         }
         if self.projection_pack.is_none() {
@@ -543,7 +543,7 @@ impl CosmosDiT {
             block.attn2.prepare_training(true)?;
         }
         self.training_rope.clear();
-        if !candle_gen::train::comparison::cache_enabled() {
+        if !candle_gen::train::policy::cache_enabled() {
             return Ok(());
         }
         for latent in latents {

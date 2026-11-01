@@ -237,9 +237,75 @@ impl Trainer for IrisDepthTrainer {
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
         let plan = self.floors(req)?;
-        let run = Run::prepare(self, plan, req, on_progress)?;
-        run.execute(req, on_progress).map_err(Into::into)
+        let policy = depth_training_policy(
+            req,
+            self.device.is_cuda(),
+            plan.resume_from.as_deref(),
+            plan.resume,
+        )?;
+        candle_gen::train::policy::with_job_policy(policy, || {
+            let mut progress = |event| {
+                candle_gen::train::policy::without_production_profile(|| on_progress(event))
+            };
+            Run::prepare(self, plan, req, &mut progress)
+                .and_then(|run| run.execute(req, &mut progress))
+        })
+        .map_err(Into::into)
     }
+}
+
+// Header/profile resolution is CPU metadata only and precedes every model,
+// optimizer, EMA (and restoration critic/SN) construction in Run::prepare.
+fn depth_resume_directory(
+    req: &TrainingRequest,
+    resume_from: Option<&Path>,
+    resume: bool,
+) -> Result<Option<PathBuf>> {
+    let root = checkpoint_root(&req.output_dir, &req.file_name);
+    match (resume_from, resume) {
+        (Some(path), _) => Ok(Some(if path.join(CKPT_STATE).is_file() {
+            path.to_path_buf()
+        } else {
+            latest_checkpoint(path).ok_or_else(|| {
+                Error::Msg(format!(
+                    "iris depth resume: {} holds no complete checkpoint",
+                    path.display()
+                ))
+            })?
+        })),
+        (None, true) => Ok(latest_checkpoint(&root)),
+        (None, false) => Ok(None),
+    }
+}
+
+fn depth_training_policy(
+    req: &TrainingRequest,
+    is_cuda: bool,
+    resume_from: Option<&Path>,
+    resume: bool,
+) -> Result<candle_gen::train::policy::JobTrainingPolicy> {
+    use candle_gen::train::policy::{profile_from_state_identity, JobTrainingPolicy};
+    let mut policy = JobTrainingPolicy::resolve(DEPTH_TRAINER_ID, is_cuda, req)?;
+    // Depth is mandatory Full. Do not apply the generation Full-mode exclusion.
+    if let Some(path) = depth_resume_directory(req, resume_from, resume)? {
+        let saved = read_checkpoint_state(&path)?;
+        policy = policy
+            .with_native_resume_profile(profile_from_state_identity(&saved.state_identity)?)?;
+    }
+    Ok(policy)
+}
+
+fn checked_depth_state_identity(saved: &str, expected_private_state: &str) -> Result<String> {
+    let expected = candle_gen::train::policy::bind_state_identity(
+        expected_private_state,
+        candle_gen::train::policy::active_profile(),
+    );
+    if saved != expected {
+        return Err(Error::Msg(
+            "iris depth resume: private execution-profile/state identity differs".into(),
+        ));
+    }
+    Ok(expected_private_state.into())
 }
 
 // =============================================================================================
@@ -737,24 +803,16 @@ impl Run {
 
         let (mut step, mut sched_step, mut lr, mut nan_count, mut epoch, mut pos, mut last_loss) =
             (0u64, 0u64, plan.optimizer.lr, 0u32, 1u32, 0usize, f64::NAN);
-        let resume_dir = match (&plan.resume_from, plan.resume) {
-            (Some(p), _) => Some(if p.join(CKPT_STATE).is_file() {
-                p.clone()
-            } else {
-                latest_checkpoint(p).ok_or_else(|| {
-                    Error::Msg(format!(
-                        "iris depth resume: {} holds no complete checkpoint",
-                        p.display()
-                    ))
-                })?
-            }),
-            (None, true) => latest_checkpoint(&ckpt_root),
-            (None, false) => None,
-        };
+        let resume_dir = depth_resume_directory(req, plan.resume_from.as_deref(), plan.resume)?;
         let resume_src = resume_dir.clone();
         if let Some(dir) = resume_dir {
             let saved = read_checkpoint_state(&dir)?;
-            check_depth_resume(&saved, &plan, &dataset_fingerprint, &base_identity)?;
+            // Normalize only a clone for the existing native contract checker;
+            // retain the actual header/tag and every base/data/cursor identity.
+            let mut compatible = saved.clone();
+            compatible.state_identity =
+                checked_depth_state_identity(&saved.state_identity, &plan.state_identity())?;
+            check_depth_resume(&compatible, &plan, &dataset_fingerprint, &base_identity)?;
             let restored = load_tensors(&dir.join(CKPT_TRAINABLE), &device)?;
             if restored.len() != params.len() || params.keys().any(|k| !restored.contains_key(k)) {
                 return Err(Error::Msg(
@@ -939,7 +997,9 @@ impl Run {
                     });
                 }
                 if plan.preview.every > 0 && self.step.is_multiple_of(plan.preview.every as u64) {
-                    self.render_previews(req, on_progress)?;
+                    candle_gen::train::policy::without_production_profile(|| {
+                        self.render_previews(req, on_progress)
+                    })?;
                 }
                 if self.step >= plan.max_steps as u64 {
                     finished = true;
@@ -992,7 +1052,10 @@ impl Run {
             ema_decay: self.plan.ema,
             seed: self.plan.seed,
             backend: BACKEND.into(),
-            state_identity: self.plan.state_identity(),
+            state_identity: candle_gen::train::policy::bind_state_identity(
+                &self.plan.state_identity(),
+                candle_gen::train::policy::active_profile(),
+            ),
             data_identity: self.plan.data_identity(),
             dataset_fingerprint: self.dataset_fingerprint.clone(),
             base_identity: self.base_identity.clone(),
@@ -1115,5 +1178,115 @@ impl Run {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod production_policy_metadata_tests {
+    use super::*;
+    use candle_gen::train::policy::{self, TrainingProfile};
+
+    fn request(output: &Path) -> TrainingRequest {
+        let config = gen_core::TrainingConfig {
+            full_finetune: true,
+            ..Default::default()
+        };
+        TrainingRequest {
+            items: vec![],
+            config,
+            output_dir: output.into(),
+            file_name: "depth.safetensors".into(),
+            trigger_words: vec![],
+            cancel: Default::default(),
+        }
+    }
+
+    fn header() -> CheckpointState {
+        CheckpointState {
+            step: 4,
+            epoch: 1,
+            batches_consumed: 4,
+            scheduler_step: 4,
+            lr: 0.001,
+            nan_count: 0,
+            last_loss: 1.,
+            artifact: "full".into(),
+            optimizer: "adamw".into(),
+            ema_decay: Some(0.5),
+            seed: 7,
+            backend: BACKEND.into(),
+            state_identity: "private-depth-config".into(),
+            data_identity: "data-options".into(),
+            dataset_fingerprint: "dataset".into(),
+            base_identity: "original-base".into(),
+            task: IrisTask::Depth,
+            stage: None,
+            parent_stage: None,
+            data_position: None,
+            dist: None,
+            repa_projector: None,
+            grad_scaler: None,
+        }
+    }
+
+    // Native JSON headers only: no Device/Tensor/model/optimizer constructors.
+    #[test]
+    fn depth_neutral_full_policy_reads_header_and_preserves_current_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let req = request(temp.path());
+        let dir = checkpoint_root(&req.output_dir, &req.file_name).join("step_000004");
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = header();
+        let original = serde_json::to_vec(&saved.to_json()).unwrap();
+        std::fs::write(dir.join(CKPT_STATE), &original).unwrap();
+        let job = depth_training_policy(&req, true, None, true).unwrap();
+        assert_eq!(job.model(), "iris_3b_depth");
+        assert_eq!(job.profile(), TrainingProfile::Current);
+        assert_eq!(
+            depth_resume_directory(&req, Some(&dir), false).unwrap(),
+            Some(dir.clone())
+        );
+        policy::with_job_policy(job, || {
+            let mut compatible = saved.clone();
+            compatible.state_identity =
+                checked_depth_state_identity(&saved.state_identity, "private-depth-config")
+                    .unwrap();
+            assert_eq!(serde_json::to_vec(&compatible.to_json()).unwrap(), original);
+            assert_eq!(
+                policy::bind_state_identity(&saved.state_identity, policy::active_profile()),
+                saved.state_identity
+            );
+            assert!(checked_depth_state_identity(&saved.state_identity, "other-config").is_err());
+        });
+        assert_eq!(
+            depth_training_policy(&req, false, None, true)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+    }
+
+    #[test]
+    fn depth_native_header_rejects_unsupported_and_experimental_profiles() {
+        let temp = tempfile::tempdir().unwrap();
+        let req = request(temp.path());
+        for tag in [
+            "measured-reference-v1/minus-e2",
+            "comparison-proof-v1/legacy",
+            "unknown-v9/current",
+        ] {
+            let mut saved = header();
+            saved.state_identity = format!("private-depth-config;execution_profile={tag}");
+            std::fs::write(
+                temp.path().join(CKPT_STATE),
+                serde_json::to_vec(&saved.to_json()).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                depth_training_policy(&req, true, Some(temp.path()), false).is_err(),
+                "{tag}"
+            );
+        }
+        assert!(depth_resume_directory(&req, Some(&temp.path().join("absent")), false).is_err());
     }
 }

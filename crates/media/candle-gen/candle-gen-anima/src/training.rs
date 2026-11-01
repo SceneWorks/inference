@@ -157,8 +157,32 @@ impl Trainer for AnimaTrainer {
         // any loading/caching — a caller that skips `validate` must not get it silently ignored.
         gen_core_train::validate_training_techniques(self.descriptor(), req)?;
         self.validate(req)?;
-        self.train_impl(req, on_progress).map_err(Into::into)
+        let policy = anima_training_policy(self.descriptor.id, self.device.is_cuda(), req)?;
+        candle_gen::train::policy::with_job_policy(policy, || {
+            let mut progress = |event| {
+                candle_gen::train::policy::without_production_profile(|| on_progress(event))
+            };
+            self.train_impl(req, &mut progress)
+        })
+        .map_err(Into::into)
     }
+}
+
+// Resolve once before conditioner/model/cache preparation. This recovery is
+// Base LoRA only; LoKr remains Current and native resume stays unsupported.
+fn anima_training_policy(
+    model_id: &str,
+    is_cuda: bool,
+    req: &TrainingRequest,
+) -> Result<candle_gen::train::policy::JobTrainingPolicy> {
+    let policy = candle_gen::train::policy::JobTrainingPolicy::resolve(model_id, is_cuda, req)?;
+    Ok(
+        if req.config.network_type == NetworkType::Lora && !req.config.full_finetune {
+            policy
+        } else {
+            policy.for_unmeasured_mode()
+        },
+    )
 }
 
 struct AnimaTrainHost<'a> {
@@ -759,6 +783,39 @@ mod tests {
             source: WeightsSource::Dir("/unused".into()),
             device: Device::Cpu,
         }
+    }
+
+    // Metadata only: never construct a Device/Tensor/trainer or call train.
+    #[test]
+    fn anima_neutral_policy_keeps_exact_owner_modes_and_callback_scope() {
+        use candle_gen::train::policy::{self, JobTrainingPolicy, TrainingProfile};
+        let mut req = request();
+        let id = trainer_descriptor().id;
+        assert_eq!(id, "anima_base");
+        let job = anima_training_policy(id, true, &req).unwrap();
+        assert_eq!(job.model(), id);
+        assert_eq!(job.profile(), TrainingProfile::Current);
+        let outer = JobTrainingPolicy::resolve("ltx_2_5_distilled", true, &req).unwrap();
+        policy::with_job_policy(outer, || {
+            assert!(!policy::cache_enabled());
+            policy::with_job_policy(job, || {
+                assert_eq!(policy::active_profile(), TrainingProfile::Current);
+                assert!(policy::cache_enabled() && policy::projection_enabled());
+                policy::without_production_profile(|| {
+                    assert_eq!(policy::active_profile(), TrainingProfile::Current)
+                });
+            });
+            assert_eq!(policy::active_profile(), outer.profile());
+        });
+        req.config.network_type = NetworkType::Lokr;
+        assert_eq!(
+            anima_training_policy(id, true, &req).unwrap().profile(),
+            TrainingProfile::Current
+        );
+        assert_eq!(
+            anima_training_policy(id, false, &req).unwrap().profile(),
+            TrainingProfile::Current
+        );
     }
 
     #[test]
