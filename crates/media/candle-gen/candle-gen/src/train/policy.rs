@@ -246,14 +246,21 @@ pub(super) fn resume_profile(meta: &HashMap<String, String>) -> Result<TrainingP
 /// Current retains the historical fingerprint byte-for-byte. Profile binding in
 /// the existing config fingerprint makes old loaders reject non-Current bundles.
 pub(super) fn bind_resume_fingerprint(base: &str, profile: TrainingProfile) -> String {
-    if profile == TrainingProfile::Current {
-        base.into()
-    } else {
-        format!(
-            "{base};execution_profile={VERSION}/{}",
-            profile.measured_arm()
-        )
+    match private_execution_tag(profile) {
+        None => base.into(),
+        Some(tag) => format!("{base};execution_profile={tag}"),
     }
+}
+
+fn private_execution_tag(profile: TrainingProfile) -> Option<String> {
+    if let Some(stage) = super::comparison::active_stage() {
+        // A proof override may execute Legacy or Streaming while the enclosing
+        // product policy differs. Never label its private checkpoint as a
+        // resumable production arm. Existing production decoders reject this
+        // experimental domain, including candidate states.
+        return Some(format!("comparison-proof-v1/{}", stage.id()));
+    }
+    (profile != TrainingProfile::Current).then(|| format!("{VERSION}/{}", profile.measured_arm()))
 }
 
 /// Bind only a native private training-state identity, never a base-model or
@@ -272,12 +279,8 @@ pub fn profile_from_state_identity(identity: &str) -> Result<TrainingProfile> {
 }
 
 pub(super) fn record_resume_profile(meta: &mut HashMap<String, String>) {
-    let profile = active_profile();
-    if profile != TrainingProfile::Current {
-        meta.insert(
-            RESUME_KEY.into(),
-            format!("{VERSION}/{}", profile.measured_arm()),
-        );
+    if let Some(tag) = private_execution_tag(active_profile()) {
+        meta.insert(RESUME_KEY.into(), tag);
     }
 }
 

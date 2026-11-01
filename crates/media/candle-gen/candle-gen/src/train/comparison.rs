@@ -312,6 +312,13 @@ mod policy_selector_metadata_tests {
                 assert_eq!(policy::cache_enabled(), cache_enabled());
                 assert_eq!(policy::projection_enabled(), projection_enabled());
                 assert_eq!(policy::reference_owner_enabled(), reference_owner_enabled());
+                let identity =
+                    policy::bind_state_identity("private-proof-state", policy::active_profile());
+                assert!(identity.ends_with(&format!("comparison-proof-v1/{}", stage.id())));
+                assert!(
+                    policy::profile_from_state_identity(&identity).is_err(),
+                    "experimental proof checkpoint cannot become a production resume"
+                );
                 policy::without_production_profile(|| {
                     assert_eq!(policy::legacy_e1(), legacy_e1());
                     assert_eq!(policy::cache_enabled(), cache_enabled());
