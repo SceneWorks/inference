@@ -23,8 +23,11 @@ fn for_native_mode(
     req: &TrainingRequest,
 ) -> JobTrainingPolicy {
     // The measured native Base fixture has one reference image and mode=edit.
-    // Its result cannot select a profile for the distinct Captioned workflow.
+    // Its result cannot select a profile for Captioned or larger workloads.
     if workflow != Workflow::PairedEdit
+        || req.config.resolution != 64
+        || !req.config.resolution_buckets.is_empty()
+        || !req.config.aspect_ratio_buckets.is_empty()
         || req.config.full_finetune
         || req.config.network_type != candle_gen::gen_core::NetworkType::Lora
     {
@@ -182,42 +185,110 @@ mod native_profile_metadata_tests {
     }
 
     #[test]
-    fn paired_edit_gate_preserves_finite_policy_and_rejects_unmeasured_modes() {
+    fn selected_64_edit_scope_preserves_legacy_resume_and_unmeasured_current() {
         let mut req = request();
-        // Use an already selected opaque finite policy solely to exercise the
-        // production mode gate. The actual FLUX selector remains Current.
-        let finite = JobTrainingPolicy::resolve("kolors", true, &req).unwrap();
-        assert_eq!(finite.profile(), TrainingProfile::WithoutE3);
-        let paired = for_native_mode(finite, Workflow::PairedEdit, &req);
-        assert_eq!(paired, finite);
-        assert!(paired
-            .with_native_resume_profile(TrainingProfile::WithoutE3)
+        req.config.resolution = 64;
+        let selected = job_policy(true, Workflow::PairedEdit, &req).unwrap();
+        assert_eq!(selected.model(), "flux3_klein_base");
+        assert_eq!(selected.profile(), TrainingProfile::Legacy);
+        assert!(selected
+            .with_native_resume_profile(TrainingProfile::Legacy)
             .is_ok());
         assert_eq!(
-            paired
+            selected
                 .with_native_resume_profile(TrainingProfile::Current)
                 .unwrap()
                 .profile(),
             TrainingProfile::Current
         );
-        assert!(paired
-            .with_native_resume_profile(TrainingProfile::Legacy)
-            .is_err());
-        let captioned = for_native_mode(finite, Workflow::Captioned, &req);
-        assert_eq!(captioned.model(), finite.model());
-        assert_eq!(captioned.profile(), TrainingProfile::Current);
-        assert!(captioned
-            .with_native_resume_profile(TrainingProfile::WithoutE3)
-            .is_err());
+        for foreign in [
+            TrainingProfile::WithoutE1,
+            TrainingProfile::WithoutE2,
+            TrainingProfile::WithoutE3,
+        ] {
+            assert!(selected.with_native_resume_profile(foreign).is_err());
+        }
+        let private = private_identity(&identity(), selected.profile()).unwrap();
+        assert_eq!(
+            saved_profile(
+                private
+                    .configuration
+                    .get(CANDLE_EXECUTION_PROFILE_KEY)
+                    .map(String::as_str)
+            )
+            .unwrap(),
+            TrainingProfile::Legacy
+        );
+        policy::with_job_policy(selected, || {
+            assert!(policy::legacy_e1());
+            assert!(!policy::cache_enabled() && !policy::projection_enabled());
+            policy::without_production_profile(|| {
+                assert_eq!(policy::active_profile(), TrainingProfile::Current);
+                assert!(policy::cache_enabled() && policy::projection_enabled());
+            });
+            assert_eq!(policy::active_profile(), TrainingProfile::Legacy);
+        });
+        for resolution in [0, 63, 65, 80, 128, 256, 512, 1024] {
+            req.config.resolution = resolution;
+            let job = job_policy(true, Workflow::PairedEdit, &req).unwrap();
+            assert_eq!(job.profile(), TrainingProfile::Current);
+            assert!(job
+                .with_native_resume_profile(TrainingProfile::Legacy)
+                .is_err());
+        }
+        req.config.resolution = 64;
+        assert_eq!(
+            job_policy(false, Workflow::PairedEdit, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+        assert_eq!(
+            job_policy(true, Workflow::Captioned, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+        req.config
+            .resolution_buckets
+            .push(candle_gen::gen_core::train::ResolutionBucket {
+                resolution: 64,
+                repeats: 1,
+            });
+        assert_eq!(
+            job_policy(true, Workflow::PairedEdit, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+        req.config.resolution_buckets.clear();
+        req.config
+            .aspect_ratio_buckets
+            .push(candle_gen::gen_core::train::AspectRatioBucket {
+                width: 64,
+                height: 64,
+                repeats: 1,
+            });
+        assert_eq!(
+            job_policy(true, Workflow::PairedEdit, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+        req.config.aspect_ratio_buckets.clear();
         req.config.full_finetune = true;
         assert_eq!(
-            for_native_mode(finite, Workflow::PairedEdit, &req).profile(),
+            job_policy(true, Workflow::PairedEdit, &req)
+                .unwrap()
+                .profile(),
             TrainingProfile::Current
         );
         req.config.full_finetune = false;
         req.config.network_type = candle_gen::gen_core::NetworkType::Lokr;
         assert_eq!(
-            for_native_mode(finite, Workflow::PairedEdit, &req).profile(),
+            job_policy(true, Workflow::PairedEdit, &req)
+                .unwrap()
+                .profile(),
             TrainingProfile::Current
         );
     }

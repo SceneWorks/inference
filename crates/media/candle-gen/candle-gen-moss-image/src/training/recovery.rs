@@ -75,7 +75,15 @@ pub(super) fn job_policy(
     req: &TrainingRequest,
 ) -> Result<JobTrainingPolicy> {
     let mut job = JobTrainingPolicy::resolve(model, cuda, req)?;
-    if req.config.network_type != gen_core::NetworkType::Lora {
+    // Only the measured fixed-square Base LoRA recipe may select a new arm.
+    // This guard must precede finite resume-profile selection below.
+    if model != "moss_image_base"
+        || req.config.resolution != 256
+        || !req.config.resolution_buckets.is_empty()
+        || !req.config.aspect_ratio_buckets.is_empty()
+        || req.config.full_finetune
+        || req.config.network_type != gen_core::NetworkType::Lora
+    {
         job = job.for_unmeasured_mode();
     }
     if req.config.resume {
@@ -460,5 +468,131 @@ mod native_profile_metadata_tests {
         );
         assert!(job_policy(MossImageVariant::Base.provider_id(), true, &req).is_err());
         assert!(job_policy(MossImageVariant::Base.provider_id(), false, &req).is_err());
+    }
+
+    #[test]
+    fn selected_base_256_scope_keeps_other_modes_resolutions_and_buckets_current() {
+        let (mut req, _, _, _) = fixture();
+        req.config.resolution = 256;
+        let base = MossImageVariant::Base.provider_id();
+        let job = job_policy(base, true, &req).unwrap();
+        assert_eq!(job.model(), base);
+        assert_eq!(job.profile(), TrainingProfile::WithoutE1);
+        policy::with_job_policy(job, || {
+            assert!(policy::legacy_e1());
+            assert!(policy::cache_enabled() && policy::projection_enabled());
+            policy::without_production_profile(|| {
+                assert_eq!(policy::active_profile(), TrainingProfile::Current);
+                assert!(!policy::legacy_e1());
+            });
+            assert_eq!(policy::active_profile(), TrainingProfile::WithoutE1);
+        });
+        for resolution in [0, 64, 255, 257, 512, 1024] {
+            req.config.resolution = resolution;
+            let outside = job_policy(base, true, &req).unwrap();
+            assert_eq!(outside.profile(), TrainingProfile::Current);
+            assert!(outside
+                .with_native_resume_profile(TrainingProfile::WithoutE1)
+                .is_err());
+        }
+        req.config.resolution = 256;
+        assert_eq!(
+            job_policy(base, false, &req).unwrap().profile(),
+            TrainingProfile::Current
+        );
+        assert_eq!(
+            job_policy(MossImageVariant::Sft.provider_id(), true, &req)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+        req.config
+            .resolution_buckets
+            .push(gen_core::train::ResolutionBucket {
+                resolution: 256,
+                repeats: 1,
+            });
+        assert_eq!(
+            job_policy(base, true, &req).unwrap().profile(),
+            TrainingProfile::Current
+        );
+        req.config.resolution_buckets.clear();
+        req.config
+            .aspect_ratio_buckets
+            .push(gen_core::train::AspectRatioBucket {
+                width: 256,
+                height: 256,
+                repeats: 1,
+            });
+        assert_eq!(
+            job_policy(base, true, &req).unwrap().profile(),
+            TrainingProfile::Current
+        );
+        req.config.aspect_ratio_buckets.clear();
+        req.config.full_finetune = true;
+        assert_eq!(
+            job_policy(base, true, &req).unwrap().profile(),
+            TrainingProfile::Current
+        );
+        req.config.full_finetune = false;
+        req.config.network_type = gen_core::NetworkType::Lokr;
+        assert_eq!(
+            job_policy(base, true, &req).unwrap().profile(),
+            TrainingProfile::Current
+        );
+    }
+
+    #[test]
+    fn selected_256_native_tag_and_historical_current_keep_original_identity() {
+        let (mut req, _, original_identity, _) = fixture();
+        req.config.resolution = 256;
+        let plan = DataPlan::new(&req, &[(256, 256)]).unwrap();
+        let original =
+            RunState::after_step(&req, &plan, &original_identity, 2, 2, 0, 0.25).unwrap();
+        let tagged = state_for_profile(&original, TrainingProfile::WithoutE1).unwrap();
+        let selected_dir = tempfile::tempdir().unwrap();
+        publish_mock(selected_dir.path(), &tagged);
+        req.output_dir = selected_dir.path().into();
+        req.config.resume = true;
+        let base = MossImageVariant::Base.provider_id();
+        assert_eq!(
+            job_policy(base, true, &req).unwrap().profile(),
+            TrainingProfile::WithoutE1
+        );
+        assert_eq!(
+            checked_state(
+                &tagged,
+                &req,
+                &plan,
+                &original_identity,
+                TrainingProfile::WithoutE1
+            )
+            .unwrap(),
+            original
+        );
+        assert!(job_policy(base, false, &req).is_err());
+        assert!(job_policy(MossImageVariant::Sft.provider_id(), true, &req).is_err());
+        req.config.resolution = 512;
+        assert!(job_policy(base, true, &req).is_err());
+        req.config.resolution = 256;
+        let old_dir = tempfile::tempdir().unwrap();
+        publish_mock(old_dir.path(), &original);
+        req.output_dir = old_dir.path().into();
+        assert_eq!(
+            job_policy(base, true, &req).unwrap().profile(),
+            TrainingProfile::Current
+        );
+        assert_eq!(
+            checked_state(
+                &original,
+                &req,
+                &plan,
+                &original_identity,
+                TrainingProfile::Current
+            )
+            .unwrap(),
+            original
+        );
+        assert_eq!(original.effective_identity, original_identity);
     }
 }

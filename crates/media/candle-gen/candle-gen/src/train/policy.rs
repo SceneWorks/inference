@@ -136,15 +136,15 @@ fn selected_profile(model: &str, cuda: bool) -> (&'static str, TrainingProfile) 
         "iris_3b" => ("iris_3b", TrainingProfile::WithoutE3),
         "iris_3b_restore" => ("iris_3b_restore", TrainingProfile::WithoutE3),
         "anima_base" => ("anima_base", TrainingProfile::WithoutE1),
+        "moss_image_base" => ("moss_image_base", TrainingProfile::WithoutE1),
+        "flux3_klein_base" => ("flux3_klein_base", TrainingProfile::Legacy),
         "kolors" => ("kolors", TrainingProfile::WithoutE3),
         "z_image_turbo" => ("z_image_turbo", TrainingProfile::WithoutE3),
         "ltx_2_5_distilled" => ("ltx_2_5_distilled", TrainingProfile::WithoutE2),
         "sd3_5_medium" => ("sd3_5_medium", TrainingProfile::Legacy),
-        // Known native owners awaiting measured adoption. Preserve their exact
-        // identity for native resume plumbing without selecting a new arm.
-        "moss_image_base" => ("moss_image_base", TrainingProfile::Current),
+        // Native owners retaining Current. Preserve their exact identity for
+        // native resume plumbing without selecting another arm.
         "moss_image_sft" => ("moss_image_sft", TrainingProfile::Current),
-        "flux3_klein_base" => ("flux3_klein_base", TrainingProfile::Current),
         "iris_3b_depth" => ("iris_3b_depth", TrainingProfile::Current),
         _ => ("unselected", TrainingProfile::Current),
     };
@@ -377,6 +377,8 @@ mod selector_metadata_tests {
             ("iris_3b", TrainingProfile::WithoutE3),
             ("iris_3b_restore", TrainingProfile::WithoutE3),
             ("anima_base", TrainingProfile::WithoutE1),
+            ("moss_image_base", TrainingProfile::WithoutE1),
+            ("flux3_klein_base", TrainingProfile::Legacy),
             ("kolors", TrainingProfile::WithoutE3),
             ("z_image_turbo", TrainingProfile::WithoutE3),
             ("ltx_2_5_distilled", TrainingProfile::WithoutE2),
@@ -685,12 +687,7 @@ mod selector_metadata_tests {
     #[test]
     fn pending_native_owners_keep_exact_identity_and_current_without_adoption() {
         let req = request(std::path::Path::new("unused-native-owner"));
-        for id in [
-            "moss_image_base",
-            "moss_image_sft",
-            "flux3_klein_base",
-            "iris_3b_depth",
-        ] {
+        for id in ["moss_image_sft", "iris_3b_depth"] {
             for cuda in [true, false] {
                 let job = JobTrainingPolicy::resolve(id, cuda, &req).unwrap();
                 assert_eq!(job.model(), id);
@@ -743,6 +740,8 @@ mod historical_acceptance_metadata_tests {
                         "iris_3b",
                         "iris_3b_restore",
                         "anima_base",
+                        "moss_image_base",
+                        "flux3_klein_base",
                         "ltx_2_5_distilled",
                         "sd3_5_medium",
                         "wan2_2_ti2v_5b",
