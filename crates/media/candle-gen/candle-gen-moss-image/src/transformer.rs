@@ -270,6 +270,9 @@ impl Norm {
         // (bfc367a631^), including its activation/FP32-island rounding below.
         let normalized = if candle_gen::train::policy::legacy_e1() {
             candle_gen::train::profile::cohort_reuse("moss:comparison-legacy-rms");
+            if candle_gen::train::comparison::active_stage().is_some() {
+                candle_gen::train::profile::cohort_reuse("comparison:e1-norm:legacy");
+            }
             let f = x.to_dtype(DType::F32)?;
             f.broadcast_mul(
                 &((f.sqr()?.mean_keepdim(candle_gen::candle_core::D::Minus1)? + 1e-6)?
