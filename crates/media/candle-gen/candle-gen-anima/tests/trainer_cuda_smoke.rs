@@ -162,7 +162,7 @@ fn anima_bounded_acceleration_acceptance() {
         comparison::with_stage(
             &root.join("comparison_metrics.json"),
             "anima_base",
-            ComparisonCadence::Ordinary,
+            ComparisonCadence::OrdinaryShort,
             || {
                 let snapshot = PathBuf::from(
                     std::env::var_os("ANIMA_TRAIN_SNAPSHOT").expect("installed snapshot"),
@@ -183,7 +183,7 @@ fn anima_bounded_acceleration_acceptance() {
                                 rank: 2,
                                 alpha: 2.,
                                 learning_rate: 1e-3,
-                                steps: 4,
+                                steps: ComparisonCadence::OrdinaryShort.updates(),
                                 resolution: 512,
                                 batch_size: 1,
                                 gradient_accumulation: 1,
@@ -204,7 +204,7 @@ fn anima_bounded_acceleration_acceptance() {
                         &mut |_| {},
                     )
                     .expect("joint DiT/conditioner comparison updates");
-                assert_eq!(output.steps, 4);
+                assert_eq!(output.steps, ComparisonCadence::OrdinaryShort.updates());
                 assert!(output.final_loss.is_finite());
                 assert!(output.adapter_path.is_file());
             },

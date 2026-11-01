@@ -63,7 +63,7 @@ class ComparisonContract(unittest.TestCase):
             for group, witnesses in zip(('e2', 'e3'), comparison._WITNESSES[plan['model']], strict=True):
                 if witnesses and plan['applicability'][group] and stage not in ('legacy', 'minus-' + group):
                     mechanism[witnesses[0]] = 2
-            candidate = int(stage == 'plus-streaming' and not (plan['cadence'] == 'iris-restoration' and i % 2 == 0))
+            candidate = int(stage == 'plus-streaming' and not (plan['cadence'] in ('iris-restoration', 'rest_recovery') and i % 2 == 0))
             value['steps'].append({'update': i, 'owner': owners[(i-1) % len(owners)], 'warmup': i <= warm,
                                    'seconds': 10., 'loss': 1. + i/100., 'finite_gradients': 3,
                                    'nonzero_gradients': 2, 'adapter_changed': True,
@@ -72,14 +72,63 @@ class ComparisonContract(unittest.TestCase):
             lines += [f'COHORT_UPDATE_START attempted_update={i}', f'COHORT_UPDATE_COMMITTED optimizer_updates={i}']
         return value, '\n'.join(lines) + '\n'
 
-    def test_exact_seventeen_plans_and_398_new_cap(self):
+    def test_exact_seventeen_plans_and_356_sourcebook_cap(self):
         self.assertEqual(len(self.cases), 17)
         plans = [comparison.spec(r) for r in self.cases.values()]
-        self.assertEqual(sum(x['max_physical_updates'] for x in plans), 398)
+        self.assertEqual(sum(x['max_physical_updates'] for x in plans), 356)
         self.assertFalse(any('minus-reference-owner' in p['stages'] for p in plans))
-        self.assertEqual(comparison.spec(self.cases['iris-depth'])['stages'], ['legacy', 'current', 'plus-streaming'])
+        self.assertEqual(comparison.spec(self.cases['iris-depth'])['stages'], ['legacy', 'current'])
         self.assertNotIn('minus-e3', comparison.spec(self.cases['lens'])['stages'])
         self.assertNotIn('plus-streaming', comparison.spec(self.cases['z_image_turbo'])['stages'])
+
+    def test_failed_case_recovery_budgets_and_strict_owner_cadences(self):
+        for model,cadence,count,warm,cap,total in [
+            ('anima_base','ordinary_short',2,1,12,20),
+            ('flux3','ordinary_short',2,1,12,20),
+            ('iris-depth','depth_recovery',2,1,4,12),
+            ('iris-restoration','rest_recovery',6,2,30,38)]:
+            base,request=self.request(model)
+            plan=comparison.validate_request((base,),request,'candle-cuda')
+            self.assertEqual((plan['cadence'],plan['updates_per_stage'],plan['warmups_per_stage'],plan['max_physical_updates']),(cadence,count,warm,cap))
+            self.assertEqual(plan['recovery_budget']['retained_conservative_charge'],8)
+            self.assertEqual(plan['recovery_budget']['cumulative_model_max'],total)
+            for stage in plan['stages']:
+                row=self.row(model,stage);metrics,text=self.fixture(row)
+                result=comparison.verify_metrics(row,metrics,text)
+                self.assertEqual(result['physical_updates'],count)
+                if count==2:
+                    self.assertIsNone(result['sample_stdev_seconds'])
+                    self.assertTrue(all(t['sample_stdev_seconds'] is None for t in result['per_owner_timings'].values()))
+                for change in (lambda m:m['comparison'].update(physical_commits=count+1),
+                               lambda m:m['steps'][-1].update(warmup=True),
+                               lambda m:m['steps'][-1].update(owner='foreign-owner')):
+                    wrong=copy.deepcopy(metrics);change(wrong)
+                    with self.assertRaises(ValueError):comparison.verify_metrics(row,wrong,text)
+                with self.assertRaises(ValueError):comparison.verify_metrics(row,metrics,text+f'COHORT_UPDATE_START attempted_update={count+1}\n')
+        depth=comparison.spec(self.cases['iris-depth'])
+        self.assertTrue(depth['applicability']['streaming_candidate'])
+        self.assertEqual(depth['deferred_applicable_stages'],['plus-streaming'])
+        with self.assertRaises(ValueError):self.row('iris-depth','plus-streaming')
+        self.assertEqual(316+18+12+12+4+30,392)
+
+    def test_iris_frozen_readers_are_exact_successful_source_boundaries(self):
+        from scripts.ci import model_proof_inputs as inputs
+        row=self.row('iris-restoration')
+        inputs.validate_contract(row,required=True)
+        root=Path(__file__).resolve().parents[2]
+        source=root/'crates/media/candle-gen/candle-gen-iris/src/train/frozen_cache.rs'
+        text=source.read_text(encoding='utf-8')
+        catalogue=json.loads((root/'scripts/ci/model-input-readers.json').read_text(encoding='utf-8'))
+        extension=catalogue['source_contract_extension']
+        for role in ('convnext','vgg','lpips'):
+            reader=f'candle-gen-iris::train::frozen_cache::{role}_native_store'
+            self.assertEqual(inputs.READERS[reader],'tensor-input')
+            self.assertIn('"'+reader+'",\n                TensorInput,',text)
+            self.assertEqual(extension['exact_successful_boundaries'][reader]['source_sha256'],hashlib.sha256(source.read_bytes()).hexdigest())
+            wrong=copy.deepcopy(row)
+            slot=next(x for x in wrong['input_contract']['requirements'] if reader in x['readers'])
+            slot['readers']=[reader+'-invented']
+            with self.assertRaisesRegex(ValueError,'exact successful source boundary'):inputs.validate_contract(wrong,required=True)
 
     def test_moss_recovery_keeps_six_short_single_owner_arms(self):
         base,request=self.request('moss')

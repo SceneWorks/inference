@@ -237,7 +237,7 @@ fn compute_step_loss_grads(
         mae,
         dtype,
         aux,
-        true,
+        candle_gen::train::policy::cache_enabled(),
     )
 }
 

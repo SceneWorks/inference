@@ -47,13 +47,13 @@ _CASES = {
     'sdxl_bounded_acceleration_acceptance': ('sdxl', 'ordinary', True, True, True),
     'kolors_bounded_acceleration_acceptance': ('kolors', 'ordinary', True, True, True),
     'sd35_medium_bounded_acceleration_acceptance': ('sd3_5_medium', 'ordinary', True, True, True),
-    'anima_bounded_acceleration_acceptance': ('anima_base', 'ordinary', True, True, True),
+    'anima_bounded_acceleration_acceptance': ('anima_base', 'ordinary_short', True, True, True),
     'moss_bounded_acceleration_acceptance': ('moss', 'moss_recovery', True, True, True),
     'mage_bounded_acceleration_acceptance': ('mage-adapter', 'ordinary', True, True, True),
-    'flux3_bounded_acceleration_acceptance': ('flux3', 'ordinary', True, True, True),
+    'flux3_bounded_acceleration_acceptance': ('flux3', 'ordinary_short', True, True, True),
     'iris_generation_bounded_acceleration_acceptance': ('iris-generation', 'ordinary', False, True, True),
-    'iris_depth_bounded_acceleration_acceptance': ('iris-depth', 'ordinary', False, False, True),
-    'iris_restoration_bounded_acceleration_acceptance': ('iris-restoration', 'iris-restoration', False, True, True),
+    'iris_depth_bounded_acceleration_acceptance': ('iris-depth', 'depth_recovery', False, False, True),
+    'iris_restoration_bounded_acceleration_acceptance': ('iris-restoration', 'rest_recovery', False, True, True),
 }
 
 # These are consuming branches, not preparation counters. Pre-existing caches,
@@ -87,7 +87,7 @@ def spec(row: dict) -> dict:
     provider = case_manifest(row)
     if provider['model_id'] != model:
         raise ValueError('provider/core comparison model identity mismatch')
-    updates, warmups = {'ordinary': (4, 1), 'moss_recovery': (3, 1), 'wan-dual': (6, 2), 'iris-restoration': (8, 2)}[cadence]
+    updates, warmups = {'ordinary': (4, 1), 'moss_recovery': (3, 1), 'ordinary_short': (2, 1), 'depth_recovery': (2, 1), 'rest_recovery': (6, 2), 'wan-dual': (6, 2), 'iris-restoration': (8, 2)}[cadence]
     stages = [s for s in STAGES if not (
         s == 'minus-e1' and not e1 or s == 'minus-e3' and not e3
         or s == 'minus-reference-owner' or s == 'plus-streaming' and not e4)]
@@ -101,6 +101,10 @@ def spec(row: dict) -> dict:
             seen.add(key)
             distinct.append(stage)
     stages = distinct
+    if cadence == 'depth_recovery':
+        # E4 is still source eligible; the remaining family allowance covers
+        # only this fresh total-effect pair. Do not relabel omitted E4 as N/A.
+        stages = ['legacy', 'current']
     if (provider['stages'] != stages or provider['updates_per_stage'] != updates
             or provider['warmups_per_stage'] != warmups or provider['max_new_updates'] != updates * len(stages)):
         raise ValueError('provider/core stage applicability or physical cadence mismatch')
@@ -120,11 +124,12 @@ def spec(row: dict) -> dict:
             'case_deadline_seconds': provider.get('case_deadline_seconds', 3600),
             'immutable_frozen_bootstrap': provider.get('immutable_frozen_bootstrap'),
             'recovery_budget': provider.get('recovery_budget'),
+            'deferred_applicable_stages': ['plus-streaming'] if cadence == 'depth_recovery' else [],
             'source_manifest_sha256': file_digest(Path(__file__).with_name('training-comparison-cases.json')),
             'baseline_scope': 'legacy optimization control with constant correctness repairs; not a historical whole binary',
             'sample_scope': 'zero new quality samples; existing quality evidence remains separate',
             'comparison_scope': 'conditional leave-one-group-out effects; not additive independent contributions; shared-GPU serial timing',
-            'noise_scope': ('one counted warmup and two timed updates per MOSS recovery arm; small sample and order/interference uncertainty' if cadence == 'moss_recovery' else 'one counted warmup per owner; three ordinary/restoration timed updates or cycles, two per Wan expert; small sample and order/interference uncertainty')}
+            'noise_scope': ('one counted warmup and one timed update per owner; no sample variance estimate, strong order/interference uncertainty' if cadence in ('ordinary_short', 'depth_recovery') else 'one warm G+D cycle and two timed G+D cycles; small sample/order/interference uncertainty' if cadence == 'rest_recovery' else 'one counted warmup and two timed updates per MOSS recovery arm; small sample and order/interference uncertainty' if cadence == 'moss_recovery' else 'one counted warmup per owner; three ordinary/restoration timed updates or cycles, two per Wan expert; small sample and order/interference uncertainty')}
 
 
 def is_recipe(name: object) -> bool:
@@ -297,7 +302,7 @@ def verify_metrics(row: dict, metrics: dict, text: str) -> dict:
             raise ValueError('invalid actual step/gradient/timing/owner witness')
         owners.append(step['owner'])
         candidate, reference = step.get('attention_candidate'), step.get('attention_reference')
-        critic_only = plan['cadence'] == 'iris-restoration' and i % 2 == 0
+        critic_only = plan['cadence'] in ('iris-restoration', 'rest_recovery') and i % 2 == 0
         if any(type(x) is not int or x < 0 for x in (candidate, reference)) or (stage != 'plus-streaming' and candidate != 0) or (stage == 'plus-streaming' and not critic_only and candidate <= 0):
             raise ValueError('requested attention mechanism was not actually selected')
         mechanisms = step.get('mechanism_consumption')
@@ -318,9 +323,9 @@ def verify_metrics(row: dict, metrics: dict, text: str) -> dict:
     declared_owners = declared_owners if isinstance(declared_owners, list) else [declared_owners]
     if unique != declared_owners:
         raise ValueError('actual optimizer owner identity differs from source provider manifest')
-    if plan['cadence'] in ('ordinary', 'moss_recovery') and len(unique) != 1:
+    if plan['cadence'] in ('ordinary', 'moss_recovery', 'ordinary_short', 'depth_recovery') and len(unique) != 1:
         raise ValueError('ordinary stage changed optimizer owner')
-    if plan['cadence'] in ('wan-dual', 'iris-restoration'):
+    if plan['cadence'] in ('wan-dual', 'iris-restoration', 'rest_recovery'):
         expected_each = n // 2
         if len(unique) != 2 or owners[:2] != unique or any(owners.count(o) != expected_each for o in unique) or any(owners[i] != unique[i % 2] for i in range(n)):
             raise ValueError('dual-owner warm/timed update cycles incomplete')
@@ -340,11 +345,11 @@ def verify_metrics(row: dict, metrics: dict, text: str) -> dict:
                      for owner in unique}
     for timings in owner_timings.values():
         timings['mean_seconds'] = statistics.mean(timings['timed_seconds'])
-        timings['sample_stdev_seconds'] = statistics.stdev(timings['timed_seconds'])
+        timings['sample_stdev_seconds'] = statistics.stdev(timings['timed_seconds']) if len(timings['timed_seconds']) > 1 else None
     return {'stage': stage, 'physical_updates': n, 'owners': owners,
             'timed_seconds': timed, 'mean_seconds': statistics.mean(timed),
             'median_seconds': statistics.median(timed), 'min_seconds': min(timed),
-            'max_seconds': max(timed), 'sample_stdev_seconds': statistics.stdev(timed),
+            'max_seconds': max(timed), 'sample_stdev_seconds': statistics.stdev(timed) if len(timed) > 1 else None,
             'sample_stdev_scope': 'Timed physical updates; multi-owner stages mix different operations. Per-owner samples are separate; no statistical confidence claim',
             'per_owner_timings': owner_timings,
             'preparation_seconds': metrics['preparation_including_load_cache_seconds'],

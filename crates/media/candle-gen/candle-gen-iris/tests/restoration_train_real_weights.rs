@@ -431,7 +431,7 @@ fn bounded_export_receipt(root: &std::path::Path, path: &std::path::Path) {
 fn iris_restoration_bounded_acceleration_acceptance() {
     let root = bounded_root();
     let comparison = candle_gen::train::comparison::requested_stage().is_some();
-    let cadence = candle_gen::train::comparison::ComparisonCadence::IrisRestoration;
+    let cadence = candle_gen::train::comparison::ComparisonCadence::RestRecovery;
     let steps = if comparison { cadence.updates() } else { 4 };
     // One source-owned representative workload, never a resolution grid. The
     // controller must admit the worst legacy arm before executing any stage.

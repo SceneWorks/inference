@@ -457,7 +457,7 @@ fn flux3_bounded_acceleration_acceptance() {
     use gen_core_flux3::training::options::OPTIONS_KEY;
     let root = bounded_root();
     let comparison = candle_gen::train::comparison::requested_stage().is_some();
-    let cadence = candle_gen::train::comparison::ComparisonCadence::Ordinary;
+    let cadence = candle_gen::train::comparison::ComparisonCadence::OrdinaryShort;
     let steps = if comparison { cadence.updates() } else { 4 };
     // One source-owned representative workload, never a resolution grid. The
     // controller must admit the worst legacy arm before executing any stage.

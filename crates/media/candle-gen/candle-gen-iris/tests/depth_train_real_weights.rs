@@ -296,7 +296,7 @@ fn bounded_export_receipt(root: &std::path::Path, path: &std::path::Path) {
 fn iris_depth_bounded_acceleration_acceptance() {
     let root = bounded_root();
     let comparison = candle_gen::train::comparison::requested_stage().is_some();
-    let cadence = candle_gen::train::comparison::ComparisonCadence::Ordinary;
+    let cadence = candle_gen::train::comparison::ComparisonCadence::DepthRecovery;
     let steps = if comparison { cadence.updates() } else { 4 };
     // One source-owned representative workload, never a resolution grid. The
     // controller must admit the worst legacy arm before executing any stage.
@@ -388,6 +388,68 @@ fn comparison_input_sha256(path: &std::path::Path) -> String {
 }
 
 #[cfg(feature = "model-inference-proof")]
+fn comparison_sidecar_with(
+    value: &serde_json::Value,
+    fingerprint: &impl Fn(&str) -> Option<String>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(path) => fingerprint(path)
+            .map(|sha| serde_json::json!({"file_sha256":sha}))
+            .unwrap_or_else(|| value.clone()),
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), comparison_sidecar_with(value, fingerprint)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| comparison_sidecar_with(item, fingerprint))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+#[cfg(feature = "model-inference-proof")]
+fn comparison_sidecar(value: &serde_json::Value) -> serde_json::Value {
+    comparison_sidecar_with(value, &|path| {
+        std::path::Path::new(path)
+            .is_file()
+            .then(|| comparison_input_sha256(std::path::Path::new(path)))
+    })
+}
+
+// Pure nested metadata; no tensor, model, device, optimizer or file conversion.
+#[test]
+#[cfg(feature = "model-inference-proof")]
+fn comparison_depth_sidecar_preserves_nested_content_and_options() {
+    let sha = "a".repeat(64);
+    let fingerprint = |path: &str| match path {
+        "stage-a/depth.npy" | "stage-b/depth.npy" => Some(sha.clone()),
+        "changed/depth.npy" => Some("b".repeat(64)),
+        _ => None,
+    };
+    let item = |path: &str, scale: u32| serde_json::json!({"depth":{"path":path,"scale":scale},"other":["native",7]});
+    let a = comparison_sidecar_with(&item("stage-a/depth.npy", 1), &fingerprint);
+    assert_eq!(
+        a,
+        comparison_sidecar_with(&item("stage-b/depth.npy", 1), &fingerprint)
+    );
+    assert_ne!(
+        a,
+        comparison_sidecar_with(&item("changed/depth.npy", 1), &fingerprint)
+    );
+    assert_ne!(
+        a,
+        comparison_sidecar_with(&item("stage-a/depth.npy", 2), &fingerprint)
+    );
+    assert_eq!(a["other"], serde_json::json!(["native", 7]));
+    assert_eq!(a["depth"]["path"]["file_sha256"], sha);
+}
+
+#[cfg(feature = "model-inference-proof")]
 fn comparison_initialization(
     config: &candle_gen::gen_core::TrainingConfig,
     items: &[candle_gen::gen_core::TrainingItem],
@@ -395,10 +457,7 @@ fn comparison_initialization(
 ) {
     let data = items.iter().map(|item| {
         let sidecars = item.model_options.iter().map(|(key,value)| {
-            let value = if let Some(path) = value.as_str().filter(|path| std::path::Path::new(path).is_file()) {
-                serde_json::json!({"file_sha256":comparison_input_sha256(std::path::Path::new(path))})
-            } else { value.clone() };
-            (key.clone(),value)
+            (key.clone(),comparison_sidecar(value))
         }).collect::<serde_json::Map<String,serde_json::Value>>();
         serde_json::json!({"image_sha256":comparison_input_sha256(&item.image_path),
             "caption":item.caption,"sidecars":sidecars,

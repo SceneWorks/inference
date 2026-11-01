@@ -919,9 +919,9 @@
       "not_applicable": [
         "minus-reference-owner"
       ],
-      "updates_per_stage": 4,
+      "updates_per_stage": 2,
       "warmups_per_stage": 1,
-      "max_new_updates": 24,
+      "max_new_updates": 12,
       "workload": {
         "resolution": 512,
         "rank": 2,
@@ -965,7 +965,19 @@
         "anima-trainer-roundtrip-tensors",
         "anima-generated-adapter-install"
       ],
-      "constant_repairs": []
+      "constant_repairs": [
+        "E2-off retains correct native per-forward RoPE construction; prepared-cache assertion applies only to E2-on."
+      ],
+      "recovery_budget": {
+        "original_source": "ce37f3d054136b0298cb38e07185e095200f6b39",
+        "original_failed_run": 41238166936,
+        "retained_conservative_charge": 8,
+        "original_model_cap": 24,
+        "maximum_new_physical_updates": 12,
+        "cumulative_model_max": 20,
+        "automatic_retry": false,
+        "unused_allowance_nontransferable": 4
+      }
     },
     {
       "package": "candle-gen-moss-image",
@@ -1231,9 +1243,9 @@
       "not_applicable_reasons": {
         "minus-reference-owner": "N-A: provider plain composable fallback or preexisting Irisfold3; no new shared bounded ReferenceOwner is called."
       },
-      "updates_per_stage": 4,
+      "updates_per_stage": 2,
       "warmups_per_stage": 1,
-      "max_new_updates": 24,
+      "max_new_updates": 12,
       "workload": {
         "resolution": 512,
         "batch_size": 1,
@@ -1305,7 +1317,8 @@
       ],
       "dropped_quality_only_slots": [],
       "constant_repairs": [
-        "Existing current correctness/reader/device/safety bounds remain common."
+        "Existing current correctness/reader/device/safety bounds remain common.",
+        "Supervisor retains original fault and verified owned-Job cleanup only; no math/fit change or invented cause from old missing seal."
       ],
       "initial_state_basis": "Fresh same-binary child/native factory. Actual configuration/data hashes plus shared optimizer/parameter initialization receipts; Iris also hashes privateparams/EMA/optimizer/critic/SN buffers before any update.",
       "runtime_directory": "Iris requires new owned BESPOKE_RUNTIME_DIR subdirectory with authoritative .sc-26850-owned-runtime marker; no stage reuses prior checkpoints.",
@@ -1314,7 +1327,17 @@
       "candidate_required_owners": [
         "flux3"
       ],
-      "case_deadline_seconds": 3600
+      "case_deadline_seconds": 3600,
+      "recovery_budget": {
+        "original_source": "ce37f3d054136b0298cb38e07185e095200f6b39",
+        "original_failed_run": 41238174846,
+        "retained_conservative_charge": 8,
+        "original_model_cap": 24,
+        "maximum_new_physical_updates": 12,
+        "cumulative_model_max": 20,
+        "automatic_retry": false,
+        "unused_allowance_nontransferable": 4
+      }
     },
     {
       "package": "candle-gen-iris",
@@ -1460,8 +1483,7 @@
       ],
       "stages": [
         "legacy",
-        "current",
-        "plus-streaming"
+        "current"
       ],
       "not_applicable": [
         "minus-reference-owner",
@@ -1475,9 +1497,9 @@
         "minus-e3": "N-A: full tracked backbone/reducer cannot frozenpack.",
         "minus-e2": "IDENTICAL legacy: E1/E3/newRefOwner N-A, only newE2 differs; deduplicate to legacy."
       },
-      "updates_per_stage": 4,
+      "updates_per_stage": 2,
       "warmups_per_stage": 1,
-      "max_new_updates": 12,
+      "max_new_updates": 4,
       "workload": {
         "resolution": 512,
         "batch_size": 1,
@@ -1551,7 +1573,8 @@
         "iris-depth-export-roundtrip-model"
       ],
       "constant_repairs": [
-        "Existing current correctness/reader/device/safety bounds remain common."
+        "Existing current correctness/reader/device/safety bounds remain common.",
+        "Canonical depth sidecar identifies actual nested input file content, preserving all options and strict state equality."
       ],
       "initial_state_basis": "Fresh same-binary child/native factory. Actual configuration/data hashes plus shared optimizer/parameter initialization receipts; Iris also hashes privateparams/EMA/optimizer/critic/SN buffers before any update.",
       "runtime_directory": "Iris requires new owned BESPOKE_RUNTIME_DIR subdirectory with authoritative .sc-26850-owned-runtime marker; no stage reuses prior checkpoints.",
@@ -1560,7 +1583,18 @@
       "candidate_required_owners": [
         "iris-depth"
       ],
-      "case_deadline_seconds": 3600
+      "case_deadline_seconds": 3600,
+      "applicability_note": "Recovery budget permits matched legacy/current only. E4 remains source eligible but is not rerun/measured in this recovery.",
+      "recovery_budget": {
+        "original_source": "ce37f3d054136b0298cb38e07185e095200f6b39",
+        "original_failed_run": 41238179924,
+        "retained_conservative_charge": 8,
+        "original_model_cap": 12,
+        "maximum_new_physical_updates": 4,
+        "cumulative_model_max": 12,
+        "automatic_retry": false,
+        "unused_allowance_nontransferable": 0
+      }
     },
     {
       "package": "candle-gen-iris",
@@ -1586,9 +1620,9 @@
         "minus-reference-owner": "N-A: provider plain composable fallback or preexisting Irisfold3; no new shared bounded ReferenceOwner is called.",
         "minus-e1": "N-A/preexisting factor scale and differentiable fold3 norm retained."
       },
-      "updates_per_stage": 8,
+      "updates_per_stage": 6,
       "warmups_per_stage": 2,
-      "max_new_updates": 40,
+      "max_new_updates": 30,
       "workload": {
         "resolution": 512,
         "batch_size": 1,
@@ -1713,7 +1747,8 @@
       "dropped_quality_only_slots": [],
       "constant_repairs": [
         "Existing current correctness/reader/device/safety bounds remain common.",
-        "Comparison-only source/run/case-owned immutable raw ConvNeXt/LPIPS decoding bootstrap identical in all five arms, independent of E2. No mutable Run/optimizer/EMA/critic/SN or stage-dependent projection/geometry pack is reused. Original noncomparison frozen readers remain unchanged."
+        "Comparison-only source/run/case-owned immutable raw ConvNeXt/LPIPS decoding bootstrap identical in all five arms, independent of E2. No mutable Run/optimizer/EMA/critic/SN or stage-dependent projection/geometry pack is reused. Original noncomparison frozen readers remain unchanged.",
+        "Exact successful frozen-cache TensorInput source reader catalogue definitions; no omitted mandatory reader."
       ],
       "initial_state_basis": "Fresh same-binary child/native factory. Actual configuration/data hashes plus shared optimizer/parameter initialization receipts; Iris also hashes privateparams/EMA/optimizer/critic/SN buffers before any update.",
       "runtime_directory": "Iris requires new owned BESPOKE_RUNTIME_DIR subdirectory with authoritative .sc-26850-owned-runtime marker; no stage reuses prior checkpoints.",
@@ -1741,7 +1776,17 @@
         "whole_model_byte_attestation": false
       },
       "case_deadline_seconds": 7200,
-      "deadline_scope": "ONE absolute model-case deadline including readiness/first bootstrap/all five children/finalization; never reset per stage"
+      "deadline_scope": "ONE absolute model-case deadline including readiness/first bootstrap/all five children/finalization; never reset per stage",
+      "recovery_budget": {
+        "original_source": "ce37f3d054136b0298cb38e07185e095200f6b39",
+        "original_failed_run": 41238182590,
+        "retained_conservative_charge": 8,
+        "original_model_cap": 40,
+        "maximum_new_physical_updates": 30,
+        "cumulative_model_max": 38,
+        "automatic_retry": false,
+        "unused_allowance_nontransferable": 2
+      }
     }
   ]
 }
