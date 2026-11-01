@@ -1839,5 +1839,136 @@
         "unused_allowance_nontransferable": 2
       }
     }
+  ],
+  "effective_budget_amendments": [
+    {
+      "amendment_id": "sc-26850-actual-final-414-2026-11-01",
+      "kind": "completed-user-authorized-effective-budget-amendment",
+      "historical_sourcebook_commit": "c75fe5fa74035a8c4a8654ffa55dfd95a2dac36e",
+      "historical_sourcebook_git_lf_sha256": "497483724388f135058d681c8a05271f085f5912bb52d7677d5447a8ac659ac9",
+      "history_preserved": "All original17 entry objects, pending proposals, original caps and failed-attempt flags remain unchanged. This later amendment records actual authority/results; it does not retroactively approve previous failures.",
+      "authorization": {
+        "verbatim_user_reply": "Go ahead with the remaining three runs and 28 updates. Raise the total cap to 414, allow the family-cap exceptions, and finish the epic.",
+        "received_at_utc": "2026-11-01T10:19:41.787928+00:00",
+        "capture_identity_scope": "Root local transcript capture; not a claimed server message ID",
+        "authorization_record_sha256": "d344a27ed6724e212a929b9574583190ca8c0096fa8726f44f9ad0b9863f2f70",
+        "question_capture_sha256": "67cb6452266043674add9d174c4ec12f0cd17aab7846d1e4db6071865beae4ef",
+        "reply_capture_sha256": "a515e240b8ddfd7697bc619874a1a1b7ec48d13abed579acf94a80471a12fec0",
+        "proposal_sha256": "2f9364f2bd0432e78c79cda9589b13820ec890f1e74c41bb7eb283b6680a5c2b",
+        "original_global_cap": 404,
+        "authorized_effective_global_cap": 414,
+        "additional_global_allowance": 10,
+        "family_caps": {
+          "flux3": {
+            "original": 24,
+            "effective": 34,
+            "exception": 10
+          },
+          "moss": {
+            "original": 24,
+            "effective": 28,
+            "exception": 4
+          },
+          "iris-depth": {
+            "original": 12,
+            "effective": 14,
+            "exception": 2
+          }
+        }
+      },
+      "actual_final_evidence": {
+        "report_kind": "READ_ONLY_NEW17_COMPARISON_INGEST",
+        "report_file": "comparison-results-final-three-414-iris-depth-41297158841-1/results.json",
+        "report_sha256": "3db6eeb22a10cc41c3999b32af2984351d99fbc50f9188962171f08271f2f30f",
+        "effective_budget_file": "final-three-414-effective-budget-FINAL.json",
+        "effective_budget_sha256": "a19f7ebc5ecd0037dc7b0f806ed868535152da3eda99afcfc5b410c89a214026",
+        "observations": 28,
+        "complete_experiments": 17,
+        "qualified_reference_update_timing_wins": 15,
+        "legacy_fallbacks_without_qualified_improvement": 2,
+        "actual_conservative_charge": 414,
+        "complete_attempt_starts": 350,
+        "complete_attempt_commits": 350,
+        "all_attempt_observed_starts": 394,
+        "all_attempt_observed_commits": 390,
+        "failed_attempt_conservative_charge": 64,
+        "original_global_cap_exceeded": true,
+        "original_family_cap_exceeded_models": [
+          "moss",
+          "flux3",
+          "iris-depth"
+        ],
+        "remaining_campaign_updates": 0,
+        "pending_reserved_updates": 0
+      },
+      "completed_final_attempts": [
+        {
+          "model_id": "flux3",
+          "measurement_producer": "c75fe5fa74035a8c4a8654ffa55dfd95a2dac36e",
+          "run_id": "41297127692",
+          "attempt": 1,
+          "workflow_url": "https://github.com/SceneWorks/inference/actions/runs/41297127692",
+          "artifact_id": 13080377076,
+          "original_verifier_accepted": true,
+          "receipt_sha256_before_and_after": "49b6bee147ed8c388084faf55d18c06b0ff51d00b443883217ed3fa7fb14d958",
+          "actual_new_updates": 12,
+          "observed_starts": 12,
+          "observed_commits": 12,
+          "retained_before_this_attempt": 22,
+          "actual_cumulative_conservative_charge": 34,
+          "original_family_cap": 24,
+          "authorized_effective_family_cap": 34,
+          "original_family_cap_exceeded": true
+        },
+        {
+          "model_id": "moss",
+          "measurement_producer": "c75fe5fa74035a8c4a8654ffa55dfd95a2dac36e",
+          "run_id": "41297143598",
+          "attempt": 1,
+          "workflow_url": "https://github.com/SceneWorks/inference/actions/runs/41297143598",
+          "artifact_id": 13080800742,
+          "original_verifier_accepted": true,
+          "receipt_sha256_before_and_after": "8db00bed16c26fb6230b2efbdd245f85e3b53fac90d1f6899223067ee124cf0a",
+          "actual_new_updates": 12,
+          "observed_starts": 12,
+          "observed_commits": 12,
+          "retained_before_this_attempt": 16,
+          "actual_cumulative_conservative_charge": 28,
+          "original_family_cap": 24,
+          "authorized_effective_family_cap": 28,
+          "original_family_cap_exceeded": true
+        },
+        {
+          "model_id": "iris-depth",
+          "measurement_producer": "c75fe5fa74035a8c4a8654ffa55dfd95a2dac36e",
+          "run_id": "41297158841",
+          "attempt": 1,
+          "workflow_url": "https://github.com/SceneWorks/inference/actions/runs/41297158841",
+          "artifact_id": 13080489577,
+          "original_verifier_accepted": true,
+          "receipt_sha256_before_and_after": "ac204ea548a80e59e1b9d3f55e0e6e41dc6b6cf43e625679646d6a635a33331d",
+          "actual_new_updates": 4,
+          "observed_starts": 4,
+          "observed_commits": 4,
+          "retained_before_this_attempt": 10,
+          "actual_cumulative_conservative_charge": 14,
+          "original_family_cap": 12,
+          "authorized_effective_family_cap": 14,
+          "original_family_cap_exceeded": true
+        }
+      ],
+      "scope_clarifications": [
+        "These17 comparative families are separate from19 historical functional implementation rows.",
+        "MOSS final C75 case is six2-update arms (one warm/one timed each); the older six3-update recovery description remains historical.",
+        "FLUX3 final case is64px PairedEdit; old512px attempts retain their original workload/charge/failure scope.",
+        "Depth measures only Legacy/Current; streaming remains eligible but not remeasured in this recovery.",
+        "Original model-level campaign workload snapshots do not replace per-attempt source_workload/source_plan."
+      ],
+      "summary_document": "docs/diagnostics/sc-26850-training-comparison-results.md",
+      "dispatch_authorized_by_amendment": false,
+      "automatic_retry": false,
+      "intermodel_transfer": false,
+      "further_training_requires_new_explicit_authorization": true
+    }
   ]
 }
