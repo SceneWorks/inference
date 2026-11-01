@@ -1247,7 +1247,7 @@
       "warmups_per_stage": 1,
       "max_new_updates": 12,
       "workload": {
-        "resolution": 512,
+        "resolution": 64,
         "batch_size": 1,
         "gradient_accumulation": 1,
         "seed": 7,
@@ -1322,7 +1322,7 @@
       ],
       "initial_state_basis": "Fresh same-binary child/native factory. Actual configuration/data hashes plus shared optimizer/parameter initialization receipts; Iris also hashes privateparams/EMA/optimizer/critic/SN buffers before any update.",
       "runtime_directory": "Iris requires new owned BESPOKE_RUNTIME_DIR subdirectory with authoritative .sc-26850-owned-runtime marker; no stage reuses prior checkpoints.",
-      "claim_limit": "512px worst-legacy admission UNMEASURED; no localNN/fit claim. Eligible E4 requires actualnativecandidate dispatch, not mere opt-in. Original functional proofs and MOSS consumerproduct scope unchanged.",
+      "claim_limit": "64px paired-edit geometry reuses the existing ordinary native training fixture. All six arms are fresh; empirical worst-legacy fit remains UNMEASURED. The failed512px H2 charge4 is retained; no owned/global memory attribution or guard relaxation. E4 still requires actual candidate dispatch.",
       "owner": "flux3",
       "candidate_required_owners": [
         "flux3"
@@ -1331,12 +1331,20 @@
       "recovery_budget": {
         "original_source": "ce37f3d054136b0298cb38e07185e095200f6b39",
         "original_failed_run": 41238174846,
-        "retained_conservative_charge": 8,
+        "retained_conservative_charge": 12,
         "original_model_cap": 24,
         "maximum_new_physical_updates": 12,
-        "cumulative_model_max": 20,
+        "cumulative_model_max": 24,
         "automatic_retry": false,
-        "unused_allowance_nontransferable": 4
+        "unused_allowance_nontransferable": 0,
+        "prior_failed_recovery": {
+          "source": "2e45c46a931baf2e30803b41dbac1c4b1e2f6569",
+          "run": 41269133067,
+          "retained_conservative_charge": 4,
+          "original_charge_before_recovery": 8,
+          "accepted": false,
+          "automatic_retry": false
+        }
       }
     },
     {

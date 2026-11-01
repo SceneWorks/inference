@@ -82,15 +82,15 @@ class ComparisonContract(unittest.TestCase):
         self.assertNotIn('plus-streaming', comparison.spec(self.cases['z_image_turbo'])['stages'])
 
     def test_failed_case_recovery_budgets_and_strict_owner_cadences(self):
-        for model,cadence,count,warm,cap,total in [
-            ('anima_base','ordinary_short',2,1,12,20),
-            ('flux3','ordinary_short',2,1,12,20),
-            ('iris-depth','depth_recovery',2,1,4,12),
-            ('iris-restoration','rest_recovery',6,2,30,38)]:
+        for model,cadence,count,warm,cap,retained,total in [
+            ('anima_base','ordinary_short',2,1,12,8,20),
+            ('flux3','ordinary_short',2,1,12,12,24),
+            ('iris-depth','depth_recovery',2,1,4,8,12),
+            ('iris-restoration','rest_recovery',6,2,30,8,38)]:
             base,request=self.request(model)
             plan=comparison.validate_request((base,),request,'candle-cuda')
             self.assertEqual((plan['cadence'],plan['updates_per_stage'],plan['warmups_per_stage'],plan['max_physical_updates']),(cadence,count,warm,cap))
-            self.assertEqual(plan['recovery_budget']['retained_conservative_charge'],8)
+            self.assertEqual(plan['recovery_budget']['retained_conservative_charge'],retained)
             self.assertEqual(plan['recovery_budget']['cumulative_model_max'],total)
             for stage in plan['stages']:
                 row=self.row(model,stage);metrics,text=self.fixture(row)
@@ -109,7 +109,33 @@ class ComparisonContract(unittest.TestCase):
         self.assertTrue(depth['applicability']['streaming_candidate'])
         self.assertEqual(depth['deferred_applicable_stages'],['plus-streaming'])
         with self.assertRaises(ValueError):self.row('iris-depth','plus-streaming')
-        self.assertEqual(316+18+12+12+4+30,392)
+        self.assertEqual(316+18+12+(4+12)+4+30,396)
+
+    def test_flux_fixed_64_edit_workload_rebinds_plan_and_initial_input_witnesses(self):
+        base,request=self.request('flux3')
+        plan=comparison.validate_request((base,),request,'candle-cuda')
+        self.assertEqual(plan['stages'],['legacy','current','minus-e1','minus-e2','minus-e3','plus-streaming'])
+        self.assertEqual((plan['updates_per_stage'],plan['warmups_per_stage'],plan['max_physical_updates']),(2,1,12))
+        workload=plan['workload']
+        self.assertEqual((workload['resolution'],workload['mode'],workload['rank'],workload['alpha'],workload['seed']),(64,'paired-edit',2,2,7))
+        self.assertEqual((workload['optimizer'],workload['learning_rate'],workload['train_dtype'],workload['gradient_checkpointing']),('adamw',0.001,'bf16',False))
+        budget=plan['recovery_budget']
+        self.assertEqual((budget['retained_conservative_charge'],budget['maximum_new_physical_updates'],budget['cumulative_model_max'],budget['original_model_cap'],budget['unused_allowance_nontransferable']),(12,12,24,24,0))
+        self.assertFalse(budget['automatic_retry'])
+        self.assertEqual((budget['prior_failed_recovery']['run'],budget['prior_failed_recovery']['retained_conservative_charge']),(41269133067,4))
+        source=(Path(__file__).resolve().parents[2]/'crates/media/candle-gen/candle-gen-flux3/tests/real_weights.rs').read_text(encoding='utf-8')
+        self.assertRegex(source,r'const BOUNDED_TRAINING_RESOLUTION: u32 = 64;\s*let resolution = BOUNDED_TRAINING_RESOLUTION;')
+        self.assertIn('item.reference_image_paths.push(reference);',source)
+        self.assertIn('"mode":"edit"',source)
+        self.assertIn('"resolution":config.resolution',source)
+        self.assertIn('"references":item.reference_image_paths.iter().map',source)
+        row=self.row('flux3');metrics,text=self.fixture(row)
+        metrics['comparison']['initialization'].append({'resolution':64,'mode':'paired-edit','target_sha256':'a'*64,'reference_sha256':'b'*64})
+        observed=comparison.verify_metrics(row,metrics,text)
+        for key,value in [('resolution',512),('mode','captioned'),('target_sha256','c'*64),('reference_sha256','d'*64)]:
+            other=copy.deepcopy(observed)
+            other['initialization'][-1][key]=value
+            with self.assertRaises(ValueError):comparison.verify_matching_states(observed,other)
 
     def test_iris_frozen_readers_are_exact_successful_source_boundaries(self):
         from scripts.ci import model_proof_inputs as inputs
@@ -165,10 +191,13 @@ class ComparisonContract(unittest.TestCase):
             self.assertNotIn('candle_gen::train::comparison::'+gate+'()',transformer)
         training=(provider/'src/training.rs').read_text(encoding='utf-8')
         entry=training.split('    fn train(\n',1)[1].split('    fn train_scoped(',1)[0]
-        self.assertLess(entry.index('JobTrainingPolicy::resolve'),entry.index('with_job_policy'))
+        self.assertLess(entry.index('recovery::job_policy'),entry.index('with_job_policy'))
         self.assertLess(entry.index('with_job_policy'),entry.index('self.train_scoped'))
-        self.assertIn('self.descriptor.id,',entry)
-        self.assertIn('self.device.is_cuda(),',entry)
+        self.assertIn('self.descriptor.id, self.device.is_cuda(), req',entry)
+        recovery=(provider/'src/training/recovery.rs').read_text(encoding='utf-8')
+        helper=recovery.split('pub(super) fn job_policy(',1)[1].split('pub(super) fn validate_resume_plan(',1)[0]
+        self.assertLess(helper.index('JobTrainingPolicy::resolve'),helper.index('contract::recovery::resume_state'))
+        self.assertIn('job.with_native_resume_profile(saved_profile(&state.effective_identity)?)?',helper)
         self.assertIn('without_production_profile(|| progress(event))',entry)
         self.assertIn('letpreview=candle_gen::train::policy::without_production_profile(',re.sub(r'\s+','',training))
         fixture=(provider/'tests/real_weights.rs').read_text(encoding='utf-8')

@@ -13,15 +13,25 @@ pub(super) fn job_policy(
     workflow: Workflow,
     req: &TrainingRequest,
 ) -> Result<JobTrainingPolicy> {
-    let mut job =
-        JobTrainingPolicy::resolve(candle_gen::gen_core::flux3::BASE_MODEL_ID, cuda, req)?;
-    if workflow != Workflow::Captioned
+    let job = JobTrainingPolicy::resolve(candle_gen::gen_core::flux3::BASE_MODEL_ID, cuda, req)?;
+    Ok(for_native_mode(job, workflow, req))
+}
+
+fn for_native_mode(
+    job: JobTrainingPolicy,
+    workflow: Workflow,
+    req: &TrainingRequest,
+) -> JobTrainingPolicy {
+    // The measured native Base fixture has one reference image and mode=edit.
+    // Its result cannot select a profile for the distinct Captioned workflow.
+    if workflow != Workflow::PairedEdit
         || req.config.full_finetune
         || req.config.network_type != candle_gen::gen_core::NetworkType::Lora
     {
-        job = job.for_unmeasured_mode();
+        job.for_unmeasured_mode()
+    } else {
+        job
     }
-    Ok(job)
 }
 
 pub(super) fn private_identity(
@@ -169,5 +179,87 @@ mod native_profile_metadata_tests {
         for binding in ["flux3-native-private-execution-v1;execution_profile=comparison-proof-v1/plus-streaming","flux3-native-private-execution-v1;execution_profile=future/minus-e3","wrong-domain","flux3-native-private-execution-v1;execution_profile=measured-reference-v1/current"] {
             assert!(saved_profile(Some(binding)).is_err());
         }
+    }
+
+    #[test]
+    fn paired_edit_gate_preserves_finite_policy_and_rejects_unmeasured_modes() {
+        let mut req = request();
+        // Use an already selected opaque finite policy solely to exercise the
+        // production mode gate. The actual FLUX selector remains Current.
+        let finite = JobTrainingPolicy::resolve("kolors", true, &req).unwrap();
+        assert_eq!(finite.profile(), TrainingProfile::WithoutE3);
+        let paired = for_native_mode(finite, Workflow::PairedEdit, &req);
+        assert_eq!(paired, finite);
+        assert!(paired
+            .with_native_resume_profile(TrainingProfile::WithoutE3)
+            .is_ok());
+        assert_eq!(
+            paired
+                .with_native_resume_profile(TrainingProfile::Current)
+                .unwrap()
+                .profile(),
+            TrainingProfile::Current
+        );
+        assert!(paired
+            .with_native_resume_profile(TrainingProfile::Legacy)
+            .is_err());
+        let captioned = for_native_mode(finite, Workflow::Captioned, &req);
+        assert_eq!(captioned.model(), finite.model());
+        assert_eq!(captioned.profile(), TrainingProfile::Current);
+        assert!(captioned
+            .with_native_resume_profile(TrainingProfile::WithoutE3)
+            .is_err());
+        req.config.full_finetune = true;
+        assert_eq!(
+            for_native_mode(finite, Workflow::PairedEdit, &req).profile(),
+            TrainingProfile::Current
+        );
+        req.config.full_finetune = false;
+        req.config.network_type = candle_gen::gen_core::NetworkType::Lokr;
+        assert_eq!(
+            for_native_mode(finite, Workflow::PairedEdit, &req).profile(),
+            TrainingProfile::Current
+        );
+    }
+
+    #[test]
+    fn fixed_64_paired_edit_recipe_uses_existing_native_options_contract() {
+        use candle_gen::gen_core::train::TrainingItem;
+        use gen_core_flux3::training::options::{TrainingOptions, TrainingPrecision, OPTIONS_KEY};
+        let mut req = request();
+        let mut item = TrainingItem::captioned("metadata-target.png".into(), "a blue tile".into());
+        item.reference_image_paths
+            .push("metadata-reference.png".into());
+        req.items.push(item);
+        req.config.resolution = 64;
+        req.config.steps = 2;
+        req.config.rank = 2;
+        req.config.alpha = 2.;
+        req.config.learning_rate = 1e-3;
+        req.config.optimizer = "adamw".into();
+        req.config.loss_type = "mse".into();
+        req.config.train_dtype = "bf16".into();
+        req.config.seed = 7;
+        req.config.batch_size = 1;
+        req.config.gradient_accumulation = 1;
+        req.config.gradient_checkpointing = false;
+        req.config.model_options.insert(
+            OPTIONS_KEY.into(),
+            serde_json::json!({"mode":"edit", "caption_dropout":0., "random_flip":false}),
+        );
+        // This parser reads config/path metadata only, never files or tensors.
+        let parsed = TrainingOptions::parse(&req).unwrap();
+        assert_eq!(parsed.workflow, Workflow::PairedEdit);
+        assert_eq!(parsed.precision, TrainingPrecision::Bf16);
+        for unsupported in [0, 63, 65, 4097] {
+            req.config.resolution = unsupported;
+            assert!(TrainingOptions::parse(&req).is_err());
+        }
+        req.config.resolution = 64;
+        req.items[0].reference_image_paths.clear();
+        assert!(
+            TrainingOptions::parse(&req).is_err(),
+            "edit mode requires its reference"
+        );
     }
 }

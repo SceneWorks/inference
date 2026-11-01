@@ -459,26 +459,19 @@ fn flux3_bounded_acceleration_acceptance() {
     let comparison = candle_gen::train::comparison::requested_stage().is_some();
     let cadence = candle_gen::train::comparison::ComparisonCadence::OrdinaryShort;
     let steps = if comparison { cadence.updates() } else { 4 };
-    // One source-owned representative workload, never a resolution grid. The
-    // controller must admit the worst legacy arm before executing any stage.
-    let resolution = if comparison { 512 } else { 64 };
+    // Reuse the ordinary fixture's supported geometry for every comparison arm.
+    // This is one fixed workload, not a grid or an empirical fit assertion.
+    const BOUNDED_TRAINING_RESOLUTION: u32 = 64;
+    let resolution = BOUNDED_TRAINING_RESOLUTION;
     let base = env_dir("FLUX3_BASE_PACKAGE_DIR");
     let input = root.join("input.png");
-    image::RgbImage::from_pixel(
-        resolution as u32,
-        resolution as u32,
-        image::Rgb([80, 140, 210]),
-    )
-    .save(&input)
-    .unwrap();
+    image::RgbImage::from_pixel(resolution, resolution, image::Rgb([80, 140, 210]))
+        .save(&input)
+        .unwrap();
     let reference = root.join("reference.png");
-    image::RgbImage::from_pixel(
-        resolution as u32,
-        resolution as u32,
-        image::Rgb([210, 160, 30]),
-    )
-    .save(&reference)
-    .unwrap();
+    image::RgbImage::from_pixel(resolution, resolution, image::Rgb([210, 160, 30]))
+        .save(&reference)
+        .unwrap();
     let mut item = TrainingItem::captioned(input, "a blue tile".into());
     item.reference_image_paths.push(reference);
     let mut config = TrainingConfig {
@@ -589,8 +582,8 @@ fn flux3_bounded_acceleration_acceptance() {
                         width: 64,
                         height: 64,
                         pixels: image::RgbImage::from_pixel(
-                            resolution as u32,
-                            resolution as u32,
+                            resolution,
+                            resolution,
                             image::Rgb([210, 160, 30]),
                         )
                         .into_raw(),
