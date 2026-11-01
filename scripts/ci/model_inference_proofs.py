@@ -1272,7 +1272,15 @@ def run(rows: tuple[dict, ...], backend: str, value: dict, expected: str, output
                                                   reap_metadata_descendants=discover and discovery_policy.backend == 'windows-cpu',
                                                   pass_fds=((int(env['SCENEWORKS_METAL_EXECUTION_LOCK_FD']),)
                                                             if 'SCENEWORKS_METAL_EXECUTION_LOCK_FD' in env else ()), **supervision)
-                        except SupervisionError as error:
+                        except (SupervisionError, OSError, ValueError) as error:
+                            # The outer release guard may also fail; preserve the original
+                            # watchdog/child/cleanup fault before the context exits.
+                            result['primary_supervision_failure'] = {
+                                'type': type(error).__name__, 'reason': getattr(error, 'reason', None),
+                                'detail': redact(str(error), env),
+                                'watchdog_device_memory': getattr(error, 'watchdog_device_memory', None),
+                                'watchdog_child_footprint': getattr(error, 'watchdog_child_footprint', None),
+                                'primary_failure': getattr(error, 'primary_failure', None)}
                             if shared_completion and isinstance(getattr(error, 'owned_completion', None), dict):
                                 physical['owned_execution_completion'] = error.owned_completion
                             raise

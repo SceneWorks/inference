@@ -1168,6 +1168,31 @@ def run_guarded(
         raise
 
 
+def _reap_faulted_job(child: object, job: object, grace: float, *, retain_completion: bool) -> dict | None:
+    """Keep fault-path cleanup factual: wait root AND observe empty owned Job.
+
+    A terminate request alone never qualifies as observed process absence. This
+    helper is metadata/process supervision only; no GPU probe or model is run.
+    """
+    job.terminate_and_reap(child, grace)
+    if not retain_completion:
+        return None
+    waited = child.wait(timeout=grace)
+    status = child.poll()
+    members = job.members()
+    if (type(waited) is not int or type(status) is not int or waited != status
+            or not isinstance(members, set) or members):
+        raise SupervisionError("cleanup-failure", "faulted child root/owned Job completion is unverified")
+    return {"scope": "supervisor-owned-windows-job", "root_pid": child.pid,
+            "root_returncode": status, "waited_returncode": waited,
+            "job_member_pids": [], "owned_pids": []}
+
+
+def _failure_identity(error: BaseException) -> dict:
+    return {"type": type(error).__name__, "reason": getattr(error, "reason", None),
+            "detail": str(error)}
+
+
 def _run_admitted(
     argv: list[str], *, cwd: Path, env: dict[str, str], policy: SafetyPolicy,
     admission: dict[str, object], stdout_path: Path, stderr_path: Path,
@@ -1347,6 +1372,7 @@ def _run_admitted(
                 return OwnedCudaRunResult(*fields, completion)
             return RunResult(*fields)
 
+        primary_fault = None
         try:
             # Windows ownership is a Job, not a POSIX process group.
             on_spawn(child.pid, None if job is not None else child.pid)
@@ -1499,12 +1525,20 @@ def _run_admitted(
                 if claim_deadline_monotonic is not None:
                     pause = min(pause, max(0., claim_deadline_monotonic - clock()))
                 time.sleep(pause)
-        except BaseException:
+        except BaseException as primary:
+            primary_fault = _failure_identity(primary)
             try:
                 if job is not None:
-                    job.terminate_and_reap(child, policy.term_grace_millis / 1000)
+                    completion = _reap_faulted_job(child, job, policy.term_grace_millis / 1000,
+                                                   retain_completion=retain_owned_completion)
+                    if completion is not None:
+                        primary.owned_completion = completion
                 else:
                     _stop_tree(child, policy.term_grace_millis / 1000, known)
+            except (OSError, ValueError, windows.WindowsJobError, subprocess.SubprocessError) as cleanup:
+                error = SupervisionError("cleanup-failure", str(cleanup))
+                error.primary_failure = _failure_identity(primary)
+                raise error from primary
             finally:
                 for path, cap in ((stdout_path, policy.stdout_cap_bytes),
                                   (stderr_path, policy.stderr_cap_bytes),
@@ -1515,8 +1549,11 @@ def _run_admitted(
             raise
         finally:
             if job is not None:
-                job.close()
                 try:
+                    job.close()
                     child.wait(timeout=policy.term_grace_millis / 1000)
-                except subprocess.TimeoutExpired as error:
-                    raise SupervisionError("cleanup-failure", "Job close did not reap root") from error
+                except (OSError, ValueError, windows.WindowsJobError, subprocess.SubprocessError) as cleanup:
+                    error = SupervisionError("cleanup-failure", "Job close/root wait failed: " + str(cleanup))
+                    if primary_fault is not None:
+                        error.primary_failure = primary_fault
+                    raise error from cleanup
