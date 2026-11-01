@@ -134,6 +134,7 @@ fn selected_profile(model: &str, cuda: bool) -> (&'static str, TrainingProfile) 
         "wan2_2_t2v_14b" => ("wan2_2_t2v_14b", TrainingProfile::WithoutE3),
         "mage_flow_base" => ("mage_flow_base", TrainingProfile::WithoutE3),
         "iris_3b" => ("iris_3b", TrainingProfile::WithoutE3),
+        "iris_3b_restore" => ("iris_3b_restore", TrainingProfile::WithoutE3),
         "kolors" => ("kolors", TrainingProfile::WithoutE3),
         "z_image_turbo" => ("z_image_turbo", TrainingProfile::WithoutE3),
         "ltx_2_5_distilled" => ("ltx_2_5_distilled", TrainingProfile::WithoutE2),
@@ -145,7 +146,6 @@ fn selected_profile(model: &str, cuda: bool) -> (&'static str, TrainingProfile) 
         "flux3_klein_base" => ("flux3_klein_base", TrainingProfile::Current),
         "anima_base" => ("anima_base", TrainingProfile::Current),
         "iris_3b_depth" => ("iris_3b_depth", TrainingProfile::Current),
-        "iris_3b_restore" => ("iris_3b_restore", TrainingProfile::Current),
         _ => ("unselected", TrainingProfile::Current),
     };
     (
@@ -375,6 +375,7 @@ mod selector_metadata_tests {
             ("wan2_2_t2v_14b", TrainingProfile::WithoutE3),
             ("mage_flow_base", TrainingProfile::WithoutE3),
             ("iris_3b", TrainingProfile::WithoutE3),
+            ("iris_3b_restore", TrainingProfile::WithoutE3),
             ("kolors", TrainingProfile::WithoutE3),
             ("z_image_turbo", TrainingProfile::WithoutE3),
             ("ltx_2_5_distilled", TrainingProfile::WithoutE2),
@@ -689,7 +690,6 @@ mod selector_metadata_tests {
             "flux3_klein_base",
             "anima_base",
             "iris_3b_depth",
-            "iris_3b_restore",
         ] {
             for cuda in [true, false] {
                 let job = JobTrainingPolicy::resolve(id, cuda, &req).unwrap();
@@ -741,6 +741,7 @@ mod historical_acceptance_metadata_tests {
                         "mage_flow_base",
                         "kolors",
                         "iris_3b",
+                        "iris_3b_restore",
                         "ltx_2_5_distilled",
                         "sd3_5_medium",
                         "wan2_2_ti2v_5b",

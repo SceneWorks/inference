@@ -1404,7 +1404,7 @@ mod production_policy_metadata_tests {
 
     // Native JSON/G+D counters only; no Tensor/Device/optimizer/cache conversion.
     #[test]
-    fn restore_neutral_lora_policy_keeps_both_owners_current_and_old_json() {
+    fn restore_measured_lora_preserves_historical_current_and_unmeasured_modes() {
         let temp = tempfile::tempdir().unwrap();
         let req = request(temp.path());
         let dir = checkpoint_root(&req.output_dir, &req.file_name).join("step_000004");
@@ -1460,11 +1460,81 @@ mod production_policy_metadata_tests {
     }
 
     #[test]
+    fn restore_selected_joint_lora_binds_only_private_resume_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let req = request(temp.path());
+        let job = restore_training_policy(&req, true, &lora(), None, false).unwrap();
+        assert_eq!(job.model(), "iris_3b_restore");
+        assert_eq!(job.profile(), TrainingProfile::WithoutE3);
+        let original = header();
+        let original_bytes = serde_json::to_vec(&original.to_json()).unwrap();
+        let tagged = policy::with_job_policy(job, || {
+            assert!(!policy::projection_enabled());
+            assert!(policy::cache_enabled());
+            let mut saved = original.clone();
+            saved.state_identity =
+                policy::bind_state_identity(&saved.state_identity, policy::active_profile());
+            assert_eq!(
+                saved.state_identity,
+                "private-restore-config;execution_profile=measured-reference-v1/minus-e3"
+            );
+            let mut compatible = saved.clone();
+            compatible.state_identity =
+                checked_restore_state_identity(&saved.state_identity, &original.state_identity)
+                    .unwrap();
+            // Compare every native JSON field, including base/data/seed and
+            // joint G+D counters/losses: only the private state tag differs.
+            assert_eq!(
+                serde_json::to_vec(&compatible.to_json()).unwrap(),
+                original_bytes
+            );
+            policy::without_production_profile(|| {
+                assert_eq!(policy::active_profile(), TrainingProfile::Current);
+                assert!(policy::projection_enabled());
+            });
+            assert_eq!(policy::active_profile(), TrainingProfile::WithoutE3);
+            saved
+        });
+        assert_eq!(
+            serde_json::to_vec(&original.to_json()).unwrap(),
+            original_bytes
+        );
+        std::fs::write(
+            temp.path().join(CKPT_STATE),
+            serde_json::to_vec(&tagged.to_json()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            restore_training_policy(&req, true, &lora(), Some(temp.path()), false)
+                .unwrap()
+                .profile(),
+            TrainingProfile::WithoutE3
+        );
+        assert!(restore_training_policy(&req, false, &lora(), Some(temp.path()), false).is_err());
+        for unmeasured in [
+            RestoreArtifact::Full,
+            RestoreArtifact::Lokr {
+                rank: 8,
+                alpha: 8.,
+                decompose_factor: -1,
+                targets: vec![],
+            },
+        ] {
+            assert!(
+                restore_training_policy(&req, true, &unmeasured, Some(temp.path()), false).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn restore_native_header_rejects_foreign_and_proof_profiles_before_prepare() {
         let temp = tempfile::tempdir().unwrap();
         let req = request(temp.path());
         for tag in [
-            "measured-reference-v1/minus-e3",
+            "measured-reference-v1/legacy",
+            "measured-reference-v1/minus-e1",
+            "measured-reference-v1/minus-e2",
+            "comparison-proof-v1/minus-e3",
             "comparison-proof-v1/plus-streaming",
             "unknown-v9/current",
         ] {
