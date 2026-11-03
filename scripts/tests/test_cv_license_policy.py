@@ -8,7 +8,7 @@ CV = ROOT / "crates/media/gen-cv"
 
 
 def manifest(path):
-    return tomllib.loads(path.read_text())
+    return tomllib.loads(path.read_text(encoding="utf-8"))
 
 
 def enabled_features(features, roots):
@@ -25,8 +25,8 @@ def enabled_features(features, roots):
 class CvLicensePolicyTests(unittest.TestCase):
     def test_extracted_source_retains_agpl_and_attribution(self):
         self.assertEqual(manifest(CV / "Cargo.toml")["package"]["license"], "AGPL-3.0-or-later")
-        self.assertIn("GNU AFFERO GENERAL PUBLIC LICENSE", (CV / "LICENSE").read_text())
-        notice = (CV / "NOTICE").read_text()
+        self.assertIn("GNU AFFERO GENERAL PUBLIC LICENSE", (CV / "LICENSE").read_text(encoding="utf-8"))
+        notice = (CV / "NOTICE").read_text(encoding="utf-8")
         self.assertIn("Michael Trefry and the SceneWorks contributors", notice)
         self.assertIn("a1d95e2c43eef4a34a3fe5bf420bb2cc2abe181f", notice)
         self.assertIn("AGPL-3.0-or-later", notice)
