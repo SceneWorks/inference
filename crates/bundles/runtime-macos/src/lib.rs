@@ -573,6 +573,6 @@ mod tests {
     }
 }
 
-/// Native CV engines used by the media worker.
-#[cfg(feature = "media")]
+/// AGPL-3.0-or-later native CV engines, enabled explicitly through `cv`.
+#[cfg(feature = "cv")]
 pub use sceneworks_gen_cv as cv;

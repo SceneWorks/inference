@@ -17,7 +17,9 @@ candle-llm = { workspace = true, features = ["cuda"] }
 default = ["media", "audio", "media-flash-attn"]
 # SceneWorks consumes the complete bundle. LLM-only products can disable default features while
 # retaining the explicitly composed CUDA LLM catalog.
-media = ["dep:sceneworks-gen-cv", "dep:candle-gen-catalog"]
+media = ["dep:candle-gen-catalog"]
+# Explicit opt-in: this includes AGPL-3.0-or-later CV code; see gen-cv/NOTICE.
+cv = ["dep:sceneworks-gen-cv"]
 # The Candle audio lane (sc-12835, docs/architecture/audio-backend-strategy.md). A separate
 # additive feature — NOT folded into `media` — so an LLM-only product (ChatWorks) can compose
 # text + TTS via `--no-default-features --features audio` without the image/video provider graph.

@@ -1,3 +1,5 @@
+//! AGPL-3.0-or-later CV engines (see the crate LICENSE and NOTICE).
+//!
 //! Native CV engines. Callers supply local weights and session loading; engines own
 //! numeric preprocessing, execution and decoding. No download or application cache policy.
 

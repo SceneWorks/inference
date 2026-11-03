@@ -29,7 +29,9 @@ tempfile = { workspace = true, optional = true }
 default = ["media", "audio"]
 # SceneWorks consumes the complete bundle. LLM-only products can disable default features without
 # falling back to separate backend dependencies or linker-driven provider discovery.
-media = ["dep:sceneworks-gen-cv", "dep:mlx-gen-catalog"]
+media = ["dep:mlx-gen-catalog"]
+# Explicit opt-in: this includes AGPL-3.0-or-later CV code; see gen-cv/NOTICE.
+cv = ["dep:sceneworks-gen-cv"]
 # The Candle audio lane (sc-12835, docs/architecture/audio-backend-strategy.md). A separate
 # additive feature — NOT folded into `media` — so an LLM-only product (ChatWorks) can compose
 # text + TTS via `--no-default-features --features audio` without the mlx media provider graph.
