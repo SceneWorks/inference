@@ -24,3 +24,6 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = ["cuda"] 
 [features]
 default = []
 mlx = ["dep:mlx-rs", "dep:mlx-gen"]
+
+# Retain intermediate references only for explicitly compiled parity instruments.
+parity-captures = []
