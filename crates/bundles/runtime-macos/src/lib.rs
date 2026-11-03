@@ -1,5 +1,9 @@
 //! Supported Apple-silicon runtime: explicit MLX media, LLM, and snapshot-preparer catalogs.
 
+/// AGPL-3.0-or-later native CV engines, enabled explicitly through `cv`.
+#[cfg(feature = "cv")]
+pub use sceneworks_gen_cv as cv;
+
 #[cfg(feature = "audio")]
 pub use candle_audio_catalog::audio;
 /// The Candle audio provider crates this bundle ships, for their public APIs beyond the registry
@@ -572,7 +576,3 @@ mod tests {
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
     }
 }
-
-/// AGPL-3.0-or-later native CV engines, enabled explicitly through `cv`.
-#[cfg(feature = "cv")]
-pub use sceneworks_gen_cv as cv;
