@@ -1,0 +1,22 @@
+SceneWorks native CV engines
+Copyright © 2026 Michael Trefry and the SceneWorks contributors.
+
+This crate contains source extracted and adapted from SceneWorks/SceneWorks:
+https://github.com/SceneWorks/SceneWorks/tree/a1d95e2c43eef4a34a3fe5bf420bb2cc2abe181f
+
+Original source: crates/sceneworks-worker/src/person_jobs.rs, pose_jobs.rs,
+upscale_jobs.rs, and their associated tests. The extraction moves YOLO11 forward
+and decode/NMS, DWPose numerical preprocessing/postprocessing and execution,
+Real-ESRGAN execution/tiling, and shared session policy into this crate.
+
+SceneWorks' README Licensing section and root LICENSE declare this source under
+the GNU Affero General Public License, version 3 or (at your option) any later
+version (SPDX: AGPL-3.0-or-later). These terms are retained; this extraction does
+not relicense the code under the inference workspace's Apache-2.0 license.
+A copy of the GNU Affero General Public License is included in LICENSE.
+
+The runtime-macos and runtime-cuda bundles expose this dependency only through
+an explicit `cv` feature. Enabling that feature includes AGPL-licensed code;
+the bundles' own source-license declarations do not replace dependency terms.
+Model weights are not included or licensed by this crate. Each model retains
+its separately applicable terms.

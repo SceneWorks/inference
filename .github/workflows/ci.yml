@@ -411,13 +411,13 @@ jobs:
       - name: Clippy Candle packages
         run: >-
           cargo clippy --locked
-          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
+          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu -p sceneworks-gen-cv
           --features candle-audio/testkit
           --all-targets -- -D warnings
       - name: Compile and lint Candle CPU model-proof hooks (no model execution)
         run: >-
           python3 -I scripts/ci/compile_model_proof_targets.py --lane cpu -- cargo clippy --locked
-          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
+          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu -p sceneworks-gen-cv
           --features candle-audio/testkit
           --all-targets -- -D warnings
       - name: Compile and lint opt-in MOSS model tests without execution
@@ -504,7 +504,7 @@ jobs:
         env:
           TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
         run: |
-          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p candle-llm -p candle-quant-kernels -p 'candle-audio*' -p runtime-cpu)
+          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p candle-llm -p candle-quant-kernels -p 'candle-audio*' -p runtime-cpu -p sceneworks-gen-cv)
           read -r -a packages <<< "$args"
           if [[ ${#packages[@]} -eq 0 ]]; then
             echo "No package in this step's set is affected by the change; nothing to test."
@@ -831,11 +831,11 @@ jobs:
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
           python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going
-          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core
+          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-cv -p sceneworks-gen-core
           -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry
           -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris
           -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train
-          --all-targets -- -D warnings
+          --features runtime-macos/cv --all-targets -- -D warnings
       # sc-27303: the measurement-campaign harness is behind mlx-llm's opt-in `campaign` feature, so
       # the step above lints the shipped (campaign-free) graph. Lint and document the harness build
       # too, so neither configuration can rot unseen.
@@ -875,7 +875,8 @@ jobs:
           python3 scripts/ci/run_ci_collection.py -- cargo doc --locked --keep-going --no-deps
           -p mlx-llm -p mlx-llm-server
           -p mlx-gen -p 'mlx-gen-*'
-          -p runtime-macos -p runtime-ios
+          -p runtime-macos -p runtime-ios -p sceneworks-gen-cv
+          --features runtime-macos/cv
       # sc-19556 CI-disk mitigation. `target/doc` is written by the step above and read by nothing
       # else in this job, so it is free to drop before the four cargo invocations start stacking
       # feature-set generations into `target/debug`. The `df`/`du` lines are the permanent probes
@@ -923,7 +924,7 @@ jobs:
           TEST_SUITE_DEADLINE_SECONDS: 3600
           TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
         run: |
-          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train)
+          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-cv -p sceneworks-gen-core -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train)
           read -r -a packages <<< "$args"
           if [[ ${#packages[@]} -eq 0 ]]; then
             echo "No package in this step's set is affected by the change; nothing to test."
@@ -934,6 +935,11 @@ jobs:
           # feature; keep running them whenever mlx-llm is in scope.
           for package in "${packages[@]}"; do
             if [[ "$package" == mlx-llm ]]; then packages+=(--features mlx-llm/campaign); break; fi
+          done
+          # Keep the opt-in CV forward path compiled without executing learned code.
+          for package in "${packages[@]}"; do
+            if [[ "$package" == sceneworks-gen-cv ]]; then packages+=(--features sceneworks-gen-cv/mlx); fi
+            if [[ "$package" == runtime-macos ]]; then packages+=(--features runtime-macos/cv); fi
           done
           python3 scripts/ci/run_ci_collection.py -- python3 scripts/ci/test_suites.py --deadline-seconds "$TEST_SUITE_DEADLINE_SECONDS" audited-safe -- cargo test --locked --no-fail-fast --lib --tests "${packages[@]}"
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
@@ -1441,7 +1447,7 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda --no-run
+          cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda,runtime-cuda/cv --no-run
       - name: Execute weights-free CUDA catalog conformance (no GPU required)
         shell: cmd
         run: |
@@ -1460,12 +1466,12 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda -- -D warnings
+          cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda,runtime-cuda/cv -- -D warnings
       - name: Compile and lint Candle CUDA model-proof hooks (no model execution)
         shell: cmd
         run: |
           call "%VCVARS%"
-          "%REVIEWED_PYTHON%" -I scripts/ci/compile_model_proof_targets.py --lane cuda -- cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda -- -D warnings
+          "%REVIEWED_PYTHON%" -I scripts/ci/compile_model_proof_targets.py --lane cuda -- cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda,runtime-cuda/cv -- -D warnings
       # The doc twin of the compile check above. The hosted rustdoc gate cannot pass --features cuda
       # (no CUDA toolkit), so `#[cfg(feature = "cuda")]` docs need this lane. Keep this doc package
       # set aligned with the compile check above; together with the hosted gate, the CPU and CUDA
@@ -1479,7 +1485,7 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: |
           call "%VCVARS%"
-          cargo doc --locked --no-deps -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda
+          cargo doc --locked --no-deps -p candle-llm -p candle-quant-kernels -p "candle-gen*" -p "candle-audio*" -p runtime-cuda --features cuda,runtime-cuda/cv
 
   windows-cuda:
     timeout-minutes: 180

@@ -14,8 +14,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 130
+EXPECTED_MEMBER_COUNT = 131
 INTERNAL_PACKAGES = {
+    "sceneworks-gen-cv",
     "candle-audio",
     "candle-audio-catalog",
     "candle-audio-kokoro",

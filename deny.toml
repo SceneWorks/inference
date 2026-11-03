@@ -58,6 +58,13 @@ allow = ["WTFPL"]
 name = "candle-audio-sheetsage2"
 allow = ["CC-BY-NC-4.0"]
 
+# Source extracted from the AGPL-3.0-or-later SceneWorks worker retains its terms.
+# Only this crate is exempted; runtime bundles require explicit `cv` opt-in.
+# Provenance and the unmodified license text are in crates/media/gen-cv/NOTICE and LICENSE.
+[[licenses.exceptions]]
+name = "sceneworks-gen-cv"
+allow = ["AGPL-3.0-or-later"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
