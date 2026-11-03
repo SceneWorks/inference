@@ -411,13 +411,13 @@ jobs:
       - name: Clippy Candle packages
         run: >-
           cargo clippy --locked
-          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
+          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu -p sceneworks-gen-cv
           --features candle-audio/testkit
           --all-targets -- -D warnings
       - name: Compile and lint Candle CPU model-proof hooks (no model execution)
         run: >-
           python3 -I scripts/ci/compile_model_proof_targets.py --lane cpu -- cargo clippy --locked
-          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu
+          -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' -p runtime-cpu -p sceneworks-gen-cv
           --features candle-audio/testkit
           --all-targets -- -D warnings
       - name: Compile and lint opt-in MOSS model tests without execution
@@ -504,7 +504,7 @@ jobs:
         env:
           TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
         run: |
-          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p candle-llm -p candle-quant-kernels -p 'candle-audio*' -p runtime-cpu)
+          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p candle-llm -p candle-quant-kernels -p 'candle-audio*' -p runtime-cpu -p sceneworks-gen-cv)
           read -r -a packages <<< "$args"
           if [[ ${#packages[@]} -eq 0 ]]; then
             echo "No package in this step's set is affected by the change; nothing to test."
@@ -831,7 +831,7 @@ jobs:
           && env.CI_COLLECTION_RESOURCE_FAILURE != 'true' && env.CI_COLLECTION_NATIVE_FATAL != 'true' }}
         run: >-
           python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going
-          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core
+          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-cv -p sceneworks-gen-core
           -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry
           -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris
           -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train
@@ -923,7 +923,7 @@ jobs:
           TEST_SUITE_DEADLINE_SECONDS: 3600
           TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
         run: |
-          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train)
+          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-cv -p sceneworks-gen-core -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train)
           read -r -a packages <<< "$args"
           if [[ ${#packages[@]} -eq 0 ]]; then
             echo "No package in this step's set is affected by the change; nothing to test."

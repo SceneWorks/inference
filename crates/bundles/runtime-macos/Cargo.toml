@@ -7,6 +7,7 @@ license = "Apache-2.0"
 repository = "https://github.com/SceneWorks/inference"
 
 [dependencies]
+sceneworks-gen-cv = { workspace = true, optional = true, features = ["mlx"] }
 runtime-catalog = { workspace = true }
 mlx-gen-catalog = { workspace = true, optional = true }
 # The Candle audio lane (sc-12835): the sanctioned cross-backend seam — the mlx macOS bundle
@@ -28,7 +29,7 @@ tempfile = { workspace = true, optional = true }
 default = ["media", "audio"]
 # SceneWorks consumes the complete bundle. LLM-only products can disable default features without
 # falling back to separate backend dependencies or linker-driven provider discovery.
-media = ["dep:mlx-gen-catalog"]
+media = ["dep:sceneworks-gen-cv", "dep:mlx-gen-catalog"]
 # The Candle audio lane (sc-12835, docs/architecture/audio-backend-strategy.md). A separate
 # additive feature — NOT folded into `media` — so an LLM-only product (ChatWorks) can compose
 # text + TTS via `--no-default-features --features audio` without the mlx media provider graph.

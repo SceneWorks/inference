@@ -572,3 +572,7 @@ mod tests {
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
     }
 }
+
+/// Native CV engines used by the media worker.
+#[cfg(feature = "media")]
+pub use sceneworks_gen_cv as cv;

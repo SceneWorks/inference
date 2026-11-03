@@ -42,6 +42,7 @@ members = [
     "crates/llm/candle-llm",
     "crates/llm/mlx-llm",
     "crates/llm/mlx-llm/server",
+    "crates/media/gen-cv",
     "crates/media/mlx-gen",
     "crates/media/mlx-gen/mlx-gen-*",
     "crates/media/candle-gen/candle-gen*",
@@ -59,6 +60,7 @@ exclude = [
 # Internal packages are paths so a checkout has one contract package, one
 # provider registry, and no dependency on unpublished repository state.
 [workspace.dependencies]
+sceneworks-gen-cv = { path = "crates/media/gen-cv" }
 sceneworks-load-progress = { path = "crates/contracts/load-progress" }
 core-llm = { path = "crates/contracts/core-llm" }
 core-llm-testkit = { path = "crates/contracts/core-llm/core-llm-testkit" }

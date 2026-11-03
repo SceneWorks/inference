@@ -550,3 +550,7 @@ mod tests {
         }
     }
 }
+
+/// Native CV engines used by the media worker.
+#[cfg(feature = "media")]
+pub use sceneworks_gen_cv as cv;
