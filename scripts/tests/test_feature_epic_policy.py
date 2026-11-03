@@ -235,6 +235,10 @@ class FeatureEpicPolicyTests(unittest.TestCase):
     def test_malformed_codegraph_feature_markers_fail_closed(self) -> None:
         for head in (
             "story/sw-6686-feature", "story/sw-6686-feature-sw-f0-slug",
+            "story/sw-0-feature-sw-f327-code-review-remediation",
+            "story/sw-01-feature-sw-f327-code-review-remediation",
+            "story/sw-abc-feature-sw-f327-code-review-remediation",
+            "story/sw--feature-sw-f327-code-review-remediation",
             "story/sw-6686-feature-sw-f327-Bad_Slug", "feature/sw-f327-Bad_Slug",
         ):
             with self.subTest(head=head):

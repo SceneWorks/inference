@@ -48,7 +48,7 @@ SYNC_RE = re.compile(
 )
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 EPIC_STORY_PREFIX_RE = re.compile(
-    r"^(?:story/sc-[1-9][0-9]*-epic|story/sw-[1-9][0-9]*-feature)(?:-|$)"
+    r"^(?:story/sc-[1-9][0-9]*-epic|story/sw-[^-]*-feature)(?:-|$)"
 )
 
 PROTECTED_PREFIXES = ("feature/", "sync/")
