@@ -32,6 +32,7 @@ default = ["media", "audio"]
 media = ["dep:mlx-gen-catalog"]
 # Explicit opt-in: this includes AGPL-3.0-or-later CV code; see gen-cv/NOTICE.
 cv = ["dep:sceneworks-gen-cv"]
+cv-parity-captures = ["cv", "sceneworks-gen-cv/parity-captures"]
 # The Candle audio lane (sc-12835, docs/architecture/audio-backend-strategy.md). A separate
 # additive feature — NOT folded into `media` — so an LLM-only product (ChatWorks) can compose
 # text + TTS via `--no-default-features --features audio` without the mlx media provider graph.

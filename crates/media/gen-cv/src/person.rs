@@ -245,21 +245,21 @@ fn nms(mut dets: Vec<Detection>, iou_thr: f32) -> Vec<Detection> {
     keep
 }
 
-/// Captured forward outputs: the final `(1,84,8400)` plus the per-block reference
-/// points the parity oracle (`refs.safetensors`) checks. Block tensors stay NHWC; the
-/// oracle is NCHW, so the test transposes before comparing. The block fields exist only
-/// for the parity test — the production `detect_people` path reads `output` alone.
+/// The final `(1,84,8400)` output, with optional per-block parity reference points.
+/// Test builds or the explicit `parity-captures` feature retain the block fields;
+/// ordinary production detection retains only `output`. Blocks stay NHWC while the
+/// reference oracle is NCHW, so proof consumers transpose before comparing.
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 pub struct YoloForward {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(any(test, feature = "parity-captures"))]
     pub block4: Array,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(any(test, feature = "parity-captures"))]
     pub block10: Array,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(any(test, feature = "parity-captures"))]
     pub block16: Array,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(any(test, feature = "parity-captures"))]
     pub block19: Array,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(any(test, feature = "parity-captures"))]
     pub block22: Array,
     pub output: Array,
 }
@@ -548,8 +548,8 @@ impl Yolo {
         Ok(hwc.transpose_axes(&[0, 2, 1])?) // (1,84,8400) channel-major
     }
 
-    /// Full YOLO11m forward, capturing the oracle block points. Shortcut residuals are
-    /// on for every C3k2 (the C3k2 default; the yaml never overrides it).
+    /// Full YOLO11m forward. The parity feature retains the oracle block points.
+    /// Shortcut residuals are on for every C3k2 (the yaml never overrides the default).
     pub fn run(&self, x: &Array) -> MlxResult<YoloForward> {
         // backbone
         let x = self.conv(x, "model.0", 2, 1, true)?; // 320,64
@@ -586,10 +586,15 @@ impl Yolo {
 
         let output = self.detect(&p3, &p4, &p5)?;
         Ok(YoloForward {
+            #[cfg(any(test, feature = "parity-captures"))]
             block4,
+            #[cfg(any(test, feature = "parity-captures"))]
             block10,
+            #[cfg(any(test, feature = "parity-captures"))]
             block16: p3,
+            #[cfg(any(test, feature = "parity-captures"))]
             block19: p4,
+            #[cfg(any(test, feature = "parity-captures"))]
             block22: p5,
             output,
         })

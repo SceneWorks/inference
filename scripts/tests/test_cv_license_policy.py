@@ -43,9 +43,22 @@ class CvLicensePolicyTests(unittest.TestCase):
                 data = manifest(ROOT / "crates/bundles" / name / "Cargo.toml")
                 self.assertTrue(data["dependencies"]["sceneworks-gen-cv"]["optional"])
                 features = data["features"]
-                for feature in features.keys() - {"cv"}:
+                explicit_cv = {"cv"}
+                if name == "runtime-macos":
+                    explicit_cv.add("cv-parity-captures")
+                for feature in features.keys() - explicit_cv:
                     self.assertNotIn("dep:sceneworks-gen-cv", enabled_features(features, [feature]), feature)
                 self.assertIn("dep:sceneworks-gen-cv", enabled_features(features, ["cv"]))
+
+    def test_parity_capture_opt_in_keeps_default_and_plain_cv_graphs_unchanged(self):
+        features = manifest(ROOT / "crates/bundles/runtime-macos/Cargo.toml")["features"]
+        capture = "sceneworks-gen-cv/parity-captures"
+        self.assertEqual(features["cv-parity-captures"], ["cv", capture])
+        self.assertIn("dep:sceneworks-gen-cv", enabled_features(features, ["cv-parity-captures"]))
+        self.assertIn(capture, enabled_features(features, ["cv-parity-captures"]))
+        self.assertNotIn(capture, enabled_features(features, ["default"]))
+        self.assertNotIn(capture, enabled_features(features, ["cv"]))
+        self.assertNotIn("dep:sceneworks-gen-cv", enabled_features(features, ["default"]))
 
     def test_mac_opt_in_preserves_mlx_engine(self):
         data = manifest(ROOT / "crates/bundles/runtime-macos/Cargo.toml")
