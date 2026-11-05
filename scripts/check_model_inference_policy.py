@@ -789,7 +789,9 @@ class RunGraph:
         # mode instead of blessing arbitrary dynamic subprocess calls.
         if relative == 'scripts/ci/test_suites.py':
             reviewed_sha = '253d75e21e94b6f9c8326f5a7cd38a4d3fbf077b5ef0ab6eb7a9e4f49127e729'
-            controls_sha = 'ca8823feb5bd4205656fb18f6531967b9784bdc8287113b9cfb5e090f3376c40'
+            # SW-6775: append the 26 migrated numeric CV/fake-session controls.
+            # Their bodies use buffers/tokens only; no ORT session or learned call.
+            controls_sha = '814b9ef4d719bb04f99c65faeb0e4afcd1782c3a46d42effa7edf8e992c5c097'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha

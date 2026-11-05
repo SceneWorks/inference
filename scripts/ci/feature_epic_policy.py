@@ -5,6 +5,8 @@ Feature work is integrated through a repository-local branch train:
 
 * ``story/sc-<story>-epic-<epic>-<slug>`` -> the unique live
   ``feature/sc-<epic>-<slug>`` with the same canonical slug;
+* ``story/sw-<item>-feature-sw-f<feature>-<slug>`` -> the unique live
+  ``feature/sw-f<feature>-<slug>`` with the same canonical slug;
 * ``sync/sc-<epic>-main-<date>[-<sequence>]`` -> matching feature branch; and
 * a feature branch -> ``main``.
 
@@ -23,7 +25,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Union
 
 
 FEATURE_RE = re.compile(
@@ -33,16 +35,26 @@ STORY_RE = re.compile(
     r"story/sc-(?P<story>[1-9][0-9]*)-epic-(?P<epic>[1-9][0-9]*)-"
     r"(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*)"
 )
+CG_FEATURE_RE = re.compile(
+    r"feature/(?P<epic>sw-f[1-9][0-9]*)-(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*)"
+)
+CG_STORY_RE = re.compile(
+    r"story/sw-[1-9][0-9]*-feature-(?P<epic>sw-f[1-9][0-9]*)-"
+    r"(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*)"
+)
 SYNC_RE = re.compile(
     r"sync/sc-(?P<epic>[1-9][0-9]*)-main-(?P<day>[0-9]{4}-[0-9]{2}-[0-9]{2})"
     r"(?:-(?P<sequence>[1-9][0-9]*))?"
 )
 SHA_RE = re.compile(r"[0-9a-f]{40}")
-EPIC_STORY_PREFIX_RE = re.compile(r"^story/sc-[1-9][0-9]*-epic(?:-|$)")
+EPIC_STORY_PREFIX_RE = re.compile(
+    r"^(?:story/sc-[1-9][0-9]*-epic|story/sw-[^-]*-feature)(?:-|$)"
+)
 
 PROTECTED_PREFIXES = ("feature/", "sync/")
 PULL_REQUEST_ACTIONS = frozenset({"opened", "reopened", "synchronize"})
-FeatureBranchResolver = Callable[[int], str]
+FeatureIdentity = Union[int, str]  # Imported Shortcut ID or qualified CodeGraph feature key.
+FeatureBranchResolver = Callable[[FeatureIdentity], str]
 CommitParentResolver = Callable[[str], tuple[str, str]]
 CommitPeeler = Callable[[str], str]
 BaseBranchResolver = Callable[[str], str]
@@ -57,7 +69,7 @@ class PolicyError(ValueError):
 @dataclass(frozen=True)
 class TrainBranch:
     kind: str
-    epic: int
+    epic: FeatureIdentity
     slug: str | None
 
 
@@ -120,6 +132,11 @@ def _parse_train_branch(branch: str) -> TrainBranch | None:
     if story:
         return TrainBranch("story", int(story.group("epic")), story.group("slug"))
 
+    for kind, pattern in (("feature", CG_FEATURE_RE), ("story", CG_STORY_RE)):
+        match = pattern.fullmatch(branch)
+        if match:
+            return TrainBranch(kind, match.group("epic"), match.group("slug"))
+
     sync = SYNC_RE.fullmatch(branch)
     if sync:
         try:
@@ -134,7 +151,8 @@ def _parse_train_branch(branch: str) -> TrainBranch | None:
     if looks_protected:
         raise PolicyError(
             "malformed feature-epic branch; expected feature/sc-<epic>-<slug>, "
-            "story/sc-<story>-epic-<epic>-<slug>, or "
+            "story/sc-<story>-epic-<epic>-<slug>, "
+            "feature/sw-f<feature>-<slug>, story/sw-<item>-feature-sw-f<feature>-<slug>, or "
             f"sync/sc-<epic>-main-<YYYY-MM-DD>[-<sequence>]: {branch!r}"
         )
     return None
@@ -356,33 +374,46 @@ def _active_pull_request_revision(
     return merge_base_sha
 
 
+def _feature_key(epic: FeatureIdentity) -> str:
+    return f"sc-{epic}" if isinstance(epic, int) else epic
+
+
+def _matches_feature(branch: str, epic: FeatureIdentity) -> bool:
+    pattern = FEATURE_RE if isinstance(epic, int) else CG_FEATURE_RE
+    match = pattern.fullmatch(branch)
+    return match is not None and (
+        int(match.group("epic")) if isinstance(epic, int) else match.group("epic")
+    ) == epic
+
+
 def _canonical_feature_branch(
-    epic: int,
+    epic: FeatureIdentity,
     resolver: FeatureBranchResolver | None,
 ) -> str:
     if resolver is None:
         raise PolicyError(
-            f"a live canonical feature-branch resolver is required for epic sc-{epic}"
+            f"a live canonical feature-branch resolver is required for epic {_feature_key(epic)}"
         )
-    branch = _string(resolver(epic), f"canonical feature branch for sc-{epic}")
-    parsed = FEATURE_RE.fullmatch(branch)
-    if parsed is None or int(parsed.group("epic")) != epic:
+    branch = _string(resolver(epic), f"canonical feature branch for {_feature_key(epic)}")
+    if not _matches_feature(branch, epic):
         raise PolicyError(
-            f"canonical feature resolver returned an invalid branch for sc-{epic}: {branch!r}"
+            f"canonical feature resolver returned an invalid branch for {_feature_key(epic)}: {branch!r}"
         )
     return branch
 
 
 def resolve_remote_feature_branch(
-    epic: int,
+    epic: FeatureIdentity,
     *,
     runner: Callable[..., Any] = subprocess.run,
 ) -> str:
     """Resolve the one live feature branch for *epic* from the fixed ``origin`` remote."""
 
-    if not isinstance(epic, int) or isinstance(epic, bool) or epic <= 0:
-        raise PolicyError(f"epic must be a positive integer, found {epic!r}")
-    pattern = f"refs/heads/feature/sc-{epic}-*"
+    if not ((isinstance(epic, int) and not isinstance(epic, bool) and epic > 0)
+            or (isinstance(epic, str) and re.fullmatch(r"sw-f[1-9][0-9]*", epic))):
+        raise PolicyError(f"epic must be a positive integer or CodeGraph feature key, found {epic!r}")
+    key = _feature_key(epic)
+    pattern = f"refs/heads/feature/{key}-*"
     command = ["git", "ls-remote", "--heads", "origin", pattern]
     try:
         result = runner(
@@ -395,12 +426,12 @@ def resolve_remote_feature_branch(
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise PolicyError(
-            f"could not resolve the canonical feature branch for sc-{epic}: {error}"
+            f"could not resolve the canonical feature branch for {_feature_key(epic)}: {error}"
         ) from error
     if result.returncode != 0:
         detail = (result.stderr or "git ls-remote failed").strip()
         raise PolicyError(
-            f"could not resolve the canonical feature branch for sc-{epic}: {detail}"
+            f"could not resolve the canonical feature branch for {_feature_key(epic)}: {detail}"
         )
 
     branches: dict[str, str] = {}
@@ -414,10 +445,9 @@ def resolve_remote_feature_branch(
         if not ref.startswith(prefix):
             raise PolicyError(f"git ls-remote returned a non-branch ref: {ref!r}")
         branch = ref.removeprefix(prefix)
-        parsed = FEATURE_RE.fullmatch(branch)
-        if parsed is None or int(parsed.group("epic")) != epic:
+        if not _matches_feature(branch, epic):
             raise PolicyError(
-                f"git ls-remote returned an invalid feature ref for sc-{epic}: {ref!r}"
+                f"git ls-remote returned an invalid feature ref for {_feature_key(epic)}: {ref!r}"
             )
         previous = branches.get(branch)
         if previous is not None and previous != sha:
@@ -428,11 +458,11 @@ def resolve_remote_feature_branch(
         branches[branch] = sha
 
     if not branches:
-        raise PolicyError(f"no live feature branch exists on origin for epic sc-{epic}")
+        raise PolicyError(f"no live feature branch exists on origin for epic {_feature_key(epic)}")
     if len(branches) != 1:
         rendered = ", ".join(sorted(branches))
         raise PolicyError(
-            f"multiple live feature branches exist on origin for epic sc-{epic}: {rendered}"
+            f"multiple live feature branches exist on origin for epic {_feature_key(epic)}: {rendered}"
         )
     return next(iter(branches))
 
@@ -504,9 +534,9 @@ def _validate_pull_request(
         if head_ref != canonical:
             raise PolicyError(
                 f"feature branch {head_ref!r} is not the unique live canonical branch "
-                f"for sc-{head_train.epic}: {canonical!r}"
+                f"for {_feature_key(head_train.epic)}: {canonical!r}"
             )
-        return f"feature epic sc-{head_train.epic} targets main"
+        return f"feature epic {_feature_key(head_train.epic)} targets main"
 
     if head_train.kind in {"story", "sync"}:
         if base_train is None or base_train.kind != "feature":
@@ -515,21 +545,21 @@ def _validate_pull_request(
             )
         if head_train.epic != base_train.epic:
             raise PolicyError(
-                f"epic mismatch: {head_ref!r} belongs to sc-{head_train.epic}, "
-                f"but {base_ref!r} belongs to sc-{base_train.epic}"
+                f"epic mismatch: {head_ref!r} belongs to {_feature_key(head_train.epic)}, "
+                f"but {base_ref!r} belongs to {_feature_key(base_train.epic)}"
             )
         canonical = _canonical_feature_branch(head_train.epic, feature_resolver)
         if base_ref != canonical:
             raise PolicyError(
                 f"target feature branch {base_ref!r} is not the unique live canonical "
-                f"branch for sc-{head_train.epic}: {canonical!r}"
+                f"branch for {_feature_key(head_train.epic)}: {canonical!r}"
             )
         if head_train.kind == "story" and head_train.slug != base_train.slug:
             raise PolicyError(
                 f"story branch {head_ref!r} uses slug {head_train.slug!r}, not the "
                 f"canonical feature slug {base_train.slug!r}"
             )
-        return f"{head_train.kind} branch targets matching feature epic sc-{head_train.epic}"
+        return f"{head_train.kind} branch targets matching feature epic {_feature_key(head_train.epic)}"
 
     raise AssertionError(f"unhandled train branch kind: {head_train.kind}")
 
@@ -576,7 +606,7 @@ def _validate_merge_group(
         if base_branch != canonical:
             raise PolicyError(
                 f"merge queue target {base_branch!r} is not the unique live canonical "
-                f"branch for sc-{base_train.epic}: {canonical!r}"
+                f"branch for {_feature_key(base_train.epic)}: {canonical!r}"
             )
 
     queue_ref = re.compile(

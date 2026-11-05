@@ -28,7 +28,7 @@ jobs:
       matrix:
         include:
           - group: base
-            packages: '-p candle-llm -p candle-quant-kernels -p candle-audio* -p runtime-cpu'
+            packages: '-p candle-llm -p candle-quant-kernels -p candle-audio* -p runtime-cpu -p sceneworks-gen-cv'
             targets: '--lib'
           - group: gen
             packages: '-p candle-gen*'
@@ -149,7 +149,7 @@ jobs:
           exec > >(tee "$RUNNER_TEMP/model-test-evidence/commands-and-results.log") 2>&1
           set -x
           if [ "$TEST_SUITE" = baseline ]; then
-            python3 scripts/ci/test_suites.py --deadline-seconds 7200 routine -- cargo test --locked --no-fail-fast --lib --tests -j 1 -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-core -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train --features mlx-llm/campaign
+            python3 scripts/ci/test_suites.py --deadline-seconds 7200 routine -- cargo test --locked --no-fail-fast --lib --tests -j 1 -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-cv -p sceneworks-gen-core -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train --features mlx-llm/campaign
           else
             python3 scripts/ci/test_suites.py --deadline-seconds 7200 exhaustive -- cargo test --locked --lib --tests -j 1 -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos --features mlx-llm/campaign
           fi

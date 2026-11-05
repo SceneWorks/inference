@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import functools
 import json
 import os
@@ -24,6 +26,8 @@ REPOSITORY = "SceneWorks/inference"
 SCRIPT = Path(__file__).resolve().parents[1] / "ci" / "feature_epic_policy.py"
 FEATURE = "feature/sc-18304-pipeline-flexibility-mlx-perf"
 STORY = "story/sc-18419-epic-18304-pipeline-flexibility-mlx-perf"
+CG_FEATURE = "feature/sw-f327-code-review-remediation"
+CG_STORY = "story/sw-6686-feature-sw-f327-code-review-remediation"
 PR_HEAD_SHA = "1" * 40
 PR_BASE_SHA = "2" * 40
 PR_MERGE_SHA = "3" * 40
@@ -45,9 +49,10 @@ HERMETIC_GIT_ENV = {
 }
 
 
-def canonical_feature(epic: int) -> str:
+def canonical_feature(epic: int | str) -> str:
     branches = {
         18304: FEATURE,
+        "sw-f327": CG_FEATURE,
         18305: "feature/sc-18305-other",
         99999: "feature/sc-99999-other-epic",
     }
@@ -208,6 +213,57 @@ class FeatureEpicPolicyTests(unittest.TestCase):
     ) -> None:
         with self.assertRaisesRegex(PolicyError, pattern):
             validate(event_name, payload, **kwargs)
+
+    def test_codegraph_train_and_identity_guards(self) -> None:
+        self.assertIn("sw-f327", validate("pull_request", pull_request_event(CG_STORY, CG_FEATURE)))
+        validate("pull_request", pull_request_event(CG_FEATURE, "main"))
+        validate("merge_group", merge_group_event(CG_FEATURE))
+        for head, base, error in (
+            (CG_STORY, "main", "must target its matching feature"),
+            (CG_STORY, "feature/sw-f328-other", "epic mismatch"),
+            (CG_STORY, "feature/sc-327-code-review-remediation", "epic mismatch"),
+            ("story/sc-6686-epic-327-code-review-remediation", CG_FEATURE, "epic mismatch"),
+            ("story/sw-6686-feature-sw-f327-wrong", CG_FEATURE, "canonical feature slug"),
+            (CG_STORY, "feature/sw-f327-duplicate", "not the unique live canonical"),
+            (CG_FEATURE, "release/next", "may target only"),
+        ):
+            with self.subTest(head=head, base=base):
+                self.assert_rejected("pull_request", pull_request_event(head, base), error)
+        self.assert_rejected("pull_request", pull_request_event(CG_STORY, CG_FEATURE, head_repository="attacker/inference"), "head.repo.full_name must be")
+        self.assert_rejected("merge_group", merge_group_event("feature/sw-f327-duplicate"), "not the unique live canonical")
+
+    def test_malformed_codegraph_feature_markers_fail_closed(self) -> None:
+        for head in (
+            "story/sw-6686-feature", "story/sw-6686-feature-sw-f0-slug",
+            "story/sw-0-feature-sw-f327-code-review-remediation",
+            "story/sw-01-feature-sw-f327-code-review-remediation",
+            "story/sw-abc-feature-sw-f327-code-review-remediation",
+            "story/sw--feature-sw-f327-code-review-remediation",
+            "story/sw-6686-feature-sw-f327-Bad_Slug", "feature/sw-f327-Bad_Slug",
+        ):
+            with self.subTest(head=head):
+                self.assert_rejected("pull_request", pull_request_event(head, "main"), "malformed feature-epic branch")
+        self.assertIn("ordinary pull request", validate("pull_request", pull_request_event("story/sw-6686-other-feature-work", "main")))
+
+    def test_codegraph_remote_resolution_fails_closed(self) -> None:
+        calls = []
+        def runner(command, **kwargs):
+            calls.append(command)
+            return SimpleNamespace(returncode=0, stdout=f"{PR_HEAD_SHA}\trefs/heads/{CG_FEATURE}\n", stderr="")
+        self.assertEqual(resolve_remote_feature_branch("sw-f327", runner=runner), CG_FEATURE)
+        self.assertEqual(calls[0], ["git", "ls-remote", "--heads", "origin", "refs/heads/feature/sw-f327-*"])
+        for output, error in (
+            ("", "no live feature branch"),
+            (f"{PR_HEAD_SHA}\trefs/heads/{CG_FEATURE}\n{PR_BASE_SHA}\trefs/heads/feature/sw-f327-duplicate\n", "multiple live feature branches"),
+            (f"{PR_HEAD_SHA}\trefs/heads/feature/sc-327-other\n", "invalid feature ref"),
+            (f"{PR_HEAD_SHA}\trefs/heads/{CG_FEATURE}/nested\n", "invalid feature ref"),
+            (f"{PR_HEAD_SHA}\trefs/heads/{CG_FEATURE}\n{PR_BASE_SHA}\trefs/heads/{CG_FEATURE}\n", "divergent commits"),
+        ):
+            with self.subTest(output=output), self.assertRaisesRegex(PolicyError, error):
+                resolve_remote_feature_branch("sw-f327", runner=lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=output, stderr=""))
+        for key in ("sw-f0", "sw-f327-*", "sc-327", True, 0):
+            with self.subTest(key=key), self.assertRaises(PolicyError):
+                resolve_remote_feature_branch(key, runner=runner)
 
     def test_epic_bearing_story_targets_matching_feature(self) -> None:
         reason = validate(

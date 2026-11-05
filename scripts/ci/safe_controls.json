@@ -289,6 +289,370 @@
         "metal"
       ],
       "reason": "312 raw rank-5/6 sum/mean/min/max/argmin/argmax and strided-index comparisons on synthetic f32 values; tensor views, scalar scaling and readback only. No learned model/module/layer, inference path, backward or optimizer executes."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "person::tests::letterbox_centers_pad_on_the_short_axis",
+      "source": "crates/media/gen-cv/src/person_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "person::tests::un_letterbox_inverts_the_forward_mapping",
+      "source": "crates/media/gen-cv/src/person_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "person::tests::decode_keeps_person_anchors_above_conf_and_builds_xyxy",
+      "source": "crates/media/gen-cv/src/person_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "person::tests::decode_clamps_boxes_to_the_frame",
+      "source": "crates/media/gen-cv/src/person_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "person::tests::decode_rejects_malformed_output_shape_and_length",
+      "source": "crates/media/gen-cv/src/person_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "person::tests::preprocess_letterbox_places_pixels_and_pads_per_layout",
+      "source": "crates/media/gen-cv/src/person_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "person::tests::nms_drops_high_overlap_keeps_disjoint",
+      "source": "crates/media/gen-cv/src/person_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "pose::tests::wholebody_to_openpose_maps_indices_and_computes_neck",
+      "source": "crates/media/gen-cv/src/pose_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "pose::tests::squareify_pads_short_axis_centered",
+      "source": "crates/media/gen-cv/src/pose_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "pose::tests::yolox_decode_embedded_nms_branch",
+      "source": "crates/media/gen-cv/src/pose_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "pose::tests::yolox_decode_rejects_truncated_output",
+      "source": "crates/media/gen-cv/src/pose_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "pose::tests::pose_decode_argmax_and_rescale",
+      "source": "crates/media/gen-cv/src/pose_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "pose::tests::pose_decode_negative_value_marks_missing",
+      "source": "crates/media/gen-cv/src/pose_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "pose::tests::pose_decode_rejects_malformed_simcc",
+      "source": "crates/media/gen-cv/src/pose_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "pose::tests::wholebody_to_openpose_rejects_short_keypoint_set",
+      "source": "crates/media/gen-cv/src/pose_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "upscale::tests::tile_slices_single_when_image_fits",
+      "source": "crates/media/gen-cv/src/upscale_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "upscale::tests::tile_slices_grid_row_major_clamped",
+      "source": "crates/media/gen-cv/src/upscale_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "upscale::tests::tile_slices_zero_tile_is_single",
+      "source": "crates/media/gen-cv/src/upscale_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "upscale::tests::crop_to_chw_layout_and_normalization",
+      "source": "crates/media/gen-cv/src/upscale_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "upscale::tests::crop_to_chw_subregion",
+      "source": "crates/media/gen-cv/src/upscale_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "upscale::tests::pad_chw_even_replicates_to_even_dims_for_pixel_unshuffle",
+      "source": "crates/media/gen-cv/src/upscale_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "upscale::tests::validate_upscale_output_rejects_mismatched_shapes",
+      "source": "crates/media/gen-cv/src/upscale_tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "session::tests::failed_second_model_discards_the_hardware_pair_before_cpu_retry",
+      "source": "crates/media/gen-cv/src/session.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "session::tests::failed_first_model_skips_second_hardware_load_and_preserves_cpu_load_error",
+      "source": "crates/media/gen-cv/src/session.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "session::tests::successful_hardware_load_does_not_rebuild_on_cpu",
+      "source": "crates/media/gen-cv/src/session.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-cv",
+      "kind": "lib",
+      "target": "sceneworks_gen_cv",
+      "test": "image_sampling::tests::samples_all_channels_with_shared_geometry",
+      "source": "crates/media/gen-cv/src/image_sampling.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
     }
   ]
 }
