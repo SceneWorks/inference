@@ -1156,14 +1156,14 @@ mod tests {
         }
         let dense_w = Weights::from_map(dense_map);
 
-        let mut packed = MiniMaxH3TextEncoder::from_weights(
+        let packed = MiniMaxH3TextEncoder::from_weights(
             &on_device(&packed_w, &device),
             "lm",
             &cfg,
             DType::F32,
         )
         .unwrap();
-        let mut dense = MiniMaxH3TextEncoder::from_weights(
+        let dense = MiniMaxH3TextEncoder::from_weights(
             &on_device(&dense_w, &device),
             "lm",
             &cfg,
