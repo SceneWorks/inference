@@ -1,108 +1,17 @@
-//! MiniMax-H3's shared-ladder `MemoryProviderContract` on Candle/CUDA (sc-18659).
+//! CUDA H3 memory contracts and executable request policy.
 //!
-//! The sibling declaration to `mlx_gen_minimax_h3::memory_strategy`. The contract carries a
-//! [`MemoryBackendRealization`], so the two backends are *allowed* to differ — and here they
-//! genuinely do, in three ways that are worth stating before the code:
-//!
-//! 1. **No fitted curve.** [`MemoryProviderContract::calibration`] is `None`. A provider with no
-//!    calibration identity can run its resident path and can never claim a verified optimized fit —
-//!    which is exactly the truth here, and is enforced: `standard_memory_strategy_safety_check`
-//!    refuses any optimized selection when the identity is absent.
-//!
-//!    The formula is [`MemoryFormulaKind::ComponentPhaseEnvelope`] as of sc-18665, but over a single
-//!    phase and the single [`MemoryFormulaVariable::AssetBytes`] input — it is the floor arm plus
-//!    the AdaLN exclusion, not MLX's fitted five-variable envelope. The variant changed because it
-//!    is the *only* one that carries `resident_components`; the absent calibration identity, not the
-//!    formula shape, is what keeps every optimized selection failing closed.
-//! 2. **Staged residency is implemented but under-declared (sc-17156 / sc-18660).** MLX declares
-//!    [`MemoryStrategy::StagedResidency`] `Implemented`. This lane now *does the same thing* —
-//!    `MiniMaxH3::generate_impl` releases each heavy component before mapping the next, and the
-//!    provider **forces** `OffloadPolicy::Sequential` so a caller cannot opt out — but the rung
-//!    stays declared `Missing` until its executable behavior seam lands, and that seam is itself
-//!    gated on a `calibration` identity this backend does not have. An implemented optimized rung
-//!    without a seam fails catalog conformance, and under-declaring is the safe direction: the
-//!    staging still happens, and nothing is admitted on an unexercisable claim.
-//! 3. **No fused streaming SDPA.** The MLX verdict that attention scratch is already streamed —
-//!    peak tracking `4·B·H·S·D` with no materialized score tensor — is a property of *MLX's* fused
-//!    kernel and **must not be copied here**. Candle materializes scores, so bounding attention
-//!    (sc-18661) may buy real memory on this backend even if it buys none on MLX.
-//!
-//! # Why the asset facts are the full four components anyway
-//!
-//! `conditioning_bytes` charges the 66.71 GB Qwen3-VL-32B text encoder, which this crate executes
-//! through [`crate::text_encoder`] (sc-17155). Asset facts are the render's byte floor, not a
-//! capability claim: a candle render of this family needs the conditioner, and a contract that
-//! declared zero there would publish a floor small enough to admit a request that cannot possibly
-//! run. Capability lives in `strategies`, where every optimized rung is honestly `Missing`.
-//!
-//! # Stage attribution
-//!
-//! The ~53 GB memory floor measured for this family is the **conditioning** stage — the dense text
-//! encoder in isolation — not the DiT and not activation pressure. The DiT's own denoise-resident
-//! cost is a separate, genuinely tiered quantity. Those measurements were taken on MLX; sc-17156
-//! landed this backend's pipeline but no fitted curve of its own, which is the other reason
-//! `calibration` is `None`.
-//!
-//! # The packed `q4`/`q8` tiers are live on this lane (sc-20267)
-//!
-//! **This crate is no longer bf16-only, and several notes in this file used to say that it was.**
-//! [`crate::quant::lin`] auto-detects the MLX affine triple and builds a packed base with no dense
-//! transient, [`crate::tier`] resolves and reconciles the published `q4` / `q8` / `bf16` subtrees, and
-//! [`crate::dit::block::AdaLnProjection`] is one of the two DiT loaders that pack. Three consequences
-//! land in this module, each carried by code below rather than left in prose:
-//!
-//! * the per-tier asset sizes are declared ([`DIT_Q4_BYTES`] and its three siblings) — **from the
-//!   manifest, not measured**, and their section note says exactly what that costs;
-//! * `resolved_adaln_bytes` finally owes and pays the **marker leg** its old doc promised: it reads
-//!   the staged DiT's own `quantization.bits` and re-derives the projection stack at that width,
-//!   taking `min(marker, footprint)` the way the MLX sibling does;
-//! * **the container is candle's, not MLX's.** A 4-bit MLX pack repacks into GGUF `Q4_1` and an
-//!   8-bit one into `Q8_0` (`candle_gen::quant::repack_packed_weight`), so the packed stack sizes are
-//!   *not* the MLX sibling's at `q4` — see `adaln_stack_bytes`, where that divergence is derived
-//!   rather than reconciled away.
-//!
-//! What has **not** changed: there is still no fitted curve, no calibration identity and no behavior
-//! seam on this lane, so every optimized rung stays `Missing` and no tier makes anything new
-//! admissible. The tiers change what a render *costs*, not what this provider *claims*.
-//!
-//! # The configured LoRA stack is charged (sc-18650)
-//!
-//! `overlay_bytes` was the literal `0` from sc-18659 until this story, and — unlike the MLX
-//! sibling's identical defect, whose contract was still unpublished — **this one shipped**. sc-18724
-//! landed the adapter seam on 2026-08-13 and nothing brought the declaration with it, so a LoRA
-//! render's resident factors were charged nothing on a live path. They are now a typed
-//! [`MemoryComponentKind::AdapterStack`] at [`MemoryComponentResidency::WholeRender`], sized through
-//! the shared `adapter_stack_resident_bytes` at [`AdapterResidencyMode::Additive`] — see
-//! [`adapter_overlay_bytes`], which is also where the probe that makes the bytes *knowable* lives.
-//!
-//! **The probe fails closed on every configured adapter**, matching the MLX sibling: an adapter that
-//! is not on disk is refused at `load` rather than charged 0, and so is one that *is* there and
-//! cannot be sized. Charging an absent path 0 would have been exact only at the **probe instant** —
-//! the contract is computed once in `crate::model::MiniMaxH3::load` and cached, while the factors are
-//! installed per render in `crate::model::MiniMaxH3::load_task_dit`, so a path that appears between
-//! the two would put ~636 MB of resident factors behind a published `overlay_bytes: 0`. That is the
-//! defect this story exists to close, and refusing at `load` costs nothing a caller could have used:
-//! `read_adapter` stats the path first, so an adapter absent at load can never reach a *successful*
-//! render on this lane in any case. The declaration and the variable are both conditional on a
-//! non-zero overlay, so a render with **no** adapter configured publishes byte-for-byte the contract
-//! this provider always has.
-//!
-//! # Source-pruned centered-curve AdaLN (sc-26684)
-//!
-//! Canonical source headers and the loader's config feed the shared `SourcePruneSizing` facts.
-//! The stored table/reduced projections/folded biases are replaced by their actual F32 compute
-//! bytes in the transformer total, and the full admitted schedule/shift domain bounds the
-//! additional F32 block/final outputs and coordinates. These buffers coexist: pruned precompute
-//! releases no operands, so the sub-stack is `WholeRender` with zero eviction credit. One task DiT
-//! is constructed per render. Mixed routes compare corrected task footprints, not gross files
-//! followed by the winner's dense eviction; pure dense/stock sizing remains unchanged.
+//! Phase staging and reference VAE tiling are unconditional pipeline behavior. Bounded
+//! attention constrains materializing fallback; deferred CUDA blocks are selectable only
+//! for sources the runtime can transfer without changing their numerical format.
 
 mod adapters;
 mod conditioning;
 mod execution;
+mod routes;
 
 pub(crate) use execution::active_context;
 pub use execution::begin_request;
+pub use routes::MEMORY_BEHAVIOR;
 
 use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::DType;
@@ -967,67 +876,45 @@ fn adaln_component(resident_bytes: u64, pruned: bool) -> MemoryResidentComponent
     }
 }
 
-/// The five capability entries. **Exactly one is `Implemented` — rung 0, `Resident`. Rungs 1-4 are
-/// all `Missing`**, which is what the `match` below returns and what the ladder reads.
-///
-/// Rung 1 is the one that needs stating carefully, because the pipeline and the declaration disagree
-/// **on purpose**. sc-17156 made the staging real — `MiniMaxH3::generate_impl` drops each heavy
-/// component and synchronizes the device before mapping the next, and `MiniMaxH3` forces
-/// [`OffloadPolicy::Sequential`](candle_gen::gen_core::OffloadPolicy) whatever the caller asks for,
-/// so a caller cannot opt out. The *declaration* deliberately did not follow: the rung stays
-/// `Missing` until its executable weights-free behavior seam lands, and that seam is gated on a
-/// `calibration` identity this crate does not have (sc-18660 pinned that chain in a test). The long
-/// note on the arm below gives the full reasoning, and the module header says the same thing.
-///
-/// So "implemented in the pipeline" and "declared `Implemented`" are two different facts here, and
-/// only the first is true. Reading this as rung 1 being available to the ladder would be wrong in
-/// the direction that matters: nothing is admitted on the strength of it.
-///
-/// Every entry publishes an empty [`MemoryParameterRanges`], which is correct in both directions:
-/// rung 0 owns no numeric parameters, and a `Missing` rung must not publish a domain it cannot
-/// honor. Flipping any of rungs 1-4 to `Implemented` without filling its domain is a conformance
-/// error, not a silent under-declaration.
-fn strategies() -> Vec<MemoryStrategyCapability> {
+/// Capability domains mirror the runtime controls; declarations never imply source support.
+fn strategies_for(streamable: bool) -> Vec<MemoryStrategyCapability> {
     MemoryStrategy::ALL
         .into_iter()
-        .map(|strategy| MemoryStrategyCapability {
-            strategy,
-            support: match strategy {
-                MemoryStrategy::Resident => MemoryStrategySupport::Implemented,
-                // Rung 1 is **implemented in code** as of sc-17156 — `MiniMaxH3::generate_impl`
-                // stages all three phases and the offload policy is forced — but it stays declared
-                // `Missing` here, and that is a deliberate under-declaration, not an oversight.
-                //
-                // `check_memory_strategy_contract` requires every *implemented optimized* rung to
-                // carry an executable weights-free **behavior seam** (a `MemoryBehaviorRegistration`
-                // with per-route fixtures, the MLX sibling's `MEMORY_BEHAVIOR`). Declaring the rung
-                // without it fails catalog conformance — correctly: an optimized declaration with no
-                // seam is a capability claim nothing can execute against.
-                //
-                // Under-declaring is the safe direction. `Missing` means the ladder never *selects*
-                // staged residency for this provider, so the staging still happens (it is forced)
-                // and nothing is admitted on the strength of an unproven declaration. The reverse —
-                // declaring it and having the seam absent — would let admission believe a rung it
-                // cannot exercise.
-                //
-                // Rung 2 (sc-18660) is `Missing` for the very same reason, and it too is **not** a
-                // porting gap: the mechanism is present — `MiniMaxH3VideoVae::decode_clip` tiles at
-                // the reference 256/64 through `crate::spatial_tiling::BoundedStitch`, the same
-                // seam the MLX sibling declares `Implemented` on. What this backend lacks is one
-                // link further back than the seam: a weights-free `MemoryBehaviorRegistration`
-                // needs a `MemoryBehaviorFixture`, and that needs a `calibration` identity this
-                // crate does not have (see `contract.calibration`). So the blocker for **both**
-                // rungs is the absent calibration identity — not the seam, and not the mechanism.
-                // A seam cannot be written before the identity exists.
-                // `an_optimized_rung_here_is_blocked_by_the_missing_calibration_identity_not_the_\
-                // seam` drives that chain and fails the moment it is removed.
-                //
-                // Rungs 3/4: sc-18661 / sc-18662.
-                _ => MemoryStrategySupport::Missing,
-            },
-            parameters: MemoryParameterRanges::default(),
+        .map(|strategy| {
+            let mut parameters = MemoryParameterRanges::default();
+            let support = match strategy {
+                MemoryStrategy::BoundedTransformerResidency if !streamable => {
+                    MemoryStrategySupport::Missing
+                }
+                _ => MemoryStrategySupport::Implemented,
+            };
+            match strategy {
+                MemoryStrategy::BoundedDecode => {
+                    parameters.decode_tile_edges =
+                        vec![crate::spatial_tiling::TILE_SAMPLE_MIN_SIZE as u32];
+                    parameters.decode_overlaps =
+                        vec![crate::spatial_tiling::TILE_SAMPLE_MIN_OVERLAP as u32];
+                }
+                MemoryStrategy::BoundedAttention => {
+                    parameters.attention_chunk_sizes = vec![1 << 20, 8 << 20, 32 << 20];
+                }
+                MemoryStrategy::BoundedTransformerResidency if streamable => {
+                    parameters.transformer_window_sizes = vec![1];
+                    parameters.transformer_window_components = vec![TransformerComponent::Both];
+                }
+                _ => {}
+            }
+            MemoryStrategyCapability {
+                strategy,
+                support,
+                parameters,
+            }
         })
         .collect()
+}
+
+fn strategies() -> Vec<MemoryStrategyCapability> {
+    strategies_for(false)
 }
 
 /// The product of a list-valued downsample factor, exactly as
@@ -1343,17 +1230,56 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
     }
 }
 
+/// Apply load-exact capability after resolving the unchanged native allocation inventory.
+fn configure_contract(
+    spec: &LoadSpec,
+    contract: &mut MemoryProviderContract,
+    fixture: bool,
+) -> candle_gen::gen_core::Result<()> {
+    let streamable = spec.load_shape == LoadShape::DeferredMaterialization
+        && (fixture || crate::model::streaming_supported(spec)?);
+    contract.load_shape = spec.load_shape;
+    if let Some(calibration) = &mut contract.calibration {
+        calibration.load_shape = spec.load_shape;
+    }
+    contract.strategies = strategies_for(streamable);
+    if let MemoryBackendRealization::CandleCuda {
+        host_to_device_block_materialization,
+        ..
+    } = &mut contract.backend
+    {
+        *host_to_device_block_materialization = streamable;
+    }
+    contract.lifecycle = MemoryLifecycleCapabilities {
+        phases: vec![
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ],
+        synchronized_phase_release: true,
+        decode_tiling: true,
+        attention_chunking: true,
+        transformer_window_materialization: streamable,
+    };
+    if let MemoryFormulaKind::ComponentPhaseEnvelope { phases, .. } = &mut contract.formula {
+        *phases = contract.lifecycle.phases.clone();
+    }
+    Ok(())
+}
+
 /// The production contract: asset facts read off the resolved snapshot.
 pub fn contract_for(spec: &LoadSpec) -> candle_gen::gen_core::Result<MemoryProviderContract> {
-    Ok(build_contract(&ComponentBytes::resolve(spec)?))
+    let mut contract = build_contract(&ComponentBytes::resolve(spec)?);
+    configure_contract(spec, &mut contract, false)?;
+    Ok(contract)
 }
 
 /// The weights-free fixture contract: the identical route declaration with zero asset facts and no
 /// filesystem traversal.
 pub fn weights_free_contract(
-    _spec: &LoadSpec,
+    spec: &LoadSpec,
 ) -> candle_gen::gen_core::Result<MemoryProviderContract> {
-    Ok(build_contract(&ComponentBytes {
+    let mut contract = build_contract(&ComponentBytes {
         // No snapshot is resolved and none is traversed, so no architecture axis is knowable.
         root: None,
         dit_dir: None,
@@ -1373,7 +1299,9 @@ pub fn weights_free_contract(
         // the MLX sibling's `ComponentBytes::weights_free` makes.
         overlay: 0,
         native_quant: None,
-    }))
+    });
+    configure_contract(spec, &mut contract, true)?;
+    Ok(contract)
 }
 
 /// The provider's real admission check, callable before any weight file is opened.
@@ -1383,18 +1311,31 @@ pub fn weights_free_contract(
 /// the geometry gates belong to the pipeline sc-17156 landed (`crate::denoise::geometry`), not to
 /// this contract.
 pub fn safety_check(
-    _spec: &LoadSpec,
+    spec: &LoadSpec,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    candle_gen::gen_core::default_memory_strategy_safety_check(contract, context)
+    candle_gen::gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        Some(candle_gen::gen_core::MemoryNumericTier {
+            precision: spec.precision,
+            quant: spec.quantize,
+        }),
+        Some(&|| routes::route_gate(context)),
+    )
 }
 
 pub fn safety_check_loaded(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    candle_gen::gen_core::default_memory_strategy_safety_check(contract, context)
+    candle_gen::gen_core::standard_memory_strategy_safety_check(
+        contract,
+        context,
+        None,
+        Some(&|| routes::route_gate(context)),
+    )
 }
 
 /// The memory-strategy registration for `minimax_h3` on candle.

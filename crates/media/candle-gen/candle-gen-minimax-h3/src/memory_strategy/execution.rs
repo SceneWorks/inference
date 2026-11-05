@@ -98,15 +98,7 @@ pub fn begin_request(
         contract.generation_memory(&context.selection),
         context.use_pid,
         crate::dit::MiniMaxH3DitConfig::default().num_layers,
-        |_pid, edge, overlap| {
-            if edge == 0 || overlap >= edge {
-                return Err(candle_gen::gen_core::Error::Unsupported(
-                    "minimax_h3: decode requires a nonzero tile with overlap smaller than its edge"
-                        .into(),
-                ));
-            }
-            Ok(())
-        },
+        |_pid, edge, overlap| super::routes::validate_decode(edge, overlap),
     )?;
     config.default_frames = context.geometry.frames;
     config.attention_chunk_size = context.selection.parameters.attention_chunk_size;
