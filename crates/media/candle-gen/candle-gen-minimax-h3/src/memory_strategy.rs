@@ -99,6 +99,10 @@
 
 mod adapters;
 mod conditioning;
+mod execution;
+
+pub(crate) use execution::active_context;
+pub use execution::begin_request;
 
 use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::DType;
@@ -1380,6 +1384,13 @@ pub fn weights_free_contract(
 /// this contract.
 pub fn safety_check(
     _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
+    candle_gen::gen_core::default_memory_strategy_safety_check(contract, context)
+}
+
+pub fn safety_check_loaded(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
