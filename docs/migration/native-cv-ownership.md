@@ -1,7 +1,7 @@
 # Native CV ownership (SW-6775 / SW-6680)
 
 `sceneworks-gen-cv` owns the existing SceneWorks native CV engines. It is composed
-through the `media` feature of `runtime-macos` (with MLX) and `runtime-cuda` (ORT).
+through the explicit `cv` feature of `runtime-macos` (with MLX) and `runtime-cuda` (ORT).
 The LLM-only and iOS bundle graphs do not acquire this dependency.
 
 | Capability | Inference owner | Preserved behavior |
