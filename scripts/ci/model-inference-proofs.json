@@ -61382,12 +61382,18 @@
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "SCENEWORKS_H3_STREAM_PROOF_DEVICE",
+      "SCENEWORKS_H3_ATTENTION_ROUTE"
+    ],
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
         "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::native_controls_capture_every_mode_packed_tier_and_adapter_stack/fixed_cpu",
-        "environment": {},
+        "environment": {
+          "SCENEWORKS_H3_STREAM_PROOF_DEVICE": null,
+          "SCENEWORKS_H3_ATTENTION_ROUTE": null
+        },
         "cargo_features": [
           "model-inference-proof"
         ],
@@ -61399,9 +61405,31 @@
         "required_work": [
           "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
         ]
+      },
+      "cuda0_materialized": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::native_controls_capture_every_mode_packed_tier_and_adapter_stack/cuda0_materialized",
+        "environment": {
+          "SCENEWORKS_H3_STREAM_PROOF_DEVICE": "cuda:0",
+          "SCENEWORKS_H3_ATTENTION_ROUTE": "materialized"
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "required_cuda_physical_index": 1,
+        "scope": "Entire source-selected body on logical CUDA0 mapped to physical GPU1; host-prepared block windows, equivalent resident route, and materializing attention observed.",
+        "required_work": [
+          "All existing source mode/tier/adapter/audio assertions",
+          "Actual host-to-device streamed blocks compared with same-device resident outputs",
+          "Injected failure/cancellation recovery and positive bounded materialized attention counters"
+        ]
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::native_controls_capture_every_mode_packed_tier_and_adapter_stack",
@@ -61706,12 +61734,18 @@
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "SCENEWORKS_H3_STREAM_PROOF_DEVICE",
+      "SCENEWORKS_H3_ATTENTION_ROUTE"
+    ],
     "default_configuration": "fixed_cpu",
     "configurations": {
       "fixed_cpu": {
         "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/text_encoder/encoder.rs::text_encoder::encoder::tests::the_packed_te_forward_matches_its_dense_grid/fixed_cpu",
-        "environment": {},
+        "environment": {
+          "SCENEWORKS_H3_STREAM_PROOF_DEVICE": null,
+          "SCENEWORKS_H3_ATTENTION_ROUTE": null
+        },
         "cargo_features": [
           "model-inference-proof"
         ],
@@ -61723,9 +61757,31 @@
         "required_work": [
           "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
         ]
+      },
+      "cuda0_materialized": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/text_encoder/encoder.rs::text_encoder::encoder::tests::the_packed_te_forward_matches_its_dense_grid/cuda0_materialized",
+        "environment": {
+          "SCENEWORKS_H3_STREAM_PROOF_DEVICE": "cuda:0",
+          "SCENEWORKS_H3_ATTENTION_ROUTE": "materialized"
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "required_cuda_physical_index": 1,
+        "scope": "Entire source-selected body on logical CUDA0 mapped to physical GPU1; host-prepared block windows, equivalent resident route, and materializing attention observed.",
+        "required_work": [
+          "All existing source mode/tier/adapter/audio assertions",
+          "Actual host-to-device streamed blocks compared with same-device resident outputs",
+          "Injected failure/cancellation recovery and positive bounded materialized attention counters"
+        ]
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/text_encoder/encoder.rs::text_encoder::encoder::tests::the_packed_te_forward_matches_its_dense_grid",

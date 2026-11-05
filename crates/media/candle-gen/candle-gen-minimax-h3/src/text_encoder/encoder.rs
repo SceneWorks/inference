@@ -1110,6 +1110,34 @@ mod tests {
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
     fn the_packed_te_forward_matches_its_dense_grid() {
+        let forced_materialized = std::env::var("SCENEWORKS_H3_ATTENTION_ROUTE")
+            .ok()
+            .as_deref()
+            == Some("materialized");
+        crate::nn::reset_attention_execution_report();
+        let device = match std::env::var("SCENEWORKS_H3_STREAM_PROOF_DEVICE")
+            .ok()
+            .as_deref()
+        {
+            None => Device::Cpu,
+            Some("cuda:0") => {
+                Device::new_cuda(0).expect("explicit CUDA proof requires logical GPU0")
+            }
+            Some(other) => panic!("unsupported explicit H3 proof device: {other}"),
+        };
+        fn on_device(weights: &Weights, device: &Device) -> Weights {
+            Weights::from_map(
+                weights
+                    .keys()
+                    .map(|key| {
+                        (
+                            key.clone(),
+                            weights.require(key).unwrap().to_device(device).unwrap(),
+                        )
+                    })
+                    .collect(),
+            )
+        }
         let cfg = packable_cfg();
         let (packed_w, grids) = packable_weights(&cfg, true);
 
@@ -1128,15 +1156,25 @@ mod tests {
         }
         let dense_w = Weights::from_map(dense_map);
 
-        let mut packed =
-            MiniMaxH3TextEncoder::from_weights(&packed_w, "lm", &cfg, DType::F32).unwrap();
-        let mut dense =
-            MiniMaxH3TextEncoder::from_weights(&dense_w, "lm", &cfg, DType::F32).unwrap();
+        let mut packed = MiniMaxH3TextEncoder::from_weights(
+            &on_device(&packed_w, &device),
+            "lm",
+            &cfg,
+            DType::F32,
+        )
+        .unwrap();
+        let mut dense = MiniMaxH3TextEncoder::from_weights(
+            &on_device(&dense_w, &device),
+            "lm",
+            &cfg,
+            DType::F32,
+        )
+        .unwrap();
         assert!(packed.embed_tokens.embedding.is_quantized());
         assert!(!dense.embed_tokens.embedding.is_quantized());
 
-        let tokens = ids(&[1, 4, 9, 2, 11]);
-        let mask = ones_mask(5);
+        let tokens = ids(&[1, 4, 9, 2, 11]).to_device(&device).unwrap();
+        let mask = ones_mask(5).to_device(&device).unwrap();
         let got = packed.forward(&tokens, &mask).unwrap();
         let want = dense.forward(&tokens, &mask).unwrap();
         let drift = candle_gen::testkit::tensor_peak_rel_or_abs(&got, &want);
@@ -1146,15 +1184,20 @@ mod tests {
             "the Q4_1 repack is lossless up to the f16 scale/bias cast; got {drift:.3e}"
         );
 
+        // Fresh host-prepared stacks ensure this comparison exercises actual H2D windows.
+        let mut packed =
+            MiniMaxH3TextEncoder::from_weights(&packed_w, "lm", &cfg, DType::F32).unwrap();
+        let mut dense =
+            MiniMaxH3TextEncoder::from_weights(&dense_w, "lm", &cfg, DType::F32).unwrap();
         let request = crate::block_stream::tests::request();
         let guard = crate::block_stream::RequestGuard::enter(
             &request,
             candle_gen::gen_core::LoadShape::DeferredMaterialization,
-            &Device::Cpu,
+            &device,
         )
         .unwrap();
-        packed.prepare_streamed(&cfg, &Device::Cpu).unwrap();
-        dense.prepare_streamed(&cfg, &Device::Cpu).unwrap();
+        packed.prepare_streamed(&cfg, &device).unwrap();
+        dense.prepare_streamed(&cfg, &device).unwrap();
         for (encoder, resident) in [(&packed, &got), (&dense, &want)] {
             let output = encoder.forward(&tokens, &mask).unwrap();
             assert!(candle_gen::testkit::tensor_peak_rel_or_abs(&output, resident) <= 1e-5);
@@ -1170,6 +1213,23 @@ mod tests {
         }
         drop(guard);
         assert!(crate::block_stream::current().is_none());
+
+        if forced_materialized {
+            let report = crate::nn::attention_execution_report();
+            assert!(
+                report.materialized_calls > 0,
+                "materializing route must execute"
+            );
+            assert_eq!(
+                report.flash_calls, 0,
+                "forced materializing route cannot dispatch fused attention"
+            );
+            assert!(
+                report.maximum_materialized_score_elements
+                    <= candle_gen::gen_core::veda::workspace::CUDA_DENSE_SCORE_ELEMENTS
+            );
+            println!("H3_MATERIALIZED_ATTENTION_PROOF {report:?}");
+        }
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::the_packed_te_forward_matches_its_dense_grid");

@@ -1163,14 +1163,25 @@ mod veda_controls_tests {
             ..Default::default()
         }
     }
-    fn weights(bits: Option<usize>) -> Weights {
-        let device = Device::Cpu;
+    fn proof_device() -> Device {
+        match std::env::var("SCENEWORKS_H3_STREAM_PROOF_DEVICE")
+            .ok()
+            .as_deref()
+        {
+            None => Device::Cpu,
+            Some("cuda:0") => {
+                Device::new_cuda(0).expect("explicit CUDA proof requires logical GPU0")
+            }
+            Some(other) => panic!("unsupported explicit H3 proof device: {other}"),
+        }
+    }
+    fn weights_on(bits: Option<usize>, device: &Device) -> Weights {
         let mut map = candle_gen::candle_core::safetensors::load(
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/fixtures/dit_block.safetensors"
             ),
-            &device,
+            device,
         )
         .unwrap();
         if let Some(bits) = bits {
@@ -1182,22 +1193,21 @@ mod veda_controls_tests {
                 .collect();
             map.insert(
                 "transformer_blocks.0.attn.to_q.weight".into(),
-                Tensor::from_vec(codes, (96, 64 / lanes), &device).unwrap(),
+                Tensor::from_vec(codes, (96, 64 / lanes), device).unwrap(),
             );
             map.insert(
                 "transformer_blocks.0.attn.to_q.scales".into(),
-                Tensor::full(0.002f32, (96, 1), &device).unwrap(),
+                Tensor::full(0.002f32, (96, 1), device).unwrap(),
             );
             map.insert(
                 "transformer_blocks.0.attn.to_q.biases".into(),
-                Tensor::full(-0.01f32, (96, 1), &device).unwrap(),
+                Tensor::full(-0.01f32, (96, 1), device).unwrap(),
             );
         }
         Weights::from_map(map)
     }
-    fn layout(mode: usize, channels: usize) -> PackedLayout {
+    fn layout_on(mode: usize, channels: usize, dev: &Device) -> PackedLayout {
         let geometry = JointGeometry::new(5, 2, 2).unwrap();
-        let dev = Device::Cpu;
         let anchors = match mode {
             1 => vec![KeyframeAnchor::First],
             2 => vec![KeyframeAnchor::Last],
@@ -1211,7 +1221,7 @@ mod veda_controls_tests {
                 &[TEXT_TAG; 5],
                 channels,
                 &anchors,
-                &dev,
+                dev,
             )
             .unwrap();
         }
@@ -1239,7 +1249,7 @@ mod veda_controls_tests {
                 num_audio_latents: 3,
             },
         ];
-        PackedLayout::build_ref2va(geometry, [1, 2, 2], &[TEXT_TAG; 5], channels, &refs, &dev)
+        PackedLayout::build_ref2va(geometry, [1, 2, 2], &[TEXT_TAG; 5], channels, &refs, dev)
             .unwrap()
     }
     fn run(
@@ -1269,7 +1279,12 @@ mod veda_controls_tests {
         Vec<crate::veda::AttentionCall>,
         candle_gen::gen_core::VedaExecutionReport,
     ) {
-        let device = Device::Cpu;
+        let device = proof_device();
+        let source_device = if streamed {
+            Device::Cpu
+        } else {
+            device.clone()
+        };
         let request = crate::block_stream::tests::request();
         let _guard = streamed.then(|| {
             crate::block_stream::RequestGuard::enter(
@@ -1279,10 +1294,11 @@ mod veda_controls_tests {
             )
             .unwrap()
         });
-        let w = weights(bits);
+        let w = weights_on(bits, &source_device);
         // CPU Candle does not implement BF16 matmul; dense fixture arithmetic is F32.
         // BF16 request/tier admission is tested at the native loader; device numerics stay gated.
-        let mut dit = MiniMaxH3Dit::from_weights(&w, &config(), &device, DType::F32).unwrap();
+        let mut dit =
+            MiniMaxH3Dit::from_weights(&w, &config(), &source_device, DType::F32).unwrap();
         // Turbo then style: two additive factors on the actual native adaptable projection.
         let projection = dit
             .adaptable_mut(&["transformer_blocks", "0", "attn", "to_q"])
@@ -1291,8 +1307,8 @@ mod veda_controls_tests {
         for strength in [0.0625, 0.5] {
             projection
                 .push_lora(
-                    Tensor::full(0.01f32, (64, 2), &device).unwrap(),
-                    Tensor::full(0.02f32, (2, 96), &device).unwrap(),
+                    Tensor::full(0.01f32, (64, 2), &source_device).unwrap(),
+                    Tensor::full(0.02f32, (2, 96), &source_device).unwrap(),
                     strength,
                 )
                 .unwrap();
@@ -1302,11 +1318,15 @@ mod veda_controls_tests {
             dit.prepare_streamed(&device, 1).unwrap();
         }
 
-        let layout = layout(mode, channels);
+        let layout = layout_on(mode, channels, &device);
         let schedule = JointSchedule::with_shifts(evals + 1, shift, 3.0).unwrap();
         let adaln = adaln_schedule(&schedule).unwrap();
         assert_eq!(adaln.num_row_classes(), NUM_ROW_CLASSES);
-        let context = w.require("in.refiner.context").unwrap();
+        let context = w
+            .require("in.refiner.context")
+            .unwrap()
+            .to_device(&device)
+            .unwrap();
         let mut model = JointDit::new(
             dit,
             layout.clone(),
@@ -1417,10 +1437,10 @@ mod veda_controls_tests {
     /// rather than its own `#[test]`: it constructs a complete synthetic `JointDit`, which the H3
     /// ordinary-execution policy keeps out of ordinary CI.
     fn assert_attached_cancel_stops_the_forward_before_the_first_block() {
-        let device = Device::Cpu;
-        let w = weights(None);
+        let device = proof_device();
+        let w = weights_on(None, &device);
         let dit = MiniMaxH3Dit::from_weights(&w, &config(), &device, DType::F32).unwrap();
-        let layout = layout(0, 1);
+        let layout = layout_on(0, 1, &device);
         let schedule = JointSchedule::with_shifts(3, 12.0, 3.0).unwrap();
         let adaln = adaln_schedule(&schedule).unwrap();
         let context = w.require("in.refiner.context").unwrap();
@@ -1468,6 +1488,11 @@ mod veda_controls_tests {
     #[test]
     #[ignore = "complete synthetic DiT/JointDit forward; dispatched only by the manual H3 native suite"]
     fn native_controls_capture_every_mode_packed_tier_and_adapter_stack() {
+        let forced_materialized = std::env::var("SCENEWORKS_H3_ATTENTION_ROUTE")
+            .ok()
+            .as_deref()
+            == Some("materialized");
+        crate::nn::reset_attention_execution_report();
         for mode in 0..5 {
             for tier in [None, Some(4), Some(8)] {
                 for channels in [1, 2] {
@@ -1503,6 +1528,23 @@ mod veda_controls_tests {
             }
         }
         assert_attached_cancel_stops_the_forward_before_the_first_block();
+
+        if forced_materialized {
+            let report = crate::nn::attention_execution_report();
+            assert!(
+                report.materialized_calls > 0,
+                "materializing route must execute"
+            );
+            assert_eq!(
+                report.flash_calls, 0,
+                "forced materializing route cannot dispatch fused attention"
+            );
+            assert!(
+                report.maximum_materialized_score_elements
+                    <= candle_gen::gen_core::veda::workspace::CUDA_DENSE_SCORE_ELEMENTS
+            );
+            println!("H3_MATERIALIZED_ATTENTION_PROOF {report:?}");
+        }
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::model::veda_controls_tests::native_controls_capture_every_mode_packed_tier_and_adapter_stack");
