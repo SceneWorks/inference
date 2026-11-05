@@ -639,6 +639,14 @@ pub trait NativeAllocationFactsExt {
     fn denoise_peak_bytes(&self, rows: NativeRows) -> u64;
     fn precompute_peak_bytes_windowed(&self, rows: NativeRows, window: Option<u32>) -> Result<u64>;
     fn denoise_peak_bytes_windowed(&self, rows: NativeRows, window: Option<u32>) -> Result<u64>;
+    /// Attention alternatives share the current QKV identity. Compose Veda with the
+    /// persistent source/window weights and carried hidden, then max against projection/FFN.
+    fn denoise_peak_bytes_with_veda(
+        &self,
+        rows: NativeRows,
+        window: Option<u32>,
+        veda: &gen_core::veda::workspace::WorkspaceBound,
+    ) -> Result<u64>;
     /// Correct the ordinary estimator's weight floor without counting operation workspace twice.
     fn resident_peak_bytes_windowed(&self, rows: NativeRows, window: Option<u32>) -> Result<u64>;
     fn peak_bytes(&self, rows: NativeRows) -> u64;
@@ -806,6 +814,50 @@ impl NativeAllocationFactsExt for NativeAllocationFacts {
                     Self::task_rows(task, rows),
                     window as usize,
                 )?))
+            })
+    }
+
+    fn denoise_peak_bytes_with_veda(
+        &self,
+        rows: NativeRows,
+        window: Option<u32>,
+        veda: &gen_core::veda::workspace::WorkspaceBound,
+    ) -> Result<u64> {
+        if matches!(self.backend, NativeBackend::Mlx { .. }) {
+            return self
+                .denoise_peak_bytes_windowed(rows, window)?
+                .checked_add(veda.unified_peak_bytes())
+                .ok_or_else(|| invalid("Veda unified memory overflow"));
+        }
+        self.selected_tasks(rows)
+            .filter(|t| t.resident_bytes > 0)
+            .try_fold(0u64, |peak, task| {
+                let rows = Self::task_rows(task, rows);
+                if let Some(profile) = &task.window {
+                    let window = window.map_or(profile.n_blocks(), |n| n as usize);
+                    let dense = self.with_adapter_denoise(
+                        task,
+                        rows,
+                        profile.denoise_peak_bytes(task, self.backend, rows, window)?,
+                    );
+                    Ok(peak.max(dense.max(profile.denoise_with_veda_bytes(
+                        task,
+                        self.backend,
+                        rows,
+                        window,
+                        veda,
+                    )?)))
+                } else {
+                    // An unstreamable native representation retains its resident route. Without
+                    // explicit shared-buffer proof, charge the complete extra bound rather than0.
+                    let dense =
+                        self.with_adapter_denoise(task, rows, self.full_denoise(task, rows)?);
+                    Ok(peak.max(
+                        dense
+                            .checked_add(veda.device_peak_bytes())
+                            .ok_or_else(|| invalid("Veda denoise size overflow"))?,
+                    ))
+                }
             })
     }
 

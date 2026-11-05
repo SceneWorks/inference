@@ -2204,7 +2204,29 @@ impl Generator for MiniMaxH3 {
         &self,
         context: &candle_gen::gen_core::MemoryRunContext,
     ) -> candle_gen::gen_core::MemorySafetyDecision {
-        crate::memory_strategy::safety_check_loaded(&self.contract, context)
+        let bits = match crate::tier::MiniMaxH3TierPaths::staged_bits(&self.tiers.dit_dir) {
+            Ok(bits) => bits,
+            Err(error) => return candle_gen::gen_core::MemorySafetyDecision::rejected(error),
+        };
+        let quant = match bits {
+            None => None,
+            Some(4) => Some(Quant::Q4),
+            Some(8) => Some(Quant::Q8),
+            _ => {
+                return candle_gen::gen_core::MemorySafetyDecision::rejected(
+                    "unsupported H3 artifact tier",
+                )
+            }
+        };
+        crate::memory_strategy::safety_check_loaded_tier(
+            &self.contract,
+            context,
+            candle_gen::gen_core::MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant,
+                component_precision_floors: &[],
+            },
+        )
     }
 
     fn begin_memory_strategy_request(
@@ -2212,6 +2234,7 @@ impl Generator for MiniMaxH3 {
         context: &candle_gen::gen_core::MemoryRunContext,
     ) -> candle_gen::gen_core::Result<Option<Box<dyn candle_gen::gen_core::MemoryRequestScope>>>
     {
+        candle_gen::request_scope::admit(self.memory_strategy_safety_check(context))?;
         crate::memory_strategy::begin_request(&self.contract, self.device.clone(), context)
     }
 

@@ -55,6 +55,7 @@ pub fn registered_fixture(
     let tier = MemoryNumericTier {
         precision: spec.precision,
         quant: spec.quantize,
+        component_precision_floors: &[],
     };
     [
         (MemoryMode::TextToImage, 0),
@@ -104,7 +105,23 @@ pub fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> candle_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    candle_gen::request_scope::admit(super::safety_check(spec, contract, context))?;
+    candle_gen::gen_core::standard_begin_request(
+        &super::MEMORY_PROFILE,
+        MODEL_ID,
+        spec,
+        contract,
+        context,
+        registered_scope,
+    )
+}
+
+fn registered_scope(
+    _provider_id: &'static str,
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _tier: MemoryNumericTier,
+) -> candle_gen::gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     super::begin_request(contract, candle_gen::candle_core::Device::Cpu, context)
 }
 
@@ -114,3 +131,45 @@ pub const MEMORY_BEHAVIOR: candle_gen::gen_core::MemoryBehaviorRegistration =
         valid_fixtures: registered_fixture,
         begin_request: registered_begin_request,
     };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn request_scope_applies_parameters_and_cleans_up_on_failure() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_load_shape(LoadShape::DeferredMaterialization);
+        let contract = super::super::weights_free_contract(&spec).unwrap();
+        let fixtures = registered_fixture(
+            &spec,
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap();
+        let context = &fixtures[0].context;
+        let mut scope = registered_begin_request(&spec, &contract, context)
+            .unwrap()
+            .unwrap();
+        let mut request = candle_gen::gen_core::GenerationRequest {
+            width: 1344,
+            height: 768,
+            frames: Some(124),
+            ..Default::default()
+        };
+        scope.configure_request(&mut request).unwrap();
+        let memory = request.memory.unwrap();
+        assert!(memory.stream_transformer_blocks);
+        assert_eq!(memory.transformer_window_size, Some(1));
+        assert_eq!(
+            memory.transformer_window_component,
+            Some(TransformerComponent::Both)
+        );
+        assert_eq!(super::super::active_context().as_ref(), Some(context));
+        assert_eq!(crate::nn::attention_execution_report(), Default::default());
+        drop(scope); // error/unwind path must clear the request-local selected policy too
+        assert!(super::super::active_context().is_none());
+        let next = registered_begin_request(&spec, &contract, context).unwrap();
+        drop(next);
+        assert!(super::super::active_context().is_none());
+    }
+}

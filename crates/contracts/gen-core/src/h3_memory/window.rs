@@ -41,6 +41,74 @@ pub struct WindowAllocation {
     root: Partition,
     layers: Vec<Layer>,
     pruned: bool,
+    cuda_working: Option<CudaWorkingSet>,
+}
+
+/// Source-config dimensions and largest runtime dequantization, independent of a checkpoint
+/// name or measured peak. CUDA's dense/affine routes need these even without native descriptors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CudaWorkingSet {
+    pub hidden: u64,
+    pub heads: u64,
+    pub head_dim: u64,
+    pub ffn_inner: u64,
+    pub element_bytes: u64,
+    pub projection_decode_bytes: u64,
+}
+impl CudaWorkingSet {
+    pub fn carried_attention_bytes(self, rows: u64) -> Result<u64> {
+        plus(
+            times(times(times(2, self.hidden)?, rows)?, self.element_bytes)?,
+            times(rows, plus(times(8, self.head_dim)?, 64)?)?,
+        )
+    }
+    fn operation_peak(self, rows: u64) -> Result<u64> {
+        let hidden = times(times(rows, self.hidden)?, self.element_bytes)?;
+        let inner = times(
+            times(times(rows, self.heads)?, self.head_dim)?,
+            self.element_bytes,
+        )?;
+        let budget = crate::veda::workspace::CUDA_DENSE_SCORE_ELEMENTS;
+        let score_row = times(rows, self.heads)?;
+        let scores = times(
+            crate::attention_budget::AttentionBudget::from_score_elements(budget, false)
+                .query_block_rows(score_row, rows),
+            score_row,
+        )?;
+        // Scoped block attention retains input/modulated hidden while QKV normalization/rope
+        // or SDPA runs. Materialized SDPA owns contiguous Q/K/V, retained spans and final cat.
+        let attention = plus(
+            times(2, hidden)?,
+            times(10, inner)?.max(plus(times(8, inner)?, times(16, scores)?)?),
+        )?;
+        // SwiGLU chunks bound the expanded projection. Prior output spans and final cat
+        // coexist with full hidden input; token-axis chunking never changes the key domain.
+        let ffn = plus(
+            times(4, hidden)?,
+            times(
+                3 * self.element_bytes,
+                times(rows, times(2, self.ffn_inner)?)?
+                    .min(budget)
+                    .max(times(2, self.ffn_inner)?),
+            )?,
+        )?;
+        plus(
+            attention.max(ffn).max(times(8, hidden)?),
+            self.projection_decode_bytes,
+        )
+    }
+    fn root_peak(self, rows: NativeRows, conditioning: bool) -> Result<u64> {
+        if conditioning {
+            return self.operation_peak(rows.conditioning);
+        }
+        plus(
+            times(
+                times(times(8, rows.packed)?, self.hidden)?,
+                self.element_bytes,
+            )?,
+            self.projection_decode_bytes,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,7 +226,62 @@ impl WindowAllocation {
             root,
             layers: layers.into_values().collect(),
             pruned,
+            cuda_working: None,
         })
+    }
+
+    pub fn with_cuda_working_set(mut self, facts: CudaWorkingSet) -> Result<Self> {
+        if facts.hidden == 0
+            || facts.heads == 0
+            || facts.head_dim == 0
+            || facts.ffn_inner == 0
+            || !matches!(facts.element_bytes, 2 | 4)
+        {
+            return Err(invalid());
+        }
+        self.cuda_working = Some(facts);
+        Ok(self)
+    }
+
+    /// Denoising only: root + modulation tables + one actual aligned body window. This excludes
+    /// successive precompute allocations and operation scratch, allowing attention alternatives
+    /// to compose with a shared buffer identity rather than adding complete phase peaks.
+    pub fn denoise_resident_bytes(
+        &self,
+        task: &NativeTaskAllocation,
+        backend: NativeBackend,
+        rows: NativeRows,
+        window: usize,
+    ) -> Result<u64> {
+        let base = plus(self.root.resident()?, self.table_bytes(task, rows)?)?;
+        self.plan(backend, window)?
+            .windows()
+            .try_fold(base, |peak, range| {
+                Ok(peak.max(plus(
+                    base,
+                    self.window_partition(range, false)?.resident()?,
+                )?))
+            })
+    }
+
+    pub fn denoise_with_veda_bytes(
+        &self,
+        task: &NativeTaskAllocation,
+        backend: NativeBackend,
+        rows: NativeRows,
+        window: usize,
+        veda: &crate::veda::workspace::WorkspaceBound,
+    ) -> Result<u64> {
+        let facts = self.cuda_working.ok_or_else(invalid)?;
+        let dense = self.denoise_peak_bytes(task, backend, rows, window)?;
+        let attention = plus(
+            self.denoise_resident_bytes(task, backend, rows, window)?,
+            plus(
+                facts.carried_attention_bytes(rows.packed)?,
+                veda.device_peak_bytes(),
+            )?,
+        )?;
+        Ok(dense.max(attention))
     }
 
     /// Add only actual current source-to-compute cast OUTPUT sizes supplied by the selected
@@ -184,6 +307,17 @@ impl WindowAllocation {
 
     pub fn n_blocks(&self) -> usize {
         self.layers.len()
+    }
+
+    pub fn streamed_weight_facts(&self) -> Result<crate::StreamedWeightFacts> {
+        Ok(crate::StreamedWeightFacts {
+            resident_bytes: self.root.resident()?,
+            stacks: vec![self
+                .layers
+                .iter()
+                .map(|layer| layer.body.resident())
+                .collect::<Result<Vec<_>>>()?],
+        })
     }
 
     /// Resident-only counterpart for the ordinary native weight floor. Includes root/refiner,
@@ -215,7 +349,7 @@ impl WindowAllocation {
     }
 
     fn plan(&self, backend: NativeBackend, window: usize) -> Result<BlockPlan> {
-        if !matches!(backend, NativeBackend::Mlx { .. }) {
+        if matches!(backend, NativeBackend::Candle { .. }) && self.cuda_working.is_none() {
             return Err(invalid());
         }
         BlockPlan::new(self.layers.len(), window)
@@ -270,6 +404,13 @@ impl WindowAllocation {
                 };
                 peak = peak.max(work);
             }
+        }
+        if matches!(backend, NativeBackend::Candle { .. }) {
+            peak = peak.max(
+                self.cuda_working
+                    .ok_or_else(invalid)?
+                    .root_peak(rows, conditioning)?,
+            );
         }
         plus(peak, self.root.forward_cast)
     }
@@ -475,6 +616,13 @@ impl WindowAllocation {
                     }
                 }
             }
+            if matches!(backend, NativeBackend::Candle { .. }) {
+                work = work.max(
+                    self.cuda_working
+                        .ok_or_else(invalid)?
+                        .operation_peak(rows.packed)?,
+                );
+            }
             peak = peak.max(plus(
                 plus(base, partition.resident()?)?,
                 partition
@@ -569,6 +717,42 @@ mod tests {
             15 + 100 + 1500
         );
         assert!(p.denoise_peak_bytes(&task, BACKEND, rows(), 1).unwrap() < task.resident_bytes);
+    }
+    #[test]
+    fn cuda_dense_windows_price_real_geometry_without_native_descriptors() {
+        let data = payloads(&[100, 200], &[10, 10]);
+        let cuda = NativeBackend::Candle {
+            tile_rows: 16,
+            workspace_bytes: 0,
+        };
+        let unknown = WindowAllocation::from_resident_tensors(&data, &[], 0, false).unwrap();
+        let task = task(vec![], 20, false);
+        assert!(unknown.denoise_peak_bytes(&task, cuda, rows(), 1).is_err());
+        let facts = CudaWorkingSet {
+            hidden: 16,
+            heads: 2,
+            head_dim: 8,
+            ffn_inner: 32,
+            element_bytes: 2,
+            projection_decode_bytes: 512,
+        };
+        let profile = unknown.with_cuda_working_set(facts).unwrap();
+        let small = profile.denoise_peak_bytes(&task, cuda, rows(), 1).unwrap();
+        assert!(
+            small
+                > profile
+                    .denoise_resident_bytes(&task, cuda, rows(), 1)
+                    .unwrap()
+        );
+        let mut larger = rows();
+        larger.packed = 4096;
+        assert!(profile.denoise_peak_bytes(&task, cuda, larger, 1).unwrap() > small);
+        assert!(profile.denoise_peak_bytes(&task, cuda, rows(), 2).unwrap() > small);
+        assert_eq!(
+            profile.streamed_weight_facts().unwrap().peak_bytes(Some(1)),
+            210
+        );
+        assert!(facts.operation_peak(u64::MAX).is_err());
     }
     #[test]
     fn dense_precompute_cache_grows_by_actual_window_end_and_evicts_adaln() {

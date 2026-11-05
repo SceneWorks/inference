@@ -131,8 +131,7 @@ pub fn sdpa_planned(
             "H3 minimum materializing attention row exceeds selected workspace budget".into(),
         ));
     }
-    let force_materialized =
-        std::env::var("SCENEWORKS_H3_ATTENTION_ROUTE").is_ok_and(|route| route == "materialized");
+    let force_materialized = force_materialized_attention();
     let kernel = candle_gen::fused_attention::select_attention_kernel(q, k, v, None);
     let materialized =
         force_materialized || matches!(kernel, candle_gen::AttentionKernel::Budgeted(_));
@@ -226,6 +225,17 @@ pub fn reset_attention_execution_report() {
 }
 pub fn attention_execution_report() -> AttentionExecutionReport {
     ATTENTION_EXECUTION.with(|r| *r.borrow())
+}
+
+fn force_materialized_attention() -> bool {
+    #[cfg(any(test, feature = "model-inference-proof"))]
+    {
+        std::env::var("SCENEWORKS_H3_ATTENTION_ROUTE").is_ok_and(|route| route == "materialized")
+    }
+    #[cfg(not(any(test, feature = "model-inference-proof")))]
+    {
+        false
+    }
 }
 
 /// The bounded fallback plan carries cancellation between query chunks.

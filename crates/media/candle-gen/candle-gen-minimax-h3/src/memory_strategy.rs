@@ -8,10 +8,12 @@ mod adapters;
 mod conditioning;
 mod execution;
 mod routes;
+mod streaming;
 
 pub(crate) use execution::active_context;
 pub use execution::begin_request;
 pub use routes::MEMORY_BEHAVIOR;
+pub use streaming::{host_peak_bytes, streaming_host_peak_bytes};
 
 use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::DType;
@@ -311,13 +313,14 @@ impl ComponentBytes {
             } else {
                 None
             };
+            let window = streaming::dit_window(&dir, &allocation, bytes, sizing.is_some())?;
             tasks.push(NativeTaskAllocation {
                 adapter,
                 resident_bytes: bytes,
                 constructor_bytes,
                 patch_size,
                 reference_task: *partition != BASE_DIT_PARTITION,
-                window: None,
+                window,
                 evicted_bytes: if sizing.is_some() {
                     0
                 } else {
@@ -367,6 +370,7 @@ impl ComponentBytes {
         });
         if let Some(facts) = &mut native_quant {
             conditioning::complete(&root, facts)?;
+            facts.conditioning_stream = streaming::text_encoder_stream(&text_encoder)?;
         }
         Ok(Self {
             // The weights-free gate: only a materialized snapshot directory carries readable
@@ -1041,16 +1045,35 @@ const MEMORY_PROFILE: candle_gen::gen_core::ProviderMemoryProfile =
             routes: &[(MODEL_ID, "")],
             pins: &[],
         }),
+        gates: candle_gen::gen_core::MemoryProfileGates::within(profile_route_gate),
+        tier: candle_gen::gen_core::MemoryProfileTier::FixedPrecision(
+            candle_gen::gen_core::Precision::Bf16,
+        ),
         ..candle_gen::gen_core::ProviderMemoryProfile::STANDARD
     };
 
-fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
-    MemoryProviderContract {
+fn build_contract(
+    components: &ComponentBytes,
+) -> candle_gen::gen_core::Result<MemoryProviderContract> {
+    let streams = components
+        .native_quant
+        .iter()
+        .flat_map(|n| n.tasks.iter())
+        .filter_map(|t| t.window.as_ref())
+        .map(|w| w.streamed_weight_facts())
+        .collect::<candle_gen::gen_core::Result<Vec<_>>>()?;
+    let transformer_stream = streams.into_iter().reduce(|mut current, next| {
+        current.resident_bytes = current.resident_bytes.max(next.resident_bytes);
+        current.stacks.extend(next.stacks);
+        current
+    });
+    Ok(MemoryProviderContract {
         phase_facts: components.native_quant.as_ref().map(|native| {
             let mut facts = candle_gen::gen_core::MemoryPhaseFacts::staged(
                 candle_gen::gen_core::StagedWeightSchedule::ThreeStage,
             );
             facts.native_quant = Some(native.clone());
+            facts.transformer_stream = transformer_stream.clone();
             facts
         }),
         architecture_facts: architecture_facts(components),
@@ -1115,7 +1138,7 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
         // needs, and declaring it is what ties the component's ordering back to `lifecycle` rather
         // than inventing an axis for it. `Conditioning` and `Decode` stay undeclared: they belong to
         // staged residency, which is still `Missing`, and declaring them would be exactly the false
-        // phase hook `no_lifecycle_phase_is_declared_without_an_implementation` refuses.
+        // phase hook `lifecycle_hooks_have_executable_phase_mechanisms` refuses.
         //
         // Safe in both conformance directions: the forward rule fires only when StagedResidency is
         // `Implemented`, and the converse fires only on `StructurallyNotApplicable`. Rung 1 here is
@@ -1227,7 +1250,7 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
             overlay_bytes: components.overlay,
         },
         runtime: Default::default(),
-    }
+    })
 }
 
 /// Apply load-exact capability after resolving the unchanged native allocation inventory.
@@ -1236,8 +1259,22 @@ fn configure_contract(
     contract: &mut MemoryProviderContract,
     fixture: bool,
 ) -> candle_gen::gen_core::Result<()> {
+    let source_facts = contract
+        .phase_facts
+        .as_ref()
+        .and_then(|f| f.native_quant.as_ref());
+    let proven_windows = source_facts.is_some_and(|f| {
+        f.conditioning_stream.is_some()
+            && f.tasks
+                .iter()
+                .filter(|t| t.resident_bytes > 0)
+                .all(|t| t.window.is_some())
+    });
     let streamable = spec.load_shape == LoadShape::DeferredMaterialization
-        && (fixture || crate::model::streaming_supported(spec)?);
+        && (fixture
+            || (proven_windows
+                && crate::model::streaming_supported(spec)
+                    .map_err(|e| CoreError::Unsupported(e.to_string()))?));
     contract.load_shape = spec.load_shape;
     if let Some(calibration) = &mut contract.calibration {
         calibration.load_shape = spec.load_shape;
@@ -1269,7 +1306,7 @@ fn configure_contract(
 
 /// The production contract: asset facts read off the resolved snapshot.
 pub fn contract_for(spec: &LoadSpec) -> candle_gen::gen_core::Result<MemoryProviderContract> {
-    let mut contract = build_contract(&ComponentBytes::resolve(spec)?);
+    let mut contract = build_contract(&ComponentBytes::resolve(spec)?)?;
     configure_contract(spec, &mut contract, false)?;
     Ok(contract)
 }
@@ -1299,7 +1336,7 @@ pub fn weights_free_contract(
         // the MLX sibling's `ComponentBytes::weights_free` makes.
         overlay: 0,
         native_quant: None,
-    });
+    })?;
     configure_contract(spec, &mut contract, true)?;
     Ok(contract)
 }
@@ -1315,15 +1352,15 @@ pub fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    candle_gen::gen_core::standard_memory_strategy_safety_check(
-        contract,
-        context,
-        Some(candle_gen::gen_core::MemoryNumericTier {
-            precision: spec.precision,
-            quant: spec.quantize,
-        }),
-        Some(&|| routes::route_gate(context)),
-    )
+    candle_gen::gen_core::standard_registered_safety_check(&MEMORY_PROFILE, spec, contract, context)
+}
+
+fn profile_route_gate(
+    _contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    _tier: candle_gen::gen_core::MemoryNumericTier,
+) -> candle_gen::gen_core::Result<()> {
+    routes::route_gate(context)
 }
 
 pub fn safety_check_loaded(
@@ -1336,6 +1373,14 @@ pub fn safety_check_loaded(
         None,
         Some(&|| routes::route_gate(context)),
     )
+}
+
+pub(crate) fn safety_check_loaded_tier(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    tier: candle_gen::gen_core::MemoryNumericTier,
+) -> MemorySafetyDecision {
+    candle_gen::gen_core::standard_safety_check(&MEMORY_PROFILE, contract, context, tier)
 }
 
 /// The memory-strategy registration for `minimax_h3` on candle.
@@ -1411,9 +1456,7 @@ pub fn veda_workspace_bound_for_contract(
 mod tests {
     use super::*;
     use candle_gen::gen_core::{
-        LoadShape, MemoryBudget, MemoryCacheState, MemoryCalibrationIdentity, MemoryGeometry,
-        MemoryMode, MemoryNumericTier, MemoryPhase, MemoryRunContext, MemorySelection,
-        MemoryStrategyParameters, ProviderRegistryBuilder,
+        LoadShape, MemoryCalibrationIdentity, MemoryPhase, ProviderRegistryBuilder,
     };
     use std::path::{Path, PathBuf};
 
@@ -2068,113 +2111,38 @@ mod tests {
 
     // --- AC2: nothing optimized is declared, and nothing optimized is reachable ------------------
 
-    /// **Rungs 1-4 are all declared `Missing`, and each is independently refused at selection.**
-    ///
-    /// Rung 1 is the interesting member: sc-17156 made the staging real in `generate_impl` and
-    /// forced the offload policy, but the declaration deliberately did not follow (see
-    /// `strategies`), so it is refused here exactly like 2-4. **Two** independent things would each
-    /// have to change before it became admittable — the declaration itself, and the `calibration`
-    /// identity that is `None` — and the assertions below check the declaration and the admission
-    /// decision separately so a change to either is visible rather than absorbed by the other.
+    /// Source-owned behavior and capability contract for CUDA H3.
     #[test]
-    fn no_optimized_rung_is_declared_or_selectable() {
+    fn optimized_rungs_match_executable_load_shape() {
+        let spec = weightless_spec();
         let contract = declared();
         assert!(
             contract.calibration.is_none(),
-            "candle has no fitted curve for this family"
+            "fixture cannot invent a measured identity"
         );
         for strategy in MemoryStrategy::ALL {
-            // Only rung 0 is declared `Implemented`; 1-4 are `Missing`. `is_optimized()` — which
-            // decides which arms below run — is `!matches!(self, Resident)`, so `StagedResidency`
-            // IS optimized and the refusal arms DO exercise rung 1. That is the point of the test,
-            // not an exception to it: the rung whose mechanism exists is refused all the same.
-            let expected = if strategy == MemoryStrategy::Resident {
-                MemoryStrategySupport::Implemented
-            } else {
-                MemoryStrategySupport::Missing
-            };
             assert_eq!(
-                contract.capability(strategy).expect("entry").support,
-                expected,
-                "{strategy:?}"
+                contract.capability(strategy).unwrap().support,
+                MemoryStrategySupport::Implemented
             );
             if strategy.is_optimized() {
-                assert!(
-                    contract
-                        .validate_selection(&MemorySelection {
-                            strategy,
-                            tier: MemoryNumericTier {
-                                precision: candle_gen::gen_core::Precision::Bf16,
-                                quant: None,
-                                component_precision_floors: &[],
-                            },
-                            parameters: MemoryStrategyParameters::default(),
-                        })
-                        .is_err(),
-                    "{strategy:?} must not be selectable"
-                );
-                assert!(
-                    matches!(
-                        safety_check(&weightless_spec(), &contract, &context(strategy)),
-                        MemorySafetyDecision::Reject { .. }
-                    ),
-                    "{strategy:?} must be refused at admission"
-                );
+                for fixture in routes::registered_fixture(&spec, &contract, strategy).unwrap() {
+                    assert_eq!(
+                        safety_check(&spec, &contract, &fixture.context),
+                        MemorySafetyDecision::Accept
+                    );
+                }
             }
         }
-        // The control arm: the one rung this backend does implement is admitted, so the rejections
-        // above are not an always-rejecting check.
+        let eager =
+            weights_free_contract(&spec.with_load_shape(LoadShape::EagerMaterialization)).unwrap();
         assert_eq!(
-            safety_check(
-                &weightless_spec(),
-                &declared(),
-                &context(MemoryStrategy::Resident)
-            ),
-            MemorySafetyDecision::Accept
+            eager
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing
         );
-    }
-
-    fn context(strategy: MemoryStrategy) -> MemoryRunContext {
-        MemoryRunContext {
-            reference_resources: None,
-            // Inert for the Resident probe this fixture serves (the authority gate fires only for
-            // optimized strategies); Calibrated matches every other provider's weights-free
-            // safety-check context.
-            optimization_authority: candle_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
-            selection: MemorySelection {
-                strategy,
-                tier: MemoryNumericTier {
-                    precision: candle_gen::gen_core::Precision::Bf16,
-                    quant: None,
-                    component_precision_floors: &[],
-                },
-                parameters: MemoryStrategyParameters::default(),
-            },
-            calibration_abi: candle_gen::gen_core::MEMORY_CALIBRATION_ABI,
-            calibration_fingerprint: String::new(),
-            load_shape: LOAD_SHAPE,
-            mode: MemoryMode::TextToImage,
-            has_reference: false,
-            use_pid: false,
-            has_phases: false,
-            geometry: MemoryGeometry {
-                width: 1344,
-                height: 768,
-                batch: 1,
-                frames: 124,
-                reference_count: 0,
-            },
-            overlay: None,
-            budget: MemoryBudget {
-                total_bytes: 256 * 1024 * 1024 * 1024,
-                committed_bytes: 0,
-                reclaimable_bytes: 0,
-                reserved_headroom_bytes: 0,
-            },
-            predicted_peak_bytes: 1024 * 1024 * 1024,
-            cache_state: MemoryCacheState::Cold,
-            evidence_revision: "unit-test".to_owned(),
-        }
     }
 
     // --- AC3: weights-free conformance, and a malformed contract fails ---------------------------
@@ -2195,8 +2163,12 @@ mod tests {
         full_snapshot(root.path());
         let production =
             contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
-        assert_eq!(fixture.strategies, production.strategies);
-        assert_eq!(fixture.lifecycle, production.lifecycle);
+        let eager_fixture = weights_free_contract(
+            &weightless_spec().with_load_shape(LoadShape::EagerMaterialization),
+        )
+        .unwrap();
+        assert_eq!(eager_fixture.strategies, production.strategies);
+        assert_eq!(eager_fixture.lifecycle, production.lifecycle);
         assert_eq!(fixture.formula, production.formula);
         // sc-22737: the identities must DIFFER, and this is the strongest form of that — the
         // weights-free fixture resolves no snapshot, so it has no `dit_dir`, so it proves no tier
@@ -2204,8 +2176,8 @@ mod tests {
         // A plan row naming a production cell therefore cannot be satisfied by the fixture.
         assert_eq!(fixture.calibration, None);
         assert!(production.calibration.is_some());
-        assert_eq!(fixture.load_shape, production.load_shape);
-        assert_eq!(fixture.backend, production.backend);
+        assert_eq!(eager_fixture.load_shape, production.load_shape);
+        assert_eq!(eager_fixture.backend, production.backend);
     }
 
     /// Each mutation is applied **alone** to a known-good contract, so each guard is proven to
@@ -2262,6 +2234,7 @@ mod tests {
                             entry.support = MemoryStrategySupport::Implemented;
                         }
                     }
+                    c.lifecycle.phases.clear();
                 }),
             ),
             (
@@ -2297,7 +2270,7 @@ mod tests {
                 Box::new(|c: &mut MemoryProviderContract| {
                     c.calibration = Some(MemoryCalibrationIdentity::new(
                         "minimax-h3-candle-v1",
-                        LoadShape::DeferredMaterialization,
+                        LoadShape::EagerMaterialization,
                     ));
                 }),
             ),
@@ -2333,18 +2306,35 @@ mod tests {
 
     // --- AC5: parameter ranges are declared exactly where they are owned ------------------------
 
+    /// Source-owned behavior and capability contract for CUDA H3.
     #[test]
     fn parameter_ranges_are_owned_by_the_rung_that_consumes_them() {
         let contract = declared();
         assert!(contract.conformance_errors().is_empty());
-        for capability in &contract.strategies {
-            assert_eq!(
-                capability.parameters,
-                MemoryParameterRanges::default(),
-                "{:?} owns no numeric parameters on this backend",
-                capability.strategy
-            );
-        }
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedDecode)
+                .unwrap()
+                .parameters
+                .decode_tile_edges,
+            vec![256]
+        );
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedAttention)
+                .unwrap()
+                .parameters
+                .attention_chunk_sizes,
+            vec![1048576, 8388608, 33554432]
+        );
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .parameters
+                .transformer_window_components,
+            vec![TransformerComponent::Both]
+        );
         for strategy in [
             MemoryStrategy::BoundedDecode,
             MemoryStrategy::BoundedAttention,
@@ -2354,7 +2344,7 @@ mod tests {
             implement_without_range(&mut mutated, strategy);
             assert!(
                 !mutated.conformance_errors().is_empty(),
-                "{strategy:?} implemented with no MemoryParameterRanges must fail"
+                "{strategy:?} requires its own parameter domain"
             );
         }
     }
@@ -2855,223 +2845,108 @@ mod tests {
 
     // --- the declaration facts that are easy to get wrong ----------------------------------------
 
-    /// The load shape is pinned to the loader, not mirrored from the request.
+    /// Source-owned behavior and capability contract for CUDA H3.
     #[test]
-    fn load_shape_is_pinned_to_the_loader_not_taken_from_the_spec() {
-        let spec = weightless_spec();
-        assert_eq!(spec.load_shape, LoadShape::DeferredMaterialization);
+    fn load_shape_tracks_the_owned_loader_contract() {
+        let deferred = weightless_spec();
         assert_eq!(
-            contract_for(&spec).expect("contract").load_shape,
+            weights_free_contract(&deferred).unwrap().load_shape,
+            LoadShape::DeferredMaterialization
+        );
+        let eager = deferred.with_load_shape(LoadShape::EagerMaterialization);
+        assert_eq!(
+            weights_free_contract(&eager).unwrap().load_shape,
             LoadShape::EagerMaterialization
         );
-        // ...and the spec IS read: the asset facts come off it.
-        let root = tempfile::tempdir().expect("tempdir");
-        sparse_snapshot(root.path(), &[("audio_vae", AUDIO_VAE_BYTES)]);
-        let resolved =
-            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
-        assert_eq!(resolved.asset_facts.decoder_bytes, AUDIO_VAE_BYTES);
-    }
-
-    /// **What actually blocks an optimized rung on this backend, executed rather than asserted**
-    /// (sc-18660).
-    ///
-    /// The MLX sibling declares rung 2 `Implemented` because its spatial tiling is reachable from a
-    /// request. **The mechanism exists here too** — `MiniMaxH3VideoVae::decode_clip` tiles at the
-    /// same reference geometry, through the same `BoundedStitch` — so the natural conclusion is
-    /// that this crate under-declares, and the natural fix is to add the weights-free
-    /// `MemoryBehaviorRegistration` seam the MLX sibling has.
-    ///
-    /// **That fix is not available on this tree, and the reason is one link further back than the
-    /// seam.** The chain, each link driven below rather than described:
-    ///
-    /// 1. this backend has no fitted curve of its own — sc-17156 landed the pipeline, not
-    ///    measurements — so `calibration` is `None`;
-    /// 2. `standard_memory_behavior_context` **requires** a calibration identity, so no
-    ///    `MemoryBehaviorFixture` can be constructed at all;
-    /// 3. without a fixture there is no `MemoryBehaviorRegistration`;
-    /// 4. `check_memory_strategy_contract` rejects a contract implementing any *optimized* rung
-    ///    with no behavior seam.
-    ///
-    /// So the blocker is the absent calibration identity — not the seam, and not the mechanism. The
-    /// seam cannot be written before the identity exists. This test **fails the moment a
-    /// calibration identity lands**, which is exactly when the flip becomes possible, and it names
-    /// the rungs waiting on it.
-    #[test]
-    fn an_optimized_rung_here_is_blocked_by_the_missing_calibration_identity_not_the_seam() {
-        let contract = declared();
-
-        // Link 1 — load-bearing, not incidental.
-        assert!(
-            contract.calibration.is_none(),
-            "a calibration identity landed: rungs 1 and 2 can now be declared here. Add the \
-             weights-free MemoryBehaviorRegistration seam (model it on \
-             mlx_gen_minimax_h3::memory_strategy::MEMORY_BEHAVIOR) and flip them — the mechanisms \
-             already exist in this crate."
-        );
-
-        // Link 2 — executed. This is the call every behavior seam must make, and it errors here.
-        let refused = candle_gen::gen_core::standard_memory_behavior_context(
-            &contract,
-            MemoryStrategy::BoundedDecode,
-            MemoryNumericTier {
-                precision: candle_gen::gen_core::Precision::Bf16,
-                quant: None,
-                component_precision_floors: &[],
-            },
-            candle_gen::gen_core::MemoryBehaviorRoute {
-                mode: candle_gen::gen_core::MemoryMode::TextToImage,
-                reference_count: 0,
-                use_pid: false,
-                has_phases: false,
-                overlay: None,
-            },
-        )
-        .expect_err("a behavior context must not be constructible without a calibration identity");
-        assert!(
-            refused.to_string().contains("calibration identity"),
-            "expected the identity refusal, got: {refused}"
-        );
-
-        // …while the MECHANISM rung 2 would declare is genuinely present in this crate today, so
-        // the gap is a declaration gap and not a porting gap.
-        // Read through `Default`, not off the constants: comparing a constant with itself would
-        // pass with the mechanism deleted.
-        let tiling = crate::spatial_tiling::SpatialTiling::default();
-        assert!(
-            tiling.enabled,
-            "the shipped candle VAE must tile by default"
-        );
-        assert_eq!((tiling.tile_height, tiling.tile_width), (256, 256));
-        assert_eq!((tiling.overlap_height, tiling.overlap_width), (64, 64));
-        // …and the stitcher rung 2 would declare is constructible here today.
-        assert!(crate::spatial_tiling::BoundedStitch::new(2, 2, &[1], &[1]).is_ok());
-    }
-
-    /// The three ways this backend's declaration diverges from the MLX sibling's, pinned so a later
-    /// slice cannot copy an MLX verdict across without the test noticing.
-    #[test]
-    fn the_candle_declaration_differs_from_mlx_where_the_backends_differ() {
-        let contract = declared();
-        // 1. No fitted curve, and no calibration identity.
-        //
-        //    The formula is a component envelope as of sc-18665 rather than the floor arm, because
-        //    that is the ONLY variant carrying `resident_components` and therefore the only shape
-        //    the AdaLN exclusion can be declared in. That is not MLX's fitted envelope and this
-        //    asserts the difference rather than the variant name: one phase and the floor arm's
-        //    single `AssetBytes` input, against MLX's three phases and five variables.
-        let MemoryFormulaKind::ComponentPhaseEnvelope {
-            phases,
-            variables,
-            resident_components,
-        } = &contract.formula
-        else {
-            panic!(
-                "the AdaLN exclusion requires a component envelope, got {:?}",
-                contract.formula
-            );
-        };
         assert_eq!(
-            variables,
-            &vec![MemoryFormulaVariable::AssetBytes],
-            "no fitted curve on this lane: the floor arm's single input, and nothing else"
-        );
-        assert_eq!(phases, &vec![MemoryPhase::Denoise]);
-        assert_eq!(resident_components.len(), 1);
-        assert_eq!(resident_components[0].id, ADALN_COMPONENT_ID);
-        assert!(contract.calibration.is_none());
-        // 2. Staged residency is IMPLEMENTED IN CODE as of sc-17156 but still declared `Missing`,
-        //    because an implemented optimized rung needs a behavior seam this lane does not have
-        //    yet, and that seam waits on a `calibration` identity (see
-        //    `an_optimized_rung_here_is_blocked_by_the_missing_calibration_identity_not_the_seam`).
-        //    Under-declaring is the safe direction — see `strategies`.
-        //
-        //    `lifecycle.phases` carries `Denoise` alone, which is the eviction's requirement and not
-        //    a staged-residency claim: `synchronized_phase_release` and all three mechanism hooks
-        //    stay false, and those are what a staged declaration would need.
-        assert_eq!(
-            contract.lifecycle.phases,
-            vec![MemoryPhase::Denoise],
-            "only the phase the AdaLN exclusion is ordered against"
-        );
-        assert!(!contract.lifecycle.synchronized_phase_release);
-        assert_eq!(
-            contract
-                .capability(MemoryStrategy::StagedResidency)
-                .expect("entry")
+            weights_free_contract(&eager)
+                .unwrap()
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
                 .support,
             MemoryStrategySupport::Missing
         );
-        // 3. No fused streaming SDPA: rung 3 stays open here on its own evidence, never on MLX's.
+    }
+
+    /// Source-owned behavior and capability contract for CUDA H3.
+    #[test]
+    fn estimated_optimized_routes_do_not_require_measurement_identity() {
+        let spec = weightless_spec();
+        let contract = declared();
+        assert!(contract.calibration.is_none());
+        let fixtures =
+            routes::registered_fixture(&spec, &contract, MemoryStrategy::BoundedDecode).unwrap();
+        assert!(!fixtures.is_empty());
+        let fixture = &fixtures[0];
         assert_eq!(
-            contract
-                .capability(MemoryStrategy::BoundedAttention)
-                .expect("entry")
-                .support,
-            MemoryStrategySupport::Missing,
-            "candle materializes attention scores; the MLX streaming verdict does not carry over"
+            fixture.context.optimization_authority,
+            candle_gen::gen_core::MemoryOptimizationAuthority::Estimated
         );
+        assert_eq!(
+            safety_check(&spec, &contract, &fixture.context),
+            MemorySafetyDecision::Accept
+        );
+        let mut impossible = fixture.context.clone();
+        impossible.budget.total_bytes = impossible.predicted_peak_bytes - 1;
+        assert!(matches!(
+            safety_check(&spec, &contract, &impossible),
+            MemorySafetyDecision::Reject { .. }
+        ));
+        let tiling = crate::spatial_tiling::SpatialTiling::default();
+        assert!(tiling.enabled);
+        assert_eq!((tiling.tile_height, tiling.overlap_height), (256, 64));
+    }
+
+    /// Source-owned behavior and capability contract for CUDA H3.
+    #[test]
+    fn candle_contract_preserves_backend_and_allocation_identity() {
+        let contract = declared();
+        assert!(contract.calibration.is_none());
+        assert_eq!(contract.backend.backend_id(), "candle");
         assert!(matches!(
             contract.backend,
-            MemoryBackendRealization::CandleCuda { .. }
+            MemoryBackendRealization::CandleCuda {
+                host_to_device_block_materialization: true,
+                ..
+            }
         ));
+        let MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases, variables, ..
+        } = &contract.formula
+        else {
+            panic!("phase envelope required")
+        };
+        assert_eq!(variables, &vec![MemoryFormulaVariable::AssetBytes]);
         assert_eq!(
-            contract.backend.backend_id(),
-            "candle",
-            "the evidence key must not be recorded under the MLX backend"
+            phases,
+            &vec![
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode
+            ]
         );
     }
 
-    /// A phase hook declared without an implementation is the false declaration conformance cannot
-    /// catch. This pins which phases are declared and, for the one that is, what implements it.
-    ///
-    /// `Denoise` is declared as of sc-18665 and **only** because the AdaLN exclusion is ordered
-    /// against it: `conformance_errors` requires a `PrecomputedThenEvicted` component's
-    /// `precomputed_in` to be a declared lifecycle phase. That eviction is implemented — the
-    /// literal in `crate::model` is unconditional — so the phase is backed by a mechanism, which is
-    /// the property this test exists to hold.
-    ///
-    /// `Conditioning` and `Decode` stay undeclared. They belong to staged residency, whose rung is
-    /// still `Missing`, and there is nothing else on this lane that needs them. Adding either would
-    /// be the false hook.
-    ///
-    /// The release primitive the remaining phases WILL declare is exercised here anyway, so this
-    /// test also fails if it is removed while that declaration is pending.
+    /// Source-owned behavior and capability contract for CUDA H3.
     #[test]
-    fn no_lifecycle_phase_is_declared_without_an_implementation() {
+    fn lifecycle_hooks_have_executable_phase_mechanisms() {
         let contract = declared();
-        for phase in [MemoryPhase::Conditioning, MemoryPhase::Decode] {
-            assert!(
-                !contract.lifecycle.phases.contains(&phase),
-                "{phase:?} must not be declared while StagedResidency is Missing and nothing else \
-                 needs it"
-            );
-        }
-        // Declared, and tied to the thing that requires it rather than to a rung.
-        assert!(contract.lifecycle.phases.contains(&MemoryPhase::Denoise));
-        let component = &contract.resident_components()[0];
-        let MemoryComponentResidency::PrecomputedThenEvicted { precomputed_in, .. } =
-            &component.residency
-        else {
-            panic!("the AdaLN component declares an eviction");
-        };
         assert_eq!(
-            precomputed_in,
-            &MemoryPhase::Denoise,
-            "Denoise is declared because the exclusion is precomputed there; if the exclusion moved \
-             phase, this phase list would have to move with it"
+            contract.lifecycle.phases,
+            vec![
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode
+            ]
         );
-        // Strip the component and the declared phase loses its justification — which is what makes
-        // the assertion above a statement about this lane rather than about a constant.
-        let mut stripped = declared();
-        stripped.formula = MemoryFormulaKind::AssetBytesPlusHeadroom;
-        assert!(stripped.resident_components().is_empty());
-
-        crate::dit::release_device_memory(&candle_gen::candle_core::Device::Cpu)
-            .expect("the phase-release primitive must exist and succeed");
-        assert!(!contract.lifecycle.synchronized_phase_release);
-        assert!(!contract.lifecycle.decode_tiling);
-        assert!(!contract.lifecycle.attention_chunking);
-        assert!(!contract.lifecycle.transformer_window_materialization);
+        assert!(
+            contract.lifecycle.synchronized_phase_release
+                && contract.lifecycle.decode_tiling
+                && contract.lifecycle.attention_chunking
+                && contract.lifecycle.transformer_window_materialization
+        );
+        crate::dit::release_device_memory(&candle_gen::candle_core::Device::Cpu).unwrap();
+        assert!(crate::spatial_tiling::BoundedStitch::new(2, 2, &[1], &[1]).is_ok());
     }
 
     /// The candle AdaLN exclusion: net, tier-safe, and conformant on a resolved snapshot.

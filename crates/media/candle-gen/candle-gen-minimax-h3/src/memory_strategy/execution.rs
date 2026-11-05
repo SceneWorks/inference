@@ -24,6 +24,15 @@ struct RequestScope {
 impl RequestScope {
     fn clear(&mut self) {
         if self.active {
+            let routes = crate::nn::attention_execution_report();
+            let context = active_context();
+            tracing::info!(event = "h3_attention_execution", flash_calls=routes.flash_calls,
+                materialized_calls=routes.materialized_calls, maximum_query_rows=routes.maximum_query_rows,
+                maximum_materialized_score_elements=routes.maximum_materialized_score_elements,
+                attention_chunk_size=?context.as_ref().and_then(|c|c.selection.parameters.attention_chunk_size),
+                transformer_window=?context.as_ref().and_then(|c|c.selection.parameters.transformer_window_size),
+                transformer_component=?context.as_ref().and_then(|c|c.selection.parameters.transformer_window_component),
+                "Observed completed H3 attention routes");
             ACTIVE.with(|active| active.borrow_mut().take());
             self.active = false;
         }
@@ -107,6 +116,7 @@ pub fn begin_request(
         core: CandleRequestScopeCore::new(config),
         active: true,
     };
+    crate::nn::reset_attention_execution_report();
     ACTIVE.with(|active| *active.borrow_mut() = Some(context.clone()));
     Ok(Some(Box::new(scope)))
 }

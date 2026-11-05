@@ -246,7 +246,7 @@ impl VedaRuntime {
         cancel: Option<&candle_gen::gen_core::CancelFlag>,
     ) -> Result<Tensor> {
         check_cancel(cancel)?;
-        if std::env::var("SCENEWORKS_H3_VEDA_FORCE_DENSE").is_ok_and(|v| v == "1") {
+        if force_dense_for_validation() {
             *self.failure.borrow_mut() = Some("Veda dense fallback forced for validation".into());
             let mut report = self.report.borrow_mut();
             if report.sparse_calls == 0 {
@@ -416,6 +416,16 @@ fn check_cancel(cancel: Option<&candle_gen::gen_core::CancelFlag>) -> Result<()>
         Err(CandleError::Canceled)
     } else {
         Ok(())
+    }
+}
+fn force_dense_for_validation() -> bool {
+    #[cfg(any(test, feature = "model-inference-proof"))]
+    {
+        candle_gen::gen_core::env_flag("SCENEWORKS_H3_VEDA_FORCE_DENSE")
+    }
+    #[cfg(not(any(test, feature = "model-inference-proof")))]
+    {
+        false
     }
 }
 /// Concatenates per-batch `[heads, seq, dim]` outputs, whose heads are `order`, back into head order.
