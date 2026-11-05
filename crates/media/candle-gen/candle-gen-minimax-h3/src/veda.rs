@@ -232,8 +232,28 @@ impl VedaRuntime {
         v: &Tensor,
         scale: f64,
     ) -> Result<Tensor> {
+        self.attention_with_cancel(layer, step, q, k, v, scale, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_with_cancel(
+        &self,
+        layer: usize,
+        step: usize,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f64,
+        cancel: Option<&candle_gen::gen_core::CancelFlag>,
+    ) -> Result<Tensor> {
+        check_cancel(cancel)?;
         if std::env::var("SCENEWORKS_H3_VEDA_FORCE_DENSE").is_ok_and(|v| v == "1") {
             *self.failure.borrow_mut() = Some("Veda dense fallback forced for validation".into());
+            let mut report = self.report.borrow_mut();
+            if report.sparse_calls == 0 {
+                report.plan = None;
+                report.plan_grid = None;
+                report.exact_plan = false;
+            }
         }
         #[cfg(test)]
         self.calls.borrow_mut().push(AttentionCall {
@@ -244,7 +264,7 @@ impl VedaRuntime {
             shape: q.dims().to_vec(),
         });
         if !self.request.full_attention(layer, step) && self.failure.borrow().is_none() {
-            match self.execute(layer, q, k, v, scale as f32) {
+            match self.execute(layer, q, k, v, scale as f32, cancel) {
                 Ok((out, pairs, workspace)) => {
                     let (b, h, n, _) = q.dims4()?;
                     let mut r = self.report.borrow_mut();
@@ -255,6 +275,7 @@ impl VedaRuntime {
                     r.workspace_bytes = r.workspace_bytes.max(workspace);
                     return Ok(out);
                 }
+                Err(CandleError::Canceled) => return Err(CandleError::Canceled),
                 Err(e) => {
                     *self.failure.borrow_mut() = Some(format!("Veda execution failed: {e}"));
                     // Failed before any sparse call (e.g. the first-use self-test): no call
@@ -274,7 +295,7 @@ impl VedaRuntime {
                     Some(format!("{reason}; dense attention executed"));
             }
         }
-        let out = crate::nn::sdpa(q, k, v, scale)?;
+        let out = crate::nn::sdpa_planned(q, k, v, scale, cancel)?;
         let (b, h, n, _) = q.dims4()?;
         let pairs = b as u64 * h as u64 * n as u64 * n as u64;
         let mut r = self.report.borrow_mut();
@@ -290,6 +311,7 @@ impl VedaRuntime {
         k: &Tensor,
         v: &Tensor,
         scale: f32,
+        cancel: Option<&candle_gen::gen_core::CancelFlag>,
     ) -> Result<(Tensor, u64, u64)> {
         let p = self
             .prepared
@@ -321,6 +343,7 @@ impl VedaRuntime {
             .as_ref()
             .is_some_and(|(d, t, n)| d.same_device(q.device()) && *t == q.dtype() && *n == dim);
         if !tested {
+            check_cancel(cancel)?;
             let mut report = self.report.borrow_mut();
             report.workspace_bytes = report
                 .workspace_bytes
@@ -335,9 +358,11 @@ impl VedaRuntime {
         let mut samples = Vec::with_capacity(batch);
         let mut pairs = 0;
         for b in 0..batch {
+            check_cancel(cancel)?;
             let mut order = Vec::with_capacity(heads);
             let mut outputs = Vec::new();
             for (shape, group) in &batches {
+                check_cancel(cancel)?;
                 let layout = &p.layouts[shape];
                 let tiles = layout.valid.len();
                 let slots = layout.perm.len();
@@ -384,6 +409,13 @@ impl VedaRuntime {
         drop(samples);
         ensure_finite(&out)?;
         Ok((out, pairs, bound.total_bytes))
+    }
+}
+fn check_cancel(cancel: Option<&candle_gen::gen_core::CancelFlag>) -> Result<()> {
+    if cancel.is_some_and(|c| c.is_cancelled()) {
+        Err(CandleError::Canceled)
+    } else {
+        Ok(())
     }
 }
 /// Concatenates per-batch `[heads, seq, dim]` outputs, whose heads are `order`, back into head order.
@@ -1793,6 +1825,7 @@ mod tests {
             let failed_report = ReportSink::default();
             let mut failed = runtime(&dev, failed_report.clone());
             failed.self_test = |_, _, _| Err("Veda actual-device self-test forced failure".into());
+            crate::nn::reset_attention_execution_report();
             let got = failed.attention(0, 0, &q, &k, &v, 0.25).unwrap();
             assert_eq!(host(got), host(crate::nn::sdpa(&q, &k, &v, 0.25).unwrap()));
             assert_eq!(failed_report.borrow().sparse_calls, 0);
@@ -1805,6 +1838,20 @@ mod tests {
             assert!(failed.tested.borrow().is_none());
             let _ = failed.attention(0, 2, &q, &k, &v, 0.25).unwrap();
             assert_eq!(failed_report.borrow().dense_calls, 2);
+            let routes = crate::nn::attention_execution_report();
+            assert!(
+                routes.flash_calls + routes.materialized_calls >= 2,
+                "Veda dense fallback must report the dense kernel actually executed"
+            );
+            if std::env::var("SCENEWORKS_H3_ATTENTION_ROUTE").is_ok_and(|v| v == "materialized") {
+                assert_eq!(routes.flash_calls, 0);
+                assert!(routes.materialized_calls >= 2);
+            }
+            assert!(
+                routes.maximum_materialized_score_elements
+                    <= crate::nn::attention_budget().max_score_elements()
+            );
+            println!("H3_DENSE_ATTENTION_ROUTES {routes:?}");
             // A non-finite sparse output (NaN V: the scores read Q/K only) is recomputed densely
             // and reported, never returned into the hidden state.
             let nan_report = ReportSink::default();
