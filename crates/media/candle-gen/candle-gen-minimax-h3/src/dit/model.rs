@@ -70,6 +70,7 @@ pub struct MiniMaxH3Dit {
     projections: DitProjections,
     refiner: TokenRefiner,
     blocks: Vec<DitBlock>,
+    stream_window: Option<usize>,
     rope: MmRope,
     /// The direct, centered-curve AdaLN of a pruned (sc-26684) checkpoint; `None` on the stock
     /// path, where the timestep MLP in [`DitProjections`] drives the projections instead.
@@ -79,6 +80,29 @@ pub struct MiniMaxH3Dit {
 }
 
 impl MiniMaxH3Dit {
+    /// Move only shared/root modules after the host stack and its residuals are prepared.
+    /// Block bases are already in runtime format: window execution transfers bytes, never repacks.
+    pub(crate) fn prepare_streamed(&mut self, device: &Device, window: usize) -> Result<()> {
+        let _ = candle_gen::block_window::BlockPlan::new(self.blocks.len(), window)?;
+        self.projections = self.projections.copy_to_device(device)?;
+        self.refiner = self.refiner.copy_to_device(device)?;
+        self.curve = self
+            .curve
+            .as_ref()
+            .map(|c| c.copy_to_device(device))
+            .transpose()?;
+        self.device = device.clone();
+        self.stream_window = Some(window);
+        tracing::info!(
+            event = "h3_transformer_stream_prepared",
+            component = "dit",
+            window,
+            host_blocks = self.blocks.len(),
+            "Prepared host-resident runtime-format DiT blocks"
+        );
+        Ok(())
+    }
+
     /// Build from an already-populated [`Weights`] map.
     ///
     /// `dtype` is the **block stack's** precision. The 17 input/output tensors are loaded at their
@@ -127,6 +151,7 @@ impl MiniMaxH3Dit {
                 projections,
                 refiner,
                 blocks,
+                stream_window: None,
                 rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
                 curve: Some(curve),
                 dtype,
@@ -143,6 +168,7 @@ impl MiniMaxH3Dit {
             projections,
             refiner,
             blocks,
+            stream_window: None,
             rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
             curve: None,
             dtype,
@@ -512,45 +538,72 @@ impl MiniMaxH3Dit {
         };
         crate::dit::block::check_adaln_indices(packed.adaln_indices, modulation_rows)?;
         let sync_between_layers = layer_cancel_needs_sync(x.dims()[1]);
-        for (layer, block) in self.blocks.iter().enumerate() {
-            if let Some(cancel) = cancel {
-                if sync_between_layers {
-                    self.device.synchronize()?;
+        let apply = |mut x: Tensor, range: std::ops::Range<usize>| -> Result<Tensor> {
+            for layer in range {
+                let transferred;
+                let block = if self.stream_window.is_some() {
+                    transferred = self.blocks[layer].copy_to_device(&self.device)?;
+                    tracing::trace!(event="h3_transformer_window_materialized", component="dit",
+                        first_block=layer, block_count=1, base_bytes=transferred.body_nbytes(),
+                        device=?self.device.location(), "Materialized prepared DiT body window");
+                    &transferred
+                } else {
+                    &self.blocks[layer]
+                };
+                if let Some(cancel) = cancel {
+                    if sync_between_layers {
+                        self.device.synchronize()?;
+                    }
+                    if cancel.is_cancelled() {
+                        return Err(CandleError::Canceled);
+                    }
                 }
-                if cancel.is_cancelled() {
-                    return Err(CandleError::Canceled);
-                }
+                x = match blocks {
+                    BlockModulation::Cached(cache) => block.forward_veda(
+                        &x,
+                        cache.modulation(layer)?,
+                        packed.adaln_indices,
+                        &self.rope,
+                        packed.tables,
+                        veda.map(|(runtime, step)| (runtime, layer, step)),
+                        cancel,
+                    )?,
+                    BlockModulation::Temb(temb) => block.forward_veda(
+                        &x,
+                        &block.modulation(temb)?,
+                        packed.adaln_indices,
+                        &self.rope,
+                        packed.tables,
+                        veda.map(|(runtime, step)| (runtime, layer, step)),
+                        cancel,
+                    )?,
+                    BlockModulation::CurveCoords(coords) => block.forward_veda(
+                        &x,
+                        &block.curve_modulation(coords)?,
+                        packed.adaln_indices,
+                        &self.rope,
+                        packed.tables,
+                        veda.map(|(runtime, step)| (runtime, layer, step)),
+                        cancel,
+                    )?,
+                };
             }
-            x = match blocks {
-                BlockModulation::Cached(cache) => block.forward_veda(
-                    &x,
-                    cache.modulation(layer)?,
-                    packed.adaln_indices,
-                    &self.rope,
-                    packed.tables,
-                    veda.map(|(runtime, step)| (runtime, layer, step)),
-                    cancel,
-                )?,
-                BlockModulation::Temb(temb) => block.forward_veda(
-                    &x,
-                    &block.modulation(temb)?,
-                    packed.adaln_indices,
-                    &self.rope,
-                    packed.tables,
-                    veda.map(|(runtime, step)| (runtime, layer, step)),
-                    cancel,
-                )?,
-                BlockModulation::CurveCoords(coords) => block.forward_veda(
-                    &x,
-                    &block.curve_modulation(coords)?,
-                    packed.adaln_indices,
-                    &self.rope,
-                    packed.tables,
-                    veda.map(|(runtime, step)| (runtime, layer, step)),
-                    cancel,
-                )?,
-            };
-        }
+            Ok(x)
+        };
+        x = if let Some(window) = self.stream_window {
+            let plan = candle_gen::block_window::BlockPlan::new(self.blocks.len(), window)?;
+            let default_cancel = CancelFlag::default();
+            candle_gen::block_window::run_windowed(
+                &self.device,
+                &plan,
+                cancel.unwrap_or(&default_cancel),
+                x,
+                || Ok(()),
+                |x, _, range| apply(x, range),
+            )?
+        } else {
+            apply(x, 0..self.blocks.len())?
+        };
         // 3. The shared output norm, then the two heads over their own rows. Gathering before
         //    projecting is bit-identical to the reference's project-then-gather (both heads are
         //    row-wise affine maps) and skips the text rows' outputs, which it discards.
@@ -761,7 +814,50 @@ impl JointDit {
         let device = dit.device.clone();
 
         let (modulation, norm_out_modulation, resident_adaln, resident_ts, released_bytes) =
-            if let Some(curve) = &dit.curve {
+            if let Some(window) = dit.stream_window {
+                let policy = crate::block_stream::current().ok_or_else(|| {
+                    CandleError::Msg("streamed AdaLN requires an active request".into())
+                })?;
+                let input = if let Some(curve) = &dit.curve {
+                    curve.coordinates(schedule.distinct_timesteps(), &device)?
+                } else {
+                    dit.embed_timesteps(schedule.distinct_timesteps())?
+                };
+                let norm_out = if let Some(curve) = &dit.curve {
+                    curve.norm_out_modulation(&input)?
+                } else {
+                    dit.projections.norm_out.modulation(&input)?
+                };
+                let plan = candle_gen::block_window::BlockPlan::new(dit.blocks.len(), window)?;
+                let layers = candle_gen::block_window::run_windowed(
+                    &device,
+                    &plan,
+                    &policy.cancel,
+                    Vec::with_capacity(dit.blocks.len()),
+                    || Ok(()),
+                    |mut layers, _, range| {
+                        for layer in range {
+                            if policy.cancel.is_cancelled() {
+                                return Err(CandleError::Canceled);
+                            }
+                            layers.push(dit.blocks[layer].modulation_for_window(&input, &device)?);
+                        }
+                        Ok(layers)
+                    },
+                )?;
+                let cache = AdaLnCache::assemble(schedule, layers, dit.pruning_identity())?;
+                for block in &mut dit.blocks {
+                    block.evict_adaln();
+                }
+                // Host projections were dropped; no GPU eviction saving is claimed.
+                (
+                    Modulation::Cached(Box::new(cache)),
+                    Some(norm_out),
+                    None,
+                    None,
+                    0,
+                )
+            } else if let Some(curve) = &dit.curve {
                 // The pruned (sc-26684) path. There is no 26.02 GB to evict — the curve operands
                 // are ~175 MB of F32 compute buffers — so PrecomputeAndEvict releases zero and
                 // Resident simply re-interpolates the table per step; both residencies are
@@ -1158,7 +1254,31 @@ mod veda_controls_tests {
         Vec<crate::veda::AttentionCall>,
         candle_gen::gen_core::VedaExecutionReport,
     ) {
+        run_inner(mode, channels, bits, evals, shift, enabled, false)
+    }
+    fn run_inner(
+        mode: usize,
+        channels: usize,
+        bits: Option<usize>,
+        evals: usize,
+        shift: f32,
+        enabled: bool,
+        streamed: bool,
+    ) -> (
+        Vec<u32>,
+        Vec<crate::veda::AttentionCall>,
+        candle_gen::gen_core::VedaExecutionReport,
+    ) {
         let device = Device::Cpu;
+        let request = crate::block_stream::tests::request();
+        let _guard = streamed.then(|| {
+            crate::block_stream::RequestGuard::enter(
+                &request,
+                candle_gen::gen_core::LoadShape::DeferredMaterialization,
+                &device,
+            )
+            .unwrap()
+        });
         let w = weights(bits);
         // CPU Candle does not implement BF16 matmul; dense fixture arithmetic is F32.
         // BF16 request/tier admission is tested at the native loader; device numerics stay gated.
@@ -1178,6 +1298,10 @@ mod veda_controls_tests {
                 .unwrap();
         }
         assert_eq!(projection.adapters().len(), 2);
+        if streamed {
+            dit.prepare_streamed(&device, 1).unwrap();
+        }
+
         let layout = layout(mode, channels);
         let schedule = JointSchedule::with_shifts(evals + 1, shift, 3.0).unwrap();
         let adaln = adaln_schedule(&schedule).unwrap();
@@ -1351,6 +1475,31 @@ mod veda_controls_tests {
                     let on = run(mode, channels, tier, 4, 12.0, true);
                     assert_eq!(on.0, off.0, "unavailable sparse must preserve dense output: mode={mode} tier={tier:?} channels={channels}");
                 }
+            }
+        }
+        // One reference/audio representative per storage arithmetic; the existing mode cases
+        // already cover task packing. This checks actual window execution with stacked residuals.
+        for tier in [None, Some(4), Some(8)] {
+            for veda in [false, true] {
+                let resident = run_inner(4, 2, tier, 4, 12.0, veda, false);
+                let streamed = run_inner(4, 2, tier, 4, 12.0, veda, true);
+                let scale = resident
+                    .0
+                    .iter()
+                    .map(|v| f32::from_bits(*v).abs())
+                    .fold(1e-12f32, f32::max);
+                let error = resident
+                    .0
+                    .iter()
+                    .zip(&streamed.0)
+                    .map(|(a, b)| (f32::from_bits(*a) - f32::from_bits(*b)).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    error / scale <= 1e-5,
+                    "streamed/resident {tier:?} Veda={veda}: {error}/{scale}"
+                );
+                assert_eq!(resident.1, streamed.1);
+                assert_eq!(resident.2, streamed.2);
             }
         }
         assert_attached_cancel_stops_the_forward_before_the_first_block();

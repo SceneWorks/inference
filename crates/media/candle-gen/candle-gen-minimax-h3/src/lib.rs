@@ -124,6 +124,7 @@ pub mod alias_free;
 pub mod audio_config;
 pub mod audio_vae;
 pub mod audio_vae_encoder;
+mod block_stream;
 pub mod blocks;
 pub mod chunking;
 pub mod conditioning;

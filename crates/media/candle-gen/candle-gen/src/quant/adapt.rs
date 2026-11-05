@@ -734,6 +734,16 @@ impl std::fmt::Debug for AdaptLinear {
 }
 
 impl AdaptLinear {
+    /// Copy a prepared base and every residual onto a bounded execution window.
+    pub fn copy_to_device(&self, device: &Device) -> candle_core::Result<Self> {
+        let mut copy = self.clone();
+        if let Base::Packed(base) = &self.base {
+            copy.base = Base::Packed(base.copy_to_device(device)?);
+        }
+        copy.to_device(device)?;
+        Ok(copy)
+    }
+
     /// Checked residual storage for a caller-owned PACKED base. No dummy tensor,
     /// dense weight, quantization, or additional kernel handle is allocated here.
     /// Call [`Self::apply_residuals`] after the caller's strict packed GEMM;
