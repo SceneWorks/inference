@@ -11,7 +11,7 @@
 //! `alias_free::transposed_conv1d`: see that function for why every transposed convolution
 //! in the audio decoder runs as zero-insert + forward `conv1d` on both backends.
 
-use candle_gen::attention::AttentionPlan;
+use candle_gen::attention::{AttentionBudget, AttentionPlan};
 use candle_gen::candle_core::{DType, Tensor, D};
 use candle_gen::candle_nn::ops::sigmoid;
 use candle_gen::gen_core::CancelFlag;
@@ -120,22 +120,117 @@ pub fn sdpa_planned(
     cancel: Option<&CancelFlag>,
 ) -> Result<Tensor> {
     let plan = attention_plan(cancel);
-    candle_gen::sdpa_dispatch_bhsd(
-        q,
-        k,
-        v,
-        scale,
-        None,
-        candle_gen::candle_nn::ops::softmax_last_dim,
-        plan,
-    )
+    let (b, h, sq, _) = q.dims4()?;
+    let sk = k.dim(2)?;
+    let row = b
+        .checked_mul(h)
+        .and_then(|v| v.checked_mul(sk))
+        .ok_or_else(|| candle_gen::CandleError::Msg("H3 attention row size overflow".into()))?;
+    if row == 0 || row as u64 > plan.budget.max_score_elements() {
+        return Err(candle_gen::CandleError::Msg(
+            "H3 minimum materializing attention row exceeds selected workspace budget".into(),
+        ));
+    }
+    let force_materialized =
+        std::env::var("SCENEWORKS_H3_ATTENTION_ROUTE").is_ok_and(|route| route == "materialized");
+    let kernel = candle_gen::fused_attention::select_attention_kernel(q, k, v, None);
+    let materialized =
+        force_materialized || matches!(kernel, candle_gen::AttentionKernel::Budgeted(_));
+    let query_rows = plan.budget.query_block_rows(row as u64, sq as u64);
+    tracing::debug!(
+        route = if materialized {
+            "materialized-query-chunked"
+        } else {
+            "flash"
+        },
+        forced = force_materialized,
+        ?kernel,
+        query_rows,
+        score_elements = plan.budget.max_score_elements(),
+        "minimax-h3: attention route"
+    );
+    let out = if force_materialized {
+        candle_gen::attention::sdpa_planned_bhsd(
+            q,
+            k,
+            v,
+            scale,
+            None,
+            candle_gen::candle_nn::ops::softmax_last_dim,
+            plan,
+        )
+    } else {
+        candle_gen::sdpa_dispatch_bhsd(
+            q,
+            k,
+            v,
+            scale,
+            None,
+            candle_gen::candle_nn::ops::softmax_last_dim,
+            plan,
+        )
+    }?;
+    ATTENTION_EXECUTION.with(|r| {
+        let mut r = r.borrow_mut();
+        if materialized {
+            r.materialized_calls += 1;
+        } else {
+            r.flash_calls += 1;
+        }
+        r.maximum_query_rows =
+            r.maximum_query_rows
+                .max(if materialized { query_rows } else { sq as u64 });
+        r.maximum_materialized_score_elements =
+            r.maximum_materialized_score_elements.max(if materialized {
+                query_rows * row as u64
+            } else {
+                0
+            });
+    });
+    Ok(out)
 }
 
-/// The plan [`sdpa_planned`] runs the fallback under: the 1e9 i32 guard, with `cancel` attached.
+/// The exact score-element allowance shared by CUDA admission, masked TE attention and FFN
+/// chunking. A selected smaller allowance is honored; a larger value cannot weaken the
+/// production fallback's bound. This is a byte bound, independent of measurement provenance.
+pub fn attention_budget() -> AttentionBudget {
+    attention_budget_for_context(crate::memory_strategy::active_context().as_ref())
+}
+
+pub fn attention_budget_for_context(
+    context: Option<&candle_gen::gen_core::MemoryRunContext>,
+) -> AttentionBudget {
+    let default = candle_gen::gen_core::veda::workspace::CUDA_DENSE_SCORE_ELEMENTS;
+    let elements = context
+        .and_then(|c| c.selection.parameters.attention_chunk_size)
+        .map(u64::from)
+        .unwrap_or(default)
+        .min(default)
+        .max(1);
+    AttentionBudget::from_score_elements(elements, false)
+}
+
+/// Request-scoped observations; only successfully completed attention calls are counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AttentionExecutionReport {
+    pub flash_calls: u64,
+    pub materialized_calls: u64,
+    pub maximum_query_rows: u64,
+    pub maximum_materialized_score_elements: u64,
+}
+thread_local! {
+    static ATTENTION_EXECUTION: std::cell::RefCell<AttentionExecutionReport> = std::cell::RefCell::default();
+}
+pub fn reset_attention_execution_report() {
+    ATTENTION_EXECUTION.with(|r| *r.borrow_mut() = Default::default());
+}
+pub fn attention_execution_report() -> AttentionExecutionReport {
+    ATTENTION_EXECUTION.with(|r| *r.borrow())
+}
+
+/// The bounded fallback plan carries cancellation between query chunks.
 fn attention_plan(cancel: Option<&CancelFlag>) -> AttentionPlan<'_> {
-    let plan = AttentionPlan::budgeted(candle_gen::attention::attention_budget_from_usize(
-        candle_gen::ATTN_SCORES_BUDGET,
-    ));
+    let plan = AttentionPlan::budgeted(attention_budget());
     match cancel {
         Some(c) => plan.with_cancel(c),
         None => plan,

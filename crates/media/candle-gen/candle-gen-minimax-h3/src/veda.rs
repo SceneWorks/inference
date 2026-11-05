@@ -17,6 +17,12 @@ use gen_core_h3::veda::{
     workspace,
     workspace::{LayoutSize, Limits},
 };
+fn runtime_limits() -> Limits {
+    Limits {
+        attention: 16 * crate::nn::attention_budget().max_score_elements(),
+        ..Limits::for_backend(Backend::Cuda)
+    }
+}
 struct Prepared {
     bundle: Bundle,
     plan: Plan,
@@ -41,7 +47,7 @@ impl Prepared {
             self.bundle.dim,
             batch,
             2,
-            Limits::for_backend(Backend::Cuda),
+            runtime_limits(),
         )?)
     }
     /// Same-shape head batches of `layer` (ascending heads), each at most the bound's batch size.
@@ -143,7 +149,7 @@ impl VedaRuntime {
                 dim,
                 1,
                 2,
-                Limits::for_backend(Backend::Cuda),
+                runtime_limits(),
             )?;
             report.borrow_mut().workspace_bytes = initial.total_bytes;
             let bundle = Bundle::load(path, layers, heads, dim)?;
@@ -200,7 +206,7 @@ impl VedaRuntime {
             bundle.dim,
             1,
             2,
-            Limits::for_backend(Backend::Cuda),
+            runtime_limits(),
         )?;
         let mut r = report.borrow_mut();
         r.predictor = Some(bundle.identity.clone());
@@ -226,6 +232,9 @@ impl VedaRuntime {
         v: &Tensor,
         scale: f64,
     ) -> Result<Tensor> {
+        if std::env::var("SCENEWORKS_H3_VEDA_FORCE_DENSE").is_ok_and(|v| v == "1") {
+            *self.failure.borrow_mut() = Some("Veda dense fallback forced for validation".into());
+        }
         #[cfg(test)]
         self.calls.borrow_mut().push(AttentionCall {
             layer,
@@ -299,6 +308,9 @@ impl VedaRuntime {
             return Err("Veda unsupported device/dtype/layout".into());
         }
         let bound = p.bound(&self.request, batch)?;
+        tracing::debug!(host_peak_bytes = bound.host_peak_bytes(),
+            device_peak_bytes = bound.device_peak_bytes(), ?bound.lifetimes,
+            "minimax-h3: Veda workspace pools");
         {
             let mut r = self.report.borrow_mut();
             r.workspace_bytes = r.workspace_bytes.max(bound.total_bytes);
@@ -369,6 +381,7 @@ impl VedaRuntime {
             samples.push(assemble(&outputs, &order)?.unsqueeze(0)?);
         }
         let out = Tensor::cat(&samples, 0)?;
+        drop(samples);
         ensure_finite(&out)?;
         Ok((out, pairs, bound.total_bytes))
     }
@@ -482,12 +495,23 @@ fn select(
 /// One f32 sum reduction plus a scalar readback per sparse call, beside the one score readback per
 /// head batch. A NaN or Inf anywhere makes the sum non-finite.
 pub(crate) fn ensure_finite(out: &Tensor) -> Result<()> {
-    let sum = out.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()?;
-    if sum.is_finite() {
-        Ok(())
-    } else {
-        Err(format!("Veda sparse attention produced non-finite output (sum {sum})").into())
+    // Scan one head/span at a time: a full FP32 copy of a long BF16 layer output
+    // would itself consume several GiB after assembly. No output values change.
+    let flat = out.flatten_all()?;
+    let count = flat.elem_count();
+    for start in (0..count).step_by(4096 * 128) {
+        let sum = flat
+            .narrow(0, start, (count - start).min(4096 * 128))?
+            .to_dtype(DType::F32)?
+            .sum_all()?
+            .to_scalar::<f32>()?;
+        if !sum.is_finite() {
+            return Err(
+                format!("Veda sparse attention produced non-finite output (sum {sum})").into(),
+            );
+        }
     }
+    Ok(())
 }
 fn budget(b: &VedaBudget) -> Budget {
     match b {
@@ -498,7 +522,9 @@ fn budget(b: &VedaBudget) -> Budget {
 /// Gathers `heads` of sample `b` into padded tile order `[heads, tiles, TILE, dim]`; padding is zero.
 fn tile(x: &Tensor, b: usize, heads: &[usize], l: &Layout) -> Result<Tensor> {
     let (_, all, _, dim) = x.dims4()?;
-    let mut a = x.get(b)?.contiguous()?;
+    // Select the bounded head batch BEFORE allocating. A strided sample view may
+    // cover the entire layer, so making it contiguous first defeats head batching.
+    let mut a = x.get(b)?;
     if heads.len() != all || heads.iter().enumerate().any(|(i, &h)| i != h) {
         let ids = Tensor::from_vec(
             heads.iter().map(|&h| h as u32).collect::<Vec<_>>(),
