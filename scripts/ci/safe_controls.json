@@ -877,6 +877,34 @@
         "win32"
       ],
       "reason": "Pure source-owned allocation arithmetic over synthetic byte counts and adapter metadata; verifies host-only install lifetimes, aligned device windows, disjoint projection/RMS work and unchanged MLX accounting. No tensor backend or learned execution."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "h3_memory::window::tests::cuda_adaln_precompute_prices_current_projection_and_cache_prefix",
+      "source": "crates/contracts/gen-core/src/h3_memory/window.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Pure byte arithmetic for affine/dense AdaLN dequantization, overlapping casts/outputs, sequential cache prefixes, independent MLX behavior, and unknown/zero/overflow refusal. No tensors, device or learned computation."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::streaming::tests::cuda_adaln_headers_separate_precompute_from_body_decode_and_refuse_unknown",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy/streaming.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Header-only safetensors fixtures distinguish q4/q8/BF16 runtime scratch, consumed AdaLN operands, CPU preparation, and unsupported native migration. No payload tensors, model factory or learned execution."
     }
   ]
 }

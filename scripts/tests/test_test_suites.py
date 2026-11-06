@@ -162,7 +162,7 @@ class TestSuites(unittest.TestCase):
     def test_safe_table_is_nonempty_and_source_bound(self):
         controls = suites.safe_controls()
         # SW-F329 appends 16 reviewed byte/source/lifecycle controls to the existing 48.
-        self.assertEqual(len(controls), 64)
+        self.assertEqual(len(controls), 66)
         self.assertEqual(sum(control["package"] == "sceneworks-gen-cv" for control in controls), 26)
         self.assertTrue(all(control['protocol'] == 'libtest' for control in controls))
         self.assertTrue(any('cancellation' in control['test'] for control in controls))

@@ -35,23 +35,93 @@ pub(super) fn dit_window(
         element_bytes: 2,
         projection_decode_bytes: decode,
     };
-    let window = candle_gen::gen_core::h3_memory::window::WindowAllocation::from_resident_tensors(
-        &allocation.resident_by_name,
-        &allocation.projections,
-        bytes.saturating_sub(allocation.resident_bytes),
-        pruned,
-    )?
-    .with_cuda_working_set(facts)?;
+    let mut window =
+        candle_gen::gen_core::h3_memory::window::WindowAllocation::from_resident_tensors(
+            &allocation.resident_by_name,
+            &allocation.projections,
+            bytes.saturating_sub(allocation.resident_bytes),
+            pruned,
+        )?
+        .with_cuda_working_set(facts)?;
     if window.n_blocks() != cfg.num_layers {
         // A partial inventory can still price its existing resident contract. It cannot
         // advertise streaming without the complete contiguous configured block stack.
         return Ok(None);
     }
+    if !pruned {
+        window = window.with_cuda_adaln_working_sets(cuda_adaln_working_sets(path, &cfg)?)?;
+    }
     Ok(Some(window))
 }
 
+fn cuda_adaln_working_sets(
+    path: &Path,
+    cfg: &crate::dit::MiniMaxH3DitConfig,
+) -> candle_gen::gen_core::Result<Vec<candle_gen::gen_core::h3_memory::window::CudaAdalnWorkingSet>>
+{
+    let invalid =
+        || CoreError::Unsupported("invalid or missing CUDA AdaLN projection facts".into());
+    let headers = weightsmeta::safetensors_path_tensor_headers(path)?;
+    let names = headers
+        .iter()
+        .map(|h| (h.name.as_str(), h))
+        .collect::<BTreeMap<_, _>>();
+    let output = (cfg.hidden_size as u64)
+        .checked_mul(18)
+        .ok_or_else(invalid)?;
+    let output_dim = usize::try_from(output).map_err(|_| invalid())?;
+    let input = cfg.time_embed_dim as u64;
+    if output == 0 || input == 0 || cfg.num_layers == 0 {
+        return Err(invalid());
+    }
+    (0..cfg.num_layers)
+        .map(|layer| {
+            let base = format!("transformer_blocks.{layer}.adaln_proj.linear");
+            let weight = names
+                .get(format!("{base}.weight").as_str())
+                .ok_or_else(invalid)?;
+            let bias = names
+                .get(format!("{base}.bias").as_str())
+                .ok_or_else(invalid)?;
+            if !bias.is_float() || bias.shape.as_slice() != [output_dim] {
+                return Err(invalid());
+            }
+            let affine = if let Some(scales) = names.get(format!("{base}.scales").as_str()) {
+                let biases = names
+                    .get(format!("{base}.biases").as_str())
+                    .ok_or_else(invalid)?;
+                candle_gen::quant::mlx_packed_qtensor_resident_bytes(
+                    weight,
+                    scales,
+                    biases,
+                    candle_gen::quant::MLX_GROUP_SIZE,
+                )?;
+                if scales.shape.as_slice() != [output_dim, (input / 64) as usize]
+                    || !input.is_multiple_of(64)
+                {
+                    return Err(invalid());
+                }
+                true
+            } else {
+                if !weight.is_float() || weight.shape.as_slice() != [output_dim, input as usize] {
+                    return Err(invalid());
+                }
+                false
+            };
+            Ok(
+                candle_gen::gen_core::h3_memory::window::CudaAdalnWorkingSet {
+                    input,
+                    output,
+                    affine,
+                },
+            )
+        })
+        .collect()
+}
+
 /// Runtime payloads collapse affine triples into the exact GGUF container used by CUDA.
-/// Returns payload-by-source-name, host constructor peak and the largest decoded projection.
+/// Returns payload-by-source-name, host constructor peak and the largest root/body decode peak.
+/// Full AdaLN decode is priced separately at its current precompute projection, not in denoise.
 fn runtime_payloads(
     path: &Path,
     text_encoder: bool,
@@ -71,6 +141,7 @@ fn runtime_payloads(
     let mut source = 0;
     let mut derived = 0;
     let mut decode = 0;
+    let mut prepare_scratch = 0;
     for h in &headers {
         source = add(source, h.data_bytes)?;
         if h.name.ends_with(".scales") || h.name.ends_with(".biases") {
@@ -108,14 +179,29 @@ fn runtime_payloads(
                         .get(1)
                         .ok_or_else(|| CoreError::Unsupported("invalid affine scales".into()))?
                         as u64;
-                    let size = n
+                    let elements = n
                         .checked_mul(groups)
                         .and_then(|v| v.checked_mul(candle_gen::quant::MLX_GROUP_SIZE as u64))
-                        .and_then(|v| v.checked_mul(if text_encoder { 4 } else { 2 }))
                         .ok_or_else(|| {
                             CoreError::Unsupported("H3 affine decode size overflow".into())
                         })?;
-                    decode = decode.max(size);
+                    // Q8 CPU repacking may transiently decode one full F32 weight. The
+                    // source map and completed runtime packs are already counted below.
+                    prepare_scratch =
+                        prepare_scratch.max(elements.checked_mul(4).ok_or_else(|| {
+                            CoreError::Unsupported("H3 affine preparation overflow".into())
+                        })?);
+                    if !h.name.contains(".adaln_proj.linear.") {
+                        // QLinear first owns F32 dequantization plus the BF16 target cast;
+                        // the TE's F32 compute aliases its already-F32 dequantized weight.
+                        decode = decode.max(
+                            elements
+                                .checked_mul(if text_encoder { 4 } else { 6 })
+                                .ok_or_else(|| {
+                                    CoreError::Unsupported("H3 affine decode size overflow".into())
+                                })?,
+                        );
+                    }
                 }
                 continue;
             }
@@ -131,14 +217,22 @@ fn runtime_payloads(
         if bytes != h.data_bytes {
             derived = add(derived, bytes)?;
         }
-        if h.shape.len() == 2 && h.is_float() && !h.name.contains("embed_tokens") {
+        if h.shape.len() == 2
+            && h.is_float()
+            && !h.name.contains("embed_tokens")
+            && !h.name.contains(".adaln_proj.linear.")
+        {
             decode = decode.max(h.materialized_bytes(if text_encoder { 4 } else { 2 })?);
         }
         payload.insert(h.name.clone(), bytes);
     }
     // Repacking can decode one complete current projection while source and earlier runtime
     // packs remain live. It never expands every block or repeats conversion during a window.
-    Ok((payload, add(add(source, derived)?, decode)?, decode))
+    Ok((
+        payload,
+        add(add(source, derived)?, prepare_scratch)?,
+        decode,
+    ))
 }
 
 pub(super) fn text_encoder_stream(
@@ -275,6 +369,102 @@ pub fn host_peak_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn headers(path: &Path, entries: &[(String, &str, Vec<usize>)]) {
+        use std::io::Write;
+        let mut header = serde_json::Map::new();
+        let mut offset = 0;
+        for (name, dtype, shape) in entries {
+            let bytes = shape.iter().product::<usize>() * if *dtype == "U32" { 4 } else { 2 };
+            header.insert(name.clone(), serde_json::json!({"dtype":dtype,"shape":shape,"data_offsets":[offset,offset+bytes]}));
+            offset += bytes;
+        }
+        let mut json = serde_json::to_vec(&header).unwrap();
+        while !json.len().is_multiple_of(8) {
+            json.push(b' ');
+        }
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&(json.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&json).unwrap();
+        file.set_len((8 + json.len() + offset) as u64).unwrap();
+    }
+
+    #[test]
+    fn cuda_adaln_headers_separate_precompute_from_body_decode_and_refuse_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("model.safetensors");
+        let cfg = crate::dit::MiniMaxH3DitConfig {
+            hidden_size: 64,
+            time_embed_dim: 64,
+            num_layers: 2,
+            ..Default::default()
+        };
+        for bits in [None, Some(4), Some(8)] {
+            let mut entries = Vec::new();
+            for (base, output) in [
+                ("transformer_blocks.0.adaln_proj.linear", 1152),
+                ("transformer_blocks.1.adaln_proj.linear", 1152),
+                ("transformer_blocks.0.ff.net.0.proj", 128),
+            ] {
+                if let Some(bits) = bits {
+                    entries.push((
+                        format!("{base}.weight"),
+                        "U32",
+                        vec![output, 64 * bits / 32],
+                    ));
+                    entries.push((format!("{base}.scales"), "BF16", vec![output, 1]));
+                    entries.push((format!("{base}.biases"), "BF16", vec![output, 1]));
+                } else {
+                    entries.push((format!("{base}.weight"), "BF16", vec![output, 64]));
+                }
+                entries.push((format!("{base}.bias"), "BF16", vec![output]));
+            }
+            headers(&file, &entries);
+            let facts = cuda_adaln_working_sets(root.path(), &cfg).unwrap();
+            assert_eq!(
+                facts,
+                vec![
+                    candle_gen::gen_core::h3_memory::window::CudaAdalnWorkingSet {
+                        input: 64,
+                        output: 1152,
+                        affine: bits.is_some(),
+                    };
+                    2
+                ]
+            );
+            let (payload, prepare, body_decode) = runtime_payloads(root.path(), false).unwrap();
+            assert_eq!(
+                body_decode,
+                128 * 64 * if bits.is_some() { 6 } else { 2 },
+                "AdaLN scratch belongs to precompute; body affine dequant owns F32+BF16"
+            );
+            if bits.is_some() {
+                assert!(prepare >= payload.values().sum::<u64>() + 4 * 1152 * 64);
+            }
+            assert!(crate::block_stream::component_supported(root.path()).unwrap());
+            let mut unknown = cfg.clone();
+            unknown.time_embed_dim = 0;
+            assert!(cuda_adaln_working_sets(root.path(), &unknown).is_err());
+            unknown = cfg.clone();
+            unknown.hidden_size = usize::MAX;
+            assert!(cuda_adaln_working_sets(root.path(), &unknown).is_err());
+            let mut partial = entries.clone();
+            partial.retain(|(name, _, _)| name != "transformer_blocks.1.adaln_proj.linear.bias");
+            headers(&file, &partial);
+            assert!(
+                cuda_adaln_working_sets(root.path(), &cfg).is_err(),
+                "missing consumed projection operand is not zero scratch"
+            );
+            // Specialized native migration remains unavailable instead of being treated as affine.
+            entries.push((
+                "transformer_blocks.0.adaln_proj.linear.weight_scale".into(),
+                "BF16",
+                vec![1152, 1],
+            ));
+            headers(&file, &entries);
+            assert!(!crate::block_stream::component_supported(root.path()).unwrap());
+        }
+    }
+
     #[test]
     fn header_inventory_prices_cuda_text_windows_and_host_embedding_separately() {
         let root = tempfile::tempdir().unwrap();

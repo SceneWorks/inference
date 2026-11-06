@@ -43,6 +43,60 @@ pub struct WindowAllocation {
     layers: Vec<Layer>,
     pruned: bool,
     cuda_working: Option<CudaWorkingSet>,
+    cuda_adaln: Option<Vec<CudaAdalnWorkingSet>>,
+}
+
+/// Actual full-width AdaLN projection consumed by CUDA's modulation_for_window. Native
+/// descriptor routes keep their existing working facts; compatible dense/affine sources
+/// supply these header-owned logical dimensions before any tensors are materialized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CudaAdalnWorkingSet {
+    pub input: u64,
+    pub output: u64,
+    pub affine: bool,
+}
+impl CudaAdalnWorkingSet {
+    fn working_bytes(self, rows: u64, element_bytes: u64) -> Result<u64> {
+        if self.input == 0 || self.output == 0 || rows == 0 || !matches!(element_bytes, 2 | 4) {
+            return Err(invalid());
+        }
+        let input = times(rows, self.input)?;
+        let output = times(rows, self.output)?;
+        let weight = times(self.input, self.output)?;
+        // The F32 temb remains alive across every projection. Silu briefly owns both
+        // sigmoid and multiplied F32 arrays; activated then stays at the compute dtype.
+        let activation = times(12, input)?;
+        let carried_input = times(4 + element_bytes, input)?;
+        // QLinear's F32 dequantization and its BF16 cast coexist at the let statement,
+        // then the F32 tensor drops BEFORE Linear::forward. F32 compute aliases the cast.
+        let dequant = if self.affine {
+            plus(
+                times(
+                    if element_bytes == 4 {
+                        4
+                    } else {
+                        4 + element_bytes
+                    },
+                    weight,
+                )?,
+                carried_input,
+            )?
+        } else {
+            0
+        };
+        // Linear's matmul and bias-added outputs overlap. The later six contiguous parts
+        // overlap the complete projected tensor instead; both phases own two output arrays.
+        let outputs = times(times(2, element_bytes)?, output)?;
+        let linear = plus(
+            plus(carried_input, outputs)?,
+            if self.affine {
+                times(element_bytes, weight)?
+            } else {
+                0
+            },
+        )?;
+        Ok(activation.max(dequant).max(linear))
+    }
 }
 
 /// Source-config dimensions and largest runtime dequantization, independent of a checkpoint
@@ -314,6 +368,7 @@ impl WindowAllocation {
             layers: layers.into_values().collect(),
             pruned,
             cuda_working: None,
+            cuda_adaln: None,
         })
     }
 
@@ -330,6 +385,18 @@ impl WindowAllocation {
             return Err(invalid());
         }
         self.cuda_working = Some(facts);
+        Ok(self)
+    }
+
+    pub fn with_cuda_adaln_working_sets(mut self, facts: Vec<CudaAdalnWorkingSet>) -> Result<Self> {
+        if self.pruned || facts.len() != self.layers.len() {
+            return Err(invalid());
+        }
+        for fact in &facts {
+            // Validate unknown/overflowing dimensions independently of the eventual schedule.
+            fact.working_bytes(1, 2)?;
+        }
+        self.cuda_adaln = Some(facts);
         Ok(self)
     }
 
@@ -684,6 +751,42 @@ impl WindowAllocation {
         if self.pruned {
             return Ok(peak);
         }
+        if let NativeBackend::Candle { .. } = backend {
+            let cuda = self.cuda_working.ok_or_else(invalid)?;
+            if table == 0 && self.layers.iter().all(|layer| layer.adaln.payload == 0) {
+                return Ok(peak);
+            }
+            let projections = self.cuda_adaln.as_ref().ok_or_else(invalid)?;
+            // text_rows and F32 RoPE tables precede precompute; norm_out's F32 shift/scale
+            // is computed once before the block loop and is retained alongside its cache.
+            let carried = plus(
+                plus(
+                    cuda.attention_tables_bytes(rows.packed)?,
+                    times(times(rows.conditioning, cuda.hidden)?, cuda.element_bytes)?,
+                )?,
+                times(times(rows.schedule, cuda.hidden)?, 8)?,
+            )?;
+            let per_layer = table / self.layers.len() as u64;
+            for (index, projection) in projections.iter().enumerate() {
+                if times(times(projection.output, cuda.element_bytes)?, rows.schedule)? != per_layer
+                {
+                    return Err(invalid());
+                }
+                // CUDA modulation_for_window copies and drops ONE projection per iteration,
+                // even inside a multi-block callback. Only earlier blocks' cache parts exist;
+                // working_bytes includes current projected output and its six returned parts.
+                let prior = times(per_layer, index as u64)?;
+                let live = plus(
+                    plus(plus(root, carried)?, prior)?,
+                    plus(
+                        self.layers[index].adaln.resident()?,
+                        projection.working_bytes(rows.schedule, cuda.element_bytes)?,
+                    )?,
+                )?;
+                peak = peak.max(live);
+            }
+            return Ok(peak);
+        }
         for range in plan.windows() {
             let partition = self.window_partition(range.clone(), true)?;
             let mut work = 0;
@@ -946,6 +1049,139 @@ mod tests {
                 .is_err());
         }
     }
+    #[test]
+    fn cuda_adaln_precompute_prices_current_projection_and_cache_prefix() {
+        let cuda = NativeBackend::Candle {
+            tile_rows: 16,
+            workspace_bytes: 0,
+        };
+        let dims = CudaAdalnWorkingSet {
+            input: 1024,
+            output: 256,
+            affine: true,
+        };
+        assert_eq!(
+            dims.working_bytes(3, 2).unwrap(),
+            6 * 1024 * 256 + 6 * 3 * 1024
+        );
+        assert_eq!(
+            dims.working_bytes(3, 4).unwrap(),
+            4 * 1024 * 256 + 8 * 3 * 1024 + 8 * 3 * 256
+        );
+        assert_eq!(
+            CudaAdalnWorkingSet {
+                affine: false,
+                ..dims
+            }
+            .working_bytes(3, 2)
+            .unwrap(),
+            12 * 3 * 1024
+        );
+        assert_eq!(
+            CudaAdalnWorkingSet {
+                input: 64,
+                output: 1152,
+                affine: true
+            }
+            .working_bytes(100, 2)
+            .unwrap(),
+            646_656,
+            "linear+bias/part outputs also need a bound"
+        );
+        let facts = CudaWorkingSet {
+            hidden: 1,
+            heads: 1,
+            head_dim: 2,
+            rotary_dim: 2,
+            ffn_inner: 2,
+            element_bytes: 2,
+            projection_decode_bytes: 0,
+        };
+        let mut rows = rows();
+        rows.packed = 1;
+        rows.schedule = 3;
+        let task = task(vec![], 2 * 256 * 2, false);
+        for packed_payload in [20 * 1024 * 256 / 32, 34 * 1024 * 256 / 32] {
+            let data = payloads(&[100, 100], &[packed_payload + 512, 2 * 1024 * 256 + 512]);
+            let bare = WindowAllocation::from_resident_tensors(&data, &[], 0, false)
+                .unwrap()
+                .with_cuda_working_set(facts)
+                .unwrap();
+            assert!(
+                bare.precompute_peak_bytes(&task, cuda, rows, 1).is_err(),
+                "unknown affine/dense facts cannot become zero work"
+            );
+            let profile = bare
+                .clone()
+                .with_cuda_adaln_working_sets(vec![
+                    dims,
+                    CudaAdalnWorkingSet {
+                        affine: false,
+                        ..dims
+                    },
+                ])
+                .unwrap();
+            // The largest first packed projection overlaps NO future block-cache prefix.
+            // Current outputs are in working_bytes; only the prior cache is added separately.
+            let expected =
+                10 + (80 + 2 + 24) + packed_payload + 512 + 6 * 1024 * 256 + 6 * 3 * 1024;
+            assert_eq!(
+                profile.precompute_peak_bytes(&task, cuda, rows, 1).unwrap(),
+                expected
+            );
+            assert_eq!(
+                profile.precompute_peak_bytes(&task, cuda, rows, 2).unwrap(),
+                expected,
+                "CUDA still copies one AdaLN projection at a time inside a block callback"
+            );
+            assert_eq!(
+                profile
+                    .precompute_peak_bytes(&task, BACKEND, rows, 1)
+                    .unwrap(),
+                bare.precompute_peak_bytes(&task, BACKEND, rows, 1).unwrap(),
+                "MLX lifetime composition is unchanged"
+            );
+            assert!(bare
+                .clone()
+                .with_cuda_adaln_working_sets(vec![dims])
+                .is_err());
+            assert!(profile
+                .precompute_peak_bytes(
+                    &task,
+                    cuda,
+                    NativeRows {
+                        schedule: 0,
+                        ..rows
+                    },
+                    1
+                )
+                .is_err());
+            assert!(profile
+                .precompute_peak_bytes(
+                    &task,
+                    cuda,
+                    NativeRows {
+                        schedule: u64::MAX,
+                        ..rows
+                    },
+                    1
+                )
+                .is_err());
+        }
+        for bad in [
+            CudaAdalnWorkingSet { input: 0, ..dims },
+            CudaAdalnWorkingSet { output: 0, ..dims },
+            CudaAdalnWorkingSet {
+                input: u64::MAX,
+                ..dims
+            },
+        ] {
+            assert!(bad.working_bytes(1, 2).is_err());
+        }
+        // The shipped affine matrix alone owns F32 decode plus BF16 cast, not merely BF16.
+        assert_eq!(6u64 * 96768 * 2688, 1_560_674_304);
+    }
+
     #[test]
     fn dense_precompute_cache_grows_by_actual_window_end_and_evicts_adaln() {
         let data = payloads(&[100, 100, 100], &[1000, 10, 10]);
