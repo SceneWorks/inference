@@ -226,6 +226,12 @@ impl Generator for Sd3Generator {
         let id = self.model_id();
         // The shared capability floor (count/size/negative/guidance/conditioning/sampler).
         self.descriptor.capabilities.validate_request(id, req)?;
+        let guidance = req.guidance.unwrap_or_else(|| self.variant.default_cfg());
+        if req.negative_prompt.is_some() && guidance == 1.0 {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: a negative prompt requires guidance != 1.0; change guidance or drop the negative prompt"
+            )));
+        }
         if req.prompt.is_empty() {
             return Err(gen_core::Error::Msg(format!(
                 "{id}: prompt must not be empty"
@@ -844,12 +850,12 @@ mod tests {
         assert_eq!(g.descriptor().backend, "candle");
 
         let d = descriptor_turbo();
-        // Turbo is guidance-distilled: no CFG, no negative prompt.
+        // Turbo defaults to CFG off but supports experimental negative conditioning.
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.mac_only);
 
-        // Turbo validate rejects guidance + negative prompt (distilled-model honesty).
+        // Explicit guidance enables negative conditioning without changing the native default.
         for bad in [
             GenerationRequest {
                 prompt: "x".into(),
@@ -859,6 +865,7 @@ mod tests {
             GenerationRequest {
                 prompt: "x".into(),
                 negative_prompt: Some("blurry".into()),
+                guidance: Some(1.5),
                 ..Default::default()
             },
         ] {
@@ -866,6 +873,16 @@ mod tests {
                 g.validate(&bad).is_ok(),
                 "turbo supports CFG overrides: {bad:?}"
             );
+        }
+        for guidance in [None, Some(1.0)] {
+            assert!(g
+                .validate(&GenerationRequest {
+                    prompt: "x".into(),
+                    negative_prompt: Some("blurry".into()),
+                    guidance,
+                    ..Default::default()
+                })
+                .is_err());
         }
     }
 

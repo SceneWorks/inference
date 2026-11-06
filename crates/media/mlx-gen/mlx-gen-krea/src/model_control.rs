@@ -680,11 +680,10 @@ impl KreaTurboControl {
         // `residency.run` borrow) to avoid capturing `self` in the heavy closure below.
         let text_co_resident = !self.residency.is_sequential();
 
-        // Phase A: prompt → context (sc-11101; sc-11125). Pose control is CFG-free (one context, no
-        // negative), so the optional "text style" tap-reweight gain (sc-12009) applies to this single
-        // conditional context — the same tap structure the txt2img/img2img encode carries (`None`/g≈1 is
-        // a no-op). Under `Sequential` the shared seam loads the text phase, encodes, materializes, then
-        // DROPS it + `clear_cache()` before the DiT/VAE/branch load below.
+        // Phase A: prompt → context (sc-11101; sc-11125), plus negative context for explicit CFG.
+        // The optional text-style gain applies to the conditional context as in txt2img/img2img.
+        // Under `Sequential` the shared seam loads the text phase, encodes, materializes, then
+        // drops it and clears the cache before loading the DiT/VAE/branch below.
         self.residency.run(
             &req.cancel,
             req.use_pid,
@@ -692,6 +691,9 @@ impl KreaTurboControl {
             |text: &KreaText| {
                 let context =
                     maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)?;
+                let negative = (req.guidance.unwrap_or(0.0) != 0.0)
+                    .then(|| text.encode(req.negative_prompt.as_deref().unwrap_or("")))
+                    .transpose()?;
                 // `Residency::run` materializes only under Sequential. For calibration fault
                 // injection, evaluate at the conditioning boundary here as well so Resident and
                 // Sequential exercise the same physical phase without changing ordinary renders.
@@ -699,12 +701,9 @@ impl KreaTurboControl {
                     req.memory,
                     gen_core::MemoryPhase::Conditioning,
                 ) {
-                    mlx_rs::transforms::eval([&context])?;
+                    mlx_rs::transforms::eval(std::iter::once(&context).chain(negative.as_ref()))?;
                     self.calibration_fault(req, gen_core::MemoryPhase::Conditioning)?;
                 }
-                let negative = (req.guidance.unwrap_or(0.0) != 0.0)
-                    .then(|| text.encode(req.negative_prompt.as_deref().unwrap_or("")))
-                    .transpose()?;
                 Ok((context, negative))
             },
             |encoded| {
@@ -940,6 +939,15 @@ mod tests {
         assert!(
             encode < fault,
             "the Conditioning fault must FOLLOW the text encode"
+        );
+        let negative = body.find("let negative =").expect("negative conditioning");
+        assert!(
+            negative < fault,
+            "both contexts must precede the conditioning fault"
+        );
+        assert!(
+            body[..fault].contains("std::iter::once(&context).chain(negative.as_ref())"),
+            "an armed fault must materialize both contexts before measuring the phase exit"
         );
         assert!(
             !body.contains("MemoryPhase::Denoise"),

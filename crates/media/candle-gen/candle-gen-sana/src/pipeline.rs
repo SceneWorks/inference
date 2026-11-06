@@ -620,7 +620,7 @@ impl SanaPipeline {
         // keeps it byte-exact; a curated name re-shapes σ over the same mu=ln(3).
         let native = sana_sigmas(req.scheduler, steps);
         let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-            None,
+            req.scheduler,
             req.scheduler_shift,
             SCHEDULE_SHIFT.ln(),
             steps,
@@ -780,7 +780,7 @@ pub(crate) fn generate_base_staged(
         load_staged_transformer(root, device, SanaTransformerConfig::sana_1600m(), memory)?;
     let native = sana_sigmas(req.scheduler, steps);
     let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-        None,
+        req.scheduler,
         req.scheduler_shift,
         SCHEDULE_SHIFT.ln(),
         steps,

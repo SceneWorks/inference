@@ -1902,7 +1902,7 @@ fn render_base_from_contexts(
     // `x + v·(σ_{i+1} − σ_i)`.
     let sigmas = base_schedule(steps, req.width, req.height, req.scheduler.as_deref());
     let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-        None,
+        req.scheduler.as_deref(),
         req.scheduler_shift,
         dynamic_mu((req.width / 16 * (req.height / 16)) as f64) as f32,
         steps,
@@ -2127,7 +2127,7 @@ fn render_multiphase_driver<T>(
     let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
     let sigmas = base_schedule(total, req.width, req.height, req.scheduler.as_deref());
     let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-        None,
+        req.scheduler.as_deref(),
         req.scheduler_shift,
         dynamic_mu((req.width / 16 * (req.height / 16)) as f64) as f32,
         total,
@@ -2400,7 +2400,7 @@ fn render_base_img2img_from_contexts(
     // Resolution-dynamic Raw sigma schedule (mu from the image-token count), identical to `render_base`.
     let sigmas = base_schedule(steps, req.width, req.height, req.scheduler.as_deref());
     let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-        None,
+        req.scheduler.as_deref(),
         req.scheduler_shift,
         dynamic_mu((req.width / 16 * (req.height / 16)) as f64) as f32,
         steps,
@@ -2682,7 +2682,7 @@ fn render_edit_from_context(
         dynamic_mu((req.width / 16 * (req.height / 16)) as f64)
     };
     let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-        None,
+        req.scheduler.as_deref(),
         req.scheduler_shift,
         mu as f32,
         steps,
