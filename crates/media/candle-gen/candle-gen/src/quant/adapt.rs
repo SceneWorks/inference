@@ -734,6 +734,27 @@ impl std::fmt::Debug for AdaptLinear {
 }
 
 impl AdaptLinear {
+    /// Inspect executable frozen LoRA storage in an explicit model-proof diagnostic.
+    /// Never prepares casts, changes caches, or reads the provider's inspection records.
+    /// Every unsupported adapter variant refuses the complete observation.
+    #[doc(hidden)]
+    #[cfg(feature = "model-inference-proof")]
+    pub fn __model_proof_frozen_lora_factors(
+        &self,
+    ) -> candle_core::Result<Vec<(Tensor, Tensor, f64)>> {
+        self.adapters
+            .iter()
+            .map(|adapter| match adapter {
+                Adapter::Lora { a, b, scale, .. } => Ok((a.clone(), b.clone(), *scale)),
+                Adapter::LokrStructured { .. }
+                | Adapter::TrainableLora { .. }
+                | Adapter::TrainableLokr { .. } => candle_core::bail!(
+                    "frozen LoRA proof observation refuses structured or trainable adapters"
+                ),
+            })
+            .collect()
+    }
+
     /// Copy a prepared base and every residual onto a bounded execution window.
     pub fn copy_to_device(&self, device: &Device) -> candle_core::Result<Self> {
         let mut copy = self.clone();

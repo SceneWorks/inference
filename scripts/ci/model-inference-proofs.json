@@ -310777,5 +310777,142 @@
       "bespoke_acceptance/adapter_sample.png",
       "bespoke_acceptance/retained_export.json"
     ]
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/layers/residency_component.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Pinned actual stock q4 block0.to_q, actual norm_q and production-resolved 8-step Turbo BF16 factors; deterministic BF16 [1,104554,5376], real [1,104554,56,128] original/bounded RMS+partial RoPE. No attention, predictor, denoise, VAE or full render. Mandatory frozen manifest D:/Codex/work/sw-f329/envelope-outputs/residency-component-manifest.v1.json SHA2569df0a1203b8a20d87b81888cb4edeaa34537f50c558aba239a79af5b3c443b01; accepted CGPU/M4 staging receipt SHA256a58d6f7e2d2655a5537b5f7deac02fb95694d5e0a1ec1d47161a14801223d6dd. Runtime checks every actual config/Turbo/14-shard digest before preparation.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/layers/residency_component.rs::dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+    "required_environment": [
+      "MODEL_PROOF_OUTPUT_DIR"
+    ],
+    "external_asset_environment": [
+      "H3_RESIDENCY_COMPONENT_MANIFEST"
+    ],
+    "device_witness": "Successful actual Q4_1 DequantDense learned projection records CUDA DEVICE; exactly one late BODY only after full metrics, source hashes and all exact assertions.",
+    "output_contract": "Every-element maxAbs/relativePeak/RMS, BF16 byte hashes, nonfinite counts. Required exact same32MiB-policy GPU-direct versus host-prepared base/residual/full outputs and packed/factor bytes; exact original versus23-chunk RMS and rotary. Default/12MiB/32MiB workspace contrasts are observational with finite outputs, never a tolerance waiver. Missing assets hard fail.",
+    "configuration_controls": [
+      "SCENEWORKS_CUDA_PROOF_POOL_BYTES"
+    ],
+    "default_configuration": "fixed_cuda",
+    "configuration_kind": "source-controls",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/layers/residency_component.rs::dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity/fixed_cuda",
+        "environment": {
+          "SCENEWORKS_CUDA_PROOF_POOL_BYTES": null
+        },
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "required_cuda_physical_index": 1,
+        "scope": "Entire same-process component diagnostic on logicalCUDA0 mapped to physicalGPU1; no proof pool and no production policy mutation.",
+        "required_work": [
+          "Mandatory actual pinned stock q4/Turbo assets and canonical production installation; host DiT preparation ends before projection compute.",
+          "Same32MiB policy direct/prepared exact packed bytes, factors, base/residual/full outputs; full every-element metrics before assertions.",
+          "Source-predeclared default/12MiB/32MiB workspace observations with same-stream reset and synchronized live buffer teardown.",
+          "Same actual rawQ original/bounded exact per-head RMS and partial RoPE:104554rows,56heads,128channels,23chunks and1572-row tail."
+        ]
+      },
+      "fixed_cuda_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/layers/residency_component.rs::dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity/fixed_cuda_gpu0",
+        "environment": {
+          "SCENEWORKS_CUDA_PROOF_POOL_BYTES": null
+        },
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "required_cuda_physical_index": 0,
+        "scope": "Entire same-process component diagnostic on logicalCUDA0 mapped to physicalGPU0; no proof pool and no production policy mutation.",
+        "required_work": [
+          "Mandatory actual pinned stock q4/Turbo assets and canonical production installation; host DiT preparation ends before projection compute.",
+          "Same32MiB policy direct/prepared exact packed bytes, factors, base/residual/full outputs; full every-element metrics before assertions.",
+          "Source-predeclared default/12MiB/32MiB workspace observations with same-stream reset and synchronized live buffer teardown.",
+          "Same actual rawQ original/bounded exact per-head RMS and partial RoPE:104554rows,56heads,128channels,23chunks and1572-row tail."
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/layers/residency_component.rs::dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "requirements": [
+        {
+          "slot": "actual-q4-projection",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "actual-stock-configuration",
+          "role": "configuration",
+          "readers": [
+            "candle-gen-minimax-h3::dit::MiniMaxH3Dit::load_from_dir/configuration"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "actual-canonical-turbo",
+          "role": "artifact-input",
+          "readers": [
+            "crates/media/candle-gen/candle-gen/src/train/merge.rs::read_adapter_capped::std::fs::read@8751"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case",
+          "expected_sha256": [
+            "e16ac20824d6e6649b193806f8fb095639bd9946c97b1bb84b4248eab1cc807f"
+          ]
+        }
+      ]
+    },
+    "output_artifacts": [
+      "residency-component.json"
+    ],
+    "optional_environment": [
+      "H3_RESIDENCY_COMPONENT_MANIFEST"
+    ]
   }
 ]
