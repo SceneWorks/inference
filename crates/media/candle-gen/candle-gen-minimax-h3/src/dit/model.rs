@@ -522,6 +522,12 @@ impl MiniMaxH3Dit {
             packed.video_indices,
             packed.audio_indices,
         )?;
+        if self.stream_window.is_some() && self.device.is_cuda() {
+            // scatter_rows cats then index_selects into independent packed storage. These
+            // per-modality projections are not inputs to any later body/output operation.
+            drop(video);
+            drop(audio);
+        }
 
         // 2. The stack. The AdaLN index bounds-check runs ONCE here rather than per block: it is a
         //    blocking D2H readback, and all 50 blocks gather with the same index tensor against
@@ -1512,6 +1518,111 @@ mod veda_controls_tests {
         assert!(layer_cancel_needs_sync(141_000));
     }
 
+    /// Reuses the existing ignored learned case and its actual device witness. Complete
+    /// 128-channel head vectors, B>1, strided rows and a ragged tail compare against the
+    /// unchanged RMS/rotary formula; observed counts prove multiple chunks really ran.
+    fn assert_bounded_qk_preconditioning_matches_resident() {
+        let device = proof_device();
+        let (batch, sequence, heads, dim) = (2, 9, 3, 128);
+        let rope = MmRope::new(16, 10_000.0).unwrap();
+        let positions: Vec<_> = (0..sequence).map(|s| [s as f64 * 0.5, 2.0, -1.0]).collect();
+        let tables = rope.tables_from_rows(&positions, &device).unwrap();
+        let values: Vec<f32> = (0..batch * (sequence + 2) * heads * dim)
+            .map(|i| (i as f32 * 0.17).sin() * 1.3)
+            .collect();
+        let weights: Vec<f32> = (0..dim).map(|i| 0.5 + i as f32 / dim as f32).collect();
+        let budget = candle_gen::attention::AttentionBudget::from_score_elements(1536, false);
+        let mut observations = Vec::new();
+        for dtype in [DType::BF16, DType::F16, DType::F32] {
+            let input =
+                Tensor::from_vec(values.clone(), (batch, sequence + 2, heads, dim), &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+                    .narrow(1, 1, sequence)
+                    .unwrap();
+            assert!(
+                !input.is_contiguous(),
+                "fixture must retain batch-strided rows"
+            );
+            let weight = Tensor::from_vec(weights.clone(), dim, &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let expected = rope
+                .apply(
+                    &crate::nn::rms_weighted(&input, &weight, 1e-6).unwrap(),
+                    &tables,
+                )
+                .unwrap();
+            let (actual, report) = crate::dit::layers::precondition_projected_qk(
+                input.clone(),
+                &weight,
+                1e-6,
+                Some((&rope, &tables)),
+                budget,
+                None,
+            )
+            .unwrap();
+            assert_eq!(actual.dtype(), dtype);
+            assert_eq!(actual.dims(), input.dims());
+            assert_eq!((report.norm_chunks, report.rotary_chunks), (5, 5));
+            assert_eq!(report.maximum_chunk_elements, 1536);
+            assert_eq!(
+                actual
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                expected
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                "per-head RMS then partial rotary must preserve every row/channel for {dtype:?}"
+            );
+            // Slicing must not silently truncate an oversized table accepted by neither
+            // the resident nor bounded geometry. Validate the entire tables before RMS.
+            let oversized_tables = rope
+                .tables_from_rows(&vec![[0.0; 3]; sequence + 1], &device)
+                .unwrap();
+            assert!(rope.apply(&input, &oversized_tables).is_err());
+            assert!(crate::dit::layers::precondition_projected_qk(
+                input.clone(),
+                &weight,
+                1e-6,
+                Some((&rope, &oversized_tables)),
+                budget,
+                None,
+            )
+            .is_err());
+            let cancel = CancelFlag::new();
+            cancel.cancel();
+            assert!(matches!(
+                crate::dit::layers::precondition_projected_qk(
+                    input,
+                    &weight,
+                    1e-6,
+                    Some((&rope, &tables)),
+                    budget,
+                    Some(&cancel),
+                ),
+                Err(CandleError::Canceled)
+            ));
+            observations.push((
+                dtype,
+                report.norm_chunks,
+                report.rotary_chunks,
+                report.maximum_chunk_elements,
+            ));
+        }
+        println!("H3_BOUNDED_QK_PROOF actual(dtype,norm_chunks,rotary_chunks,max_elements)={observations:?}; B2 strided9rows head128 chunk2 tail1 exact values; oversized tables and cancellation refused");
+    }
+
     #[test]
     #[ignore = "complete synthetic DiT/JointDit forward; dispatched only by the manual H3 native suite"]
     fn native_controls_capture_every_mode_packed_tier_and_adapter_stack() {
@@ -1529,32 +1640,35 @@ mod veda_controls_tests {
                 }
             }
         }
-        // One reference/audio representative per storage arithmetic; the existing mode cases
-        // already cover task packing. This checks actual window execution with stacked residuals.
-        for tier in [None, Some(4), Some(8)] {
-            for veda in [false, true] {
-                let resident = run_inner(4, 2, tier, 4, 12.0, veda, false);
-                let streamed = run_inner(4, 2, tier, 4, 12.0, veda, true);
-                let scale = resident
-                    .0
-                    .iter()
-                    .map(|v| f32::from_bits(*v).abs())
-                    .fold(1e-12f32, f32::max);
-                let error = resident
-                    .0
-                    .iter()
-                    .zip(&streamed.0)
-                    .map(|(a, b)| (f32::from_bits(*a) - f32::from_bits(*b)).abs())
-                    .fold(0f32, f32::max);
-                assert!(
-                    error / scale <= 1e-5,
-                    "streamed/resident {tier:?} Veda={veda}: {error}/{scale}"
-                );
-                assert_eq!(resident.1, streamed.1);
-                assert_eq!(resident.2, streamed.2);
+        // Both task partitions and every conditioning/audio mode reach actual window
+        // execution, each with dense/q4/q8 bases and stacked LoRA/LoKr residuals.
+        for mode in 0..5 {
+            for tier in [None, Some(4), Some(8)] {
+                for veda in [false, true] {
+                    let resident = run_inner(mode, 2, tier, 4, 12.0, veda, false);
+                    let streamed = run_inner(mode, 2, tier, 4, 12.0, veda, true);
+                    let scale = resident
+                        .0
+                        .iter()
+                        .map(|v| f32::from_bits(*v).abs())
+                        .fold(1e-12f32, f32::max);
+                    let error = resident
+                        .0
+                        .iter()
+                        .zip(&streamed.0)
+                        .map(|(a, b)| (f32::from_bits(*a) - f32::from_bits(*b)).abs())
+                        .fold(0f32, f32::max);
+                    assert!(
+                        error / scale <= 1e-5,
+                        "streamed/resident {tier:?} Veda={veda}: {error}/{scale}"
+                    );
+                    assert_eq!(resident.1, streamed.1);
+                    assert_eq!(resident.2, streamed.2);
+                }
             }
         }
         assert_attached_cancel_stops_the_forward_before_the_first_block();
+        assert_bounded_qk_preconditioning_matches_resident();
 
         if forced_materialized {
             let report = crate::nn::attention_execution_report();
