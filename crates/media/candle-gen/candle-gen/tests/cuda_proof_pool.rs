@@ -31,6 +31,20 @@ fn constructor_binds_candle_to_an_enforced_pool() -> candle_gen::candle_core::Re
         free_bytes > requested * 2,
         "primitive proof needs physical headroom above its cap to distinguish cap enforcement from ordinary OOM"
     );
+    // A SetStream call resets a user workspace. Exercise the existing matmul boundary's
+    // rebind after a same-stream reset, using raw arithmetic rather than a learned layer.
+    unsafe {
+        candle_gen::candle_core::cuda_backend::cudarc::cublas::result::set_stream(
+            *cuda.cublas_handle().handle(),
+            cuda.cuda_stream().cu_stream() as _,
+        )
+        .map_err(candle_gen::candle_core::Error::wrap)?;
+    }
+    {
+        let a = Tensor::ones((4, 4), DType::F32, &device)?;
+        assert_eq!(a.matmul(&a)?.to_vec2::<f32>()?, vec![vec![4.; 4]; 4]);
+    }
+    device.synchronize()?;
     let before = proof_pool::snapshot(0)?.expect("constructor installed a proof pool");
     assert_eq!(before.cap_bytes, requested as u64);
     let mut allocations = Vec::new();
@@ -81,7 +95,7 @@ fn constructor_binds_candle_to_an_enforced_pool() -> candle_gen::candle_core::Re
     );
     // No invented all-device peak: these are driver-continuous pool counters only.
     println!(
-        "CUDA_PROOF_POOL_EVIDENCE {{\"logicalOrdinal\":0,\"capBytes\":{},\"heldBytes\":{},\"usedHighBytes\":{},\"reservedHighBytes\":{},\"overCapRefused\":true,\"bothConstructors\":true,\"scope\":\"stream-ordered allocator; context/library/foreign allocations excluded\"}}",
+        "CUDA_PROOF_POOL_EVIDENCE {{\"logicalOrdinal\":0,\"capBytes\":{},\"heldBytes\":{},\"usedHighBytes\":{},\"reservedHighBytes\":{},\"overCapRefused\":true,\"bothConstructors\":true,\"cublasStreamResetRebound\":true,\"scope\":\"stream-ordered allocator plus explicit cuBLAS workspace; context/library-internal/foreign allocations excluded\"}}",
         requested, held_bytes, peak.used_high_bytes, peak.reserved_high_bytes
     );
     Ok(())

@@ -11,7 +11,7 @@
 
 use super::WrapErr;
 use crate::Result;
-use cudarc::driver::{sys, CudaContext};
+use cudarc::driver::{sys, CudaContext, CudaSlice, CudaStream, DevicePtr};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -21,6 +21,9 @@ struct Installed {
     _context: Arc<CudaContext>,
     pool: usize,
     cap_bytes: usize,
+    // Retain until process exit, including when callers retain an exported cuBLAS handle after
+    // dropping its CudaDevice. The small proof process declares these live buffers in its cap.
+    blas_workspaces: HashMap<usize, Arc<CudaSlice<u8>>>,
 }
 
 static INSTALLED: OnceLock<Mutex<HashMap<usize, Installed>>> = OnceLock::new();
@@ -135,9 +138,65 @@ pub(super) fn configure(context: &Arc<CudaContext>) -> Result<()> {
             _context: context.clone(),
             pool: pool as usize,
             cap_bytes,
+            blas_workspaces: HashMap::new(),
         },
     );
     eprintln!("CUDA_PROOF_POOL installed logical_ordinal={ordinal} cap_bytes={cap_bytes} scope=stream_ordered_pool outside_pool=unbounded_requires_separate_reserve_and_observation");
+    Ok(())
+}
+
+/// Keep cuBLAS's explicit workspace inside the proof pool. Called after its constructor's
+/// initial SetStream and immediately before every Candle matmul: SetStream resets a user
+/// workspace, even when it selects the same stream. H3 has no direct handle/stream mutation.
+/// An externally changed stream is refused rather than applying a buffer with wrong ownership.
+pub(super) fn bind_cublas_workspace(
+    stream: &Arc<CudaStream>,
+    blas: &cudarc::cublas::CudaBlas,
+) -> Result<()> {
+    let Some(state) = INSTALLED.get() else {
+        return Ok(());
+    };
+    let mut state = state
+        .lock()
+        .map_err(|_| crate::Error::Msg("CUDA proof-pool state was poisoned".into()))?;
+    let Some(installed) = state.get_mut(&stream.context().ordinal()) else {
+        return Ok(());
+    };
+    installed._context.bind_to_thread().w()?;
+    if active_pool(installed._context.cu_device())? as usize != installed.pool {
+        crate::bail!("CUDA current pool changed before proof cuBLAS allocation");
+    }
+    let mut current = std::ptr::null_mut();
+    // SAFETY: the live cuBLAS handle owns its stream; current is a valid out pointer.
+    unsafe { cudarc::cublas::sys::cublasGetStream_v2(*blas.handle(), &mut current).result() }
+        .w()?;
+    if current as usize != stream.cu_stream() as usize {
+        crate::bail!("CUDA proof cuBLAS handle was moved to another stream; refusing untracked workspace ownership");
+    }
+    let handle = *blas.handle() as usize;
+    if let std::collections::hash_map::Entry::Vacant(entry) =
+        installed.blas_workspaces.entry(handle)
+    {
+        // NVIDIA recommends 32 MiB for sm90+; explicit storage prevents fallback to the
+        // library's default outside-pool workspace. This is proof-only, not a math-mode change.
+        entry.insert(Arc::new(stream.alloc_zeros::<u8>(32 * 1024 * 1024).w()?));
+    }
+    let workspace = installed
+        .blas_workspaces
+        .get(&handle)
+        .expect("inserted workspace");
+    let (pointer, _guard) = workspace.device_ptr(stream);
+    // SAFETY: process-lifetime pool storage outlives every use of this handle. Same-stream
+    // ordering protects initialization; ordinary H3 execution serializes cuBLAS operations.
+    unsafe {
+        cudarc::cublas::sys::cublasSetWorkspace_v2(
+            *blas.handle(),
+            pointer as *mut _,
+            workspace.len(),
+        )
+        .result()
+    }
+    .w()?;
     Ok(())
 }
 
