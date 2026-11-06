@@ -229,6 +229,8 @@ PRODUCTION_ENV_READS = frozenset({
     # and with_stage, whose source-owned recipe checks exact UUID/index mapping.
     "MODEL_PROOF_COMPARISON_STAGE", "MODEL_PROOF_COMPARISON_BINDING", "SCENEWORKS_GPU_ID",
     "MODEL_PROOF_IRIS_FROZEN_CACHE_DIR", "BESPOKE_RUNTIME_DIR",
+    # H3's explicit fallback validation routes; inert outside test/model-inference-proof builds.
+    "SCENEWORKS_H3_ATTENTION_ROUTE", "SCENEWORKS_H3_VEDA_FORCE_DENSE",
     # Subprocess capture markers set by a parent test harness for its own child.
     "IOS_CAPTURE_IN_CHILD", "IOS_CAPTURE_PERMIT_CPU_CHILD", "IRIS_STREAM_CPU_CHILD",
     "SDXL_IOS_QUANTUM_CPU_BODY_DONE", "SDXL_IOS_QUANTUM_CPU_CHILD",
@@ -2840,9 +2842,6 @@ BESPOKE_MEMORY_SKELETONS: dict[tuple[str, str], str] = {
     ),
     ("candle-gen-minimax-h3", "architecture_facts"): (
         "reads the DiT partition the component resolver charged, which can live outside the snapshot root"
-    ),
-    ("candle-gen-minimax-h3", "safety_check"): (
-        "deliberately tier-blind gen-core default for an uncalibrated resident-only route; a profile always binds a loaded tier"
     ),
     ("candle-gen-moss-image", "architecture_facts"): (
         "geometry is read from the authenticated Sources package config, not a snapshot root"

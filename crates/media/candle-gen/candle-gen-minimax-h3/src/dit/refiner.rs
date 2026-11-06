@@ -40,6 +40,15 @@ pub struct TokenRefinerBlock {
 }
 
 impl TokenRefinerBlock {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.norm1 = copy.norm1.copy_to_device(device)?;
+        copy.attn = copy.attn.copy_to_device(device)?;
+        copy.norm2 = copy.norm2.copy_to_device(device)?;
+        copy.ff = copy.ff.copy_to_device(device)?;
+        Ok(copy)
+    }
+
     /// Load block `prefix` (e.g. `token_refiner.refiner_blocks.0`).
     pub fn from_weights(
         w: &Weights,
@@ -102,6 +111,17 @@ pub struct TokenRefiner {
 }
 
 impl TokenRefiner {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.blocks = copy
+            .blocks
+            .iter()
+            .map(|b| b.copy_to_device(device))
+            .collect::<Result<_>>()?;
+        copy.final_norm = copy.final_norm.copy_to_device(device)?;
+        Ok(copy)
+    }
+
     /// Load `token_refiner`. `cfg.num_refiner_layers` blocks — 2 in the published checkpoint.
     pub fn from_weights(
         w: &Weights,

@@ -79,6 +79,13 @@ pub struct CurveProjection {
 }
 
 impl CurveProjection {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.weight = copy.weight.to_device(device)?;
+        copy.bias = copy.bias.to_device(device)?;
+        Ok(copy)
+    }
+
     /// The pruning identity of the checkpoint this projection came from.
     pub fn pruning_identity(&self) -> PruningIdentity {
         self.identity
@@ -207,6 +214,16 @@ pub struct CurveAdaLn {
 }
 
 impl CurveAdaLn {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.table = copy.table.to_device(device)?;
+        for (tensor, _) in copy.operands.values_mut() {
+            *tensor = tensor.to_device(device)?;
+        }
+        copy.device = device.clone();
+        Ok(copy)
+    }
+
     /// Canonical names this checkpoint variant consumes — the table, every block's reduced pair,
     /// and the final reduced pair.
     pub fn names(topology: &PrunedAdaLn) -> Vec<String> {

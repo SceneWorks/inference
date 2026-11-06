@@ -148,8 +148,8 @@ use crate::dit::adaln::AdaLnResidency;
 use crate::dit::model::{JointDit, MiniMaxH3Dit};
 use crate::dit::positions::KeyframeAnchor;
 use crate::pipeline::{
-    fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents, prepend_condition_rows,
-    render_latents_with_observer, resolve_geometry, revert_pixel_normalization, t2va_layout,
+    decoded_frames_to_images, fit_audio_to_video, fl2va_layout, initial_latents,
+    prepend_condition_rows, render_latents_with_observer, resolve_geometry, t2va_layout,
     RequestGeometry, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE, SPATIAL_STRIDE,
 };
 use crate::reference::{Ref2VaReference, Ref2VaReferences, VideoReference};
@@ -639,6 +639,7 @@ pub struct MiniMaxH3 {
     device: Device,
     dtype: DType,
     offload: OffloadPolicy,
+    load_shape: candle_gen::gen_core::LoadShape,
     contract: MemoryProviderContract,
     /// The staged adapter specs, held as **paths and strengths** rather than tensors — the same
     /// discipline the rest of this struct keeps. They are read once per render, in
@@ -669,6 +670,30 @@ fn terminal_device_sample(device: &Device) -> serde_json::Value {
 #[cfg(not(feature = "cuda"))]
 fn terminal_device_sample(_device: &Device) -> serde_json::Value {
     serde_json::json!({"method": "unavailable_without_cuda", "poolAvailable": false})
+}
+
+/// Whether the resolved source supports byte-preserving host-to-device block migration.
+/// This is a header-only operation, shared by strategy declaration and the load boundary.
+pub(crate) fn streaming_supported(spec: &LoadSpec) -> Result<bool> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(path) => path.as_path(),
+        WeightsSource::File(path) => path.parent().unwrap_or(path),
+    };
+    let paths = crate::tier::MiniMaxH3TierPaths::resolve(
+        root,
+        staged_component_dir(spec, crate::tier::DIT_COMPONENT),
+        staged_component_dir(spec, crate::tier::TEXT_ENCODER_COMPONENT),
+    );
+    if !crate::block_stream::component_supported(&paths.dit_dir)?
+        || !crate::block_stream::component_supported(&paths.text_encoder_dir)?
+    {
+        return Ok(false);
+    }
+    let reference = paths.reference_dit_dir;
+    if reference.is_dir() && !crate::block_stream::component_supported(&reference)? {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 impl MiniMaxH3 {
@@ -724,6 +749,11 @@ impl MiniMaxH3 {
             None => tiers.require_dit_unasserted()?,
         }
         tiers.require_text_encoder()?;
+        if spec.load_shape == candle_gen::gen_core::LoadShape::DeferredMaterialization
+            && !streaming_supported(spec)?
+        {
+            return Err(CandleError::Msg("minimax-h3: this native quantized source does not support runtime-format block migration; use its resident route".into()));
+        }
         let device = candle_gen::default_device()?;
         Ok(Self {
             descriptor: descriptor(),
@@ -736,6 +766,7 @@ impl MiniMaxH3 {
             dtype: DType::BF16,
             // **Not `spec.offload_policy`.** See [`OFFLOAD_POLICY`] and the module docs.
             offload: OFFLOAD_POLICY,
+            load_shape: spec.load_shape,
             contract: crate::memory_strategy::contract_for(spec)?,
             adapters: spec.adapters.clone(),
             veda_report: Default::default(),
@@ -894,10 +925,22 @@ impl MiniMaxH3 {
     /// The partition is mapped to its **resolved tier directory** through `Self::partition_dir`,
     /// so a staged tier's DiT is denoised from rather than the root's.
     pub fn load_task_dit(&self, partition: &str) -> Result<MiniMaxH3Dit> {
+        let policy = crate::block_stream::current();
+        let load_device = if policy.is_some() {
+            &Device::Cpu
+        } else {
+            &self.device
+        };
         let mut dit =
-            MiniMaxH3Dit::load_from_dir(self.partition_dir(partition)?, &self.device, self.dtype)?;
+            MiniMaxH3Dit::load_from_dir(self.partition_dir(partition)?, load_device, self.dtype)?;
         if !self.adapters.is_empty() {
             crate::adapters::apply_minimax_h3_adapters(&mut dit, &self.adapters)?;
+        }
+        if let Some(policy) = policy {
+            if policy.cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
+            }
+            dit.prepare_streamed(&self.device, policy.window)?;
         }
         Ok(dit)
     }
@@ -938,14 +981,26 @@ impl MiniMaxH3 {
             candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
         let prefixes = lm_prefixes(LM_PREFIX, &cfg);
         let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        let policy = crate::block_stream::current();
+        let load_device = if policy.is_some() {
+            &Device::Cpu
+        } else {
+            &self.device
+        };
         let w = candle_gen::Weights::from_files_filtered_host_packed(
             &shards,
-            &self.device,
+            load_device,
             TE_STORE_DTYPE,
             &refs,
         )?;
-        let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
+        let mut te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
         drop(w);
+        if let Some(policy) = policy {
+            if policy.cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
+            }
+            te.prepare_streamed(&cfg, &self.device)?;
+        }
         let context =
             candle_gen::gen_core::with_prompt_encoding(on_progress, || te.forward(&ids, &mask))?;
         // candle is eager, so `context` is already materialized here and dropping the encoder
@@ -989,14 +1044,26 @@ impl MiniMaxH3 {
             candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
         let prefixes = lm_prefixes(LM_PREFIX, &cfg);
         let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        let policy = crate::block_stream::current();
+        let load_device = if policy.is_some() {
+            &Device::Cpu
+        } else {
+            &self.device
+        };
         let w = candle_gen::Weights::from_files_filtered_host_packed(
             &shards,
-            &self.device,
+            load_device,
             TE_STORE_DTYPE,
             &refs,
         )?;
-        let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
+        let mut te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
         drop(w);
+        if let Some(policy) = policy {
+            if policy.cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
+            }
+            te.prepare_streamed(&cfg, &self.device)?;
+        }
         let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
             te.forward_with_images(
                 &ids,
@@ -1028,6 +1095,8 @@ impl MiniMaxH3 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        let _stream_request =
+            crate::block_stream::RequestGuard::enter(req, self.load_shape, &self.device)?;
         *self.veda_report.borrow_mut() = candle_gen::gen_core::VedaExecutionReport {
             requested: req.veda.as_ref().is_some_and(|v| v.enabled),
             ..Default::default()
@@ -1218,7 +1287,7 @@ impl MiniMaxH3 {
             let video = vae.decode(&rendered.video)?;
             drop(vae);
             crate::dit::release_device_memory(&self.device)?;
-            frames_to_images(&revert_pixel_normalization(&video)?)?
+            decoded_frames_to_images(&video)?
         };
         phase.done();
         let phase = PhaseLog::start("audio_vae_decode");
@@ -1591,7 +1660,7 @@ impl MiniMaxH3 {
             let video = vae.decode(&rendered.video)?;
             drop(vae);
             crate::dit::release_device_memory(&self.device)?;
-            frames_to_images(&revert_pixel_normalization(&video)?)?
+            decoded_frames_to_images(&video)?
         };
         phase.done();
         let phase = PhaseLog::start("audio_vae_decode");
@@ -1732,14 +1801,26 @@ impl MiniMaxH3 {
             candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
         let prefixes = lm_prefixes(LM_PREFIX, &cfg);
         let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        let policy = crate::block_stream::current();
+        let load_device = if policy.is_some() {
+            &Device::Cpu
+        } else {
+            &self.device
+        };
         let w = candle_gen::Weights::from_files_filtered_host_packed(
             &shards,
-            &self.device,
+            load_device,
             TE_STORE_DTYPE,
             &refs,
         )?;
-        let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
+        let mut te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
         drop(w);
+        if let Some(policy) = policy {
+            if policy.cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
+            }
+            te.prepare_streamed(&cfg, &self.device)?;
+        }
         let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
             te.forward_with_references(
                 &ids,
@@ -2119,6 +2200,44 @@ impl Generator for MiniMaxH3 {
         Some(&self.contract)
     }
 
+    fn memory_strategy_safety_check(
+        &self,
+        context: &candle_gen::gen_core::MemoryRunContext,
+    ) -> candle_gen::gen_core::MemorySafetyDecision {
+        let bits = match crate::tier::MiniMaxH3TierPaths::staged_bits(&self.tiers.dit_dir) {
+            Ok(bits) => bits,
+            Err(error) => return candle_gen::gen_core::MemorySafetyDecision::rejected(error),
+        };
+        let quant = match bits {
+            None => None,
+            Some(4) => Some(Quant::Q4),
+            Some(8) => Some(Quant::Q8),
+            _ => {
+                return candle_gen::gen_core::MemorySafetyDecision::rejected(
+                    "unsupported H3 artifact tier",
+                )
+            }
+        };
+        crate::memory_strategy::safety_check_loaded_tier(
+            &self.contract,
+            context,
+            candle_gen::gen_core::MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant,
+                component_precision_floors: &[],
+            },
+        )
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &candle_gen::gen_core::MemoryRunContext,
+    ) -> candle_gen::gen_core::Result<Option<Box<dyn candle_gen::gen_core::MemoryRequestScope>>>
+    {
+        candle_gen::request_scope::admit(self.memory_strategy_safety_check(context))?;
+        crate::memory_strategy::begin_request(&self.contract, self.device.clone(), context)
+    }
+
     fn generate(
         &self,
         req: &GenerationRequest,
@@ -2223,10 +2342,9 @@ pub fn load(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Generator>>
 ///   [`MiniMaxH3::offload_policy`] reports the enforced value, so the override is observable rather
 ///   than silent. Refusing a `Resident` request would break every caller that never asked for
 ///   staging; see the module docs.
-/// * **`spec.load_shape`** — same shape. `crate::memory_strategy::LOAD_SHAPE` is pinned to the
-///   loader this crate actually has and published on the memory contract whatever the spec says,
-///   which `load_shape_is_pinned_to_the_loader_not_taken_from_the_spec` asserts. sc-18662 changes
-///   the loader, not this decision.
+/// * **`spec.load_shape`** — read by the metadata-only factory and retained for request-time
+///   streaming. Deferred loads validate source migration support before materialization;
+///   the request chooses whether the prepared host stack executes under a window.
 fn reject_unread_slots(spec: &LoadSpec) -> candle_gen::gen_core::Result<()> {
     let mut unread: Vec<&str> = Vec::new();
     if spec.control.is_some() {
@@ -4207,14 +4325,20 @@ mod tests {
 
     /// The three `LoadSpec` slots that are decided but deliberately **not** refused stay that way.
     ///
-    /// `offload_policy` and `load_shape` are *overridden and reported*, not ignored — refusing them
-    /// would break every caller that never asked for staging — and `components` is refused a layer
-    /// down by `reject_unknown_components`. This pins that a bare spec carrying the non-default
-    /// residency knobs still loads, so the refusal list above cannot quietly grow to cover them.
+    /// Component staging remains enforced and a supported deferred source is retained as such.
     #[test]
     fn the_residency_knobs_are_overridden_rather_than_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let root = staged_root(&tmp);
+        // Deferred capability inspects real headers; a zero-byte placeholder is not a source.
+        for component in [BASE_DIT_PARTITION, crate::tier::TEXT_ENCODER_COMPONENT] {
+            candle_gen::candle_core::safetensors::save(
+                &std::collections::HashMap::<String, candle_gen::candle_core::Tensor>::new(),
+                root.join(component)
+                    .join("model-00001-of-00001.safetensors"),
+            )
+            .unwrap();
+        }
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(OffloadPolicy::Resident)
             .with_load_shape(candle_gen::gen_core::LoadShape::DeferredMaterialization);

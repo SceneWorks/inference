@@ -1,8 +1,9 @@
-//! MLX native H3 deferred-DiT residency. Source: `block_stream.rs::{DitBlockStream,
+//! Native H3 deferred-DiT residency. MLX source: `block_stream.rs::{DitBlockStream,
 //! precompute_adaln_windowed}` and `dit/model.rs::{load_dir_deferred,new_windowed,
 //! forward_windowed}`. Fresh weights views and forced carried state bound each ACTUAL aligned
 //! BlockPlan window; refiner/root tensors are not streamed. This is structural arithmetic, not a
-//! measured peak and not permission to advertise Candle streaming.
+//! measured peak. CUDA eligibility additionally requires source-owned `CudaWorkingSet`
+//! facts matching its eager prepared-host/body-transfer loader and bounded attention/FFN.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,6 +42,222 @@ pub struct WindowAllocation {
     root: Partition,
     layers: Vec<Layer>,
     pruned: bool,
+    cuda_working: Option<CudaWorkingSet>,
+    cuda_adaln: Option<Vec<CudaAdalnWorkingSet>>,
+}
+
+/// Actual full-width AdaLN projection consumed by CUDA's modulation_for_window. Specialized
+/// native CUDA sources already decline streaming; their resident and MLX allocation routes
+/// keep the existing descriptor facts. Dense/affine windows supply these header-owned facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CudaAdalnWorkingSet {
+    pub input: u64,
+    pub output: u64,
+    pub affine: bool,
+    /// One for a broadcast bias; otherwise the consumed bias requires this schedule length.
+    pub bias_rows: u64,
+}
+impl CudaAdalnWorkingSet {
+    fn working_bytes(self, rows: u64, element_bytes: u64) -> Result<u64> {
+        if self.input == 0
+            || self.output == 0
+            || rows == 0
+            || self.bias_rows == 0
+            || (self.bias_rows != 1 && self.bias_rows != rows)
+            || !matches!(element_bytes, 2 | 4)
+        {
+            return Err(invalid());
+        }
+        let input = times(rows, self.input)?;
+        let output = times(rows, self.output)?;
+        let weight = times(self.input, self.output)?;
+        // The F32 temb remains alive across every projection. Silu briefly owns both
+        // sigmoid and multiplied F32 arrays; activated then stays at the compute dtype.
+        let activation = times(12, input)?;
+        let carried_input = times(4 + element_bytes, input)?;
+        // QLinear's F32 dequantization and its BF16 cast coexist at the let statement,
+        // then the F32 tensor drops BEFORE Linear::forward. F32 compute aliases the cast.
+        let dequant = if self.affine {
+            plus(
+                times(
+                    if element_bytes == 4 {
+                        4
+                    } else {
+                        4 + element_bytes
+                    },
+                    weight,
+                )?,
+                carried_input,
+            )?
+        } else {
+            0
+        };
+        // Linear's matmul and bias-added outputs overlap. The later six contiguous parts
+        // overlap the complete projected tensor instead; both phases own two output arrays.
+        let outputs = times(times(2, element_bytes)?, output)?;
+        let linear = plus(
+            plus(carried_input, outputs)?,
+            if self.affine {
+                times(element_bytes, weight)?
+            } else {
+                0
+            },
+        )?;
+        Ok(activation.max(dequant).max(linear))
+    }
+}
+
+/// Source-config dimensions and largest runtime dequantization, independent of a checkpoint
+/// name or measured peak. CUDA's dense/affine routes need these even without native descriptors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CudaWorkingSet {
+    pub hidden: u64,
+    pub heads: u64,
+    pub head_dim: u64,
+    pub rotary_dim: u64,
+    pub ffn_inner: u64,
+    pub element_bytes: u64,
+    pub projection_decode_bytes: u64,
+}
+impl CudaWorkingSet {
+    fn attention_tables_bytes(self, rows: u64) -> Result<u64> {
+        // MmRopeTables retains two F32 [S,R] tables across every block. The existing
+        // 64-byte row envelope also covers device positions (12), inverse permutation (4),
+        // resident local/class indices (8), active AdaLN/timestep indices (8), and one
+        // gather/scatter U32 upload (4). Host F64 position rows and Vec indices are excluded.
+        times(rows, plus(times(8, self.rotary_dim)?, 64)?)
+    }
+    pub fn carried_attention_bytes(self, rows: u64) -> Result<u64> {
+        plus(
+            times(times(times(2, self.hidden)?, rows)?, self.element_bytes)?,
+            self.attention_tables_bytes(rows)?,
+        )
+    }
+    fn qk_norm_peak(self, rows: u64, inner: u64) -> Result<u64> {
+        // DitAttention's shadowed original Q/K/V stay alive through the inner scope. During
+        // the second rms_weighted, normalized Q is also retained: four stream buffers.
+        // nn::rms_weighted retains xf and normed through the final weighted cast. F32 xf
+        // aliases K only on an F32 stream; the final cast likewise aliases its F32 input.
+        let f32_inner = times(times(times(rows, self.heads)?, self.head_dim)?, 4)?;
+        let reduction = times(times(rows, self.heads)?, 4)?;
+        let (xf, cast) = if self.element_bytes == 4 {
+            (0, 0)
+        } else {
+            (f32_inner, inner)
+        };
+        let square_reduce = plus(f32_inner, reduction)?;
+        let divide = plus(f32_inner, times(2, reduction)?)?;
+        let weighted_cast = plus(
+            plus(times(2, f32_inner)?, cast)?,
+            times(4, self.head_dim)?, // at most one F32 norm-weight cast
+        )?;
+        plus(
+            plus(times(4, inner)?, xf)?,
+            square_reduce.max(divide).max(weighted_cast),
+        )
+    }
+    fn rotary_peak(self, rows: u64, inner: u64) -> Result<u64> {
+        let rotated = times(
+            times(times(rows, self.heads)?, self.rotary_dim)?,
+            self.element_bytes,
+        )?;
+        let partial = self.rotary_dim != self.head_dim;
+        let head = if partial { rotated } else { 0 };
+        let table_casts = if self.element_bytes == 4 {
+            0
+        } else {
+            times(times(times(2, rows)?, self.rotary_dim)?, self.element_bytes)?
+        };
+        // During the second apply: original QKV, normalized Q/K and already rotated Q
+        // remain (six stream buffers). apply retains head, rotated, both products and
+        // their sum at the multiply-add; partial rotary then cats out+tail into a full
+        // buffer. The head view is a copy only for partial rotary. Narrow views alias.
+        let multiply_add = plus(head, times(4, rotated)?)?;
+        let final_cat = if partial {
+            plus(plus(head, times(2, rotated)?)?, inner)?
+        } else {
+            0 // out is already contiguous
+        };
+        plus(
+            plus(times(6, inner)?, table_casts)?,
+            multiply_add.max(final_cat),
+        )
+    }
+    fn operation_peak(self, rows: u64) -> Result<u64> {
+        self.operation_peak_with_adapter(rows, 0)
+    }
+    fn operation_peak_with_adapter(self, rows: u64, adapter_work: u64) -> Result<u64> {
+        let hidden = times(times(rows, self.hidden)?, self.element_bytes)?;
+        let inner = times(
+            times(times(rows, self.heads)?, self.head_dim)?,
+            self.element_bytes,
+        )?;
+        let budget = crate::veda::workspace::CUDA_DENSE_SCORE_ELEMENTS;
+        let score_row = times(rows, self.heads)?;
+        let scores = times(
+            crate::attention_budget::AttentionBudget::from_score_elements(budget, false)
+                .query_block_rows(score_row, rows),
+            score_row,
+        )?;
+        // Materialized SDPA: caller QKV (3), its own contiguous Q/Kt/V (3), retained
+        // output spans (1) and final cat (1). H3 uses softmax_last_dim, so 16 bytes per
+        // score covers the two score/scaling buffers plus softmax output for F32 or BF16.
+        let materialized = plus(times(8, inner)?, times(16, scores)?)?;
+        // The current vendored fixed-length FlashAttention wrapper allocates an F32
+        // [B,128,H,S] LSE buffer, not [B,H,S]. Its kernel overlaps caller QKV+output;
+        // after return the output's transpose/contiguous overlaps one more full buffer.
+        let flash_lse = times(times(rows, self.heads)?, 128 * 4)?;
+        let fused = plus(times(4, inner)?, flash_lse)?.max(times(5, inner)?);
+        // Head merge retains the original SDPA output and its contiguous merged copy;
+        // to_out then allocates hidden output while caller QKV remain.
+        let output_projection = plus(times(5, inner)?, hidden)?;
+        // Scoped attention retains input and modulated hidden throughout these alternatives.
+        let attention = plus(
+            times(2, hidden)?,
+            self.qk_norm_peak(rows, inner)?
+                .max(self.rotary_peak(rows, inner)?)
+                .max(materialized)
+                .max(fused)
+                .max(output_projection),
+        )?;
+        // Residual adapters execute INSIDE a projection, never during later Q/K RMS,
+        // rotary or SDPA. The larger to_out envelope (QKV + SDPA/merged outputs + base
+        // hidden output) also covers earlier Q/K/V projections retaining prior outputs.
+        let adapted_projection = plus(plus(times(2, hidden)?, output_projection)?, adapter_work)?;
+        // SwiGLU chunks bound the expanded projection. Prior output spans and final cat
+        // coexist with full hidden input; token-axis chunking never changes the key domain.
+        let ffn = plus(
+            times(4, hidden)?,
+            times(
+                3 * self.element_bytes,
+                times(rows, times(2, self.ffn_inner)?)?
+                    .min(budget)
+                    .max(times(2, self.ffn_inner)?),
+            )?,
+        )?;
+        plus(
+            plus(
+                attention
+                    .max(adapted_projection)
+                    .max(plus(ffn, adapter_work)?)
+                    .max(times(8, hidden)?),
+                self.attention_tables_bytes(rows)?,
+            )?,
+            self.projection_decode_bytes,
+        )
+    }
+    fn root_peak(self, rows: NativeRows, conditioning: bool) -> Result<u64> {
+        if conditioning {
+            return self.operation_peak(rows.conditioning);
+        }
+        plus(
+            times(
+                times(times(8, rows.packed)?, self.hidden)?,
+                self.element_bytes,
+            )?,
+            self.projection_decode_bytes,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,7 +375,78 @@ impl WindowAllocation {
             root,
             layers: layers.into_values().collect(),
             pruned,
+            cuda_working: None,
+            cuda_adaln: None,
         })
+    }
+
+    pub fn with_cuda_working_set(mut self, facts: CudaWorkingSet) -> Result<Self> {
+        if facts.hidden == 0
+            || facts.heads == 0
+            || facts.head_dim == 0
+            || facts.rotary_dim == 0
+            || !facts.rotary_dim.is_multiple_of(2)
+            || facts.rotary_dim > facts.head_dim
+            || facts.ffn_inner == 0
+            || !matches!(facts.element_bytes, 2 | 4)
+        {
+            return Err(invalid());
+        }
+        self.cuda_working = Some(facts);
+        Ok(self)
+    }
+
+    pub fn with_cuda_adaln_working_sets(mut self, facts: Vec<CudaAdalnWorkingSet>) -> Result<Self> {
+        if self.pruned || facts.len() != self.layers.len() {
+            return Err(invalid());
+        }
+        for fact in &facts {
+            // Validate unknown/overflowing dimensions independently of the eventual schedule.
+            fact.working_bytes(fact.bias_rows, 2)?;
+        }
+        self.cuda_adaln = Some(facts);
+        Ok(self)
+    }
+
+    /// Denoising only: root + modulation tables + one actual aligned body window. This excludes
+    /// successive precompute allocations and operation scratch, allowing attention alternatives
+    /// to compose with a shared buffer identity rather than adding complete phase peaks.
+    pub fn denoise_resident_bytes(
+        &self,
+        task: &NativeTaskAllocation,
+        backend: NativeBackend,
+        rows: NativeRows,
+        window: usize,
+    ) -> Result<u64> {
+        let base = plus(self.root.resident()?, self.table_bytes(task, rows)?)?;
+        self.plan(backend, window)?
+            .windows()
+            .try_fold(base, |peak, range| {
+                Ok(peak.max(plus(
+                    base,
+                    self.window_partition(range, false)?.resident()?,
+                )?))
+            })
+    }
+
+    pub fn denoise_with_veda_bytes(
+        &self,
+        task: &NativeTaskAllocation,
+        backend: NativeBackend,
+        rows: NativeRows,
+        window: usize,
+        veda: &crate::veda::workspace::WorkspaceBound,
+    ) -> Result<u64> {
+        let facts = self.cuda_working.ok_or_else(invalid)?;
+        let dense = self.denoise_peak_bytes(task, backend, rows, window)?;
+        let attention = plus(
+            self.denoise_resident_bytes(task, backend, rows, window)?,
+            plus(
+                facts.carried_attention_bytes(rows.packed)?,
+                veda.device_peak_bytes(),
+            )?,
+        )?;
+        Ok(dense.max(attention))
     }
 
     /// Add only actual current source-to-compute cast OUTPUT sizes supplied by the selected
@@ -184,6 +472,47 @@ impl WindowAllocation {
 
     pub fn n_blocks(&self) -> usize {
         self.layers.len()
+    }
+
+    pub fn streamed_weight_facts(&self) -> Result<crate::StreamedWeightFacts> {
+        Ok(crate::StreamedWeightFacts {
+            resident_bytes: self.root.resident()?,
+            stacks: vec![self
+                .layers
+                .iter()
+                .map(|layer| layer.body.resident())
+                .collect::<Result<Vec<_>>>()?],
+        })
+    }
+
+    /// CUDA prepares/folds all adapter factors on the HOST before prepare_streamed moves
+    /// root/refiner and the current body window. The per-copy prepared caches are independently
+    /// owned and drop with that window. Ordinary clones retain their existing shared semantics.
+    pub fn adapter_resident_bytes(
+        &self,
+        task: &NativeTaskAllocation,
+        backend: NativeBackend,
+        window: usize,
+    ) -> Result<u64> {
+        let plan = self.plan(backend, window)?;
+        let Some(adapter) = &task.adapter else {
+            return Ok(0);
+        };
+        let mut root = 0;
+        let mut blocks = vec![0; self.layers.len()];
+        for projection in &adapter.projections {
+            let dest = match locate(&projection.target.path)? {
+                Location::Root => &mut root,
+                Location::Body(i) => blocks.get_mut(i).ok_or_else(invalid)?,
+                Location::Adaln(_) => return Err(invalid()), // not adapter-addressable
+            };
+            *dest = plus(*dest, projection.resident_bytes)?;
+        }
+        let peak = plan.windows().try_fold(root, |peak, range| {
+            let body = blocks[range].iter().try_fold(0, |n, &b| plus(n, b))?;
+            Ok(peak.max(plus(root, body)?))
+        });
+        peak
     }
 
     /// Resident-only counterpart for the ordinary native weight floor. Includes root/refiner,
@@ -215,7 +544,7 @@ impl WindowAllocation {
     }
 
     fn plan(&self, backend: NativeBackend, window: usize) -> Result<BlockPlan> {
-        if !matches!(backend, NativeBackend::Mlx { .. }) {
+        if matches!(backend, NativeBackend::Candle { .. }) && self.cuda_working.is_none() {
             return Err(invalid());
         }
         BlockPlan::new(self.layers.len(), window)
@@ -270,6 +599,13 @@ impl WindowAllocation {
                 };
                 peak = peak.max(work);
             }
+        }
+        if matches!(backend, NativeBackend::Candle { .. }) {
+            peak = peak.max(
+                self.cuda_working
+                    .ok_or_else(invalid)?
+                    .root_peak(rows, conditioning)?,
+            );
         }
         plus(peak, self.root.forward_cast)
     }
@@ -423,6 +759,42 @@ impl WindowAllocation {
         if self.pruned {
             return Ok(peak);
         }
+        if let NativeBackend::Candle { .. } = backend {
+            let cuda = self.cuda_working.ok_or_else(invalid)?;
+            if table == 0 && self.layers.iter().all(|layer| layer.adaln.payload == 0) {
+                return Ok(peak);
+            }
+            let projections = self.cuda_adaln.as_ref().ok_or_else(invalid)?;
+            // text_rows and F32 RoPE tables precede precompute; norm_out's F32 shift/scale
+            // is computed once before the block loop and is retained alongside its cache.
+            let carried = plus(
+                plus(
+                    cuda.attention_tables_bytes(rows.packed)?,
+                    times(times(rows.conditioning, cuda.hidden)?, cuda.element_bytes)?,
+                )?,
+                times(times(rows.schedule, cuda.hidden)?, 8)?,
+            )?;
+            let per_layer = table / self.layers.len() as u64;
+            for (index, projection) in projections.iter().enumerate() {
+                if times(times(projection.output, cuda.element_bytes)?, rows.schedule)? != per_layer
+                {
+                    return Err(invalid());
+                }
+                // CUDA modulation_for_window copies and drops ONE projection per iteration,
+                // even inside a multi-block callback. Only earlier blocks' cache parts exist;
+                // working_bytes includes current projected output and its six returned parts.
+                let prior = times(per_layer, index as u64)?;
+                let live = plus(
+                    plus(plus(root, carried)?, prior)?,
+                    plus(
+                        self.layers[index].adaln.resident()?,
+                        projection.working_bytes(rows.schedule, cuda.element_bytes)?,
+                    )?,
+                )?;
+                peak = peak.max(live);
+            }
+            return Ok(peak);
+        }
         for range in plan.windows() {
             let partition = self.window_partition(range.clone(), true)?;
             let mut work = 0;
@@ -474,6 +846,18 @@ impl WindowAllocation {
                         work = work.max(p.working_bytes(backend, rows));
                     }
                 }
+            }
+            if matches!(backend, NativeBackend::Candle { .. }) {
+                work = work.max(
+                    self.cuda_working
+                        .ok_or_else(invalid)?
+                        .operation_peak_with_adapter(
+                            rows.packed,
+                            task.adapter.as_ref().map_or(0, |a| {
+                                a.forward_working_bytes_for(backend, rows, RowDomain::Packed)
+                            }),
+                        )?,
+                );
             }
             peak = peak.max(plus(
                 plus(base, partition.resident()?)?,
@@ -570,6 +954,256 @@ mod tests {
         );
         assert!(p.denoise_peak_bytes(&task, BACKEND, rows(), 1).unwrap() < task.resident_bytes);
     }
+    #[test]
+    fn cuda_dense_windows_price_real_geometry_without_native_descriptors() {
+        let data = payloads(&[100, 200], &[10, 10]);
+        let cuda = NativeBackend::Candle {
+            tile_rows: 16,
+            workspace_bytes: 0,
+        };
+        let unknown = WindowAllocation::from_resident_tensors(&data, &[], 0, false).unwrap();
+        let task = task(vec![], 20, false);
+        assert!(unknown.denoise_peak_bytes(&task, cuda, rows(), 1).is_err());
+        let facts = CudaWorkingSet {
+            hidden: 16,
+            heads: 2,
+            head_dim: 8,
+            rotary_dim: 6,
+            ffn_inner: 32,
+            element_bytes: 2,
+            projection_decode_bytes: 512,
+        };
+        let profile = unknown.with_cuda_working_set(facts).unwrap();
+        let small = profile.denoise_peak_bytes(&task, cuda, rows(), 1).unwrap();
+        assert!(
+            small
+                > profile
+                    .denoise_resident_bytes(&task, cuda, rows(), 1)
+                    .unwrap()
+        );
+        let mut larger = rows();
+        larger.packed = 4096;
+        assert!(profile.denoise_peak_bytes(&task, cuda, larger, 1).unwrap() > small);
+        assert!(profile.denoise_peak_bytes(&task, cuda, rows(), 2).unwrap() > small);
+        assert_eq!(
+            profile.streamed_weight_facts().unwrap().peak_bytes(Some(1)),
+            210
+        );
+        assert!(facts.operation_peak(u64::MAX).is_err());
+
+        // Source-lifetime regression: the second BF16 RMS norm's final cast retains
+        // 4 stream inputs + xf/normed/weighted F32 (6 stream equivalents) + cast (1).
+        let stock = CudaWorkingSet {
+            hidden: 5376,
+            heads: 56,
+            head_dim: 128,
+            rotary_dim: 96,
+            ffn_inner: 14336,
+            element_bytes: 2,
+            projection_decode_bytes: 0,
+        };
+        let packed = 104_000;
+        let inner = packed * 56 * 128 * 2;
+        assert_eq!(stock.qk_norm_peak(packed, inner).unwrap(), 11 * inner + 512);
+        let rotary = packed * 56 * 96 * 2;
+        let cast_tables = 2 * packed * 96 * 2;
+        assert_eq!(
+            stock.rotary_peak(packed, inner).unwrap(),
+            6 * inner + cast_tables + (5 * rotary).max(inner + 3 * rotary)
+        );
+        // Tables/layout survive both attention and FFN; dequantization is a separate,
+        // simultaneous maximum supplied by the selected weight inventory.
+        let expected = 2 * packed * 5376 * 2 + 11 * inner + 512 + packed * (8 * 96 + 64);
+        assert_eq!(stock.operation_peak(packed).unwrap(), expected);
+        assert_eq!(expected, 18_723_328_512);
+        assert_eq!(
+            CudaWorkingSet {
+                element_bytes: 4,
+                ..stock
+            }
+            .qk_norm_peak(packed, inner * 2)
+            .unwrap(),
+            6 * inner * 2 + 512
+        );
+        // Partial rotary below half a head is dominated by its final full-width cat,
+        // and an F32 stream aliases its already-F32 cos/sin tables.
+        let narrow = CudaWorkingSet {
+            rotary_dim: 2,
+            element_bytes: 4,
+            ..facts
+        };
+        assert_eq!(narrow.rotary_peak(3, 3 * 2 * 8 * 4).unwrap(), 1488);
+        // For short sequences/small heads the vendored 128-wide LSE, not a multiple
+        // of inner, determines fused scratch. This fails if LSE is priced as [B,H,S].
+        assert_eq!(
+            CudaWorkingSet {
+                hidden: 1,
+                heads: 1,
+                ffn_inner: 1,
+                projection_decode_bytes: 0,
+                ..facts
+            }
+            .operation_peak(1)
+            .unwrap(),
+            692
+        );
+        for rotary_dim in [0, 3, 10] {
+            assert!(profile
+                .clone()
+                .with_cuda_working_set(CudaWorkingSet {
+                    rotary_dim,
+                    ..facts
+                })
+                .is_err());
+        }
+    }
+    #[test]
+    fn cuda_adaln_precompute_prices_current_projection_and_cache_prefix() {
+        let cuda = NativeBackend::Candle {
+            tile_rows: 16,
+            workspace_bytes: 0,
+        };
+        let dims = CudaAdalnWorkingSet {
+            input: 1024,
+            output: 256,
+            affine: true,
+            bias_rows: 1,
+        };
+        assert_eq!(
+            dims.working_bytes(3, 2).unwrap(),
+            6 * 1024 * 256 + 6 * 3 * 1024
+        );
+        assert_eq!(
+            dims.working_bytes(3, 4).unwrap(),
+            4 * 1024 * 256 + 8 * 3 * 1024 + 8 * 3 * 256
+        );
+        assert_eq!(
+            CudaAdalnWorkingSet {
+                affine: false,
+                ..dims
+            }
+            .working_bytes(3, 2)
+            .unwrap(),
+            12 * 3 * 1024
+        );
+        assert_eq!(
+            CudaAdalnWorkingSet {
+                input: 64,
+                output: 1152,
+                affine: true,
+                bias_rows: 1,
+            }
+            .working_bytes(100, 2)
+            .unwrap(),
+            646_656,
+            "linear+bias/part outputs also need a bound"
+        );
+        let facts = CudaWorkingSet {
+            hidden: 1,
+            heads: 1,
+            head_dim: 2,
+            rotary_dim: 2,
+            ffn_inner: 2,
+            element_bytes: 2,
+            projection_decode_bytes: 0,
+        };
+        let mut rows = rows();
+        rows.packed = 1;
+        rows.schedule = 3;
+        let task = task(vec![], 2 * 256 * 2, false);
+        for packed_payload in [20 * 1024 * 256 / 32, 34 * 1024 * 256 / 32] {
+            let data = payloads(&[100, 100], &[packed_payload + 512, 2 * 1024 * 256 + 512]);
+            let bare = WindowAllocation::from_resident_tensors(&data, &[], 0, false)
+                .unwrap()
+                .with_cuda_working_set(facts)
+                .unwrap();
+            assert!(
+                bare.precompute_peak_bytes(&task, cuda, rows, 1).is_err(),
+                "unknown affine/dense facts cannot become zero work"
+            );
+            let profile = bare
+                .clone()
+                .with_cuda_adaln_working_sets(vec![
+                    dims,
+                    CudaAdalnWorkingSet {
+                        affine: false,
+                        ..dims
+                    },
+                ])
+                .unwrap();
+            // The largest first packed projection overlaps NO future block-cache prefix.
+            // Current outputs are in working_bytes; only the prior cache is added separately.
+            let expected =
+                10 + (80 + 2 + 24) + packed_payload + 512 + 6 * 1024 * 256 + 6 * 3 * 1024;
+            assert_eq!(
+                profile.precompute_peak_bytes(&task, cuda, rows, 1).unwrap(),
+                expected
+            );
+            assert_eq!(
+                profile.precompute_peak_bytes(&task, cuda, rows, 2).unwrap(),
+                expected,
+                "CUDA still copies one AdaLN projection at a time inside a block callback"
+            );
+            assert_eq!(
+                profile
+                    .precompute_peak_bytes(&task, BACKEND, rows, 1)
+                    .unwrap(),
+                bare.precompute_peak_bytes(&task, BACKEND, rows, 1).unwrap(),
+                "MLX lifetime composition is unchanged"
+            );
+            assert!(bare
+                .clone()
+                .with_cuda_adaln_working_sets(vec![dims])
+                .is_err());
+            assert!(profile
+                .precompute_peak_bytes(
+                    &task,
+                    cuda,
+                    NativeRows {
+                        schedule: 0,
+                        ..rows
+                    },
+                    1
+                )
+                .is_err());
+            assert!(profile
+                .precompute_peak_bytes(
+                    &task,
+                    cuda,
+                    NativeRows {
+                        schedule: u64::MAX,
+                        ..rows
+                    },
+                    1
+                )
+                .is_err());
+        }
+        for bad in [
+            CudaAdalnWorkingSet { input: 0, ..dims },
+            CudaAdalnWorkingSet { output: 0, ..dims },
+            CudaAdalnWorkingSet {
+                input: u64::MAX,
+                ..dims
+            },
+        ] {
+            assert!(bad.working_bytes(1, 2).is_err());
+        }
+        // The shipped affine matrix alone owns F32 decode plus BF16 cast, not merely BF16.
+        assert_eq!(6u64 * 96768 * 2688, 1_560_674_304);
+        let row_bias = CudaAdalnWorkingSet {
+            bias_rows: 3,
+            ..dims
+        };
+        assert_eq!(
+            row_bias.working_bytes(3, 2).unwrap(),
+            dims.working_bytes(3, 2).unwrap()
+        );
+        assert!(
+            row_bias.working_bytes(2, 2).is_err(),
+            "row-dependent bias must match the actual schedule before allocation"
+        );
+    }
+
     #[test]
     fn dense_precompute_cache_grows_by_actual_window_end_and_evicts_adaln() {
         let data = payloads(&[100, 100, 100], &[1000, 10, 10]);

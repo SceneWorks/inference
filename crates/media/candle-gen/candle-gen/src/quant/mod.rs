@@ -549,6 +549,46 @@ impl std::fmt::Debug for QLinear {
 }
 
 impl QLinear {
+    /// Copy an already prepared projection without repacking or changing its arithmetic.
+    /// Block streaming keeps the host copy alive and uploads only runtime-format bytes.
+    pub fn copy_to_device(&self, device: &Device) -> Result<Self> {
+        let mut copy = self.clone();
+        match &mut copy {
+            Self::Quantized { weight, bias, .. } => {
+                let transfer = |source: &QTensor| -> Result<std::sync::Arc<QTensor>> {
+                    if source.device().same_device(device) {
+                        // The caller already cloned the owning Arc; this branch is handled below.
+                        candle_core::bail!("internal redundant packed transfer");
+                    }
+                    Ok(std::sync::Arc::new(QTensor::new(
+                        QStorage::from_data(source.data()?, device, source.dtype())?,
+                        source.shape().clone(),
+                    )?))
+                };
+                *weight = match &*weight {
+                    QuantWeight::Dequant(source) if !source.device().same_device(device) => {
+                        QuantWeight::Dequant(transfer(source)?)
+                    }
+                    QuantWeight::Matmul(QMatMul::QTensor(source))
+                        if !source.device().same_device(device) =>
+                    {
+                        QuantWeight::Matmul(QMatMul::QTensor(transfer(source)?))
+                    }
+                    QuantWeight::Matmul(QMatMul::Tensor(source)) => {
+                        QuantWeight::Matmul(QMatMul::Tensor(source.to_device(device)?))
+                    }
+                    QuantWeight::Matmul(QMatMul::TensorF16(source)) => {
+                        QuantWeight::Matmul(QMatMul::TensorF16(source.to_device(device)?))
+                    }
+                    existing => existing.clone(),
+                };
+                *bias = bias.as_ref().map(|b| b.to_device(device)).transpose()?;
+            }
+            _ => copy.to_device(device)?,
+        }
+        Ok(copy)
+    }
+
     /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`).
     pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self::Dense(DenseLinear::Linear(candle_nn::linear(

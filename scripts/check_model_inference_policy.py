@@ -791,7 +791,9 @@ class RunGraph:
             reviewed_sha = '253d75e21e94b6f9c8326f5a7cd38a4d3fbf077b5ef0ab6eb7a9e4f49127e729'
             # SW-6775: append the 26 migrated numeric CV/fake-session controls.
             # Their bodies use buffers/tokens only; no ORT session or learned call.
-            controls_sha = '814b9ef4d719bb04f99c65faeb0e4afcd1782c3a46d42effa7edf8e992c5c097'
+            # SW-F329 appends source/byte/lifecycle arithmetic and frozen-cache ownership
+            # controls. Their reviewed bodies execute no learned forward or inference kernel.
+            controls_sha = '9da105226be67efc8dba6bcdf6b9299493fced0ed653cb96895e601663589ab0'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha

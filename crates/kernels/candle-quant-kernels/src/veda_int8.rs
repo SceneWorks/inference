@@ -332,13 +332,15 @@ mod cuda {
                 .launch(cfg(slots / ATTEND_ROWS))
                 .map_err(candle_core::Error::wrap)?;
         }
-        Tensor::from_storage(
+        // Observe the successful learned CUDA output after quantization/attention launches,
+        // before callers copy it to the host. Feature-OFF expansion is the same expression.
+        __model_proof_output!(Tensor::from_storage(
             Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())),
             Shape::from(q.dims()),
             BackpropOp::none(),
             false,
         )
-        .to_dtype(q.dtype())
+        .to_dtype(q.dtype()))
     }
 }
 #[cfg(test)]

@@ -314,6 +314,7 @@ mod tests {
     }
 
     /// Root-relative names joined with their content digest, the shape a receipt keys on.
+    #[cfg(unix)]
     fn keyed_digests(root: &Path, files: &[PathBuf]) -> Vec<(String, [u8; 32])> {
         names(root, files)
             .into_iter()

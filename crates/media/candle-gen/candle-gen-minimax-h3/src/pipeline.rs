@@ -360,6 +360,26 @@ pub fn frames_to_images(video: &Tensor) -> Result<Vec<Image>> {
     Ok(out)
 }
 
+/// Convert decoded, ImageNet-normalized pixels to delivered RGB one frame at a time.
+///
+/// The decoded tensor remains live, but F32 normalization/round/clamp and HWC byte scratch are
+/// bounded by one frame rather than the clip length. These are the same elementwise operations
+/// as the bulk helpers above, in the same order, with no change to rounding or channel layout.
+pub fn decoded_frames_to_images(video: &Tensor) -> Result<Vec<Image>> {
+    let s = video.dims();
+    if s.len() != 5 || s[0] != 1 || s[1] != 3 {
+        return Err(CandleError::Msg(format!(
+            "minimax_h3 decode: expected [1, 3, T, H, W], got {s:?}"
+        )));
+    }
+    let mut out = Vec::with_capacity(s[2]);
+    for frame in 0..s[2] {
+        let pixels = video.narrow(2, frame, 1)?;
+        out.extend(frames_to_images(&revert_pixel_normalization(&pixels)?)?);
+    }
+    Ok(out)
+}
+
 /// How the delivered soundtrack is reconciled with the delivered picture.
 ///
 /// # The decision: **the audio is fitted to the picture** — trimmed or silence-padded at the tail.
@@ -1131,6 +1151,30 @@ mod tests {
         assert_eq!(imgs[0].pixels.len(), h * w * 3);
         assert_eq!(&imgs[0].pixels[..3], &[255, 0, 0]);
         assert_eq!(&imgs[1].pixels[..3], &[0, 255, 0]);
+    }
+
+    #[test]
+    fn frame_bounded_conversion_preserves_bulk_pixels_and_frame_order() {
+        let d = dev();
+        let shape = (1, 3, 5, 3, 7);
+        let values = (0..3 * 5 * 3 * 7)
+            .map(|i| ((i * 37 % 301) as f32 - 150.0) / 31.0)
+            .collect::<Vec<_>>();
+        let original = Tensor::from_vec(values, shape, &d).unwrap();
+        for dtype in [DType::F32, DType::BF16] {
+            let decoded = original.to_dtype(dtype).unwrap();
+            let bulk = frames_to_images(&revert_pixel_normalization(&decoded).unwrap()).unwrap();
+            let bounded = decoded_frames_to_images(&decoded).unwrap();
+            assert_eq!(bounded.len(), 5);
+            for (got, expected) in bounded.iter().zip(&bulk) {
+                assert_eq!((got.width, got.height), (expected.width, expected.height));
+                assert_eq!(got.pixels, expected.pixels);
+            }
+        }
+        assert!(
+            decoded_frames_to_images(&Tensor::zeros((2, 3, 1, 3, 7), DType::F32, &d).unwrap())
+                .is_err()
+        );
     }
 
     fn track(samples: usize, channels: u16) -> AudioTrack {

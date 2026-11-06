@@ -4,7 +4,10 @@ use super::{
     contract::{Layout, Plan, TileShape, FROZEN_PLANS, TILE},
     VedaBudget, VedaRequest,
 };
-pub use gen_core::veda::workspace::{Backend, Chunk, Request, WorkspaceBound};
+pub use gen_core::veda::workspace::{
+    Backend, Chunk, Request, WorkspaceBound, WorkspaceLifetimes, WorkspacePoolBytes,
+    CUDA_DENSE_SCORE_ELEMENTS,
+};
 use gen_core::{Conditioning, Error, GenerationRequest, Result};
 use std::collections::BTreeMap;
 
@@ -17,7 +20,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             copies: 512 << 20,
-            attention: 512 << 20,
+            attention: 16 * CUDA_DENSE_SCORE_ELEMENTS,
         }
     }
 }
@@ -153,7 +156,13 @@ pub fn chunk(
     limits: Limits,
 ) -> Result<Chunk> {
     if group == 0
+        || group > 65535
         || dim == 0
+        || dim > 128
+        || l.seq == 0
+        || l.seq > i32::MAX as usize
+        || l.slots > i32::MAX as usize
+        || l.slots < l.seq
         || l.video == 0
         || l.reference >= l.video
         || !l.slots.is_multiple_of(TILE)
@@ -241,7 +250,9 @@ pub fn bound(
     request.validate(layers, usize::MAX).map_err(Error::Msg)?;
     if layouts.is_empty()
         || batch == 0
+        || batch > u32::MAX as usize
         || heads == 0
+        || heads > 65535
         || plan.heads.len() != layers
         || plan
             .heads
@@ -317,8 +328,13 @@ pub fn bound(
     let plans = 32 * FROZEN_PLANS.len() as u64;
     let load = 275_415_649 + plans + bytes(24 * heads as u128 * (dim as u128).pow(2))?;
     let position = bytes(6 * 24 * seq as u128)?; // packed layout/model clones, including Vec growth capacity
-    let outputs =
-        bytes(12 * batch as u128 * heads as u128 * seq as u128 * dim as u128 * element as u128)?;
+                                                 // CUDA's eager runtime retains native-order head results, their concatenation and
+                                                 // head-order reconstruction simultaneously. Samples are dropped before the bounded
+                                                 // finite-output scan. MLX retains its original conservative lazy/cache allowance.
+    let output_copies = if backend == Backend::Cuda { 3 } else { 12 };
+    let outputs = bytes(
+        output_copies * batch as u128 * heads as u128 * seq as u128 * dim as u128 * element as u128,
+    )?;
     // MLX narrows FP32 Q/K/V to BF16 once per layer for its 16-bit NAX products.
     let narrowed = if backend == Backend::Mlx && element == 4 {
         3 * 2 * batch as u128 * heads as u128 * seq as u128 * dim as u128
@@ -338,12 +354,20 @@ pub fn bound(
         Backend::Mlx => outputs
             .checked_add(inputs)
             .ok_or_else(|| bad("size overflow"))?,
-        // Production Candle dense SDPA has a 1e9 score-element query budget. Minimum one
-        // query exceeds it when B*H*S > budget; that minimum is explicitly priced too.
+        // Runtime refuses before allocation if one query row cannot fit this allowance.
+        // This prices the materializing path even when the actual device can use FlashAttention.
         Backend::Cuda => {
             let row = batch as u128 * heads as u128 * seq as u128;
-            let rows = (1_000_000_000u128 / row.max(1)).max(1).min(seq as u128);
-            bytes(16 * row * rows + outputs as u128 + inputs as u128)?
+            let score_elements = (limits.attention / 16).min(CUDA_DENSE_SCORE_ELEMENTS);
+            if row == 0 || row > score_elements as u128 {
+                return Err(bad(
+                    "minimum dense attention row exceeds workspace allowance",
+                ));
+            }
+            let rows = (score_elements as u128 / row).min(seq as u128);
+            // Original strided QKV is caller-owned. The materializing helper makes
+            // contiguous Q/V and transposed K copies while those originals remain live.
+            bytes(16 * row * rows + outputs as u128 + 2 * inputs as u128)?
         }
     };
     // MLX's Metal route builds no tile-order copy of Q/K/V: its kernels read them in place.
@@ -360,13 +384,22 @@ pub fn bound(
         .iter()
         .map(|(shape, l)| {
             if backend == Backend::Mlx {
-                return chunks[shape].copies_bytes;
+                return Ok(chunks[shape].copies_bytes);
             }
-            chunks[shape].copies_bytes.saturating_sub(
-                (12 * l.slots as u128 * dim as u128 * element as u128 * chunks[shape].heads as u128)
-                    as u64,
-            )
+            // veda_score::launch: one video Q/K FP32 cast, TripPool features and
+            // projected output (the previous Q output remains while K is scored),
+            // OR the two projected outputs plus the device logits. Projection
+            // uploads are separate `predictor_device_bytes`, host readback is selector.
+            let (v, d, h, n) = (
+                l.video as u128,
+                dim as u128,
+                chunks[shape].heads as u128,
+                (l.slots / TILE) as u128,
+            );
+            bytes(h * ((4 * v * TILE as u128 * d + 20 * v * d).max(8 * v * d + 4 * v * v)) + 4 * n)
         })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
         .max()
         .unwrap_or(0);
     let total = bytes(
@@ -386,6 +419,78 @@ pub fn bound(
             + self_test as u128
             + fallback as u128,
     )?;
+    let persistent_host =
+        bytes(predictor_host as u128 + layout_bytes as u128 + plans as u128 + position as u128)?;
+    let lifetimes = if backend == Backend::Cuda {
+        // Predictor checkpoint bytes coexist with decoded host projections during load.
+        // Scorer/selection host vectors and CUDA CSR uploads are charged independently:
+        // selector owns retained-key Vecs/readback; the CSR expansion remains while its
+        // device copy and attention kernel run. Neither host-only pool is VRAM.
+        let mask_host = layouts
+            .iter()
+            .map(|(shape, l)| {
+                let n = (l.slots / TILE) as u128;
+                bytes(32 * chunks[shape].heads as u128 * n * n + 64 * n)
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        let retained_tiles = tile_bytes / 4; // three Q/K/V buffers within the 12-copy gather allowance
+        let sparse_scratch = (tile_bytes as u128)
+            .max(retained_tiles as u128 + scorer_bytes as u128 + device as u128)
+            .max(retained_tiles as u128 + scratch as u128);
+        let projection_host = layouts
+            .iter()
+            .map(|(shape, l)| {
+                let h = chunks[shape].heads as u128;
+                bytes(24 * h * (dim as u128).pow(2) + 4 * h * (l.video as u128).pow(2))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        WorkspaceLifetimes {
+            predictor_load: WorkspacePoolBytes {
+                host: bytes(persistent_host as u128 + load as u128)?,
+                ..Default::default()
+            },
+            self_test: WorkspacePoolBytes {
+                // The self-test's tiny CPU oracles coexist with its device fixtures.
+                host: bytes(persistent_host as u128 + self_test as u128)?,
+                device: bytes(inputs as u128 + self_test as u128)?,
+                shared_device: inputs,
+            },
+            sparse: WorkspacePoolBytes {
+                host: bytes(
+                    persistent_host as u128
+                        + (selector as u128 + mask_host as u128).max(projection_host as u128),
+                )?,
+                device: bytes(inputs as u128 + outputs as u128 + sparse_scratch + gather as u128)?,
+                shared_device: inputs,
+            },
+            dense_fallback: WorkspacePoolBytes {
+                // Rust unwinds failed sparse-call locals before calling dense SDPA.
+                // Prepared host predictor/layouts remain; scratch, uploads and masks do not.
+                host: persistent_host,
+                device: fallback,
+                shared_device: inputs,
+            },
+        }
+    } else {
+        // Unified memory and MLX's lazy graph/cache semantics keep the historical bound.
+        let pool = WorkspacePoolBytes {
+            host: total,
+            device: total,
+            shared_device: 0,
+        };
+        WorkspaceLifetimes {
+            predictor_load: pool,
+            self_test: pool,
+            sparse: pool,
+            dense_fallback: pool,
+        }
+    };
     Ok(WorkspaceBound {
         backend,
         plan: plan.name.clone(),
@@ -407,6 +512,7 @@ pub fn bound(
         dense_fallback_bytes: fallback,
         chunks,
         total_bytes: total,
+        lifetimes,
     })
 }
 /// Choose from the exact immutable checkpoint plan table without reading weights.
@@ -452,6 +558,16 @@ pub fn for_video_request_with_patch(
     backend: Backend,
     patch: [usize; 3],
 ) -> Result<Option<WorkspaceBound>> {
+    for_video_request_with_patch_and_limits(req, backend, patch, Limits::for_backend(backend))
+}
+
+/// The caller and runtime must use the same selected per-call allowances.
+pub fn for_video_request_with_patch_and_limits(
+    req: Request<'_>,
+    backend: Backend,
+    patch: [usize; 3],
+    limits: Limits,
+) -> Result<Option<WorkspaceBound>> {
     let Some(r) = req.veda.filter(|r| r.enabled) else {
         return Ok(None);
     };
@@ -467,7 +583,7 @@ pub fn for_video_request_with_patch(
         128,
         req.count.max(1) as usize,
         2,
-        Limits::for_backend(backend),
+        limits,
     )
     .map(Some)
 }
@@ -1005,6 +1121,107 @@ mod tests {
             assert_eq!(b.plan_grid, fixture_choice([37, 24, 42]));
             assert_eq!(b.plan, frozen_plan([37, 24, 42]).unwrap().name);
         }
+    }
+    #[test]
+    fn cuda_pool_boundaries_are_independent_and_phases_are_alternatives() {
+        let mut r = req();
+        r.frames = Some(345);
+        let b = for_request(&r, Backend::Cuda).unwrap().unwrap();
+        let host = b.host_peak_bytes();
+        let device = b.device_peak_bytes();
+        let reserve = 1 << 30;
+        assert!(b.fits_pools(host, device + reserve, reserve));
+        assert!(!b.fits_pools(host - 1, device + reserve, reserve));
+        assert!(!b.fits_pools(host, device + reserve - 1, reserve));
+        assert!(!b.fits_pools(u64::MAX, u64::MAX, u64::MAX));
+        assert_eq!(
+            b.lifetimes.predictor_load.device, 0,
+            "predictor decode is host-only"
+        );
+        assert!(b.lifetimes.predictor_load.host >= b.predictor_host_bytes + b.predictor_load_bytes);
+        assert!(
+            device < b.total_bytes,
+            "host and successive phases are not incremental VRAM"
+        );
+        assert_eq!(
+            device,
+            b.lifetimes.phases().iter().map(|p| p.device).max().unwrap()
+        );
+        assert_eq!(b.incremental_device_peak_bytes(0).unwrap(), device);
+        let shared = b.input_qkv_bytes;
+        let incremental = b.incremental_device_peak_bytes(shared).unwrap();
+        assert_eq!(
+            incremental + shared,
+            device,
+            "caller QKV is credited once per overlapping phase"
+        );
+        assert_eq!(
+            b.incremental_device_peak_bytes(u64::MAX).unwrap(),
+            incremental,
+            "unproven weights/output credit cannot reduce the bound"
+        );
+    }
+
+    #[test]
+    fn constrained_materializing_fallback_prices_the_runtime_score_domain() {
+        let r = req();
+        let default = for_request(&r, Backend::Cuda).unwrap().unwrap();
+        let small = for_video_request_with_patch_and_limits(
+            Request::from(&r),
+            Backend::Cuda,
+            STOCK_PATCH,
+            Limits {
+                attention: 16 * (CUDA_DENSE_SCORE_ELEMENTS / 2),
+                ..Limits::for_backend(Backend::Cuda)
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(small.dense_fallback_bytes < default.dense_fallback_bytes);
+        let refused = for_video_request_with_patch_and_limits(
+            Request::from(&r),
+            Backend::Cuda,
+            STOCK_PATCH,
+            Limits {
+                attention: 1,
+                ..Limits::for_backend(Backend::Cuda)
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("minimum dense attention row"));
+        let mlx = for_request(&r, Backend::Mlx).unwrap().unwrap();
+        assert_eq!(mlx.unified_peak_bytes(), mlx.total_bytes);
+        assert_eq!(
+            mlx.device_peak_bytes(),
+            mlx.total_bytes,
+            "CUDA pool separation cannot remove MLX's shared physical memory"
+        );
+    }
+
+    #[test]
+    fn unknown_and_overflowing_raw_allocation_facts_are_not_zero() {
+        let malformed = LayoutSize {
+            seq: usize::MAX,
+            slots: usize::MAX,
+            video: 1,
+            reference: 0,
+            ref_tokens: 0,
+            target_tokens: 1,
+        };
+        assert!(chunk(
+            malformed,
+            1,
+            128,
+            2,
+            Backend::Cuda,
+            req().veda.as_ref().unwrap(),
+            Limits::default()
+        )
+        .is_err());
+        let mut b = for_request(&req(), Backend::Cuda).unwrap().unwrap();
+        b.lifetimes.sparse.shared_device = b.lifetimes.sparse.device + 1;
+        assert!(b.incremental_device_peak_bytes(1).is_err());
     }
     #[test]
     fn cuda_cold_envelope_prices_every_control_budget_and_forced_fallback() {

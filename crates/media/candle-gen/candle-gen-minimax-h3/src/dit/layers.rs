@@ -167,6 +167,17 @@ pub struct LinearNoBias {
 }
 
 impl LinearNoBias {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.inner = self.inner.copy_to_device(device)?;
+        // `adapters` is the inspection record; its factors already live in `inner`.
+        // Keep the record host-backed instead of uploading a second executable copy.
+        for residual in &mut copy.lokr_adapters {
+            residual.factors = residual.factors.to_device(device)?;
+        }
+        Ok(copy)
+    }
+
     /// Load `{prefix}` — **packed** when `{prefix}.scales` is present, else dense at `dtype`.
     pub fn from_weights(w: &Weights, prefix: &str, dtype: DType) -> Result<Self> {
         let loaded = crate::quant::lin(w, crate::quant::DIT, prefix, false, dtype)?;
@@ -366,6 +377,17 @@ pub struct DitAttention {
 }
 
 impl DitAttention {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.to_q = copy.to_q.copy_to_device(device)?;
+        copy.to_k = copy.to_k.copy_to_device(device)?;
+        copy.to_v = copy.to_v.copy_to_device(device)?;
+        copy.to_out = copy.to_out.copy_to_device(device)?;
+        copy.norm_q = copy.norm_q.to_device(device)?;
+        copy.norm_k = copy.norm_k.to_device(device)?;
+        Ok(copy)
+    }
+
     /// Load `{prefix}` (e.g. `transformer_blocks.0.attn`).
     pub fn from_weights(
         w: &Weights,
@@ -481,16 +503,20 @@ impl DitAttention {
         // The published checkpoint ships `to_q`/`to_k`/`to_v` already split, so this applies NO
         // fused-QKV transform. See `crate::dit::qkv` for which transform produced them and why
         // that must be asserted rather than assumed.
-        let q = self.to_q.forward(x)?.reshape((b, seq, h, d))?;
-        let k = self.to_k.forward(x)?.reshape((b, seq, h, d))?;
-        let v = self.to_v.forward(x)?.reshape((b, seq, h, d))?;
+        let (q, k, v) = {
+            let q = self.to_q.forward(x)?.reshape((b, seq, h, d))?;
+            let k = self.to_k.forward(x)?.reshape((b, seq, h, d))?;
+            let v = self.to_v.forward(x)?.reshape((b, seq, h, d))?;
 
-        // qk-norm first, rotary second.
-        let q = rms_weighted(&q, &self.norm_q, self.qk_norm_eps)?;
-        let k = rms_weighted(&k, &self.norm_k, self.qk_norm_eps)?;
-        let (q, k) = match rope {
-            Some((rope, tables)) => (rope.apply(&q, tables)?, rope.apply(&k, tables)?),
-            None => (q, k),
+            // End the projection/norm/rope lifetime before SDPA: shadowed tensor handles
+            // otherwise keep their backing allocations alive through the entire attention.
+            let q = rms_weighted(&q, &self.norm_q, self.qk_norm_eps)?;
+            let k = rms_weighted(&k, &self.norm_k, self.qk_norm_eps)?;
+            let (q, k) = match rope {
+                Some((rope, tables)) => (rope.apply(&q, tables)?, rope.apply(&k, tables)?),
+                None => (q, k),
+            };
+            (q, k, v)
         };
 
         // MiniMax-H3 packs one request into a single attention document: no mask, not causal —
@@ -507,14 +533,9 @@ impl DitAttention {
         let vh = v.transpose(1, 2)?;
         let scale = 1.0 / (d as f64).sqrt();
         let out = match veda {
-            Some((runtime, layer, step)) => runtime.attention(
-                layer,
-                step,
-                &qh.contiguous()?,
-                &kh.contiguous()?,
-                &vh.contiguous()?,
-                scale,
-            )?,
+            Some((runtime, layer, step)) => {
+                runtime.attention_with_cancel(layer, step, &qh, &kh, &vh, scale, cancel)?
+            }
             None => sdpa_planned(&qh, &kh, &vh, scale, cancel)?,
         };
 
@@ -570,6 +591,13 @@ pub struct DitFeedForward {
 }
 
 impl DitFeedForward {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.proj = copy.proj.copy_to_device(device)?;
+        copy.out = copy.out.copy_to_device(device)?;
+        Ok(copy)
+    }
+
     /// Load `{prefix}` (e.g. `transformer_blocks.0.ff`).
     pub fn from_weights(w: &Weights, prefix: &str, dtype: DType) -> Result<Self> {
         Ok(Self {
@@ -615,10 +643,7 @@ impl DitFeedForward {
     /// the module doc for why the token axis is the exact split and why the equivalence is
     /// tolerance-level rather than bitwise.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.forward_budgeted(
-            x,
-            AttentionBudget::from_score_elements(FFN_INTERMEDIATE_BUDGET, false),
-        )
+        self.forward_budgeted(x, crate::nn::attention_budget())
     }
 
     /// [`Self::forward`] at an explicit budget.
@@ -696,6 +721,12 @@ pub struct RmsNorm {
 }
 
 impl RmsNorm {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.weight = copy.weight.to_device(device)?;
+        Ok(copy)
+    }
+
     /// Load `{prefix}.weight` at `dtype`.
     pub fn from_weights(w: &Weights, prefix: &str, eps: f64, dtype: DType) -> Result<Self> {
         Ok(Self {

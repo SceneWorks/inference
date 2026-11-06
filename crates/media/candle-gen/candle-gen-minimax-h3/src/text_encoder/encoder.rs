@@ -27,8 +27,8 @@
 //! # This lane materializes attention scores; MLX's does not
 //!
 //! MLX calls a fused `scaled_dot_product_attention` that streams the scores. candle has no such
-//! kernel, so attention routes through `candle_gen::sdpa_budgeted_bhsd` with the shared
-//! `ATTN_SCORES_BUDGET`. At **64 heads** the `[1, 64, S, S]` score tensor crosses `i32::MAX` at
+//! masked kernel, so attention routes through `crate::nn::sdpa_masked` and the shared
+//! materializing attention plan. At **64 heads** the `[1, 64, S, S]` score tensor crosses `i32::MAX` at
 //! S ≈ 5793 — well inside the presentation lengths a long `fl2va` prompt with two keyframe vision
 //! blocks can reach — so the budgeted split is load-bearing here, not a precaution.
 
@@ -73,6 +73,12 @@ struct Proj {
 }
 
 impl Proj {
+    fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.inner = self.inner.copy_to_device(device)?;
+        Ok(copy)
+    }
+
     /// Load `{key}` — **packed** when `{key}.scales` is present, else dense at `dtype`.
     fn load(w: &Weights, key: &str, dtype: DType) -> Result<Self> {
         let loaded = crate::quant::lin(w, crate::quant::TEXT_ENCODER, key, false, dtype)?;
@@ -111,6 +117,7 @@ impl Proj {
 
 /// GQA self-attention: 64 query / 8 kv heads, bias-less q/k/v/o, per-head q/k RMSNorm on the head
 /// dim **before** RoPE, HF half-split RoPE, masked SDPA.
+#[derive(Clone)]
 struct Qwen3Attention {
     q_proj: Proj,
     k_proj: Proj,
@@ -125,6 +132,17 @@ struct Qwen3Attention {
 }
 
 impl Qwen3Attention {
+    fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.q_proj = copy.q_proj.copy_to_device(device)?;
+        copy.k_proj = copy.k_proj.copy_to_device(device)?;
+        copy.v_proj = copy.v_proj.copy_to_device(device)?;
+        copy.o_proj = copy.o_proj.copy_to_device(device)?;
+        copy.q_norm = copy.q_norm.to_device(device)?;
+        copy.k_norm = copy.k_norm.to_device(device)?;
+        Ok(copy)
+    }
+
     fn load(w: &Weights, prefix: &str, cfg: &MiniMaxH3TeConfig, dtype: DType) -> Result<Self> {
         // The q/k norms are `[head_dim]` vectors, ~0.5 KB each. Kept f32 so `rms_weighted` runs
         // f32-on-f32 whatever the projection store is — bit-identical to an all-f32 load.
@@ -195,15 +213,7 @@ impl Qwen3Attention {
         let v = repeat_kv(&v, groups)?;
 
         let scale = (hd as f64).powf(-0.5);
-        let o = candle_gen::sdpa_budgeted_bhsd(
-            &q,
-            &k,
-            &v,
-            scale,
-            Some(mask),
-            candle_gen::candle_nn::ops::softmax_last_dim,
-            candle_gen::ATTN_SCORES_BUDGET,
-        )?;
+        let o = crate::nn::sdpa_masked(&q, &k, &v, scale, mask)?;
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
         self.o_proj.forward(&o)
     }
@@ -211,6 +221,7 @@ impl Qwen3Attention {
 
 /// Qwen3 SwiGLU feed-forward: `down(silu(gate(x)) * up(x))`, bias-less. FFN width 25600 over a
 /// 5120 hidden — the widest single tensor in the encoder.
+#[derive(Clone)]
 struct Qwen3Mlp {
     gate: Proj,
     up: Proj,
@@ -218,6 +229,14 @@ struct Qwen3Mlp {
 }
 
 impl Qwen3Mlp {
+    fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.gate = copy.gate.copy_to_device(device)?;
+        copy.up = copy.up.copy_to_device(device)?;
+        copy.down = copy.down.copy_to_device(device)?;
+        Ok(copy)
+    }
+
     fn load(w: &Weights, prefix: &str, dtype: DType) -> Result<Self> {
         Ok(Self {
             gate: Proj::load(w, &format!("{prefix}.gate_proj"), dtype)?,
@@ -231,13 +250,34 @@ impl Qwen3Mlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let g = silu(&self.gate.forward(x)?)?;
-        let u = self.up.forward(x)?;
-        self.down.forward(&(g * u)?)
+        let width = self.gate.inner.out_features();
+        let shape = x.dims();
+        let axis = shape.len() - 2;
+        let leading: usize = shape[..axis].iter().product();
+        let budget = crate::nn::attention_budget();
+        let rows =
+            budget.query_block_rows((leading * width * 2) as u64, shape[axis] as u64) as usize;
+        let span = |x: &Tensor| -> Result<Tensor> {
+            let g = silu(&self.gate.forward(x)?)?;
+            let u = self.up.forward(x)?;
+            self.down.forward(&(g * u)?)
+        };
+        if rows >= shape[axis] {
+            return span(x);
+        }
+        let mut outputs = Vec::new();
+        for start in (0..shape[axis]).step_by(rows.max(1)) {
+            outputs.push(span(
+                &x.narrow(axis, start, rows.min(shape[axis] - start))?
+                    .contiguous()?,
+            )?);
+        }
+        Ok(Tensor::cat(&outputs, axis)?)
     }
 }
 
 /// Qwen3 decoder block (pre-norm residual): `h += attn(input_ln(h))`, then `h += mlp(post_ln(h))`.
+#[derive(Clone)]
 struct Qwen3DecoderLayer {
     input_ln: Tensor,
     post_ln: Tensor,
@@ -247,6 +287,15 @@ struct Qwen3DecoderLayer {
 }
 
 impl Qwen3DecoderLayer {
+    fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.input_ln = copy.input_ln.to_device(device)?;
+        copy.post_ln = copy.post_ln.to_device(device)?;
+        copy.attn = copy.attn.copy_to_device(device)?;
+        copy.mlp = copy.mlp.copy_to_device(device)?;
+        Ok(copy)
+    }
+
     fn load(w: &Weights, prefix: &str, cfg: &MiniMaxH3TeConfig, dtype: DType) -> Result<Self> {
         // Both layer norms are `TE_DENSE_BY_POLICY` entries read through a raw `require` — guarded
         // for the same reason the q/k norms above are.
@@ -306,6 +355,63 @@ pub struct MiniMaxH3TextEncoder {
 }
 
 impl MiniMaxH3TextEncoder {
+    /// The complete prepared stack is host-resident. Only the current window is copied.
+    pub(crate) fn prepare_streamed(
+        &mut self,
+        cfg: &MiniMaxH3TeConfig,
+        device: &candle_gen::candle_core::Device,
+    ) -> Result<()> {
+        self.rotary = Rotary::new(cfg.head_dim, cfg.rope_theta, MAX_TEXT_POSITIONS, device)?;
+        Ok(())
+    }
+
+    fn run_layers(
+        &self,
+        hidden: Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: &Tensor,
+        mut after: impl FnMut(usize, Tensor) -> Result<Tensor>,
+    ) -> Result<Tensor> {
+        let policy = crate::block_stream::current();
+        let mut apply = |mut hidden: Tensor, range: std::ops::Range<usize>| -> Result<Tensor> {
+            for index in range {
+                if let Some(policy) = &policy {
+                    if policy.cancel.is_cancelled() {
+                        return Err(CandleError::Canceled);
+                    }
+                }
+                let transferred;
+                let layer = if policy.is_some() {
+                    transferred = self.layers[index].copy_to_device(hidden.device())?;
+                    tracing::trace!(event="h3_transformer_window_materialized", component="text_encoder",
+                        first_block=index, block_count=1, base_bytes=transferred.nbytes(),
+                        device=?hidden.device().location(), "Materialized prepared text encoder window");
+                    &transferred
+                } else {
+                    &self.layers[index]
+                };
+                hidden = layer.forward(&hidden, cos, sin, mask)?;
+                hidden = after(index, hidden)?;
+            }
+            Ok(hidden)
+        };
+        if let Some(policy) = &policy {
+            let device = hidden.device().clone();
+            let plan = candle_gen::block_window::BlockPlan::new(self.layers.len(), policy.window)?;
+            candle_gen::block_window::run_windowed(
+                &device,
+                &plan,
+                &policy.cancel,
+                hidden,
+                || Ok(()),
+                |hidden, _, range| apply(hidden, range),
+            )
+        } else {
+            apply(hidden, 0..self.layers.len())
+        }
+    }
+
     /// Load from the `text_encoder` weights under `prefix` (normally
     /// [`LM_PREFIX`](super::LM_PREFIX) = `"model.language_model"`):
     /// `{prefix}.embed_tokens.weight` and `{prefix}.layers.{i}.…` for `i` in `0..select_hidden`.
@@ -446,11 +552,8 @@ impl MiniMaxH3TextEncoder {
         }
         let (cos, sin) = self.rotary.text(s)?;
         let mask = self.mask(attention_mask, b, s)?;
-        let mut hidden = self.embed(input_ids)?;
-        for layer in &self.layers {
-            hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
-        }
-        Ok(hidden)
+        let hidden = self.embed(input_ids)?;
+        self.run_layers(hidden, &cos, &sin, &mask, |_, hidden| Ok(hidden))
     }
 
     /// **Vision-grounded** conditioning (the `fl2va` image path): run the encoder with each
@@ -578,8 +681,7 @@ impl MiniMaxH3TextEncoder {
         )?;
         let mask = self.mask(attention_mask, b, s)?;
 
-        for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
+        hidden = self.run_layers(hidden, &cos, &sin, &mask, |i, mut hidden| {
             for (k, &(start, len)) in blocks.iter().enumerate() {
                 if i < deepstack[k].len() {
                     let ds = deepstack[k][i].unsqueeze(0)?.to_dtype(hidden.dtype())?;
@@ -587,7 +689,8 @@ impl MiniMaxH3TextEncoder {
                     hidden = replace_seq(&hidden, &mid, start, start + len, s)?;
                 }
             }
-        }
+            Ok(hidden)
+        })?;
         debug_assert_eq!(self.layers.len(), self.out_layer + 1);
         Ok(hidden)
     }
@@ -601,7 +704,22 @@ impl MiniMaxH3TextEncoder {
     fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
         let (b, s) = input_ids.dims2()?;
         let flat = input_ids.reshape(b * s)?.to_dtype(DType::U32)?;
-        let rows = self.embed_tokens.embedding.forward(&flat)?;
+        // A streamed dense token table stays on the host too: gather only selected rows
+        // before uploading. Packed embeddings already implement bounded host-row lookup.
+        let lookup = if crate::block_stream::current().is_some()
+            && matches!(
+                &self.embed_tokens.embedding,
+                candle_gen::quant::QEmbedding::Dense(_)
+            ) {
+            flat.to_device(&candle_gen::candle_core::Device::Cpu)?
+        } else {
+            flat
+        };
+        let rows = self
+            .embed_tokens
+            .embedding
+            .forward(&lookup)?
+            .to_device(input_ids.device())?;
         let hidden = self.embed_tokens.hidden;
         Ok(rows.reshape((b, s, hidden))?.to_dtype(TE_COMPUTE_DTYPE)?)
     }
@@ -984,6 +1102,34 @@ mod tests {
     #[test]
     #[ignore = "model inference; explicit model workflow only"]
     fn the_packed_te_forward_matches_its_dense_grid() {
+        let forced_materialized = std::env::var("SCENEWORKS_H3_ATTENTION_ROUTE")
+            .ok()
+            .as_deref()
+            == Some("materialized");
+        crate::nn::reset_attention_execution_report();
+        let device = match std::env::var("SCENEWORKS_H3_STREAM_PROOF_DEVICE")
+            .ok()
+            .as_deref()
+        {
+            None => Device::Cpu,
+            Some("cuda:0") => {
+                Device::new_cuda(0).expect("explicit CUDA proof requires logical GPU0")
+            }
+            Some(other) => panic!("unsupported explicit H3 proof device: {other}"),
+        };
+        fn on_device(weights: &Weights, device: &Device) -> Weights {
+            Weights::from_map(
+                weights
+                    .keys()
+                    .map(|key| {
+                        (
+                            key.clone(),
+                            weights.require(key).unwrap().to_device(device).unwrap(),
+                        )
+                    })
+                    .collect(),
+            )
+        }
         let cfg = packable_cfg();
         let (packed_w, grids) = packable_weights(&cfg, true);
 
@@ -1002,13 +1148,25 @@ mod tests {
         }
         let dense_w = Weights::from_map(dense_map);
 
-        let packed = MiniMaxH3TextEncoder::from_weights(&packed_w, "lm", &cfg, DType::F32).unwrap();
-        let dense = MiniMaxH3TextEncoder::from_weights(&dense_w, "lm", &cfg, DType::F32).unwrap();
+        let packed = MiniMaxH3TextEncoder::from_weights(
+            &on_device(&packed_w, &device),
+            "lm",
+            &cfg,
+            DType::F32,
+        )
+        .unwrap();
+        let dense = MiniMaxH3TextEncoder::from_weights(
+            &on_device(&dense_w, &device),
+            "lm",
+            &cfg,
+            DType::F32,
+        )
+        .unwrap();
         assert!(packed.embed_tokens.embedding.is_quantized());
         assert!(!dense.embed_tokens.embedding.is_quantized());
 
-        let tokens = ids(&[1, 4, 9, 2, 11]);
-        let mask = ones_mask(5);
+        let tokens = ids(&[1, 4, 9, 2, 11]).to_device(&device).unwrap();
+        let mask = ones_mask(5).to_device(&device).unwrap();
         let got = packed.forward(&tokens, &mask).unwrap();
         let want = dense.forward(&tokens, &mask).unwrap();
         let drift = candle_gen::testkit::tensor_peak_rel_or_abs(&got, &want);
@@ -1017,6 +1175,53 @@ mod tests {
             drift < 5e-3,
             "the Q4_1 repack is lossless up to the f16 scale/bias cast; got {drift:.3e}"
         );
+
+        // Fresh host-prepared stacks ensure this comparison exercises actual H2D windows.
+        let mut packed =
+            MiniMaxH3TextEncoder::from_weights(&packed_w, "lm", &cfg, DType::F32).unwrap();
+        let mut dense =
+            MiniMaxH3TextEncoder::from_weights(&dense_w, "lm", &cfg, DType::F32).unwrap();
+        let request = crate::block_stream::tests::request();
+        let guard = crate::block_stream::RequestGuard::enter(
+            &request,
+            candle_gen::gen_core::LoadShape::DeferredMaterialization,
+            &device,
+        )
+        .unwrap();
+        packed.prepare_streamed(&cfg, &device).unwrap();
+        dense.prepare_streamed(&cfg, &device).unwrap();
+        for (encoder, resident) in [(&packed, &got), (&dense, &want)] {
+            let output = encoder.forward(&tokens, &mask).unwrap();
+            assert!(candle_gen::testkit::tensor_peak_rel_or_abs(&output, resident) <= 1e-5);
+            let hidden = encoder.embed(&tokens).unwrap();
+            let (cos, sin) = encoder.rotary.text(5).unwrap();
+            let attention = encoder.mask(&mask, 1, 5).unwrap();
+            let failed = encoder.run_layers(hidden, &cos, &sin, &attention, |_, _| {
+                Err(CandleError::Msg("injected post-layer failure".into()))
+            });
+            assert!(failed.unwrap_err().to_string().contains("injected"));
+            let recovered = encoder.forward(&tokens, &mask).unwrap();
+            assert!(candle_gen::testkit::tensor_peak_rel_or_abs(&recovered, resident) <= 1e-5);
+        }
+        drop(guard);
+        assert!(crate::block_stream::current().is_none());
+
+        if forced_materialized {
+            let report = crate::nn::attention_execution_report();
+            assert!(
+                report.materialized_calls > 0,
+                "materializing route must execute"
+            );
+            assert_eq!(
+                report.flash_calls, 0,
+                "forced materializing route cannot dispatch fused attention"
+            );
+            assert!(
+                report.maximum_materialized_score_elements
+                    <= candle_gen::gen_core::veda::workspace::CUDA_DENSE_SCORE_ELEMENTS
+            );
+            println!("H3_MATERIALIZED_ATTENTION_PROOF {report:?}");
+        }
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED text_encoder::encoder::tests::the_packed_te_forward_matches_its_dense_grid");

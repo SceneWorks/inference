@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub mod cudnn;
 mod device;
 mod error;
+pub mod proof_pool;
 mod utils;
 pub use device::{CudaDevice, DeviceId};
 pub use error::{CudaError, WrapErr};
@@ -2238,6 +2239,7 @@ impl BackendStorage for CudaStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
+        proof_pool::bind_cublas_workspace(&self.device.cuda_stream(), &self.device.blas)?;
         let elem_count = b * m * n;
         let dev = &self.device;
         let slice = match (&self.slice, &rhs.slice) {

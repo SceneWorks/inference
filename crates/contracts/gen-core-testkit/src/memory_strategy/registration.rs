@@ -91,13 +91,6 @@ pub(super) fn check_memory_registration(
     let Some(routes) = contract.pid_decode_routes.as_ref() else {
         return;
     };
-    let Some(_) = contract.calibration.as_ref() else {
-        errors.push(format!(
-            "{}: PiD route conformance needs a calibration identity for a valid admission probe",
-            registration.provider_id
-        ));
-        return;
-    };
     let Some(behavior) = behavior else {
         errors.push(format!(
             "{}: decode-route conformance needs provider-owned behavior fixtures",
@@ -258,6 +251,9 @@ pub(super) fn check_behavior_fixture(
         return;
     }
 
+    // Measured admission binds its identity. Providers own any structural-estimate wire
+    // convention, including materialization shape; these probes exercise their declared
+    // admission callbacks rather than imposing a new rule on the shared safety pipeline.
     let mut mutated_abi = fixture.context.clone();
     mutated_abi.calibration_abi = mutated_abi.calibration_abi.wrapping_add(1);
     if matches!(
@@ -292,7 +288,19 @@ pub(super) fn check_behavior_fixture(
         MemorySafetyDecision::Accept
     ) {
         errors.push(format!(
-            "{}: {strategy:?} safety check is blind to mutated calibration load shape",
+            "{}: {strategy:?} safety check is blind to mutated materialization load shape",
+            registration.provider_id
+        ));
+    }
+
+    let mut unauthorized = fixture.context.clone();
+    unauthorized.optimization_authority = gen_core::MemoryOptimizationAuthority::Resident;
+    if matches!(
+        (registration.safety_check)(fixture_spec, contract, &unauthorized),
+        MemorySafetyDecision::Accept
+    ) {
+        errors.push(format!(
+            "{}: {strategy:?} safety check accepts optimized execution without authority",
             registration.provider_id
         ));
     }
