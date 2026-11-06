@@ -1330,8 +1330,11 @@ mod veda_controls_tests {
         )
         .unwrap()
         .expect("the native projection has a structured LoKr factorization");
-        projection.push_lokr_structured(lokr).unwrap();
-        assert_eq!(projection.adapters().len(), 3);
+        let before_lokr = projection.nbytes();
+        let lokr_bytes = lokr.nbytes();
+        projection.push_lokr(lokr, false, 0.125);
+        assert_eq!(projection.nbytes(), before_lokr + lokr_bytes);
+        assert_eq!(projection.adapters().len(), 2);
         if streamed {
             dit.prepare_streamed(&device, 1).unwrap();
         }
