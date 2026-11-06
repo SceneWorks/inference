@@ -291,10 +291,15 @@ the pool or resets its watermarks. Non-OOM and observation/trim/retry errors pro
 stream synchronization: pending frees can remain outstanding and cause refusal,
 without invalidating capture on another stream.
 
-The ignored 512 MiB allocator proof must exercise a real recovered cross-stream OOM
-and over-cap refusal. Its temporary reuse/retention attributes are restored before
-assertions. This establishes the allocator mechanism, not an actual 24 GiB model fit
-or a physical smaller-GPU performance claim; those require dedicated validation.
+The ignored 512 MiB allocator proof validates actual cap enforcement, over-cap
+refusal, both device constructors and explicit cuBLAS workspace rebinding. It reports
+the actual successful recovery count and whether that count is positive, including
+zero/false when the driver directly satisfies allocations. It does not promise to
+force fragmentation: allocator reuse attributes do not guarantee a recoverable OOM.
+The exact retry policy has CPU-only fake-callback controls; a zero runtime count
+provides no successful-retry evidence. Actual bounded full-model anchors establish
+model fit and any naturally exercised recovery through pre-cleanup diagnostics.
+Neither proof establishes physical smaller-GPU performance.
 See NVIDIA CUDA 12.9 `cuMemPoolTrimTo`: asynchronously freed storage can remain
 outstanding until synchronization, and live backing cannot be released.
 

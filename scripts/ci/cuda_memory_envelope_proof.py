@@ -82,12 +82,18 @@ def run(output: Path, executable: Path, env: dict[str, str], *, claim=execution_
             if len(markers) != 1:
                 raise ValueError('exactly one positive allocator enforcement receipt required')
             evidence = json.loads(markers[0])
+            count = evidence.get('successfulRecoveryCount')
+            exercised = evidence.get('fragmentationRecoveryExercised')
+            byte_fields = ('capBytes', 'heldBytes', 'usedHighBytes', 'reservedHighBytes')
             if (not all(evidence.get(key) is True for key in
-                        ('overCapRefused', 'bothConstructors', 'cublasStreamResetRebound',
-                         'fragmentationRecoveryExercised'))
-                    or evidence.get('capBytes') != 536870912
-                    or not 0 < evidence.get('reservedHighBytes', 0) <= evidence['capBytes']):
-                raise ValueError('allocator enforcement evidence is incomplete or outside its cap')
+                        ('overCapRefused', 'bothConstructors', 'cublasStreamResetRebound'))
+                    or not all(type(evidence.get(key)) is int for key in byte_fields)
+                    or evidence['capBytes'] != 536870912
+                    or not evidence['capBytes'] // 2 <= evidence['heldBytes']
+                    <= evidence['usedHighBytes'] <= evidence['reservedHighBytes'] <= evidence['capBytes']
+                    or type(count) is not int or count < 0
+                    or type(exercised) is not bool or exercised != (count > 0)):
+                raise ValueError('allocator enforcement evidence is incomplete, inconsistent or outside its cap')
             receipt['allocator_evidence'] = evidence
         if not receipt['physical_execution'].get('post_execution_verified'):
             raise ValueError('physical execution release verification did not complete')

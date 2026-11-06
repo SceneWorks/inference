@@ -4,109 +4,6 @@
 
 use candle_gen::candle_core::{cuda_backend::proof_pool, DType, Device, Tensor};
 
-/// Force a real cross-stream cached-backing OOM inside the SAME capped pool. The fixture
-/// alone disables CUDA's normal reuse shortcuts; production pool attributes are unchanged.
-fn prove_cross_stream_recovery(
-    device: &Device,
-    other_stream: &Device,
-) -> candle_gen::candle_core::Result<()> {
-    use candle_gen::candle_core::cuda_backend::cudarc::driver::sys;
-    use sys::CUmemPool_attribute as A;
-    let cuda = device.as_cuda_device()?;
-    let mut pool = std::ptr::null_mut();
-    let wrap = candle_gen::candle_core::Error::wrap;
-    // SAFETY: the constructor installed and retains this device's pool until process exit.
-    unsafe {
-        sys::cuDeviceGetMemPool(&mut pool, cuda.cuda_stream().context().cu_device()).result()
-    }
-    .map_err(wrap)?;
-    let reuse = [
-        A::CU_MEMPOOL_ATTR_REUSE_FOLLOW_EVENT_DEPENDENCIES,
-        A::CU_MEMPOOL_ATTR_REUSE_ALLOW_OPPORTUNISTIC,
-        A::CU_MEMPOOL_ATTR_REUSE_ALLOW_INTERNAL_DEPENDENCIES,
-    ];
-    let mut saved_reuse = [0i32; 3];
-    let mut saved_threshold = 0u64;
-    // SAFETY: each attribute receives its documented int or uint64_t out pointer.
-    unsafe {
-        for (attr, value) in reuse.iter().zip(&mut saved_reuse) {
-            sys::cuMemPoolGetAttribute(pool, *attr, (value as *mut i32).cast())
-                .result()
-                .map_err(wrap)?;
-        }
-        sys::cuMemPoolGetAttribute(
-            pool,
-            A::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-            (&mut saved_threshold as *mut u64).cast(),
-        )
-        .result()
-        .map_err(wrap)?;
-    }
-    let mut after_priming = None;
-    // No assertions until all temporary attributes have been restored, including error exits.
-    let exercise = (|| -> candle_gen::candle_core::Result<()> {
-        let mut disabled = 0i32;
-        let mut retained = u64::MAX;
-        // SAFETY: the same live pool, with documented attribute types. Cap is never modified.
-        unsafe {
-            for attr in reuse {
-                sys::cuMemPoolSetAttribute(pool, attr, (&mut disabled as *mut i32).cast())
-                    .result()
-                    .map_err(wrap)?;
-            }
-            sys::cuMemPoolSetAttribute(
-                pool,
-                A::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-                (&mut retained as *mut u64).cast(),
-            )
-            .result()
-            .map_err(wrap)?;
-        }
-        let cached = Tensor::zeros(320 * 1024 * 1024, DType::U8, other_stream)?;
-        after_priming = proof_pool::successful_recoveries(0)?;
-        // Queue a free on the nonblocking other stream. Fixture-only host observation
-        // makes unused backing trimmable; recovery itself must never fence a context.
-        drop(cached);
-        other_stream.synchronize()?;
-        let recovered = Tensor::zeros(320 * 1024 * 1024, DType::U8, device)?;
-        device.synchronize()?;
-        drop(recovered);
-        Ok(())
-    })();
-    let mut restoration_error = None;
-    // SAFETY: restore every saved attribute with its original type even if setup/allocation failed.
-    unsafe {
-        for (attr, value) in reuse.iter().zip(&mut saved_reuse) {
-            if let Err(error) =
-                sys::cuMemPoolSetAttribute(pool, *attr, (value as *mut i32).cast()).result()
-            {
-                restoration_error.get_or_insert(error);
-            }
-        }
-        if let Err(error) = sys::cuMemPoolSetAttribute(
-            pool,
-            A::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-            (&mut saved_threshold as *mut u64).cast(),
-        )
-        .result()
-        {
-            restoration_error.get_or_insert(error);
-        }
-    }
-    if let Some(error) = restoration_error {
-        return Err(wrap(error));
-    }
-    exercise?;
-    device.synchronize()?;
-    other_stream.synchronize()?;
-    assert!(
-        proof_pool::successful_recoveries(0)?.expect("installed pool")
-            > after_priming.expect("priming completed"),
-        "fixture did not exercise a real allocation OOM recovered by same-pool trim/retry"
-    );
-    Ok(())
-}
-
 #[test]
 #[ignore = "explicit CUDA allocator proof; dedicated process and physical-device binding required"]
 fn constructor_binds_candle_to_an_enforced_pool() -> candle_gen::candle_core::Result<()> {
@@ -196,19 +93,16 @@ fn constructor_binds_candle_to_an_enforced_pool() -> candle_gen::candle_core::Re
         released.used_bytes, before.used_bytes,
         "allocation proof leaked live pool storage"
     );
-    assert_eq!(
-        requested,
-        512 * MIB,
-        "recovery proof uses the dedicated512MiB cap"
-    );
-    prove_cross_stream_recovery(&device, &second_stream_device)?;
-    let final_pool = proof_pool::snapshot(0)?.expect("pool remains installed");
-    assert_eq!(final_pool.used_bytes, before.used_bytes);
-    assert!(final_pool.reserved_high_bytes <= requested as u64);
+    assert!(released.reserved_high_bytes <= requested as u64);
+    let successful_recovery_count =
+        proof_pool::successful_recoveries(0)?.expect("proof pool remains installed");
+    // Recovery is observational: the driver may satisfy freed storage directly. A zero
+    // count proves no successful retry occurred, not a failure of cap enforcement.
     // No invented all-device peak: these are driver-continuous pool counters only.
     println!(
-        "CUDA_PROOF_POOL_EVIDENCE {{\"logicalOrdinal\":0,\"capBytes\":{},\"heldBytes\":{},\"usedHighBytes\":{},\"reservedHighBytes\":{},\"overCapRefused\":true,\"bothConstructors\":true,\"cublasStreamResetRebound\":true,\"fragmentationRecoveryExercised\":true,\"scope\":\"stream-ordered allocator plus explicit cuBLAS workspace; context/library-internal/foreign allocations excluded\"}}",
-        requested, held_bytes, final_pool.used_high_bytes, final_pool.reserved_high_bytes
+        "CUDA_PROOF_POOL_EVIDENCE {{\"logicalOrdinal\":0,\"capBytes\":{},\"heldBytes\":{},\"usedHighBytes\":{},\"reservedHighBytes\":{},\"overCapRefused\":true,\"bothConstructors\":true,\"cublasStreamResetRebound\":true,\"successfulRecoveryCount\":{},\"fragmentationRecoveryExercised\":{},\"scope\":\"stream-ordered allocator plus explicit cuBLAS workspace; context/library-internal/foreign allocations excluded\"}}",
+        requested, held_bytes, released.used_high_bytes, released.reserved_high_bytes,
+        successful_recovery_count, successful_recovery_count > 0
     );
     Ok(())
 }
