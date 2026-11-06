@@ -310877,7 +310877,7 @@
             "candle-gen::Weights::from_files_filtered"
           ],
           "minimum_collections": 1,
-          "minimum_items": 1,
+          "minimum_items": 14,
           "required_grade": "reader-binding",
           "scope": "case"
         },
@@ -310893,14 +310893,88 @@
           "scope": "case"
         },
         {
-          "slot": "actual-canonical-turbo",
+          "slot": "actual-turbo-loader-binding",
           "role": "artifact-input",
           "readers": [
             "crates/media/candle-gen/candle-gen/src/train/merge.rs::read_adapter_capped::std::fs::read@8751"
           ],
           "minimum_collections": 1,
           "minimum_items": 1,
-          "required_grade": "content",
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "actual-shard-mmaps",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::new"
+          ],
+          "minimum_collections": 14,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "actual-source-header-inventory",
+          "role": "configuration",
+          "readers": [
+            "gen-core::weightsmeta::file_tensor_locations_impl"
+          ],
+          "minimum_collections": 14,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "verified-complete-shards",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen-minimax-h3::residency_component::verified-shards"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 14,
+          "required_grade": "validated-content",
+          "scope": "case",
+          "expected_sha256": [
+            "6d5ba9b4acfc9246cd1df7b3e157a9b101c4458b7ef788ff0e1ec76321831a71",
+            "95321756ababc90fb758cd39fcd2d0366d326b45022cda5cd310236a3344da9b",
+            "f5e70d6d8bc871455944e8f9da7f4d9dd3a0574b124c39226d153edebb2c0797",
+            "5e16bc143946dd2a3a7d6aac4a3277e9ac34431f149f80aee51e88c8b6df05f0",
+            "601fef51b7e0538a425b441f77c38be8b18952442a19324ce03d0d28574f5c8f",
+            "d12865ea0ffd48cfc7d311f8fa8953ec832daf9048f27b8564f22a691bd2f7ad",
+            "a3d7a8aee94ecdd06bb072b635a7c56b53aba7fbb7dd19a87f0c96dcedf1907f",
+            "62ba99fc9679e154a328aaa6170cf74d0c47bdd12dfe6407a92367feb6d16960",
+            "e3fe77de684132940effbfc2479d6e123e40702606b11637366512b2d0a104f1",
+            "580fe2760e245184c6a14c3f842da4aa8e08be2cad88ad352f5bd17f7b52a374",
+            "186000b10654fdbf6c4edb0bdfa406b1847e5d0bf691879d8fe507fe6a37f2b8",
+            "bce82195aaae6c4984f51f1adf2ab32d81da0f41ec228b014c6327d79a533611",
+            "d15dcbc77a87acf2ee3a140a1b259c0255a99a4cdff544dfcd702f32aee1f5e3",
+            "bbbdefdbafe5feb98d48841f9601772df0e1eeefd0a6d26b2cd4b214de21bd71"
+          ]
+        },
+        {
+          "slot": "verified-stock-configuration",
+          "role": "configuration",
+          "readers": [
+            "candle-gen-minimax-h3::residency_component::verified-config"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "validated-content",
+          "scope": "case",
+          "expected_sha256": [
+            "9208a8892c74a15dcac6828039a528ba13ba2eac0b708ee7d26caef59237ee8d"
+          ]
+        },
+        {
+          "slot": "actual-canonical-turbo",
+          "role": "artifact-input",
+          "readers": [
+            "candle-gen-minimax-h3::residency_component::verified-turbo"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "validated-content",
           "scope": "case",
           "expected_sha256": [
             "e16ac20824d6e6649b193806f8fb095639bd9946c97b1bb84b4248eab1cc807f"
@@ -311014,7 +311088,7 @@
             "candle-core::safetensors::MmapedSafetensors::new"
           ],
           "minimum_collections": 13,
-          "minimum_items": 13,
+          "minimum_items": 1,
           "required_grade": "reader-binding",
           "scope": "case"
         },
@@ -311039,6 +311113,86 @@
           "minimum_items": 2,
           "required_grade": "reader-binding",
           "scope": "case"
+        },
+        {
+          "slot": "actual-source-header-inventory",
+          "role": "configuration",
+          "readers": [
+            "gen-core::weightsmeta::file_tensor_locations_impl"
+          ],
+          "minimum_collections": 13,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "verified-complete-te-shards",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen-minimax-h3::residency_te::verified-shards"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 13,
+          "required_grade": "validated-content",
+          "scope": "case",
+          "expected_sha256": [
+            "c559e8d35a308cee213ad6bafb64ac0d122e137592aba00a212484627aa5b6a7",
+            "e9fcd69cb2face5254040ab97262f5af77fdf849482ffa3872b5758d80214c05",
+            "91b3758bb16937db2724cbf12975159281f7cdb20c106532c4f05a1a18d082e4",
+            "409800b9a40d3dc31ef5dba6a83768e8bb6c4083c2a9d7261697f4a768270c61",
+            "ae9e6aa4a32f15d2b1968fb5dc2720ec6b6034b8287705b377f3e9ada560acd5",
+            "cfc65313e11a6f15b4054341bd99529b99072628797a9ebd7b55f34ab5fb7e34",
+            "7ad216929f6202d5acb9f43f5dfbbc689884b111091601f2696267f10c28bf73",
+            "87d6f7be840e2351bcad0178b545f17da56c470a2098e5fdbf76ae175d431f0d",
+            "beb4a89fec21e42cb0e38c5e43fcf7d53ce12e7b37fe3cf35e4463bd56e05900",
+            "0cb90e23220629cf6e143d110fa0af40a7b6337935fd5fad42ce6fc9bc8ea8eb",
+            "03c4d31a65a13aa10ef36c9119869a041da3fb4a22897159126789087b9851ee",
+            "41e834d49b8a25640280fe743580845be5c04e5f464f817ca95e30dc297c0b9d",
+            "16ac1bb814c35022f223c4233575d3b7d129b36f017bc503302f083f5181ef3f"
+          ]
+        },
+        {
+          "slot": "verified-te-configuration",
+          "role": "configuration",
+          "readers": [
+            "candle-gen-minimax-h3::residency_te::verified-config"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "validated-content",
+          "scope": "case",
+          "expected_sha256": [
+            "de4a0698c7bbd69501e6a9d33db628a7efbfb2494e6ef3fa620775fc1898daa3"
+          ]
+        },
+        {
+          "slot": "verified-base-tokenizer-pair",
+          "role": "tokenizer",
+          "readers": [
+            "candle-gen-minimax-h3::residency_te::verified-tokenizers"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 2,
+          "required_grade": "validated-content",
+          "scope": "case",
+          "expected_sha256": [
+            "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+            "a07e942ac874baa13758de8d1fbdb186683cc03416b5589e1b6671c6b3057c68"
+          ]
+        },
+        {
+          "slot": "verified-original-request",
+          "role": "artifact-input",
+          "readers": [
+            "candle-gen-minimax-h3::residency_te::verified-request"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "validated-content",
+          "scope": "case",
+          "expected_sha256": [
+            "b5b5ba095203fab1eddb9ba1793162959328e16ee34a0ca6e19d44e2325bce23"
+          ]
         }
       ]
     },

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "source_contract_sha256": "2d2352eb4e8657458e778d9dc24318748c2dddf5acb867ff5d4252b405d0056e",
-  "scope": "Source-declared API role/grade registry plus exact Iris frozen-cache source extension; cumulative contract hash binds base contract SHA and extension source. Not runtime evidence.",
+  "source_contract_sha256": "54caa23a1f25aa218ccaae8617d8cc4edfd14f53da073c40ff608be57022d1dd",
+  "scope": "Source-declared role/grade registry, Iris source extension and explicit H3 fixture verified-content observers. source_contract_sha256 hashes canonical readers/supporting/source-extension metadata; not runtime evidence.",
   "supporting_not_consumption": [
     "candle-audio-yue2::snapshot::verify_component"
   ],
@@ -3896,6 +3896,48 @@
       "role": "tensor-input",
       "grades": [
         "reader-binding"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_component::verified-shards": {
+      "role": "model-weights",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_component::verified-config": {
+      "role": "configuration",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_component::verified-turbo": {
+      "role": "artifact-input",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_te::verified-shards": {
+      "role": "model-weights",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_te::verified-config": {
+      "role": "configuration",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_te::verified-tokenizers": {
+      "role": "tokenizer",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_te::verified-request": {
+      "role": "artifact-input",
+      "grades": [
+        "validated-content"
       ]
     }
   },

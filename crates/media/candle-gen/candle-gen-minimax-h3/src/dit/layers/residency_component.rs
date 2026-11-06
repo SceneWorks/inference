@@ -271,6 +271,50 @@ fn required_path(manifest: &Value, key: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+// These are fixture-verifier observations, never stronger claims about the
+// underlying reader APIs. Call only after verification AND successful consumption.
+fn record_verified_content(
+    reader: &str,
+    role: candle_gen::gen_core::model_input_proof::InputRole,
+    assets: &[&Value],
+    manifest_sha: &str,
+) -> Result<()> {
+    use candle_gen::gen_core::model_input_proof::{record_inputs, sha256_from_hex, InputIdentity};
+    let paths = assets
+        .iter()
+        .map(|asset| {
+            asset["path"]
+                .as_str()
+                .map(PathBuf::from)
+                .ok_or_else(|| error("verified asset path missing"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let hashes = assets
+        .iter()
+        .map(|asset| {
+            asset["sha256"]
+                .as_str()
+                .and_then(sha256_from_hex)
+                .ok_or_else(|| error("verified asset digest missing"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let binding = format!("frozen manifest SHA256={manifest_sha}; actual bytes matched accepted receipt before successful consumption; not same-read-buffer, post-read or opened-handle/ABA attestation");
+    let items = paths
+        .iter()
+        .zip(hashes)
+        .map(|(path, hash)| {
+            InputIdentity::validated(
+                path,
+                hash,
+                "H3 fixture verify_asset + frozen manifest/accepted receipt SHA256 checks",
+                &binding,
+            )
+        })
+        .collect::<Vec<_>>();
+    record_inputs(reader, role, &items);
+    Ok(())
+}
+
 fn verify_asset(
     path: &Path,
     expected: &Value,
@@ -495,6 +539,25 @@ fn production_q4_turbo_workspace_and_qk_parity() -> Result<()> {
         )?;
     }
     let copied = host.copy_to_device(&device)?;
+    record_verified_content(
+        "candle-gen-minimax-h3::residency_component::verified-shards",
+        candle_gen::gen_core::model_input_proof::InputRole::ModelWeights,
+        &verified_sources[2..].iter().collect::<Vec<_>>(),
+        EXPECTED_MANIFEST_SHA256,
+    )?;
+    record_verified_content(
+        "candle-gen-minimax-h3::residency_component::verified-config",
+        candle_gen::gen_core::model_input_proof::InputRole::Configuration,
+        &[&verified_sources[0]],
+        EXPECTED_MANIFEST_SHA256,
+    )?;
+    record_verified_content(
+        "candle-gen-minimax-h3::residency_component::verified-turbo",
+        candle_gen::gen_core::model_input_proof::InputRole::ArtifactInput,
+        &[&verified_sources[1]],
+        EXPECTED_MANIFEST_SHA256,
+    )?;
+
     let packed = json!({"hostSha256":packed_hash(&host)?,
         "directSha256":packed_hash(&direct)?, "copiedSha256":packed_hash(&copied)?});
     let host_factors = host.inner.__model_proof_frozen_lora_factors()?;

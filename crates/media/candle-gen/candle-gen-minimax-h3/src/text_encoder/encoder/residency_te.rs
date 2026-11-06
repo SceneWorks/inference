@@ -228,6 +228,50 @@ fn required_path(manifest: &Value, key: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+// These are fixture-verifier observations, never stronger claims about the
+// underlying reader APIs. Call only after verification AND successful consumption.
+fn record_verified_content(
+    reader: &str,
+    role: candle_gen::gen_core::model_input_proof::InputRole,
+    assets: &[&Value],
+    manifest_sha: &str,
+) -> Result<()> {
+    use candle_gen::gen_core::model_input_proof::{record_inputs, sha256_from_hex, InputIdentity};
+    let paths = assets
+        .iter()
+        .map(|asset| {
+            asset["path"]
+                .as_str()
+                .map(PathBuf::from)
+                .ok_or_else(|| error("verified asset path missing"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let hashes = assets
+        .iter()
+        .map(|asset| {
+            asset["sha256"]
+                .as_str()
+                .and_then(sha256_from_hex)
+                .ok_or_else(|| error("verified asset digest missing"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let binding = format!("frozen manifest SHA256={manifest_sha}; actual bytes matched accepted receipt before successful consumption; not same-read-buffer, post-read or opened-handle/ABA attestation");
+    let items = paths
+        .iter()
+        .zip(hashes)
+        .map(|(path, hash)| {
+            InputIdentity::validated(
+                path,
+                hash,
+                "H3 fixture verify_asset + frozen manifest/accepted receipt SHA256 checks",
+                &binding,
+            )
+        })
+        .collect::<Vec<_>>();
+    record_inputs(reader, role, &items);
+    Ok(())
+}
+
 fn verify_asset(
     path: &Path,
     expected: &Value,
@@ -459,7 +503,7 @@ fn production_prompt_resident_window_first_difference() -> Result<()> {
         );
     }
     let request_path = required_path(&manifest, "requestPath")?;
-    let request_raw = std::fs::read(request_path).map_err(error)?;
+    let request_raw = std::fs::read(&request_path).map_err(error)?;
     assert_eq!(format!("{:x}", Sha256::digest(&request_raw)), REQUEST_SHA);
     assert_eq!(manifest["requestSha256"], REQUEST_SHA);
     let request: Value = serde_json::from_slice(&request_raw).map_err(error)?;
@@ -475,6 +519,18 @@ fn production_prompt_resident_window_first_difference() -> Result<()> {
     }
     assert!(request["sourceAssetId"].is_null() && request["lastFrameAssetId"].is_null());
     let cfg = MiniMaxH3TeConfig::from_component_dir(&directory)?;
+    let config_assets = verified
+        .iter()
+        .filter(|asset| asset["relative"] == "q4/text_encoder/config.json")
+        .collect::<Vec<_>>();
+    assert_eq!(config_assets.len(), 1);
+    record_verified_content(
+        "candle-gen-minimax-h3::residency_te::verified-config",
+        candle_gen::gen_core::model_input_proof::InputRole::Configuration,
+        &config_assets,
+        MANIFEST_SHA,
+    )?;
+
     assert_eq!(
         (
             cfg.hidden_size,
@@ -517,6 +573,28 @@ fn production_prompt_resident_window_first_difference() -> Result<()> {
         "shape":attention_mask.dims(),"dtype":"U32","elements":mask_values.len(),
         "sha256":format!("{:x}",Sha256::digest(mask_values.iter().flat_map(|value|value.to_le_bytes()).collect::<Vec<_>>()))
     });
+
+    let tokenizer_assets = verified
+        .iter()
+        .filter(|asset| {
+            asset["relative"] == "tokenizer/tokenizer.json"
+                || asset["relative"] == "tokenizer/tokenizer_config.json"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tokenizer_assets.len(), 2);
+    record_verified_content(
+        "candle-gen-minimax-h3::residency_te::verified-tokenizers",
+        candle_gen::gen_core::model_input_proof::InputRole::Tokenizer,
+        &tokenizer_assets,
+        MANIFEST_SHA,
+    )?;
+    let verified_request = json!({"path":request_path,"sha256":REQUEST_SHA});
+    record_verified_content(
+        "candle-gen-minimax-h3::residency_te::verified-request",
+        candle_gen::gen_core::model_input_proof::InputRole::ArtifactInput,
+        &[&verified_request],
+        MANIFEST_SHA,
+    )?;
     crate::nn::reset_attention_execution_report();
     let (mut resident, resident_context, same_policy) = with_workspace(
         &device,
@@ -524,6 +602,22 @@ fn production_prompt_resident_window_first_difference() -> Result<()> {
         || {
             let resident = load_encoder(&files, &cfg, &device)?;
             let mut streamed = load_encoder(&files, &cfg, &Device::Cpu)?;
+            let shards = verified
+                .iter()
+                .filter(|asset| {
+                    asset["relative"]
+                        .as_str()
+                        .is_some_and(|relative| relative.ends_with(".safetensors"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(shards.len(), 13);
+            record_verified_content(
+                "candle-gen-minimax-h3::residency_te::verified-shards",
+                candle_gen::gen_core::model_input_proof::InputRole::ModelWeights,
+                &shards,
+                MANIFEST_SHA,
+            )?;
+
             assert!(
                 resident.embed_tokens.embedding.is_quantized()
                     && streamed.embed_tokens.embedding.is_quantized()
