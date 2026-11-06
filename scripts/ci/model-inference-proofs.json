@@ -61770,10 +61770,11 @@
         ],
         "backend": "candle-cuda",
         "expected_devices": [
+          "candle-cpu",
           "candle-cuda"
         ],
         "required_cuda_physical_index": 1,
-        "scope": "Entire source-selected body on logical CUDA0 mapped to physical GPU1; host-prepared block windows, equivalent resident route, and materializing attention observed.",
+        "scope": "Entire source-selected body: CPU bounded dense embedding-row lookup plus actual CUDA encoder blocks; host-prepared streamed stacks compared with same-device resident outputs, materializing attention observed.",
         "required_work": [
           "All existing source mode/tier/adapter/audio assertions",
           "Actual host-to-device streamed blocks compared with same-device resident outputs",
