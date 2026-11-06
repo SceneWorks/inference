@@ -10,6 +10,37 @@ pub enum Backend {
     Mlx,
     Cuda,
 }
+/// The CUDA H3 materializing fallback's default score domain. Sixteen bytes per score
+/// conservatively cover scores, scaling/softmax transients and probabilities (512 MiB).
+/// Runtime and request pricing use this same limit; fused attention remains eligible.
+pub const CUDA_DENSE_SCORE_ELEMENTS: u64 = 32 * 1024 * 1024;
+
+/// Allocations simultaneously live in one attention phase, in separate physical pools.
+/// `shared_device` is the input QKV storage included in `device`, not an extra allocation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorkspacePoolBytes {
+    pub host: u64,
+    pub device: u64,
+    pub shared_device: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorkspaceLifetimes {
+    pub predictor_load: WorkspacePoolBytes,
+    pub self_test: WorkspacePoolBytes,
+    pub sparse: WorkspacePoolBytes,
+    pub dense_fallback: WorkspacePoolBytes,
+}
+impl WorkspaceLifetimes {
+    pub fn phases(self) -> [WorkspacePoolBytes; 4] {
+        [
+            self.predictor_load,
+            self.self_test,
+            self.sparse,
+            self.dense_fallback,
+        ]
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct Chunk {
     pub heads: usize,
@@ -44,6 +75,58 @@ pub struct WorkspaceBound {
     pub dense_fallback_bytes: u64,
     pub chunks: BTreeMap<TileShape, Chunk>,
     pub total_bytes: u64,
+    /// CUDA uses phase maxima independently per pool. MLX's unified-memory bound retains
+    /// the conservative lazy-graph/cache lifetimes represented by `total_bytes`.
+    pub lifetimes: WorkspaceLifetimes,
+}
+impl WorkspaceBound {
+    pub fn host_peak_bytes(&self) -> u64 {
+        self.lifetimes
+            .phases()
+            .iter()
+            .map(|p| p.host)
+            .max()
+            .unwrap_or(0)
+    }
+    pub fn device_peak_bytes(&self) -> u64 {
+        self.lifetimes
+            .phases()
+            .iter()
+            .map(|p| p.device)
+            .max()
+            .unwrap_or(0)
+    }
+    pub fn unified_peak_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Credit only independently proven shared caller QKV, once in each overlapping phase.
+    /// No credit is granted for weights, outputs, or a historical dense measured peak.
+    pub fn incremental_device_peak_bytes(&self, shared_qkv_credit: u64) -> crate::Result<u64> {
+        let mut peak = 0;
+        for phase in self.lifetimes.phases() {
+            if phase.shared_device > phase.device {
+                return Err(crate::Error::Unsupported(
+                    "invalid Veda shared-device allocation facts".into(),
+                ));
+            }
+            peak = peak.max(phase.device - phase.shared_device.min(shared_qkv_credit));
+        }
+        Ok(peak)
+    }
+
+    /// Check pools separately; equality fits, including the caller's explicit reserve.
+    pub fn fits_pools(&self, host_available: u64, device_available: u64, reserve: u64) -> bool {
+        let device = if self.backend == Backend::Mlx {
+            self.unified_peak_bytes()
+        } else {
+            self.device_peak_bytes()
+        };
+        self.host_peak_bytes() <= host_available
+            && device
+                .checked_add(reserve)
+                .is_some_and(|need| need <= device_available)
+    }
 }
 /// Borrowed product/native admission shape; avoids cloning decoded media just to price it.
 #[derive(Clone, Copy)]

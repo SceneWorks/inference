@@ -555,6 +555,16 @@ fn route_aware_safety(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
+    // This fixture provider owns its structural-estimate wire convention, just as legacy
+    // production providers do. It is deliberately not a rule of the shared safety pipeline.
+    if context.load_shape != contract.load_shape
+        || (contract.calibration.is_none()
+            && (context.calibration_abi != 0 || !context.calibration_fingerprint.is_empty()))
+    {
+        return MemorySafetyDecision::Reject {
+            reason: "fixture provider's absent-calibration handshake".into(),
+        };
+    }
     let routes = contract.pid_decode_routes.as_ref().unwrap();
     let edge = context.selection.parameters.decode_tile_edge;
     let overlap = context.selection.parameters.decode_overlap;
@@ -697,6 +707,174 @@ fn route_aware_registration_accepts_matching_routes_and_rejects_cross_routes() {
         &mut errors,
     );
     assert_eq!(errors, Vec::<String>::new());
+    estimated_conformance_uses_absent_identity_sentinel_and_keeps_materialization_and_routes();
+    estimated_conformance_catches_handshake_and_materialization_blind_admission();
+}
+
+fn estimated_pid_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    let mut contract = pid_contract(spec)?;
+    contract.calibration = None;
+    Ok(contract)
+}
+
+fn estimated_pid_fixture(
+    _spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    strategy: MemoryStrategy,
+) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
+    if strategy != MemoryStrategy::BoundedDecode {
+        return Ok(Vec::new());
+    }
+    let routes = contract.pid_decode_routes.as_ref().unwrap();
+    Ok([(&routes.native, false), (&routes.pid, true)]
+        .into_iter()
+        .map(|(route, use_pid)| {
+            let mut context = route_context(
+                0,
+                "",
+                contract.load_shape,
+                route.tile_edges[0],
+                route.tile_overlap,
+                use_pid,
+            );
+            context.optimization_authority = MemoryOptimizationAuthority::Estimated;
+            gen_core::MemoryBehaviorFixture::new(context)
+        })
+        .collect())
+}
+
+fn estimated_errors_for(
+    safety_check: fn(&LoadSpec, &MemoryProviderContract, &MemoryRunContext) -> MemorySafetyDecision,
+) -> Vec<String> {
+    let registration = MemoryRegistration {
+        provider_id: "pid-provider",
+        contract: estimated_pid_contract,
+        safety_check,
+    };
+    let behavior = MemoryBehaviorRegistration {
+        provider_id: "pid-provider",
+        valid_fixtures: estimated_pid_fixture,
+        begin_request: pid_begin,
+    };
+    let mut errors = Vec::new();
+    check_memory_registration(
+        &registration,
+        None,
+        None,
+        Some(&behavior),
+        &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+        &mut errors,
+    );
+    errors
+}
+
+fn estimated_conformance_uses_absent_identity_sentinel_and_keeps_materialization_and_routes() {
+    assert_eq!(
+        estimated_errors_for(route_aware_safety),
+        Vec::<String>::new()
+    );
+    let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+    for calibrated in [true, false] {
+        let contract = if calibrated {
+            pid_contract(&spec).unwrap()
+        } else {
+            estimated_pid_contract(&spec).unwrap()
+        };
+        let fixture = if calibrated {
+            pid_fixture
+        } else {
+            estimated_pid_fixture
+        };
+        for fixture in fixture(&spec, &contract, MemoryStrategy::BoundedDecode).unwrap() {
+            let context = fixture.context;
+            assert!(matches!(
+                route_aware_safety(&spec, &contract, &context),
+                MemorySafetyDecision::Accept
+            ));
+            let mut abi = context.clone();
+            abi.calibration_abi = abi.calibration_abi.wrapping_add(1);
+            let mut fingerprint = context.clone();
+            fingerprint.calibration_fingerprint.push_str("-stale");
+            for mutated in [abi, fingerprint] {
+                assert!(matches!(
+                    route_aware_safety(&spec, &contract, &mutated),
+                    MemorySafetyDecision::Reject { .. }
+                ));
+            }
+            let mut stale = context.clone();
+            stale.evidence_revision = "old-external-observation".into();
+            assert!(matches!(
+                route_aware_safety(&spec, &contract, &stale),
+                MemorySafetyDecision::Accept
+            ));
+            let mut shape = context.clone();
+            shape.load_shape = match shape.load_shape {
+                gen_core::LoadShape::EagerMaterialization => {
+                    gen_core::LoadShape::DeferredMaterialization
+                }
+                gen_core::LoadShape::DeferredMaterialization => {
+                    gen_core::LoadShape::EagerMaterialization
+                }
+            };
+            assert!(matches!(
+                route_aware_safety(&spec, &contract, &shape),
+                MemorySafetyDecision::Reject { .. }
+            ));
+        }
+    }
+    let cross_route = estimated_errors_for(overlap_blind);
+    assert!(
+        cross_route
+            .iter()
+            .any(|error| error.contains("overlap 256 on native route")),
+        "{cross_route:#?}"
+    );
+    assert!(
+        cross_route
+            .iter()
+            .any(|error| error.contains("overlap 64 on PiD route")),
+        "{cross_route:#?}"
+    );
+}
+
+fn estimated_conformance_catches_handshake_and_materialization_blind_admission() {
+    let handshake = estimated_errors_for(|spec, contract, context| {
+        let mut trusted = context.clone();
+        trusted.calibration_abi = 0;
+        trusted.calibration_fingerprint.clear();
+        route_aware_safety(spec, contract, &trusted)
+    });
+    for identity in ["ABI", "fingerprint"] {
+        assert!(
+            handshake
+                .iter()
+                .any(|error| error.contains("blind to mutated calibration")
+                    && error.contains(identity)),
+            "{handshake:#?}"
+        );
+    }
+    let shape_blind = estimated_errors_for(|spec, contract, context| {
+        let mut trusted = context.clone();
+        trusted.load_shape = contract.load_shape;
+        route_aware_safety(spec, contract, &trusted)
+    });
+    assert!(
+        shape_blind
+            .iter()
+            .any(|error| error.contains("mutated materialization load shape")),
+        "{shape_blind:#?}"
+    );
+    let authority_blind = estimated_errors_for(|spec, contract, context| {
+        let mut trusted = context.clone();
+        trusted.optimization_authority = MemoryOptimizationAuthority::Estimated;
+        route_aware_safety(spec, contract, &trusted)
+    });
+    assert!(
+        authority_blind
+            .iter()
+            .any(|error| error.contains("without authority")),
+        "{authority_blind:#?}"
+    );
 }
 
 #[test]

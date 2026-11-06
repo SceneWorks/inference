@@ -1,5 +1,17 @@
 # Vendored `candle-core` — CUDA-graph parameter cache (sc-24441)
 
+SW-6925 adds `src/cuda_backend/proof_pool.rs` and two constructor calls. The explicit
+`SCENEWORKS_CUDA_PROOF_POOL_BYTES` byte count installs a private CUDA stream-ordered
+pool with driver-enforced `CUmemPoolProps.maxSize` before streams/library handles
+are created. With the variable absent the ordinary allocator is unchanged.
+This is an allocator bound, not a whole-device bound: reserve and observe
+context, module, library-internal, and foreign allocations separately. See
+`docs/testing/h3-cuda-memory-envelope.md` at the repository root for the proof
+protocol and limitations. The pool remains installed for the proof process's
+lifetime, refusing cap changes and current-pool replacement. A restart is required
+to change or remove it. `candle-gen/tests/cuda_proof_pool.rs` is an ignored
+raw-allocation proof executed only by the separate explicit workflow.
+
 Dependency maintenance (2026-10-17): the standalone `Cargo.toml` now requires
 `zip = "9"` instead of `7.2.0` to address RUSTSEC-2026-0367, RUSTSEC-2026-0368,
 and RUSTSEC-2026-0369. Features remain disabled by default. `src/npy.rs` and

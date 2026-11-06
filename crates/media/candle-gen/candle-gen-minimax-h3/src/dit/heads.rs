@@ -85,6 +85,13 @@ pub struct LinearBias {
 }
 
 impl LinearBias {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.weight = copy.weight.to_device(device)?;
+        copy.bias = copy.bias.to_device(device)?;
+        Ok(copy)
+    }
+
     /// Load `{prefix}.weight` / `{prefix}.bias` **at their stored dtype**, checking the shape.
     ///
     /// The dtype is deliberately not a parameter: these tensors are the mixed-precision half of the
@@ -236,6 +243,13 @@ pub struct TimestepEmbedder {
 }
 
 impl TimestepEmbedder {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.linear_1 = copy.linear_1.copy_to_device(device)?;
+        copy.linear_2 = copy.linear_2.copy_to_device(device)?;
+        Ok(copy)
+    }
+
     /// Load `{prefix}.linear_1` / `{prefix}.linear_2` (e.g. `time_embedder`).
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &MiniMaxH3DitConfig) -> Result<Self> {
         Ok(Self {
@@ -320,6 +334,17 @@ pub struct AdaLayerNormOut {
 }
 
 impl AdaLayerNormOut {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.norm = copy.norm.copy_to_device(device)?;
+        copy.linear = copy
+            .linear
+            .as_ref()
+            .map(|p| p.copy_to_device(device))
+            .transpose()?;
+        Ok(copy)
+    }
+
     /// Load `{prefix}.norm` / `{prefix}.linear` (e.g. `norm_out`).
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &MiniMaxH3DitConfig) -> Result<Self> {
         Self::load(w, prefix, cfg, true)
@@ -497,6 +522,22 @@ pub struct DitProjections {
 }
 
 impl DitProjections {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.proj_in = copy.proj_in.copy_to_device(device)?;
+        copy.audio_proj_in = copy.audio_proj_in.copy_to_device(device)?;
+        copy.context_embedder = copy.context_embedder.copy_to_device(device)?;
+        copy.time_embedder = copy
+            .time_embedder
+            .as_ref()
+            .map(|p| p.copy_to_device(device))
+            .transpose()?;
+        copy.norm_out = copy.norm_out.copy_to_device(device)?;
+        copy.proj_out = copy.proj_out.copy_to_device(device)?;
+        copy.audio_proj_out = copy.audio_proj_out.copy_to_device(device)?;
+        Ok(copy)
+    }
+
     /// Tensors this module owns — exactly 17 in the published checkpoint; 14 on the pruned path,
     /// where the four `time_embedder` tensors are one `adaln_t_table`.
     pub const TENSOR_COUNT: usize = 17;

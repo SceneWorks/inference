@@ -383,8 +383,10 @@ impl CudaDevice {
 impl CudaDevice {
     pub fn new_with_stream(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
+        super::proof_pool::configure(&context)?;
         let stream = context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
+        super::proof_pool::bind_cublas_workspace(&stream, &blas)?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],
@@ -407,8 +409,10 @@ impl BackendDevice for CudaDevice {
 
     fn new(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
+        super::proof_pool::configure(&context)?;
         let stream = context.default_stream();
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
+        super::proof_pool::bind_cublas_workspace(&stream, &blas)?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],

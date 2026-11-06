@@ -311,7 +311,12 @@ fn video_decode_with_patch(
         f.video_element_bytes,
         4,
     ])?;
-    let converted = mul(&[frames, h, w, f.pixel_channels, 4 * 4 + 2])?;
+    // Candle's decoded_frames_to_images converts a single NCTHW frame at a time. The entire
+    // decoded clip/backing chunks remain covered by output below; only F32 norm/mul/add/clamp,
+    // round and interleaved U8 scratch are frame-bounded. MLX still converts the whole clip.
+    // Keep the conservative four-F32/two-U8 arrays even though some peaks are disjoint.
+    let conversion_frames = if f.lazy_encode { frames } else { 1 };
+    let converted = mul(&[conversion_frames, h, w, f.pixel_channels, 4 * 4 + 2])?;
     // Candle nn::linear explicitly materializes w.t().contiguous() before matmul.
     // One projection's transient transformed weight coexists with the original resident weight.
     // MLX's transpose is a view; no extra resident weight is invented for that path.
@@ -688,6 +693,29 @@ mod tests {
             video_decode([37, 24, 42], 124, &deeper).unwrap()
                 < video_decode([37, 24, 42], 124, &f).unwrap()
         );
+    }
+
+    #[test]
+    fn candle_frame_conversion_bounds_scratch_without_discarding_the_clip() {
+        let f = H3ConditioningMemoryFacts {
+            lazy_encode: false,
+            unified_memory: false,
+            video_element_bytes: 2,
+            ..Default::default()
+        };
+        let long = video_decode([102, 24, 42], 345, &f).unwrap();
+        let short = video_decode([37, 24, 42], 124, &f).unwrap();
+        let pixels = 768 * 1344 * 3;
+        // Four full padded BF16 outputs still cover temporal backing views/cat/crop. The change
+        // only bounds pixel conversion scratch; it must not turn full output into a one-frame cost.
+        assert!(long - short >= (345 - 124) * pixels * 2 * 4);
+        assert!(long >= (345 + 34) * pixels * 2 * 4);
+        let mut bulk = f.clone();
+        bulk.lazy_encode = true;
+        let bulk = video_decode([102, 24, 42], 345, &bulk).unwrap();
+        // Native eager linear includes one transposed FFN weight absent in the lazy twin.
+        let transpose = 2048 * (2 * 4 * 2048) * 2;
+        assert_eq!(bulk + transpose - long, (345 - 1) * pixels * 18);
     }
     fn request(conditioning: &[Conditioning]) -> Request<'_> {
         Request {

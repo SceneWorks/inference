@@ -129,6 +129,12 @@ pub struct AdaLnProjection {
 }
 
 impl AdaLnProjection {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.inner = copy.inner.copy_to_device(device)?;
+        Ok(copy)
+    }
+
     /// The width of the timestep embedding this projection consumes — `time_embed_dim`, 2688
     /// shipped.
     ///
@@ -299,6 +305,36 @@ pub struct DitBlock {
 }
 
 impl DitBlock {
+    pub(crate) fn modulation_for_window(
+        &self,
+        input: &Tensor,
+        device: &candle_gen::candle_core::Device,
+    ) -> Result<AdaLnModulation> {
+        if let Some(curve) = &self.curve {
+            return curve.copy_to_device(device)?.modulation(input);
+        }
+        self.adaln_proj
+            .as_ref()
+            .ok_or_else(|| {
+                CandleError::Msg("streamed AdaLN projection was already released".into())
+            })?
+            .copy_to_device(device)?
+            .forward(input)
+    }
+
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.norm1 = copy.norm1.copy_to_device(device)?;
+        copy.attn = copy.attn.copy_to_device(device)?;
+        copy.norm2 = copy.norm2.copy_to_device(device)?;
+        copy.ff = copy.ff.copy_to_device(device)?;
+        // Denoising consumes the precomputed modulation cache. Neither the full AdaLN
+        // projection nor a pruned curve projection belongs in a repeated body window.
+        copy.adaln_proj = None;
+        copy.curve = None;
+        Ok(copy)
+    }
+
     /// Load block `prefix` (e.g. `transformer_blocks.0`).
     pub fn from_weights(
         w: &Weights,
@@ -506,17 +542,19 @@ impl DitBlock {
         let idx = adaln_indices.to_dtype(DType::U32)?;
         let rows = s[1];
 
-        let normed = modulate(
-            &self.norm1.forward(x)?,
-            &modulation.scale_msa,
-            &modulation.shift_msa,
-            &idx,
-        )?;
-        let attn = self
-            .attn
-            .forward_veda(&normed, Some((rope, tables)), veda, cancel)?;
-        let gate = gate_rows(&modulation.gate_msa, &idx, rows, x.dtype())?;
-        let x = x.add(&gate.broadcast_mul(&attn)?)?;
+        let x = {
+            let normed = modulate(
+                &self.norm1.forward(x)?,
+                &modulation.scale_msa,
+                &modulation.shift_msa,
+                &idx,
+            )?;
+            let attn = self
+                .attn
+                .forward_veda(&normed, Some((rope, tables)), veda, cancel)?;
+            let gate = gate_rows(&modulation.gate_msa, &idx, rows, x.dtype())?;
+            x.add(&gate.broadcast_mul(&attn)?)?
+        };
 
         let normed = modulate(
             &self.norm2.forward(&x)?,

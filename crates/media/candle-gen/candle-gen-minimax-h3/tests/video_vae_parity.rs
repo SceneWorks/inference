@@ -193,9 +193,32 @@ fn decode_clip_matches_the_reference() {
 #[ignore = "model inference; explicit model workflow only"]
 fn temporal_decode_matches_the_reference() {
     let f = fixture();
-    let vae = vae(&f, 3);
+    // Explicit manual configuration only; default fixture execution remains CPU. A requested
+    // CUDA proof must actually construct CUDA tensors, never silently fall back to the host.
+    let device = match std::env::var("SCENEWORKS_H3_VAE_PROOF_DEVICE") {
+        Err(std::env::VarError::NotPresent) => Device::Cpu,
+        Ok(value) if value == "cuda:0" => {
+            #[cfg(feature = "cuda")]
+            {
+                Device::new_cuda(0).expect("required CUDA proof device")
+            }
+            #[cfg(not(feature = "cuda"))]
+            panic!("SCENEWORKS_H3_VAE_PROOF_DEVICE=cuda:0 requires feature cuda");
+        }
+        other => panic!("invalid SCENEWORKS_H3_VAE_PROOF_DEVICE: {other:?}"),
+    };
+    let map = model_map(&f)
+        .into_iter()
+        .map(|(name, tensor)| (name, tensor.to_device(&device).unwrap()))
+        .collect();
+    let vae =
+        MiniMaxH3VideoVae::from_weights(&weights(map), &fixture_config(3), &device, DType::F32)
+            .unwrap();
     for (tokens, frames) in [(5, 17), (7, 22), (9, 30), (12, 39), (17, 56)] {
-        let latent = f.tensor(&format!("in.temporal{tokens}.latent"));
+        let latent = f
+            .tensor(&format!("in.temporal{tokens}.latent"))
+            .to_device(&device)
+            .unwrap();
         let want = f.tensor(&format!("out.temporal{tokens}.video"));
         let got = vae.decode(&latent).expect("decode");
         assert_eq!(
@@ -204,6 +227,25 @@ fn temporal_decode_matches_the_reference() {
             "{tokens} tokens should decode to {frames} frames"
         );
         assert_parity(&got, &want, TOL, &format!("decode_temporal({tokens})"));
+        // Exercise delivered pixels from actual decoded fixture values, including padded clips
+        // and blended seams. Frame-bounded conversion must preserve every clamp/round byte.
+        for dtype in [DType::F32, DType::BF16] {
+            let pixels = got.to_dtype(dtype).unwrap();
+            let bulk = candle_gen_minimax_h3::pipeline::frames_to_images(
+                &candle_gen_minimax_h3::pipeline::revert_pixel_normalization(&pixels).unwrap(),
+            )
+            .unwrap();
+            let bounded =
+                candle_gen_minimax_h3::pipeline::decoded_frames_to_images(&pixels).unwrap();
+            assert_eq!(bulk.len(), bounded.len());
+            for (expected, actual) in bulk.iter().zip(&bounded) {
+                assert_eq!(
+                    (actual.width, actual.height),
+                    (expected.width, expected.height)
+                );
+                assert_eq!(actual.pixels, expected.pixels);
+            }
+        }
     }
 
     #[cfg(feature = "model-inference-proof")]
