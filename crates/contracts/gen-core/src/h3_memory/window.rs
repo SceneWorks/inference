@@ -107,6 +107,30 @@ impl CudaAdalnWorkingSet {
     }
 }
 
+/// Maximum elements in one CUDA streamed-body Q/K normalization or rotary tile. This is
+/// the same maximum as materialized attention, and a smaller selected attention budget wins.
+pub const CUDA_QK_PRECONDITION_ELEMENTS: u64 = crate::veda::workspace::CUDA_DENSE_SCORE_ELEMENTS;
+
+/// Complete sequence rows per Q/K tile. Never split a head's reduction channels or mix batch
+/// rows with another token's rotary tables. Unknown/overflowing or unaffordable rows refuse.
+pub fn qk_precondition_token_block(
+    batch: u64,
+    heads: u64,
+    head_dim: u64,
+    sequence: u64,
+    selected_elements: u64,
+) -> Result<u64> {
+    if batch == 0 || heads == 0 || head_dim == 0 || sequence == 0 {
+        return Err(invalid());
+    }
+    let row = times(times(batch, heads)?, head_dim)?;
+    let limit = selected_elements.min(CUDA_QK_PRECONDITION_ELEMENTS);
+    if row > limit {
+        return Err(invalid());
+    }
+    Ok((limit / row).min(sequence))
+}
+
 /// Source-config dimensions and largest runtime dequantization, independent of a checkpoint
 /// name or measured peak. CUDA's dense/affine routes need these even without native descriptors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,10 +207,71 @@ impl CudaWorkingSet {
             multiply_add.max(final_cat),
         )
     }
+    fn windowed_qk_precondition_peak(self, rows: u64, inner: u64) -> Result<u64> {
+        let tile_rows = qk_precondition_token_block(
+            1,
+            self.heads,
+            self.head_dim,
+            rows,
+            CUDA_QK_PRECONDITION_ELEMENTS,
+        )?;
+        let elements = times(times(tile_rows, self.heads)?, self.head_dim)?;
+        let reduction = times(times(tile_rows, self.heads)?, 4)?;
+        // The second K pass retains final Q + projected K + prior BF16/F32 result chunks.
+        // Final cat instead overlaps Q + K + all chunks + the new complete output (4 inner).
+        // Existing RMS arithmetic remains F32: xf/normed/weighted plus the output cast,
+        // one reduction and one norm-weight cast. F32 xf aliases the projected input.
+        let rms_tile = plus(
+            plus(
+                times(if self.element_bytes == 4 { 8 } else { 14 }, elements)?,
+                reduction,
+            )?,
+            times(4, self.head_dim)?,
+        )?;
+        let normalized = plus(times(3, inner)?, rms_tile)?.max(times(4, inner)?);
+        // Projected K is explicitly dropped BEFORE rotary. Current normalized K, prior Q,
+        // and retained rotated chunks have the same 3-inner envelope as normalization.
+        let rotated = times(
+            times(times(tile_rows, self.heads)?, self.rotary_dim)?,
+            self.element_bytes,
+        )?;
+        let head = if self.rotary_dim == self.head_dim {
+            0
+        } else {
+            rotated
+        };
+        let table_casts = if self.element_bytes == 4 {
+            0
+        } else {
+            times(
+                times(times(2, tile_rows)?, self.rotary_dim)?,
+                self.element_bytes,
+            )?
+        };
+        let multiply_add = plus(head, times(4, rotated)?)?;
+        let final_tile_cat = if self.rotary_dim == self.head_dim {
+            0
+        } else {
+            plus(
+                plus(head, times(2, rotated)?)?,
+                times(elements, self.element_bytes)?,
+            )?
+        };
+        let rotary_tile = plus(table_casts, multiply_add.max(final_tile_cat))?;
+        let rotary = plus(times(3, inner)?, rotary_tile)?.max(times(4, inner)?);
+        Ok(normalized.max(rotary))
+    }
     fn operation_peak(self, rows: u64) -> Result<u64> {
         self.operation_peak_with_adapter(rows, 0)
     }
     fn operation_peak_with_adapter(self, rows: u64, adapter_work: u64) -> Result<u64> {
+        self.operation_peak_for(rows, adapter_work, false)
+    }
+    #[cfg(test)]
+    fn windowed_operation_peak_with_adapter(self, rows: u64, adapter_work: u64) -> Result<u64> {
+        self.operation_peak_for(rows, adapter_work, true)
+    }
+    fn operation_peak_for(self, rows: u64, adapter_work: u64, windowed: bool) -> Result<u64> {
         let hidden = times(times(rows, self.hidden)?, self.element_bytes)?;
         let inner = times(
             times(times(rows, self.heads)?, self.head_dim)?,
@@ -211,11 +296,18 @@ impl CudaWorkingSet {
         // Head merge retains the original SDPA output and its contiguous merged copy;
         // to_out then allocates hidden output while caller QKV remain.
         let output_projection = plus(times(5, inner)?, hidden)?;
+        // Only selected CUDA body windows use bounded independent Q/K preprocessing.
+        // Resident/refiner execution and its original full-width facts remain unchanged.
+        let precondition = if windowed {
+            self.windowed_qk_precondition_peak(rows, inner)?
+        } else {
+            self.qk_norm_peak(rows, inner)?
+                .max(self.rotary_peak(rows, inner)?)
+        };
         // Scoped attention retains input and modulated hidden throughout these alternatives.
         let attention = plus(
             times(2, hidden)?,
-            self.qk_norm_peak(rows, inner)?
-                .max(self.rotary_peak(rows, inner)?)
+            precondition
                 .max(materialized)
                 .max(fused)
                 .max(output_projection),
@@ -227,7 +319,10 @@ impl CudaWorkingSet {
         // SwiGLU chunks bound the expanded projection. Prior output spans and final cat
         // coexist with full hidden input; token-axis chunking never changes the key domain.
         let ffn = plus(
-            times(4, hidden)?,
+            // During the streamed block's FFN the model caller still owns the old
+            // packed x, alongside the new attention residual, modulated input and
+            // chunk outputs/final cat. Keep resident pricing unchanged.
+            times(if windowed { 5 } else { 4 }, hidden)?,
             times(
                 3 * self.element_bytes,
                 times(rows, times(2, self.ffn_inner)?)?
@@ -235,12 +330,24 @@ impl CudaWorkingSet {
                     .max(times(2, self.ffn_inner)?),
             )?,
         )?;
+        let block_norm = if windowed {
+            // norm2 also overlaps the caller's old x. F32 xf/normed/weighted and the
+            // BF16 cast give nine hidden buffers, plus two reduction-sized temporaries
+            // and a possible F32 norm-weight cast. These phases may dominate imports
+            // whose hidden width is much larger than the attention inner width.
+            plus(
+                plus(times(9, hidden)?, times(8, rows)?)?,
+                times(4, self.hidden)?,
+            )?
+        } else {
+            times(8, hidden)?
+        };
         plus(
             plus(
                 attention
                     .max(adapted_projection)
                     .max(plus(ffn, adapter_work)?)
-                    .max(times(8, hidden)?),
+                    .max(block_norm),
                 self.attention_tables_bytes(rows)?,
             )?,
             self.projection_decode_bytes,
@@ -439,6 +546,33 @@ impl WindowAllocation {
     ) -> Result<u64> {
         let facts = self.cuda_working.ok_or_else(invalid)?;
         let dense = self.denoise_peak_bytes(task, backend, rows, window)?;
+        self.compose_veda_peak(task, backend, rows, window, veda, facts, dense)
+    }
+
+    pub fn bounded_cuda_denoise_with_veda_bytes(
+        &self,
+        task: &NativeTaskAllocation,
+        backend: NativeBackend,
+        rows: NativeRows,
+        window: usize,
+        veda: &crate::veda::workspace::WorkspaceBound,
+    ) -> Result<u64> {
+        let facts = self.cuda_working.ok_or_else(invalid)?;
+        let dense = self.bounded_cuda_denoise_peak_bytes(task, backend, rows, window)?;
+        self.compose_veda_peak(task, backend, rows, window, veda, facts, dense)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compose_veda_peak(
+        &self,
+        task: &NativeTaskAllocation,
+        backend: NativeBackend,
+        rows: NativeRows,
+        window: usize,
+        veda: &crate::veda::workspace::WorkspaceBound,
+        facts: CudaWorkingSet,
+        dense: u64,
+    ) -> Result<u64> {
         let attention = plus(
             self.denoise_resident_bytes(task, backend, rows, window)?,
             plus(
@@ -827,12 +961,40 @@ impl WindowAllocation {
         Ok(peak)
     }
 
+    /// Legacy full/resident execution. A full-span caller is not evidence of streamed
+    /// preprocessing; keep its original working bound even on a single-layer source.
     pub fn denoise_peak_bytes(
         &self,
         task: &NativeTaskAllocation,
         backend: NativeBackend,
         rows: NativeRows,
         window: usize,
+    ) -> Result<u64> {
+        self.denoise_peak_bytes_impl(task, backend, rows, window, false)
+    }
+
+    /// Explicit selected CUDA body-window route. Unlike a layer-count heuristic, this
+    /// distinguishes a one-layer streamed source from the same source's resident execution.
+    pub fn bounded_cuda_denoise_peak_bytes(
+        &self,
+        task: &NativeTaskAllocation,
+        backend: NativeBackend,
+        rows: NativeRows,
+        window: usize,
+    ) -> Result<u64> {
+        if !matches!(backend, NativeBackend::Candle { .. }) {
+            return Err(invalid());
+        }
+        self.denoise_peak_bytes_impl(task, backend, rows, window, true)
+    }
+
+    fn denoise_peak_bytes_impl(
+        &self,
+        task: &NativeTaskAllocation,
+        backend: NativeBackend,
+        rows: NativeRows,
+        window: usize,
+        bounded_qk: bool,
     ) -> Result<u64> {
         let plan = self.plan(backend, window)?;
         let base = plus(self.root.resident()?, self.table_bytes(task, rows)?)?;
@@ -848,16 +1010,13 @@ impl WindowAllocation {
                 }
             }
             if matches!(backend, NativeBackend::Candle { .. }) {
-                work = work.max(
-                    self.cuda_working
-                        .ok_or_else(invalid)?
-                        .operation_peak_with_adapter(
-                            rows.packed,
-                            task.adapter.as_ref().map_or(0, |a| {
-                                a.forward_working_bytes_for(backend, rows, RowDomain::Packed)
-                            }),
-                        )?,
-                );
+                work = work.max(self.cuda_working.ok_or_else(invalid)?.operation_peak_for(
+                    rows.packed,
+                    task.adapter.as_ref().map_or(0, |a| {
+                        a.forward_working_bytes_for(backend, rows, RowDomain::Packed)
+                    }),
+                    bounded_qk,
+                )?);
             }
             peak = peak.max(plus(
                 plus(base, partition.resident()?)?,
@@ -1016,6 +1175,93 @@ mod tests {
         let expected = 2 * packed * 5376 * 2 + 11 * inner + 512 + packed * (8 * 96 + 64);
         assert_eq!(stock.operation_peak(packed).unwrap(), expected);
         assert_eq!(expected, 18_723_328_512);
+        // Actual failed packed geometry: one F32 Q/K buffer was 2,997,772,288 bytes.
+        // This checked plan limits EVERY new F32 RMS tile to 134,213,632 bytes instead.
+        let actual = 104_554;
+        let token_block = qk_precondition_token_block(1, 56, 128, actual, u64::MAX).unwrap();
+        assert_eq!(token_block, 4_681);
+        assert_eq!(token_block * 56 * 128 * 4, 134_213_632);
+        assert_eq!(actual.div_ceil(token_block), 23);
+        // Lower Q/K scratch must not hide the later norm2/FFN lifetime for a source
+        // with a wide hidden stream and small attention heads.
+        let wide_hidden = CudaWorkingSet {
+            hidden: 4096,
+            heads: 1,
+            head_dim: 8,
+            rotary_dim: 6,
+            ffn_inner: 1,
+            ..stock
+        };
+        assert!(
+            wide_hidden
+                .windowed_operation_peak_with_adapter(1, 0)
+                .unwrap()
+                >= 9 * 4096 * 2 + 4 * 4096
+        );
+        let one_layer_payload = payloads(&[100], &[10]);
+        let one_layer = WindowAllocation::from_resident_tensors(&one_layer_payload, &[], 0, false)
+            .unwrap()
+            .with_cuda_working_set(stock)
+            .unwrap();
+        let mut actual_rows = rows();
+        actual_rows.packed = actual;
+        let resident = one_layer
+            .denoise_resident_bytes(&task, cuda, actual_rows, 1)
+            .unwrap();
+        assert_eq!(
+            one_layer
+                .denoise_peak_bytes(&task, cuda, actual_rows, 1)
+                .unwrap(),
+            resident + stock.operation_peak(actual).unwrap(),
+            "even a one-layer Resident source retains its original full-width Q/K bound"
+        );
+        assert_eq!(
+            one_layer
+                .bounded_cuda_denoise_peak_bytes(&task, cuda, actual_rows, 1)
+                .unwrap(),
+            resident
+                + stock
+                    .windowed_operation_peak_with_adapter(actual, 0)
+                    .unwrap(),
+            "only explicit CUDA-window pricing uses bounded Q/K scratch"
+        );
+        let mlx = NativeBackend::Mlx { tile_columns: 256 };
+        assert!(one_layer
+            .bounded_cuda_denoise_peak_bytes(&task, mlx, actual_rows, 1)
+            .is_err());
+        assert_eq!(
+            one_layer
+                .denoise_peak_bytes(&task, mlx, actual_rows, 1)
+                .unwrap(),
+            WindowAllocation::from_resident_tensors(&one_layer_payload, &[], 0, false)
+                .unwrap()
+                .denoise_peak_bytes(&task, mlx, actual_rows, 1)
+                .unwrap(),
+            "CUDA working facts never change the existing MLX execution/pricing route"
+        );
+        println!(
+            "H3_QK_ALLOCATION_FACTS rows={actual} old={} bounded={} token_chunk={token_block}",
+            stock.operation_peak(actual).unwrap(),
+            stock
+                .windowed_operation_peak_with_adapter(actual, 0)
+                .unwrap()
+        );
+        assert!(
+            stock
+                .windowed_operation_peak_with_adapter(actual, 0)
+                .unwrap()
+                < stock.operation_peak(actual).unwrap()
+        );
+        assert_eq!(qk_precondition_token_block(2, 3, 128, 9, 1536).unwrap(), 2);
+        assert_eq!(qk_precondition_token_block(2, 3, 128, 9, 1535).unwrap(), 1);
+        for dims in [
+            (0, 3, 128, 9, 1536),
+            (2, 3, 128, 0, 1536),
+            (2, 3, 128, 9, 767),
+            (u64::MAX, 2, 128, 9, u64::MAX),
+        ] {
+            assert!(qk_precondition_token_block(dims.0, dims.1, dims.2, dims.3, dims.4).is_err());
+        }
         assert_eq!(
             CudaWorkingSet {
                 element_bytes: 4,

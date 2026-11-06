@@ -809,12 +809,21 @@ impl NativeAllocationFactsExt for NativeAllocationFacts {
                 Ok(peak.max(self.with_adapter_denoise(
                     task,
                     Self::task_rows(task, rows),
-                    profile.denoise_peak_bytes(
-                        task,
-                        self.backend,
-                        Self::task_rows(task, rows),
-                        window as usize,
-                    )?,
+                    if matches!(self.backend, NativeBackend::Candle { .. }) {
+                        profile.bounded_cuda_denoise_peak_bytes(
+                            task,
+                            self.backend,
+                            Self::task_rows(task, rows),
+                            window as usize,
+                        )?
+                    } else {
+                        profile.denoise_peak_bytes(
+                            task,
+                            self.backend,
+                            Self::task_rows(task, rows),
+                            window as usize,
+                        )?
+                    },
                 )))
             })
     }
@@ -872,19 +881,38 @@ impl NativeAllocationFactsExt for NativeAllocationFacts {
             .try_fold(0u64, |peak, task| {
                 let rows = Self::task_rows(task, rows);
                 if let Some(profile) = &task.window {
+                    let selected_window = window;
                     let window = window.map_or(profile.n_blocks(), |n| n as usize);
-                    let dense = self.with_adapter_denoise(
-                        task,
-                        rows,
-                        profile.denoise_peak_bytes(task, self.backend, rows, window)?,
-                    );
-                    Ok(peak.max(dense.max(profile.denoise_with_veda_bytes(
-                        task,
-                        self.backend,
-                        rows,
-                        window,
-                        veda,
-                    )?)))
+                    let (dense, with_veda) = if selected_window.is_some() {
+                        (
+                            profile.bounded_cuda_denoise_peak_bytes(
+                                task,
+                                self.backend,
+                                rows,
+                                window,
+                            )?,
+                            profile.bounded_cuda_denoise_with_veda_bytes(
+                                task,
+                                self.backend,
+                                rows,
+                                window,
+                                veda,
+                            )?,
+                        )
+                    } else {
+                        (
+                            profile.denoise_peak_bytes(task, self.backend, rows, window)?,
+                            profile.denoise_with_veda_bytes(
+                                task,
+                                self.backend,
+                                rows,
+                                window,
+                                veda,
+                            )?,
+                        )
+                    };
+                    let dense = self.with_adapter_denoise(task, rows, dense);
+                    Ok(peak.max(dense.max(with_veda)))
                 } else {
                     // An unstreamable native representation retains its resident route. Without
                     // explicit shared-buffer proof, charge the complete extra bound rather than0.
@@ -1481,6 +1509,22 @@ mod tests {
             .is_err());
         let precompute = facts.precompute_peak_bytes_windowed(rows, Some(1)).unwrap();
         let denoise = facts.denoise_peak_bytes_windowed(rows, Some(1)).unwrap();
+        let task = &facts.tasks[0];
+        let profile = task.window.as_ref().unwrap();
+        let old_resident = profile
+            .denoise_peak_bytes(task, CUDA, rows, profile.n_blocks())
+            .unwrap();
+        assert_eq!(
+            facts.denoise_peak_bytes_windowed(rows, None).unwrap(),
+            old_resident
+        );
+        assert_eq!(facts.denoise_peak_bytes(rows), old_resident);
+        assert_eq!(
+            denoise,
+            profile
+                .bounded_cuda_denoise_peak_bytes(task, CUDA, rows, 1)
+                .unwrap()
+        );
         assert!(facts.precompute_peak_bytes_windowed(rows, None).unwrap() > 10_000_000);
         let adapter = facts.tasks[0].adapter.take();
         assert_eq!(
