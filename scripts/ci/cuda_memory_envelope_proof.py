@@ -83,7 +83,8 @@ def run(output: Path, executable: Path, env: dict[str, str], *, claim=execution_
                 raise ValueError('exactly one positive allocator enforcement receipt required')
             evidence = json.loads(markers[0])
             if (not all(evidence.get(key) is True for key in
-                        ('overCapRefused', 'bothConstructors', 'cublasStreamResetRebound'))
+                        ('overCapRefused', 'bothConstructors', 'cublasStreamResetRebound',
+                         'fragmentationRecoveryExercised'))
                     or evidence.get('capBytes') != 536870912
                     or not 0 < evidence.get('reservedHighBytes', 0) <= evidence['capBytes']):
                 raise ValueError('allocator enforcement evidence is incomplete or outside its cap')

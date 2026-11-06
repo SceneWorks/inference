@@ -905,6 +905,76 @@
         "win32"
       ],
       "reason": "Header-only safetensors fixtures distinguish q4/q8/BF16 runtime scratch, consumed AdaLN operands, CPU preparation, and unsupported native migration. No payload tensors, model factory or learned execution."
+    },
+    {
+      "package": "candle-core",
+      "kind": "lib",
+      "target": "candle_core",
+      "test": "cuda_pool_recovery::tests::allocation_recovery_observes_then_trims_then_retries_once_without_changing_cap",
+      "source": "crates/media/candle-gen/vendor/candle-core/src/cuda_backend/proof_pool/recovery.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Exact allocator policy source compiled without CUDA; fake reclaim callbacks and integer byte counters test observation/trim/retry order, immutable caps, failure propagation and no retry loop. No tensor, device, learned forward or numerical kernel executes."
+    },
+    {
+      "package": "candle-core",
+      "kind": "lib",
+      "target": "candle_core",
+      "test": "cuda_pool_recovery::tests::allocation_recovery_does_not_attempt_to_fit_live_or_oversize_allocations",
+      "source": "crates/media/candle-gen/vendor/candle-core/src/cuda_backend/proof_pool/recovery.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Exact allocator policy source compiled without CUDA; fake reclaim callbacks and integer byte counters test observation/trim/retry order, immutable caps, failure propagation and no retry loop. No tensor, device, learned forward or numerical kernel executes."
+    },
+    {
+      "package": "candle-core",
+      "kind": "lib",
+      "target": "candle_core",
+      "test": "cuda_pool_recovery::tests::allocation_recovery_propagates_observation_and_trim_failures_without_retry",
+      "source": "crates/media/candle-gen/vendor/candle-core/src/cuda_backend/proof_pool/recovery.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Exact allocator policy source compiled without CUDA; fake reclaim callbacks and integer byte counters test observation/trim/retry order, immutable caps, failure propagation and no retry loop. No tensor, device, learned forward or numerical kernel executes."
+    },
+    {
+      "package": "candle-core",
+      "kind": "lib",
+      "target": "candle_core",
+      "test": "cuda_pool_recovery::tests::allocation_recovery_refuses_changed_pool_and_does_not_loop_on_retry_failure",
+      "source": "crates/media/candle-gen/vendor/candle-core/src/cuda_backend/proof_pool/recovery.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Exact allocator policy source compiled without CUDA; fake reclaim callbacks and integer byte counters test observation/trim/retry order, immutable caps, failure propagation and no retry loop. No tensor, device, learned forward or numerical kernel executes."
+    },
+    {
+      "package": "candle-core",
+      "kind": "lib",
+      "target": "candle_core",
+      "test": "cuda_pool_recovery::tests::allocation_recovery_rechecks_live_bytes_after_trim_before_retry",
+      "source": "crates/media/candle-gen/vendor/candle-core/src/cuda_backend/proof_pool/recovery.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Exact allocator policy source compiled without CUDA; fake reclaim callbacks and integer byte counters test observation/trim/retry order, immutable caps, failure propagation and no retry loop. No tensor, device, learned forward or numerical kernel executes."
     }
   ]
 }

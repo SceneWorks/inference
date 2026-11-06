@@ -48,6 +48,10 @@ class AllocatorLauncherTests(unittest.TestCase):
         self.exercise(verified=False, error=ValueError)
         self.exercise(valid_evidence=False, error=ValueError)
 
+    def test_missing_or_false_recovery_witness_cannot_pass(self):
+        self.exercise(recovery=None, error=ValueError)
+        self.exercise(recovery=False, error=ValueError)
+
     def test_invalid_binding_refuses_before_any_claim_or_launch(self):
         for key, value in [('CUDA_VISIBLE_DEVICES', '0'), ('SCENEWORKS_GPU_ID', '0'),
                            ('SCENEWORKS_CUDA_PROOF_POOL_BYTES', '1')]:
@@ -58,7 +62,7 @@ class AllocatorLauncherTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     proof.run(Path(temporary), Path('MOCK.exe'), env, claim=unexpected, supervise=unexpected)
 
-    def exercise(self, *, returncode=0, fault=None, error=None, verified=True, valid_evidence=True):
+    def exercise(self, *, returncode=0, fault=None, error=None, verified=True, valid_evidence=True, recovery=True):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             states = []
@@ -85,6 +89,8 @@ class AllocatorLauncherTests(unittest.TestCase):
                 evidence = {'overCapRefused': valid_evidence, 'bothConstructors': True,
                             'cublasStreamResetRebound': True, 'capBytes': 536870912,
                             'reservedHighBytes': 536870912}
+                if recovery is not None:
+                    evidence['fragmentationRecoveryExercised'] = recovery
                 kwargs['stdout_path'].write_text('test result: ok. 1 passed; 0 failed; 0 ignored\n'
                                                 + 'CUDA_PROOF_POOL_EVIDENCE ' + json.dumps(evidence) + '\n', encoding='utf-8')
                 return RunResult(123, returncode, 1, None, 2, None, 0.1, (), {'MOCK': True})

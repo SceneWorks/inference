@@ -278,6 +278,26 @@ its own root manifest patches it to this directory — and upstream `1e6aa85e` h
 candle-core = { git = "https://github.com/SceneWorks/inference", rev = "<the pinned inference rev>" }
 ```
 
+## SW-F329: capped-pool allocation OOM recovery
+
+Only an explicitly installed private proof pool enables the extra allocator path.
+Without that pool, `CudaDevice::{alloc,alloc_zeros,clone_htod}` keep the original raw
+stream calls and arguments. Constructors, RNG, operators, kernels and numerical
+modes are unchanged. On a driver allocation OOM, the capped path records requested
+bytes and current/cumulative pool counters before unwind, excludes graph capture,
+trims only unused backing in that same pool and retries once only when
+checked live bytes plus the request fit the original cap. It never raises/replaces
+the pool or resets its watermarks. Non-OOM and observation/trim/retry errors propagate. It performs no context or
+stream synchronization: pending frees can remain outstanding and cause refusal,
+without invalidating capture on another stream.
+
+The ignored 512 MiB allocator proof must exercise a real recovered cross-stream OOM
+and over-cap refusal. Its temporary reuse/retention attributes are restored before
+assertions. This establishes the allocator mechanism, not an actual 24 GiB model fit
+or a physical smaller-GPU performance claim; those require dedicated validation.
+See NVIDIA CUDA 12.9 `cuMemPoolTrimTo`: asynchronously freed storage can remain
+outstanding until synchronization, and live backing cannot be released.
+
 ## MAINTENANCE — re-vendor on every candle pin bump
 
 `scripts/bump_pins.py` refuses a candle bump while this copy exists. To bump:
