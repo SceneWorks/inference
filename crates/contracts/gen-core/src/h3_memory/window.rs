@@ -122,6 +122,9 @@ impl CudaWorkingSet {
         )
     }
     fn operation_peak(self, rows: u64) -> Result<u64> {
+        self.operation_peak_with_adapter(rows, 0)
+    }
+    fn operation_peak_with_adapter(self, rows: u64, adapter_work: u64) -> Result<u64> {
         let hidden = times(times(rows, self.hidden)?, self.element_bytes)?;
         let inner = times(
             times(times(rows, self.heads)?, self.head_dim)?,
@@ -155,6 +158,10 @@ impl CudaWorkingSet {
                 .max(fused)
                 .max(output_projection),
         )?;
+        // Residual adapters execute INSIDE a projection, never during later Q/K RMS,
+        // rotary or SDPA. The larger to_out envelope (QKV + SDPA/merged outputs + base
+        // hidden output) also covers earlier Q/K/V projections retaining prior outputs.
+        let adapted_projection = plus(plus(times(2, hidden)?, output_projection)?, adapter_work)?;
         // SwiGLU chunks bound the expanded projection. Prior output spans and final cat
         // coexist with full hidden input; token-axis chunking never changes the key domain.
         let ffn = plus(
@@ -168,7 +175,10 @@ impl CudaWorkingSet {
         )?;
         plus(
             plus(
-                attention.max(ffn).max(times(8, hidden)?),
+                attention
+                    .max(adapted_projection)
+                    .max(plus(ffn, adapter_work)?)
+                    .max(times(8, hidden)?),
                 self.attention_tables_bytes(rows)?,
             )?,
             self.projection_decode_bytes,
@@ -398,6 +408,36 @@ impl WindowAllocation {
                 .map(|layer| layer.body.resident())
                 .collect::<Result<Vec<_>>>()?],
         })
+    }
+
+    /// CUDA prepares/folds all adapter factors on the HOST before prepare_streamed moves
+    /// root/refiner and the current body window. The per-copy prepared caches are independently
+    /// owned and drop with that window. Ordinary clones retain their existing shared semantics.
+    pub fn adapter_resident_bytes(
+        &self,
+        task: &NativeTaskAllocation,
+        backend: NativeBackend,
+        window: usize,
+    ) -> Result<u64> {
+        let plan = self.plan(backend, window)?;
+        let Some(adapter) = &task.adapter else {
+            return Ok(0);
+        };
+        let mut root = 0;
+        let mut blocks = vec![0; self.layers.len()];
+        for projection in &adapter.projections {
+            let dest = match locate(&projection.target.path)? {
+                Location::Root => &mut root,
+                Location::Body(i) => blocks.get_mut(i).ok_or_else(invalid)?,
+                Location::Adaln(_) => return Err(invalid()), // not adapter-addressable
+            };
+            *dest = plus(*dest, projection.resident_bytes)?;
+        }
+        let peak = plan.windows().try_fold(root, |peak, range| {
+            let body = blocks[range].iter().try_fold(0, |n, &b| plus(n, b))?;
+            Ok(peak.max(plus(root, body)?))
+        });
+        peak
     }
 
     /// Resident-only counterpart for the ordinary native weight floor. Includes root/refiner,
@@ -700,7 +740,12 @@ impl WindowAllocation {
                 work = work.max(
                     self.cuda_working
                         .ok_or_else(invalid)?
-                        .operation_peak(rows.packed)?,
+                        .operation_peak_with_adapter(
+                            rows.packed,
+                            task.adapter.as_ref().map_or(0, |a| {
+                                a.forward_working_bytes_for(backend, rows, RowDomain::Packed)
+                            }),
+                        )?,
                 );
             }
             peak = peak.max(plus(

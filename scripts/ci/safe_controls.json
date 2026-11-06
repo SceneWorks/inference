@@ -863,6 +863,20 @@
         "win32"
       ],
       "reason": "CPU Tensor construction/readback and Arc/Weak ownership only, with directly seeded frozen factor caches. No learned forward, matmul, factor preparation, numeric model operation or accelerator work executes."
+    },
+    {
+      "package": "sceneworks-gen-core-h3",
+      "kind": "lib",
+      "target": "gen_core_h3",
+      "test": "h3_memory::tests::cuda_host_prepared_windows_scope_adapter_storage_and_projection_work",
+      "source": "crates/contracts/gen-core-h3/src/h3_memory.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Pure source-owned allocation arithmetic over synthetic byte counts and adapter metadata; verifies host-only install lifetimes, aligned device windows, disjoint projection/RMS work and unchanged MLX accounting. No tensor backend or learned execution."
     }
   ]
 }
