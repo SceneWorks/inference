@@ -1391,7 +1391,7 @@ mod tests {
         let curated = resolve_run_params(&schedule, &r).unwrap().sigmas;
         assert_eq!(
             curated,
-            resolve_flow_schedule(Some("simple"), 0.0, 8, &saved_then_zero())
+            mlx_gen::resolve_flow_schedule(Some("simple"), 0.0, 8, &saved_then_zero())
         );
         assert_ne!(curated, saved_then_zero());
     }
