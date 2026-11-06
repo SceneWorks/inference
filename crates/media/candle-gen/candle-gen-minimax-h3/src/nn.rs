@@ -122,20 +122,11 @@ pub fn sdpa_planned(
     let plan = attention_plan(cancel);
     let (b, h, sq, _) = q.dims4()?;
     let sk = k.dim(2)?;
-    let row = b
-        .checked_mul(h)
-        .and_then(|v| v.checked_mul(sk))
-        .ok_or_else(|| candle_gen::CandleError::Msg("H3 attention row size overflow".into()))?;
-    if row == 0 || row as u64 > plan.budget.max_score_elements() {
-        return Err(candle_gen::CandleError::Msg(
-            "H3 minimum materializing attention row exceeds selected workspace budget".into(),
-        ));
-    }
+    let (query_rows, score_elements) = materializing_chunk_shape(b, h, sq, sk, plan.budget)?;
     let force_materialized = force_materialized_attention();
     let kernel = candle_gen::fused_attention::select_attention_kernel(q, k, v, None);
     let materialized =
         force_materialized || matches!(kernel, candle_gen::AttentionKernel::Budgeted(_));
-    let query_rows = plan.budget.query_block_rows(row as u64, sq as u64);
     tracing::debug!(
         route = if materialized {
             "materialized-query-chunked"
@@ -169,24 +160,94 @@ pub fn sdpa_planned(
             plan,
         )
     }?;
-    ATTENTION_EXECUTION.with(|r| {
-        let mut r = r.borrow_mut();
-        if materialized {
-            r.materialized_calls += 1;
-        } else {
-            r.flash_calls += 1;
-        }
-        r.maximum_query_rows =
-            r.maximum_query_rows
-                .max(if materialized { query_rows } else { sq as u64 });
-        r.maximum_materialized_score_elements =
-            r.maximum_materialized_score_elements.max(if materialized {
-                query_rows * row as u64
-            } else {
-                0
-            });
-    });
+    record_attention_execution(
+        materialized,
+        if materialized { query_rows } else { sq as u64 },
+        if materialized { score_elements } else { 0 },
+    )?;
     Ok(out)
+}
+
+/// Masked TE attention always uses the shared materializing plan. Record its actual largest
+/// completed query chunk only after the entire operation succeeds, just like unmasked attention.
+pub(crate) fn sdpa_masked(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: &Tensor,
+) -> Result<Tensor> {
+    let plan = attention_plan(None);
+    let (b, h, sq, _) = q.dims4()?;
+    let (query_rows, score_elements) = materializing_chunk_shape(b, h, sq, k.dim(2)?, plan.budget)?;
+    let out = candle_gen::attention::sdpa_planned_bhsd(
+        q,
+        k,
+        v,
+        scale,
+        Some(mask),
+        candle_gen::candle_nn::ops::softmax_last_dim,
+        plan,
+    )?;
+    record_attention_execution(true, query_rows, score_elements)?;
+    tracing::debug!(
+        route = "materialized-query-chunked",
+        masked = true,
+        query_rows,
+        score_elements,
+        budget_score_elements = plan.budget.max_score_elements(),
+        "minimax-h3: completed attention route"
+    );
+    Ok(out)
+}
+
+/// Derive the executed chunk maximum using the same planner as shared SDPA. A ragged last
+/// chunk cannot exceed the first chunk; an all-rows call reports its actual size, not the budget.
+fn materializing_chunk_shape(
+    b: usize,
+    h: usize,
+    sq: usize,
+    sk: usize,
+    budget: AttentionBudget,
+) -> Result<(u64, u64)> {
+    let row = b
+        .checked_mul(h)
+        .and_then(|v| v.checked_mul(sk))
+        .ok_or_else(|| candle_gen::CandleError::Msg("H3 attention row size overflow".into()))?;
+    if row == 0 || sq == 0 || row as u64 > budget.max_score_elements() {
+        return Err(candle_gen::CandleError::Msg(
+            "H3 minimum materializing attention row exceeds selected workspace budget".into(),
+        ));
+    }
+    let query_rows = budget.query_block_rows(row as u64, sq as u64);
+    let score_elements = query_rows
+        .checked_mul(row as u64)
+        .ok_or_else(|| candle_gen::CandleError::Msg("H3 attention chunk size overflow".into()))?;
+    Ok((query_rows, score_elements))
+}
+
+fn record_attention_execution(
+    materialized: bool,
+    query_rows: u64,
+    score_elements: u64,
+) -> Result<()> {
+    ATTENTION_EXECUTION.with(|r| {
+        let mut current = r.borrow_mut();
+        let mut next = *current;
+        let counter = if materialized {
+            &mut next.materialized_calls
+        } else {
+            &mut next.flash_calls
+        };
+        *counter = counter.checked_add(1).ok_or_else(|| {
+            candle_gen::CandleError::Msg("H3 attention execution counter overflow".into())
+        })?;
+        next.maximum_query_rows = next.maximum_query_rows.max(query_rows);
+        next.maximum_materialized_score_elements =
+            next.maximum_materialized_score_elements.max(score_elements);
+        *current = next;
+        Ok(())
+    })
 }
 
 /// The exact score-element allowance shared by CUDA admission, masked TE attention and FFN
@@ -251,6 +312,45 @@ fn attention_plan(cancel: Option<&CancelFlag>) -> AttentionPlan<'_> {
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
+
+    #[test]
+    fn materializing_receipt_uses_actual_chunk_extent_and_refuses_unbounded_rows() {
+        let budget = AttentionBudget::from_score_elements(50, false);
+        // [B=1,H=2,Q=10,K=7]: 3-row chunks plus a one-row tail, not 50 score elements.
+        assert_eq!(
+            materializing_chunk_shape(1, 2, 10, 7, budget).unwrap(),
+            (3, 42)
+        );
+        assert_eq!(
+            materializing_chunk_shape(1, 2, 2, 7, budget).unwrap(),
+            (2, 28)
+        );
+        assert!(materializing_chunk_shape(1, 8, 2, 7, budget).is_err());
+        assert!(materializing_chunk_shape(usize::MAX, 2, 2, 7, budget).is_err());
+        assert!(materializing_chunk_shape(1, 2, 0, 7, budget).is_err());
+        assert!(materializing_chunk_shape(1, 2, 2, 0, budget).is_err());
+    }
+
+    #[test]
+    fn attention_receipt_counter_overflow_does_not_partially_update_the_report() {
+        reset_attention_execution_report();
+        record_attention_execution(true, 3, 42).unwrap();
+        record_attention_execution(false, 10, 0).unwrap();
+        assert_eq!(
+            attention_execution_report(),
+            AttentionExecutionReport {
+                flash_calls: 1,
+                materialized_calls: 1,
+                maximum_query_rows: 10,
+                maximum_materialized_score_elements: 42,
+            }
+        );
+        ATTENTION_EXECUTION.with(|r| r.borrow_mut().materialized_calls = u64::MAX);
+        let before = attention_execution_report();
+        assert!(record_attention_execution(true, 100, 1000).is_err());
+        assert_eq!(attention_execution_report(), before);
+        reset_attention_execution_report();
+    }
 
     /// The request flag reaches the plan the budgeted fallback checks between query chunks.
     #[test]

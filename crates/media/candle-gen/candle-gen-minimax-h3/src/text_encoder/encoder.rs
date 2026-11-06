@@ -27,8 +27,8 @@
 //! # This lane materializes attention scores; MLX's does not
 //!
 //! MLX calls a fused `scaled_dot_product_attention` that streams the scores. candle has no such
-//! kernel, so attention routes through `candle_gen::sdpa_budgeted_bhsd` with the shared
-//! `ATTN_SCORES_BUDGET`. At **64 heads** the `[1, 64, S, S]` score tensor crosses `i32::MAX` at
+//! masked kernel, so attention routes through [`crate::nn::sdpa_masked`] and the shared
+//! materializing attention plan. At **64 heads** the `[1, 64, S, S]` score tensor crosses `i32::MAX` at
 //! S ≈ 5793 — well inside the presentation lengths a long `fl2va` prompt with two keyframe vision
 //! blocks can reach — so the budgeted split is load-bearing here, not a precaution.
 
@@ -213,15 +213,7 @@ impl Qwen3Attention {
         let v = repeat_kv(&v, groups)?;
 
         let scale = (hd as f64).powf(-0.5);
-        let o = candle_gen::sdpa_budgeted_bhsd(
-            &q,
-            &k,
-            &v,
-            scale,
-            Some(mask),
-            candle_gen::candle_nn::ops::softmax_last_dim,
-            crate::nn::attention_budget().max_score_elements() as usize,
-        )?;
+        let o = crate::nn::sdpa_masked(&q, &k, &v, scale, mask)?;
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
         self.o_proj.forward(&o)
     }
