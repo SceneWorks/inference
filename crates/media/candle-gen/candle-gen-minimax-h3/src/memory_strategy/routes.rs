@@ -14,7 +14,10 @@ pub(super) fn validate_decode(edge: u32, overlap: u32) -> candle_gen::gen_core::
     Ok(())
 }
 
-pub(super) fn route_gate(context: &MemoryRunContext) -> candle_gen::gen_core::Result<()> {
+pub(super) fn route_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> candle_gen::gen_core::Result<()> {
     let g = context.geometry;
     let stride = crate::pipeline::SPATIAL_STRIDE;
     if context.use_pid
@@ -35,6 +38,32 @@ pub(super) fn route_gate(context: &MemoryRunContext) -> candle_gen::gen_core::Re
         context.selection.parameters.decode_overlap,
     ) {
         validate_decode(edge, overlap)?;
+    }
+    if let Some(elements) = context.selection.parameters.attention_chunk_size {
+        // Necessary geometry-only lower bound. The product subsequently prices the complete
+        // prompt/reference/source request; an unsupported minimum row must never be advertised
+        // as a working bounded selection merely because its generic budget scalar fits.
+        let request = candle_gen::gen_core::GenerationRequest {
+            width: g.width,
+            height: g.height,
+            frames: Some(g.frames),
+            count: g.batch,
+            ..Default::default()
+        };
+        let (rows, _) = gen_core_h3::veda::workspace::h3_row_bound((&request).into())?;
+        let heads = contract
+            .architecture_facts
+            .attention_heads
+            .map_or(56, u64::from);
+        if rows
+            .checked_mul(heads)
+            .is_none_or(|row| row > u64::from(elements))
+        {
+            return Err(CoreError::Unsupported(
+                "minimax_h3: minimum materializing attention row exceeds selected workspace budget"
+                    .into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -65,9 +94,15 @@ pub fn registered_fixture(
     .into_iter()
     .map(|(mode, reference_count)| {
         let calibration = contract.calibration.as_ref();
+        let mut selection = contract.representative_selection(strategy, tier, false)?;
+        if selection.parameters.attention_chunk_size.is_some() {
+            selection.parameters.attention_chunk_size = contract
+                .capability(MemoryStrategy::BoundedAttention)
+                .and_then(|cap| cap.parameters.attention_chunk_sizes.last().copied());
+        }
         let context = MemoryRunContext {
             reference_resources: None,
-            selection: contract.representative_selection(strategy, tier, false)?,
+            selection,
             optimization_authority: MemoryOptimizationAuthority::Estimated,
             calibration_abi: candle_gen::gen_core::MEMORY_CALIBRATION_ABI,
             calibration_fingerprint: calibration

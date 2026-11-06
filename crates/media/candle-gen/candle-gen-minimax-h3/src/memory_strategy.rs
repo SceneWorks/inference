@@ -1356,11 +1356,11 @@ pub fn safety_check(
 }
 
 fn profile_route_gate(
-    _contract: &MemoryProviderContract,
+    contract: &MemoryProviderContract,
     context: &MemoryRunContext,
     _tier: candle_gen::gen_core::MemoryNumericTier,
 ) -> candle_gen::gen_core::Result<()> {
-    routes::route_gate(context)
+    routes::route_gate(contract, context)
 }
 
 pub fn safety_check_loaded(
@@ -1371,7 +1371,7 @@ pub fn safety_check_loaded(
         contract,
         context,
         None,
-        Some(&|| routes::route_gate(context)),
+        Some(&|| routes::route_gate(contract, context)),
     )
 }
 
@@ -2347,6 +2347,30 @@ mod tests {
                 "{strategy:?} requires its own parameter domain"
             );
         }
+        let mut run = routes::registered_fixture(
+            &weightless_spec(),
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap()
+        .remove(0)
+        .context;
+        run.geometry.frames = 345;
+        run.selection.parameters.attention_chunk_size = Some(1048576);
+        assert!(matches!(
+            safety_check(&weightless_spec(), &contract, &run),
+            MemorySafetyDecision::Reject { .. }
+        ));
+        run.selection.parameters.attention_chunk_size = Some(33554432);
+        assert_eq!(
+            safety_check(&weightless_spec(), &contract, &run),
+            MemorySafetyDecision::Accept
+        );
+        run.evidence_revision = "older-pin-provenance-is-advisory".into();
+        assert_eq!(
+            safety_check(&weightless_spec(), &contract, &run),
+            MemorySafetyDecision::Accept
+        );
     }
 
     // --- AC4: measured asset facts --------------------------------------------------------------

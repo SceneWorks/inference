@@ -246,7 +246,15 @@ pub fn host_peak_bytes(
         candle_gen::gen_core::veda::workspace::Backend::Cuda,
     )?
     .map_or(0, |bound| bound.host_peak_bytes());
-    let adapters = adapter_source_bytes(spec)?;
+    let adapters = if spec.adapters.is_empty() {
+        0
+    } else {
+        let allocation = super::dit_allocation(dit, false)?;
+        let profile = super::adapters::profile(dit, &spec.adapters, &allocation.projections)?;
+        // Includes installed originals/prepared caches and source-file install transients;
+        // file length alone misses F32 factors and the first-forward prepared representation.
+        profile.install_peak_bytes.max(profile.resident_bytes)
+    };
     let media = u64::from(req.width)
         .checked_mul(u64::from(req.height))
         .and_then(|v| v.checked_mul(u64::from(req.frames)))

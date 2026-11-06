@@ -1,8 +1,9 @@
-//! MLX native H3 deferred-DiT residency. Source: `block_stream.rs::{DitBlockStream,
+//! Native H3 deferred-DiT residency. MLX source: `block_stream.rs::{DitBlockStream,
 //! precompute_adaln_windowed}` and `dit/model.rs::{load_dir_deferred,new_windowed,
 //! forward_windowed}`. Fresh weights views and forced carried state bound each ACTUAL aligned
 //! BlockPlan window; refiner/root tensors are not streamed. This is structural arithmetic, not a
-//! measured peak and not permission to advertise Candle streaming.
+//! measured peak. CUDA eligibility additionally requires source-owned `CudaWorkingSet`
+//! facts matching its eager prepared-host/body-transfer loader and bounded attention/FFN.
 
 use std::collections::{BTreeMap, BTreeSet};
 

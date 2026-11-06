@@ -653,6 +653,202 @@
         "win32"
       ],
       "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "h3_memory::window::tests::cuda_dense_windows_price_real_geometry_without_native_descriptors",
+      "source": "crates/contracts/gen-core/src/h3_memory/window.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Pure allocation arithmetic and fake payload sizes; no Tensor, learned model, numerical kernel or device work executes."
+    },
+    {
+      "package": "sceneworks-gen-core-h3",
+      "kind": "lib",
+      "target": "gen_core_h3",
+      "test": "veda::workspace::tests::cuda_pool_boundaries_are_independent_and_phases_are_alternatives",
+      "source": "crates/contracts/gen-core-h3/src/veda/workspace.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Pure source-bound arithmetic checks independent host/device budgets, reserve equality and shared QKV lifetime composition; no tensors or inference."
+    },
+    {
+      "package": "sceneworks-gen-core-h3",
+      "kind": "lib",
+      "target": "gen_core_h3",
+      "test": "veda::workspace::tests::constrained_materializing_fallback_prices_the_runtime_score_domain",
+      "source": "crates/contracts/gen-core-h3/src/veda/workspace.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Request geometry, immutable plan metadata and score-domain arithmetic only; no predictor weights or attention kernel execute."
+    },
+    {
+      "package": "sceneworks-gen-core-h3",
+      "kind": "lib",
+      "target": "gen_core_h3",
+      "test": "veda::workspace::tests::unknown_and_overflowing_raw_allocation_facts_are_not_zero",
+      "source": "crates/contracts/gen-core-h3/src/veda/workspace.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Malformed allocation metadata and checked arithmetic refusal only; no Tensor, model, numerical kernel or accelerator work."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::streaming::tests::header_inventory_prices_cuda_text_windows_and_host_embedding_separately",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy/streaming.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Tiny safetensors headers/data-file sizing only; no tensor/model constructor, learned forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::routes::tests::request_scope_applies_parameters_and_cleans_up_on_failure",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy/routes.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free contract and lifecycle scope config, request fields and thread-local cleanup. CPU device used solely as inert synchronization handle; no model executes."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::optimized_rungs_match_executable_load_shape",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::load_shape_tracks_the_owned_loader_contract",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::estimated_optimized_routes_do_not_require_measurement_identity",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::candle_contract_preserves_backend_and_allocation_identity",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::lifecycle_hooks_have_executable_phase_mechanisms",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::parameter_ranges_are_owned_by_the_rung_that_consumes_them",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::each_contract_mutation_is_independently_detected",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::fixture_contract_conforms_weights_free",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
     }
   ]
 }
