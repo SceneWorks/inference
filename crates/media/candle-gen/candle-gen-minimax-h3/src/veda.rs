@@ -566,15 +566,24 @@ fn tile(x: &Tensor, b: usize, heads: &[usize], l: &Layout) -> Result<Tensor> {
     let (_, all, _, dim) = x.dims4()?;
     // Select the bounded head batch BEFORE allocating. A strided sample view may
     // cover the entire layer, so making it contiguous first defeats head batching.
-    let mut a = x.get(b)?;
-    if heads.len() != all || heads.iter().enumerate().any(|(i, &h)| i != h) {
-        let ids = Tensor::from_vec(
-            heads.iter().map(|&h| h as u32).collect::<Vec<_>>(),
-            heads.len(),
-            x.device(),
-        )?;
-        a = a.index_select(&ids, 0)?;
-    }
+    let sample = x.get(b)?;
+    let a = if sample.is_contiguous()
+        && heads.len() == all
+        && heads.iter().enumerate().all(|(i, &h)| i == h)
+    {
+        sample
+    } else {
+        // CUDA index_select requires contiguous input, but production QKV are BSHD
+        // projections transposed to BHSD. Cat copies the selected narrow VIEWS directly
+        // through copy_strided_src into one bounded head-batch allocation. Never copy the
+        // full sample before selection. Singleton cat returns a view, hence contiguous here;
+        // multi-head cat already owns contiguous storage and this call adds no second copy.
+        let selected = heads
+            .iter()
+            .map(|&head| sample.narrow(0, head, 1))
+            .collect::<candle_gen::candle_core::Result<Vec<_>>>()?;
+        Tensor::cat(&selected, 0)?.contiguous()?
+    };
     let perm = Tensor::from_vec(
         l.perm.iter().map(|&x| x.max(0) as u32).collect::<Vec<_>>(),
         l.perm.len(),
@@ -1634,6 +1643,22 @@ mod tests {
     #[ignore = "model inference; explicit model workflow only"]
     fn actual_cuda_kernel_gate() {
         let dev = Device::new_cuda(0).expect("S3 requires an exclusively admitted CUDA device");
+        // Exactly the production DitAttention layout: contiguous BSHD projections, then
+        // transpose to BHSD without making the complete QKV tensors contiguous again.
+        let production_view = |x: &Tensor| {
+            let view = x
+                .transpose(1, 2)
+                .unwrap()
+                .contiguous()
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+            assert!(
+                !view.is_contiguous(),
+                "the production-layout regression must be strided"
+            );
+            view
+        };
         for dtype in [DType::BF16, DType::F16] {
             for dim in [16, 128] {
                 device_self_test(&dev, dtype, dim).unwrap();
@@ -1669,6 +1694,13 @@ mod tests {
                     batched_scoring_failures(&r, &q, &k)
                         .into_iter()
                         .map(|f| format!("{dtype:?} H{heads} D{dim} {f}")),
+                );
+                // Includes full batches, single-head sub-batches, reordered mixed-shape
+                // heads and production-width D128, each against the same host contract.
+                failures.extend(
+                    batched_scoring_failures(&r, &production_view(&q), &production_view(&k))
+                        .into_iter()
+                        .map(|f| format!("strided {dtype:?} H{heads} D{dim} {f}")),
                 );
             }
             let report = ReportSink::default();
@@ -1736,6 +1768,26 @@ mod tests {
             assert!(report.borrow().selected_token_pairs < report.borrow().dense_token_pairs);
             assert_eq!(report.borrow().kernel.as_deref(), Some(KERNEL));
             assert!(r.tested.borrow().is_some());
+            let strided_report = ReportSink::default();
+            let strided = runtime(&dev, strided_report.clone());
+            let (sq, sk, sv) = (
+                production_view(&q),
+                production_view(&k),
+                production_view(&v),
+            );
+            let sparse = strided.attention(0, 0, &sq, &sk, &sv, 0.25).unwrap();
+            let oracle = masked_dense_oracle(&strided, 0, &sq, &sk, &sv, 0.25);
+            check(
+                "production-transposed",
+                &strided,
+                sparse,
+                oracle,
+                &mut failures,
+            );
+            assert_eq!(strided_report.borrow().sparse_calls, 1);
+            assert_eq!(strided_report.borrow().dense_calls, 0);
+            assert_eq!(strided_report.borrow().kernel.as_deref(), Some(KERNEL));
+            assert!(strided_report.borrow().fallback_reason.is_none());
             r.request.full_attention_steps = vec![1];
             let full = r.attention(0, 1, &q, &k, &v, 0.25).unwrap();
             let dense = crate::nn::sdpa(&q, &k, &v, 0.25).unwrap();
@@ -1891,6 +1943,7 @@ mod tests {
                     "exact_scorer_and_masks":true, "tiled_kernel_bits_equal_pointer_v1":true,
                     "forced_failure_dense":true, "unsupported_dtype_dense":true,
                     "intentional_dense_identity":true,
+                    "production_transposed_sparse_calls":strided_report.borrow().sparse_calls,
                 })
             );
         }
