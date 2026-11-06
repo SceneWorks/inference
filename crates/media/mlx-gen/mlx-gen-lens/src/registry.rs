@@ -684,7 +684,7 @@ impl LensGenerator {
                         .heavy
                         .resolve_sigmas(latent_h, latent_w, steps, req.scheduler.as_deref());
                 let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
-                    None,
+                    req.scheduler.as_deref(),
                     req.scheduler_shift,
                     mlx_gen::gen_core::sampling::compute_mu(latent_h * latent_w, steps),
                     steps,

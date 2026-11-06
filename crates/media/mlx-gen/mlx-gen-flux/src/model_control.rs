@@ -273,7 +273,7 @@ impl Flux1DevControl {
             req.scheduler.as_deref(),
         )?;
         let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
-            None,
+            req.scheduler.as_deref(),
             req.scheduler_shift,
             crate::pipeline::linear_sigma_mu(req.width, req.height, true),
             steps,

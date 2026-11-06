@@ -412,7 +412,7 @@ mod tests {
     /// The base differs from Turbo where it must (CFG support, distinct id) and agrees on the shared
     /// envelope (family/backend/modality/size). Turbo must stay guidance-distilled (untouched).
     #[test]
-    fn base_differs_from_turbo_only_in_cfg() {
+    fn base_and_turbo_expose_cfg_with_distinct_native_defaults() {
         let base = descriptor();
         let turbo = crate::descriptor();
         assert_eq!(base.family, turbo.family);
@@ -421,10 +421,10 @@ mod tests {
         assert_eq!(base.capabilities.min_size, turbo.capabilities.min_size);
         assert_eq!(base.capabilities.max_size, turbo.capabilities.max_size);
         assert_ne!(base.id, turbo.id);
-        // Turbo is guidance-distilled (CFG off); base is full-CFG. Turbo untouched by sc-8414.
-        assert!(!turbo.capabilities.supports_guidance);
+        // Both accept CFG; the Turbo default remains guidance-off.
+        assert!(turbo.capabilities.supports_guidance);
         assert!(base.capabilities.supports_guidance);
-        assert!(!turbo.capabilities.supports_negative_prompt);
+        assert!(turbo.capabilities.supports_negative_prompt);
         assert!(base.capabilities.supports_negative_prompt);
     }
 

@@ -971,7 +971,7 @@ impl Chroma {
         // achieved capture σ and truncate the denoise.
         let sigmas = self.build_schedule(req.width, req.height, steps, req.scheduler.as_deref())?;
         let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
-            None,
+            req.scheduler.as_deref(),
             req.scheduler_shift,
             self.variant.sigma_shift().ln(),
             steps as usize,

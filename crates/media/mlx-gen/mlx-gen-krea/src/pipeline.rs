@@ -818,7 +818,7 @@ impl KreaHeavy {
         plan.guidance = req.guidance.unwrap_or(0.0);
         let native = turbo_schedule(steps, req.scheduler.as_deref());
         plan.sigmas = Some(mlx_gen::resolve_flow_schedule_with_shift(
-            None,
+            req.scheduler.as_deref(),
             req.scheduler_shift,
             TURBO_MU as f32,
             steps,

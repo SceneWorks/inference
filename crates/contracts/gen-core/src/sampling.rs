@@ -116,6 +116,20 @@ mod flow_shift_tests {
         let shifted =
             flow_schedule_with_shift(Some("normal"), 3.0_f32.ln(), Some(6.0), 2, &native).unwrap();
         assert_ne!(original, shifted);
+        for scheduler in ["normal", "karras", "exponential", "sgm_uniform"] {
+            let prior =
+                flow_schedule_with_shift(Some(scheduler), 3.0_f32.ln(), None, 8, &native).unwrap();
+            let from_prior =
+                flow_schedule_with_shift(Some(scheduler), 3.0_f32.ln(), Some(6.0), 8, &prior)
+                    .unwrap();
+            let direct =
+                flow_schedule_with_shift(Some(scheduler), 3.0_f32.ln(), Some(6.0), 8, &native)
+                    .unwrap();
+            assert_eq!(
+                from_prior, direct,
+                "{scheduler} must be built at the requested shift"
+            );
+        }
         for invalid in [0.0, -1.0, f32::INFINITY, f32::NAN] {
             assert!(flow_schedule_with_shift(None, 0.0, Some(invalid), 2, &native).is_err());
         }

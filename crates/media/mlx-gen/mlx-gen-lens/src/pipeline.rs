@@ -767,7 +767,7 @@ impl LensHeavy {
         // unknown name returns this native schedule verbatim.
         let native = self.resolve_sigmas(latent_h, latent_w, num_steps, scheduler_name);
         let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
-            None,
+            scheduler_name,
             scheduler_shift,
             compute_mu(latent_h * latent_w, num_steps),
             num_steps,

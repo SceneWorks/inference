@@ -1336,7 +1336,7 @@ impl Krea {
             crate::schedule::TURBO_MU as f32
         };
         let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
-            None,
+            req.scheduler.as_deref(),
             req.scheduler_shift,
             native_mu,
             steps,
@@ -1439,7 +1439,7 @@ impl Krea {
                 let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
                 let native = base_schedule(total, req.width, req.height, req.scheduler.as_deref());
                 Ok(mlx_gen::resolve_flow_schedule_with_shift(
-                    None,
+                    req.scheduler.as_deref(),
                     req.scheduler_shift,
                     crate::schedule::dynamic_mu((req.width / 16 * (req.height / 16)) as f64) as f32,
                     total,

@@ -154,8 +154,8 @@ fn turbo_generates_via_registry() {
         .expect("registry load boogu_image_turbo");
     assert_eq!(g.descriptor().id, "boogu_image_turbo");
     assert!(
-        !g.descriptor().capabilities.supports_guidance,
-        "turbo is CFG-free"
+        g.descriptor().capabilities.supports_guidance,
+        "Turbo permits experimental CFG while retaining its CFG-off default"
     );
 
     let (res, steps) = (256u32, 4u32);

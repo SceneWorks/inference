@@ -476,7 +476,7 @@ pub(crate) fn stage_encode_edit(
             let cond = encode_image_instruction_parts(
                 &text.tok, &text.te, edit, references, preflight, device,
             )?;
-            let uncond = if req.guidance.unwrap_or(DEFAULT_GUIDANCE) > 1.0 {
+            let uncond = if req.guidance.unwrap_or(DEFAULT_GUIDANCE) != 1.0 {
                 let negative = preflight.negative.as_ref().ok_or_else(|| {
                     CandleError::Msg(
                         "boogu edit: CFG-negative conditioning was not admitted".into(),
@@ -643,11 +643,16 @@ pub(crate) fn stage_denoise_turbo(
                 Some(&preview_hook),
                 |x, timestep| {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                    Ok(heavy
-                        .dit
-                        .forward(x, &t, &cond)?
-                        .to_dtype(DType::F32)?
-                        .neg()?)
+                    Ok(turbo_prediction(
+                        &heavy.dit,
+                        x,
+                        &t,
+                        &cond,
+                        uncond.as_ref(),
+                        req.guidance.unwrap_or(0.0),
+                    )?
+                    .to_dtype(DType::F32)?
+                    .neg()?)
                 },
             )
         });
