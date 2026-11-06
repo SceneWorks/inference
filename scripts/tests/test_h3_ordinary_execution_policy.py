@@ -432,6 +432,7 @@ DISCOVERY_SIGNALS = [
 # Modules whose ignored model tests use explicit real-weight/native proof routes,
 # including model-inference-proofs.yml, not the synthetic H3 routes above.
 REAL_WEIGHT_MODULES = {
+    ("candle", "text_encoder::encoder::residency_te"),
     ("mlx", "adaln_cold_start"),
     ("mlx", "adaln_evict_real_weights"),
     ("mlx", "audio_vae_encode_parity"),

@@ -43,6 +43,10 @@ use crate::nn::{rms_weighted, silu};
 
 use super::{MiniMaxH3TeConfig, TE_COMPUTE_DTYPE};
 
+#[cfg(all(feature = "cuda", feature = "model-inference-proof"))]
+#[cfg(test)]
+mod residency_te;
+
 /// Longest presentation the pre-built 1-D RoPE table covers.
 ///
 /// The text path reads a prefix of a table built once at load. 16384 is ~4x the longest prompt the

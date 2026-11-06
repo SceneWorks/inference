@@ -310914,5 +310914,139 @@
     "optional_environment": [
       "H3_RESIDENCY_COMPONENT_MANIFEST"
     ]
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "text_encoder::encoder::residency_te::production_prompt_resident_window_first_difference",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/text_encoder/encoder/residency_te.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Actual accepted q4 TE + original588-token prompt and BASE tokenizer; frozen manifest SHA2562bad494f27a89b6770f98fb0858ed1d89620cbc452716bcbd44a562dc92df113, accepted CGPU/M4 staging receipt SHA256a58d6f7e2d2655a5537b5f7deac02fb95694d5e0a1ec1d47161a14801223d6dd. All16 consumed model/config/tokenizer assets and request bytes verified before CUDA/model preparation. Same32MiB resident/direct versus canonicalCPU-prepared/window1 layer pairs and independent runtime tables; librarydefault resident context observational only.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/text_encoder/encoder/residency_te.rs::text_encoder::encoder::residency_te::production_prompt_resident_window_first_difference",
+    "required_environment": [
+      "MODEL_PROOF_OUTPUT_DIR"
+    ],
+    "external_asset_environment": [
+      "H3_RESIDENCY_TE_MANIFEST"
+    ],
+    "device_witness": "Actual completed learned F32 TE projections on CUDA;50 same-policy layer pairs plus50 default-resident layers,150 masked-attention calls, one late exact BODY after all metrics and assertions.",
+    "output_contract": "Every-element F32 metrics/hashes for independently built runtime tables/initialembedding and each50layer input/output/fullcontext, first-difference index, actual packed preparation/norm identities. Exact same-policy diagnostic requirement; default32 workspace contrast finite and observational without invented tolerance. Bounded isolated4MiB readback; source-derived pre-compute32GiB diagnostic planning (not a product fit claim).",
+    "configuration_controls": [
+      "SCENEWORKS_CUDA_PROOF_POOL_BYTES"
+    ],
+    "default_configuration": "fixed_cuda",
+    "configuration_kind": "source-controls",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/text_encoder/encoder/residency_te.rs::text_encoder::encoder::residency_te::production_prompt_resident_window_first_difference/fixed_cuda",
+        "environment": {
+          "SCENEWORKS_CUDA_PROOF_POOL_BYTES": null
+        },
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "required_cuda_physical_index": 1,
+        "scope": "Entire actual pinned F32 TE original-prompt first-difference diagnostic; no DiT, Veda, VAE or clip.",
+        "required_work": [
+          "All mandatory frozen-source assets/config/tokenizer/request and exactly588 original tokens; no optional early pass.",
+          "Same explicit32MiB original resident layer forwards versus actual production window1 run_layers(after), independently generated runtime tables and embeddings; exact input and each50-layer/fullcontext outputs.",
+          "Discarded CPU tables captured observationally; librarydefault resident fullcontext contrast finite/observational, no new numerical tolerance.",
+          "Positive150 completed masked-attention calls and50 completed layer pairs/default50layers; bounded isolated4MiB readbacks; serialize metrics before exact assertion."
+        ]
+      },
+      "fixed_cuda_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/text_encoder/encoder/residency_te.rs::text_encoder::encoder::residency_te::production_prompt_resident_window_first_difference/fixed_cuda_gpu0",
+        "environment": {
+          "SCENEWORKS_CUDA_PROOF_POOL_BYTES": null
+        },
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "required_cuda_physical_index": 0,
+        "scope": "Entire actual pinned F32 TE original-prompt first-difference diagnostic; no DiT, Veda, VAE or clip.",
+        "required_work": [
+          "All mandatory frozen-source assets/config/tokenizer/request and exactly588 original tokens; no optional early pass.",
+          "Same explicit32MiB original resident layer forwards versus actual production window1 run_layers(after), independently generated runtime tables and embeddings; exact input and each50-layer/fullcontext outputs.",
+          "Discarded CPU tables captured observationally; librarydefault resident fullcontext contrast finite/observational, no new numerical tolerance.",
+          "Positive150 completed masked-attention calls and50 completed layer pairs/default50layers; bounded isolated4MiB readbacks; serialize metrics before exact assertion."
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/text_encoder/encoder/residency_te.rs::text_encoder::encoder::residency_te::production_prompt_resident_window_first_difference",
+      "requirements": [
+        {
+          "slot": "actual-te-shard-readers",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::new"
+          ],
+          "minimum_collections": 13,
+          "minimum_items": 13,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "actual-te-configuration",
+          "role": "configuration",
+          "readers": [
+            "candle-gen-minimax-h3::text_encoder::MiniMaxH3TeConfig::from_component_dir/configuration"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "actual-original-tokenizer-pair",
+          "role": "tokenizer",
+          "readers": [
+            "candle-gen-minimax-h3::text_encoder::MiniMaxH3Tokenizer::from_snapshot/tokenizer-pair"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 2,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "output_artifacts": [
+      "residency-te.json"
+    ],
+    "optional_environment": [
+      "H3_RESIDENCY_TE_MANIFEST"
+    ]
   }
 ]
