@@ -1186,6 +1186,7 @@ pub struct SanaGenerateRequest<'a> {
     pub sampler: Option<&'a str>,
     /// Optional curated epic-7114 scheduler name re-shaping σ over the same `mu = ln(shift)`.
     pub scheduler: Option<&'a str>,
+    pub scheduler_shift: Option<f32>,
     /// **img2img** reference image (sc-10190): when present with a positive [`Self::strength`], the
     /// DC-AE-encoded init latent seeds the denoise instead of pure noise. `None` = plain txt2img.
     pub init_image: Option<&'a Image>,
@@ -1207,6 +1208,7 @@ impl<'a> SanaGenerateRequest<'a> {
             seed: None,
             sampler: None,
             scheduler: None,
+            scheduler_shift: None,
             init_image: None,
             strength: None,
         }
@@ -1602,6 +1604,7 @@ impl SanaHeavy {
                 .scheduler
                 .filter(|name| mlx_gen::Scheduler::from_name(name).is_some())
                 .map(str::to_owned),
+            scheduler_shift: req.scheduler_shift,
             steps: Some(steps.max(1) as u32),
             guidance: Some(guidance),
             ..Default::default()

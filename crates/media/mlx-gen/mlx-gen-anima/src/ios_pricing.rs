@@ -155,7 +155,10 @@ fn price_request_controls(
             req.provider, req.mode, req.geometry.reference_count
         )));
     }
-    let facts = snapshot_facts(req.spec, variant)?;
+    let mut facts = snapshot_facts(req.spec, variant)?;
+    if let Some(controls) = &sampling {
+        facts.uses_cfg |= controls.effective_guidance().is_some_and(|g| g != 1.0);
+    }
     // Anima tokenizes `padding="longest"` up to the 512-token window: a request-dependent window
     // prices at it, an unstated one at the window's maximum.
     let max = crate::tokenizer::MAX_LEN as u32;

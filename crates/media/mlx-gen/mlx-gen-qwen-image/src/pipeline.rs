@@ -18,9 +18,9 @@ pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preproces
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_scheduler_names, default_seed, resolve_flow_schedule, run_flow_sampler, CancelFlag,
-    Error, FlowMatchEuler, GenerationRequest, Image, LatentDecoder, PreviewSink, Progress, Result,
-    SamplerRun, TimestepConvention,
+    curated_scheduler_names, default_seed, run_flow_sampler, CancelFlag, Error, FlowMatchEuler,
+    GenerationRequest, Image, LatentDecoder, PreviewSink, Progress, Result, SamplerRun,
+    TimestepConvention,
 };
 
 use crate::control_transformer::QwenFunControlBranch;
@@ -122,7 +122,7 @@ pub struct RunParams {
 /// static-shift schedule + its step default; otherwise the production resolution-dependent
 /// `qwen_scheduler`. The solver (integration method) is chosen separately by [`run_flow_sampler`]
 /// from the same `req.sampler` name. Identical across T2I/Edit/Control (F-117).
-pub fn resolve_run_params(req: &GenerationRequest, width: u32, height: u32) -> RunParams {
+pub fn resolve_run_params(req: &GenerationRequest, width: u32, height: u32) -> Result<RunParams> {
     let is_lightning = req.sampler.as_deref() == Some(LIGHTNING_SAMPLER);
     let default_steps = if is_lightning {
         LIGHTNING_DEFAULT_STEPS
@@ -143,8 +143,14 @@ pub fn resolve_run_params(req: &GenerationRequest, width: u32, height: u32) -> R
     } else {
         qwen_mu(width, height)
     };
-    let sigmas = resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
-    RunParams {
+    let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        mu,
+        steps,
+        &native,
+    )?;
+    Ok(RunParams {
         is_lightning,
         steps,
         // Qwen's CFG scale is real classifier-free guidance (an uncond/negative branch runs — see
@@ -156,7 +162,7 @@ pub fn resolve_run_params(req: &GenerationRequest, width: u32, height: u32) -> R
         base_seed: req.seed.unwrap_or_else(default_seed),
         sampler_name: req.sampler.clone(),
         sigmas,
-    }
+    })
 }
 
 /// The true-CFG negative prompt: the request's negative when non-blank, else [`NEGATIVE_FALLBACK`].
@@ -1146,7 +1152,8 @@ mod tests {
             },
             1024,
             1024,
-        );
+        )
+        .unwrap();
         assert_eq!(rp.guidance, 7.5, "true_cfg must win over guidance");
 
         // true_cfg absent → guidance fallback.
@@ -1158,7 +1165,8 @@ mod tests {
             },
             1024,
             1024,
-        );
+        )
+        .unwrap();
         assert_eq!(
             rp.guidance, 2.0,
             "guidance is the fallback when true_cfg is absent"
@@ -1173,7 +1181,8 @@ mod tests {
             },
             1024,
             1024,
-        );
+        )
+        .unwrap();
         assert_eq!(
             rp.guidance, DEFAULT_GUIDANCE,
             "both unset falls back to DEFAULT_GUIDANCE"

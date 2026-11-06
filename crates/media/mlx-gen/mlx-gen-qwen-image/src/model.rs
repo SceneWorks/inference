@@ -368,7 +368,7 @@ impl QwenImage {
 
         // Shared step/sampler/guidance/seed resolution (F-117); `req.sampler == "lightning"` selects
         // the few-step recipe, else the production resolution-dependent schedule.
-        let params = resolve_run_params(req, req.width, req.height);
+        let params = resolve_run_params(req, req.width, req.height)?;
         // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
         // `start_step = 0` for pure txt2img (the fork's `Config.init_time_step`).
         let reference = resolve_reference(req, MODEL_ID)?;

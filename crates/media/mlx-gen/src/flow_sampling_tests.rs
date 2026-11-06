@@ -624,3 +624,51 @@ fn small_real_native_solver_allocation_checks_logical_adapter_assumptions() {
         }
     }
 }
+
+#[test]
+fn explicit_shift_survives_canonical_replay_and_changes_native_schedule() {
+    let defaults = FlowSamplingDefaults {
+        solver: Solver::Euler,
+        steps: 4,
+        guidance: Some(1.0),
+        true_cfg_overrides: false,
+        default_alias: false,
+    };
+    let native = [1.0, 0.9, 0.75, 0.5, 0.0];
+    let request = GenerationRequest {
+        scheduler_shift: Some(18.375),
+        guidance: Some(1.5),
+        ..Default::default()
+    };
+    let resolved = ResolvedFlowSampling::resolve(
+        &request,
+        defaults,
+        &native,
+        3.0f32.ln(),
+        TimestepConvention::Sigma,
+    )
+    .unwrap();
+    let recipe = FlowSamplingRecipe::from_token(&resolved.recipe().canonical_token()).unwrap();
+    let replay = recipe.to_request();
+    assert_eq!(replay.scheduler_shift, Some(18.375));
+    let restored = ResolvedFlowSampling::resolve(
+        &replay,
+        defaults,
+        &native,
+        3.0f32.ln(),
+        TimestepConvention::Sigma,
+    )
+    .unwrap();
+    assert_eq!(resolved.sigmas(), restored.sigmas());
+    assert_ne!(resolved.sigmas(), native);
+    let ordinary = ResolvedFlowSampling::resolve(
+        &GenerationRequest::default(),
+        defaults,
+        &native,
+        3.0f32.ln(),
+        TimestepConvention::Sigma,
+    )
+    .unwrap();
+    assert_eq!(ordinary.sigmas(), native);
+    assert_eq!(ordinary.recipe().to_request().scheduler_shift, None);
+}

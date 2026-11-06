@@ -430,7 +430,7 @@ impl QwenImageEdit {
         // the few-step recipe (its matching Edit Lightning LoRA must be supplied via `spec.adapters`),
         // else the production resolution-dependent schedule.
         let (out_w, out_h) = (req.width, req.height);
-        let params = resolve_run_params(req, out_w, out_h);
+        let params = resolve_run_params(req, out_w, out_h)?;
         // Phase A: reference + prompts → conditioning embeds (epic 10834 Phase 1, sc-11006; sc-11125).
         // Under `Sequential` the shared seam loads the Qwen2.5-VL encoder, runs the vision tower over
         // the reference + the LM over pos/neg, materializes, then DROPS it + `clear_cache()` so its

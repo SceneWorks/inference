@@ -28,8 +28,8 @@ use crate::control_transformer::ZImageControlTransformer;
 use crate::loader;
 use crate::model::{validate_request, ZImageDecodeView, DEFAULT_STEPS};
 use crate::pipeline::{
-    self, denoise_control_with_progress_and_preview, encode_control_context, encode_init_latents,
-    init_time_step,
+    self, denoise_control_cfg_with_progress_and_preview, encode_control_context,
+    encode_init_latents, init_time_step,
 };
 use crate::text_encoder::TextEncoder;
 use crate::vae::Vae;
@@ -57,6 +57,8 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             // Control (required) + an optional img2img Reference init.
             conditioning: vec![ConditioningKind::Control, ConditioningKind::Reference],
+            supports_guidance: true,
+            supports_negative_prompt: true,
             supports_lora: true,
             supports_lokr: true,
             // Curated unified-framework integrator menu (epic 7114 P3), as the base turbo variant.
@@ -414,22 +416,31 @@ impl ZImageTurboControl {
                     MODEL_ID,
                     encoder_window,
                 )?;
-                if is_img2img {
-                    Ok(cap)
+                let cap = if is_img2img {
+                    cap
                 } else {
-                    // PARITY-BF16 (sc-2609): round the text embeddings to bf16 to match the fork's cap.
-                    pipeline::caption_cast_quantum(&cap)
-                }
+                    pipeline::caption_cast_quantum(&cap)?
+                };
+                let negative = (req.guidance.unwrap_or(0.0) != 0.0)
+                    .then(|| {
+                        pipeline::encode_uncond(
+                            &self.tokenizer,
+                            text_encoder,
+                            req.negative_prompt.as_deref().unwrap_or(""),
+                            encoder_window,
+                        )
+                    })
+                    .transpose()?;
+                Ok((cap, negative))
             },
-            // Materialize the post-cast `cap` while the encoder is still alive (Sequential only) — MLX
-            // is lazy, so an un-evaluated `cap` keeps the encoder referenced through the graph and the
-            // drop would free nothing.
-            |cap| match cap {
-                Some(cap) => Ok(mlx_rs::transforms::eval([cap])?),
-                None => Ok(()),
+            |encoded| {
+                if let Some((cap, negative)) = encoded {
+                    mlx_rs::transforms::eval(std::iter::once(cap).chain(negative.as_ref()))?;
+                }
+                Ok(())
             },
             // ── Phase B (denoise): heavy bundle + cap → evaluated latents.
-            |heavy: &ZImageControlHeavyOwned, cap, on_progress| {
+            |heavy: &ZImageControlHeavyOwned, (cap, negative), on_progress| {
                 pipeline::calibration_fault(
                     req,
                     mlx_gen::gen_core::MemoryPhase::Denoise,
@@ -465,13 +476,15 @@ impl ZImageTurboControl {
                     req,
                     on_progress,
                     |latents, seed, op| {
-                        denoise_control_with_progress_and_preview(
+                        denoise_control_cfg_with_progress_and_preview(
                             &heavy.transformer,
                             &scheduler,
                             sampler_name,
                             seed,
                             latents,
                             &cap,
+                            negative.as_ref(),
+                            1.0 + req.guidance.unwrap_or(0.0),
                             &control_context,
                             control_scale,
                             start_step,
@@ -585,7 +598,7 @@ mod tests {
         assert_eq!(d.family, "z-image");
         assert!(d.capabilities.accepts(ConditioningKind::Control));
         assert!(d.capabilities.accepts(ConditioningKind::Reference));
-        assert!(!d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_guidance);
     }
 
     #[test]

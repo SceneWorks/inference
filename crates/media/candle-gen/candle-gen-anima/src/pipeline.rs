@@ -62,6 +62,8 @@ pub struct GenOptions {
     pub seed: u64,
     /// Curated sampler name; `None` ⇒ [`DEFAULT_SAMPLER`].
     pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub scheduler_shift: Option<f32>,
     /// The caller's live per-step latent preview sink (epic 16948, sc-16953), carried here rather
     /// than as a further positional argument to [`AnimaPipeline::generate`] so the hook is built
     /// next to the sampler call it feeds and the two cannot drift apart.
@@ -257,7 +259,14 @@ fn render_encoded_components(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Image> {
     let dtype = render.dtype();
-    let sigmas = anima_sigmas(opts.steps);
+    let native = anima_sigmas(opts.steps);
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+        opts.scheduler.as_deref(),
+        opts.scheduler_shift,
+        SIGMA_SHIFT.ln(),
+        opts.steps,
+        &native,
+    )?;
     // Keep the initial latent in **f32** — the sampler integrates in f32 (`predict` returns the
     // velocity as f32; the VAE is loaded + decodes in f32), and the DiT casts its input to the
     // compute dtype internally (`CosmosDiT::forward`). Casting the noise to `dtype` here is a no-op

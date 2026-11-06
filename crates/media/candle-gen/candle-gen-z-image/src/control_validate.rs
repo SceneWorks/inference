@@ -104,6 +104,9 @@ fn run_control_validation(
         steps,
         control_scale: 1.0,
         guidance,
+        sampler: None,
+        scheduler: None,
+        scheduler_shift: None,
         negative_prompt: negative.map(str::to_string),
         seed: 12345,
         // Native VAE: this harness validates the pose-control pipeline, not the optional PiD SR (sc-8044).

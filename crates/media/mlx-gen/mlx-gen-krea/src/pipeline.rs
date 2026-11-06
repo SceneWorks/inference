@@ -311,6 +311,8 @@ pub struct KreaHeavy {
 /// Raw CFG path, the unconditional one. Built once per request by [`KreaHeavy::prepare_t2i`], reused for
 /// every seed in the count loop.
 pub struct T2iPlan {
+    pub(crate) sigmas: Option<Vec<f32>>,
+    pub(crate) guidance: f32,
     prep_pos: JointPrep,
     prep_neg: Option<JointPrep>,
 }
@@ -331,6 +333,8 @@ pub struct MultiPhasePlan {
 /// Count-invariant img2img render state (F-073): the seed-independent clean reference latent (VAE-encoded
 /// once) plus the step-invariant prep(s). Built once by [`KreaHeavy::prepare_img2img`].
 pub struct Img2ImgPlan {
+    pub(crate) sigmas: Option<Vec<f32>>,
+    pub(crate) guidance: f32,
     prep_pos: JointPrep,
     prep_neg: Option<JointPrep>,
     clean: Array,
@@ -340,6 +344,7 @@ pub struct Img2ImgPlan {
 /// VAE-encoded in-context reference tokens + the reference-frame RoPE. Built once by
 /// [`KreaHeavy::prepare_edit_plan`].
 pub struct EditPlan {
+    pub(crate) sigmas: Option<Vec<f32>>,
     prep_pos: EditPrep,
     prep_neg: Option<EditPrep>,
 }
@@ -348,6 +353,9 @@ pub struct EditPlan {
 /// embedded once through the frozen base `img_in`. Built once by [`KreaHeavy::prepare_control`].
 pub struct ControlPlan {
     prep: JointPrep,
+    negative: Option<JointPrep>,
+    guidance: f32,
+    sigmas: Option<Vec<f32>>,
     ctrl_tokens: Array,
 }
 
@@ -445,7 +453,7 @@ impl KreaHeavy {
         window: Option<crate::block_stream::BlockWindow<'_>>,
         attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> Result<Array> {
-        let negative = if guidance > 0.0 {
+        let negative = if guidance != 0.0 {
             Some(plan.prep_neg.as_ref().ok_or_else(|| {
                 mlx_gen::Error::Msg(
                     "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
@@ -639,7 +647,12 @@ impl KreaHeavy {
             Some(nc) => Some(self.dit.prepare(nc, None, &geom)?),
             None => None,
         };
-        Ok(T2iPlan { prep_pos, prep_neg })
+        Ok(T2iPlan {
+            sigmas: None,
+            guidance: 0.0,
+            prep_pos,
+            prep_neg,
+        })
     }
 
     /// **Turbo t2i render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing the
@@ -658,6 +671,7 @@ impl KreaHeavy {
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
         let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
+        let full = plan.sigmas.as_ref().cloned().unwrap_or(full);
         let sigmas = &full[..keep.min(full.len())];
         let block_window = self
             .dit
@@ -674,10 +688,13 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v = self.dit.forward_prepared_windowed_budgeted(
+                let v = Self::prepared_cfg_velocity(
+                    &self.dit,
                     x,
                     &t,
                     &plan.prep_pos,
+                    plan.prep_neg.as_ref(),
+                    plan.guidance,
                     block_window,
                     attention,
                 )?;
@@ -776,7 +793,38 @@ impl KreaHeavy {
         let prep = self
             .dit
             .prepare(context, None, &Self::geom_latent(width, height)?)?;
-        Ok(ControlPlan { prep, ctrl_tokens })
+        Ok(ControlPlan {
+            prep,
+            ctrl_tokens,
+            negative: None,
+            guidance: 0.0,
+            sigmas: None,
+        })
+    }
+
+    pub(crate) fn apply_control_sampling(
+        &self,
+        plan: &mut ControlPlan,
+        negative: Option<&Array>,
+        req: &mlx_gen::GenerationRequest,
+        steps: usize,
+    ) -> Result<()> {
+        plan.negative = negative
+            .map(|context| {
+                self.dit
+                    .prepare(context, None, &Self::geom_latent(req.width, req.height)?)
+            })
+            .transpose()?;
+        plan.guidance = req.guidance.unwrap_or(0.0);
+        let native = turbo_schedule(steps, req.scheduler.as_deref());
+        plan.sigmas = Some(mlx_gen::resolve_flow_schedule_with_shift(
+            None,
+            req.scheduler_shift,
+            TURBO_MU as f32,
+            steps,
+            &native,
+        )?);
+        Ok(())
     }
 
     /// **Pose-control render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing the
@@ -799,7 +847,10 @@ impl KreaHeavy {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
-        let sigmas = turbo_schedule(opts.steps, opts.scheduler.as_deref());
+        let sigmas = plan
+            .sigmas
+            .clone()
+            .unwrap_or_else(|| turbo_schedule(opts.steps, opts.scheduler.as_deref()));
         let block_window = self
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
@@ -825,7 +876,31 @@ impl KreaHeavy {
                     block_window,
                     attention,
                 )?;
-                Ok(v.as_dtype(Dtype::Float32)?)
+                let positive = v.as_dtype(Dtype::Float32)?;
+                match &plan.negative {
+                    Some(negative) => {
+                        let negative = branch
+                            .forward(
+                                &self.dit,
+                                x,
+                                &t,
+                                negative,
+                                &plan.ctrl_tokens,
+                                control_scale,
+                                block_window,
+                                attention,
+                            )?
+                            .as_dtype(Dtype::Float32)?;
+                        Ok(mlx_rs::ops::add(
+                            &positive,
+                            &mlx_rs::ops::multiply(
+                                &mlx_rs::ops::subtract(&positive, &negative)?,
+                                Array::from_f32(plan.guidance),
+                            )?,
+                        )?)
+                    }
+                    None => Ok(positive),
+                }
             },
         )?;
 
@@ -901,6 +976,8 @@ impl KreaHeavy {
             None => None,
         };
         Ok(Img2ImgPlan {
+            sigmas: None,
+            guidance: 0.0,
             prep_pos,
             prep_neg,
             clean,
@@ -926,6 +1003,7 @@ impl KreaHeavy {
         let noise = init_noise(opts.height, opts.width, opts.seed)?;
         // Start step from strength; blend the clean latent with noise at σ_k, then denoise the window.
         let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
+        let full = plan.sigmas.as_ref().cloned().unwrap_or(full);
         let start = init_time_step(opts.steps, Some(strength)).min(full.len().saturating_sub(1));
         // PiD `from_ldm` early-stop (sc-10121): the caller resolved `keep` against THIS full schedule
         // with THIS `start` (via `flow_capture_for_request`'s `start_step`), so truncating the img2img
@@ -950,10 +1028,13 @@ impl KreaHeavy {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v = self.dit.forward_prepared_windowed_budgeted(
+                let v = Self::prepared_cfg_velocity(
+                    &self.dit,
                     x,
                     &t,
                     &plan.prep_pos,
+                    plan.prep_neg.as_ref(),
+                    plan.guidance,
                     block_window,
                     attention,
                 )?;
@@ -1024,6 +1105,7 @@ impl KreaHeavy {
             opts.height,
             opts.scheduler.as_deref(),
         );
+        let full = plan.sigmas.as_ref().cloned().unwrap_or(full);
         let sigmas = &full[..keep.min(full.len())];
         let block_window = self
             .dit
@@ -1146,7 +1228,7 @@ impl KreaHeavy {
             let dit = self.dit.clone_for_multiphase(&specs)?;
             // Prep built from THIS phase's clone (an adapter may steer the text-fusion aggregator).
             let prep_pos = dit.prepare(ctx_pos, None, &geom)?;
-            let prep_neg = if phase.guidance > 0.0 {
+            let prep_neg = if phase.guidance != 0.0 {
                 let neg = ctx_neg.ok_or_else(|| {
                     mlx_gen::Error::Msg(
                         "krea_2 multi-phase: a CFG phase (guidance > 0) needs a negative context, \
@@ -1160,7 +1242,12 @@ impl KreaHeavy {
             };
             plans.push(MultiPhasePlan {
                 dit,
-                plan: T2iPlan { prep_pos, prep_neg },
+                plan: T2iPlan {
+                    sigmas: None,
+                    guidance: 0.0,
+                    prep_pos,
+                    prep_neg,
+                },
                 guidance: phase.guidance,
                 slice: phase.slice,
             });
@@ -1279,6 +1366,7 @@ impl KreaHeavy {
             opts.height,
             opts.scheduler.as_deref(),
         );
+        let full = plan.sigmas.as_ref().cloned().unwrap_or(full);
         let start = init_time_step(opts.steps, Some(strength)).min(full.len().saturating_sub(1));
         // PiD `from_ldm` early-stop (sc-10121): `keep` was resolved against THIS schedule + `start`, so
         // `full[start..keep]` exits at `full[keep-1]` — the decoder's degrade σ. `keep == full.len()`
@@ -1401,7 +1489,11 @@ impl KreaHeavy {
             Some(nc) => Some(self.dit.prepare_edit(nc, None, &geom, &ref_latents)?),
             None => None,
         };
-        Ok(EditPlan { prep_pos, prep_neg })
+        Ok(EditPlan {
+            sigmas: None,
+            prep_pos,
+            prep_neg,
+        })
     }
 
     /// **Kontext edit render from a hoisted plan** (F-073) — one image at `opts.seed`, reusing the
@@ -1438,6 +1530,7 @@ impl KreaHeavy {
                 opts.scheduler.as_deref(),
             )
         };
+        let full = plan.sigmas.as_ref().cloned().unwrap_or(full);
         let sigmas = &full[..keep.min(full.len())];
         let block_window = self
             .dit
@@ -1750,7 +1843,7 @@ impl KreaPipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let ctx_pos = self.text.encode(prompt)?;
-        let ctx_neg = if guidance > 0.0 {
+        let ctx_neg = if guidance != 0.0 {
             Some(self.text.encode(negative_prompt)?)
         } else {
             None
@@ -1808,7 +1901,7 @@ impl KreaPipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let ctx_pos = self.text.encode(prompt)?;
-        let ctx_neg = if guidance > 0.0 {
+        let ctx_neg = if guidance != 0.0 {
             Some(self.text.encode(negative_prompt)?)
         } else {
             None
@@ -1875,7 +1968,7 @@ impl KreaPipeline {
         // (F-073).
         let gv = self.text.run_vision(sources)?;
         let ctx_pos = self.text.encode_grounded_from_vision(&gv, prompt)?;
-        let ctx_neg = if guidance > 0.0 {
+        let ctx_neg = if guidance != 0.0 {
             Some(
                 self.text
                     .encode_grounded_from_vision(&gv, negative_prompt)?,
@@ -2399,6 +2492,8 @@ mod tests {
         );
         let t2i_plan = |with_negative: bool| -> Result<T2iPlan> {
             Ok(T2iPlan {
+                sigmas: None,
+                guidance: 0.0,
                 prep_pos: dit.prepare(&positive_context, None, &latent)?,
                 prep_neg: with_negative
                     .then(|| dit.prepare(&negative_context, None, &latent))
@@ -2408,11 +2503,15 @@ mod tests {
         let cfg_t2i = t2i_plan(true).unwrap();
         let plain_t2i = t2i_plan(false).unwrap();
         let cfg_img2img = Img2ImgPlan {
+            sigmas: None,
+            guidance: 0.0,
             prep_pos: dit.prepare(&positive_context, None, &latent).unwrap(),
             prep_neg: Some(dit.prepare(&negative_context, None, &latent).unwrap()),
             clean: latent.clone(),
         };
         let plain_img2img = Img2ImgPlan {
+            sigmas: None,
+            guidance: 0.0,
             prep_pos: dit.prepare(&positive_context, None, &latent).unwrap(),
             prep_neg: None,
             clean: latent.clone(),
@@ -2424,6 +2523,7 @@ mod tests {
             &[1, 16, 2, 2],
         );
         let cfg_edit = EditPlan {
+            sigmas: None,
             prep_pos: dit
                 .prepare_edit(
                     &positive_context,
@@ -2443,6 +2543,7 @@ mod tests {
             ),
         };
         let plain_edit = EditPlan {
+            sigmas: None,
             prep_pos: dit
                 .prepare_edit(&positive_context, None, &latent, &[reference])
                 .unwrap(),

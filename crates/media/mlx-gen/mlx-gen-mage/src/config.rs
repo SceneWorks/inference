@@ -104,7 +104,7 @@ pub const FFN_ACTIVATION: &str = "gelu-approximate";
 pub const QKV_BIAS: bool = true;
 
 /// No distilled-guidance embedding: Mage uses **real CFG** (a second unconditional forward), which
-/// is why `cfg > 1.0` builds a negative branch at all (`pipeline.py:326`, `:535`).
+/// is why `cfg != 1.0` builds a negative branch at all (`pipeline.py:326`, `:535`).
 pub const GUIDANCE_EMBED: bool = false;
 
 /// **Zero** single-stream blocks: all [`MageFlowConfig::depth`] blocks are dual-stream (SD3-style

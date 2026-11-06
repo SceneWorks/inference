@@ -56,6 +56,7 @@ fn active_preview_emits_native_four_step_strip_without_changing_rgb() {
                 guidance,
                 None,
                 None,
+                None,
                 1663088,
                 None,
                 None,

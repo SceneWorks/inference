@@ -25,9 +25,9 @@
 use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
-    Capabilities, ConditioningKind, FlowMatchEuler, GenerationOutput, GenerationRequest, Generator,
-    LatentDecoder, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Residency, Result,
+    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, ConditioningKind,
+    FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec,
+    Modality, ModelDescriptor, Progress, Quant, Residency, Result,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma};
 
@@ -293,12 +293,13 @@ impl ZImage {
                 // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
                 // over `shift=6.0`.
                 let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-                let resolved_sigmas = resolve_flow_schedule(
+                let resolved_sigmas = mlx_gen::resolve_flow_schedule_with_shift(
                     req.scheduler.as_deref(),
+                    req.scheduler_shift,
                     SCHEDULE_SHIFT.ln(),
                     steps,
                     &native.sigmas,
-                );
+                )?;
                 // PiD decode overlay (epic 7840, sc-7846) + `from_ldm` early-stop (sc-8048): mint a
                 // decoder when `use_pid` is set AND a PiD overlay was loaded, else `None` → the native
                 // VAE (errors loudly if requested without one). Z-Image base is flow-match
@@ -433,7 +434,7 @@ mod tests {
         // Distinct ids — they coexist in the registry.
         assert_ne!(base.id, turbo.id);
         // Turbo is guidance-distilled (CFG off); base is full-CFG.
-        assert!(!turbo.capabilities.supports_guidance);
+        assert!(turbo.capabilities.supports_guidance);
         assert!(base.capabilities.supports_guidance);
     }
 

@@ -23,7 +23,7 @@ const RES_MAX: u32 = 1536;
 /// Build the descriptor for a variant. Turbo is the merged CFG-free student (no guidance / negative
 /// prompt); Base/Aesthetic run true classifier-free guidance.
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
-    let cfg_capable = variant.uses_cfg();
+    let cfg_capable = true;
     ModelDescriptor {
         encoder_contract: None,
         denoiser_output_latent_space: Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
@@ -263,11 +263,8 @@ impl Anima {
             ],
         );
         let variant = self.variant;
-        let guidance = if variant.uses_cfg() {
-            req.guidance.unwrap_or(variant.default_guidance())
-        } else {
-            1.0
-        };
+        let guidance = req.guidance.unwrap_or(variant.default_guidance());
+        let cfg_on = variant.uses_cfg() || guidance != 1.0;
         let negative = req.negative_prompt.clone().unwrap_or_default();
         // Epic 7114 sampler/scheduler axis: `None` ⇒ the native er_sde default / native σ schedule.
         let sampler = req
@@ -314,7 +311,7 @@ impl Anima {
             |text: &AnimaText| {
                 calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Conditioning)?;
                 let cond = text.encode_inputs(&req.prompt)?;
-                let uncond = if variant.uses_cfg() {
+                let uncond = if cfg_on {
                     Some(text.encode_inputs(&negative)?)
                 } else {
                     None
@@ -369,6 +366,7 @@ impl Anima {
                         guidance,
                         &sampler,
                         scheduler.as_deref(),
+                        req.scheduler_shift,
                         seed,
                         &req.preview,
                         &req.cancel,
@@ -609,8 +607,8 @@ mod tests {
         let t = descriptor_turbo();
         assert!(descriptor_aesthetic().capabilities.supports_preview);
         assert!(t.capabilities.supports_preview);
-        assert!(!t.capabilities.supports_guidance);
-        assert!(!t.capabilities.supports_negative_prompt);
+        assert!(t.capabilities.supports_guidance);
+        assert!(t.capabilities.supports_negative_prompt);
         // er_sde is advertised in the curated menu.
         assert!(
             b.capabilities.samplers.contains(&"er_sde"),
@@ -641,15 +639,16 @@ mod tests {
         );
         assert!(validate_request(&descriptor_base(), &req(1024, 1024)).is_ok());
 
-        // Turbo rejects guidance / negative (CFG-free).
+        // Turbo retains CFG-off defaults but accepts experimental two-pass CFG.
         assert!(validate_request(
             &descriptor_turbo(),
             &GenerationRequest {
-                guidance: Some(4.5),
+                guidance: Some(1.5),
+                negative_prompt: Some("blurry".into()),
                 ..req(1024, 1024)
             }
         )
-        .is_err());
+        .is_ok());
     }
 
     #[test]

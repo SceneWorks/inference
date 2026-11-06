@@ -311,6 +311,17 @@ pub fn resolve_schedule(
 /// Schedule construction is **convention-independent** — the σ schedule is the same noise-fraction ramp
 /// however the model consumes σ — so this always builds with [`TimestepConvention::Sigma`]; the engine's
 /// own conditioning convention is applied separately by [`run_flow_sampler`].
+/// Flow schedule resolver that honors an explicit request shift on native and curated grids.
+pub fn resolve_flow_schedule_with_shift(
+    scheduler_name: Option<&str>,
+    shift: Option<f32>,
+    mu: f32,
+    steps: usize,
+    native: &[f32],
+) -> gen_core::Result<Vec<f32>> {
+    gen_core::sampling::flow_schedule_with_shift(scheduler_name, mu, shift, steps, native)
+}
+
 pub fn resolve_flow_schedule(
     scheduler_name: Option<&str>,
     mu: f32,

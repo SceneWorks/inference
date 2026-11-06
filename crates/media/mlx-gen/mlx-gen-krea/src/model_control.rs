@@ -22,7 +22,6 @@ use mlx_gen_wan::OwnedWanSingleFrameDecoder;
 
 use mlx_gen::default_seed;
 
-use mlx_rs::Array;
 use std::path::Path;
 
 use crate::config::Krea2Config;
@@ -703,17 +702,20 @@ impl KreaTurboControl {
                     mlx_rs::transforms::eval([&context])?;
                     self.calibration_fault(req, gen_core::MemoryPhase::Conditioning)?;
                 }
-                Ok(context)
+                let negative = (req.guidance.unwrap_or(0.0) != 0.0)
+                    .then(|| text.encode(req.negative_prompt.as_deref().unwrap_or("")))
+                    .transpose()?;
+                Ok((context, negative))
             },
-            // Materialize the context while the text phase is still alive (Sequential only).
-            |ctx: Option<&Array>| {
-                let Some(ctx) = ctx else { return Ok(()) };
-                mlx_rs::transforms::eval([ctx])?;
+            |encoded| {
+                if let Some((positive, negative)) = encoded {
+                    mlx_rs::transforms::eval(std::iter::once(positive).chain(negative.as_ref()))?;
+                }
                 Ok(())
             },
             // Phase B: heavy render components (DiT + VAE + the pose branch). The render loop below runs
             // identically for both residencies.
-            |heavy_owned, context, on_progress| {
+            |heavy_owned, (context, negative), on_progress| {
                 // sc-22738: the Denoise + Decode phase EXITS live inside `render_control_from`
                 // (pipeline.rs), where this image's produced latent and decoded image actually
                 // exist; `turbo_options` below carries the request-scoped `memory` + `provider_id`
@@ -751,13 +753,16 @@ impl KreaTurboControl {
                 // Hoist the count-invariant pose VAE encode + text prep OUT of the per-image loop
                 // (F-073): both depend only on the (shared) context + pose + geometry, not the per-seed
                 // noise. Build the plan ONCE; each seed reuses it via `render_control_from`.
-                let (admitted_geometry, plan) =
+                let (admitted_geometry, mut plan) =
                     requested_geometry.prepare_after_feasibility(feasible, |width, height| {
                         heavy
                             .heavy
                             .prepare_control(&context, control_image, width, height)
                     })?;
 
+                heavy
+                    .heavy
+                    .apply_control_sampling(&mut plan, negative.as_ref(), req, steps)?;
                 let mut images = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let opts = admitted_geometry.turbo_options(
@@ -1130,8 +1135,8 @@ mod tests {
         // Pose ControlNet: Control conditioning (not the base Turbo Reference), CFG-free.
         assert!(d.capabilities.accepts(ConditioningKind::Control));
         assert!(!d.capabilities.accepts(ConditioningKind::Reference));
-        assert!(!d.capabilities.supports_guidance);
-        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_negative_prompt);
         // Q4/Q8 base is supported (sc-11727) — inherited from the base Turbo descriptor, no longer blanked.
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         // Shared surface stays in lockstep with the base Turbo descriptor.

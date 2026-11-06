@@ -87,6 +87,45 @@ pub(crate) struct TextPreflight {
     negative: Option<TextTokenIds>,
 }
 
+impl TextPreflight {
+    pub(crate) fn with_negative_prompt(
+        mut self,
+        tok: &BooguTokenizer,
+        prompt: Option<&str>,
+    ) -> Result<Self> {
+        if let Some(prompt) = prompt.filter(|prompt| !prompt.trim().is_empty()) {
+            if self.negative.is_none() {
+                return Err(Error::Msg("boogu: a negative prompt requires CFG".into()));
+            }
+            self.negative = Some(tok.preflight_t2i(prompt)?);
+        }
+        Ok(self)
+    }
+}
+impl EditPreflight {
+    pub(crate) fn with_negative_prompt(
+        mut self,
+        tok: &BooguTokenizer,
+        prompt: Option<&str>,
+    ) -> Result<Self> {
+        if let Some(prompt) = prompt.filter(|prompt| !prompt.trim().is_empty()) {
+            if self.negative_text.is_none() && self.negative_grounded.is_none() {
+                return Err(Error::Msg(
+                    "boogu edit: a negative prompt requires CFG".into(),
+                ));
+            }
+            if self.negative_text.is_some() {
+                self.negative_text = Some(tok.preflight_t2i(prompt)?);
+            }
+            if self.negative_grounded.is_some() {
+                self.negative_grounded =
+                    Some(tok.preflight_edit_with_images(prompt, &self.counts)?);
+            }
+        }
+        Ok(self)
+    }
+}
+
 /// Tokenize every ordinary 1280-limited leg before entering component residency.
 pub(crate) fn preflight_text(
     tok: &BooguTokenizer,
@@ -159,7 +198,7 @@ pub(crate) fn with_resident_edit_preflight<T>(
         tok,
         references,
         instruction,
-        opts.text_guidance_scale > 1.0,
+        opts.text_guidance_scale != 1.0,
         opts.condition_on_image,
         opts.condition_on_image && opts.use_input_images_4_neg_instruct,
     )?;
@@ -210,6 +249,9 @@ pub struct TurboOptions {
     pub width: u32,
     pub steps: usize,
     pub seed: u64,
+    /// Additional two-pass CFG strength; zero retains the distilled default.
+    pub guidance: f32,
+    pub scheduler_shift: Option<f32>,
     /// DMD conditioning sigma — the first (lowest) sigma in the schedule.
     pub conditioning_sigma: f32,
     /// Curated unified-framework integrator (epic 7114). `None` is the native DMD student loop
@@ -230,6 +272,8 @@ impl Default for TurboOptions {
             width: 1024,
             steps: 4,
             seed: 0,
+            guidance: 0.0,
+            scheduler_shift: None,
             conditioning_sigma: 0.001,
             sampler: None,
             scheduler: None,
@@ -366,10 +410,8 @@ impl BooguEncoders {
     pub(crate) fn encode_turbo_preflight(
         &self,
         preflight: &TextPreflight,
-    ) -> Result<(Array, Array)> {
-        let (ids, mask) = preflight.positive.to_arrays()?;
-        let cond = self.te.last_hidden(&ids, &mask)?;
-        Ok((cond, mask))
+    ) -> Result<BooguBaseCond> {
+        self.encode_base_preflight(preflight)
     }
 
     /// Instruction-Edit conditioning (true-CFG). Faithful edit (`condition_on_image`) runs the
@@ -401,7 +443,7 @@ impl BooguEncoders {
             let (ids, mask) = tokens.to_arrays()?;
             (self.te.last_hidden(&ids, &mask)?, mask)
         };
-        let uncond = if opts.text_guidance_scale > 1.0 {
+        let uncond = if opts.text_guidance_scale != 1.0 {
             if opts.condition_on_image && opts.use_input_images_4_neg_instruct {
                 let preflight = preflight.ok_or_else(|| {
                     Error::Msg(
@@ -608,23 +650,6 @@ impl BooguHeavy {
         )?)
     }
 
-    /// CFG-free flow velocity for the Turbo DMD student: one DiT forward, negated into the FLOW
-    /// convention and cast to f32.
-    fn turbo_velocity(
-        &self,
-        x: &Array,
-        timestep: f32,
-        cond: &Array,
-        mask: &Array,
-    ) -> Result<Array> {
-        let t = Array::from_slice(&[timestep], &[1]);
-        let v = self.dit.forward(x, &t, cond, mask)?;
-        Ok(multiply(
-            &v.as_dtype(Dtype::Float32)?,
-            Array::from_f32(-1.0),
-        )?)
-    }
-
     /// Render one Base (true-CFG) image from pure noise. `sigmas` is the (possibly `from_ldm`-truncated)
     /// schedule; `c` is the phase-A conditioning; the per-image seed lives on `opts.seed`.
     pub(crate) fn render_base_t2i(
@@ -697,8 +722,7 @@ impl BooguHeavy {
     /// routes through the curated unified framework over the DMD σ grid; unset is the native DMD loop.
     pub(crate) fn render_turbo_t2i(
         &self,
-        cond: &Array,
-        mask: &Array,
+        c: &BooguBaseCond,
         opts: &TurboOptions,
         decoder: Option<&dyn LatentDecoder>,
         cancel: &CancelFlag,
@@ -712,7 +736,13 @@ impl BooguHeavy {
             let sampler = turbo_curated_sampler(opts.sampler.as_deref());
             let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
             let native = turbo_native_sigmas(opts.conditioning_sigma, opts.steps);
-            let sigmas = resolve_flow_schedule(opts.scheduler.as_deref(), 0.0, opts.steps, &native);
+            let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+                opts.scheduler.as_deref(),
+                opts.scheduler_shift,
+                0.0,
+                opts.steps,
+                &native,
+            )?;
             let lat = run_flow_sampler(
                 SamplerRun {
                     sampler_name: Some(sampler),
@@ -723,17 +753,32 @@ impl BooguHeavy {
                 },
                 TimestepConvention::OneMinusSigma,
                 lat,
-                |x, timestep| self.turbo_velocity(x, timestep, cond, mask),
+                |x, timestep| self.base_velocity(x, timestep, c, 1.0 + opts.guidance),
             )?;
             on_progress(Progress::Decoding);
             return self.decode_latents(&lat, decoder);
         }
 
         let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
-        let sigmas = dmd_sigmas(opts.conditioning_sigma, opts.steps);
+        let clean_sigmas = dmd_sigmas(opts.conditioning_sigma, opts.steps);
+        let sigmas = if opts.scheduler_shift.is_some() {
+            let noise_sigmas: Vec<_> = clean_sigmas.iter().map(|sigma| 1.0 - sigma).collect();
+            mlx_gen::resolve_flow_schedule_with_shift(
+                None,
+                opts.scheduler_shift,
+                0.0,
+                opts.steps,
+                &noise_sigmas,
+            )?
+            .into_iter()
+            .map(|sigma| 1.0 - sigma)
+            .collect()
+        } else {
+            clean_sigmas
+        };
         let lat = self.denoise_turbo_native(
-            cond,
-            mask,
+            c,
+            opts.guidance,
             lat,
             &sigmas,
             0,
@@ -752,8 +797,7 @@ impl BooguHeavy {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_turbo_img2img(
         &self,
-        cond: &Array,
-        mask: &Array,
+        c: &BooguBaseCond,
         clean: &Array,
         start_step: usize,
         opts: &TurboOptions,
@@ -768,7 +812,13 @@ impl BooguHeavy {
         if turbo_uses_curated(opts.sampler.as_deref(), opts.scheduler.as_deref()) {
             let sampler = turbo_curated_sampler(opts.sampler.as_deref());
             let native = turbo_native_sigmas(opts.conditioning_sigma, opts.steps);
-            let full = resolve_flow_schedule(opts.scheduler.as_deref(), 0.0, opts.steps, &native);
+            let full = mlx_gen::resolve_flow_schedule_with_shift(
+                opts.scheduler.as_deref(),
+                opts.scheduler_shift,
+                0.0,
+                opts.steps,
+                &native,
+            )?;
             let start = start_step.min(full.len().saturating_sub(1));
             let lat = add_noise_by_interpolation(clean, &noise, full[start])?;
             let sigmas = &full[start..];
@@ -782,7 +832,7 @@ impl BooguHeavy {
                 },
                 TimestepConvention::OneMinusSigma,
                 lat,
-                |x, timestep| self.turbo_velocity(x, timestep, cond, mask),
+                |x, timestep| self.base_velocity(x, timestep, c, 1.0 + opts.guidance),
             )?;
             on_progress(Progress::Decoding);
             return self.decode_latents(&lat, decoder);
@@ -790,12 +840,27 @@ impl BooguHeavy {
 
         // Native DMD student loop seeded from the noise-blended reference (see the pre-split note: the
         // native clean-fraction `c_k` → noise-fraction `1 − c_k` matches the curated blend byte-for-byte).
-        let sigmas = dmd_sigmas(opts.conditioning_sigma, opts.steps);
+        let clean_sigmas = dmd_sigmas(opts.conditioning_sigma, opts.steps);
+        let sigmas = if opts.scheduler_shift.is_some() {
+            let noise_sigmas: Vec<_> = clean_sigmas.iter().map(|sigma| 1.0 - sigma).collect();
+            mlx_gen::resolve_flow_schedule_with_shift(
+                None,
+                opts.scheduler_shift,
+                0.0,
+                opts.steps,
+                &noise_sigmas,
+            )?
+            .into_iter()
+            .map(|sigma| 1.0 - sigma)
+            .collect()
+        } else {
+            clean_sigmas
+        };
         let start = start_step.min(sigmas.len().saturating_sub(1));
         let lat = add_noise_by_interpolation(clean, &noise, 1.0 - sigmas[start])?;
         let lat = self.denoise_turbo_native(
-            cond,
-            mask,
+            c,
+            opts.guidance,
             lat,
             &sigmas,
             start,
@@ -850,8 +915,8 @@ impl BooguHeavy {
     #[allow(clippy::too_many_arguments)]
     fn denoise_turbo_native(
         &self,
-        cond: &Array,
-        mask: &Array,
+        c: &BooguBaseCond,
+        guidance: f32,
         mut lat: Array,
         sigmas: &[f32],
         start: usize,
@@ -868,7 +933,16 @@ impl BooguHeavy {
             }
             let sigma = sigmas[i];
             let t = Array::from_slice(&[sigma], &[1]);
-            let pred = self.dit.forward(&lat, &t, cond, mask)?;
+            let pred = self.dit.forward(&lat, &t, &c.cond, &c.cond_mask)?;
+            let pred = if let Some((negative, mask)) = &c.uncond {
+                let negative = self.dit.forward(&lat, &t, negative, mask)?;
+                add(
+                    &pred,
+                    &multiply(&subtract(&pred, &negative)?, Array::from_f32(guidance))?,
+                )?
+            } else {
+                pred
+            };
             // Predict (clean estimate): x += (1 − sigma)·v, in f32.
             lat = add(
                 &lat.as_dtype(Dtype::Float32)?,
@@ -952,7 +1026,7 @@ impl BooguPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let preflight = preflight_text(&self.tok, prompt, opts.text_guidance_scale > 1.0)?;
+        let preflight = preflight_text(&self.tok, prompt, opts.text_guidance_scale != 1.0)?;
         let cond = self.enc.encode_base_preflight(&preflight)?;
         self.heavy
             .render_base_t2i(&cond, opts, sigmas, decoder, cancel, on_progress)
@@ -974,7 +1048,7 @@ impl BooguPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let preflight = preflight_text(&self.tok, prompt, opts.text_guidance_scale > 1.0)?;
+        let preflight = preflight_text(&self.tok, prompt, opts.text_guidance_scale != 1.0)?;
         let cond = self.enc.encode_base_preflight(&preflight)?;
         let clean = self
             .heavy
@@ -1007,10 +1081,10 @@ impl BooguPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let preflight = preflight_text(&self.tok, prompt, false)?;
-        let (cond, mask) = self.enc.encode_turbo_preflight(&preflight)?;
+        let preflight = preflight_text(&self.tok, prompt, opts.guidance != 0.0)?;
+        let c = self.enc.encode_turbo_preflight(&preflight)?;
         self.heavy
-            .render_turbo_t2i(&cond, &mask, opts, decoder, cancel, on_progress)
+            .render_turbo_t2i(&c, opts, decoder, cancel, on_progress)
     }
 
     /// **img2img latent-init on the Turbo (DMD few-step, CFG-free) path** (epic 8588 A4.3, sc-10191).
@@ -1026,21 +1100,13 @@ impl BooguPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let preflight = preflight_text(&self.tok, prompt, false)?;
-        let (cond, mask) = self.enc.encode_turbo_preflight(&preflight)?;
+        let preflight = preflight_text(&self.tok, prompt, opts.guidance != 0.0)?;
+        let c = self.enc.encode_turbo_preflight(&preflight)?;
         let clean = self
             .heavy
             .encode_init_clean(init, opts.width, opts.height)?;
-        self.heavy.render_turbo_img2img(
-            &cond,
-            &mask,
-            &clean,
-            start_step,
-            opts,
-            decoder,
-            cancel,
-            on_progress,
-        )
+        self.heavy
+            .render_turbo_img2img(&c, &clean, start_step, opts, decoder, cancel, on_progress)
     }
 
     /// Generate one RGB image via the **Edit** path (single-reference convenience over
@@ -1255,6 +1321,21 @@ fn base_shift_mu() -> f32 {
 /// capture σ and truncate the denoise — the schedule must be known where the decoder is resolved. This
 /// is the exact `sigmas` the Base/Edit `run_flow_sampler` runs over (noise-fraction, `vp_frame=false`,
 /// so the schedule σ *is* the degrade σ).
+pub(crate) fn base_request_schedule(
+    req: &mlx_gen::GenerationRequest,
+    steps: usize,
+) -> Result<Vec<f32>> {
+    let native = base_flow_schedule(steps, None);
+    mlx_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        MAX_SHIFT as f32,
+        steps,
+        &native,
+    )
+    .map_err(Into::into)
+}
+
 pub fn base_flow_schedule(steps: usize, scheduler: Option<&str>) -> Vec<f32> {
     let native = base_native_sigmas(steps);
     resolve_flow_schedule(scheduler, base_shift_mu(), steps, &native)

@@ -888,8 +888,8 @@ pub fn descriptor_for(variant: MageVariant) -> ModelDescriptor {
         capabilities: Capabilities {
             // Real CFG (`guidance_embed: false`) on the undistilled checkpoints; the distilled
             // ones run at cfg 1.0, where the reference never builds the negative branch.
-            supports_negative_prompt: !variant.is_distilled(),
-            supports_guidance: !variant.is_distilled(),
+            supports_negative_prompt: true,
+            supports_guidance: true,
             conditioning: if variant.is_edit() {
                 vec![
                     ConditioningKind::Reference,
@@ -1541,6 +1541,7 @@ impl Generator for MageFlow {
                             cfg,
                             run_seed,
                             &key,
+                            req.scheduler_shift,
                             req.memory,
                             &req.cancel,
                             progress,
@@ -1612,6 +1613,7 @@ impl Generator for MageFlow {
                         steps as usize,
                         cfg,
                         &key,
+                        req.scheduler_shift,
                         req.memory,
                         &req.cancel,
                         progress,
@@ -3599,8 +3601,8 @@ mod tests {
         assert!(!crate::pipeline::uses_cfg(
             MageVariant::EditTurbo.default_cfg()
         ));
-        assert!(!turbo.capabilities.supports_guidance);
-        assert!(!turbo.capabilities.supports_negative_prompt);
+        assert!(turbo.capabilities.supports_guidance);
+        assert!(turbo.capabilities.supports_negative_prompt);
     }
 
     #[test]
@@ -3823,8 +3825,8 @@ mod tests {
         assert_eq!(MageVariant::Turbo.default_steps(), 4);
         assert_eq!(MageVariant::Turbo.default_cfg(), 1.0);
         let descriptor = descriptor_for(MageVariant::Turbo);
-        assert!(!descriptor.capabilities.supports_guidance);
-        assert!(!descriptor.capabilities.supports_negative_prompt);
+        assert!(descriptor.capabilities.supports_guidance);
+        assert!(descriptor.capabilities.supports_negative_prompt);
         let plain = GenerationRequest {
             prompt: "test".into(),
             width: 1024,
@@ -3833,11 +3835,12 @@ mod tests {
         };
         validate_generation_request(&descriptor, &plain).unwrap();
         let mut negative = plain.clone();
-        negative.negative_prompt = Some("must not be encoded".into());
-        assert!(validate_generation_request(&descriptor, &negative).is_err());
+        negative.negative_prompt = Some("blurry".into());
+        negative.guidance = Some(1.5);
+        assert!(validate_generation_request(&descriptor, &negative).is_ok());
         let mut guided = plain;
         guided.guidance = Some(2.0);
-        assert!(validate_generation_request(&descriptor, &guided).is_err());
+        assert!(validate_generation_request(&descriptor, &guided).is_ok());
     }
 
     #[test]

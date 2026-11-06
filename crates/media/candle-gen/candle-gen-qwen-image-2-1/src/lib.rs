@@ -610,7 +610,13 @@ pub(crate) fn resolve_run_params(
     let tokens = scheduler::image_tokens(req.width, req.height);
     let native = scheduler::sigmas(scheduler, steps, tokens)?;
     let mu = scheduler::mu_for_tokens(scheduler, tokens) as f32;
-    let sigmas = candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        mu,
+        steps,
+        &native,
+    )?;
     Ok(run_params_over(sigmas, req))
 }
 
@@ -629,7 +635,13 @@ pub(crate) fn resolve_turbo_run_params(
 ) -> Result<RunParams> {
     let steps = req.steps.unwrap_or(schedule.default_steps()) as usize;
     let native = scheduler::resample_saved_sigmas(&schedule.sample_sigmas, steps)?;
-    let sigmas = candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        0.0,
+        steps,
+        &native,
+    )?;
     Ok(run_params_over(sigmas, req))
 }
 

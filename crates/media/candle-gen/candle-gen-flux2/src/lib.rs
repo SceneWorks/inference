@@ -1183,8 +1183,13 @@ impl Pipeline {
         // `euler_step` flow-match loop within tolerance.
         let mu = pipeline::compute_mu(pipeline::image_seq_len(req.width, req.height), steps);
         let native = pipeline::schedule(steps, req.width, req.height);
-        let sigmas =
-            candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            mu,
+            steps,
+            &native,
+        )?;
 
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let latents =

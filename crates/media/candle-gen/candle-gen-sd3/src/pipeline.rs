@@ -542,7 +542,7 @@ impl Pipeline {
         let mut enc = candle_gen::lock_recover(encoders);
         let cond_out = enc.encode(&req.prompt)?;
         let cond = aggregate(&self.cfg, &cond_out)?;
-        let uncond = if self.variant.cfg_enabled() && cfg_scale != 1.0 {
+        let uncond = if cfg_scale != 1.0 {
             let neg = req.negative_prompt.as_deref().unwrap_or("");
             let uncond_out = enc.encode(neg)?;
             Some(aggregate(&self.cfg, &uncond_out)?)
@@ -574,11 +574,7 @@ impl Pipeline {
             .steps
             .map(|s| s as usize)
             .unwrap_or_else(|| self.variant.default_steps());
-        let cfg_scale = if self.variant.cfg_enabled() {
-            req.guidance.unwrap_or_else(|| self.variant.default_cfg())
-        } else {
-            1.0
-        };
+        let cfg_scale = req.guidance.unwrap_or_else(|| self.variant.default_cfg());
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / VAE_SCALE) as usize;
         let lat_w = (req.width / VAE_SCALE) as usize;
@@ -617,7 +613,7 @@ impl Pipeline {
                 uncond.as_ref(),
                 cfg_scale,
                 steps,
-                self.variant.shift(),
+                req.scheduler_shift.unwrap_or(self.variant.shift()),
                 (lat_h, lat_w),
                 seed,
                 self.device.clone(),
@@ -650,11 +646,7 @@ impl Pipeline {
             .steps
             .map(|value| value as usize)
             .unwrap_or_else(|| self.variant.default_steps());
-        let cfg_scale = if self.variant.cfg_enabled() {
-            req.guidance.unwrap_or_else(|| self.variant.default_cfg())
-        } else {
-            1.0
-        };
+        let cfg_scale = req.guidance.unwrap_or_else(|| self.variant.default_cfg());
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let latent_hw = (
             (req.height / VAE_SCALE) as usize,
@@ -715,7 +707,7 @@ impl Pipeline {
                 uncond.as_ref(),
                 cfg_scale,
                 steps,
-                self.variant.shift(),
+                req.scheduler_shift.unwrap_or(self.variant.shift()),
                 latent_hw,
                 seed,
                 self.device.clone(),

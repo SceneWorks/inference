@@ -82,9 +82,7 @@ pub const MAX_DURATION_SECS: f32 = 30.0;
 /// the 1000-timestep training grid adds cost without resolution.
 pub const MAX_STEPS: u32 = 1000;
 
-/// CFG guidance bounds: 1.0 turns guidance off (single forward per step); values far above the
-/// reference default 4.0 over-saturate flow-matching CFG, so the advertised ceiling stays
-/// generous-but-sane.
+/// Recommended CFG range. Advanced callers may use any finite scale; 1.0 disables CFG.
 pub const GUIDANCE_RANGE: (f32, f32) = (1.0, 20.0);
 
 /// Prompt languages the model was trained on (bilingual English / Chinese; free-text prompts —
@@ -156,15 +154,6 @@ pub(crate) fn validate_request(
             return Err(gen_core::Error::Msg(format!(
                 "{id}: steps {steps} above the {MAX_STEPS}-step ceiling (the 1000-timestep \
                  flow-matching training grid)"
-            )));
-        }
-    }
-    if let Some(g) = req.guidance {
-        if !(GUIDANCE_RANGE.0..=GUIDANCE_RANGE.1).contains(&g) {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: guidance (CFG scale) {g} outside {:?} (1.0 disables CFG; the reference \
-                 default is {DEFAULT_CFG_SCALE})",
-                GUIDANCE_RANGE
             )));
         }
     }
@@ -391,10 +380,10 @@ mod tests {
         assert!(validate_request(&d, &r).is_err());
         let mut r = audio_req(AudioParams::default());
         r.guidance = Some(0.5);
-        assert!(validate_request(&d, &r).is_err());
+        assert!(validate_request(&d, &r).is_ok());
         let mut r = audio_req(AudioParams::default());
         r.guidance = Some(21.0);
-        assert!(validate_request(&d, &r).is_err());
+        assert!(validate_request(&d, &r).is_ok());
         let mut r = audio_req(AudioParams::default());
         r.scheduler_shift = Some(0.0);
         assert!(validate_request(&d, &r).is_err());

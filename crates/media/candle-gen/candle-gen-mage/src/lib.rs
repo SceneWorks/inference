@@ -180,7 +180,7 @@ pub fn descriptor_base() -> ModelDescriptor {
 }
 
 pub fn descriptor_turbo() -> ModelDescriptor {
-    generation_descriptor(config::TURBO_MODEL_ID, false, false)
+    generation_descriptor(config::TURBO_MODEL_ID, true, true)
 }
 
 pub struct MageGenerator {
@@ -439,6 +439,7 @@ impl Generator for MageEditGenerator {
                     steps,
                     guidance,
                     base_seed.wrapping_add(index as u64),
+                    req.scheduler_shift,
                     req.memory,
                     &req.cancel,
                     on_progress,
@@ -515,6 +516,7 @@ impl Generator for MageEditGenerator {
                             steps,
                             guidance,
                             base_seed,
+                            req.scheduler_shift,
                             req.memory,
                             &req.cancel,
                             on_progress,
@@ -689,6 +691,7 @@ impl Generator for MageGenerator {
                     steps,
                     guidance,
                     base_seed.wrapping_add(index as u64),
+                    req.scheduler_shift,
                     req.memory,
                     &req.cancel,
                     on_progress,
@@ -748,6 +751,7 @@ impl Generator for MageGenerator {
                             steps,
                             guidance,
                             base_seed,
+                            req.scheduler_shift,
                             req.memory,
                             &req.cancel,
                             on_progress,
@@ -939,8 +943,8 @@ pub fn edit_descriptor(variant: MageEditVariant) -> ModelDescriptor {
         modality: Modality::Image,
         required_components: REQUIRED_COMPONENTS,
         capabilities: Capabilities {
-            supports_negative_prompt: !matches!(variant, MageEditVariant::EditTurbo),
-            supports_guidance: !matches!(variant, MageEditVariant::EditTurbo),
+            supports_negative_prompt: true,
+            supports_guidance: true,
             // Mage exposes its two-forward CFG scale through `guidance`; `true_cfg` is a distinct
             // request field and is not consumed by this provider.
             supports_true_cfg: false,

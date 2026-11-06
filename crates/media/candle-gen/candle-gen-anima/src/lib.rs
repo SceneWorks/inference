@@ -88,7 +88,7 @@ const RES_MAX: u32 = 1536;
 /// Build the descriptor for a variant. Turbo is the merged CFG-free student (no guidance / negative
 /// prompt); Base/Aesthetic run true classifier-free guidance.
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
-    let cfg_capable = variant.uses_cfg();
+    let cfg_capable = true;
     ModelDescriptor {
         encoder_contract: None,
         denoiser_output_latent_space: Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
@@ -475,11 +475,8 @@ impl Generator for Anima {
         validate_request(&self.descriptor, req)?;
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
-        let guidance = if self.variant.uses_cfg() {
-            req.guidance.unwrap_or(self.variant.default_guidance())
-        } else {
-            1.0
-        };
+        let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
+        let cfg_on = self.variant.uses_cfg() || guidance != 1.0;
         let negative = req.negative_prompt.clone().unwrap_or_default();
 
         // Shared batch frame (sc-7792): the `0..count` loop + per-image `image_seed(base_seed, n)`
@@ -500,6 +497,8 @@ impl Generator for Anima {
                 guidance,
                 seed,
                 sampler: req.sampler.clone(),
+                scheduler: req.scheduler.clone(),
+                scheduler_shift: req.scheduler_shift,
                 // The caller's live preview sink (epic 16948, sc-16953). Cloning is an `Arc` bump;
                 // an absent sink is inert and the denoise never projects anything.
                 preview: req.preview.clone(),
@@ -513,9 +512,7 @@ impl Generator for Anima {
                 |text| match text {
                     AnimaTextPhase::Resident(pipeline) => {
                         let cond = pipeline.encode_prompt(&req.prompt)?;
-                        let uncond = self
-                            .variant
-                            .uses_cfg()
+                        let uncond = cfg_on
                             .then(|| pipeline.encode_prompt(&negative))
                             .transpose()?;
                         Ok((cond, uncond))
@@ -523,9 +520,7 @@ impl Generator for Anima {
                     AnimaTextPhase::Staged(components) => {
                         let cond =
                             AnimaPipeline::encode_staged(components, &self.device, &req.prompt)?;
-                        let uncond = self
-                            .variant
-                            .uses_cfg()
+                        let uncond = cfg_on
                             .then(|| {
                                 AnimaPipeline::encode_staged(components, &self.device, &negative)
                             })
@@ -773,8 +768,8 @@ mod tests {
         }
         // Turbo is the CFG-free merged student.
         let t = descriptor_turbo();
-        assert!(!t.capabilities.supports_guidance);
-        assert!(!t.capabilities.supports_negative_prompt);
+        assert!(t.capabilities.supports_guidance);
+        assert!(t.capabilities.supports_negative_prompt);
         // The default flow solver (er_sde on the 441ecec gen-core pin) is a real curated sampler.
         assert_eq!(pipeline::DEFAULT_SAMPLER, "er_sde");
         assert!(

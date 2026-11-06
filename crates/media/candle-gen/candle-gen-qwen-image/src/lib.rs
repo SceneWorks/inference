@@ -604,8 +604,13 @@ impl Pipeline {
         // closure — a multi-eval solver re-runs the whole closure.
         let native = pipeline::qwen_sigmas(steps, req.width, req.height);
         let mu = pipeline::qwen_mu(req.width, req.height);
-        let sigmas =
-            candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            mu,
+            steps,
+            &native,
+        )?;
 
         // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
         // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),

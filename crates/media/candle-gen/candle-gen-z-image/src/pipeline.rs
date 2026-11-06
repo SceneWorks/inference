@@ -1342,8 +1342,13 @@ impl Pipeline {
                 FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
             scheduler.set_timesteps(steps, Some(mu));
             let native: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
-            let sigmas =
-                candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
+            let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+                req.scheduler.as_deref(),
+                req.scheduler_shift,
+                0.0,
+                steps,
+                &native,
+            )?;
             let start = start_step.min(sigmas.len().saturating_sub(1));
             let x_t = match clean {
                 Some(clean) => {
@@ -1424,12 +1429,13 @@ impl Pipeline {
             let mut scheduler = FlowMatchEulerDiscreteScheduler::new(base_scheduler_config());
             scheduler.set_timesteps(steps, None);
             let native: Vec<f32> = scheduler.sigmas.iter().map(|&sigma| sigma as f32).collect();
-            let sigmas = candle_gen::resolve_flow_schedule(
+            let sigmas = candle_gen::resolve_flow_schedule_with_shift(
                 req.scheduler.as_deref(),
+                req.scheduler_shift,
                 (BASE_SCHEDULE_SHIFT as f32).ln(),
                 steps,
                 &native,
-            );
+            )?;
             let start = start_step.min(sigmas.len().saturating_sub(1));
             let x_t = match clean {
                 Some(clean) => {
@@ -1599,8 +1605,13 @@ impl Pipeline {
             // is NEGATED before the step — both Z-Image-specific quirks live inside the `predict`
             // closure, so a multi-eval solver re-applies them each eval.
             let native: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
-            let sigmas =
-                candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
+            let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+                req.scheduler.as_deref(),
+                req.scheduler_shift,
+                0.0,
+                steps,
+                &native,
+            )?;
 
             // img2img / `Reference` (sc-11783): blend the pre-encoded clean latent with the seeded noise
             // at `σ_start = sigmas[start]` and denoise the reduced `start..` schedule tail. `start` is
@@ -1772,12 +1783,13 @@ impl Pipeline {
             // Curated scheduler axis (epic 7114): an unset `req.scheduler` returns `native` verbatim
             // (the byte-exact shift=6.0 default); a curated name re-shapes σ over the same shift
             // (`mu = ln(shift)`), exactly as `mlx-gen-z-image::model_base`.
-            let sigmas = candle_gen::resolve_flow_schedule(
+            let sigmas = candle_gen::resolve_flow_schedule_with_shift(
                 req.scheduler.as_deref(),
+                req.scheduler_shift,
                 (BASE_SCHEDULE_SHIFT as f32).ln(),
                 steps,
                 &native,
-            );
+            )?;
 
             // img2img / `Reference` (sc-8646): blend the pre-encoded clean latent with the seeded noise
             // at `σ_start = sigmas[start]` and denoise the reduced `start..` schedule tail. `start` is

@@ -374,7 +374,7 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
     let (id, cfg) = match variant {
         Variant::Large => (MODEL_ID, true),
         Variant::Medium => (MODEL_ID_MEDIUM, true),
-        Variant::LargeTurbo => (MODEL_ID_TURBO, false),
+        Variant::LargeTurbo => (MODEL_ID_TURBO, true),
     };
     ModelDescriptor {
         encoder_contract: None,
@@ -845,8 +845,8 @@ mod tests {
 
         let d = descriptor_turbo();
         // Turbo is guidance-distilled: no CFG, no negative prompt.
-        assert!(!d.capabilities.supports_guidance, "turbo is distilled");
-        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.mac_only);
 
         // Turbo validate rejects guidance + negative prompt (distilled-model honesty).
@@ -862,7 +862,10 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            assert!(g.validate(&bad).is_err(), "turbo should reject: {bad:?}");
+            assert!(
+                g.validate(&bad).is_ok(),
+                "turbo supports CFG overrides: {bad:?}"
+            );
         }
     }
 

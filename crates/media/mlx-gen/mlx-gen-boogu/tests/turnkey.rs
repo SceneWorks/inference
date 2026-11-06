@@ -60,6 +60,8 @@ fn assemble_turnkey_loads() {
         pipe.generate_turbo(
             "a red apple on a wooden table",
             &TurboOptions {
+                guidance: 0.0,
+                scheduler_shift: None,
                 height: 512,
                 width: 512,
                 steps: 4,

@@ -18,8 +18,8 @@
 
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler_with_latent_hook, CancelFlag, FlowMatchEuler, Image,
-    PreviewSink, Progress, Result, SamplerRun, TimestepConvention,
+    run_flow_sampler_with_latent_hook, CancelFlag, FlowMatchEuler, Image, PreviewSink, Progress,
+    Result, SamplerRun, TimestepConvention,
 };
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
@@ -43,9 +43,19 @@ pub const SCHEDULE_SHIFT: f32 = 3.0;
 /// Resolve SD3.5's native or curated flow schedule over its static model shift.  The `normal`
 /// endpoint is intentionally the same as the frozen native fixture; other curated names may
 /// redistribute interior steps but must never lose the static shift.
-pub(crate) fn resolve_sd3_sigmas(scheduler: Option<&str>, steps: usize) -> Vec<f32> {
+pub(crate) fn resolve_sd3_sigmas(
+    scheduler: Option<&str>,
+    steps: usize,
+    shift: Option<f32>,
+) -> Result<Vec<f32>> {
     let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-    resolve_flow_schedule(scheduler, SCHEDULE_SHIFT.ln(), steps, &native.sigmas)
+    Ok(mlx_gen::resolve_flow_schedule_with_shift(
+        scheduler,
+        shift,
+        SCHEDULE_SHIFT.ln(),
+        steps,
+        &native.sigmas,
+    )?)
 }
 
 /// Seeded txt2img latent noise — shape `[1, 16, height/8, width/8]`, f32. diffusers
@@ -780,13 +790,13 @@ mod tests {
     fn native_and_curated_sd35_schedule_endpoints_match_frozen_fixture() {
         // Frozen from diffusers FlowMatchEulerDiscreteScheduler { shift: 3.0 } at four steps.
         let fixture = [1.0_f32, 0.9, 0.75, 0.5, 0.0];
-        let native = resolve_sd3_sigmas(None, 4);
+        let native = resolve_sd3_sigmas(None, 4, None).unwrap();
         assert_eq!(native.len(), fixture.len());
         for (got, want) in native.iter().zip(fixture) {
             assert!((got - want).abs() < 1e-5, "native got {got} want {want}");
         }
 
-        let curated = resolve_sd3_sigmas(Some("normal"), 4);
+        let curated = resolve_sd3_sigmas(Some("normal"), 4, None).unwrap();
         assert_eq!(curated.first(), Some(&fixture[0]));
         assert_eq!(curated.last(), Some(&fixture[4]));
         assert!(

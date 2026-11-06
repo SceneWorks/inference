@@ -20,7 +20,7 @@ use std::path::Path;
 
 use crate::loader;
 use crate::pipeline::{
-    self, denoise_with_progress_and_preview, encode_init_latents, init_time_step,
+    self, denoise_cfg_with_progress_and_preview, encode_init_latents, init_time_step,
 };
 use crate::text_encoder::TextEncoder;
 use crate::transformer::ZImageTransformer;
@@ -74,7 +74,8 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             supported_quants: &[Quant::Q4, Quant::Q8],
             // Turbo is guidance-distilled: no CFG, no negative prompt.
-            supports_negative_prompt: false,
+            supports_negative_prompt: true,
+            supports_guidance: true,
             // img2img reference; ControlNet is a separate variant (sc-2349).
             conditioning: vec![ConditioningKind::Reference],
             supports_lora: true,
@@ -621,6 +622,8 @@ impl ZImageTurbo {
             ],
         );
 
+        let guidance = 1.0 + req.guidance.unwrap_or(0.0);
+        let cfg_on = guidance != 1.0;
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let base_seed = req.seed.unwrap_or_else(default_seed);
 
@@ -669,21 +672,37 @@ impl ZImageTurbo {
                     MODEL_ID,
                     encoder_window,
                 )?;
-                if is_img2img {
-                    Ok(cap)
+                let cap = if is_img2img {
+                    cap
                 } else {
-                    pipeline::caption_cast_quantum(&cap)
-                }
+                    pipeline::caption_cast_quantum(&cap)?
+                };
+                let negative = if cfg_on {
+                    Some(pipeline::encode_uncond(
+                        &self.tokenizer,
+                        text_encoder,
+                        req.negative_prompt.as_deref().unwrap_or(""),
+                        encoder_window,
+                    )?)
+                } else {
+                    None
+                };
+                Ok((cap, negative))
             },
             // Materialize `cap` while the encoder is still alive (Sequential only) — MLX is lazy, so an
             // un-evaluated `cap` keeps the encoder referenced through the graph and the drop frees nothing.
-            |cap| match cap {
-                Some(cap) => Ok(mlx_rs::transforms::eval([cap])?),
-                None => Ok(()),
+            |encoded| {
+                if let Some((cap, negative)) = encoded {
+                    match negative {
+                        Some(negative) => mlx_rs::transforms::eval([cap, negative])?,
+                        None => mlx_rs::transforms::eval([cap])?,
+                    }
+                }
+                Ok(())
             },
             // ── Phase B (denoise): heavy bundle + cap → (evaluated latents, minted PiD decoder). The
             // PiD decoder is minted here (owned, no borrow of `heavy.pid`) so it survives the shed.
-            |heavy: &ZImageHeavyOwned, cap, on_progress| {
+            |heavy: &ZImageHeavyOwned, (cap, negative), on_progress| {
                 pipeline::calibration_fault(
                     req,
                     mlx_gen::gen_core::MemoryPhase::Denoise,
@@ -728,13 +747,15 @@ impl ZImageTurbo {
                     req,
                     on_progress,
                     |latents, seed, op| {
-                        denoise_with_progress_and_preview(
+                        denoise_cfg_with_progress_and_preview(
                             &heavy.transformer,
                             &scheduler,
                             sampler_name,
                             seed,
                             latents,
                             &cap,
+                            negative.as_ref(),
+                            guidance,
                             start_step,
                             attention_budget,
                             block_window,
@@ -792,6 +813,17 @@ pub(crate) fn validate_request(
     // strings name the actual model instead of a hardcoded `z_image_turbo:` (F-089a). The `?` keeps
     // the typed `Error::Unsupported` for capability gaps.
     caps.validate_request(id, req)?;
+    if req
+        .negative_prompt
+        .as_ref()
+        .is_some_and(|negative| !negative.is_empty())
+        && id == MODEL_ID
+        && req.guidance.unwrap_or(0.0) == 0.0
+    {
+        return Err(Error::Msg(format!(
+            "{id}: a negative prompt requires CFG different from 0.0"
+        )));
+    }
 
     // Z-Image-specific checks layered on top of the shared floor:
     // F-096: reject a whitespace-only prompt too (`"   "` renders an effectively unconditioned image),
@@ -937,7 +969,7 @@ mod tests {
         assert_eq!(d.family, "z-image");
         assert_eq!(d.modality, Modality::Image);
         assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
-        assert!(!d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_guidance);
     }
 
     #[test]
@@ -969,10 +1001,11 @@ mod tests {
         // guidance on a distilled model (non-empty prompt so the empty-prompt guard doesn't mask it).
         let mut req = GenerationRequest {
             prompt: "a fox".into(),
-            guidance: Some(4.0),
+            guidance: Some(1.5),
+            negative_prompt: Some("blurry".into()),
             ..Default::default()
         };
-        assert!(validate_request(MODEL_ID, &caps, &req).is_err());
+        assert!(validate_request(MODEL_ID, &caps, &req).is_ok());
         // out-of-range size.
         req = GenerationRequest {
             prompt: "a fox".into(),

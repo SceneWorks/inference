@@ -26,10 +26,10 @@
 use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
-    AcceptedControlKinds, Capabilities, ConditioningKind, ControlBranch, ControlKind,
-    FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, Residency, Result,
+    curated_sampler_names, curated_scheduler_names, default_seed, AcceptedControlKinds,
+    Capabilities, ConditioningKind, ControlBranch, ControlKind, FlowMatchEuler, GenerationOutput,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Residency,
+    Result,
 };
 
 use crate::model::validate_request;
@@ -266,12 +266,14 @@ impl ZImageControl {
                 // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
                 // over shift=6.0.
                 let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-                let scheduler = FlowMatchEuler::from_sigmas(resolve_flow_schedule(
-                    req.scheduler.as_deref(),
-                    SCHEDULE_SHIFT.ln(),
-                    steps,
-                    &native.sigmas,
-                ))?;
+                let scheduler =
+                    FlowMatchEuler::from_sigmas(mlx_gen::resolve_flow_schedule_with_shift(
+                        req.scheduler.as_deref(),
+                        req.scheduler_shift,
+                        SCHEDULE_SHIFT.ln(),
+                        steps,
+                        &native.sigmas,
+                    )?)?;
 
                 // The 33ch control context is constant across steps + the batch + both CFG branches —
                 // build once. It stays **f32** (the fork feeds it f32, promoting the control branch to
