@@ -135,3 +135,5 @@ cuda = [
 # (sc-26691: MiniMax-H3's DiT and video VAE decoder). Implies `cuda`; compiles the CUTLASS kernel
 # set, so it is opt-in rather than part of `cuda`.
 flash-attn = ["cuda", "candle-gen/flash-attn", "candle-gen-minimax-h3/flash-attn"]
+# Explicitly dispatched H3 acceptance; no additional model execution in normal CI.
+h3-memory-proof = ["candle-gen-minimax-h3/model-inference-proof"]

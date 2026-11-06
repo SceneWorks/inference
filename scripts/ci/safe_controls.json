@@ -653,6 +653,328 @@
         "win32"
       ],
       "reason": "CV numeric fixture or provider-fallback state transition using plain buffers/tokens. No model load, learned execution, tensor backend or ORT environment is reachable."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "h3_memory::window::tests::cuda_dense_windows_price_real_geometry_without_native_descriptors",
+      "source": "crates/contracts/gen-core/src/h3_memory/window.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Pure allocation arithmetic and fake payload sizes; no Tensor, learned model, numerical kernel or device work executes."
+    },
+    {
+      "package": "sceneworks-gen-core-h3",
+      "kind": "lib",
+      "target": "gen_core_h3",
+      "test": "veda::workspace::tests::cuda_pool_boundaries_are_independent_and_phases_are_alternatives",
+      "source": "crates/contracts/gen-core-h3/src/veda/workspace.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Pure source-bound arithmetic checks independent host/device budgets, reserve equality and shared QKV lifetime composition; no tensors or inference."
+    },
+    {
+      "package": "sceneworks-gen-core-h3",
+      "kind": "lib",
+      "target": "gen_core_h3",
+      "test": "veda::workspace::tests::constrained_materializing_fallback_prices_the_runtime_score_domain",
+      "source": "crates/contracts/gen-core-h3/src/veda/workspace.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Request geometry, immutable plan metadata and score-domain arithmetic only; no predictor weights or attention kernel execute."
+    },
+    {
+      "package": "sceneworks-gen-core-h3",
+      "kind": "lib",
+      "target": "gen_core_h3",
+      "test": "veda::workspace::tests::unknown_and_overflowing_raw_allocation_facts_are_not_zero",
+      "source": "crates/contracts/gen-core-h3/src/veda/workspace.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Malformed allocation metadata and checked arithmetic refusal only; no Tensor, model, numerical kernel or accelerator work."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::streaming::tests::header_inventory_prices_cuda_text_windows_and_host_embedding_separately",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy/streaming.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Tiny safetensors headers/data-file sizing only; no tensor/model constructor, learned forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::routes::tests::request_scope_applies_parameters_and_cleans_up_on_failure",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy/routes.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free contract and lifecycle scope config, request fields and thread-local cleanup. CPU device used solely as inert synchronization handle; no model executes."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::optimized_rungs_match_executable_load_shape",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::load_shape_tracks_the_owned_loader_contract",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::estimated_optimized_routes_do_not_require_measurement_identity",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::candle_contract_preserves_backend_and_allocation_identity",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::lifecycle_hooks_have_executable_phase_mechanisms",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::parameter_ranges_are_owned_by_the_rung_that_consumes_them",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::each_contract_mutation_is_independently_detected",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::tests::fixture_contract_conforms_weights_free",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "quant::adapt::tests::device_copy_owns_frozen_adapter_caches_without_mutating_the_source",
+      "source": "crates/media/candle-gen/candle-gen/src/quant/adapt.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CPU Tensor construction/readback and Arc/Weak ownership only, with directly seeded frozen factor caches. No learned forward, matmul, factor preparation, numeric model operation or accelerator work executes."
+    },
+    {
+      "package": "sceneworks-gen-core-h3",
+      "kind": "lib",
+      "target": "gen_core_h3",
+      "test": "h3_memory::tests::cuda_host_prepared_windows_scope_adapter_storage_and_projection_work",
+      "source": "crates/contracts/gen-core-h3/src/h3_memory.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Pure source-owned allocation arithmetic over synthetic byte counts and adapter metadata; verifies host-only install lifetimes, aligned device windows, disjoint projection/RMS work and unchanged MLX accounting. No tensor backend or learned execution."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "h3_memory::window::tests::cuda_adaln_precompute_prices_current_projection_and_cache_prefix",
+      "source": "crates/contracts/gen-core/src/h3_memory/window.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Pure byte arithmetic for affine/dense AdaLN dequantization, overlapping casts/outputs, sequential cache prefixes, independent MLX behavior, and unknown/zero/overflow refusal. No tensors, device or learned computation."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "memory_strategy::streaming::tests::cuda_adaln_headers_separate_precompute_from_body_decode_and_refuse_unknown",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/memory_strategy/streaming.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Header-only safetensors fixtures distinguish q4/q8/BF16 runtime scratch, consumed AdaLN operands, CPU preparation, and unsupported native migration. No payload tensors, model factory or learned execution."
+    },
+    {
+      "package": "candle-core",
+      "kind": "lib",
+      "target": "candle_core",
+      "test": "cuda_pool_recovery::tests::allocation_recovery_observes_then_trims_then_retries_once_without_changing_cap",
+      "source": "crates/media/candle-gen/vendor/candle-core/src/cuda_backend/proof_pool/recovery.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Exact allocator policy source compiled without CUDA; fake reclaim callbacks and integer byte counters test observation/trim/retry order, immutable caps, failure propagation and no retry loop. No tensor, device, learned forward or numerical kernel executes."
+    },
+    {
+      "package": "candle-core",
+      "kind": "lib",
+      "target": "candle_core",
+      "test": "cuda_pool_recovery::tests::allocation_recovery_does_not_attempt_to_fit_live_or_oversize_allocations",
+      "source": "crates/media/candle-gen/vendor/candle-core/src/cuda_backend/proof_pool/recovery.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Exact allocator policy source compiled without CUDA; fake reclaim callbacks and integer byte counters test observation/trim/retry order, immutable caps, failure propagation and no retry loop. No tensor, device, learned forward or numerical kernel executes."
+    },
+    {
+      "package": "candle-core",
+      "kind": "lib",
+      "target": "candle_core",
+      "test": "cuda_pool_recovery::tests::allocation_recovery_propagates_observation_and_trim_failures_without_retry",
+      "source": "crates/media/candle-gen/vendor/candle-core/src/cuda_backend/proof_pool/recovery.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Exact allocator policy source compiled without CUDA; fake reclaim callbacks and integer byte counters test observation/trim/retry order, immutable caps, failure propagation and no retry loop. No tensor, device, learned forward or numerical kernel executes."
+    },
+    {
+      "package": "candle-core",
+      "kind": "lib",
+      "target": "candle_core",
+      "test": "cuda_pool_recovery::tests::allocation_recovery_refuses_changed_pool_and_does_not_loop_on_retry_failure",
+      "source": "crates/media/candle-gen/vendor/candle-core/src/cuda_backend/proof_pool/recovery.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Exact allocator policy source compiled without CUDA; fake reclaim callbacks and integer byte counters test observation/trim/retry order, immutable caps, failure propagation and no retry loop. No tensor, device, learned forward or numerical kernel executes."
+    },
+    {
+      "package": "candle-core",
+      "kind": "lib",
+      "target": "candle_core",
+      "test": "cuda_pool_recovery::tests::allocation_recovery_rechecks_live_bytes_after_trim_before_retry",
+      "source": "crates/media/candle-gen/vendor/candle-core/src/cuda_backend/proof_pool/recovery.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Exact allocator policy source compiled without CUDA; fake reclaim callbacks and integer byte counters test observation/trim/retry order, immutable caps, failure propagation and no retry loop. No tensor, device, learned forward or numerical kernel executes."
     }
   ]
 }

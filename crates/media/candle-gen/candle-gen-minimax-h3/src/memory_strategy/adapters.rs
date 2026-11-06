@@ -73,6 +73,27 @@ mod tests {
         )
         .unwrap();
         let mut entries = Vec::new();
+        // Complete non-adapter AdaLN inputs are needed by header-owned precompute pricing.
+        // Keep these before the declared adapter targets: the final-leaf deletion below must
+        // still discriminate an incomplete adapter-addressable source census.
+        for (name, shape) in [
+            (
+                "transformer_blocks.0.adaln_proj.linear.weight",
+                vec![18 * 7168, 2688],
+            ),
+            (
+                "transformer_blocks.0.adaln_proj.linear.bias",
+                vec![18 * 7168],
+            ),
+            ("time_embedder.linear_1.weight", vec![7168, 256]),
+            ("time_embedder.linear_1.bias", vec![7168]),
+            ("time_embedder.linear_2.weight", vec![2688, 7168]),
+            ("time_embedder.linear_2.bias", vec![2688]),
+            ("norm_out.linear.weight", vec![2 * 7168, 2688]),
+            ("norm_out.linear.bias", vec![2 * 7168]),
+        ] {
+            entries.push((name.into(), "F32", shape));
+        }
         // Explicit source inventory, independent of adapter_target_paths so a
         // mapper that drops a refiner/FFN leaf does not rewrite the fixture too.
         for container in ["transformer_blocks.0", "token_refiner.refiner_blocks.0"] {

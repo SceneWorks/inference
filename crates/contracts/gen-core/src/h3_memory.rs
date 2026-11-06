@@ -294,5 +294,7 @@ impl NativeProjection {
 }
 pub mod window;
 
-/// The actual Candle H3 outer FFN token-span planner's element budget.
-pub const FFN_INTERMEDIATE_BUDGET: u64 = 1_000_000_000;
+/// The largest actual CUDA H3 outer FFN token-span budget. The selected request may
+/// choose a smaller bound through the same policy as attention; never assume the old
+/// i32-only one-billion-element guard is still the runtime's working set.
+pub const FFN_INTERMEDIATE_BUDGET: u64 = crate::veda::workspace::CUDA_DENSE_SCORE_ELEMENTS;

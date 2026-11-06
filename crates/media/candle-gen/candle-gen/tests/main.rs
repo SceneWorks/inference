@@ -31,6 +31,9 @@ mod cublaslt_8bit_numerics;
 #[path = "cublaslt_nvfp4_gemm.rs"]
 mod cublaslt_nvfp4_gemm;
 
+#[path = "cuda_proof_pool.rs"]
+mod cuda_proof_pool;
+
 #[path = "cuda_quant_smoke.rs"]
 mod cuda_quant_smoke;
 

@@ -1,0 +1,76 @@
+name: Explicit CUDA memory envelope primitive
+
+# Manual allocator proof, separate from normal PR/main CI and all model campaigns.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prove:
+    runs-on: [self-hosted, Windows, X64, cuda]
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '4'
+      CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+      CUDA_COMPUTE_CAP: '80'
+      SCENEWORKS_CUDA_PROOF_POOL_BYTES: '536870912'
+      VCVARS: 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Bind physical GPU1 and owned proof outputs
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse HEAD) -ne $env:GITHUB_SHA) { throw 'source mismatch' }
+          $uuid = (nvidia-smi -i 1 --query-gpu=uuid --format=csv,noheader,nounits).Trim()
+          if ($LASTEXITCODE -ne 0 -or $uuid -notmatch '^GPU-[0-9a-fA-F-]{36}$') { throw 'physical GPU1 identity unavailable' }
+          $root = "D:\Codex\work\cuda-envelope-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path "$root\tmp" -Force | Out-Null
+          $encoding = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "CUDA_VISIBLE_DEVICES=$uuid`nCUDA_DEVICE_ORDER=PCI_BUS_ID`nSCENEWORKS_GPU_ID=1`nCARGO_TARGET_DIR=$root\target`nTEMP=$root\tmp`nTMP=$root\tmp`nPROOF_ROOT=$root`n", $encoding)
+          nvidia-smi -i 1 --query-gpu=index,uuid,name,memory.total,memory.used,driver_version --format=csv | Set-Content "$root\device-before.csv"
+          if ($LASTEXITCODE -ne 0) { throw 'device inventory unavailable' }
+          git rev-parse HEAD | Set-Content "$root\source.txt"
+      - name: Check allocator launcher without CUDA execution
+        shell: powershell
+        run: |
+          python -m unittest scripts.tests.test_cuda_memory_envelope_proof
+          if ($LASTEXITCODE -ne 0) { throw 'allocator launcher checks failed' }
+          python scripts/ci/cuda_memory_envelope_proof.py --help
+          if ($LASTEXITCODE -ne 0) { throw 'allocator launcher startup failed' }
+      - name: Compile allocator primitive without execution
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          if errorlevel 1 exit /b %ERRORLEVEL%
+          cargo test --locked -p candle-gen --features cuda,testkit --test integration --no-run --message-format=json >"%PROOF_ROOT%\allocator-compile.jsonl" 2>"%PROOF_ROOT%\allocator-compile.log"
+          exit /b %ERRORLEVEL%
+      - name: Prove constructor cap under the host-global GPU1 lease
+        shell: powershell
+        run: |
+          python scripts/ci/cuda_memory_envelope_proof.py --artifacts "$env:PROOF_ROOT\allocator-compile.jsonl" --output "$env:PROOF_ROOT"
+          $code = $LASTEXITCODE
+          if (Test-Path "$env:PROOF_ROOT\allocator-proof.log") { Get-Content "$env:PROOF_ROOT\allocator-proof.log" }
+          if (Test-Path "$env:PROOF_ROOT\allocator-proof.stderr.log") { Get-Content "$env:PROOF_ROOT\allocator-proof.stderr.log" }
+          if ($code -ne 0) { throw "allocator primitive failed: $code" }
+      - name: Record final device state
+        if: always() && env.PROOF_ROOT != ''
+        shell: powershell
+        run: |
+          nvidia-smi -i 1 --query-gpu=index,uuid,name,memory.total,memory.used,driver_version --format=csv | Set-Content "$env:PROOF_ROOT\device-after.csv"
+          if ($LASTEXITCODE -ne 0) { throw 'final device inventory unavailable' }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always() && env.PROOF_ROOT != ''
+        with:
+          name: cuda-memory-envelope-primitive
+          path: |
+            ${{ env.PROOF_ROOT }}/*.log
+            ${{ env.PROOF_ROOT }}/*.csv
+            ${{ env.PROOF_ROOT }}/*.json
+            ${{ env.PROOF_ROOT }}/source.txt
+          if-no-files-found: error

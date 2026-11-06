@@ -70,6 +70,7 @@ pub struct MiniMaxH3Dit {
     projections: DitProjections,
     refiner: TokenRefiner,
     blocks: Vec<DitBlock>,
+    stream_window: Option<usize>,
     rope: MmRope,
     /// The direct, centered-curve AdaLN of a pruned (sc-26684) checkpoint; `None` on the stock
     /// path, where the timestep MLP in [`DitProjections`] drives the projections instead.
@@ -79,6 +80,29 @@ pub struct MiniMaxH3Dit {
 }
 
 impl MiniMaxH3Dit {
+    /// Move only shared/root modules after the host stack and its residuals are prepared.
+    /// Block bases are already in runtime format: window execution transfers bytes, never repacks.
+    pub(crate) fn prepare_streamed(&mut self, device: &Device, window: usize) -> Result<()> {
+        let _ = candle_gen::block_window::BlockPlan::new(self.blocks.len(), window)?;
+        self.projections = self.projections.copy_to_device(device)?;
+        self.refiner = self.refiner.copy_to_device(device)?;
+        self.curve = self
+            .curve
+            .as_ref()
+            .map(|c| c.copy_to_device(device))
+            .transpose()?;
+        self.device = device.clone();
+        self.stream_window = Some(window);
+        tracing::info!(
+            event = "h3_transformer_stream_prepared",
+            component = "dit",
+            window,
+            host_blocks = self.blocks.len(),
+            "Prepared host-resident runtime-format DiT blocks"
+        );
+        Ok(())
+    }
+
     /// Build from an already-populated [`Weights`] map.
     ///
     /// `dtype` is the **block stack's** precision. The 17 input/output tensors are loaded at their
@@ -127,6 +151,7 @@ impl MiniMaxH3Dit {
                 projections,
                 refiner,
                 blocks,
+                stream_window: None,
                 rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
                 curve: Some(curve),
                 dtype,
@@ -143,6 +168,7 @@ impl MiniMaxH3Dit {
             projections,
             refiner,
             blocks,
+            stream_window: None,
             rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
             curve: None,
             dtype,
@@ -496,6 +522,12 @@ impl MiniMaxH3Dit {
             packed.video_indices,
             packed.audio_indices,
         )?;
+        if self.stream_window.is_some() && self.device.is_cuda() {
+            // scatter_rows cats then index_selects into independent packed storage. These
+            // per-modality projections are not inputs to any later body/output operation.
+            drop(video);
+            drop(audio);
+        }
 
         // 2. The stack. The AdaLN index bounds-check runs ONCE here rather than per block: it is a
         //    blocking D2H readback, and all 50 blocks gather with the same index tensor against
@@ -512,45 +544,72 @@ impl MiniMaxH3Dit {
         };
         crate::dit::block::check_adaln_indices(packed.adaln_indices, modulation_rows)?;
         let sync_between_layers = layer_cancel_needs_sync(x.dims()[1]);
-        for (layer, block) in self.blocks.iter().enumerate() {
-            if let Some(cancel) = cancel {
-                if sync_between_layers {
-                    self.device.synchronize()?;
+        let apply = |mut x: Tensor, range: std::ops::Range<usize>| -> Result<Tensor> {
+            for layer in range {
+                let transferred;
+                let block = if self.stream_window.is_some() {
+                    transferred = self.blocks[layer].copy_to_device(&self.device)?;
+                    tracing::trace!(event="h3_transformer_window_materialized", component="dit",
+                        first_block=layer, block_count=1, base_bytes=transferred.body_nbytes(),
+                        device=?self.device.location(), "Materialized prepared DiT body window");
+                    &transferred
+                } else {
+                    &self.blocks[layer]
+                };
+                if let Some(cancel) = cancel {
+                    if sync_between_layers {
+                        self.device.synchronize()?;
+                    }
+                    if cancel.is_cancelled() {
+                        return Err(CandleError::Canceled);
+                    }
                 }
-                if cancel.is_cancelled() {
-                    return Err(CandleError::Canceled);
-                }
+                x = match blocks {
+                    BlockModulation::Cached(cache) => block.forward_veda(
+                        &x,
+                        cache.modulation(layer)?,
+                        packed.adaln_indices,
+                        &self.rope,
+                        packed.tables,
+                        veda.map(|(runtime, step)| (runtime, layer, step)),
+                        cancel,
+                    )?,
+                    BlockModulation::Temb(temb) => block.forward_veda(
+                        &x,
+                        &block.modulation(temb)?,
+                        packed.adaln_indices,
+                        &self.rope,
+                        packed.tables,
+                        veda.map(|(runtime, step)| (runtime, layer, step)),
+                        cancel,
+                    )?,
+                    BlockModulation::CurveCoords(coords) => block.forward_veda(
+                        &x,
+                        &block.curve_modulation(coords)?,
+                        packed.adaln_indices,
+                        &self.rope,
+                        packed.tables,
+                        veda.map(|(runtime, step)| (runtime, layer, step)),
+                        cancel,
+                    )?,
+                };
             }
-            x = match blocks {
-                BlockModulation::Cached(cache) => block.forward_veda(
-                    &x,
-                    cache.modulation(layer)?,
-                    packed.adaln_indices,
-                    &self.rope,
-                    packed.tables,
-                    veda.map(|(runtime, step)| (runtime, layer, step)),
-                    cancel,
-                )?,
-                BlockModulation::Temb(temb) => block.forward_veda(
-                    &x,
-                    &block.modulation(temb)?,
-                    packed.adaln_indices,
-                    &self.rope,
-                    packed.tables,
-                    veda.map(|(runtime, step)| (runtime, layer, step)),
-                    cancel,
-                )?,
-                BlockModulation::CurveCoords(coords) => block.forward_veda(
-                    &x,
-                    &block.curve_modulation(coords)?,
-                    packed.adaln_indices,
-                    &self.rope,
-                    packed.tables,
-                    veda.map(|(runtime, step)| (runtime, layer, step)),
-                    cancel,
-                )?,
-            };
-        }
+            Ok(x)
+        };
+        x = if let Some(window) = self.stream_window {
+            let plan = candle_gen::block_window::BlockPlan::new(self.blocks.len(), window)?;
+            let default_cancel = CancelFlag::default();
+            candle_gen::block_window::run_windowed(
+                &self.device,
+                &plan,
+                cancel.unwrap_or(&default_cancel),
+                x,
+                || Ok(()),
+                |x, _, range| apply(x, range),
+            )?
+        } else {
+            apply(x, 0..self.blocks.len())?
+        };
         // 3. The shared output norm, then the two heads over their own rows. Gathering before
         //    projecting is bit-identical to the reference's project-then-gather (both heads are
         //    row-wise affine maps) and skips the text rows' outputs, which it discards.
@@ -761,7 +820,50 @@ impl JointDit {
         let device = dit.device.clone();
 
         let (modulation, norm_out_modulation, resident_adaln, resident_ts, released_bytes) =
-            if let Some(curve) = &dit.curve {
+            if let Some(window) = dit.stream_window {
+                let policy = crate::block_stream::current().ok_or_else(|| {
+                    CandleError::Msg("streamed AdaLN requires an active request".into())
+                })?;
+                let input = if let Some(curve) = &dit.curve {
+                    curve.coordinates(schedule.distinct_timesteps(), &device)?
+                } else {
+                    dit.embed_timesteps(schedule.distinct_timesteps())?
+                };
+                let norm_out = if let Some(curve) = &dit.curve {
+                    curve.norm_out_modulation(&input)?
+                } else {
+                    dit.projections.norm_out.modulation(&input)?
+                };
+                let plan = candle_gen::block_window::BlockPlan::new(dit.blocks.len(), window)?;
+                let layers = candle_gen::block_window::run_windowed(
+                    &device,
+                    &plan,
+                    &policy.cancel,
+                    Vec::with_capacity(dit.blocks.len()),
+                    || Ok(()),
+                    |mut layers, _, range| {
+                        for layer in range {
+                            if policy.cancel.is_cancelled() {
+                                return Err(CandleError::Canceled);
+                            }
+                            layers.push(dit.blocks[layer].modulation_for_window(&input, &device)?);
+                        }
+                        Ok(layers)
+                    },
+                )?;
+                let cache = AdaLnCache::assemble(schedule, layers, dit.pruning_identity())?;
+                for block in &mut dit.blocks {
+                    block.evict_adaln();
+                }
+                // Host projections were dropped; no GPU eviction saving is claimed.
+                (
+                    Modulation::Cached(Box::new(cache)),
+                    Some(norm_out),
+                    None,
+                    None,
+                    0,
+                )
+            } else if let Some(curve) = &dit.curve {
                 // The pruned (sc-26684) path. There is no 26.02 GB to evict — the curve operands
                 // are ~175 MB of F32 compute buffers — so PrecomputeAndEvict releases zero and
                 // Resident simply re-interpolates the table per step; both residencies are
@@ -1067,14 +1169,25 @@ mod veda_controls_tests {
             ..Default::default()
         }
     }
-    fn weights(bits: Option<usize>) -> Weights {
-        let device = Device::Cpu;
+    fn proof_device() -> Device {
+        match std::env::var("SCENEWORKS_H3_STREAM_PROOF_DEVICE")
+            .ok()
+            .as_deref()
+        {
+            None => Device::Cpu,
+            Some("cuda:0") => {
+                Device::new_cuda(0).expect("explicit CUDA proof requires logical GPU0")
+            }
+            Some(other) => panic!("unsupported explicit H3 proof device: {other}"),
+        }
+    }
+    fn weights_on(bits: Option<usize>, device: &Device) -> Weights {
         let mut map = candle_gen::candle_core::safetensors::load(
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/fixtures/dit_block.safetensors"
             ),
-            &device,
+            device,
         )
         .unwrap();
         if let Some(bits) = bits {
@@ -1086,22 +1199,21 @@ mod veda_controls_tests {
                 .collect();
             map.insert(
                 "transformer_blocks.0.attn.to_q.weight".into(),
-                Tensor::from_vec(codes, (96, 64 / lanes), &device).unwrap(),
+                Tensor::from_vec(codes, (96, 64 / lanes), device).unwrap(),
             );
             map.insert(
                 "transformer_blocks.0.attn.to_q.scales".into(),
-                Tensor::full(0.002f32, (96, 1), &device).unwrap(),
+                Tensor::full(0.002f32, (96, 1), device).unwrap(),
             );
             map.insert(
                 "transformer_blocks.0.attn.to_q.biases".into(),
-                Tensor::full(-0.01f32, (96, 1), &device).unwrap(),
+                Tensor::full(-0.01f32, (96, 1), device).unwrap(),
             );
         }
         Weights::from_map(map)
     }
-    fn layout(mode: usize, channels: usize) -> PackedLayout {
+    fn layout_on(mode: usize, channels: usize, dev: &Device) -> PackedLayout {
         let geometry = JointGeometry::new(5, 2, 2).unwrap();
-        let dev = Device::Cpu;
         let anchors = match mode {
             1 => vec![KeyframeAnchor::First],
             2 => vec![KeyframeAnchor::Last],
@@ -1115,7 +1227,7 @@ mod veda_controls_tests {
                 &[TEXT_TAG; 5],
                 channels,
                 &anchors,
-                &dev,
+                dev,
             )
             .unwrap();
         }
@@ -1143,7 +1255,7 @@ mod veda_controls_tests {
                 num_audio_latents: 3,
             },
         ];
-        PackedLayout::build_ref2va(geometry, [1, 2, 2], &[TEXT_TAG; 5], channels, &refs, &dev)
+        PackedLayout::build_ref2va(geometry, [1, 2, 2], &[TEXT_TAG; 5], channels, &refs, dev)
             .unwrap()
     }
     fn run(
@@ -1158,11 +1270,41 @@ mod veda_controls_tests {
         Vec<crate::veda::AttentionCall>,
         candle_gen::gen_core::VedaExecutionReport,
     ) {
-        let device = Device::Cpu;
-        let w = weights(bits);
+        run_inner(mode, channels, bits, evals, shift, enabled, false)
+    }
+    fn run_inner(
+        mode: usize,
+        channels: usize,
+        bits: Option<usize>,
+        evals: usize,
+        shift: f32,
+        enabled: bool,
+        streamed: bool,
+    ) -> (
+        Vec<u32>,
+        Vec<crate::veda::AttentionCall>,
+        candle_gen::gen_core::VedaExecutionReport,
+    ) {
+        let device = proof_device();
+        let source_device = if streamed {
+            Device::Cpu
+        } else {
+            device.clone()
+        };
+        let request = crate::block_stream::tests::request();
+        let _guard = streamed.then(|| {
+            crate::block_stream::RequestGuard::enter(
+                &request,
+                candle_gen::gen_core::LoadShape::DeferredMaterialization,
+                &device,
+            )
+            .unwrap()
+        });
+        let w = weights_on(bits, &source_device);
         // CPU Candle does not implement BF16 matmul; dense fixture arithmetic is F32.
         // BF16 request/tier admission is tested at the native loader; device numerics stay gated.
-        let mut dit = MiniMaxH3Dit::from_weights(&w, &config(), &device, DType::F32).unwrap();
+        let mut dit =
+            MiniMaxH3Dit::from_weights(&w, &config(), &source_device, DType::F32).unwrap();
         // Turbo then style: two additive factors on the actual native adaptable projection.
         let projection = dit
             .adaptable_mut(&["transformer_blocks", "0", "attn", "to_q"])
@@ -1171,18 +1313,47 @@ mod veda_controls_tests {
         for strength in [0.0625, 0.5] {
             projection
                 .push_lora(
-                    Tensor::full(0.01f32, (64, 2), &device).unwrap(),
-                    Tensor::full(0.02f32, (2, 96), &device).unwrap(),
+                    Tensor::full(0.01f32, (64, 2), &source_device).unwrap(),
+                    Tensor::full(0.02f32, (2, 96), &source_device).unwrap(),
                     strength,
                 )
                 .unwrap();
         }
+        // Structured LoKr uses a separate frozen preparation cache. Exercise its transfer
+        // alongside both LoRAs, on the same dense/packed resident and streamed routes.
+        let lokr_left = Tensor::full(0.01f32, (12, 8), &source_device).unwrap();
+        let lokr_right = Tensor::full(0.02f32, (8, 8), &source_device).unwrap();
+        let lokr = candle_gen::quant::LokrFactors::build(
+            0.125,
+            (96, 64),
+            Some(&lokr_left),
+            None,
+            None,
+            Some(&lokr_right),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("the native projection has a structured LoKr factorization");
+        let before_lokr = projection.nbytes();
+        let lokr_bytes = lokr.nbytes();
+        projection.push_lokr(lokr, false, 0.125);
+        assert_eq!(projection.nbytes(), before_lokr + lokr_bytes);
         assert_eq!(projection.adapters().len(), 2);
-        let layout = layout(mode, channels);
+        if streamed {
+            dit.prepare_streamed(&device, 1).unwrap();
+        }
+
+        let layout = layout_on(mode, channels, &device);
         let schedule = JointSchedule::with_shifts(evals + 1, shift, 3.0).unwrap();
         let adaln = adaln_schedule(&schedule).unwrap();
         assert_eq!(adaln.num_row_classes(), NUM_ROW_CLASSES);
-        let context = w.require("in.refiner.context").unwrap();
+        let context = w
+            .require("in.refiner.context")
+            .unwrap()
+            .to_device(&device)
+            .unwrap();
         let mut model = JointDit::new(
             dit,
             layout.clone(),
@@ -1200,11 +1371,15 @@ mod veda_controls_tests {
         };
         controls.validate(2, evals).unwrap();
         let report = crate::veda::ReportSink::default();
-        model.prepare_veda(
-            &controls,
-            Some(std::path::Path::new("/managed/predictor.safetensors")),
-            report.clone(),
-        );
+        // Keep the original unsupported-device control on CPU. CUDA reaches predictor
+        // loading, so use an explicitly absent component rather than a machine-dependent
+        // nonexistent path. Both configurations must report the intended dense fallback.
+        let unavailable_predictor = if matches!(device, Device::Cuda(_)) {
+            None
+        } else {
+            Some(std::path::Path::new("/managed/predictor.safetensors"))
+        };
+        model.prepare_veda(&controls, unavailable_predictor, report.clone());
         let video = Tensor::full(0.02f32, (1, layout.video_indices().len(), 96), &device).unwrap();
         let audio = Tensor::full(0.03f32, (1, layout.audio_indices().len(), 32), &device).unwrap();
         let (outv, outa) = denoise_av(
@@ -1274,11 +1449,13 @@ mod veda_controls_tests {
             assert_eq!(observed.sparse_calls, 0);
             assert_eq!(observed.dense_calls, (evals * 2) as u64);
             assert_eq!(observed.selected_token_pairs, observed.dense_token_pairs);
-            assert!(observed
-                .fallback_reason
-                .as_deref()
-                .unwrap()
-                .contains("unavailable"));
+            let reason = observed.fallback_reason.as_deref().unwrap();
+            if matches!(device, Device::Cuda(_)) {
+                assert_eq!(reason, "Veda predictor component is missing; repair/install the managed component; dense attention executed");
+            } else {
+                assert!(reason.contains("unavailable"), "{reason}");
+            }
+            assert_eq!(observed.predictor_load_attempts, 0);
         } else {
             assert!(model.veda.is_none());
             assert_eq!(observed, Default::default());
@@ -1293,10 +1470,10 @@ mod veda_controls_tests {
     /// rather than its own `#[test]`: it constructs a complete synthetic `JointDit`, which the H3
     /// ordinary-execution policy keeps out of ordinary CI.
     fn assert_attached_cancel_stops_the_forward_before_the_first_block() {
-        let device = Device::Cpu;
-        let w = weights(None);
+        let device = proof_device();
+        let w = weights_on(None, &device);
         let dit = MiniMaxH3Dit::from_weights(&w, &config(), &device, DType::F32).unwrap();
-        let layout = layout(0, 1);
+        let layout = layout_on(0, 1, &device);
         let schedule = JointSchedule::with_shifts(3, 12.0, 3.0).unwrap();
         let adaln = adaln_schedule(&schedule).unwrap();
         let context = w.require("in.refiner.context").unwrap();
@@ -1341,9 +1518,119 @@ mod veda_controls_tests {
         assert!(layer_cancel_needs_sync(141_000));
     }
 
+    /// Reuses the existing ignored learned case and its actual device witness. Complete
+    /// 128-channel head vectors, B>1, strided rows and a ragged tail compare against the
+    /// unchanged RMS/rotary formula; observed counts prove multiple chunks really ran.
+    fn assert_bounded_qk_preconditioning_matches_resident() {
+        let device = proof_device();
+        let (batch, sequence, heads, dim) = (2, 9, 3, 128);
+        let rope = MmRope::new(16, 10_000.0).unwrap();
+        let positions: Vec<_> = (0..sequence).map(|s| [s as f64 * 0.5, 2.0, -1.0]).collect();
+        let tables = rope.tables_from_rows(&positions, &device).unwrap();
+        let values: Vec<f32> = (0..batch * (sequence + 2) * heads * dim)
+            .map(|i| (i as f32 * 0.17).sin() * 1.3)
+            .collect();
+        let weights: Vec<f32> = (0..dim).map(|i| 0.5 + i as f32 / dim as f32).collect();
+        let budget = candle_gen::attention::AttentionBudget::from_score_elements(1536, false);
+        let mut observations = Vec::new();
+        for dtype in [DType::BF16, DType::F16, DType::F32] {
+            let input =
+                Tensor::from_vec(values.clone(), (batch, sequence + 2, heads, dim), &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+                    .narrow(1, 1, sequence)
+                    .unwrap();
+            assert!(
+                !input.is_contiguous(),
+                "fixture must retain batch-strided rows"
+            );
+            let weight = Tensor::from_vec(weights.clone(), dim, &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let expected = rope
+                .apply(
+                    &crate::nn::rms_weighted(&input, &weight, 1e-6).unwrap(),
+                    &tables,
+                )
+                .unwrap();
+            let (actual, report) = crate::dit::layers::precondition_projected_qk(
+                input.clone(),
+                &weight,
+                1e-6,
+                Some((&rope, &tables)),
+                budget,
+                None,
+            )
+            .unwrap();
+            assert_eq!(actual.dtype(), dtype);
+            assert_eq!(actual.dims(), input.dims());
+            assert_eq!((report.norm_chunks, report.rotary_chunks), (5, 5));
+            assert_eq!(report.maximum_chunk_elements, 1536);
+            assert_eq!(
+                actual
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                expected
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                "per-head RMS then partial rotary must preserve every row/channel for {dtype:?}"
+            );
+            // Slicing must not silently truncate an oversized table accepted by neither
+            // the resident nor bounded geometry. Validate the entire tables before RMS.
+            let oversized_tables = rope
+                .tables_from_rows(&vec![[0.0; 3]; sequence + 1], &device)
+                .unwrap();
+            assert!(rope.apply(&input, &oversized_tables).is_err());
+            assert!(crate::dit::layers::precondition_projected_qk(
+                input.clone(),
+                &weight,
+                1e-6,
+                Some((&rope, &oversized_tables)),
+                budget,
+                None,
+            )
+            .is_err());
+            let cancel = CancelFlag::new();
+            cancel.cancel();
+            assert!(matches!(
+                crate::dit::layers::precondition_projected_qk(
+                    input,
+                    &weight,
+                    1e-6,
+                    Some((&rope, &tables)),
+                    budget,
+                    Some(&cancel),
+                ),
+                Err(CandleError::Canceled)
+            ));
+            observations.push((
+                dtype,
+                report.norm_chunks,
+                report.rotary_chunks,
+                report.maximum_chunk_elements,
+            ));
+        }
+        println!("H3_BOUNDED_QK_PROOF actual(dtype,norm_chunks,rotary_chunks,max_elements)={observations:?}; B2 strided9rows head128 chunk2 tail1 exact values; oversized tables and cancellation refused");
+    }
+
     #[test]
     #[ignore = "complete synthetic DiT/JointDit forward; dispatched only by the manual H3 native suite"]
     fn native_controls_capture_every_mode_packed_tier_and_adapter_stack() {
+        let forced_materialized = std::env::var("SCENEWORKS_H3_ATTENTION_ROUTE")
+            .ok()
+            .as_deref()
+            == Some("materialized");
+        crate::nn::reset_attention_execution_report();
         for mode in 0..5 {
             for tier in [None, Some(4), Some(8)] {
                 for channels in [1, 2] {
@@ -1353,7 +1640,52 @@ mod veda_controls_tests {
                 }
             }
         }
+        // Both task partitions and every conditioning/audio mode reach actual window
+        // execution, each with dense/q4/q8 bases and stacked LoRA/LoKr residuals.
+        for mode in 0..5 {
+            for tier in [None, Some(4), Some(8)] {
+                for veda in [false, true] {
+                    let resident = run_inner(mode, 2, tier, 4, 12.0, veda, false);
+                    let streamed = run_inner(mode, 2, tier, 4, 12.0, veda, true);
+                    let scale = resident
+                        .0
+                        .iter()
+                        .map(|v| f32::from_bits(*v).abs())
+                        .fold(1e-12f32, f32::max);
+                    let error = resident
+                        .0
+                        .iter()
+                        .zip(&streamed.0)
+                        .map(|(a, b)| (f32::from_bits(*a) - f32::from_bits(*b)).abs())
+                        .fold(0f32, f32::max);
+                    assert!(
+                        error / scale <= 1e-5,
+                        "streamed/resident {tier:?} Veda={veda}: {error}/{scale}"
+                    );
+                    assert_eq!(resident.1, streamed.1);
+                    assert_eq!(resident.2, streamed.2);
+                }
+            }
+        }
         assert_attached_cancel_stops_the_forward_before_the_first_block();
+        assert_bounded_qk_preconditioning_matches_resident();
+
+        if forced_materialized {
+            let report = crate::nn::attention_execution_report();
+            assert!(
+                report.materialized_calls > 0,
+                "materializing route must execute"
+            );
+            assert_eq!(
+                report.flash_calls, 0,
+                "forced materializing route cannot dispatch fused attention"
+            );
+            assert!(
+                report.maximum_materialized_score_elements
+                    <= candle_gen::gen_core::veda::workspace::CUDA_DENSE_SCORE_ELEMENTS
+            );
+            println!("H3_MATERIALIZED_ATTENTION_PROOF {report:?}");
+        }
 
         #[cfg(feature = "model-inference-proof")]
         println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::model::veda_controls_tests::native_controls_capture_every_mode_packed_tier_and_adapter_stack");

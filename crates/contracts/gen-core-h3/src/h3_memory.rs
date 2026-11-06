@@ -628,6 +628,10 @@ pub trait NativeAllocationFactsExt {
     /// Header-selected partition geometry for conditioning and sparse admission. No weights load.
     fn selected_patch(&self, req: crate::veda::workspace::Request<'_>) -> Result<[usize; 3]>;
     fn adapter_resident_bytes(&self, rows: NativeRows) -> u64;
+    /// Selected CUDA host-prepared root/current-window factors and their independent caches.
+    /// Resident and MLX routes preserve the full installed adapter profile.
+    fn adapter_resident_bytes_windowed(&self, rows: NativeRows, window: Option<u32>)
+        -> Result<u64>;
     fn request_rows(
         &self,
         req: crate::veda::workspace::Request<'_>,
@@ -639,6 +643,14 @@ pub trait NativeAllocationFactsExt {
     fn denoise_peak_bytes(&self, rows: NativeRows) -> u64;
     fn precompute_peak_bytes_windowed(&self, rows: NativeRows, window: Option<u32>) -> Result<u64>;
     fn denoise_peak_bytes_windowed(&self, rows: NativeRows, window: Option<u32>) -> Result<u64>;
+    /// Attention alternatives share the current QKV identity. Compose Veda with the
+    /// persistent source/window weights and carried hidden, then max against projection/FFN.
+    fn denoise_peak_bytes_with_veda(
+        &self,
+        rows: NativeRows,
+        window: Option<u32>,
+        veda: &gen_core::veda::workspace::WorkspaceBound,
+    ) -> Result<u64>;
     /// Correct the ordinary estimator's weight floor without counting operation workspace twice.
     fn resident_peak_bytes_windowed(&self, rows: NativeRows, window: Option<u32>) -> Result<u64>;
     fn peak_bytes(&self, rows: NativeRows) -> u64;
@@ -664,6 +676,31 @@ impl NativeAllocationFactsExt for NativeAllocationFacts {
             .map(|p| p.resident_bytes)
             .max()
             .unwrap_or(0)
+    }
+
+    fn adapter_resident_bytes_windowed(
+        &self,
+        rows: NativeRows,
+        window: Option<u32>,
+    ) -> Result<u64> {
+        let Some(window) = window.filter(|_| matches!(self.backend, NativeBackend::Candle { .. }))
+        else {
+            return Ok(self.adapter_resident_bytes(rows));
+        };
+        self.selected_tasks(rows)
+            .filter(|t| t.resident_bytes > 0)
+            .try_fold(0, |peak, task| {
+                let profile = task.window.as_ref().ok_or_else(|| {
+                    invalid("H3 source has no CUDA adapter block-window allocation profile")
+                })?;
+                Ok(
+                    peak.max(profile.adapter_resident_bytes(
+                        task,
+                        self.backend,
+                        window as usize,
+                    )?),
+                )
+            })
     }
 
     fn request_rows(
@@ -731,16 +768,25 @@ impl NativeAllocationFactsExt for NativeAllocationFacts {
                 let profile = task.window.as_ref().ok_or_else(|| {
                     invalid("H3 source has no native block-window allocation profile")
                 })?;
-                Ok(peak.max(self.with_adapter_precompute(
-                    task,
-                    Self::task_rows(task, rows),
-                    profile.precompute_peak_bytes(
-                        task,
-                        self.backend,
-                        Self::task_rows(task, rows),
-                        window as usize,
-                    )?,
-                )))
+                let rows = Self::task_rows(task, rows);
+                let base =
+                    profile.precompute_peak_bytes(task, self.backend, rows, window as usize)?;
+                let value = if matches!(self.backend, NativeBackend::Candle { .. }) {
+                    // load_task_dit installs the adapter on the prepared CPU model BEFORE
+                    // root/current-window transfer. Full source/constructor/install peaks
+                    // belong to the separately gated HOST pool, not this device window.
+                    base.checked_add(task.adapter.as_ref().map_or(0, |adapter| {
+                        adapter.forward_working_bytes_for(
+                            self.backend,
+                            rows,
+                            RowDomain::Conditioning,
+                        )
+                    }))
+                    .ok_or_else(|| invalid("CUDA root adapter workspace overflow"))?
+                } else {
+                    self.with_adapter_precompute(task, rows, base)
+                };
+                Ok(peak.max(value))
             })
     }
 
@@ -763,12 +809,21 @@ impl NativeAllocationFactsExt for NativeAllocationFacts {
                 Ok(peak.max(self.with_adapter_denoise(
                     task,
                     Self::task_rows(task, rows),
-                    profile.denoise_peak_bytes(
-                        task,
-                        self.backend,
-                        Self::task_rows(task, rows),
-                        window as usize,
-                    )?,
+                    if matches!(self.backend, NativeBackend::Candle { .. }) {
+                        profile.bounded_cuda_denoise_peak_bytes(
+                            task,
+                            self.backend,
+                            Self::task_rows(task, rows),
+                            window as usize,
+                        )?
+                    } else {
+                        profile.denoise_peak_bytes(
+                            task,
+                            self.backend,
+                            Self::task_rows(task, rows),
+                            window as usize,
+                        )?
+                    },
                 )))
             })
     }
@@ -806,6 +861,69 @@ impl NativeAllocationFactsExt for NativeAllocationFacts {
                     Self::task_rows(task, rows),
                     window as usize,
                 )?))
+            })
+    }
+
+    fn denoise_peak_bytes_with_veda(
+        &self,
+        rows: NativeRows,
+        window: Option<u32>,
+        veda: &gen_core::veda::workspace::WorkspaceBound,
+    ) -> Result<u64> {
+        if matches!(self.backend, NativeBackend::Mlx { .. }) {
+            return self
+                .denoise_peak_bytes_windowed(rows, window)?
+                .checked_add(veda.unified_peak_bytes())
+                .ok_or_else(|| invalid("Veda unified memory overflow"));
+        }
+        self.selected_tasks(rows)
+            .filter(|t| t.resident_bytes > 0)
+            .try_fold(0u64, |peak, task| {
+                let rows = Self::task_rows(task, rows);
+                if let Some(profile) = &task.window {
+                    let selected_window = window;
+                    let window = window.map_or(profile.n_blocks(), |n| n as usize);
+                    let (dense, with_veda) = if selected_window.is_some() {
+                        (
+                            profile.bounded_cuda_denoise_peak_bytes(
+                                task,
+                                self.backend,
+                                rows,
+                                window,
+                            )?,
+                            profile.bounded_cuda_denoise_with_veda_bytes(
+                                task,
+                                self.backend,
+                                rows,
+                                window,
+                                veda,
+                            )?,
+                        )
+                    } else {
+                        (
+                            profile.denoise_peak_bytes(task, self.backend, rows, window)?,
+                            profile.denoise_with_veda_bytes(
+                                task,
+                                self.backend,
+                                rows,
+                                window,
+                                veda,
+                            )?,
+                        )
+                    };
+                    let dense = self.with_adapter_denoise(task, rows, dense);
+                    Ok(peak.max(dense.max(with_veda)))
+                } else {
+                    // An unstreamable native representation retains its resident route. Without
+                    // explicit shared-buffer proof, charge the complete extra bound rather than0.
+                    let dense =
+                        self.with_adapter_denoise(task, rows, self.full_denoise(task, rows)?);
+                    Ok(peak.max(
+                        dense
+                            .checked_add(veda.device_peak_bytes())
+                            .ok_or_else(|| invalid("Veda denoise size overflow"))?,
+                    ))
+                }
             })
     }
 
@@ -865,6 +983,11 @@ impl NativeAllocationFactsInternal for NativeAllocationFacts {
         rows: NativeRows,
         base: u64,
     ) -> u64 {
+        if matches!(self.backend, NativeBackend::Candle { .. }) && task.window.is_some() {
+            // CUDA's source-owned operation DAG already composes residual projection work
+            // as an alternative to normalization/rotary, rather than adding both lifetimes.
+            return base;
+        }
         base.saturating_add(task.adapter.as_ref().map_or(0, |p| {
             p.forward_working_bytes_for(self.backend, rows, RowDomain::Packed)
         }))
@@ -924,6 +1047,11 @@ impl NativeAllocationFactsInternal for NativeAllocationFacts {
     }
 
     fn full_denoise(&self, task: &NativeTaskAllocation, rows: NativeRows) -> Result<u64> {
+        if matches!(self.backend, NativeBackend::Candle { .. }) {
+            if let Some(profile) = &task.window {
+                return profile.denoise_peak_bytes(task, self.backend, rows, profile.n_blocks());
+            }
+        }
         if matches!(self.backend, NativeBackend::Mlx { .. }) {
             if let Some(profile) = &task.window {
                 return profile.denoise_peak_bytes_full(task, self.backend, rows);
@@ -1259,6 +1387,170 @@ mod tests {
             "existing S5 two-stream bound includes fixed timesteps"
         );
         assert!(request_rows((&req).into(), 0).is_err());
+    }
+
+    #[test]
+    fn cuda_host_prepared_windows_scope_adapter_storage_and_projection_work() {
+        use gen_core::h3_adapter_memory::{
+            H3AdapterMemoryProfile, H3AdapterProjectionMemory, H3AdapterTarget,
+        };
+        use gen_core::h3_memory::window::{CudaWorkingSet, WindowAllocation};
+        let projection = |path: &str, resident| H3AdapterProjectionMemory {
+            target: H3AdapterTarget {
+                path: path.into(),
+                input: 16,
+                output: 16,
+                packed: true,
+                activation_width: 2,
+                activation_dtype: Dtype::BF16,
+                rows: if path.starts_with("token_refiner.") {
+                    RowDomain::Conditioning
+                } else {
+                    RowDomain::Packed
+                },
+            },
+            installed_bytes: resident / 2,
+            resident_bytes: resident,
+            forward_fixed_bytes: 0,
+            forward_bytes_per_row: if path.starts_with("token_refiner.") {
+                0
+            } else {
+                32
+            },
+        };
+        let window = WindowAllocation::from_resident_tensors(
+            &[
+                ("token_refiner.weight".into(), 100),
+                ("transformer_blocks.0.attn.to_q.weight".into(), 100),
+                ("transformer_blocks.1.attn.to_q.weight".into(), 200),
+                ("transformer_blocks.2.attn.to_q.weight".into(), 100),
+            ],
+            &[],
+            0,
+            false,
+        )
+        .unwrap()
+        .with_cuda_working_set(CudaWorkingSet {
+            hidden: 16,
+            heads: 2,
+            head_dim: 8,
+            rotary_dim: 6,
+            ffn_inner: 32,
+            element_bytes: 2,
+            projection_decode_bytes: 0,
+        })
+        .unwrap();
+        let task = NativeTaskAllocation {
+            resident_bytes: 500,
+            // A deliberately large source-map/install high-water discriminates host-prepared
+            // windows from a resident device install without touching any tensor backend.
+            constructor_bytes: 1_000_000,
+            patch_size: [1, 1, 1],
+            reference_task: false,
+            window: Some(window),
+            evicted_bytes: 0,
+            table_bytes_per_timestep: 0,
+            projections: vec![],
+            adapter: Some(H3AdapterMemoryProfile {
+                resident_bytes: 700,
+                install_peak_bytes: 10_000_000,
+                projections: vec![
+                    projection("token_refiner.refiner_blocks.0.attn.to_q", 300),
+                    projection("transformer_blocks.0.attn.to_q", 100),
+                    projection("transformer_blocks.1.attn.to_q", 200),
+                    projection("transformer_blocks.2.attn.to_q", 100),
+                ],
+            }),
+        };
+        let mut facts = NativeAllocationFacts {
+            backend: CUDA,
+            tasks: vec![task],
+            default_evaluations: 4,
+            conditioning: None,
+            conditioning_stream: None,
+            conditioning_resident_bytes: 0,
+            conditioning_load_bytes: 0,
+            video_decode_resident_bytes: 0,
+            video_decode_load_bytes: 0,
+            audio_decode_resident_bytes: 0,
+            audio_decode_load_bytes: 0,
+        };
+        let rows = NativeRows {
+            task: NativeTaskSelection::Base,
+            packed: 100,
+            conditioning: 2,
+            visual_elements: 0,
+            ..ROWS
+        };
+        assert_eq!(
+            facts.adapter_resident_bytes_windowed(rows, None).unwrap(),
+            700
+        );
+        assert_eq!(
+            facts
+                .adapter_resident_bytes_windowed(rows, Some(1))
+                .unwrap(),
+            500
+        );
+        assert_eq!(
+            facts
+                .adapter_resident_bytes_windowed(rows, Some(2))
+                .unwrap(),
+            600
+        );
+        assert_eq!(
+            facts
+                .adapter_resident_bytes_windowed(rows, Some(3))
+                .unwrap(),
+            700
+        );
+        assert!(facts
+            .adapter_resident_bytes_windowed(rows, Some(0))
+            .is_err());
+        let precompute = facts.precompute_peak_bytes_windowed(rows, Some(1)).unwrap();
+        let denoise = facts.denoise_peak_bytes_windowed(rows, Some(1)).unwrap();
+        let task = &facts.tasks[0];
+        let profile = task.window.as_ref().unwrap();
+        let old_resident = profile
+            .denoise_peak_bytes(task, CUDA, rows, profile.n_blocks())
+            .unwrap();
+        assert_eq!(
+            facts.denoise_peak_bytes_windowed(rows, None).unwrap(),
+            old_resident
+        );
+        assert_eq!(facts.denoise_peak_bytes(rows), old_resident);
+        assert_eq!(
+            denoise,
+            profile
+                .bounded_cuda_denoise_peak_bytes(task, CUDA, rows, 1)
+                .unwrap()
+        );
+        assert!(facts.precompute_peak_bytes_windowed(rows, None).unwrap() > 10_000_000);
+        let adapter = facts.tasks[0].adapter.take();
+        assert_eq!(
+            precompute,
+            facts.precompute_peak_bytes_windowed(rows, Some(1)).unwrap()
+        );
+        assert_eq!(
+            denoise,
+            facts.denoise_peak_bytes_windowed(rows, Some(1)).unwrap(),
+            "the larger RMS/rotary phase cannot overlap projection-only adapter arithmetic"
+        );
+        facts.tasks[0].adapter = adapter;
+        facts.tasks[0].adapter.as_mut().unwrap().projections[1].forward_bytes_per_row = 1_000_000;
+        assert!(
+            facts.denoise_peak_bytes_windowed(rows, Some(1)).unwrap() > denoise,
+            "a larger executing adapter projection still raises the device operation bound"
+        );
+        facts.backend = MLX;
+        assert_eq!(
+            facts
+                .adapter_resident_bytes_windowed(rows, Some(1))
+                .unwrap(),
+            700,
+            "MLX retains its existing unified installed factors and constructor lifetime"
+        );
+        assert!(facts.precompute_peak_bytes_windowed(rows, Some(1)).unwrap() > 10_000_000);
     }
 
     #[test]

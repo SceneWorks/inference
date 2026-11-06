@@ -167,6 +167,17 @@ pub struct LinearNoBias {
 }
 
 impl LinearNoBias {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.inner = self.inner.copy_to_device(device)?;
+        // `adapters` is the inspection record; its factors already live in `inner`.
+        // Keep the record host-backed instead of uploading a second executable copy.
+        for residual in &mut copy.lokr_adapters {
+            residual.factors = residual.factors.to_device(device)?;
+        }
+        Ok(copy)
+    }
+
     /// Load `{prefix}` — **packed** when `{prefix}.scales` is present, else dense at `dtype`.
     pub fn from_weights(w: &Weights, prefix: &str, dtype: DType) -> Result<Self> {
         let loaded = crate::quant::lin(w, crate::quant::DIT, prefix, false, dtype)?;
@@ -366,6 +377,17 @@ pub struct DitAttention {
 }
 
 impl DitAttention {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.to_q = copy.to_q.copy_to_device(device)?;
+        copy.to_k = copy.to_k.copy_to_device(device)?;
+        copy.to_v = copy.to_v.copy_to_device(device)?;
+        copy.to_out = copy.to_out.copy_to_device(device)?;
+        copy.norm_q = copy.norm_q.to_device(device)?;
+        copy.norm_k = copy.norm_k.to_device(device)?;
+        Ok(copy)
+    }
+
     /// Load `{prefix}` (e.g. `transformer_blocks.0.attn`).
     pub fn from_weights(
         w: &Weights,
@@ -481,16 +503,61 @@ impl DitAttention {
         // The published checkpoint ships `to_q`/`to_k`/`to_v` already split, so this applies NO
         // fused-QKV transform. See `crate::dit::qkv` for which transform produced them and why
         // that must be asserted rather than assumed.
-        let q = self.to_q.forward(x)?.reshape((b, seq, h, d))?;
-        let k = self.to_k.forward(x)?.reshape((b, seq, h, d))?;
-        let v = self.to_v.forward(x)?.reshape((b, seq, h, d))?;
+        let (q, k, v) = if rope.is_some()
+            && x.device().is_cuda()
+            && crate::block_stream::current().is_some()
+        {
+            // The validated request scope is Both/window=1/deferred. Complete one Q/K
+            // projection, bounded F32 RMS, then bounded stream-dtype rotary before the
+            // next projection. V is created last. Resident/refiner arithmetic below stays
+            // unchanged, including its original GEMM shapes and operation ordering.
+            let budget = crate::nn::attention_budget();
+            let projected = self.to_q.forward(x)?;
+            let q_input = projected.reshape((b, seq, h, d))?;
+            // A chained forward()?.reshape()? receiver would retain its temporary
+            // alias for the entire helper call, defeating drop(projected) before RoPE.
+            drop(projected);
+            let (q, q_report) = precondition_projected_qk(
+                q_input,
+                &self.norm_q,
+                self.qk_norm_eps,
+                rope,
+                budget,
+                cancel,
+            )?;
+            let projected = self.to_k.forward(x)?;
+            let k_input = projected.reshape((b, seq, h, d))?;
+            drop(projected);
+            let (k, k_report) = precondition_projected_qk(
+                k_input,
+                &self.norm_k,
+                self.qk_norm_eps,
+                rope,
+                budget,
+                cancel,
+            )?;
+            let v = self.to_v.forward(x)?.reshape((b, seq, h, d))?;
+            tracing::debug!(event="h3_qk_preconditioned", token_rows=seq,
+                norm_chunks=q_report.norm_chunks + k_report.norm_chunks,
+                rotary_chunks=q_report.rotary_chunks + k_report.rotary_chunks,
+                maximum_chunk_elements=q_report.maximum_chunk_elements.max(k_report.maximum_chunk_elements),
+                budget_elements=budget.max_score_elements(), dtype=?x.dtype(),
+                "Completed bounded streamed-body Q/K RMS and rotary");
+            (q, k, v)
+        } else {
+            let q = self.to_q.forward(x)?.reshape((b, seq, h, d))?;
+            let k = self.to_k.forward(x)?.reshape((b, seq, h, d))?;
+            let v = self.to_v.forward(x)?.reshape((b, seq, h, d))?;
 
-        // qk-norm first, rotary second.
-        let q = rms_weighted(&q, &self.norm_q, self.qk_norm_eps)?;
-        let k = rms_weighted(&k, &self.norm_k, self.qk_norm_eps)?;
-        let (q, k) = match rope {
-            Some((rope, tables)) => (rope.apply(&q, tables)?, rope.apply(&k, tables)?),
-            None => (q, k),
+            // End the projection/norm/rope lifetime before SDPA: shadowed tensor handles
+            // otherwise keep their backing allocations alive through the entire attention.
+            let q = rms_weighted(&q, &self.norm_q, self.qk_norm_eps)?;
+            let k = rms_weighted(&k, &self.norm_k, self.qk_norm_eps)?;
+            let (q, k) = match rope {
+                Some((rope, tables)) => (rope.apply(&q, tables)?, rope.apply(&k, tables)?),
+                None => (q, k),
+            };
+            (q, k, v)
         };
 
         // MiniMax-H3 packs one request into a single attention document: no mask, not causal —
@@ -507,14 +574,9 @@ impl DitAttention {
         let vh = v.transpose(1, 2)?;
         let scale = 1.0 / (d as f64).sqrt();
         let out = match veda {
-            Some((runtime, layer, step)) => runtime.attention(
-                layer,
-                step,
-                &qh.contiguous()?,
-                &kh.contiguous()?,
-                &vh.contiguous()?,
-                scale,
-            )?,
+            Some((runtime, layer, step)) => {
+                runtime.attention_with_cancel(layer, step, &qh, &kh, &vh, scale, cancel)?
+            }
             None => sdpa_planned(&qh, &kh, &vh, scale, cancel)?,
         };
 
@@ -524,6 +586,104 @@ impl DitAttention {
             .reshape((b, seq, h * d))?;
         self.to_out.forward(&out)
     }
+}
+
+/// Successful work observations from the actual chunk loops, also asserted by the manual
+/// same-device parity fixture so deleting chunking cannot yield a vacuous numerical pass.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct QkPreconditionReport {
+    pub norm_chunks: usize,
+    pub rotary_chunks: usize,
+    pub maximum_chunk_elements: usize,
+}
+
+/// Preserve the original per-head F32 RMS formula, then the original stream-dtype partial
+/// rotary, while bounding both transient phases. A complete projected input remains alive
+/// through RMS Vec+cat; drop it explicitly BEFORE any rotary work. During K, Q is the only
+/// other retained projection; V is not created until both helpers return.
+pub(super) fn precondition_projected_qk(
+    projected: Tensor,
+    weight: &Tensor,
+    eps: f64,
+    rope: Option<(&MmRope, &MmRopeTables)>,
+    budget: AttentionBudget,
+    cancel: Option<&CancelFlag>,
+) -> Result<(Tensor, QkPreconditionReport)> {
+    let (batch, sequence, heads, head_dim) = projected.dims4()?;
+    if let Some((_, tables)) = rope {
+        let (cos_rows, rotary) = tables.cos.dims2()?;
+        let (sin_rows, sin_rotary) = tables.sin.dims2()?;
+        if cos_rows != sequence || sin_rows != sequence || rotary != sin_rotary || rotary > head_dim
+        {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 bounded Q/K: expected matching rotary tables [{sequence}, R <= {head_dim}], got {:?}/{:?}",
+                tables.cos.dims(), tables.sin.dims(),
+            )));
+        }
+    }
+    let block = candle_gen::gen_core::h3_memory::window::qk_precondition_token_block(
+        batch as u64,
+        heads as u64,
+        head_dim as u64,
+        sequence as u64,
+        budget.max_score_elements(),
+    )
+    .map_err(|error| CandleError::Msg(error.to_string()))? as usize;
+    let (normed, norm_chunks, norm_max) =
+        map_qk_token_chunks(&projected, block, cancel, |chunk, _, _| {
+            rms_weighted(chunk, weight, eps)
+        })?;
+    drop(projected);
+    let (out, rotary_chunks, rotary_max) = match rope {
+        Some((rope, tables)) => {
+            map_qk_token_chunks(&normed, block, cancel, |chunk, start, len| {
+                let chunk_tables = MmRopeTables {
+                    cos: tables.cos.narrow(0, start, len)?,
+                    sin: tables.sin.narrow(0, start, len)?,
+                };
+                rope.apply(chunk, &chunk_tables)
+            })?
+        }
+        None => (normed, 0, 0),
+    };
+    Ok((
+        out,
+        QkPreconditionReport {
+            norm_chunks,
+            rotary_chunks,
+            maximum_chunk_elements: norm_max.max(rotary_max),
+        },
+    ))
+}
+
+fn map_qk_token_chunks(
+    input: &Tensor,
+    block: usize,
+    cancel: Option<&CancelFlag>,
+    mut operation: impl FnMut(&Tensor, usize, usize) -> Result<Tensor>,
+) -> Result<(Tensor, usize, usize)> {
+    let sequence = input.dim(1)?;
+    let mut chunks = Vec::new();
+    let mut maximum = 0;
+    for start in (0..sequence).step_by(block) {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(CandleError::Canceled);
+        }
+        let len = block.min(sequence - start);
+        let chunk = input.narrow(1, start, len)?;
+        let out = operation(&chunk, start, len)?;
+        maximum = maximum.max(chunk.elem_count());
+        chunks.push(out);
+    }
+    let count = chunks.len();
+    // At most one full set of retained results plus this final full output. No F32
+    // conversion spans the entire projected Q/K, and cat preserves batch/sequence order.
+    let out = if count == 1 {
+        chunks.pop().expect("one chunk")
+    } else {
+        Tensor::cat(&chunks, 1)?
+    };
+    Ok((out, count, maximum))
 }
 
 /// Max elements in one SwiGLU intermediate `[.., block, 2·ffn_dim]` before the token axis is
@@ -570,6 +730,13 @@ pub struct DitFeedForward {
 }
 
 impl DitFeedForward {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.proj = copy.proj.copy_to_device(device)?;
+        copy.out = copy.out.copy_to_device(device)?;
+        Ok(copy)
+    }
+
     /// Load `{prefix}` (e.g. `transformer_blocks.0.ff`).
     pub fn from_weights(w: &Weights, prefix: &str, dtype: DType) -> Result<Self> {
         Ok(Self {
@@ -615,10 +782,7 @@ impl DitFeedForward {
     /// the module doc for why the token axis is the exact split and why the equivalence is
     /// tolerance-level rather than bitwise.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.forward_budgeted(
-            x,
-            AttentionBudget::from_score_elements(FFN_INTERMEDIATE_BUDGET, false),
-        )
+        self.forward_budgeted(x, crate::nn::attention_budget())
     }
 
     /// [`Self::forward`] at an explicit budget.
@@ -696,6 +860,12 @@ pub struct RmsNorm {
 }
 
 impl RmsNorm {
+    pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.weight = copy.weight.to_device(device)?;
+        Ok(copy)
+    }
+
     /// Load `{prefix}.weight` at `dtype`.
     pub fn from_weights(w: &Weights, prefix: &str, eps: f64, dtype: DType) -> Result<Self> {
         Ok(Self {

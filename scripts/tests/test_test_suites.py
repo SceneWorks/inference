@@ -161,7 +161,9 @@ class TestSuites(unittest.TestCase):
 
     def test_safe_table_is_nonempty_and_source_bound(self):
         controls = suites.safe_controls()
-        self.assertEqual(len(controls), 48)
+        # SW-F329 includes five exact CPU-only allocator recovery controls.
+        self.assertEqual(len(controls), 71)
+        self.assertEqual(sum(control["package"] == "candle-core" for control in controls), 5)
         self.assertEqual(sum(control["package"] == "sceneworks-gen-cv" for control in controls), 26)
         self.assertTrue(all(control['protocol'] == 'libtest' for control in controls))
         self.assertTrue(any('cancellation' in control['test'] for control in controls))

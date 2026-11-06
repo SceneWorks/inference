@@ -124,6 +124,7 @@ pub mod alias_free;
 pub mod audio_config;
 pub mod audio_vae;
 pub mod audio_vae_encoder;
+mod block_stream;
 pub mod blocks;
 pub mod chunking;
 pub mod conditioning;
@@ -293,6 +294,7 @@ pub fn register_memory_contract_surfaces(
     registry
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit Candle MiniMax-H3 provider catalog.
