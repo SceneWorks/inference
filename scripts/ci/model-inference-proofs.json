@@ -61921,12 +61921,16 @@
     "required_environment": [],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
-    "configuration_controls": [],
+    "configuration_controls": [
+      "SCENEWORKS_H3_ATTENTION_ROUTE"
+    ],
     "default_configuration": null,
     "configurations": {
       "fixed_cuda": {
         "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/veda.rs::veda::tests::actual_cuda_kernel_gate/fixed_cuda",
-        "environment": {},
+        "environment": {
+          "SCENEWORKS_H3_ATTENTION_ROUTE": null
+        },
         "cargo_features": [
           "cuda",
           "model-inference-proof"
@@ -61938,10 +61942,31 @@
         "scope": "whole selected source case",
         "required_work": [
           "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
-        ]
+        ],
+        "required_cuda_physical_index": 1
+      },
+      "cuda0_materialized": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/veda.rs::veda::tests::actual_cuda_kernel_gate/cuda0_materialized",
+        "environment": {
+          "SCENEWORKS_H3_ATTENTION_ROUTE": "materialized"
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Entire existing actual CUDA sparse/scorer/oracle matrix and forced sparse-to-dense fallback with fused attention disabled on physical GPU1.",
+        "required_work": [
+          "Every existing BF16/F16 numerical oracle, task partition, mask/scorer assertion, sparse kernel and forced-failure dense assertion",
+          "Positive materializing attention route counters and score-element bound; no fused calls in forced route"
+        ],
+        "required_cuda_physical_index": 1
       }
     },
-    "configuration_kind": "feature-only",
+    "configuration_kind": "source-controls",
     "input_contract": {
       "fixture_kind": "source-defined",
       "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/veda.rs::veda::tests::actual_cuda_kernel_gate",
