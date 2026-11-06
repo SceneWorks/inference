@@ -817,7 +817,7 @@ pub(crate) fn validate_request(
         .negative_prompt
         .as_ref()
         .is_some_and(|negative| !negative.is_empty())
-        && id == MODEL_ID
+        && id.starts_with("z_image_turbo")
         && req.guidance.unwrap_or(0.0) == 0.0
     {
         return Err(Error::Msg(format!(
@@ -907,6 +907,23 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn turbo_control_negative_prompt_requires_effective_cfg() {
+        let descriptor = crate::model_control::descriptor();
+        for guidance in [None, Some(0.0), Some(1.5)] {
+            let request = GenerationRequest {
+                prompt: "p".into(),
+                negative_prompt: Some("blurry".into()),
+                guidance,
+                ..Default::default()
+            };
+            assert_eq!(
+                validate_request(descriptor.id, &descriptor.capabilities, &request).is_ok(),
+                guidance == Some(1.5)
+            );
+        }
+    }
+
     use super::*;
     use mlx_gen::OffloadPolicy;
 
