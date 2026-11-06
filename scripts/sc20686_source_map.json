@@ -19,7 +19,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/edit_provider.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 524
+              "line": 530
             }
           ],
           "creation": [
@@ -337,7 +337,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::reference_forward",
-              "line": 1591
+              "line": 1602
             }
           ],
           "reads": [
