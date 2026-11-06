@@ -46,18 +46,26 @@ pub struct WindowAllocation {
     cuda_adaln: Option<Vec<CudaAdalnWorkingSet>>,
 }
 
-/// Actual full-width AdaLN projection consumed by CUDA's modulation_for_window. Native
-/// descriptor routes keep their existing working facts; compatible dense/affine sources
-/// supply these header-owned logical dimensions before any tensors are materialized.
+/// Actual full-width AdaLN projection consumed by CUDA's modulation_for_window. Specialized
+/// native CUDA sources already decline streaming; their resident and MLX allocation routes
+/// keep the existing descriptor facts. Dense/affine windows supply these header-owned facts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CudaAdalnWorkingSet {
     pub input: u64,
     pub output: u64,
     pub affine: bool,
+    /// One for a broadcast bias; otherwise the consumed bias requires this schedule length.
+    pub bias_rows: u64,
 }
 impl CudaAdalnWorkingSet {
     fn working_bytes(self, rows: u64, element_bytes: u64) -> Result<u64> {
-        if self.input == 0 || self.output == 0 || rows == 0 || !matches!(element_bytes, 2 | 4) {
+        if self.input == 0
+            || self.output == 0
+            || rows == 0
+            || self.bias_rows == 0
+            || (self.bias_rows != 1 && self.bias_rows != rows)
+            || !matches!(element_bytes, 2 | 4)
+        {
             return Err(invalid());
         }
         let input = times(rows, self.input)?;
@@ -394,7 +402,7 @@ impl WindowAllocation {
         }
         for fact in &facts {
             // Validate unknown/overflowing dimensions independently of the eventual schedule.
-            fact.working_bytes(1, 2)?;
+            fact.working_bytes(fact.bias_rows, 2)?;
         }
         self.cuda_adaln = Some(facts);
         Ok(self)
@@ -1059,6 +1067,7 @@ mod tests {
             input: 1024,
             output: 256,
             affine: true,
+            bias_rows: 1,
         };
         assert_eq!(
             dims.working_bytes(3, 2).unwrap(),
@@ -1081,7 +1090,8 @@ mod tests {
             CudaAdalnWorkingSet {
                 input: 64,
                 output: 1152,
-                affine: true
+                affine: true,
+                bias_rows: 1,
             }
             .working_bytes(100, 2)
             .unwrap(),
@@ -1180,6 +1190,18 @@ mod tests {
         }
         // The shipped affine matrix alone owns F32 decode plus BF16 cast, not merely BF16.
         assert_eq!(6u64 * 96768 * 2688, 1_560_674_304);
+        let row_bias = CudaAdalnWorkingSet {
+            bias_rows: 3,
+            ..dims
+        };
+        assert_eq!(
+            row_bias.working_bytes(3, 2).unwrap(),
+            dims.working_bytes(3, 2).unwrap()
+        );
+        assert!(
+            row_bias.working_bytes(2, 2).is_err(),
+            "row-dependent bias must match the actual schedule before allocation"
+        );
     }
 
     #[test]

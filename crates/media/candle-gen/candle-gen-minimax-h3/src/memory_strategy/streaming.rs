@@ -83,7 +83,16 @@ fn cuda_adaln_working_sets(
             let bias = names
                 .get(format!("{base}.bias").as_str())
                 .ok_or_else(invalid)?;
-            if !bias.is_float() || bias.shape.as_slice() != [output_dim] {
+            // Linear broadcasts its bias, and AdaLN subsequently reshapes the output.
+            // Preserve scalar/singleton-prefixed and row-dependent accepted layouts, not
+            // just canonical [N]. Leading non-singletons would change output volume.
+            let bias_columns = bias.shape.last().copied().unwrap_or(1);
+            let bias_rows = bias.shape.iter().rev().nth(1).copied().unwrap_or(1) as u64;
+            if !bias.is_float()
+                || bias_rows == 0
+                || bias_columns != 1 && bias_columns != output_dim
+                || bias.shape.iter().rev().skip(2).any(|&n| n != 1)
+            {
                 return Err(invalid());
             }
             let affine = if let Some(scales) = names.get(format!("{base}.scales").as_str()) {
@@ -113,6 +122,7 @@ fn cuda_adaln_working_sets(
                     input,
                     output,
                     affine,
+                    bias_rows,
                 },
             )
         })
@@ -427,6 +437,7 @@ mod tests {
                         input: 64,
                         output: 1152,
                         affine: bits.is_some(),
+                        bias_rows: 1,
                     };
                     2
                 ]
@@ -440,6 +451,27 @@ mod tests {
             if bits.is_some() {
                 assert!(prepare >= payload.values().sum::<u64>() + 4 * 1152 * 64);
             }
+            for (shape, rows) in [
+                (vec![], 1),
+                (vec![1], 1),
+                (vec![1, 1152], 1),
+                (vec![1, 1, 1152], 1),
+                (vec![3, 1152], 3),
+                (vec![3, 1], 3),
+            ] {
+                let mut broadcast = entries.clone();
+                broadcast
+                    .iter_mut()
+                    .find(|(name, _, _)| name == "transformer_blocks.0.adaln_proj.linear.bias")
+                    .unwrap()
+                    .2 = shape;
+                headers(&file, &broadcast);
+                assert_eq!(
+                    cuda_adaln_working_sets(root.path(), &cfg).unwrap()[0].bias_rows,
+                    rows
+                );
+            }
+            headers(&file, &entries);
             assert!(crate::block_stream::component_supported(root.path()).unwrap());
             let mut unknown = cfg.clone();
             unknown.time_embed_dim = 0;
