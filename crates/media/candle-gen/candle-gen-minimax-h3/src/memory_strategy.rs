@@ -2902,6 +2902,8 @@ mod tests {
             routes::registered_fixture(&spec, &contract, MemoryStrategy::BoundedDecode).unwrap();
         assert!(!fixtures.is_empty());
         let fixture = &fixtures[0];
+        assert_eq!(fixture.context.calibration_abi, 0);
+        assert!(fixture.context.calibration_fingerprint.is_empty());
         assert_eq!(
             fixture.context.optimization_authority,
             candle_gen::gen_core::MemoryOptimizationAuthority::Estimated
@@ -2910,6 +2912,22 @@ mod tests {
             safety_check(&spec, &contract, &fixture.context),
             MemorySafetyDecision::Accept
         );
+        let mut stale = fixture.context.clone();
+        stale.evidence_revision = "stale-external-measurement-revision".into();
+        assert_eq!(
+            safety_check(&spec, &contract, &stale),
+            MemorySafetyDecision::Accept
+        );
+        let mut malformed_abi = stale.clone();
+        malformed_abi.calibration_abi = candle_gen::gen_core::MEMORY_CALIBRATION_ABI;
+        let mut malformed_fingerprint = stale;
+        malformed_fingerprint.calibration_fingerprint = "invented-measurement-v1".into();
+        for malformed in [malformed_abi, malformed_fingerprint] {
+            assert!(matches!(
+                safety_check(&spec, &contract, &malformed),
+                MemorySafetyDecision::Reject { .. }
+            ));
+        }
         let mut impossible = fixture.context.clone();
         impossible.budget.total_bytes = impossible.predicted_peak_bytes - 1;
         assert!(matches!(

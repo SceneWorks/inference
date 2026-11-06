@@ -251,45 +251,31 @@ pub(super) fn check_behavior_fixture(
         return;
     }
 
-    // Measured admission binds its calibration handshake. With no calibration record, an
-    // explicit estimate must instead ignore those measurement-only identity fields; demanding
-    // rejection would force providers to invent evidence or add a spurious freshness gate.
-    // Materialization shape remains a separate execution axis and is always checked below.
+    // Measured admission binds its identity; estimates without calibration carry the explicit
+    // ABI-zero/empty-fingerprint sentinel. Mutating either is a malformed wire handshake, not
+    // stale external evidence. Materialization remains a separate execution axis below.
     let mut mutated_abi = fixture.context.clone();
     mutated_abi.calibration_abi = mutated_abi.calibration_abi.wrapping_add(1);
-    let abi_accepted = matches!(
+    if matches!(
         (registration.safety_check)(fixture_spec, contract, &mutated_abi),
         MemorySafetyDecision::Accept
-    );
-    let calibrated = contract.calibration.is_some();
-    if abi_accepted == calibrated {
+    ) {
         errors.push(format!(
-            "{}: {strategy:?} safety check {} mutated calibration ABI",
-            registration.provider_id,
-            if calibrated {
-                "is blind to"
-            } else {
-                "rejects irrelevant"
-            }
+            "{}: {strategy:?} safety check is blind to mutated calibration ABI",
+            registration.provider_id
         ));
     }
     let mut mutated_fingerprint = fixture.context.clone();
     mutated_fingerprint
         .calibration_fingerprint
         .push_str("-mutated");
-    let fingerprint_accepted = matches!(
+    if matches!(
         (registration.safety_check)(fixture_spec, contract, &mutated_fingerprint),
         MemorySafetyDecision::Accept
-    );
-    if fingerprint_accepted == calibrated {
+    ) {
         errors.push(format!(
-            "{}: {strategy:?} safety check {} mutated calibration fingerprint",
-            registration.provider_id,
-            if calibrated {
-                "is blind to"
-            } else {
-                "rejects irrelevant"
-            }
+            "{}: {strategy:?} safety check is blind to mutated calibration fingerprint",
+            registration.provider_id
         ));
     }
     let mut mutated_shape = fixture.context.clone();

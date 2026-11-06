@@ -697,8 +697,8 @@ fn route_aware_registration_accepts_matching_routes_and_rejects_cross_routes() {
         &mut errors,
     );
     assert_eq!(errors, Vec::<String>::new());
-    estimated_conformance_ignores_measurement_identity_but_keeps_materialization_and_routes();
-    estimated_conformance_catches_freshness_gates_and_materialization_blind_admission();
+    estimated_conformance_uses_absent_identity_sentinel_and_keeps_materialization_and_routes();
+    estimated_conformance_catches_handshake_and_materialization_blind_admission();
 }
 
 fn estimated_pid_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
@@ -721,7 +721,7 @@ fn estimated_pid_fixture(
         .map(|(route, use_pid)| {
             let mut context = route_context(
                 0,
-                "unmeasured",
+                "",
                 contract.load_shape,
                 route.tile_edges[0],
                 route.tile_overlap,
@@ -758,7 +758,7 @@ fn estimated_errors_for(
     errors
 }
 
-fn estimated_conformance_ignores_measurement_identity_but_keeps_materialization_and_routes() {
+fn estimated_conformance_uses_absent_identity_sentinel_and_keeps_materialization_and_routes() {
     assert_eq!(
         estimated_errors_for(route_aware_safety),
         Vec::<String>::new()
@@ -786,14 +786,17 @@ fn estimated_conformance_ignores_measurement_identity_but_keeps_materialization_
             let mut fingerprint = context.clone();
             fingerprint.calibration_fingerprint.push_str("-stale");
             for mutated in [abi, fingerprint] {
-                assert_eq!(
-                    matches!(
-                        route_aware_safety(&spec, &contract, &mutated),
-                        MemorySafetyDecision::Accept
-                    ),
-                    !calibrated
-                );
+                assert!(matches!(
+                    route_aware_safety(&spec, &contract, &mutated),
+                    MemorySafetyDecision::Reject { .. }
+                ));
             }
+            let mut stale = context.clone();
+            stale.evidence_revision = "old-external-observation".into();
+            assert!(matches!(
+                route_aware_safety(&spec, &contract, &stale),
+                MemorySafetyDecision::Accept
+            ));
             let mut shape = context.clone();
             shape.load_shape = match shape.load_shape {
                 gen_core::LoadShape::EagerMaterialization => {
@@ -824,23 +827,20 @@ fn estimated_conformance_ignores_measurement_identity_but_keeps_materialization_
     );
 }
 
-fn estimated_conformance_catches_freshness_gates_and_materialization_blind_admission() {
-    let freshness = estimated_errors_for(|spec, contract, context| {
-        if context.calibration_abi != 0 || context.calibration_fingerprint != "unmeasured" {
-            MemorySafetyDecision::Reject {
-                reason: "irrelevant measurement freshness".into(),
-            }
-        } else {
-            route_aware_safety(spec, contract, context)
-        }
+fn estimated_conformance_catches_handshake_and_materialization_blind_admission() {
+    let handshake = estimated_errors_for(|spec, contract, context| {
+        let mut trusted = context.clone();
+        trusted.calibration_abi = 0;
+        trusted.calibration_fingerprint.clear();
+        route_aware_safety(spec, contract, &trusted)
     });
     for identity in ["ABI", "fingerprint"] {
         assert!(
-            freshness.iter().any(
-                |error| error.contains("rejects irrelevant mutated calibration")
-                    && error.contains(identity)
-            ),
-            "{freshness:#?}"
+            handshake
+                .iter()
+                .any(|error| error.contains("blind to mutated calibration")
+                    && error.contains(identity)),
+            "{handshake:#?}"
         );
     }
     let shape_blind = estimated_errors_for(|spec, contract, context| {

@@ -20,8 +20,8 @@ pub struct MemoryRunContext {
     pub selection: MemorySelection,
     pub optimization_authority: MemoryOptimizationAuthority,
     /// Provider calibration identity that the caller used for admission, when the contract
-    /// declares one. Resident requests carry that handshake too. An uncalibrated estimate does
-    /// not gain measurement authority or execution restrictions from these metadata fields.
+    /// declares one. Resident requests carry that handshake too. An uncalibrated context uses
+    /// ABI zero and an empty fingerprint: the explicit absence of a measurement identity.
     pub calibration_abi: u32,
     pub calibration_fingerprint: String,
     /// Actual provider materialization shape used for this request. It must match the concrete

@@ -774,6 +774,8 @@ fn calibration_free_optimization_requires_explicit_estimate_authority() {
     let mut contract = adopted_contract();
     let mut context = admitted_context(&contract);
     contract.calibration = None;
+    context.calibration_abi = 0;
+    context.calibration_fingerprint.clear();
     context.selection.strategy = MemoryStrategy::StagedResidency;
     context.optimization_authority = MemoryOptimizationAuthority::Estimated;
     assert_eq!(
@@ -1233,6 +1235,8 @@ fn compatibility_default_never_advertises_an_optimized_rung() {
     // This resident compatibility provider uses its own concrete materialization shape, not
     // the unrelated deferred adopted fixture's shape. No calibration identity is required.
     context.load_shape = contract.load_shape;
+    context.calibration_abi = 0;
+    context.calibration_fingerprint.clear();
     assert_eq!(
         default_memory_strategy_safety_check(&contract, &context),
         MemorySafetyDecision::Accept,

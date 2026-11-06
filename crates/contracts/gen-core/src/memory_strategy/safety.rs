@@ -63,6 +63,11 @@ pub fn standard_memory_strategy_safety_check(
                 contract.provider_id
             ));
         }
+    } else if context.calibration_abi != 0 || !context.calibration_fingerprint.is_empty() {
+        return reject(format!(
+            "{}: absent-calibration handshake requires ABI zero and empty fingerprint",
+            contract.provider_id
+        ));
     } else if context.selection.strategy.is_optimized()
         && context.optimization_authority != MemoryOptimizationAuthority::Estimated
     {

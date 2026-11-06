@@ -104,7 +104,7 @@ pub fn registered_fixture(
             reference_resources: None,
             selection,
             optimization_authority: MemoryOptimizationAuthority::Estimated,
-            calibration_abi: candle_gen::gen_core::MEMORY_CALIBRATION_ABI,
+            calibration_abi: calibration.map_or(0, |c| c.abi),
             calibration_fingerprint: calibration
                 .map_or_else(String::new, |c| c.fingerprint.clone()),
             load_shape: contract.load_shape,
