@@ -80,7 +80,7 @@ pub const DEFAULT_CFG: f32 = mmdit::CFG_STRENGTH as f32;
 /// Largest solver step count accepted — a finer ladder than a few hundred Euler steps only adds cost.
 pub const MAX_STEPS: u32 = 500;
 
-/// CFG guidance bounds: 1.0 turns guidance off (single forward per step); the reference default is 4.5.
+/// Recommended CFG guidance range: 1.0 turns guidance off (single forward per step); the reference default is 4.5.
 pub const GUIDANCE_RANGE: (f32, f32) = (1.0, 20.0);
 
 /// Prompt language the CLIP text tower was trained on (English; the prompt is advisory and optional).
@@ -168,14 +168,8 @@ pub(crate) fn validate_request(
             )));
         }
     }
-    if let Some(g) = req.guidance {
-        if !(GUIDANCE_RANGE.0..=GUIDANCE_RANGE.1).contains(&g) {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: guidance (CFG scale) {g} outside {GUIDANCE_RANGE:?} (1.0 disables CFG; the \
-                 reference default is {DEFAULT_CFG})"
-            )));
-        }
-    }
+    // The shared floor checks finite guidance. Recommendations remain defaults rather than
+    // hard bounds; the existing sampler retains its CFG-off semantics below unit guidance.
 
     // The clip must carry a frame rate (the reference derives every length from fps; the variant
     // deliberately does not duplicate it — it rides req.fps) and enough frames for one sync segment.
@@ -841,6 +835,10 @@ mod tests {
         assert!(validate_request(&d, &bad_steps).is_err());
         let mut bad_cfg = foley_req(foley_frames(8, 16, 16, 0), 8);
         bad_cfg.guidance = Some(0.5);
+        assert!(validate_request(&d, &bad_cfg).is_ok());
+        bad_cfg.guidance = Some(101.5);
+        assert!(validate_request(&d, &bad_cfg).is_ok());
+        bad_cfg.guidance = Some(f32::NAN);
         assert!(validate_request(&d, &bad_cfg).is_err());
 
         // Duration above the trained 8 s window → rejected by the shared floor.

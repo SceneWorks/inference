@@ -441,7 +441,7 @@ impl QwenImageControl {
             on_progress,
             |te: &QwenTextEncoder| {
                 let pos = encode_prompt(&self.tokenizer, te, &req.prompt, MODEL_ID)?;
-                let neg = if params.is_lightning {
+                let neg = if params.guidance == 1.0 {
                     None
                 } else {
                     Some(encode_prompt(

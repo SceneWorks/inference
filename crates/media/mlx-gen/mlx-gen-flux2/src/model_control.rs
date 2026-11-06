@@ -412,6 +412,17 @@ impl Flux2DevControl {
         };
 
         let sched = schedule_with(steps, req.width, req.height, req.scheduler.as_deref())?;
+        let sched =
+            mlx_gen::FlowMatchEuler::from_sigmas(mlx_gen::resolve_flow_schedule_with_shift(
+                None,
+                req.scheduler_shift,
+                mlx_gen::gen_core::sampling::compute_mu(
+                    mlx_gen::gen_core::sampling::image_seq_len(req.width, req.height),
+                    steps,
+                ),
+                steps,
+                &sched.sigmas,
+            )?)?;
         let lat_h = (req.height / 16) as usize;
         let lat_w = (req.width / 16) as usize;
         let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);

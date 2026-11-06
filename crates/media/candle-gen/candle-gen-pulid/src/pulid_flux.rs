@@ -140,6 +140,7 @@ pub struct PulidFluxRequest {
     /// Curated σ-schedule selection (epic 7114). `None` (or a native alias) ⇒ FLUX's verbatim
     /// time-shifted `get_schedule`; a curated scheduler name re-strides σ over the dev time-shift `mu`.
     pub scheduler: Option<String>,
+    pub scheduler_shift: Option<f32>,
     pub seed: u64,
     /// Opt into the PiD super-resolving decoder (epic 7840, sc-8044): when `true` **and** the model was
     /// loaded with [`with_pid`](PulidFlux::with_pid), the final latent is decoded by the `flux` PiD student
@@ -168,6 +169,7 @@ impl Default for PulidFluxRequest {
             id_weight: DEFAULT_ID_WEIGHT,
             sampler: None,
             scheduler: None,
+            scheduler_shift: None,
             seed: 0,
             use_pid: false,
             preview: PreviewSink::default(),
@@ -502,6 +504,7 @@ impl PulidFlux {
             heavy.as_ref(),
             req.sampler.as_deref(),
             req.scheduler.as_deref(),
+            req.scheduler_shift,
             req.seed,
             &preview,
             &req.cancel,
@@ -541,6 +544,7 @@ impl PulidFlux {
         heavy: Option<&FluxRefHeavy>,
         sampler: Option<&str>,
         scheduler: Option<&str>,
+        scheduler_shift: Option<f32>,
         seed: u64,
         preview: &PreviewHook<'_>,
         cancel: &CancelFlag,
@@ -556,7 +560,13 @@ impl PulidFlux {
         // branch is inert here) — the candle-gen-flux twin, deduped in sc-11249 / F-140.
         let mu = flow_mu(Variant::Dev, state.img.dim(1)?);
         let steps = native.len().saturating_sub(1);
-        let sigmas = candle_gen::resolve_flow_schedule(scheduler, mu, steps, &native);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            scheduler,
+            scheduler_shift,
+            mu,
+            steps,
+            &native,
+        )?;
         candle_gen::run_flow_sampler(
             sampler,
             TimestepConvention::Sigma,

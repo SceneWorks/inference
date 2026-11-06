@@ -158,7 +158,11 @@ pub fn resolve_run_params(req: &GenerationRequest, width: u32, height: u32) -> R
         // descriptors advertise `supports_true_cfg`, so honor a caller-supplied `true_cfg`, falling
         // back to `guidance`, then the default — instead of silently dropping `true_cfg` (F-103). The
         // default path (both unset → `DEFAULT_GUIDANCE`) is unchanged.
-        guidance: req.true_cfg.or(req.guidance).unwrap_or(DEFAULT_GUIDANCE),
+        guidance: req.true_cfg.or(req.guidance).unwrap_or(if is_lightning {
+            1.0
+        } else {
+            DEFAULT_GUIDANCE
+        }),
         base_seed: req.seed.unwrap_or_else(default_seed),
         sampler_name: req.sampler.clone(),
         sigmas,
@@ -1187,6 +1191,22 @@ mod tests {
             rp.guidance, DEFAULT_GUIDANCE,
             "both unset falls back to DEFAULT_GUIDANCE"
         );
+    }
+
+    #[test]
+    fn lightning_defaults_to_cfg_off_but_accepts_advanced_overrides() {
+        let mut request = GenerationRequest {
+            sampler: Some(LIGHTNING_SAMPLER.into()),
+            ..Default::default()
+        };
+        let defaults = resolve_run_params(&request, 1024, 1024).unwrap();
+        assert_eq!(defaults.guidance, 1.0);
+        assert_eq!(defaults.sigmas, lightning_sigmas(defaults.steps));
+        request.guidance = Some(1.5);
+        request.scheduler_shift = Some(18.375);
+        let overridden = resolve_run_params(&request, 1024, 1024).unwrap();
+        assert_eq!(overridden.guidance, 1.5);
+        assert_ne!(overridden.sigmas, defaults.sigmas);
     }
 
     #[test]

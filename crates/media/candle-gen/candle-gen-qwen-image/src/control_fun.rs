@@ -77,6 +77,9 @@ pub struct QwenFunControlRequest {
     pub width: u32,
     pub height: u32,
     pub steps: usize,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub scheduler_shift: Option<f32>,
     /// True-CFG guidance scale.
     pub guidance: f32,
     /// Conditioning scale on the VACE hints (`0` ≡ base txt2img).
@@ -99,6 +102,9 @@ impl Default for QwenFunControlRequest {
             width: 1024,
             height: 1024,
             steps: 30,
+            sampler: None,
+            scheduler: None,
+            scheduler_shift: None,
             guidance: 4.0,
             control_scale: DEFAULT_CONTROL_SCALE,
             seed: 0,
@@ -279,7 +285,7 @@ impl QwenFunControl {
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
 
         let pos = self.encode(&req.prompt)?;
-        let neg = if req.guidance > 1.0 {
+        let neg = if req.guidance != 1.0 {
             let n = if req.negative.trim().is_empty() {
                 NEGATIVE_FALLBACK
             } else {
@@ -306,12 +312,18 @@ impl QwenFunControl {
 
         // Routed through the unified curated sampler/scheduler framework (epic 7114): the `native`
         // schedule is the production `qwen_sigmas`, `mu` steers the (non-default) curated scheduler. The
-        // bespoke control provider has no `req.sampler`/`req.scheduler` surface, so both stay `None` (the
-        // N1 default: `euler` over the native schedule). The model is fed the raw sigma (`Sigma`
+        // bespoke control request forwards optional sampler, scheduler and Shift overrides. Absent
+        // overrides retain `euler` over the native schedule. The model is fed the raw sigma (`Sigma`
         // convention); the VACE branch + true-CFG pos/neg/blend all live inside the `predict` closure.
         let native = pipeline::qwen_sigmas(req.steps, req.width, req.height);
         let mu = pipeline::qwen_mu(req.width, req.height);
-        let sigmas = candle_gen::resolve_flow_schedule(None, mu, req.steps, &native);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            mu,
+            req.steps,
+            &native,
+        )?;
         let latents = pipeline::create_noise(req.seed, req.width, req.height, &self.device)?
             .to_dtype(DIT_DTYPE)?;
 
@@ -323,7 +335,7 @@ impl QwenFunControl {
         let preview = crate::preview::hook(&req.preview, req.width, req.height);
 
         let latents = candle_gen::run_flow_sampler(
-            None,
+            req.sampler.as_deref(),
             candle_gen::gen_core::sampling::TimestepConvention::Sigma,
             &sigmas,
             latents,
