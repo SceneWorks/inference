@@ -1365,11 +1365,15 @@ mod veda_controls_tests {
         };
         controls.validate(2, evals).unwrap();
         let report = crate::veda::ReportSink::default();
-        model.prepare_veda(
-            &controls,
-            Some(std::path::Path::new("/managed/predictor.safetensors")),
-            report.clone(),
-        );
+        // Keep the original unsupported-device control on CPU. CUDA reaches predictor
+        // loading, so use an explicitly absent component rather than a machine-dependent
+        // nonexistent path. Both configurations must report the intended dense fallback.
+        let unavailable_predictor = if matches!(device, Device::Cuda(_)) {
+            None
+        } else {
+            Some(std::path::Path::new("/managed/predictor.safetensors"))
+        };
+        model.prepare_veda(&controls, unavailable_predictor, report.clone());
         let video = Tensor::full(0.02f32, (1, layout.video_indices().len(), 96), &device).unwrap();
         let audio = Tensor::full(0.03f32, (1, layout.audio_indices().len(), 32), &device).unwrap();
         let (outv, outa) = denoise_av(
@@ -1439,11 +1443,13 @@ mod veda_controls_tests {
             assert_eq!(observed.sparse_calls, 0);
             assert_eq!(observed.dense_calls, (evals * 2) as u64);
             assert_eq!(observed.selected_token_pairs, observed.dense_token_pairs);
-            assert!(observed
-                .fallback_reason
-                .as_deref()
-                .unwrap()
-                .contains("unavailable"));
+            let reason = observed.fallback_reason.as_deref().unwrap();
+            if matches!(device, Device::Cuda(_)) {
+                assert_eq!(reason, "Veda predictor component is missing; repair/install the managed component; dense attention executed");
+            } else {
+                assert!(reason.contains("unavailable"), "{reason}");
+            }
+            assert_eq!(observed.predictor_load_attempts, 0);
         } else {
             assert!(model.veda.is_none());
             assert_eq!(observed, Default::default());
