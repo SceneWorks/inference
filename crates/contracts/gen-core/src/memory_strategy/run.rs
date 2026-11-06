@@ -19,11 +19,13 @@ pub struct MemoryReferenceResourceFacts {
 pub struct MemoryRunContext {
     pub selection: MemorySelection,
     pub optimization_authority: MemoryOptimizationAuthority,
-    /// Provider calibration identity that the caller used for admission. Resident requests carry
-    /// this handshake too; optimized-only evidence validation is not sufficient.
+    /// Provider calibration identity that the caller used for admission, when the contract
+    /// declares one. Resident requests carry that handshake too. An uncalibrated estimate does
+    /// not gain measurement authority or execution restrictions from these metadata fields.
     pub calibration_abi: u32,
     pub calibration_fingerprint: String,
-    /// Typed materialization shape covered by the calibration handshake.
+    /// Actual provider materialization shape used for this request. It must match the concrete
+    /// contract independently of whether admission also carries a calibration handshake.
     pub load_shape: LoadShape,
     pub mode: MemoryMode,
     /// Compatibility summary for older callers. It must equal `geometry.reference_count > 0`;

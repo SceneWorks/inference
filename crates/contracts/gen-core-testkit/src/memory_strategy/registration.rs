@@ -91,13 +91,6 @@ pub(super) fn check_memory_registration(
     let Some(routes) = contract.pid_decode_routes.as_ref() else {
         return;
     };
-    let Some(_) = contract.calibration.as_ref() else {
-        errors.push(format!(
-            "{}: PiD route conformance needs a calibration identity for a valid admission probe",
-            registration.provider_id
-        ));
-        return;
-    };
     let Some(behavior) = behavior else {
         errors.push(format!(
             "{}: decode-route conformance needs provider-owned behavior fixtures",
@@ -258,28 +251,45 @@ pub(super) fn check_behavior_fixture(
         return;
     }
 
+    // Measured admission binds its calibration handshake. With no calibration record, an
+    // explicit estimate must instead ignore those measurement-only identity fields; demanding
+    // rejection would force providers to invent evidence or add a spurious freshness gate.
+    // Materialization shape remains a separate execution axis and is always checked below.
     let mut mutated_abi = fixture.context.clone();
     mutated_abi.calibration_abi = mutated_abi.calibration_abi.wrapping_add(1);
-    if matches!(
+    let abi_accepted = matches!(
         (registration.safety_check)(fixture_spec, contract, &mutated_abi),
         MemorySafetyDecision::Accept
-    ) {
+    );
+    let calibrated = contract.calibration.is_some();
+    if abi_accepted == calibrated {
         errors.push(format!(
-            "{}: {strategy:?} safety check is blind to mutated calibration ABI",
-            registration.provider_id
+            "{}: {strategy:?} safety check {} mutated calibration ABI",
+            registration.provider_id,
+            if calibrated {
+                "is blind to"
+            } else {
+                "rejects irrelevant"
+            }
         ));
     }
     let mut mutated_fingerprint = fixture.context.clone();
     mutated_fingerprint
         .calibration_fingerprint
         .push_str("-mutated");
-    if matches!(
+    let fingerprint_accepted = matches!(
         (registration.safety_check)(fixture_spec, contract, &mutated_fingerprint),
         MemorySafetyDecision::Accept
-    ) {
+    );
+    if fingerprint_accepted == calibrated {
         errors.push(format!(
-            "{}: {strategy:?} safety check is blind to mutated calibration fingerprint",
-            registration.provider_id
+            "{}: {strategy:?} safety check {} mutated calibration fingerprint",
+            registration.provider_id,
+            if calibrated {
+                "is blind to"
+            } else {
+                "rejects irrelevant"
+            }
         ));
     }
     let mut mutated_shape = fixture.context.clone();
@@ -292,7 +302,19 @@ pub(super) fn check_behavior_fixture(
         MemorySafetyDecision::Accept
     ) {
         errors.push(format!(
-            "{}: {strategy:?} safety check is blind to mutated calibration load shape",
+            "{}: {strategy:?} safety check is blind to mutated materialization load shape",
+            registration.provider_id
+        ));
+    }
+
+    let mut unauthorized = fixture.context.clone();
+    unauthorized.optimization_authority = gen_core::MemoryOptimizationAuthority::Resident;
+    if matches!(
+        (registration.safety_check)(fixture_spec, contract, &unauthorized),
+        MemorySafetyDecision::Accept
+    ) {
+        errors.push(format!(
+            "{}: {strategy:?} safety check accepts optimized execution without authority",
             registration.provider_id
         ));
     }

@@ -45,6 +45,14 @@ pub fn standard_memory_strategy_safety_check(
             contract.provider_id, context.selection.strategy
         ));
     }
+    // Materialization is an execution axis even when admission uses a source-derived estimate
+    // with no calibration record. It must never be mistaken for optional evidence metadata.
+    if context.load_shape != contract.load_shape {
+        return reject(format!(
+            "{}: request materialization shape {:?} does not match provider shape {:?}",
+            contract.provider_id, context.load_shape, contract.load_shape
+        ));
+    }
     if let Some(calibration) = contract.calibration.as_ref() {
         if context.calibration_abi != calibration.abi
             || context.calibration_fingerprint != calibration.fingerprint

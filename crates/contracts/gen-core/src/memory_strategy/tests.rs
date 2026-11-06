@@ -1060,7 +1060,7 @@ fn default_safety_check_rejects_mutated_calibration_handshake() {
     assert!(matches!(
         default_memory_strategy_safety_check(&contract, &wrong_shape),
         MemorySafetyDecision::Reject { reason }
-            if reason.contains("calibration handshake mismatch")
+            if reason.contains("request materialization shape")
     ));
 
     let mut wrong_abi = context;
@@ -1230,6 +1230,9 @@ fn compatibility_default_never_advertises_an_optimized_rung() {
     }
 
     let mut context = admitted_context(&adopted_contract());
+    // This resident compatibility provider uses its own concrete materialization shape, not
+    // the unrelated deferred adopted fixture's shape. No calibration identity is required.
+    context.load_shape = contract.load_shape;
     assert_eq!(
         default_memory_strategy_safety_check(&contract, &context),
         MemorySafetyDecision::Accept,
