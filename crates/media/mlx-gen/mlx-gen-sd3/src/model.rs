@@ -555,7 +555,13 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
     }
     // Standard CFG has no negative contribution exactly at scale one. Other finite
     // values, including inverse guidance, remain experimental but meaningful.
-    if req.negative_prompt.is_some() && req.guidance.is_some_and(|g| g == 1.0) {
+    let variant = match id {
+        crate::config::SD3_5_LARGE_TURBO_ID => Sd3Variant::LargeTurbo,
+        crate::config::SD3_5_MEDIUM_ID => Sd3Variant::Medium,
+        _ => Sd3Variant::Large,
+    };
+    let effective_guidance = req.guidance.unwrap_or(variant.default_guidance());
+    if req.negative_prompt.is_some() && effective_guidance == 1.0 {
         return Err(Error::Msg(format!(
             "{id}: a negative prompt requires guidance != 1.0; change guidance or drop the negative prompt"
         )));
@@ -1208,7 +1214,7 @@ mod tests {
 
     #[test]
     fn turbo_accepts_experimental_guidance_and_negative_prompt() {
-        // On Turbo, supplying guidance or a negative prompt is a validation error (CFG-off variant).
+        // Explicit experimental CFG enables negative conditioning; omitted/unit guidance stays off.
         let d = turbo_descriptor();
         let with_guidance = GenerationRequest {
             prompt: "a fox".into(),
@@ -1223,6 +1229,13 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&d, &with_neg).is_ok());
+        for guidance in [None, Some(1.0)] {
+            let off = GenerationRequest {
+                guidance,
+                ..with_neg.clone()
+            };
+            assert!(validate_request(&d, &off).is_err());
+        }
         // A plain txt2img request (no guidance/neg) passes.
         let plain = GenerationRequest {
             prompt: "a fox".into(),

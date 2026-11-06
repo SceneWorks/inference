@@ -433,9 +433,9 @@ mod tests {
     }
 
     #[test]
-    fn base_control_differs_from_turbo_control_only_in_cfg() {
+    fn base_and_turbo_control_share_cfg_capability() {
         // The two control variants share family/backend/modality/size envelope + the Control+Reference
-        // conditioning; the documented delta is CFG support (base undistilled vs guidance-distilled Turbo).
+        // conditioning; both accept experimental CFG with distinct native defaults.
         let base = descriptor();
         let turbo = crate::model_control::descriptor();
         assert_eq!(base.family, turbo.family);
@@ -444,8 +444,8 @@ mod tests {
         assert_eq!(base.capabilities.min_size, turbo.capabilities.min_size);
         assert_eq!(base.capabilities.max_size, turbo.capabilities.max_size);
         assert_ne!(base.id, turbo.id);
-        // Turbo control is guidance-distilled (CFG off); base control is full-CFG.
-        assert!(!turbo.capabilities.supports_guidance);
+        // Turbo control defaults to CFG off while retaining experimental CFG support.
+        assert!(turbo.capabilities.supports_guidance);
         assert!(base.capabilities.supports_guidance);
     }
 
