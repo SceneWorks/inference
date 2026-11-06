@@ -148,8 +148,8 @@ use crate::dit::adaln::AdaLnResidency;
 use crate::dit::model::{JointDit, MiniMaxH3Dit};
 use crate::dit::positions::KeyframeAnchor;
 use crate::pipeline::{
-    fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents, prepend_condition_rows,
-    render_latents_with_observer, resolve_geometry, revert_pixel_normalization, t2va_layout,
+    decoded_frames_to_images, fit_audio_to_video, fl2va_layout, initial_latents,
+    prepend_condition_rows, render_latents_with_observer, resolve_geometry, t2va_layout,
     RequestGeometry, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE, SPATIAL_STRIDE,
 };
 use crate::reference::{Ref2VaReference, Ref2VaReferences, VideoReference};
@@ -1287,7 +1287,7 @@ impl MiniMaxH3 {
             let video = vae.decode(&rendered.video)?;
             drop(vae);
             crate::dit::release_device_memory(&self.device)?;
-            frames_to_images(&revert_pixel_normalization(&video)?)?
+            decoded_frames_to_images(&video)?
         };
         phase.done();
         let phase = PhaseLog::start("audio_vae_decode");
@@ -1660,7 +1660,7 @@ impl MiniMaxH3 {
             let video = vae.decode(&rendered.video)?;
             drop(vae);
             crate::dit::release_device_memory(&self.device)?;
-            frames_to_images(&revert_pixel_normalization(&video)?)?
+            decoded_frames_to_images(&video)?
         };
         phase.done();
         let phase = PhaseLog::start("audio_vae_decode");
