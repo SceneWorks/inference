@@ -48,6 +48,26 @@ class AllocatorLauncherTests(unittest.TestCase):
         self.exercise(verified=False, error=ValueError)
         self.exercise(valid_evidence=False, error=ValueError)
 
+    def test_zero_and_positive_recovery_counts_are_reported_honestly(self):
+        self.exercise(recovery_count=0, recovery=False)
+        self.exercise(recovery_count=2, recovery=True)
+
+    def test_missing_malformed_or_inconsistent_recovery_observations_cannot_pass(self):
+        for count in (None, -1, True, False, 0.5, "0"):
+            with self.subTest(count=count):
+                self.exercise(recovery_count=count, error=ValueError)
+        for count, exercised in ((0, True), (1, False), (0, None), (0, 0), (1, 1)):
+            with self.subTest(count=count, exercised=exercised):
+                self.exercise(recovery_count=count, recovery=exercised, error=ValueError)
+
+    def test_missing_or_out_of_cap_high_marks_cannot_pass(self):
+        for field, value in (("heldBytes", None), ("heldBytes", 1),
+                             ("usedHighBytes", None), ("usedHighBytes", 536870913),
+                             ("reservedHighBytes", 536870913), ("reservedHighBytes", True),
+                             ("usedHighBytes", 536870911.0)):
+            with self.subTest(field=field, value=value):
+                self.exercise(evidence_override={field: value}, error=ValueError)
+
     def test_invalid_binding_refuses_before_any_claim_or_launch(self):
         for key, value in [('CUDA_VISIBLE_DEVICES', '0'), ('SCENEWORKS_GPU_ID', '0'),
                            ('SCENEWORKS_CUDA_PROOF_POOL_BYTES', '1')]:
@@ -58,7 +78,7 @@ class AllocatorLauncherTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     proof.run(Path(temporary), Path('MOCK.exe'), env, claim=unexpected, supervise=unexpected)
 
-    def exercise(self, *, returncode=0, fault=None, error=None, verified=True, valid_evidence=True):
+    def exercise(self, *, returncode=0, fault=None, error=None, verified=True, valid_evidence=True, recovery_count=0, recovery=False, evidence_override=None):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             states = []
@@ -84,7 +104,13 @@ class AllocatorLauncherTests(unittest.TestCase):
                     raise fault
                 evidence = {'overCapRefused': valid_evidence, 'bothConstructors': True,
                             'cublasStreamResetRebound': True, 'capBytes': 536870912,
+                            'heldBytes': 469762048, 'usedHighBytes': 536870912,
                             'reservedHighBytes': 536870912}
+                if recovery_count is not None:
+                    evidence['successfulRecoveryCount'] = recovery_count
+                if recovery is not None:
+                    evidence['fragmentationRecoveryExercised'] = recovery
+                evidence.update(evidence_override or {})
                 kwargs['stdout_path'].write_text('test result: ok. 1 passed; 0 failed; 0 ignored\n'
                                                 + 'CUDA_PROOF_POOL_EVIDENCE ' + json.dumps(evidence) + '\n', encoding='utf-8')
                 return RunResult(123, returncode, 1, None, 2, None, 0.1, (), {'MOCK': True})
@@ -94,8 +120,11 @@ class AllocatorLauncherTests(unittest.TestCase):
                     proof.run(output, Path('MOCK.exe'), environment(), claim=claim, supervise=supervise,
                               clock=lambda: next(ticks))
             else:
-                self.assertTrue(proof.run(output, Path('MOCK.exe'), environment(), claim=claim,
-                                          supervise=supervise, clock=lambda: next(ticks))['accepted'])
+                result = proof.run(output, Path('MOCK.exe'), environment(), claim=claim,
+                                   supervise=supervise, clock=lambda: next(ticks))
+                self.assertTrue(result['accepted'])
+                self.assertEqual(result['allocator_evidence']['successfulRecoveryCount'], recovery_count)
+                self.assertIs(result['allocator_evidence']['fragmentationRecoveryExercised'], recovery)
             self.assertEqual(states, ['locked', 'released'])
             receipt = json.loads((output / 'allocator-execution.json').read_text(encoding='utf-8'))
             self.assertEqual(receipt['accepted'], error is None)

@@ -15,6 +15,8 @@ use cudarc::driver::{sys, CudaContext, CudaSlice, CudaStream, DevicePtr};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod recovery;
+
 pub const ENV: &str = "SCENEWORKS_CUDA_PROOF_POOL_BYTES";
 
 struct Installed {
@@ -24,6 +26,7 @@ struct Installed {
     // Retain until process exit, including when callers retain an exported cuBLAS handle after
     // dropping its CudaDevice. The small proof process declares these live buffers in its cap.
     blas_workspaces: HashMap<usize, Arc<CudaSlice<u8>>>,
+    successful_recoveries: u64,
 }
 
 static INSTALLED: OnceLock<Mutex<HashMap<usize, Installed>>> = OnceLock::new();
@@ -139,6 +142,7 @@ pub(super) fn configure(context: &Arc<CudaContext>) -> Result<()> {
             pool: pool as usize,
             cap_bytes,
             blas_workspaces: HashMap::new(),
+            successful_recoveries: 0,
         },
     );
     eprintln!("CUDA_PROOF_POOL installed logical_ordinal={ordinal} cap_bytes={cap_bytes} scope=stream_ordered_pool outside_pool=unbounded_requires_separate_reserve_and_observation");
@@ -170,7 +174,10 @@ pub(super) fn bind_cublas_workspace(
     // SAFETY: the live cuBLAS handle owns its stream; current is a valid out pointer.
     unsafe { cudarc::cublas::sys::cublasGetStream_v2(*blas.handle(), &mut current).result() }
         .w()?;
-    if current as usize != stream.cu_stream() as usize {
+    if !std::ptr::eq(
+        current.cast::<std::ffi::c_void>(),
+        stream.cu_stream().cast::<std::ffi::c_void>(),
+    ) {
         crate::bail!("CUDA proof cuBLAS handle was moved to another stream; refusing untracked workspace ownership");
     }
     let handle = *blas.handle() as usize;
@@ -230,9 +237,174 @@ pub fn snapshot(ordinal: usize) -> Result<Option<Snapshot>> {
     }))
 }
 
+/// Positive allocator-recovery witness for the dedicated raw-allocation proof. Never reset.
+pub fn successful_recoveries(ordinal: usize) -> Result<Option<u64>> {
+    let Some(state) = INSTALLED.get() else {
+        return Ok(None);
+    };
+    let state = state
+        .lock()
+        .map_err(|_| crate::Error::Msg("CUDA proof-pool state was poisoned".into()))?;
+    Ok(state.get(&ordinal).map(|entry| entry.successful_recoveries))
+}
+
+pub(super) fn is_installed(ordinal: usize) -> Result<bool> {
+    let Some(state) = INSTALLED.get() else {
+        return Ok(false);
+    };
+    let state = state
+        .lock()
+        .map_err(|_| crate::Error::Msg("CUDA proof-pool state was poisoned".into()))?;
+    Ok(state.contains_key(&ordinal))
+}
+
+fn is_allocation_oom(error: cudarc::driver::DriverError) -> bool {
+    error.0 == sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY
+}
+
+/// Preserve ordinary allocations exactly. Only an installed proof pool's allocation OOM
+/// may trim unused backing in that same pool and retry the original request once.
+pub(super) fn allocate<T>(
+    stream: &Arc<CudaStream>,
+    requested_bytes: Option<usize>,
+    operation: &'static str,
+    caller: &std::panic::Location<'_>,
+    mut allocation: impl FnMut() -> std::result::Result<T, cudarc::driver::DriverError>,
+) -> Result<T> {
+    let error = match allocation() {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    if !is_allocation_oom(error) {
+        return Err(error).w();
+    }
+    let ordinal = stream.context().ordinal();
+    let Some(before) = snapshot(ordinal)? else {
+        return Err(error).w();
+    };
+    let requested_description = requested_bytes
+        .map(|bytes| bytes.to_string())
+        .unwrap_or_else(|| "overflow".into());
+    let report = |phase: &str, stats: &Snapshot| {
+        eprintln!("CUDA_PROOF_POOL_ALLOCATION phase={phase} operation={operation} requested_bytes={requested_description} logical_ordinal={ordinal} stream=0x{:x} cap_bytes={} used_bytes={} used_high_bytes={} reserved_bytes={} reserved_high_bytes={} caller={caller}",
+            stream.cu_stream() as usize, stats.cap_bytes, stats.used_bytes, stats.used_high_bytes, stats.reserved_bytes, stats.reserved_high_bytes);
+    };
+    report("oom", &before);
+    let Some(requested_bytes) = requested_bytes else {
+        return Err(error).w();
+    };
+    if stream.capture_status().w()? != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
+        return Err(error).w();
+    }
+    // The installed entry retains the pool/context until process exit. Do not hold its mutex
+    // across allocation; CUDA slice drops can complete on other streams.
+    let (pool, context) = {
+        let state = INSTALLED
+            .get()
+            .expect("snapshot found installed pool")
+            .lock()
+            .map_err(|_| crate::Error::Msg("CUDA proof-pool state was poisoned".into()))?;
+        let installed = state
+            .get(&ordinal)
+            .expect("installed pool is process-lifetime");
+        (installed.pool, installed._context.clone())
+    };
+    struct DriverReclaim<'a, F> {
+        ordinal: usize,
+        pool: usize,
+        context: Arc<CudaContext>,
+        report: &'a F,
+    }
+    impl<F: Fn(&str, &Snapshot)> recovery::Reclaim for DriverReclaim<'_, F> {
+        fn snapshot(&mut self, phase: &str) -> Result<recovery::State> {
+            let stats = snapshot(self.ordinal)?.ok_or_else(|| {
+                crate::Error::Msg("CUDA proof pool disappeared during OOM recovery".into())
+            })?;
+            (self.report)(phase, &stats);
+            Ok(recovery::State {
+                cap_bytes: stats.cap_bytes,
+                used_bytes: stats.used_bytes,
+            })
+        }
+        fn trim(&mut self) -> Result<()> {
+            self.context.bind_to_thread().w()?;
+            if active_pool(self.context.cu_device())? as usize != self.pool {
+                crate::bail!("CUDA current pool changed before OOM trim");
+            }
+            // SAFETY: the process-lifetime installed pool is still current on this retained
+            // context. TrimTo never releases live or outstanding allocations and performs no
+            // context/stream synchronization that could interfere with capture elsewhere.
+            unsafe { sys::cuMemPoolTrimTo(self.pool as sys::CUmemoryPool, 0).result() }.w()
+        }
+    }
+    let mut reclaim = DriverReclaim {
+        ordinal,
+        pool,
+        context,
+        report: &report,
+    };
+    match recovery::reclaim_and_retry(
+        requested_bytes as u64,
+        before.cap_bytes,
+        &mut reclaim,
+        &mut allocation,
+    )? {
+        None => Err(error).w(),
+        Some(result) => {
+            if result.is_ok() {
+                let mut state = INSTALLED
+                    .get()
+                    .expect("installed pool")
+                    .lock()
+                    .map_err(|_| crate::Error::Msg("CUDA proof-pool state was poisoned".into()))?;
+                let entry = state.get_mut(&ordinal).expect("process-lifetime pool");
+                entry.successful_recoveries =
+                    entry.successful_recoveries.checked_add(1).ok_or_else(|| {
+                        crate::Error::Msg("CUDA proof recovery counter overflow".into())
+                    })?;
+            }
+            let after = snapshot(ordinal)?.ok_or_else(|| {
+                crate::Error::Msg("CUDA proof pool disappeared after OOM retry".into())
+            })?;
+            report(
+                if result.is_ok() {
+                    "recovered"
+                } else {
+                    "retry_failed"
+                },
+                &after,
+            );
+            result.w()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::requested_cap;
+    use super::*;
+
+    #[test]
+    fn allocation_uncapped_state_does_not_install_or_recover_anything() {
+        assert!(!is_installed(0).unwrap());
+        assert!(snapshot(0).unwrap().is_none());
+        assert!(successful_recoveries(0).unwrap().is_none());
+    }
+
+    #[test]
+    fn allocation_only_recovers_the_driver_oom_error_class() {
+        use cudarc::driver::DriverError;
+        assert!(is_allocation_oom(DriverError(
+            sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY
+        )));
+        for status in [
+            sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+            sys::CUresult::CUDA_ERROR_INVALID_CONTEXT,
+            sys::CUresult::CUDA_ERROR_LAUNCH_FAILED,
+            sys::CUresult::CUDA_ERROR_STREAM_CAPTURE_INVALIDATED,
+        ] {
+            assert!(!is_allocation_oom(DriverError(status)));
+        }
+    }
 
     #[test]
     fn proof_cap_is_explicit_and_invalid_values_fail_closed() {

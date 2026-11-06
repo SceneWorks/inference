@@ -93,10 +93,16 @@ fn constructor_binds_candle_to_an_enforced_pool() -> candle_gen::candle_core::Re
         released.used_bytes, before.used_bytes,
         "allocation proof leaked live pool storage"
     );
+    assert!(released.reserved_high_bytes <= requested as u64);
+    let successful_recovery_count =
+        proof_pool::successful_recoveries(0)?.expect("proof pool remains installed");
+    // Recovery is observational: the driver may satisfy freed storage directly. A zero
+    // count proves no successful retry occurred, not a failure of cap enforcement.
     // No invented all-device peak: these are driver-continuous pool counters only.
     println!(
-        "CUDA_PROOF_POOL_EVIDENCE {{\"logicalOrdinal\":0,\"capBytes\":{},\"heldBytes\":{},\"usedHighBytes\":{},\"reservedHighBytes\":{},\"overCapRefused\":true,\"bothConstructors\":true,\"cublasStreamResetRebound\":true,\"scope\":\"stream-ordered allocator plus explicit cuBLAS workspace; context/library-internal/foreign allocations excluded\"}}",
-        requested, held_bytes, peak.used_high_bytes, peak.reserved_high_bytes
+        "CUDA_PROOF_POOL_EVIDENCE {{\"logicalOrdinal\":0,\"capBytes\":{},\"heldBytes\":{},\"usedHighBytes\":{},\"reservedHighBytes\":{},\"overCapRefused\":true,\"bothConstructors\":true,\"cublasStreamResetRebound\":true,\"successfulRecoveryCount\":{},\"fragmentationRecoveryExercised\":{},\"scope\":\"stream-ordered allocator plus explicit cuBLAS workspace; context/library-internal/foreign allocations excluded\"}}",
+        requested, held_bytes, released.used_high_bytes, released.reserved_high_bytes,
+        successful_recovery_count, successful_recovery_count > 0
     );
     Ok(())
 }

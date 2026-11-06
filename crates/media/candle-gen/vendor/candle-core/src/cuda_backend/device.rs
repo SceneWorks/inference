@@ -72,18 +72,38 @@ impl std::fmt::Debug for CudaDevice {
 
 impl CudaDevice {
     #[allow(clippy::missing_safety_doc)]
+    #[track_caller]
     pub unsafe fn alloc<T: cudarc::driver::DeviceRepr>(
         &self,
         len: usize,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
-        self.stream.alloc::<T>(len).w()
+        if !super::proof_pool::is_installed(self.context.ordinal())? {
+            return self.stream.alloc::<T>(len).w();
+        }
+        super::proof_pool::allocate(
+            &self.stream,
+            len.checked_mul(std::mem::size_of::<T>()),
+            "alloc",
+            std::panic::Location::caller(),
+            || self.stream.alloc::<T>(len),
+        )
     }
 
+    #[track_caller]
     pub fn alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
         &self,
         len: usize,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
-        self.stream.alloc_zeros::<T>(len).w()
+        if !super::proof_pool::is_installed(self.context.ordinal())? {
+            return self.stream.alloc_zeros::<T>(len).w();
+        }
+        super::proof_pool::allocate(
+            &self.stream,
+            len.checked_mul(std::mem::size_of::<T>()),
+            "alloc_zeros",
+            std::panic::Location::caller(),
+            || self.stream.alloc_zeros::<T>(len),
+        )
     }
 
     pub fn enable_cuda_graph_htod_cache(&self) -> CudaGraphHtodCacheGuard {
@@ -139,6 +159,7 @@ impl CudaDevice {
         self.stream.memcpy_dtoh(src, dst).w()
     }
 
+    #[track_caller]
     pub fn clone_htod<
         T: cudarc::driver::DeviceRepr + 'static,
         Src: cudarc::driver::HostSlice<T> + ?Sized,
@@ -149,7 +170,16 @@ impl CudaDevice {
         if cuda_graph_htod_cache_enabled() && !src.is_empty() {
             return self.clone_htod_capture_cached(src);
         }
-        self.stream.clone_htod(src).w()
+        if !super::proof_pool::is_installed(self.context.ordinal())? {
+            return self.stream.clone_htod(src).w();
+        }
+        super::proof_pool::allocate(
+            &self.stream,
+            src.len().checked_mul(std::mem::size_of::<T>()),
+            "clone_htod",
+            std::panic::Location::caller(),
+            || self.stream.clone_htod(src),
+        )
     }
 
     fn check_capture_copy(&self, op: &str) -> Result<()> {

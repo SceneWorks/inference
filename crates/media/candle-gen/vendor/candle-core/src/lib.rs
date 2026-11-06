@@ -80,6 +80,10 @@ macro_rules! __model_input_select {
 }
 
 pub mod backend;
+// The exact allocator policy is also checked without CUDA or device construction.
+#[cfg(all(test, not(feature = "cuda")))]
+#[path = "cuda_backend/proof_pool/recovery.rs"]
+mod cuda_pool_recovery;
 pub mod backprop;
 pub mod conv;
 mod convert;
