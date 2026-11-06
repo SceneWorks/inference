@@ -30,10 +30,24 @@ successful allocation beyond it, a pool watermark below the retained tensors,
 or driver reservation above the cap. Cleanup returns live pool use to baseline.
 This is allocator evidence only; it does not execute H3 or establish model fit.
 
+Compilation uses `--no-run` outside the physical lease. The narrow allocator
+launcher selects the exact compiler-reported integration executable, then uses
+`model_proof_resources.execution_claim` and the existing owned-child supervisor.
+The test holds the host-global `%PUBLIC%/SceneWorks/gpu-locks/<GPU1-UUID>.lock`
+through child-tree cleanup and post-execution verification; UUID visibility and
+Actions concurrency alone do not provide ownership. Contention waits within one
+30-minute claim/execution deadline. Timeouts or cancellation use the existing
+Windows Job cleanup before the lease's `finally` release. The execution receipt,
+lease observations and supervisor policy are retained alongside the test log.
+Supervisor caps (16 GiB host,8 GiB device plus2 GiB free reserve) bound this raw
+primitive process and are separate from the enforced512MiB allocator pool.
+
 The workflow is manual-only and independent of PR/main CI. Estimated execution
 after compilation is under one minute; fresh CUDA compilation cost is unknown
 and can dominate. It adds no weights/download/history requirement. One job has
 a 90-minute bound; the test holds at most 512 MiB plus context/library overhead.
+Launcher tests use CPU stubs only; the existing CUDA lease tests use fake driver
+inventory and byte locks. Neither executes the allocator primitive in ordinary CI.
 
 ## 24 GiB anchor protocol
 
