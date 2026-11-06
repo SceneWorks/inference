@@ -555,6 +555,16 @@ fn route_aware_safety(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
+    // This fixture provider owns its structural-estimate wire convention, just as legacy
+    // production providers do. It is deliberately not a rule of the shared safety pipeline.
+    if context.load_shape != contract.load_shape
+        || (contract.calibration.is_none()
+            && (context.calibration_abi != 0 || !context.calibration_fingerprint.is_empty()))
+    {
+        return MemorySafetyDecision::Reject {
+            reason: "fixture provider's absent-calibration handshake".into(),
+        };
+    }
     let routes = contract.pid_decode_routes.as_ref().unwrap();
     let edge = context.selection.parameters.decode_tile_edge;
     let overlap = context.selection.parameters.decode_overlap;

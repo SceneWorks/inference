@@ -18,6 +18,14 @@ pub(super) fn route_gate(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> candle_gen::gen_core::Result<()> {
+    if context.load_shape != contract.load_shape
+        || (contract.calibration.is_none()
+            && (context.calibration_abi != 0 || !context.calibration_fingerprint.is_empty()))
+    {
+        return Err(CoreError::Unsupported(
+            "minimax_h3: provider wire handshake crossed ABI, fingerprint, or materialization shape".into(),
+        ));
+    }
     let g = context.geometry;
     let stride = crate::pipeline::SPATIAL_STRIDE;
     if context.use_pid

@@ -1034,10 +1034,9 @@ fn production_calibration_fingerprint(components: &ComponentBytes) -> Option<Str
     )
 }
 
-/// The Candle MiniMax-H3 memory profile (sc-27307). Only the fingerprint spelling is profile
-/// data: the safety check is the deliberately tier-blind shared default (no optimized rung, no
-/// route gate), and the architecture facts read the DiT partition the component resolver charged,
-/// which may sit outside the snapshot root.
+/// The Candle MiniMax-H3 memory profile. Its provider-owned gate checks the source route and
+/// wire handshake before the shared tier, parameter, and budget checks. Architecture facts read
+/// the DiT partition the component resolver charged, which may sit outside the snapshot root.
 const MEMORY_PROFILE: candle_gen::gen_core::ProviderMemoryProfile =
     candle_gen::gen_core::ProviderMemoryProfile {
         fingerprint: Some(candle_gen::gen_core::MemoryFingerprintTable {
@@ -1045,7 +1044,7 @@ const MEMORY_PROFILE: candle_gen::gen_core::ProviderMemoryProfile =
             routes: &[(MODEL_ID, "")],
             pins: &[],
         }),
-        gates: candle_gen::gen_core::MemoryProfileGates::within(profile_route_gate),
+        gates: candle_gen::gen_core::MemoryProfileGates::before(profile_route_gate),
         tier: candle_gen::gen_core::MemoryProfileTier::FixedPrecision(
             candle_gen::gen_core::Precision::Bf16,
         ),
@@ -2918,13 +2917,26 @@ mod tests {
             safety_check(&spec, &contract, &stale),
             MemorySafetyDecision::Accept
         );
+        assert_eq!(
+            safety_check_loaded(&contract, &stale),
+            MemorySafetyDecision::Accept
+        );
         let mut malformed_abi = stale.clone();
         malformed_abi.calibration_abi = candle_gen::gen_core::MEMORY_CALIBRATION_ABI;
+        let mut wrong_shape = stale.clone();
+        wrong_shape.load_shape = match wrong_shape.load_shape {
+            LoadShape::EagerMaterialization => LoadShape::DeferredMaterialization,
+            LoadShape::DeferredMaterialization => LoadShape::EagerMaterialization,
+        };
         let mut malformed_fingerprint = stale;
         malformed_fingerprint.calibration_fingerprint = "invented-measurement-v1".into();
-        for malformed in [malformed_abi, malformed_fingerprint] {
+        for malformed in [malformed_abi, malformed_fingerprint, wrong_shape] {
             assert!(matches!(
                 safety_check(&spec, &contract, &malformed),
+                MemorySafetyDecision::Reject { .. }
+            ));
+            assert!(matches!(
+                safety_check_loaded(&contract, &malformed),
                 MemorySafetyDecision::Reject { .. }
             ));
         }

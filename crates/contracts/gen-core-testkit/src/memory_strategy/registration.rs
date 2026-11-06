@@ -251,9 +251,9 @@ pub(super) fn check_behavior_fixture(
         return;
     }
 
-    // Measured admission binds its identity; estimates without calibration carry the explicit
-    // ABI-zero/empty-fingerprint sentinel. Mutating either is a malformed wire handshake, not
-    // stale external evidence. Materialization remains a separate execution axis below.
+    // Measured admission binds its identity. Providers own any structural-estimate wire
+    // convention, including materialization shape; these probes exercise their declared
+    // admission callbacks rather than imposing a new rule on the shared safety pipeline.
     let mut mutated_abi = fixture.context.clone();
     mutated_abi.calibration_abi = mutated_abi.calibration_abi.wrapping_add(1);
     if matches!(
