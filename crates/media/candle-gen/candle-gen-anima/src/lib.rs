@@ -577,6 +577,21 @@ pub(crate) fn validate_request(
         )));
     }
     desc.capabilities.validate_request(id, req)?;
+    let guidance = req.guidance.unwrap_or_else(|| {
+        Variant::from_id(id)
+            .unwrap_or(Variant::Base)
+            .default_guidance()
+    });
+    if guidance == 1.0
+        && req
+            .negative_prompt
+            .as_ref()
+            .is_some_and(|text| !text.trim().is_empty())
+    {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: a negative prompt requires guidance != 1.0"
+        )));
+    }
     if !req.width.is_multiple_of(RES_MULTIPLE) || !req.height.is_multiple_of(RES_MULTIPLE) {
         return Err(gen_core::Error::Msg(format!(
             "{id}: {}x{} must be a multiple of {RES_MULTIPLE}",
@@ -780,6 +795,14 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_requests() {
+        for guidance in [None, Some(1.0)] {
+            let request = GenerationRequest {
+                guidance,
+                negative_prompt: Some("blurry".into()),
+                ..req(1024, 1024)
+            };
+            assert!(validate_request(&descriptor_turbo(), &request).is_err());
+        }
         assert!(validate_request(&descriptor_base(), &GenerationRequest::default()).is_err()); // empty prompt
         assert!(validate_request(&descriptor_base(), &req(1000, 1024)).is_err()); // not mult of 16
         assert!(validate_request(&descriptor_base(), &req(256, 256)).is_err()); // below min

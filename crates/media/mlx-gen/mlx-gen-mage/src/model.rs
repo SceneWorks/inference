@@ -1697,6 +1697,20 @@ fn validate_generation_request(
     descriptor
         .capabilities
         .validate_request(descriptor.id, req)?;
+    let guidance = req.guidance.unwrap_or_else(|| {
+        MageVariant::from_id(descriptor.id).map_or(1.0, MageVariant::default_cfg)
+    });
+    if guidance == 1.0
+        && req
+            .negative_prompt
+            .as_ref()
+            .is_some_and(|text| !text.trim().is_empty())
+    {
+        return Err(mlx_gen::gen_core::Error::Msg(format!(
+            "{}: a negative prompt requires guidance != 1.0",
+            descriptor.id
+        )));
+    }
     if !req.width.is_multiple_of(REQUIRED_SIZE_MULTIPLE)
         || !req.height.is_multiple_of(REQUIRED_SIZE_MULTIPLE)
     {
@@ -3587,6 +3601,22 @@ mod tests {
 
     #[test]
     fn edit_variant_defaults_and_cfg_surfaces_are_exact() {
+        for variant in [MageVariant::Turbo, MageVariant::EditTurbo] {
+            for guidance in [None, Some(1.0), Some(1.5)] {
+                let request = GenerationRequest {
+                    prompt: "p".into(),
+                    width: 1024,
+                    height: 1024,
+                    guidance,
+                    negative_prompt: Some("blurry".into()),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    validate_generation_request(&descriptor_for(variant), &request).is_ok(),
+                    guidance == Some(1.5)
+                );
+            }
+        }
         let base = descriptor_edit_base();
         assert_eq!(base.id, "mage_flow_edit_base");
         assert_eq!(MageVariant::EditBase.default_steps(), 30);

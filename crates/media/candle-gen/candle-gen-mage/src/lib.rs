@@ -370,6 +370,17 @@ impl Generator for MageEditGenerator {
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
+        let guidance = req.guidance.unwrap_or(self.variant.defaults().1);
+        if guidance == 1.0
+            && req
+                .negative_prompt
+                .as_ref()
+                .is_some_and(|text| !text.trim().is_empty())
+        {
+            return Err(gen_core::Error::Msg(
+                "mage edit: a negative prompt requires guidance != 1.0".into(),
+            ));
+        }
         if req.prompt.trim().is_empty() {
             return Err(gen_core::Error::Msg(
                 "mage edit: instruction must not be empty".into(),
@@ -633,6 +644,17 @@ impl Generator for MageGenerator {
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)?;
+        let guidance = req.guidance.unwrap_or(self.default_guidance);
+        if guidance == 1.0
+            && req
+                .negative_prompt
+                .as_ref()
+                .is_some_and(|text| !text.trim().is_empty())
+        {
+            return Err(gen_core::Error::Msg(
+                "mage_flow: a negative prompt requires guidance != 1.0".into(),
+            ));
+        }
         if req.prompt.trim().is_empty() {
             return Err(gen_core::Error::Msg(
                 "mage_flow: prompt must not be empty".into(),
@@ -1180,6 +1202,47 @@ pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    #[test]
+    fn turbo_negatives_require_effective_cfg() {
+        let registry = provider_registry().unwrap();
+        for id in ["mage_flow_turbo", "mage_flow_edit_turbo"] {
+            let generator = registry
+                .load(
+                    id,
+                    &LoadSpec::new(WeightsSource::Dir("/nonexistent".into())),
+                )
+                .unwrap();
+            for guidance in [None, Some(1.0), Some(1.5)] {
+                let conditioning = if id.contains("edit") {
+                    vec![Conditioning::Reference {
+                        image: gen_core::Image {
+                            width: 1,
+                            height: 1,
+                            pixels: vec![0; 3],
+                        },
+                        strength: None,
+                    }]
+                } else {
+                    vec![]
+                };
+                let request = GenerationRequest {
+                    prompt: "p".into(),
+                    width: 1024,
+                    height: 1024,
+                    guidance,
+                    negative_prompt: Some("blurry".into()),
+                    conditioning,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    generator.validate(&request).is_ok(),
+                    guidance == Some(1.5),
+                    "{id}: {guidance:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn rl_registry_surface_and_geometry_are_exact() {
