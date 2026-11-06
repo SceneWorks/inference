@@ -97,7 +97,7 @@ class AllocatorLauncherTests(unittest.TestCase):
                 self.assertTrue(proof.run(output, Path('MOCK.exe'), environment(), claim=claim,
                                           supervise=supervise, clock=lambda: next(ticks))['accepted'])
             self.assertEqual(states, ['locked', 'released'])
-            receipt = json.loads((output / 'allocator-execution.json').read_text())
+            receipt = json.loads((output / 'allocator-execution.json').read_text(encoding='utf-8'))
             self.assertEqual(receipt['accepted'], error is None)
             if error:
                 self.assertIn('error', receipt)
