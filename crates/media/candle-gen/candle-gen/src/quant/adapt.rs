@@ -737,6 +737,16 @@ impl AdaptLinear {
     /// Copy a prepared base and every residual onto a bounded execution window.
     pub fn copy_to_device(&self, device: &Device) -> candle_core::Result<Self> {
         let mut copy = self.clone();
+        // Ordinary clones deliberately share immutable-factor preparation caches. A bounded
+        // device copy has a different owner/lifetime: migration and its subsequent forward
+        // must neither clear the host source's cache nor publish device tensors back into it.
+        for adapter in &mut copy.adapters {
+            match adapter {
+                Adapter::Lora { prepared, .. } => *prepared = PreparedLora::default(),
+                Adapter::LokrStructured { factors } => factors.prepared = Arc::default(),
+                Adapter::TrainableLora { .. } | Adapter::TrainableLokr { .. } => {}
+            }
+        }
         if let Base::Packed(base) = &self.base {
             copy.base = Base::Packed(base.copy_to_device(device)?);
         }
@@ -1584,6 +1594,131 @@ mod tests {
     use candle_core::safetensors::MmapedSafetensors;
     use candle_core::{Device, Tensor};
     use std::collections::HashMap;
+
+    /// Ownership only: seed valid CPU preparation entries directly, without a learned forward.
+    /// A window must own its caches even for a same-device copy (CPU is the portable control).
+    #[test]
+    fn device_copy_owns_frozen_adapter_caches_without_mutating_the_source() {
+        let device = Device::Cpu;
+        let a = Tensor::from_vec(vec![1f32; 8], (4, 2), &device).unwrap();
+        let b = Tensor::from_vec(vec![2f32; 8], (2, 4), &device).unwrap();
+        let prepared = PreparedLora::default();
+        prepared
+            .by_dtype
+            .lock()
+            .unwrap()
+            .push((DType::F32, a.clone(), b.clone()));
+        let w1 = Tensor::from_vec(vec![1f32, 2., 3., 4.], (2, 2), &device).unwrap();
+        let w2 = Tensor::from_vec(vec![2f32, 3., 5., 7.], (2, 2), &device).unwrap();
+        let w2t = Tensor::from_vec(vec![2f32, 5., 3., 7.], (2, 2), &device).unwrap();
+        let factors = LokrFactors {
+            w1: w1.clone(),
+            w2: w2.clone(),
+            a: 2,
+            b: 2,
+            c: 2,
+            d: 2,
+            output_slice: Some((0, 4)),
+            scale: 0.5,
+            prepared: Arc::new(Mutex::new(vec![(DType::F32, w1.clone(), w2t.clone())])),
+        };
+        let source = AdaptLinear {
+            base: Base::Dense(Linear::new(
+                Tensor::zeros((4, 4), DType::F32, &device).unwrap(),
+                None,
+            )),
+            out_features: 4,
+            in_features: 4,
+            adapters: vec![
+                Adapter::Lora {
+                    a: a.clone(),
+                    b: b.clone(),
+                    scale: 0.25,
+                    prepared,
+                },
+                Adapter::LokrStructured { factors },
+            ],
+        };
+        let ordinary = source.clone();
+        match (&source.adapters[0], &ordinary.adapters[0]) {
+            (Adapter::Lora { prepared: a, .. }, Adapter::Lora { prepared: b, .. }) => {
+                assert!(Arc::ptr_eq(&a.by_dtype, &b.by_dtype))
+            }
+            _ => panic!("frozen LoRA expected"),
+        }
+        match (&source.adapters[1], &ordinary.adapters[1]) {
+            (Adapter::LokrStructured { factors: a }, Adapter::LokrStructured { factors: b }) => {
+                assert!(Arc::ptr_eq(&a.prepared, &b.prepared))
+            }
+            _ => panic!("frozen LoKr expected"),
+        }
+        drop(ordinary);
+        let copy = source.copy_to_device(&device).unwrap();
+        assert_eq!(
+            source.frozen_adapter_preparation_count(),
+            2,
+            "device-copy migration must not clear the retained source's prepared views"
+        );
+        assert_eq!(copy.frozen_adapter_preparation_count(), 0);
+        let lora_owner = match (&source.adapters[0], &copy.adapters[0]) {
+            (
+                Adapter::Lora {
+                    a: sa,
+                    b: sb,
+                    scale: ss,
+                    prepared: sp,
+                },
+                Adapter::Lora {
+                    a: ca,
+                    b: cb,
+                    scale: cs,
+                    prepared: cp,
+                },
+            ) => {
+                assert!(!Arc::ptr_eq(&sp.by_dtype, &cp.by_dtype));
+                assert_eq!(ss, cs);
+                assert_eq!(sa.to_vec2::<f32>().unwrap(), ca.to_vec2::<f32>().unwrap());
+                assert_eq!(sb.to_vec2::<f32>().unwrap(), cb.to_vec2::<f32>().unwrap());
+                assert!(ca.device().same_device(&device) && cb.device().same_device(&device));
+                cp.by_dtype
+                    .lock()
+                    .unwrap()
+                    .push((DType::F32, ca.clone(), cb.clone()));
+                Arc::downgrade(&cp.by_dtype)
+            }
+            _ => panic!("frozen LoRA expected"),
+        };
+        let lokr_owner = match (&source.adapters[1], &copy.adapters[1]) {
+            (Adapter::LokrStructured { factors: s }, Adapter::LokrStructured { factors: c }) => {
+                assert!(!Arc::ptr_eq(&s.prepared, &c.prepared));
+                assert_eq!(s.scale, c.scale);
+                assert_eq!(s.output_slice, c.output_slice);
+                assert_eq!(s.shape(), c.shape());
+                assert_eq!(
+                    s.w1.to_vec2::<f32>().unwrap(),
+                    c.w1.to_vec2::<f32>().unwrap()
+                );
+                assert_eq!(
+                    s.w2.to_vec2::<f32>().unwrap(),
+                    c.w2.to_vec2::<f32>().unwrap()
+                );
+                c.prepared
+                    .lock()
+                    .unwrap()
+                    .push((DType::F32, c.w1.clone(), w2t));
+                Arc::downgrade(&c.prepared)
+            }
+            _ => panic!("frozen LoKr expected"),
+        };
+        assert_eq!(source.frozen_adapter_preparation_count(), 2);
+        assert_eq!(copy.frozen_adapter_preparation_count(), 2);
+        drop(copy);
+        assert!(
+            lora_owner.upgrade().is_none() && lokr_owner.upgrade().is_none(),
+            "dropping the execution window must release both cache owners"
+        );
+        assert_eq!(source.frozen_adapter_preparation_count(), 2);
+    }
 
     #[test]
     fn external_base_reuses_checked_residuals_without_a_fake_weight_or_duplicate_cache() {

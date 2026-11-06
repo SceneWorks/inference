@@ -849,6 +849,20 @@
         "win32"
       ],
       "reason": "Weights-free source contracts, geometry/parameter declarations and lifecycle/config refusal checks only. No tensor/model forward, numerical kernel, network or GPU execution."
+    },
+    {
+      "package": "candle-gen",
+      "kind": "lib",
+      "target": "candle_gen",
+      "test": "quant::adapt::tests::device_copy_owns_frozen_adapter_caches_without_mutating_the_source",
+      "source": "crates/media/candle-gen/candle-gen/src/quant/adapt.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "CPU Tensor construction/readback and Arc/Weak ownership only, with directly seeded frozen factor caches. No learned forward, matmul, factor preparation, numeric model operation or accelerator work executes."
     }
   ]
 }
