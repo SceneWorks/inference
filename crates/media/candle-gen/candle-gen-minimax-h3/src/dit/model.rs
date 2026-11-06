@@ -1313,7 +1313,25 @@ mod veda_controls_tests {
                 )
                 .unwrap();
         }
-        assert_eq!(projection.adapters().len(), 2);
+        // Structured LoKr uses a separate frozen preparation cache. Exercise its transfer
+        // alongside both LoRAs, on the same dense/packed resident and streamed routes.
+        let lokr_left = Tensor::full(0.01f32, (12, 8), &source_device).unwrap();
+        let lokr_right = Tensor::full(0.02f32, (8, 8), &source_device).unwrap();
+        let lokr = candle_gen::quant::LokrFactors::build(
+            0.125,
+            (96, 64),
+            Some(&lokr_left),
+            None,
+            None,
+            Some(&lokr_right),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("the native projection has a structured LoKr factorization");
+        projection.push_lokr_structured(lokr).unwrap();
+        assert_eq!(projection.adapters().len(), 3);
         if streamed {
             dit.prepare_streamed(&device, 1).unwrap();
         }
