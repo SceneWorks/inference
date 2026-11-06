@@ -19,6 +19,7 @@ const HIDDEN: usize = 5376;
 const HEADS: usize = 56;
 const HEAD_DIM: usize = 128;
 const BUDGET: u64 = 32 * 1024 * 1024;
+const MAX_READBACK_ELEMENTS: usize = 1024 * 1024;
 const PREFIX: &str = "transformer_blocks.0.attn.to_q";
 const NORM: &str = "transformer_blocks.0.attn.norm_q.weight";
 const MODEL_REVISION: &str = "137ce668c55a20bc0935fd1cf2a3de8448abb7f4";
@@ -57,13 +58,39 @@ fn update_bf16_hash(hash: &mut Sha256, values: &[bf16]) {
     hash.update(bytes);
 }
 
+fn readback_chunk(flat: &Tensor, start: usize, len: usize) -> Result<Vec<bf16>> {
+    assert!(len > 0 && len <= MAX_READBACK_ELEMENTS);
+    // CUDA to_vec1 copies the WHOLE backing storage before applying the layout.
+    // A contiguous narrow can still alias the full projection. Force a new,
+    // chunk-sized allocation; contiguous() and copy() do not establish this bound.
+    let chunk = flat.narrow(0, start, len)?.force_contiguous()?;
+    assert_eq!(chunk.elem_count(), len);
+    {
+        let (storage, layout) = chunk.storage_and_layout();
+        assert_eq!(layout.start_offset(), 0);
+        let storage_elements = match &*storage {
+            candle_gen::candle_core::Storage::Cpu(candle_gen::candle_core::CpuStorage::BF16(
+                values,
+            )) => values.len(),
+            candle_gen::candle_core::Storage::Cuda(storage) => {
+                storage.as_cuda_slice::<bf16>()?.len()
+            }
+            _ => return Err(error("BF16 readback requires CPU or CUDA storage")),
+        };
+        assert_eq!(storage_elements, len, "readback must own only its chunk");
+    }
+    let values = chunk.to_vec1::<bf16>()?;
+    assert_eq!(values.len(), len);
+    Ok(values)
+}
+
 fn tensor_identity(tensor: &Tensor) -> Result<Value> {
     assert_eq!(tensor.dtype(), DType::BF16);
     let flat = tensor.flatten_all()?;
     let mut hash = Sha256::new();
-    for start in (0..tensor.elem_count()).step_by(1024 * 1024) {
-        let len = (1024 * 1024).min(tensor.elem_count() - start);
-        update_bf16_hash(&mut hash, &flat.narrow(0, start, len)?.to_vec1::<bf16>()?);
+    for start in (0..tensor.elem_count()).step_by(MAX_READBACK_ELEMENTS) {
+        let len = MAX_READBACK_ELEMENTS.min(tensor.elem_count() - start);
+        update_bf16_hash(&mut hash, &readback_chunk(&flat, start, len)?);
     }
     Ok(json!({"shape":tensor.dims(),"dtype":"BF16","sha256":format!("{:x}",hash.finalize())}))
 }
@@ -82,10 +109,10 @@ fn comparison(left: &Tensor, right: &Tensor) -> Result<Value> {
     let mut peak_bits = 0u16;
     let mut squares = 0f64;
     let mut nonfinite = 0u64;
-    for start in (0..left.elem_count()).step_by(1024 * 1024) {
-        let len = (1024 * 1024).min(left.elem_count() - start);
-        let a = left_flat.narrow(0, start, len)?.to_vec1::<bf16>()?;
-        let b = right_flat.narrow(0, start, len)?.to_vec1::<bf16>()?;
+    for start in (0..left.elem_count()).step_by(MAX_READBACK_ELEMENTS) {
+        let len = MAX_READBACK_ELEMENTS.min(left.elem_count() - start);
+        let a = readback_chunk(&left_flat, start, len)?;
+        let b = readback_chunk(&right_flat, start, len)?;
         update_bf16_hash(&mut lh, &a);
         update_bf16_hash(&mut rh, &b);
         for (a, b) in a.into_iter().zip(b) {
@@ -606,6 +633,9 @@ fn production_q4_turbo_workspace_and_qk_parity() -> Result<()> {
         "kind":"h3-residency-component/v1", "schemaVersion":1,
         "accepted":exact && finite_observations, "completedLearnedProjectionCalls":completed_projections,
         "completedResidualOnlyScopes":2,
+        "readback":{"method":"narrow-force_contiguous-to_vec1",
+            "maximumAllowedChunkElements":MAX_READBACK_ELEMENTS,"elementBytes":2,
+            "everyChunkLayoutStartOffset":0,"everyStorageElementCountEqualsChunk":true},
         "device":{"logicalOrdinal":0,"computeCapability":[major,minor],
             "cudaVisibleDevices":std::env::var("CUDA_VISIBLE_DEVICES").ok(),
             "proofPoolInstalled":false,"stream":format!("{:p}",stream.cu_stream())},
