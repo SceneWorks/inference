@@ -1080,38 +1080,10 @@ fn build_contract(
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
             host_backed_weights: true,
-            // There is no block-wise host→device materialization path in this crate at all: the
-            // DiT loads as a whole stack. sc-18662 builds one.
+            // configure_contract binds the executable source/window capabilities before this
+            // baseline is published. Packed weights are prepared on the host once; windows
+            // transfer runtime-format bytes without per-block repacking.
             host_to_device_block_materialization: false,
-            // Answered even though rung 4 is `Missing`, because the field is deliberately not
-            // optional.
-            //
-            // **The premise this used to rest on is gone.** It read "this crate has no packed tier
-            // and therefore no MLX-affine → GGML repack seam", and named a packed candle tier
-            // landing as "the change that turns a conforming realization into a
-            // `HostFormatConversion` one". sc-20267 landed that tier: `crate::quant::lin` routes
-            // every packed projection through `candle_gen::quant::repack_packed_weight`, which is
-            // host-side work proportional to the weight.
-            //
-            // The declaration is unchanged all the same, on two grounds that are stated here rather
-            // than left implicit, because the old comment's own prediction says otherwise:
-            //
-            // 1. **there is no window path here to characterize.**
-            //    `host_to_device_block_materialization` above is `false` and rung 4 is `Missing` —
-            //    the DiT loads as a whole stack — so this field describes a counterfactual either
-            //    way, and `conformance_errors` only reads it when rung 4 is `Implemented`.
-            // 2. **`DeviceFormatTransfer` is the obligation, and it is reachable.** The enum's own
-            //    doc calls `HostFormatConversion` a transitional state a conforming rung SHOULD not
-            //    be in, and says of exactly this repack that "nothing about Candle prevents it: the
-            //    conversion is content-addressed by the source tensor and can be done once, ahead of
-            //    the render, into a device-format artifact a window then maps and copies". Every
-            //    other packed-tier candle provider in this workspace declares the same value.
-            //
-            // **sc-18662 still owns re-verifying this**, and the obligation is now sharper rather
-            // than conditional: whatever window loader it builds must do the repack ahead of the
-            // render, or it must change this field to `HostFormatConversion` and name its own
-            // removal story. Building a per-window repack and leaving this value is the one
-            // outcome the field exists to prevent.
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
         strategies: strategies(),
@@ -1124,24 +1096,8 @@ fn build_contract(
         additional_prerequisites: Vec::new(),
         default_engagement_exclusions: Vec::new(),
         resident_request_memory: ResidentRequestMemory::PreserveLoadDefaults,
-        // Empty, and paired with the `Missing` rung-1 declaration above for the same reason: the
-        // phases ARE implemented (`generate_impl` releases each component and synchronizes the
-        // device via `crate::dit::release_device_memory`), but the rung they belong to cannot be
-        // declared until its behavior seam exists, and a lifecycle block attached to a `Missing`
-        // rung is a claim with no rung to hang on. The seam waits on a `calibration` identity, so
-        // the rung and this block flip together when one lands.
-        //
-        // `phases` is no longer empty, and it declares exactly ONE entry. sc-18665's exclusion is
-        // `PrecomputedThenEvicted { precomputed_in: Denoise }`, and `conformance_errors` requires
-        // that phase to be a declared lifecycle phase — so `Denoise` is the minimum the eviction
-        // needs, and declaring it is what ties the component's ordering back to `lifecycle` rather
-        // than inventing an axis for it. `Conditioning` and `Decode` stay undeclared: they belong to
-        // staged residency, which is still `Missing`, and declaring them would be exactly the false
-        // phase hook `lifecycle_hooks_have_executable_phase_mechanisms` refuses.
-        //
-        // Safe in both conformance directions: the forward rule fires only when StagedResidency is
-        // `Implemented`, and the converse fires only on `StructurallyNotApplicable`. Rung 1 here is
-        // `Missing`, which is neither. Every other hook stays false.
+        // configure_contract publishes the executable conditioning/denoise/decode staging,
+        // decode tiling, attention chunking and transformer-window lifecycle for this source.
         lifecycle: MemoryLifecycleCapabilities {
             phases: vec![MemoryPhase::Denoise],
             ..Default::default()
@@ -1342,10 +1298,9 @@ pub fn weights_free_contract(
 
 /// The provider's real admission check, callable before any weight file is opened.
 ///
-/// The shared check is sufficient here and a route gate would be a lie: with no optimized rung and
-/// no calibration identity, every admission this provider can accept is the resident baseline, and
-/// the geometry gates belong to the pipeline sc-17156 landed (`crate::denoise::geometry`), not to
-/// this contract.
+/// The standard profile applies H3's source-owned wire/materialization guard, followed by
+/// numeric-tier, strategy, geometry, authority and budget checks. Source-derived estimates
+/// do not require measured calibration or an external measurement freshness gate.
 pub fn safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
