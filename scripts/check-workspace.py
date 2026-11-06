@@ -2843,9 +2843,6 @@ BESPOKE_MEMORY_SKELETONS: dict[tuple[str, str], str] = {
     ("candle-gen-minimax-h3", "architecture_facts"): (
         "reads the DiT partition the component resolver charged, which can live outside the snapshot root"
     ),
-    ("candle-gen-minimax-h3", "safety_check"): (
-        "deliberately tier-blind gen-core default for an uncalibrated resident-only route; a profile always binds a loaded tier"
-    ),
     ("candle-gen-moss-image", "architecture_facts"): (
         "geometry is read from the authenticated Sources package config, not a snapshot root"
     ),
