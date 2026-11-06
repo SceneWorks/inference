@@ -731,8 +731,13 @@ impl Pipeline {
         let native: Vec<f32> = timesteps.iter().map(|&t| t as f32).collect();
         let mu = flow_mu(self.variant, state.img.dim(1)?);
         let steps = native.len().saturating_sub(1);
-        let sigmas =
-            candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            mu,
+            steps,
+            &native,
+        )?;
         // Guidance is only consumed by the dev DiT; schnell's DiT ignores the tensor. The packed DiT
         // takes the same shape (`Option<&Tensor>` — `None` for schnell, since `guidance_embed` is off).
         let packed_guidance = if self.variant.supports_guidance() {

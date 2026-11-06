@@ -64,6 +64,9 @@ pub struct Flux2ControlRequest {
     pub width: u32,
     pub height: u32,
     pub steps: usize,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub scheduler_shift: Option<f32>,
     /// Embedded guidance scale (dev default ≈ 4.0).
     pub guidance: f32,
     /// `control_context_scale` — how strongly the control branch locks the base (≈ 0.65–0.80).
@@ -90,6 +93,9 @@ impl Default for Flux2ControlRequest {
             width: 1024,
             height: 1024,
             steps: DEFAULT_STEPS_DEV as usize,
+            sampler: None,
+            scheduler: None,
+            scheduler_shift: None,
             guidance: DEFAULT_GUIDANCE_DEV,
             control_scale: DEFAULT_CONTROL_SCALE,
             seed: 0,
@@ -503,7 +509,13 @@ impl Flux2Control {
         // empirical-mu schedule (the N1 no-op reproducing the legacy flow-match loop within tolerance).
         let mu = pipeline::compute_mu(pipeline::image_seq_len(req.width, req.height), req.steps);
         let native = pipeline::schedule(req.steps, req.width, req.height);
-        let sigmas = candle_gen::resolve_flow_schedule(None, mu, req.steps, &native);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            mu,
+            req.steps,
+            &native,
+        )?;
 
         let latents = pipeline::create_noise(cfg, req.seed, req.width, req.height, device)?;
         // Per-step latent preview (epic 16948, sc-16955), bound to the same `(lat_h, lat_w)` the decode
@@ -535,7 +547,7 @@ impl Flux2Control {
         // predict closure so a multi-eval solver re-runs it. dev is guidance-distilled: a single forward
         // feeding the embedded guidance scalar (no negative pass). FLUX.2 embeds σ×1000.
         let latents = candle_gen::run_flow_sampler(
-            None,
+            req.sampler.as_deref(),
             TimestepConvention::Sigma,
             &sigmas,
             latents,

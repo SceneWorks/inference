@@ -120,7 +120,7 @@ impl MagePipeline {
     ) -> Result<MageEncoded> {
         Ok(MageEncoded {
             positive: text.encode(prompt)?,
-            negative: (guidance > 1.0)
+            negative: (guidance != 1.0)
                 .then(|| text.encode(negative_prompt))
                 .transpose()?,
         })
@@ -147,6 +147,7 @@ impl MagePipeline {
             guidance,
             seed,
             None,
+            None,
             &candle_gen::gen_core::CancelFlag::default(),
             on_progress,
         )
@@ -162,6 +163,7 @@ impl MagePipeline {
         steps: usize,
         guidance: f32,
         seed: u64,
+        scheduler_shift: Option<f32>,
         memory: Option<GenerationMemory>,
         cancel: &candle_gen::gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
@@ -178,6 +180,7 @@ impl MagePipeline {
             steps,
             guidance,
             seed,
+            scheduler_shift,
             memory,
             cancel,
             on_progress,
@@ -194,6 +197,7 @@ impl MagePipeline {
         steps: usize,
         guidance: f32,
         seed: u64,
+        scheduler_shift: Option<f32>,
         memory: Option<GenerationMemory>,
         cancel: &candle_gen::gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
@@ -218,7 +222,15 @@ impl MagePipeline {
         let mut tokens = noise
             .permute((0, 2, 3, 1))?
             .reshape((1, gh * gw, LATENT_CHANNELS))?;
-        let ladder = scheduler::sigmas(steps)?;
+        let native = scheduler::sigmas(steps)?;
+        let ladder = candle_gen::resolve_flow_schedule_with_shift(
+            None,
+            scheduler_shift,
+            6.0f32.ln(),
+            steps,
+            &native,
+        )
+        .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
         let attention_budget = memory
             .filter(|memory| memory.chunk_attention)
             .and_then(|memory| memory.attention_chunk_size)

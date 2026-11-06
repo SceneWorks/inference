@@ -177,6 +177,9 @@ pub struct ZImageControlRequest {
     /// (4.0); `Some(1.0)` collapses CFG to a single cond forward (Turbo-equivalent cost). Ignored in
     /// Turbo mode.
     pub guidance: Option<f32>,
+    pub scheduler_shift: Option<f32>,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
     /// **Base mode only** (sc-8680): the negative-prompt text for the uncond CFG branch. `None`/empty →
     /// the unconditional embedding (empty string, still wrapped by the Qwen chat template). Ignored in
     /// Turbo mode.
@@ -212,6 +215,9 @@ impl Default for ZImageControlRequest {
             steps: DEFAULT_STEPS,
             control_scale: DEFAULT_CONTROL_SCALE,
             guidance: None,
+            scheduler_shift: None,
+            sampler: None,
+            scheduler: None,
             negative_prompt: None,
             seed: 0,
             use_pid: false,
@@ -1004,6 +1010,14 @@ impl ZImageControl {
             FlowMatchEulerDiscreteScheduler::new(crate::pipeline::base_scheduler_config());
         scheduler.set_timesteps(steps, None);
         let sigmas: Vec<f32> = scheduler.sigmas.iter().map(|&sigma| sigma as f32).collect();
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            6.0f32.ln(),
+            steps,
+            &sigmas,
+        )
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
         let prepared = prepare_inputs(&noise, std::slice::from_ref(cap), &self.device)?;
         let uncond = match neg_cap {
             Some(negative) => {
@@ -1038,7 +1052,7 @@ impl ZImageControl {
         // conditional target trajectory.
         let preview = crate::preview::hook(&req.preview);
         candle_gen::run_flow_sampler(
-            None,
+            req.sampler.as_deref(),
             TimestepConvention::OneMinusSigma,
             &sigmas,
             prepared.latents,
@@ -1103,7 +1117,9 @@ impl ZImageControl {
         let encoded: Result<(Tensor, Option<Tensor>)> = (|| {
             let cap =
                 self.text_embeddings_with(&text.text_encoder, &text.tokenizer, &req.prompt)?;
-            let neg = if self.base && req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE) != 1.0 {
+            let neg = if (self.base || req.guidance.is_some())
+                && req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE) != 1.0
+            {
                 Some(self.uncond_embeddings_with(
                     &text.text_encoder,
                     &text.tokenizer,
@@ -1122,7 +1138,7 @@ impl ZImageControl {
         candle_gen::check_cancel(&req.cancel)?;
         on_progress(Progress::Loading(LoadPhase::Renderer));
         let transformer = self.load_control_transformer(req.memory.stream_transformer_blocks)?;
-        let latents = if self.base {
+        let latents = if self.base || req.guidance.is_some() {
             self.denoise_base_with(&transformer, req, &cap, neg.as_ref(), &control, on_progress)
         } else {
             self.denoise_turbo_with(&transformer, req, &cap, &control, on_progress)
@@ -1179,6 +1195,20 @@ impl ZImageControl {
         skeleton: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        let mut effective = req.clone();
+        let experimental = !self.base
+            && (req.guidance.unwrap_or(0.0) != 0.0
+                || req.scheduler_shift.is_some()
+                || req.sampler.is_some()
+                || req.scheduler.is_some());
+        if experimental {
+            effective.guidance = Some(1.0 + req.guidance.unwrap_or(0.0));
+            // Turbo's original native schedule is unshifted on this backend.
+            effective.scheduler_shift = Some(req.scheduler_shift.unwrap_or(1.0));
+        } else if !self.base {
+            effective.guidance = None;
+        }
+        let req = &effective;
         read_with_prepared_spec(self.prepared_spec.as_ref(), || {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
@@ -1192,7 +1222,7 @@ impl ZImageControl {
                 }
                 return self.generate_staged(req, skeleton, on_progress);
             }
-            if self.base {
+            if self.base || experimental {
                 self.generate_base(req, skeleton, on_progress)
             } else {
                 self.generate_turbo(req, skeleton, on_progress)
@@ -1355,6 +1385,14 @@ impl ZImageControl {
             FlowMatchEulerDiscreteScheduler::new(crate::pipeline::base_scheduler_config());
         scheduler.set_timesteps(steps, None);
         let sigmas: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            6.0f32.ln(),
+            steps,
+            &sigmas,
+        )
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
 
         // prepare_inputs pads cap_feats (+ mask) and adds the frame axis for the cond and (when CFG is
         // on) the uncond branch.
@@ -1394,7 +1432,7 @@ impl ZImageControl {
         // single conditional target trajectory.
         let preview = crate::preview::hook(&req.preview);
         let latents = candle_gen::run_flow_sampler(
-            None,
+            req.sampler.as_deref(),
             TimestepConvention::OneMinusSigma,
             &sigmas,
             prepared.latents,

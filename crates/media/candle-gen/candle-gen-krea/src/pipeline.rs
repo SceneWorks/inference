@@ -185,8 +185,18 @@ pub(crate) struct KreaHeavy {
     pid: Option<Arc<PidEngine>>,
 }
 
+pub(crate) struct TurboContext {
+    positive: Tensor,
+    negative: Option<Tensor>,
+}
+
+fn encode_turbo_context(text: &KreaText, req: &GenerationRequest) -> Result<TurboContext> {
+    let (positive, negative) = encode_base_contexts(text, req, req.guidance.unwrap_or(0.0))?;
+    Ok(TurboContext { positive, negative })
+}
+
 pub(crate) enum ResidencyContext {
-    Turbo(Tensor),
+    Turbo(TurboContext),
     Raw {
         context: Tensor,
         negative: Option<Tensor>,
@@ -281,7 +291,7 @@ pub(crate) fn encode_residency(
             guidance,
         })
     } else {
-        Ok(ResidencyContext::Turbo(encode_prompt_context(text, req)?))
+        Ok(ResidencyContext::Turbo(encode_turbo_context(text, req)?))
     }
 }
 
@@ -1194,7 +1204,7 @@ pub fn render(
     // Condition encoding (seed-independent): the 12 selected Qwen3-VL hidden layers, stacked +
     // prefix-dropped → the DiT's text_fusion context [1, n_tok, 12, 2560]. CFG-free, B=1.
     let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
-        encode_prompt_context(&comps.text, req)
+        encode_turbo_context(&comps.text, req)
     })?;
     render_from_context(&comps.heavy, req, device, &context, on_progress)
 }
@@ -1246,7 +1256,7 @@ pub(crate) fn render_three_stage_with_native(
         load_text_cancelable(root, text_encoder_source, device, Some(&req.cancel))?
     };
     let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
-        encode_prompt_context(&text, req)
+        encode_turbo_context(&text, req)
     })?;
     device.synchronize()?;
     drop(text);
@@ -1285,12 +1295,13 @@ pub(crate) fn render_three_stage_with_native(
     let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let native = turbo_sigmas(steps);
-    let sigmas = candle_gen::resolve_flow_schedule(
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
         req.scheduler.as_deref(),
+        req.scheduler_shift,
         TURBO_MU as f32,
         steps,
         &native,
-    );
+    )?;
     let attention_budget = if memory.chunk_attention {
         memory
             .attention_chunk_size
@@ -1326,11 +1337,24 @@ pub(crate) fn render_three_stage_with_native(
                 let v = dit.forward_with_memory(
                     x,
                     &t,
-                    &context,
+                    &context.positive,
                     attention_budget,
                     transformer_window,
                     &req.cancel,
                 )?;
+                let v = if let Some(negative) = &context.negative {
+                    let negative = dit.forward_with_memory(
+                        x,
+                        &t,
+                        negative,
+                        attention_budget,
+                        transformer_window,
+                        &req.cancel,
+                    )?;
+                    krea_cfg_combine(&v, &negative, req.guidance.unwrap_or(0.0))?
+                } else {
+                    v
+                };
                 Ok(v.to_dtype(DType::F32)?)
             },
         )
@@ -1434,8 +1458,9 @@ pub fn render_tap_reweight(
     let (_base_context, context) = candle_gen::gen_core::with_prompt_encoding(
         on_progress,
         || -> std::result::Result<_, candle_gen::CandleError> {
-            let base_context = encode_prompt_context(&comps.text, req)?;
-            let context = apply_tap_weights(&base_context, weights)?;
+            let mut context = encode_turbo_context(&comps.text, req)?;
+            let base_context = context.positive.clone();
+            context.positive = apply_tap_weights(&base_context, weights)?;
             Ok((base_context, context))
         },
     )?;
@@ -1526,7 +1551,7 @@ fn render_from_context(
     comps: &KreaHeavy,
     req: &GenerationRequest,
     device: &Device,
-    context: &Tensor,
+    context: &TurboContext,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     candle_gen::check_cancel(&req.cancel)?;
@@ -1534,17 +1559,27 @@ fn render_from_context(
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let prepared = comps
         .dit
-        .prepare_conditioning(context, req.width, req.height)?;
+        .prepare_conditioning(&context.positive, req.width, req.height)?;
+    let prepared_neg = context
+        .negative
+        .as_ref()
+        .map(|negative| {
+            comps
+                .dit
+                .prepare_conditioning(negative, req.width, req.height)
+        })
+        .transpose()?;
 
     // Native exponential-mu Turbo sigmas are the byte-exact default; a curated scheduler reshapes over
     // the same mu. Raw sigma → DiT timestep, raw velocity → Euler `x + v·(σ_{i+1} − σ_i)`.
     let native = turbo_sigmas(steps);
-    let sigmas = candle_gen::resolve_flow_schedule(
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
         req.scheduler.as_deref(),
+        req.scheduler_shift,
         TURBO_MU as f32,
         steps,
         &native,
-    );
+    )?;
 
     // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
     // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
@@ -1578,6 +1613,20 @@ fn render_from_context(
                     crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
                     &req.cancel,
                 )?;
+                let v = if let Some(negative) = &prepared_neg {
+                    let negative = comps.dit.forward_prepared_with_memory(
+                        x,
+                        &t,
+                        negative,
+                        candle_gen::ATTN_SCORES_BUDGET,
+                        crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                        &req.cancel,
+                    )?;
+                    krea_cfg_combine(&v, &negative, req.guidance.unwrap_or(0.0))?
+                } else {
+                    v
+                };
+
                 Ok(v.to_dtype(DType::F32)?)
             },
         )?;
@@ -1625,7 +1674,7 @@ pub fn render_img2img(
 ) -> Result<Vec<Image>> {
     // Condition encoding (seed-independent), identical to `render`: img2img changes only the init latent.
     let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
-        encode_prompt_context(&comps.text, req)
+        encode_turbo_context(&comps.text, req)
     })?;
     render_img2img_from_context(
         &comps.heavy,
@@ -1651,7 +1700,7 @@ fn render_img2img_from_context(
     reference: &Image,
     strength: Option<f32>,
     device: &Device,
-    context: &Tensor,
+    context: &TurboContext,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     candle_gen::check_cancel(&req.cancel)?;
@@ -1659,15 +1708,25 @@ fn render_img2img_from_context(
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let prepared = comps
         .dit
-        .prepare_conditioning(context, req.width, req.height)?;
+        .prepare_conditioning(&context.positive, req.width, req.height)?;
+    let prepared_neg = context
+        .negative
+        .as_ref()
+        .map(|negative| {
+            comps
+                .dit
+                .prepare_conditioning(negative, req.width, req.height)
+        })
+        .transpose()?;
 
     let native = turbo_sigmas(steps);
-    let sigmas = candle_gen::resolve_flow_schedule(
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
         req.scheduler.as_deref(),
+        req.scheduler_shift,
         TURBO_MU as f32,
         steps,
         &native,
-    );
+    )?;
 
     // The img2img start step + the σ that seeds the blend (the fork's leaves). Clamp `start` to the last
     // schedule index defensively so `sigmas[start]` is always valid (a curated scheduler may re-stride the
@@ -1718,6 +1777,20 @@ fn render_img2img_from_context(
                         crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
                         &req.cancel,
                     )?;
+                    let v = if let Some(negative) = &prepared_neg {
+                        let negative = comps.dit.forward_prepared_with_memory(
+                            x,
+                            &t,
+                            negative,
+                            candle_gen::ATTN_SCORES_BUDGET,
+                            crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                            &req.cancel,
+                        )?;
+                        krea_cfg_combine(&v, &negative, req.guidance.unwrap_or(0.0))?
+                    } else {
+                        v
+                    };
+
                     Ok(v.to_dtype(DType::F32)?)
                 },
             )?
@@ -1784,7 +1857,7 @@ fn encode_base_contexts(
     // layers → the DiT's text_fusion context [1, n_tok, 12, 2560].
     let context = encode_prompt_context(text, req)?;
 
-    let neg_context = if guidance > 0.0 {
+    let neg_context = if guidance != 0.0 {
         let negative = req.negative_prompt.as_deref().unwrap_or_default();
         Some(encode_negative_context(text, negative)?)
     } else {
@@ -1828,6 +1901,14 @@ fn render_base_from_contexts(
     // reshapes over the same dynamic mu. Raw sigma → DiT timestep, raw velocity → Euler
     // `x + v·(σ_{i+1} − σ_i)`.
     let sigmas = base_schedule(steps, req.width, req.height, req.scheduler.as_deref());
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        dynamic_mu((req.width / 16 * (req.height / 16)) as f64) as f32,
+        steps,
+        &sigmas,
+    )
+    .map_err(|error| CandleError::Msg(error.to_string()))?;
 
     // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
     // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
@@ -2045,6 +2126,14 @@ fn render_multiphase_driver<T>(
     // the sigma trajectory continuous across boundaries (no per-phase recompute / reset).
     let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
     let sigmas = base_schedule(total, req.width, req.height, req.scheduler.as_deref());
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        dynamic_mu((req.width / 16 * (req.height / 16)) as f64) as f32,
+        total,
+        &sigmas,
+    )
+    .map_err(|error| CandleError::Msg(error.to_string()))?;
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
     // The job-local base DiT the phases re-adapt (never the shared resident) — built ONCE per request and
@@ -2065,7 +2154,7 @@ fn render_multiphase_driver<T>(
     for (phase, specs) in resolved.iter().zip(&phase_specs) {
         materialize_multiphase_adapter_set(&mut dit, specs)?;
         let positive = dit.prepare_conditioning(context, req.width, req.height)?;
-        let negative = if phase.guidance > 0.0 {
+        let negative = if phase.guidance != 0.0 {
             let context = neg_context.ok_or_else(|| {
                 CandleError::Msg(
                     "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
@@ -2125,7 +2214,7 @@ fn render_multiphase_driver<T>(
                     )?;
                     // Per-phase CFG: two forwards combined by the reference `krea_cfg_combine` when
                     // guidance > 0; else the bare conditional velocity (single forward).
-                    let v = if guidance > 0.0 {
+                    let v = if guidance != 0.0 {
                         let negative = negative.as_ref().ok_or_else(|| {
                             CandleError::Msg(
                                 "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
@@ -2310,6 +2399,14 @@ fn render_base_img2img_from_contexts(
 
     // Resolution-dynamic Raw sigma schedule (mu from the image-token count), identical to `render_base`.
     let sigmas = base_schedule(steps, req.width, req.height, req.scheduler.as_deref());
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        dynamic_mu((req.width / 16 * (req.height / 16)) as f64) as f32,
+        steps,
+        &sigmas,
+    )
+    .map_err(|error| CandleError::Msg(error.to_string()))?;
 
     // The img2img start step + the σ that seeds the blend (the fork's leaves, shared with the Turbo
     // `render_img2img`). Clamp `start` to the last schedule index defensively so `sigmas[start]` is always
@@ -2481,11 +2578,9 @@ pub(crate) fn encode_edit_context(
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     // Turbo edit is CFG-free: force guidance 0 so the unconditional grounded encode is skipped and the
     // sampler runs a single conditional forward. Raw edit honors the request guidance (default 3.5).
-    let guidance = if distilled {
-        0.0
-    } else {
-        req.guidance.unwrap_or(RAW_GUIDANCE)
-    };
+    let guidance = req
+        .guidance
+        .unwrap_or(if distilled { 0.0 } else { RAW_GUIDANCE });
 
     // Wire (b): run the vision tower ONCE per reference (shared across the pos/neg instruction encodings).
     let vision = text.vision()?;
@@ -2500,7 +2595,7 @@ pub(crate) fn encode_edit_context(
         grounding.condition(&text.tok, &text.te, &req.prompt)?,
         req.text_style_gain,
     )?;
-    let neg_context = if guidance > 0.0 {
+    let neg_context = if guidance != 0.0 {
         let negative = req.negative_prompt.as_deref().unwrap_or_default();
         Some(grounding.condition(&text.tok, &text.te, negative)?)
     } else {
@@ -2581,6 +2676,19 @@ fn render_edit_from_context(
     } else {
         base_schedule(steps, req.width, req.height, req.scheduler.as_deref())
     };
+    let mu = if distilled {
+        TURBO_MU
+    } else {
+        dynamic_mu((req.width / 16 * (req.height / 16)) as f64)
+    };
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        mu as f32,
+        steps,
+        &sigmas,
+    )
+    .map_err(|error| CandleError::Msg(error.to_string()))?;
 
     // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853, sc-11197): a per-generation
     // PiD decoder bound to this request when `req.use_pid` is set (errors if requested but not loaded),

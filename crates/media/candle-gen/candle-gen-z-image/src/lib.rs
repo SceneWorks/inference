@@ -468,6 +468,17 @@ impl Generator for ZImageGenerator {
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID, req)?;
+        if req
+            .negative_prompt
+            .as_ref()
+            .is_some_and(|negative| !negative.is_empty())
+            && req.guidance.unwrap_or(0.0) == 0.0
+        {
+            return Err(gen_core::Error::Msg(
+                "z_image_turbo: a negative prompt requires CFG different from 0.0".into(),
+            ));
+        }
+
         // Model-specific floor on top (mirrors mlx-gen-z-image::validate_request).
         if req.prompt.is_empty() {
             return Err(gen_core::Error::Msg(
@@ -554,7 +565,9 @@ impl Generator for ZImageGenerator {
                         .map_err(candle_gen::CandleError::from)?;
                     drop(candle_gen::lock_recover(&self.components).take());
                     drop(candle_gen::lock_recover(&self.vae_encoder).take());
-                    let images = pipe.render_sequential(req, on_progress)?;
+                    let images = if req.guidance.unwrap_or(0.0) != 0.0 || req.scheduler_shift.is_some() {
+                        pipe.render_base_sequential(&experimental_cfg_request(req), on_progress)?
+                    } else { pipe.render_sequential(req, on_progress)? };
                     return Ok(GenerationOutput::Images(images));
                 }
                 let components = self.components(&pipe)?;
@@ -581,12 +594,26 @@ impl Generator for ZImageGenerator {
                     None
                 };
 
-                let images =
-                    pipe.render(req, &components, clean.as_ref(), start_step, on_progress)?;
+                let images = if req.guidance.unwrap_or(0.0) != 0.0 || req.scheduler_shift.is_some() {
+                    let request = experimental_cfg_request(req);
+                    pipe.render_base(&request, &components, clean.as_ref(), start_step, on_progress)?
+                } else {
+                    pipe.render(req, &components, clean.as_ref(), start_step, on_progress)?
+                };
                 Ok(GenerationOutput::Images(images))
             },
         )
     }
+}
+
+/// The experimental CFG renderer shares Turbo's weights and defaults. Candle Turbo's original
+/// schedule is unshifted; retain it when only CFG is overridden, and honor an explicit shift.
+fn experimental_cfg_request(req: &GenerationRequest) -> GenerationRequest {
+    let mut request = req.clone();
+    request.steps = Some(req.steps.unwrap_or(DEFAULT_STEPS as u32));
+    request.guidance = Some(1.0 + req.guidance.unwrap_or(0.0));
+    request.scheduler_shift = Some(req.scheduler_shift.unwrap_or(1.0));
+    request
 }
 
 /// Z-Image-Turbo's identity + the wired surface: distilled txt2img (no CFG, no negative prompt) plus
@@ -607,7 +634,8 @@ pub fn descriptor() -> ModelDescriptor {
         modality: Modality::Image,
         capabilities: Capabilities {
             // Turbo is guidance-distilled: no CFG, no negative prompt.
-            supports_negative_prompt: false,
+            supports_negative_prompt: true,
+            supports_guidance: true,
             // img2img reference-guided latent-init (sc-11783): a single `Conditioning::Reference` seeds
             // the CFG-free denoise from the VAE-encoded reference (`render` + `encode_reference`, the
             // Turbo mirror of the base `z_image` img2img sc-8646). The strict-pose ControlNet + the
@@ -1387,10 +1415,10 @@ mod tests {
     fn descriptor_advertises_only_wired_txt2img_surface() {
         let d = descriptor();
         assert!(
-            !d.capabilities.supports_guidance,
-            "turbo is guidance-distilled"
+            d.capabilities.supports_guidance,
+            "Turbo supports explicit experimental CFG"
         );
-        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.supports_true_cfg);
         assert!(!d.capabilities.mac_only);
         // img2img reference-guided latent-init advertised (sc-11783) — a single `Reference`, NOT
@@ -1458,12 +1486,6 @@ mod tests {
         for bad in [
             // empty prompt
             GenerationRequest::default(),
-            // guidance on a distilled model (descriptor advertises no guidance)
-            GenerationRequest {
-                prompt: "x".into(),
-                guidance: Some(5.0),
-                ..Default::default()
-            },
             // negative prompt (not supported)
             GenerationRequest {
                 prompt: "x".into(),

@@ -1221,6 +1221,9 @@ impl Capabilities {
             }
         }
         req.ensure_finite_floats()?;
+        if req.scheduler_shift.is_some_and(|shift| shift <= 0.0) {
+            return Err(Error::Msg(format!("{id}: scheduler_shift must be > 0")));
+        }
         if let Some(s) = &req.sampler {
             if !self.samplers.contains(&s.as_str()) {
                 return Err(Error::Unsupported(format!(

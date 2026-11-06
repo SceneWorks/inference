@@ -606,6 +606,62 @@ fn price_source_quanta(
         4,
     )?;
     let host_schedule = sampling.host_schedule_bytes()?;
+    // Turbo's public CFG is an offset: zero keeps the original single forward. A second
+    // caption and its prepared tokens/RoPE stay live while the two forwards run serially.
+    // This bounds the negative caption at the text window, independently of the positive text.
+    let cfg_on = sampling
+        .effective_guidance()
+        .is_some_and(|value| value != 0.0);
+    let cap = facts.window_tokens as u64;
+    let (_, _, pad) = crate::transformer::caption_pos_keep(facts.window_tokens as i32);
+    let caption_tokens = cap + pad as u64;
+    let lh = (route.height / crate::pipeline::SPATIAL_SCALE) as i32;
+    let lw = (route.width / crate::pipeline::SPATIAL_SCALE) as i32;
+    let cfg = &facts.dit_cfg;
+    let image_tokens = (1 / cfg.f_patch_size) * (lh / cfg.patch_size) * (lw / cfg.patch_size);
+    let (_, _, image_pad) = crate::transformer::image_pos_keep(
+        1 / cfg.f_patch_size,
+        lh / cfg.patch_size,
+        lw / cfg.patch_size,
+        caption_tokens as i32,
+    );
+    let image_tokens = image_tokens as u64 + image_pad as u64;
+    let rope_dim = cfg.axes_dims.iter().map(|&axis| axis as u64).sum::<u64>();
+    let negative_caption = cap * cfg.cap_feat_dim as u64 * 4;
+    let negative_prepared = caption_tokens * cfg.cap_feat_dim as u64 * 4
+        + 8 * (image_tokens + caption_tokens) * rope_dim
+        + if route.mode.control() {
+            image_tokens * cfg.dim as u64 * 4
+        } else {
+            0
+        };
+    let cfg_held = |phase: IosPhase, label: &str| -> u64 {
+        if !cfg_on {
+            return 0;
+        }
+        match phase {
+            IosPhase::Conditioning => negative_caption,
+            IosPhase::Load
+                if route.execution.stage_residency
+                    && matches!(
+                        label,
+                        q::DIT_LOAD | q::CONTROL_LOAD | q::CONTROL_QUANTIZE | q::VAE_LOAD
+                    ) =>
+            {
+                negative_caption
+            }
+            IosPhase::Encode => negative_caption,
+            // Latent initialization precedes both prepares. At the second prepare, the first
+            // branch's prepared context is live; a held positive velocity exists only later,
+            // while the negative forward runs. Include the control branch's second embedding.
+            IosPhase::Denoise if label == q::LATENTS => negative_caption,
+            IosPhase::Denoise if matches!(label, q::DIT_PREPARE | q::CONTROL_EMBED) => {
+                negative_caption + negative_prepared
+            }
+            IosPhase::Denoise => negative_caption + negative_prepared + elements * 4,
+            _ => 0,
+        }
+    };
     let (forward_possible, zero_possible) = source_callback_presence(route, sampling)?;
     let first = facts.replay_quanta(quanta, route, QuantizationHistory::RequestFirst, 0, false)?;
     let endpoints = if route.count > 1 {
@@ -623,6 +679,10 @@ fn price_source_quanta(
                 .checked_add(host_schedule)
                 .ok_or_else(|| Error::Unsupported("Z host schedule owners overflow".into()))?;
         }
+        window.held_bytes = window
+            .held_bytes
+            .checked_add(cfg_held(window.phase, &window.label))
+            .ok_or_else(|| Error::Unsupported("Z CFG owners overflow".into()))?;
         pricing.take_window(window);
         Ok(())
     };

@@ -901,6 +901,17 @@ pub fn run_av_curated_sampler(
 /// own conditioning convention (`Sigma` / `OneMinusSigma`) is applied separately by [`run_flow_sampler`].
 /// A curated scheduler may return a length other than `steps + 1` (`ddim_uniform` / `beta` re-stride),
 /// which simply changes the effective step count — the same behaviour ComfyUI / diffusers have.
+/// Flow schedule resolver that honors an explicit request shift on native and curated grids.
+pub fn resolve_flow_schedule_with_shift(
+    scheduler_name: Option<&str>,
+    shift: Option<f32>,
+    mu: f32,
+    steps: usize,
+    native: &[f32],
+) -> gen_core::Result<Vec<f32>> {
+    gen_core::sampling::flow_schedule_with_shift(scheduler_name, mu, shift, steps, native)
+}
+
 pub fn resolve_flow_schedule(
     scheduler_name: Option<&str>,
     mu: f32,

@@ -558,6 +558,7 @@ impl Pipeline {
         guided: bool,
         sampler: Option<&str>,
         scheduler: Option<&str>,
+        scheduler_shift: Option<f32>,
         seed: u64,
         cancel: &gen_core::CancelFlag,
         memory: gen_core::GenerationMemory,
@@ -566,7 +567,14 @@ impl Pipeline {
     ) -> CResult<Tensor> {
         let mu = lens_mu(num_steps, latent_h, latent_w);
         let native = lens_sigmas(num_steps, latent_h, latent_w);
-        let sigmas = candle_gen::resolve_flow_schedule(scheduler, mu, num_steps, &native);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            scheduler,
+            scheduler_shift,
+            mu,
+            num_steps,
+            &native,
+        )
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
         let init = init_latents.to_dtype(DIT_DTYPE)?;
         let attention_budget = if memory.chunk_attention {
             let size = memory.attention_chunk_size.ok_or_else(|| {
@@ -711,6 +719,7 @@ impl Pipeline {
                 guided,
                 req.sampler.as_deref(),
                 req.scheduler.as_deref(),
+                req.scheduler_shift,
                 seed,
                 &req.cancel,
                 memory,
@@ -818,6 +827,7 @@ impl Pipeline {
                 guided,
                 req.sampler.as_deref(),
                 req.scheduler.as_deref(),
+                req.scheduler_shift,
                 seed,
                 &req.cancel,
                 memory,
@@ -1836,6 +1846,7 @@ impl LensGenerator {
             num_steps,
             guidance,
             guided,
+            None,
             None,
             None,
             0,

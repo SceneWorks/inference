@@ -70,6 +70,9 @@ pub struct IpAdapterFluxRequest {
     pub width: u32,
     pub height: u32,
     pub steps: usize,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub scheduler_shift: Option<f32>,
     /// Guidance scale — embedded by the dev DiT, inert on schnell.
     pub guidance: f32,
     /// IP-Adapter scale (the decoupled-cross-attn weight on the reference image tokens).
@@ -94,6 +97,9 @@ impl Default for IpAdapterFluxRequest {
             width: 1024,
             height: 1024,
             steps: 25,
+            sampler: None,
+            scheduler: None,
+            scheduler_shift: None,
             guidance: 3.5,
             ip_adapter_scale: DEFAULT_IP_SCALE,
             seed: 0,
@@ -303,6 +309,7 @@ impl IpAdapterFlux {
         // never join the running latent, so the strip shows the target image alone.
         let preview = crate::preview::hook(&req.preview, req.width, req.height);
         let latents = self.denoise(
+            req,
             &state,
             &timesteps,
             guidance,
@@ -340,6 +347,7 @@ impl IpAdapterFlux {
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
+        req: &IpAdapterFluxRequest,
         state: &State,
         timesteps: &[f64],
         guidance: f64,
@@ -358,7 +366,13 @@ impl IpAdapterFlux {
         let native: Vec<f32> = timesteps.iter().map(|&t| t as f32).collect();
         let mu = flow_mu(self.variant, state.img.dim(1)?);
         let steps = native.len().saturating_sub(1);
-        let sigmas = candle_gen::resolve_flow_schedule(None, mu, steps, &native);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            mu,
+            steps,
+            &native,
+        )?;
         let prepared = self.backbone.prepare_conditioning(
             heavy,
             &state.img,
@@ -367,7 +381,7 @@ impl IpAdapterFlux {
             &state.txt_ids,
         )?;
         candle_gen::run_flow_sampler(
-            None,
+            req.sampler.as_deref(),
             TimestepConvention::Sigma,
             &sigmas,
             state.img.clone(),

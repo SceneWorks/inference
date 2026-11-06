@@ -14,7 +14,7 @@
 //!   block-diagonal masks. Sides must be multiples of
 //!   [`SIZE_MULTIPLE`]; the native range is
 //!   [`MIN_SIZE`]–[`MAX_SIZE`] per side.
-//! - **CFG.** `use_neg = cfg > 1.0` (`:326`, `:535`): at cfg ≤ 1 the reference builds **no**
+//! - **CFG.** `use_neg = cfg != 1.0` (`:326`, `:535`): at cfg ≤ 1 the reference builds **no**
 //!   unconditional branch at all — one segment, one `cu_seqlens` pair, positive conditioning only.
 //!   Both Turbo variants default there, so the CFG-off path is a first-class case, not an edge one.
 //!   Under `batch_cfg` the duplicated uncond branch rotates at msrope frame index 1 — see
@@ -54,7 +54,7 @@ pub const STATIC_SHIFT: f32 = 6.0;
 
 /// The frozen pipeline constructs an unconditional branch only above guidance scale 1.
 pub const fn uses_cfg(cfg: f32) -> bool {
-    cfg > 1.0
+    cfg != 1.0
 }
 
 /// Upstream's native-resolution image-token budget for one packed DiT invocation.
@@ -212,11 +212,19 @@ pub(crate) fn denoise_generation_phase(
     steps: usize,
     cfg: f32,
     gs_key: &GsKey,
+    scheduler_shift: Option<f32>,
     memory: Option<GenerationMemory>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<DenoisedGenerationBatch> {
-    let sigmas = mage_flow_sigmas(steps)?;
+    let native = mage_flow_sigmas(steps)?;
+    let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+        None,
+        scheduler_shift,
+        STATIC_SHIFT.ln(),
+        steps,
+        &native,
+    )?;
     let total_steps = steps * encoded.len();
     let mut out = Vec::with_capacity(samples.len());
     let mut packs = Vec::with_capacity(encoded.len());
@@ -383,6 +391,7 @@ pub(crate) fn denoise_edit_phase(
     cfg: f32,
     seed: i64,
     gs_key: &GsKey,
+    scheduler_shift: Option<f32>,
     memory: Option<GenerationMemory>,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
@@ -404,7 +413,14 @@ pub(crate) fn denoise_edit_phase(
     let total_tokens = (references.len() as i32 + 1) * gh * gw;
     let layout = PackLayout::new(shapes, vec![total_tokens], vec![encoded.cond_len])?;
     let cond_ctx = transformer.pack_context(layout.clone())?;
-    let sigmas = mage_flow_sigmas(steps)?;
+    let native = mage_flow_sigmas(steps)?;
+    let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+        None,
+        scheduler_shift,
+        STATIC_SHIFT.ln(),
+        steps,
+        &native,
+    )?;
     let mut trajectories = Vec::with_capacity(2);
     for (step, pair) in sigmas.windows(2).enumerate() {
         if cancel.is_cancelled() {

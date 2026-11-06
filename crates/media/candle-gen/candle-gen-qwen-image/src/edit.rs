@@ -125,12 +125,15 @@ pub struct QwenEditRequest {
     pub width: u32,
     pub height: u32,
     pub steps: usize,
-    /// True-CFG guidance scale. Ignored (CFG forced off) on the [`lightning`](Self::lightning) path.
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub scheduler_shift: Option<f32>,
+    /// True-CFG guidance scale; 1.0 keeps the recommended single-forward Lightning path.
     pub guidance: f32,
     pub seed: u64,
     /// The Qwen-Image-Edit-2511-Lightning few-step distill path (sc-6220): use the static-shift
-    /// [`pipeline::lightning_sigmas`] schedule and run **CFG-off** (a single forward per step, no
-    /// negative branch — the distill LoRA is CFG-distilled). The matching distill LoRA must be supplied
+    /// [`pipeline::lightning_sigmas`] schedule, with CFG-off recommended (guidance 1.0). Explicit
+    /// guidance enables the negative branch. The matching distill LoRA must be supplied
     /// via [`QwenEditPaths::adapters`]. `false` = the production multi-step true-CFG path.
     pub lightning: bool,
     /// Release the text/VAE-encode phase before loading the DiT/VAE-decode phase for this request.
@@ -158,6 +161,9 @@ impl Default for QwenEditRequest {
             width: 1024,
             height: 1024,
             steps: 30,
+            sampler: None,
+            scheduler: None,
+            scheduler_shift: None,
             guidance: 4.0,
             seed: 0,
             lightning: false,
@@ -646,7 +652,7 @@ impl QwenEdit {
         let pos = self.encode_prompt(vl_encoder, &req.prompt, edit_img.n_image_tokens, &vision)?;
         // CFG-off on the lightning path: the distill LoRA is CFG-distilled, so a single forward per
         // step (no negative branch) — matching the MLX lightning recipe (sc-6220).
-        let neg = if req.guidance > 1.0 && !req.lightning {
+        let neg = if req.guidance != 1.0 {
             let n = if req.negative.trim().is_empty() {
                 NEGATIVE_FALLBACK
             } else {
@@ -688,8 +694,7 @@ impl QwenEdit {
     ///
     /// Lightning uses the static-shift schedule (resolution-independent); production uses the dynamic-μ
     /// schedule (sc-6220). Routed through the unified curated sampler/scheduler framework (epic 7114 P4,
-    /// sc-7123): the bespoke edit provider has no `req.sampler`/`req.scheduler` surface yet, so both stay
-    /// `None` (the N1 default: `euler` over the native schedule). The model is fed the raw sigma (`Sigma`
+    /// sc-7123): absent sampling overrides retain `euler` over the native schedule. The model is fed the raw sigma (`Sigma`
     /// convention); Qwen-Image-Edit is **true CFG**, and the dual-latent concat/slice (concatenate the
     /// updating noise with the static reference latents over the sequence axis, then slice the noise
     /// prefix post-forward) lives — with the pos/neg/blend — inside the `predict` closure.
@@ -719,7 +724,13 @@ impl QwenEdit {
                 pipeline::qwen_mu(req.width, req.height),
             )
         };
-        let sigmas = candle_gen::resolve_flow_schedule(None, mu, req.steps, &native);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            mu,
+            req.steps,
+            &native,
+        )?;
         let latents = pipeline::create_noise(req.seed, req.width, req.height, &self.device)?
             .to_dtype(DIT_DTYPE)?;
         let memory = req.memory.unwrap_or_default();
@@ -747,7 +758,7 @@ impl QwenEdit {
         let preview = crate::preview::hook(&req.preview, req.width, req.height);
 
         let latents = candle_gen::run_flow_sampler(
-            None,
+            req.sampler.as_deref(),
             candle_gen::gen_core::sampling::TimestepConvention::Sigma,
             &sigmas,
             latents,
@@ -1250,9 +1261,9 @@ fn validate_memory_request(
                 "qwen edit: Lightning route requires its admitted distillation adapter".to_owned(),
             ));
         }
-        if req.steps != 4 || req.guidance != 1.0 {
+        if req.steps != 4 {
             return Err(CandleError::Msg(format!(
-                "qwen edit: Lightning route requires steps=4 and guidance=1.0 (got steps={} guidance={})",
+                "qwen edit: Lightning route requires steps=4 (got steps={} guidance={})",
                 req.steps, req.guidance
             )));
         }
@@ -1469,6 +1480,16 @@ mod tests {
             memory: lightning_memory,
             ..Default::default()
         };
+        assert!(validate_memory_request(
+            &lightning_context,
+            &lightning_contract,
+            &lightning_spec,
+            &lightning_request,
+            1
+        )
+        .is_ok());
+        lightning_request.guidance = 1.5;
+        lightning_request.scheduler_shift = Some(18.375);
         assert!(validate_memory_request(
             &lightning_context,
             &lightning_contract,

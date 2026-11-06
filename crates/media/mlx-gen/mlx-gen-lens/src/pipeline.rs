@@ -649,6 +649,7 @@ impl LensHeavy {
             guidance_scale,
             sampler_name,
             scheduler_name,
+            None,
             seed,
             None,
             cancel,
@@ -687,6 +688,7 @@ impl LensHeavy {
             guidance_scale,
             sampler_name,
             scheduler_name,
+            None,
             seed,
             keep,
             cancel,
@@ -708,6 +710,7 @@ impl LensHeavy {
         guidance_scale: f32,
         sampler_name: Option<&str>,
         scheduler_name: Option<&str>,
+        scheduler_shift: Option<f32>,
         seed: u64,
         keep: Option<usize>,
         cancel: &CancelFlag,
@@ -724,6 +727,7 @@ impl LensHeavy {
             guidance_scale,
             sampler_name,
             scheduler_name,
+            scheduler_shift,
             seed,
             keep,
             cancel,
@@ -747,6 +751,7 @@ impl LensHeavy {
         guidance_scale: f32,
         sampler_name: Option<&str>,
         scheduler_name: Option<&str>,
+        scheduler_shift: Option<f32>,
         seed: u64,
         keep: Option<usize>,
         cancel: &CancelFlag,
@@ -760,7 +765,14 @@ impl LensHeavy {
         // (`compute_mu(seq_len, steps)`), so `karras` / `exponential` / … stay consistent with Lens's
         // resolution-/step-dependent shift instead of degrading to a linear ramp; an unset / legacy /
         // unknown name returns this native schedule verbatim.
-        let sigmas = self.resolve_sigmas(latent_h, latent_w, num_steps, scheduler_name);
+        let native = self.resolve_sigmas(latent_h, latent_w, num_steps, scheduler_name);
+        let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+            scheduler_name,
+            scheduler_shift,
+            compute_mu(latent_h * latent_w, num_steps),
+            num_steps,
+            &native,
+        )?;
         // PiD `from_ldm` early-stop (sc-8048): `keep` truncates the descending schedule so the denoise
         // stops at the achieved-σ step and hands PiD the partially-denoised latent (`sigmas[keep-1]` is
         // the capture σ; Lens is `vp_frame=false` so the schedule σ *is* the degrade σ). `None` → the
@@ -893,6 +905,7 @@ impl LensHeavy {
             guidance_scale,
             sampler,
             scheduler,
+            None,
             seed,
             keep,
             pid_decoder,
@@ -914,6 +927,7 @@ impl LensHeavy {
         guidance_scale: f32,
         sampler: Option<&str>,
         scheduler: Option<&str>,
+        scheduler_shift: Option<f32>,
         seed: u64,
         keep: Option<usize>,
         pid_decoder: Option<&dyn mlx_gen::LatentDecoder>,
@@ -934,6 +948,7 @@ impl LensHeavy {
             guidance_scale,
             sampler,
             scheduler,
+            scheduler_shift,
             seed,
             keep,
             cancel,

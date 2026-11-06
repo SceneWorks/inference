@@ -363,6 +363,7 @@ impl Pipeline {
                 guidance,
                 req.sampler.as_deref(),
                 req.scheduler.as_deref(),
+                req.scheduler_shift,
                 seed,
                 &preview,
                 &req.cancel,
@@ -454,6 +455,7 @@ impl Pipeline {
                 guidance,
                 req.sampler.as_deref(),
                 req.scheduler.as_deref(),
+                req.scheduler_shift,
                 seed,
                 &preview,
                 &req.cancel,
@@ -586,6 +588,7 @@ impl Pipeline {
         guidance: f32,
         sampler: Option<&str>,
         scheduler: Option<&str>,
+        scheduler_shift: Option<f32>,
         seed: u64,
         preview: &candle_gen::preview::PreviewHook<'_>,
         cancel: &gen_core::CancelFlag,
@@ -595,7 +598,14 @@ impl Pipeline {
         // Flash/Base shift=1 → 0). Base's native beta schedule is returned verbatim on the default
         // path, so `mu` only steers the alternative curated schedulers.
         let mu = self.variant.sigma_shift().ln();
-        let sigmas = candle_gen::resolve_flow_schedule(scheduler, mu, steps, native);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            scheduler,
+            scheduler_shift,
+            mu,
+            steps,
+            native,
+        )
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
         candle_gen::run_flow_sampler(
             sampler,
             TimestepConvention::Sigma,

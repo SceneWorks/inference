@@ -135,7 +135,13 @@ pub fn sd3_sigmas(steps: usize, shift: f32) -> Vec<f32> {
             };
             // linspace(1.0, 1/steps, steps)
             let sigma = 1.0 - frac * (1.0 - min_sigma);
-            shift * sigma / (1.0 + (shift - 1.0) * sigma)
+            // The endpoint is invariant. For small positive shifts, f32 rounds `shift - 1`
+            // to -1, which would otherwise turn this first node into a division by zero.
+            if sigma == 1.0 {
+                1.0
+            } else {
+                shift * sigma / (1.0 + (shift - 1.0) * sigma)
+            }
         })
         .collect();
     out.push(0.0);
@@ -542,7 +548,7 @@ impl Pipeline {
         let mut enc = candle_gen::lock_recover(encoders);
         let cond_out = enc.encode(&req.prompt)?;
         let cond = aggregate(&self.cfg, &cond_out)?;
-        let uncond = if self.variant.cfg_enabled() && cfg_scale != 1.0 {
+        let uncond = if cfg_scale != 1.0 {
             let neg = req.negative_prompt.as_deref().unwrap_or("");
             let uncond_out = enc.encode(neg)?;
             Some(aggregate(&self.cfg, &uncond_out)?)
@@ -574,11 +580,7 @@ impl Pipeline {
             .steps
             .map(|s| s as usize)
             .unwrap_or_else(|| self.variant.default_steps());
-        let cfg_scale = if self.variant.cfg_enabled() {
-            req.guidance.unwrap_or_else(|| self.variant.default_cfg())
-        } else {
-            1.0
-        };
+        let cfg_scale = req.guidance.unwrap_or_else(|| self.variant.default_cfg());
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / VAE_SCALE) as usize;
         let lat_w = (req.width / VAE_SCALE) as usize;
@@ -617,7 +619,7 @@ impl Pipeline {
                 uncond.as_ref(),
                 cfg_scale,
                 steps,
-                self.variant.shift(),
+                req.scheduler_shift.unwrap_or(self.variant.shift()),
                 (lat_h, lat_w),
                 seed,
                 self.device.clone(),
@@ -650,11 +652,7 @@ impl Pipeline {
             .steps
             .map(|value| value as usize)
             .unwrap_or_else(|| self.variant.default_steps());
-        let cfg_scale = if self.variant.cfg_enabled() {
-            req.guidance.unwrap_or_else(|| self.variant.default_cfg())
-        } else {
-            1.0
-        };
+        let cfg_scale = req.guidance.unwrap_or_else(|| self.variant.default_cfg());
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let latent_hw = (
             (req.height / VAE_SCALE) as usize,
@@ -715,7 +713,7 @@ impl Pipeline {
                 uncond.as_ref(),
                 cfg_scale,
                 steps,
-                self.variant.shift(),
+                req.scheduler_shift.unwrap_or(self.variant.shift()),
                 latent_hw,
                 seed,
                 self.device.clone(),
@@ -1105,6 +1103,21 @@ mod tests {
             shifted[mid],
             unshifted[mid]
         );
+    }
+
+    #[test]
+    fn small_positive_shift_preserves_finite_schedule_endpoints() {
+        for shift in [1e-8, 1e-20, f32::MIN_POSITIVE] {
+            for steps in [1, 4, 50] {
+                for scheduler in [None, Some("normal")] {
+                    let sigmas = resolve_sd3_sigmas(scheduler, steps, shift);
+                    assert_eq!(sigmas.first(), Some(&1.0), "{shift} {scheduler:?}");
+                    assert_eq!(sigmas.last(), Some(&0.0), "{shift} {scheduler:?}");
+                    assert!(sigmas.iter().all(|sigma| sigma.is_finite()));
+                    assert!(sigmas.windows(2).all(|pair| pair[0] >= pair[1]));
+                }
+            }
+        }
     }
 
     #[test]

@@ -970,6 +970,13 @@ impl Chroma {
         // every image), and the PiD `from_ldm` early-stop below needs it to mint the decoder at the
         // achieved capture σ and truncate the denoise.
         let sigmas = self.build_schedule(req.width, req.height, steps, req.scheduler.as_deref())?;
+        let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            self.variant.sigma_shift().ln(),
+            steps as usize,
+            &sigmas,
+        )?;
 
         // ── The request-scoped ladder selection (SC-15520) ───────────────────────────────────────
         //

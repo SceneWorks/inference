@@ -112,10 +112,10 @@ pub fn total_phase_steps(phases: &[GenerationPhase]) -> usize {
 }
 
 /// Whether a phase runs the **true-CFG** (two forwards per step: conditional + unconditional) path.
-/// Mirrors the single-phase Raw selector (`cfg = guidance > 0`): a strictly-positive guidance engages
-/// classifier-free guidance; `0.0` (and, upstream, `None`) collapses to a single conditional forward.
+/// Mirrors the single-phase Raw selector: nonzero guidance engages classifier-free guidance,
+/// including inverse guidance. Zero collapses to a single conditional forward.
 pub fn phase_uses_cfg(guidance: f32) -> bool {
-    guidance > 0.0
+    guidance != 0.0
 }
 
 /// Whether **any** resolved phase uses the CFG path — the discriminator for whether the render must
@@ -360,6 +360,15 @@ mod tests {
         )
         .unwrap();
         assert!(!any_phase_uses_cfg(&cfg_off));
+        let inverse = resolve_phases(
+            &[phase(4, Some(-0.5), vec![]), phase(4, Some(0.0), vec![])],
+            0.0,
+            0,
+            "krea_2_raw",
+        )
+        .unwrap();
+        assert!(phase_uses_cfg(-0.5));
+        assert!(any_phase_uses_cfg(&inverse));
     }
 
     /// Per-phase adapter resolution: base-only (empty), a weight override, a load-time-scale default

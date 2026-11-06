@@ -120,6 +120,8 @@ fn profile_turbo_q4() {
         .generate_turbo(
             "warmup",
             &TurboOptions {
+                guidance: 0.0,
+                scheduler_shift: None,
                 height: 256,
                 width: 256,
                 steps: 2,
@@ -137,6 +139,8 @@ fn profile_turbo_q4() {
         .generate_turbo(
             "a red apple on a wooden table",
             &TurboOptions {
+                guidance: 0.0,
+                scheduler_shift: None,
                 height: 1024,
                 width: 1024,
                 steps: 4,

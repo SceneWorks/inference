@@ -35,7 +35,7 @@ pub(crate) fn defaults() -> FlowSamplingDefaults {
     FlowSamplingDefaults {
         solver: Solver::ErSde,
         steps: crate::config::Variant::Turbo.default_steps(),
-        guidance: None,
+        guidance: Some(1.0),
         true_cfg_overrides: false,
         default_alias: false,
     }
@@ -91,7 +91,7 @@ mod tests {
             default.steps(),
             crate::config::Variant::Turbo.default_steps() as usize
         );
-        assert_eq!(default.effective_guidance(), None);
+        assert_eq!(default.effective_guidance(), Some(1.0));
         for name in crate::model::descriptor_turbo().capabilities.samplers {
             let req = GenerationRequest {
                 sampler: Some(name.into()),

@@ -1,6 +1,6 @@
 //! Host-only canonical FLOW request replay and the plan consumed by actual curated factories.
 //! Native schedules/defaults/aliases are supplied by the provider; no model policy is inferred here.
-use super::{canonical_solver, resolve_flow_schedule};
+use super::canonical_solver;
 use crate::gen_core::sampling::solvers::SolverEpoch;
 use crate::gen_core::sampling::TimestepConvention;
 use crate::{Conditioning, Error, GenerationRequest, Result, Scheduler, Solver};
@@ -23,6 +23,8 @@ struct FlowSamplingWire {
     solver: String,
     #[serde(deserialize_with = "required_option")]
     scheduler: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scheduler_shift: Option<f32>,
     steps: u32,
     #[serde(deserialize_with = "required_option")]
     guidance: Option<f32>,
@@ -55,6 +57,9 @@ impl TryFrom<FlowSamplingWire> for FlowSamplingRecipe {
     type Error = String;
     fn try_from(wire: FlowSamplingWire) -> std::result::Result<Self, Self::Error> {
         if wire.version != 1
+            || wire
+                .scheduler_shift
+                .is_some_and(|shift| !shift.is_finite() || shift <= 0.0)
             || wire.steps == 0
             || Solver::from_name(&wire.solver).is_none()
             || wire
@@ -84,6 +89,7 @@ pub struct ResolvedFlowControls {
     solver: Solver,
     convention: TimestepConvention,
     effective_guidance: Option<f32>,
+    guidance_off: f32,
 }
 
 /// Exact schedule plan: only post-admission runtime or an explicitly byte-bounded capture analysis.
@@ -94,6 +100,7 @@ pub struct ResolvedFlowSampling {
     sigmas: Vec<f32>,
     convention: TimestepConvention,
     effective_guidance: Option<f32>,
+    guidance_off: f32,
 }
 fn invalid(message: impl Into<String>) -> Error {
     Error::Unsupported(format!("flow sampling: {}", message.into()))
@@ -127,6 +134,11 @@ impl ResolvedFlowControls {
             solver,
             convention,
             effective_guidance: recipe.0.guidance,
+            guidance_off: if defaults.guidance == Some(0.0) {
+                0.0
+            } else {
+                1.0
+            },
         })
     }
 
@@ -174,6 +186,7 @@ impl ResolvedFlowControls {
             version: 1,
             solver: solver.name().into(),
             scheduler: scheduler.map(str::to_owned),
+            scheduler_shift: req.scheduler_shift,
             steps,
             guidance: effective_guidance,
             strength: req.strength,
@@ -187,6 +200,11 @@ impl ResolvedFlowControls {
             solver,
             convention,
             effective_guidance,
+            guidance_off: if defaults.guidance == Some(0.0) {
+                0.0
+            } else {
+                1.0
+            },
         })
     }
     pub fn recipe(&self) -> &FlowSamplingRecipe {
@@ -210,7 +228,7 @@ impl ResolvedFlowControls {
         self.convention
     }
     pub fn allocation_class(&self) -> String {
-        allocation_class(self.solver, self.effective_guidance)
+        allocation_class(self.solver, self.effective_guidance, self.guidance_off)
     }
     /// Checked source host-buffer envelope, not a step cap. Named terms follow native schedule,
     /// normal's timestep buffer, sigma Vec growth, resolved/window/model copies and virtual table.
@@ -279,14 +297,20 @@ impl ResolvedFlowControls {
     /// runtime admission. `native` and `mu` are the provider's unchanged builder
     /// inputs; this is the SAME path as `ResolvedFlowSampling::resolve`.
     pub fn materialize_schedule(self, native: &[f32], mu: f32) -> Result<ResolvedFlowSampling> {
-        let sigmas =
-            resolve_flow_schedule(self.recipe.0.scheduler.as_deref(), mu, self.steps(), native);
+        let sigmas = crate::resolve_flow_schedule_with_shift(
+            self.recipe.0.scheduler.as_deref(),
+            self.recipe.0.scheduler_shift,
+            mu,
+            self.steps(),
+            native,
+        )?;
         Ok(ResolvedFlowSampling {
             recipe: self.recipe,
             solver: self.solver,
             sigmas,
             convention: self.convention,
             effective_guidance: self.effective_guidance,
+            guidance_off: self.guidance_off,
         })
     }
 
@@ -312,11 +336,11 @@ impl ResolvedFlowControls {
         )
     }
 }
-fn allocation_class(solver: Solver, guidance: Option<f32>) -> String {
+fn allocation_class(solver: Solver, guidance: Option<f32>, off: f32) -> String {
     format!(
         "flow1-{}-{}",
         solver.name(),
-        if guidance.is_some_and(|g| g > 1.0) {
+        if guidance.is_some_and(|g| g != off) {
             "sequential-cfg"
         } else {
             "cfgfree"
@@ -417,15 +441,7 @@ impl ResolvedFlowSampling {
         })
     }
     pub fn allocation_class(&self) -> String {
-        format!(
-            "flow1-{}-{}",
-            self.solver.name(),
-            if self.effective_guidance.is_some_and(|g| g > 1.0) {
-                "sequential-cfg"
-            } else {
-                "cfgfree"
-            }
-        )
+        allocation_class(self.solver, self.effective_guidance, self.guidance_off)
     }
 }
 
@@ -467,6 +483,7 @@ impl FlowSamplingRecipe {
     pub fn apply_to(&self, req: &mut GenerationRequest) -> Result<()> {
         req.sampler = Some(self.0.solver.clone());
         req.scheduler = self.0.scheduler.clone();
+        req.scheduler_shift = self.0.scheduler_shift;
         req.steps = Some(self.0.steps);
         req.guidance = self.0.guidance;
         req.true_cfg = None;

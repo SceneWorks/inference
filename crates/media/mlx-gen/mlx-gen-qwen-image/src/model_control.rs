@@ -428,7 +428,7 @@ impl QwenImageControl {
         } = crate::pipeline::resolve_request_rungs(req, &self.memory_strategy)?;
 
         // Shared step/sampler/guidance/seed resolution (F-117).
-        let params = resolve_run_params(req, req.width, req.height);
+        let params = resolve_run_params(req, req.width, req.height)?;
         let (control_image, control_scale) = self.resolve_control(req)?;
 
         // Phase A: prompt → embeds (epic 10834 Phase 1, sc-11006; sc-11125). Under `Sequential` the
@@ -441,7 +441,7 @@ impl QwenImageControl {
             on_progress,
             |te: &QwenTextEncoder| {
                 let pos = encode_prompt(&self.tokenizer, te, &req.prompt, MODEL_ID)?;
-                let neg = if params.is_lightning {
+                let neg = if params.guidance == 1.0 {
                     None
                 } else {
                     Some(encode_prompt(

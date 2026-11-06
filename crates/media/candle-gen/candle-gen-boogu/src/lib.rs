@@ -449,6 +449,22 @@ impl Generator for BooguGenerator {
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         let id = self.descriptor.id;
         self.descriptor.capabilities.validate_request(id, req)?;
+        let (default, off) = if matches!(self.variant, Variant::Turbo) {
+            (0.0, 0.0)
+        } else {
+            (pipeline::DEFAULT_GUIDANCE, 1.0)
+        };
+        if req
+            .negative_prompt
+            .as_ref()
+            .is_some_and(|prompt| !prompt.trim().is_empty())
+            && req.guidance.unwrap_or(default) == off
+        {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: a negative prompt requires CFG"
+            )));
+        }
+
         if req.prompt.trim().is_empty() {
             return Err(gen_core::Error::Msg(format!(
                 "{id}: prompt must not be empty"
@@ -493,22 +509,29 @@ impl Generator for BooguGenerator {
         // staged component load. Later phases consume the exact admitted ids rather than re-tokenizing.
         let tok = self.preflight_tokenizer()?;
         let preflight = match self.variant {
-            Variant::Base => RequestPreflight::Base(pipeline::preflight_text(
-                &tok,
-                &req.prompt,
-                req.guidance.unwrap_or(pipeline::DEFAULT_GUIDANCE) > 1.0,
-            )?),
-            Variant::Turbo => {
-                RequestPreflight::Turbo(pipeline::preflight_text(&tok, &req.prompt, false)?)
-            }
+            Variant::Base => RequestPreflight::Base(
+                pipeline::preflight_text(
+                    &tok,
+                    &req.prompt,
+                    req.guidance.unwrap_or(pipeline::DEFAULT_GUIDANCE) != 1.0,
+                )?
+                .with_negative_prompt(&tok, req.negative_prompt.as_deref())?,
+            ),
+            Variant::Turbo => RequestPreflight::Turbo(
+                pipeline::preflight_text(&tok, &req.prompt, req.guidance.unwrap_or(0.0) != 0.0)?
+                    .with_negative_prompt(&tok, req.negative_prompt.as_deref())?,
+            ),
             Variant::Edit => {
                 let references = resolve_edit_references(req)?;
-                RequestPreflight::Edit(pipeline::preflight_edit(
-                    &tok,
-                    &references,
-                    &req.prompt,
-                    req.guidance.unwrap_or(pipeline::DEFAULT_GUIDANCE) > 1.0,
-                )?)
+                RequestPreflight::Edit(
+                    pipeline::preflight_edit(
+                        &tok,
+                        &references,
+                        &req.prompt,
+                        req.guidance.unwrap_or(pipeline::DEFAULT_GUIDANCE) != 1.0,
+                    )?
+                    .with_negative_prompt(&tok, req.negative_prompt.as_deref())?,
+                )
             }
         };
         self.memory_admission.consume_for_generate(req)?;
@@ -733,6 +756,7 @@ pub fn descriptor() -> ModelDescriptor {
         modality: Modality::Image,
         capabilities: Capabilities {
             supports_guidance: true,
+            supports_negative_prompt: true,
             // All three registered routes emit one latent preview per outer denoise step. Base and
             // Edit use the shared flow driver; Turbo additionally covers its default native DMD loop.
             supports_preview: true,
@@ -764,7 +788,7 @@ pub fn descriptor() -> ModelDescriptor {
 pub fn descriptor_turbo() -> ModelDescriptor {
     let mut d = descriptor();
     d.id = BOOGU_IMAGE_TURBO_ID;
-    d.capabilities.supports_guidance = false;
+    d.capabilities.supports_guidance = true;
     d.capabilities.samplers = TURBO_SAMPLERS.to_vec();
     d
 }
@@ -1315,7 +1339,7 @@ mod tests {
     fn descriptor_surfaces() {
         let b = descriptor();
         assert!(b.capabilities.supports_guidance);
-        assert!(!b.capabilities.supports_negative_prompt);
+        assert!(b.capabilities.supports_negative_prompt);
         assert!(b.capabilities.supports_preview);
         // sc-11786: Base advertises a single-`Reference` img2img surface (no MultiReference).
         assert_eq!(
@@ -1326,7 +1350,7 @@ mod tests {
         assert_eq!(b.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         let t = descriptor_turbo();
         assert_eq!(t.id, BOOGU_IMAGE_TURBO_ID);
-        assert!(!t.capabilities.supports_guidance);
+        assert!(t.capabilities.supports_guidance);
         assert_eq!(t.capabilities.samplers, TURBO_SAMPLERS.to_vec());
         assert_eq!(t.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert!(t.capabilities.supports_preview);

@@ -14,9 +14,9 @@ use mlx_gen::gen_core::{
 };
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, gen_core, resolve_flow_schedule,
-    Capabilities, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, OutputChannels, Precision, Progress, Quant, Residency, Result, SizeFloor,
+    curated_sampler_names, curated_scheduler_names, default_seed, gen_core, Capabilities, Error,
+    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
+    OutputChannels, Precision, Progress, Quant, Residency, Result, SizeFloor,
 };
 
 use crate::config::{
@@ -652,7 +652,13 @@ pub(crate) fn resolve_run_params(
 ) -> Result<RunParams> {
     let steps = req.steps.unwrap_or(schedule.default_steps()) as usize;
     let (native, mu) = schedule.native_sigmas(steps, req.width, req.height)?;
-    let sigmas = resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
+    let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        mu,
+        steps,
+        &native,
+    )?;
     // `true_cfg_scale`: honour a caller-supplied `true_cfg`, then `guidance`, then the upstream
     // default (off). Guidance engages only with a negative prompt, as upstream's `do_true_cfg`.
     let true_cfg = req.true_cfg.or(req.guidance).unwrap_or(DEFAULT_TRUE_CFG);
@@ -1385,7 +1391,7 @@ mod tests {
         let curated = resolve_run_params(&schedule, &r).unwrap().sigmas;
         assert_eq!(
             curated,
-            resolve_flow_schedule(Some("simple"), 0.0, 8, &saved_then_zero())
+            mlx_gen::resolve_flow_schedule(Some("simple"), 0.0, 8, &saved_then_zero())
         );
         assert_ne!(curated, saved_then_zero());
     }

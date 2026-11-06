@@ -1105,8 +1105,8 @@ fn cfg_capability_matrix_matches_the_registered_candle_render_paths() {
         assert!(!capabilities.supports_true_cfg, "{id}");
     }
     let turbo = descriptor("sd3_5_large_turbo").capabilities;
-    assert!(!turbo.supports_guidance);
-    assert!(!turbo.supports_negative_prompt);
+    assert!(turbo.supports_guidance);
+    assert!(turbo.supports_negative_prompt);
     assert!(!turbo.supports_true_cfg);
 
     for id in ["sensenova_u1_8b", "sensenova_u1_8b_fast"] {

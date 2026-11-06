@@ -1509,14 +1509,8 @@ pub(crate) fn validate_request(
             )));
         }
     }
-    if let Some(guidance) = request.guidance {
-        if !(GUIDANCE_RANGE.0..=GUIDANCE_RANGE.1).contains(&guidance) {
-            return Err(gen_core::Error::Msg(format!(
-                "{model_id}: guidance {guidance} outside {}..={}",
-                GUIDANCE_RANGE.0, GUIDANCE_RANGE.1
-            )));
-        }
-    }
+    // Finite guidance is checked by the capability floor. The recommended range does not
+    // constrain experimental CFG; method-specific mathematical restrictions remain below.
     if request.guidance_momentum.unwrap_or(0.0) != 0.0 {
         return Err(gen_core::Error::Unsupported(format!(
             "{model_id} does not support APG momentum"
@@ -2791,6 +2785,8 @@ mod tests {
 
             let mut invalid = request();
             invalid.guidance = Some(GUIDANCE_RANGE.1 + 0.1);
+            assert!(validate_request(variant, &descriptor, &invalid).is_ok());
+            invalid.guidance = Some(f32::NAN);
             assert!(validate_request(variant, &descriptor, &invalid).is_err());
         }
     }

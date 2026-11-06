@@ -180,7 +180,7 @@ impl Sd3Variant {
     /// separate [`mlx_gen::GenerationRequest::true_cfg`] request field. SD3.5's MLX render path
     /// consumes `guidance` and `negative_prompt`, but never consumes `true_cfg`.
     pub fn uses_classifier_free_guidance(self) -> bool {
-        matches!(self, Self::Large | Self::Medium)
+        true
     }
 
     /// Compatibility alias for callers that used the old, ambiguous method name.

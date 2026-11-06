@@ -536,6 +536,7 @@ fn base_sana_request<'a>(
         seed: Some(seed),
         sampler: req.sampler.as_deref(),
         scheduler: req.scheduler.as_deref(),
+        scheduler_shift: req.scheduler_shift,
         init_image,
         strength,
     }

@@ -9,7 +9,7 @@ pub(crate) fn defaults() -> FlowSamplingDefaults {
     FlowSamplingDefaults {
         solver: Solver::Euler,
         steps: crate::model::DEFAULT_STEPS,
-        guidance: None,
+        guidance: Some(0.0),
         true_cfg_overrides: false,
         default_alias: false,
     }

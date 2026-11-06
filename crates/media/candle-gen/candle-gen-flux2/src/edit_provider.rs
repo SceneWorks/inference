@@ -62,6 +62,9 @@ pub struct Flux2EditRequest {
     pub width: u32,
     pub height: u32,
     pub steps: usize,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub scheduler_shift: Option<f32>,
     /// Guidance scale. 1.0 (klein default) = a single CFG-free forward; > 1.0 adds a negative pass.
     pub guidance: f32,
     pub seed: u64,
@@ -94,6 +97,9 @@ impl Default for Flux2EditRequest {
             width: 1024,
             height: 1024,
             steps: DEFAULT_STEPS as usize,
+            sampler: None,
+            scheduler: None,
+            scheduler_shift: None,
             guidance: DEFAULT_GUIDANCE,
             seed: 0,
             enhance_prompt: false,
@@ -663,7 +669,13 @@ impl Flux2Edit {
         // the legacy `euler_step` flow-match loop within tolerance.
         let mu = pipeline::compute_mu(pipeline::image_seq_len(req.width, req.height), req.steps);
         let native = pipeline::schedule(req.steps, req.width, req.height);
-        let sigmas = candle_gen::resolve_flow_schedule(None, mu, req.steps, &native);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            mu,
+            req.steps,
+            &native,
+        )?;
 
         let latents = pipeline::create_noise(cfg, req.seed, req.width, req.height, device)?;
         let (_, reference_sq, _) = ref_tokens.dims3()?;
@@ -719,7 +731,7 @@ impl Flux2Edit {
         // predict closure so a multi-eval solver re-runs them. FLUX.2 uses the Sigma convention but the
         // model embeds σ×1000, so feed `sigma * 1000.0` to the transformer.
         let latents = candle_gen::run_flow_sampler(
-            None,
+            req.sampler.as_deref(),
             TimestepConvention::Sigma,
             &sigmas,
             latents,

@@ -262,6 +262,7 @@ fn base_request(steps: usize, size: u32, sampler: Option<&str>) -> PulidFluxRequ
         id_weight: 1.0,
         sampler: sampler.map(str::to_string),
         scheduler: None,
+        scheduler_shift: None,
         seed: SEED,
         use_pid: false,
         preview: PreviewSink::default(),

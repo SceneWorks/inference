@@ -246,6 +246,8 @@ fn edit_smoke() {
 fn turbo_smoke() {
     let pipe = BooguPipeline::from_snapshot(turbo_dir()).expect("load Boogu Turbo pipeline");
     let opts = TurboOptions {
+        guidance: 0.0,
+        scheduler_shift: None,
         height: 768,
         width: 768,
         steps: 4,

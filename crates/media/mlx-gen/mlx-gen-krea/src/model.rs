@@ -319,7 +319,8 @@ pub fn descriptor() -> ModelDescriptor {
         modality: Modality::Image,
         capabilities: Capabilities {
             // CFG-free distilled student (like Ideogram Turbo / Boogu Turbo / SDXL-Lightning).
-            supports_guidance: false,
+            supports_guidance: true,
+            supports_negative_prompt: true,
             // Reference-image conditioning = img2img latent-init (epic 8588 slice A, sc-10135): a single
             // `Conditioning::Reference { image, strength }` seeds the denoise from the VAE-encoded
             // reference (see [`generate_impl`] → `generate_turbo_img2img_with_progress`). Turbo only; the
@@ -1227,18 +1228,18 @@ impl Krea {
                 text.encode_grounded_from_vision(&gv, &req.prompt)?,
                 req.text_style_gain,
             )?;
-            let neg = if guidance > 0.0 {
+            let neg = if guidance != 0.0 {
                 Some(text.encode_grounded_from_vision(&gv, negative)?)
             } else {
                 None
             };
             Ok(KreaContexts { pos, neg })
-        } else if is_raw {
+        } else if is_raw || guidance != 0.0 {
             // POSITIVE context carries the Krea "text style" tap-reweight gain (sc-11878); the
             // CFG-negative context is encoded WITHOUT it so the knob steers only the conditional
             // prediction (mirrors candle-gen-krea `encode_prompt_context`). `None`/g≈1 is a no-op.
             let pos = maybe_apply_style_gain(text.encode(&req.prompt)?, req.text_style_gain)?;
-            let neg = if guidance > 0.0 {
+            let neg = if guidance != 0.0 {
                 Some(text.encode(negative)?)
             } else {
                 None
@@ -1328,6 +1329,19 @@ impl Krea {
         } else {
             turbo_schedule(steps, req.scheduler.as_deref())
         };
+        let native_mu = if is_raw {
+            crate::schedule::dynamic_mu((req.width as f64 / 16.0) * (req.height as f64 / 16.0))
+                as f32
+        } else {
+            crate::schedule::TURBO_MU as f32
+        };
+        let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            native_mu,
+            steps,
+            &sigmas,
+        )?;
         // Edit extracts its own ordered source list (a single `Reference` or a `MultiReference`
         // scene+person pair, epic 10871 P1.3); img2img/t2i use the single-`Reference` helper. Kept
         // separate so an edit's `MultiReference` never trips `single_reference`'s "exactly one
@@ -1369,11 +1383,9 @@ impl Krea {
         // FORCED to 0 for `krea_2_turbo_edit` so the edit runs a single conditional forward — its
         // descriptor advertises no guidance, so `req.guidance` is already rejected upstream; this just
         // pins the CFG-free default that makes `encode` skip the unconditional grounded context.
-        let guidance = if is_turbo_edit {
-            0.0
-        } else {
-            req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE)
-        };
+        let guidance = req
+            .guidance
+            .unwrap_or(if is_raw { DEFAULT_RAW_GUIDANCE } else { 0.0 });
         let negative = req.negative_prompt.clone().unwrap_or_default();
         let multiphase = self.resolve_multiphase(req, guidance)?;
         Ok(KreaRequest {
@@ -1387,6 +1399,7 @@ impl Krea {
             edit_sources,
             img2img,
             capture_sigma,
+            sigmas,
             keep,
             guidance,
             negative,
@@ -1420,10 +1433,20 @@ impl Krea {
             }
             _ => None,
         };
-        let sigmas = resolved.as_ref().map(|resolved| {
-            let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
-            base_schedule(total, req.width, req.height, req.scheduler.as_deref())
-        });
+        let sigmas = resolved
+            .as_ref()
+            .map(|resolved| -> Result<Vec<f32>> {
+                let total = resolved.last().map(|p| p.slice.end).unwrap_or(0);
+                let native = base_schedule(total, req.width, req.height, req.scheduler.as_deref());
+                Ok(mlx_gen::resolve_flow_schedule_with_shift(
+                    req.scheduler.as_deref(),
+                    req.scheduler_shift,
+                    crate::schedule::dynamic_mu((req.width / 16 * (req.height / 16)) as f64) as f32,
+                    total,
+                    &native,
+                )?)
+            })
+            .transpose()?;
         let encode_guidance = match &resolved {
             Some(resolved) if multiphase::any_phase_uses_cfg(resolved) => 1.0,
             Some(_) => 0.0,
@@ -1509,7 +1532,20 @@ impl Krea {
             );
         }
 
-        let plan = self.build_render_plan(&heavy, ctx, request)?;
+        let mut plan = self.build_render_plan(&heavy, ctx, request)?;
+        match &mut plan {
+            KreaRenderPlan::Turbo(plan) | KreaRenderPlan::BaseCfg(plan) => {
+                plan.guidance = request.guidance;
+                plan.sigmas = Some(request.sigmas.clone());
+            }
+            KreaRenderPlan::Img2ImgRaw { plan, .. } | KreaRenderPlan::Img2ImgTurbo { plan, .. } => {
+                plan.guidance = request.guidance;
+                plan.sigmas = Some(request.sigmas.clone());
+            }
+            KreaRenderPlan::Edit(plan) => {
+                plan.sigmas = Some(request.sigmas.clone());
+            }
+        }
         let mut images = Vec::with_capacity(req.count as usize);
         for n in 0..req.count {
             let opts = self.turbo_options(request, request.steps, n);
@@ -1641,11 +1677,12 @@ impl Krea {
             )?)
         } else {
             // Turbo t2i is CFG-free (`ctx.neg` is always `None` here).
-            KreaRenderPlan::Turbo(
-                heavy
-                    .heavy
-                    .prepare_t2i(&ctx.pos, None, req.width, req.height)?,
-            )
+            KreaRenderPlan::Turbo(heavy.heavy.prepare_t2i(
+                &ctx.pos,
+                ctx.neg.as_ref(),
+                req.width,
+                req.height,
+            )?)
         })
     }
 
@@ -1679,6 +1716,7 @@ struct KreaRequest<'r> {
     /// The img2img init image and its resolved fidelity strength.
     img2img: Option<(&'r Image, f32)>,
     capture_sigma: f32,
+    sigmas: Vec<f32>,
     keep: usize,
     guidance: f32,
     negative: String,
@@ -1790,6 +1828,17 @@ pub fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Resu
         return Err(Error::Msg(format!("{id}: prompt must not be empty")));
     }
     desc.capabilities.validate_request(id, req)?;
+    if id.starts_with("krea_2_turbo")
+        && req.guidance.unwrap_or(0.0) == 0.0
+        && req
+            .negative_prompt
+            .as_ref()
+            .is_some_and(|text| !text.trim().is_empty())
+    {
+        return Err(Error::Unsupported(format!(
+            "{id}: a negative prompt requires nonzero CFG"
+        )));
+    }
     let img2img_id = match id {
         KREA_2_EDIT_ID => Some(KREA_2_RAW_ID),
         KREA_2_TURBO_EDIT_ID => Some(KREA_2_TURBO_ID),
@@ -3221,8 +3270,8 @@ mod tests {
         assert_eq!(d.modality, Modality::Image);
         // CFG-free distilled Turbo: no guidance, no negative prompt. img2img reference conditioning
         // (sc-10135) IS advertised (the only conditioning surface).
-        assert!(!d.capabilities.supports_guidance);
-        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_negative_prompt);
         assert_eq!(
             d.capabilities.conditioning,
             vec![ConditioningKind::Reference]
@@ -3255,7 +3304,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_guidance_and_negative_prompt() {
+    fn validate_allows_experimental_cfg_and_refuses_negative_at_cfg_off() {
         // Turbo is CFG-free: the capability floor rejects a guidance override and a negative prompt.
         assert!(validate_request(
             &descriptor(),
@@ -3264,7 +3313,7 @@ mod tests {
                 ..req(512, 512)
             }
         )
-        .is_err());
+        .is_ok());
         assert!(validate_request(
             &descriptor(),
             &GenerationRequest {
@@ -3725,8 +3774,8 @@ mod tests {
         assert_eq!(d.modality, Modality::Image);
         // Derived from the distilled Turbo descriptor: CFG-free (no guidance, no user negative prompt),
         // UNLIKE the full-CFG `krea_2_edit`. This is the recipe difference the spike validates.
-        assert!(!d.capabilities.supports_guidance);
-        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.supports_true_cfg);
         // Same edit conditioning surface as `edit_descriptor` — a single `Reference` or a scene+person
         // `MultiReference`; the `krea2_identity_edit` LoRA rides `spec.adapters`.
@@ -3745,11 +3794,11 @@ mod tests {
     }
 
     #[test]
-    fn turbo_edit_rejects_guidance_and_negative_prompt() {
+    fn turbo_edit_allows_experimental_cfg_and_refuses_negative_at_cfg_off() {
         // The CFG-free floor (like Turbo t2i) rejects both — the edit runs a single conditional forward.
         let mut r = ref_req(1, None);
         r.guidance = Some(3.5);
-        assert!(validate_request(&turbo_edit_descriptor(), &r).is_err());
+        assert!(validate_request(&turbo_edit_descriptor(), &r).is_ok());
         let mut r = ref_req(1, None);
         r.negative_prompt = Some("blurry".into());
         assert!(validate_request(&turbo_edit_descriptor(), &r).is_err());

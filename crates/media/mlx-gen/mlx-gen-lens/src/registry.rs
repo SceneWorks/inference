@@ -683,6 +683,13 @@ impl LensGenerator {
                     heavy
                         .heavy
                         .resolve_sigmas(latent_h, latent_w, steps, req.scheduler.as_deref());
+                let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+                    req.scheduler.as_deref(),
+                    req.scheduler_shift,
+                    mlx_gen::gen_core::sampling::compute_mu(latent_h * latent_w, steps),
+                    steps,
+                    &sigmas,
+                )?;
                 let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
                 let keep = (keep < sigmas.len()).then_some(keep);
                 // F-030 (sc-11133): the PiD `from_ldm` early-stop truncates the descending schedule to
@@ -718,6 +725,7 @@ impl LensGenerator {
                         // unified framework; the worker also pre-normalizes unadvertised names).
                         req.sampler.as_deref(),
                         req.scheduler.as_deref(),
+                        req.scheduler_shift,
                         seed,
                         keep,
                         pid_ref,
@@ -867,6 +875,7 @@ impl LensGenerator {
                         guidance,
                         req.sampler.as_deref(),
                         req.scheduler.as_deref(),
+                        req.scheduler_shift,
                         seed,
                         None,
                         &req.cancel,

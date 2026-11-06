@@ -88,7 +88,7 @@ const RES_MAX: u32 = 1536;
 /// Build the descriptor for a variant. Turbo is the merged CFG-free student (no guidance / negative
 /// prompt); Base/Aesthetic run true classifier-free guidance.
 fn descriptor_for(variant: Variant) -> ModelDescriptor {
-    let cfg_capable = variant.uses_cfg();
+    let cfg_capable = true;
     ModelDescriptor {
         encoder_contract: None,
         denoiser_output_latent_space: Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
@@ -475,11 +475,8 @@ impl Generator for Anima {
         validate_request(&self.descriptor, req)?;
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
-        let guidance = if self.variant.uses_cfg() {
-            req.guidance.unwrap_or(self.variant.default_guidance())
-        } else {
-            1.0
-        };
+        let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
+        let cfg_on = self.variant.uses_cfg() || guidance != 1.0;
         let negative = req.negative_prompt.clone().unwrap_or_default();
 
         // Shared batch frame (sc-7792): the `0..count` loop + per-image `image_seed(base_seed, n)`
@@ -500,6 +497,8 @@ impl Generator for Anima {
                 guidance,
                 seed,
                 sampler: req.sampler.clone(),
+                scheduler: req.scheduler.clone(),
+                scheduler_shift: req.scheduler_shift,
                 // The caller's live preview sink (epic 16948, sc-16953). Cloning is an `Arc` bump;
                 // an absent sink is inert and the denoise never projects anything.
                 preview: req.preview.clone(),
@@ -513,9 +512,7 @@ impl Generator for Anima {
                 |text| match text {
                     AnimaTextPhase::Resident(pipeline) => {
                         let cond = pipeline.encode_prompt(&req.prompt)?;
-                        let uncond = self
-                            .variant
-                            .uses_cfg()
+                        let uncond = cfg_on
                             .then(|| pipeline.encode_prompt(&negative))
                             .transpose()?;
                         Ok((cond, uncond))
@@ -523,9 +520,7 @@ impl Generator for Anima {
                     AnimaTextPhase::Staged(components) => {
                         let cond =
                             AnimaPipeline::encode_staged(components, &self.device, &req.prompt)?;
-                        let uncond = self
-                            .variant
-                            .uses_cfg()
+                        let uncond = cfg_on
                             .then(|| {
                                 AnimaPipeline::encode_staged(components, &self.device, &negative)
                             })
@@ -582,6 +577,21 @@ pub(crate) fn validate_request(
         )));
     }
     desc.capabilities.validate_request(id, req)?;
+    let guidance = req.guidance.unwrap_or_else(|| {
+        Variant::from_id(id)
+            .unwrap_or(Variant::Base)
+            .default_guidance()
+    });
+    if guidance == 1.0
+        && req
+            .negative_prompt
+            .as_ref()
+            .is_some_and(|text| !text.trim().is_empty())
+    {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: a negative prompt requires guidance != 1.0"
+        )));
+    }
     if !req.width.is_multiple_of(RES_MULTIPLE) || !req.height.is_multiple_of(RES_MULTIPLE) {
         return Err(gen_core::Error::Msg(format!(
             "{id}: {}x{} must be a multiple of {RES_MULTIPLE}",
@@ -773,8 +783,8 @@ mod tests {
         }
         // Turbo is the CFG-free merged student.
         let t = descriptor_turbo();
-        assert!(!t.capabilities.supports_guidance);
-        assert!(!t.capabilities.supports_negative_prompt);
+        assert!(t.capabilities.supports_guidance);
+        assert!(t.capabilities.supports_negative_prompt);
         // The default flow solver (er_sde on the 441ecec gen-core pin) is a real curated sampler.
         assert_eq!(pipeline::DEFAULT_SAMPLER, "er_sde");
         assert!(
@@ -785,6 +795,14 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_requests() {
+        for guidance in [None, Some(1.0)] {
+            let request = GenerationRequest {
+                guidance,
+                negative_prompt: Some("blurry".into()),
+                ..req(1024, 1024)
+            };
+            assert!(validate_request(&descriptor_turbo(), &request).is_err());
+        }
         assert!(validate_request(&descriptor_base(), &GenerationRequest::default()).is_err()); // empty prompt
         assert!(validate_request(&descriptor_base(), &req(1000, 1024)).is_err()); // not mult of 16
         assert!(validate_request(&descriptor_base(), &req(256, 256)).is_err()); // below min

@@ -803,6 +803,17 @@ impl Generator for KreaGenerator {
             )));
         }
         self.descriptor.capabilities.validate_request(id, req)?;
+        if id.starts_with("krea_2_turbo")
+            && req.guidance.unwrap_or(0.0) == 0.0
+            && req
+                .negative_prompt
+                .as_ref()
+                .is_some_and(|text| !text.trim().is_empty())
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{id}: a negative prompt requires nonzero CFG"
+            )));
+        }
         if req.steps == Some(0) {
             return Err(gen_core::Error::Msg(format!("{id}: steps must be >= 1")));
         }
@@ -1157,7 +1168,8 @@ pub fn descriptor() -> ModelDescriptor {
         modality: Modality::Image,
         capabilities: Capabilities {
             // CFG-free distilled student (like Ideogram Turbo / Boogu Turbo / SDXL-Lightning).
-            supports_guidance: false,
+            supports_guidance: true,
+            supports_negative_prompt: true,
             // Turbo img2img reference-guided latent-init (sc-10134, epic 8588): a single
             // `Conditioning::Reference { image, strength }` seeds the denoise from the VAE-encoded
             // reference (`pipeline::render_img2img`). A MultiReference is NOT accepted here (that is the
@@ -6131,8 +6143,8 @@ mod tests {
         let d = descriptor();
         assert_eq!(d.id, KREA_2_TURBO_ID);
         assert_eq!(d.modality, Modality::Image);
-        assert!(!d.capabilities.supports_guidance);
-        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_negative_prompt);
         // Turbo advertises single-reference img2img (sc-10134) — but NOT MultiReference (the edit surface).
         assert_eq!(
             d.capabilities.conditioning,
@@ -6210,7 +6222,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_guidance_and_negative_prompt() {
+    fn validate_allows_experimental_cfg_and_refuses_negative_at_cfg_off() {
         let fixture = tempfile::tempdir().unwrap();
         let spec = valid_directory_spec(fixture.path());
         let g = crate::provider_registry()
@@ -6228,7 +6240,7 @@ mod tests {
                 guidance: Some(3.5),
                 ..base.clone()
             })
-            .is_err());
+            .is_ok());
         assert!(g
             .validate(&GenerationRequest {
                 negative_prompt: Some("y".into()),

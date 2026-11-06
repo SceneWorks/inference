@@ -368,7 +368,7 @@ impl QwenImage {
 
         // Shared step/sampler/guidance/seed resolution (F-117); `req.sampler == "lightning"` selects
         // the few-step recipe, else the production resolution-dependent schedule.
-        let params = resolve_run_params(req, req.width, req.height);
+        let params = resolve_run_params(req, req.width, req.height)?;
         // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
         // `start_step = 0` for pure txt2img (the fork's `Config.init_time_step`).
         let reference = resolve_reference(req, MODEL_ID)?;
@@ -396,7 +396,7 @@ impl QwenImage {
             on_progress,
             |te: &QwenTextEncoder| {
                 let pos = encode_prompt(&self.tokenizer, te, &req.prompt, MODEL_ID)?;
-                let neg = if params.is_lightning {
+                let neg = if params.guidance == 1.0 {
                     None
                 } else {
                     Some(encode_prompt(

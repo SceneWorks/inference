@@ -173,6 +173,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let req = Krea2ControlRequest {
         prompt: a.prompt,
+        guidance: None,
+        negative_prompt: None,
+        sampler: None,
+        scheduler: None,
+        scheduler_shift: None,
         width: a.size,
         height: a.size,
         steps: a.steps,

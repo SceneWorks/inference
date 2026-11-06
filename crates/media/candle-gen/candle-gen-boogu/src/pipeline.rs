@@ -63,6 +63,41 @@ pub(crate) struct TextPreflight {
     negative: Option<TextTokenIds>,
 }
 
+impl TextPreflight {
+    pub(crate) fn with_negative_prompt(
+        mut self,
+        tok: &BooguTokenizer,
+        prompt: Option<&str>,
+    ) -> Result<Self> {
+        if let Some(prompt) = prompt.filter(|prompt| !prompt.trim().is_empty()) {
+            if self.negative.is_none() {
+                return Err(CandleError::Msg(
+                    "boogu: a negative prompt requires CFG".into(),
+                ));
+            }
+            self.negative = Some(tok.preflight_t2i(prompt)?);
+        }
+        Ok(self)
+    }
+}
+impl EditPreflight {
+    pub(crate) fn with_negative_prompt(
+        mut self,
+        tok: &BooguTokenizer,
+        prompt: Option<&str>,
+    ) -> Result<Self> {
+        if let Some(prompt) = prompt.filter(|prompt| !prompt.trim().is_empty()) {
+            if self.negative.is_none() {
+                return Err(CandleError::Msg(
+                    "boogu edit: a negative prompt requires CFG".into(),
+                ));
+            }
+            self.negative = Some(tok.preflight_t2i(prompt)?);
+        }
+        Ok(self)
+    }
+}
+
 /// Tokenize every ordinary text-only conditioning leg for one request before any component load.
 pub(crate) fn preflight_text(
     tok: &BooguTokenizer,
@@ -304,6 +339,7 @@ pub(crate) enum StagedCondition {
     },
     Turbo {
         cond: Tensor,
+        uncond: Option<Tensor>,
         clean: Option<Tensor>,
         start_step: usize,
     },
@@ -347,7 +383,7 @@ pub(crate) fn stage_encode_base(
             let cond = text
                 .te
                 .last_hidden(&text.tok.text_ids_to_tensor(&preflight.positive)?)?;
-            let uncond = if guidance > 1.0 {
+            let uncond = if guidance != 1.0 {
                 let negative = preflight.negative.as_ref().ok_or_else(|| {
                     CandleError::Msg(
                         "boogu base: CFG-negative conditioning was not admitted".into(),
@@ -396,13 +432,25 @@ pub(crate) fn stage_encode_turbo(
         )?),
         _ => None,
     };
-    let cond = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
-        text.te
-            .last_hidden(&text.tok.text_ids_to_tensor(&preflight.positive)?)
-            .map_err(candle_gen::CandleError::from)
-    })?;
+    let (cond, uncond) =
+        candle_gen::gen_core::with_prompt_encoding(on_progress, || -> Result<_> {
+            let cond = text
+                .te
+                .last_hidden(&text.tok.text_ids_to_tensor(&preflight.positive)?)?;
+            let uncond = preflight
+                .negative
+                .as_ref()
+                .map(|negative| {
+                    text.te
+                        .last_hidden(&text.tok.text_ids_to_tensor(negative)?)
+                        .map_err(CandleError::from)
+                })
+                .transpose()?;
+            Ok((cond, uncond))
+        })?;
     Ok(StagedCondition::Turbo {
         cond,
+        uncond,
         clean,
         start_step,
     })
@@ -428,7 +476,7 @@ pub(crate) fn stage_encode_edit(
             let cond = encode_image_instruction_parts(
                 &text.tok, &text.te, edit, references, preflight, device,
             )?;
-            let uncond = if req.guidance.unwrap_or(DEFAULT_GUIDANCE) > 1.0 {
+            let uncond = if req.guidance.unwrap_or(DEFAULT_GUIDANCE) != 1.0 {
                 let negative = preflight.negative.as_ref().ok_or_else(|| {
                     CandleError::Msg(
                         "boogu edit: CFG-negative conditioning was not admitted".into(),
@@ -473,12 +521,13 @@ pub(crate) fn stage_denoise_base(
     let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let native = base_native_sigmas(steps);
-    let sigmas = candle_gen::resolve_flow_schedule(
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
         req.scheduler.as_deref(),
+        req.scheduler_shift,
         base_shift_mu(),
         steps,
         &native,
-    );
+    )?;
     let start = start_step.min(sigmas.len().saturating_sub(1));
     let run_sigmas = &sigmas[start..];
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
@@ -510,6 +559,44 @@ pub(crate) fn stage_denoise_base(
     })
 }
 
+fn turbo_prediction(
+    dit: &BooguTransformer,
+    latent: &Tensor,
+    timestep: &Tensor,
+    positive: &Tensor,
+    negative: Option<&Tensor>,
+    guidance: f32,
+) -> Result<Tensor> {
+    let positive = dit.forward(latent, timestep, positive)?;
+    match negative {
+        Some(negative) => {
+            let negative = dit.forward(latent, timestep, negative)?;
+            Ok((&positive + ((&positive - negative)? * guidance as f64)?)?)
+        }
+        None => Ok(positive),
+    }
+}
+
+fn turbo_shifted_sigmas(req: &GenerationRequest, steps: usize) -> Result<Vec<f32>> {
+    let clean = dmd_sigmas(DEFAULT_TURBO_SIGMA, steps);
+    if req.scheduler_shift.is_none() {
+        return Ok(clean);
+    }
+    let noise: Vec<_> = clean.iter().map(|sigma| 1.0 - sigma).collect();
+    Ok(
+        candle_gen::resolve_flow_schedule_with_shift(
+            None,
+            req.scheduler_shift,
+            0.0,
+            steps,
+            &noise,
+        )?
+        .into_iter()
+        .map(|sigma| 1.0 - sigma)
+        .collect(),
+    )
+}
+
 pub(crate) fn stage_denoise_turbo(
     heavy: &StagedDenoise,
     req: &GenerationRequest,
@@ -519,6 +606,7 @@ pub(crate) fn stage_denoise_turbo(
 ) -> Result<Vec<Tensor>> {
     let StagedCondition::Turbo {
         cond,
+        uncond,
         clean,
         start_step,
     } = encoded
@@ -531,8 +619,13 @@ pub(crate) fn stage_denoise_turbo(
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     if turbo_uses_curated(req.sampler.as_deref(), req.scheduler.as_deref()) {
         let native = turbo_native_sigmas(DEFAULT_TURBO_SIGMA, steps);
-        let sigmas =
-            candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            0.0,
+            steps,
+            &native,
+        )?;
         let start = start_step.min(sigmas.len().saturating_sub(1));
         let sampler = turbo_curated_sampler(req.sampler.as_deref());
         return candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
@@ -550,16 +643,21 @@ pub(crate) fn stage_denoise_turbo(
                 Some(&preview_hook),
                 |x, timestep| {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                    Ok(heavy
-                        .dit
-                        .forward(x, &t, &cond)?
-                        .to_dtype(DType::F32)?
-                        .neg()?)
+                    Ok(turbo_prediction(
+                        &heavy.dit,
+                        x,
+                        &t,
+                        &cond,
+                        uncond.as_ref(),
+                        req.guidance.unwrap_or(0.0),
+                    )?
+                    .to_dtype(DType::F32)?
+                    .neg()?)
                 },
             )
         });
     }
-    let sigmas = dmd_sigmas(DEFAULT_TURBO_SIGMA, steps);
+    let sigmas = turbo_shifted_sigmas(req, steps)?;
     let start = start_step.min(sigmas.len().saturating_sub(1));
     let total = (steps - start) as u32;
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
@@ -574,7 +672,14 @@ pub(crate) fn stage_denoise_turbo(
             preview_hook.emit_step(&preview_counter, i, &lat);
             let sigma = sigmas[i];
             let t = Tensor::from_vec(vec![sigma], (1,), device)?;
-            let pred = heavy.dit.forward(&lat, &t, &cond)?;
+            let pred = turbo_prediction(
+                &heavy.dit,
+                &lat,
+                &t,
+                &cond,
+                uncond.as_ref(),
+                req.guidance.unwrap_or(0.0),
+            )?;
             lat =
                 (lat.to_dtype(DType::F32)? + (pred.to_dtype(DType::F32)? * (1.0 - sigma) as f64)?)?;
             if i + 1 < steps {
@@ -618,12 +723,13 @@ pub(crate) fn stage_denoise_edit(
     let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let native = base_native_sigmas(steps);
-    let sigmas = candle_gen::resolve_flow_schedule(
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
         req.scheduler.as_deref(),
+        req.scheduler_shift,
         base_shift_mu(),
         steps,
         &native,
-    );
+    )?;
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, 0, device)?;
         let preview_hook = crate::preview::hook(&req.preview);
@@ -708,7 +814,7 @@ pub(crate) fn render_base(
             let cond = comps
                 .te
                 .last_hidden(&comps.tok.text_ids_to_tensor(&preflight.positive)?)?;
-            let do_cfg = guidance > 1.0;
+            let do_cfg = guidance != 1.0;
             let uncond = if do_cfg {
                 let negative = preflight.negative.as_ref().ok_or_else(|| {
                     CandleError::Msg(
@@ -727,12 +833,13 @@ pub(crate) fn render_base(
         },
     )?;
     let native = base_native_sigmas(steps);
-    let sigmas = candle_gen::resolve_flow_schedule(
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
         req.scheduler.as_deref(),
+        req.scheduler_shift,
         base_shift_mu(),
         steps,
         &native,
-    );
+    )?;
 
     // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
     // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
@@ -814,15 +921,25 @@ pub(crate) fn render_turbo(
 ) -> Result<Vec<Image>> {
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-    let cond = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
-        comps
-            .te
-            .last_hidden(&comps.tok.text_ids_to_tensor(&preflight.positive)?)
-            .map_err(candle_gen::CandleError::from)
-    })?;
-    // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
-    // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
-    // `None` → the native VAE decode. Shared by both the curated and native DMD decode sites below.
+    let (cond, uncond) =
+        candle_gen::gen_core::with_prompt_encoding(on_progress, || -> Result<_> {
+            let cond = comps
+                .te
+                .last_hidden(&comps.tok.text_ids_to_tensor(&preflight.positive)?)?;
+            let uncond = preflight
+                .negative
+                .as_ref()
+                .map(|negative| {
+                    comps
+                        .te
+                        .last_hidden(&comps.tok.text_ids_to_tensor(negative)?)
+                        .map_err(CandleError::from)
+                })
+                .transpose()?;
+            Ok((cond, uncond))
+        })?; // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+             // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
+             // `None` → the native VAE decode. Shared by both the curated and native DMD decode sites below.
     let pid_decoder = candle_gen_pid::resolve_pid_decoder(
         comps.pid.as_deref(),
         req,
@@ -840,8 +957,13 @@ pub(crate) fn render_turbo(
         let native = turbo_native_sigmas(DEFAULT_TURBO_SIGMA, steps);
         // The DMD grid is linear in clean-fraction (no logistic shift), so mu = 0 for a curated
         // scheduler re-shape over the same σ span.
-        let sigmas =
-            candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            0.0,
+            steps,
+            &native,
+        )?;
         // img2img (sc-11786): seed at `σ_start` and denoise the reduced `start..` tail. `clean` is
         // `None` (start 0) for pure txt2img ⇒ full schedule from pure noise (byte-identical curated path).
         let start = start_step.min(sigmas.len().saturating_sub(1));
@@ -862,7 +984,14 @@ pub(crate) fn render_turbo(
                 Some(&preview_hook),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                    let v = comps.dit.forward(x, &t, &cond)?;
+                    let v = turbo_prediction(
+                        &comps.dit,
+                        x,
+                        &t,
+                        &cond,
+                        uncond.as_ref(),
+                        req.guidance.unwrap_or(0.0),
+                    )?;
                     Ok(v.to_dtype(DType::F32)?.neg()?)
                 },
             )?;
@@ -871,7 +1000,7 @@ pub(crate) fn render_turbo(
         });
     }
 
-    let sigmas = dmd_sigmas(DEFAULT_TURBO_SIGMA, steps);
+    let sigmas = turbo_shifted_sigmas(req, steps)?;
     let start = start_step.min(sigmas.len().saturating_sub(1));
     let total = (steps - start) as u32;
 
@@ -890,7 +1019,14 @@ pub(crate) fn render_turbo(
             preview_hook.emit_step(&preview_counter, i, &lat);
             let sigma = sigmas[i];
             let t = Tensor::from_vec(vec![sigma], (1,), device)?;
-            let pred = comps.dit.forward(&lat, &t, &cond)?;
+            let pred = turbo_prediction(
+                &comps.dit,
+                &lat,
+                &t,
+                &cond,
+                uncond.as_ref(),
+                req.guidance.unwrap_or(0.0),
+            )?;
             // Predict (clean estimate): x += (1 − sigma)·v, in f32.
             lat =
                 (lat.to_dtype(DType::F32)? + (pred.to_dtype(DType::F32)? * (1.0 - sigma) as f64)?)?;
@@ -993,7 +1129,7 @@ pub(crate) fn render_edit(
         on_progress,
         || -> std::result::Result<_, candle_gen::CandleError> {
             let cond = encode_image_instruction(comps, edit, references, preflight, device)?;
-            let do_cfg = guidance > 1.0;
+            let do_cfg = guidance != 1.0;
             let uncond = if do_cfg {
                 let negative = preflight.negative.as_ref().ok_or_else(|| {
                     CandleError::Msg(
@@ -1012,12 +1148,13 @@ pub(crate) fn render_edit(
         },
     )?;
     let native = base_native_sigmas(steps);
-    let sigmas = candle_gen::resolve_flow_schedule(
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
         req.scheduler.as_deref(),
+        req.scheduler_shift,
         base_shift_mu(),
         steps,
         &native,
-    );
+    )?;
 
     // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
     // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else

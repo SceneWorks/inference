@@ -84,6 +84,9 @@ pub struct Flux1ControlRequest {
     pub width: u32,
     pub height: u32,
     pub steps: usize,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub scheduler_shift: Option<f32>,
     /// Embedded guidance scale (dev default ≈ 3.5).
     pub guidance: f32,
     /// `control_scale` — how strongly the control branch locks the base (≈ 0.7). `None` = absent → the
@@ -113,6 +116,9 @@ impl Default for Flux1ControlRequest {
             width: 1024,
             height: 1024,
             steps: 25,
+            sampler: None,
+            scheduler: None,
+            scheduler_shift: None,
             guidance: 3.5,
             control_scale: None,
             control_kind: "pose".into(),
@@ -334,6 +340,7 @@ impl Flux1DevControl {
         // `generate_with_injector` cannot diverge on whether the sink is forwarded.
         let preview = crate::preview::hook(&req.preview, req.width, req.height);
         let latents = self.denoise(
+            req,
             &state,
             &control_latent,
             &timesteps,
@@ -395,6 +402,7 @@ impl Flux1DevControl {
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
+        req: &Flux1ControlRequest,
         state: &State,
         control_latent: &Tensor,
         timesteps: &[f64],
@@ -413,7 +421,13 @@ impl Flux1DevControl {
         let native: Vec<f32> = timesteps.iter().map(|&t| t as f32).collect();
         let mu = flow_mu(Variant::Dev, state.img.dim(1)?);
         let steps = native.len().saturating_sub(1);
-        let sigmas = candle_gen::resolve_flow_schedule(None, mu, steps, &native);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            mu,
+            steps,
+            &native,
+        )?;
         let prepared = self.backbone.prepare_conditioning(
             heavy,
             &state.img,
@@ -422,7 +436,7 @@ impl Flux1DevControl {
             &state.txt_ids,
         )?;
         candle_gen::run_flow_sampler(
-            None,
+            req.sampler.as_deref(),
             TimestepConvention::Sigma,
             &sigmas,
             state.img.clone(),

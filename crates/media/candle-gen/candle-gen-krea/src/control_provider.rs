@@ -118,6 +118,11 @@ pub struct Krea2ControlPaths {
 #[derive(Clone)]
 pub struct Krea2ControlRequest {
     pub prompt: String,
+    pub guidance: Option<f32>,
+    pub negative_prompt: Option<String>,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub scheduler_shift: Option<f32>,
     pub width: u32,
     pub height: u32,
     pub steps: usize,
@@ -151,6 +156,11 @@ impl Default for Krea2ControlRequest {
     fn default() -> Self {
         Self {
             prompt: String::new(),
+            guidance: None,
+            negative_prompt: None,
+            sampler: None,
+            scheduler: None,
+            scheduler_shift: None,
             width: 1024,
             height: 1024,
             steps: TURBO_STEPS,
@@ -173,12 +183,21 @@ struct Krea2ControlText {
 }
 
 impl Krea2ControlText {
-    fn encode(&self, req: &Krea2ControlRequest) -> Result<Tensor> {
-        maybe_apply_style_gain(
+    fn encode(&self, req: &Krea2ControlRequest) -> Result<(Tensor, Option<Tensor>)> {
+        let positive = maybe_apply_style_gain(
             self.te
                 .forward(&self.tokenizer.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?,
             req.text_style_gain,
-        )
+        )?;
+        let negative = (req.guidance.unwrap_or(0.0) != 0.0)
+            .then(|| -> Result<Tensor> {
+                Ok(self.te.forward(&self.tokenizer.encode_prompt(
+                    req.negative_prompt.as_deref().unwrap_or(""),
+                    MAX_TEXT_TOKENS,
+                )?)?)
+            })
+            .transpose()?;
+        Ok((positive, negative))
     }
 }
 
@@ -549,15 +568,20 @@ impl Krea2ControlHeavy {
         device: &Device,
         req: &Krea2ControlRequest,
         control_image: &Image,
-        context: Tensor,
+        context: (Tensor, Option<Tensor>),
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         candle_gen::check_cancel(&req.cancel)?;
         let ctrl_nchw = control_image_to_nchw(control_image, req.width, req.height, device)?;
         let ctrl_latent = self.vae_encoder.encode(&ctrl_nchw)?;
+        let (positive, negative) = context;
         let prepared = self
             .dit
-            .prepare_control_conditioning(&context, &ctrl_latent)?;
+            .prepare_control_conditioning(&positive, &ctrl_latent)?;
+        let negative = negative
+            .as_ref()
+            .map(|context| self.dit.prepare_control_conditioning(context, &ctrl_latent))
+            .transpose()?;
         let scale = req.control_scale as f64;
 
         let (lat_h, lat_w) = (
@@ -569,13 +593,21 @@ impl Krea2ControlHeavy {
         let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
             .to_device(device)?;
 
-        let sigmas = turbo_sigmas(req.steps);
+        let native = turbo_sigmas(req.steps);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            crate::schedule::TURBO_MU as f32,
+            req.steps,
+            &native,
+        )
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
         // The control branch injects its residual inside `forward_with_control`, so the running latent
         // the preview sees is the ordinary `[1, 16, H/8, W/8]` Krea trajectory — the same latent space
         // the reused Qwen fit was measured in, packed base tier or not (the branch dequants on load).
         let preview = crate::preview::hook(&req.preview);
         let latent = candle_gen::run_flow_sampler(
-            None,
+            req.sampler.as_deref(),
             TimestepConvention::Sigma,
             &sigmas,
             noise,
@@ -593,7 +625,23 @@ impl Krea2ControlHeavy {
                     &prepared,
                     scale,
                 )?;
-                Ok(v.to_dtype(DType::F32)?)
+                let positive = v.to_dtype(DType::F32)?;
+                match &negative {
+                    Some(negative) => {
+                        let negative = forward_with_prepared_control(
+                            &self.dit,
+                            &self.branch,
+                            x,
+                            &t,
+                            negative,
+                            scale,
+                        )?
+                        .to_dtype(DType::F32)?;
+                        Ok((&positive
+                            + ((&positive - negative)? * req.guidance.unwrap_or(0.0) as f64)?)?)
+                    }
+                    None => Ok(positive),
+                }
             },
         )?;
 
@@ -612,6 +660,29 @@ impl Krea2ControlHeavy {
 fn validate_request(req: &Krea2ControlRequest) -> Result<()> {
     if req.prompt.trim().is_empty() {
         return Err(CandleError::Msg("krea control: prompt is required".into()));
+    }
+    if req.guidance.is_some_and(|guidance| !guidance.is_finite()) {
+        return Err(CandleError::Msg(
+            "krea control: guidance must be finite".into(),
+        ));
+    }
+    if req
+        .scheduler_shift
+        .is_some_and(|shift| !shift.is_finite() || shift <= 0.0)
+    {
+        return Err(CandleError::Msg(
+            "krea control: scheduler shift must be finite and positive".into(),
+        ));
+    }
+    if req.guidance.unwrap_or(0.0) == 0.0
+        && req
+            .negative_prompt
+            .as_ref()
+            .is_some_and(|text| !text.trim().is_empty())
+    {
+        return Err(CandleError::Msg(
+            "krea control: a negative prompt requires nonzero CFG".into(),
+        ));
     }
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(CandleError::Msg(format!(
@@ -873,6 +944,33 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&ok).is_ok());
+    }
+
+    #[test]
+    fn experimental_sampling_is_validated_before_control_encoding() {
+        for (guidance, expected) in [
+            (None, false),
+            (Some(0.0), false),
+            (Some(1.5), true),
+            (Some(-0.5), true),
+            (Some(f32::NAN), false),
+        ] {
+            let request = Krea2ControlRequest {
+                prompt: "p".into(),
+                negative_prompt: Some("blurry".into()),
+                guidance,
+                ..Default::default()
+            };
+            assert_eq!(validate_request(&request).is_ok(), expected);
+        }
+        for shift in [0.0, -1.0, f32::INFINITY] {
+            let request = Krea2ControlRequest {
+                prompt: "p".into(),
+                scheduler_shift: Some(shift),
+                ..Default::default()
+            };
+            assert!(validate_request(&request).is_err());
+        }
     }
 
     /// The size/steps guards fire.

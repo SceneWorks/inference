@@ -57,8 +57,8 @@ fn variant_ids_and_schedules() {
     );
     assert_eq!(Sd3Variant::LargeTurbo.default_steps(), 4);
     assert!((Sd3Variant::LargeTurbo.default_guidance() - 1.0).abs() < 1e-6);
-    // Turbo is distilled, guidance-free (no classifier-free guidance / negative prompt).
-    assert!(!Sd3Variant::LargeTurbo.uses_classifier_free_guidance());
+    // Turbo defaults to CFG-off but accepts explicit CFG and negative conditioning.
+    assert!(Sd3Variant::LargeTurbo.uses_classifier_free_guidance());
 
     // Both variants share one MMDiT arch.
     assert_eq!(Sd3Variant::Large.arch(), Sd3Variant::LargeTurbo.arch());
@@ -87,7 +87,7 @@ fn descriptor_capabilities() {
     let turbo = Sd3Variant::LargeTurbo.descriptor();
     assert_eq!(turbo.id, SD3_5_LARGE_TURBO_ID);
     assert!(!turbo.capabilities.supports_true_cfg);
-    assert!(!turbo.capabilities.supports_negative_prompt);
+    assert!(turbo.capabilities.supports_negative_prompt);
     assert!(turbo.capabilities.supports_preview);
 
     let medium = Sd3Variant::Medium.descriptor();

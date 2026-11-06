@@ -14,8 +14,6 @@
 
 use std::path::Path;
 
-use mlx_rs::Array;
-
 use mlx_gen::img2img::init_time_step;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
@@ -26,8 +24,8 @@ use mlx_gen::{
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 
 use crate::pipeline::{
-    base_flow_schedule, resolve_reference, BooguBaseCond, BooguEncoders, BooguHeavy, EditOptions,
-    GenerateOptions, TurboOptions,
+    resolve_reference, BooguBaseCond, BooguEncoders, BooguHeavy, EditOptions, GenerateOptions,
+    TurboOptions,
 };
 use crate::tokenizer::BooguTokenizer;
 
@@ -83,7 +81,7 @@ pub fn descriptor() -> ModelDescriptor {
         modality: Modality::Image,
         capabilities: Capabilities {
             // The CFG-negative is a fixed empty/drop instruction, not a user negative prompt.
-            supports_negative_prompt: false,
+            supports_negative_prompt: true,
             supports_guidance: true,
             // Base/Turbo are text-to-image, and a single `Reference` opts them into img2img
             // latent-init (epic 8588 A4.3, sc-10191): VAE-encode the reference + noise-blend at a
@@ -130,7 +128,7 @@ const TURBO_SAMPLERS: &[&str] = &["lcm", "euler_ancestral", "dpmpp_sde"];
 pub fn descriptor_turbo() -> ModelDescriptor {
     let mut d = descriptor();
     d.id = BOOGU_IMAGE_TURBO_ID;
-    d.capabilities.supports_guidance = false;
+    d.capabilities.supports_guidance = true;
     // The Turbo student is a DMD distillation sampler (predict clean estimate → flow-renoise with fresh
     // noise). Its native loop (`generate_turbo`, `req.sampler == None`) stays the byte-exact default; a
     // real-weight survey (sc-7491) showed the curated *stochastic* solvers ([`TURBO_SAMPLERS`]) — `lcm`
@@ -340,7 +338,8 @@ impl Boogu {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
         let preflight =
-            crate::pipeline::preflight_text(&self.tokenizer, &req.prompt, guidance > 1.0)?;
+            crate::pipeline::preflight_text(&self.tokenizer, &req.prompt, guidance != 1.0)?
+                .with_negative_prompt(&self.tokenizer, req.negative_prompt.as_deref())?;
         // img2img (epic 8588 A4.3, sc-10191): a single `Reference` seeds the true-CFG denoise from the
         // VAE-encoded reference at a strength-derived start step; no reference → pure t2i (start 0).
         // Seed-independent — resolved above the residency lifecycle.
@@ -348,7 +347,7 @@ impl Boogu {
         let start_step = reference
             .map(|(_, strength)| init_time_step(steps, Some(strength)))
             .unwrap_or(0);
-        let sigmas = base_flow_schedule(steps, req.scheduler.as_deref());
+        let sigmas = crate::pipeline::base_request_schedule(req, steps)?;
 
         self.residency.run(
             &req.cancel,
@@ -445,11 +444,12 @@ impl Boogu {
             &self.tokenizer,
             &references,
             &req.prompt,
-            guidance > 1.0,
+            guidance != 1.0,
             true,
             false,
-        )?;
-        let sigmas = base_flow_schedule(steps, req.scheduler.as_deref());
+        )?
+        .with_negative_prompt(&self.tokenizer, req.negative_prompt.as_deref())?;
+        let sigmas = crate::pipeline::base_request_schedule(req, steps)?;
         // The faithful edit runs each reference through the vision tower (image-conditioned) and the
         // CFG-negative is the text-only empty/drop instruction — the reference defaults.
         let edit_opts = EditOptions {
@@ -537,7 +537,12 @@ impl Boogu {
             )));
         }
         let steps = req.steps.unwrap_or(DEFAULT_TURBO_STEPS) as usize;
-        let preflight = crate::pipeline::preflight_text(&self.tokenizer, &req.prompt, false)?;
+        let preflight = crate::pipeline::preflight_text(
+            &self.tokenizer,
+            &req.prompt,
+            req.guidance.unwrap_or(0.0) != 0.0,
+        )?
+        .with_negative_prompt(&self.tokenizer, req.negative_prompt.as_deref())?;
         // img2img (epic 8588 A4.3, sc-10191): a single `Reference` seeds the few-step DMD denoise from
         // the VAE-encoded reference at a strength-derived start step; no reference → pure t2i.
         let reference = resolve_reference(req, id)?;
@@ -550,14 +555,11 @@ impl Boogu {
             req.use_pid,
             on_progress,
             |enc: &BooguEncoders| enc.encode_turbo_preflight(&preflight),
-            |encoded: Option<&(Array, Array)>| {
-                let Some((cond, mask)) = encoded else {
-                    return Ok(());
-                };
-                mlx_rs::transforms::eval([cond, mask])?;
-                Ok(())
+            |encoded: Option<&BooguBaseCond>| match encoded {
+                Some(c) => c.materialize(),
+                None => Ok(()),
             },
-            |heavy: &BooguHeavy, (cond, mask), on_progress| {
+            |heavy: &BooguHeavy, c, on_progress| {
                 // No early-stop on Turbo: the PiD decoder (when `use_pid`) is minted at the clean
                 // terminal σ=0 (the DMD loop's final x0 estimate), matching the full-loop latent.
                 let pid_decoder =
@@ -577,14 +579,15 @@ impl Boogu {
                         steps,
                         seed: base_seed.wrapping_add(n as u64),
                         conditioning_sigma: DEFAULT_TURBO_SIGMA,
+                        guidance: req.guidance.unwrap_or(0.0),
+                        scheduler_shift: req.scheduler_shift,
                         sampler: req.sampler.clone(),
                         scheduler: req.scheduler.clone(),
                     };
                     let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
                     let img = match &clean {
                         Some(clean) => heavy.render_turbo_img2img(
-                            &cond,
-                            &mask,
+                            &c,
                             clean,
                             start_step,
                             &opts,
@@ -592,14 +595,9 @@ impl Boogu {
                             &req.cancel,
                             on_progress,
                         )?,
-                        None => heavy.render_turbo_t2i(
-                            &cond,
-                            &mask,
-                            &opts,
-                            decoder,
-                            &req.cancel,
-                            on_progress,
-                        )?,
+                        None => {
+                            heavy.render_turbo_t2i(&c, &opts, decoder, &req.cancel, on_progress)?
+                        }
                     };
                     images.push(img);
                 }
@@ -750,6 +748,20 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
         return Err(Error::Msg(format!("{id}: prompt must not be empty")));
     }
     desc.capabilities.validate_request(id, req)?;
+    let (default, off) = if id == BOOGU_IMAGE_TURBO_ID {
+        (0.0, 0.0)
+    } else {
+        (DEFAULT_GUIDANCE, 1.0)
+    };
+    if req
+        .negative_prompt
+        .as_ref()
+        .is_some_and(|prompt| !prompt.trim().is_empty())
+        && req.guidance.unwrap_or(default) == off
+    {
+        return Err(Error::Msg(format!("{id}: a negative prompt requires CFG")));
+    }
+
     if req.steps == Some(0) {
         return Err(Error::Msg(format!("{id}: steps must be >= 1")));
     }
@@ -1139,7 +1151,7 @@ mod tests {
         assert_eq!(d.backend, "mlx");
         assert_eq!(d.modality, Modality::Image);
         assert!(d.capabilities.supports_guidance);
-        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_negative_prompt);
         // Base is text-to-image with a single-`Reference` img2img surface (sc-10191); no
         // MultiReference (that is the Edit checkpoint's).
         assert_eq!(
@@ -1157,7 +1169,7 @@ mod tests {
         assert_eq!(t.family, b.family);
         assert_eq!(t.modality, b.modality);
         assert!(b.capabilities.supports_guidance);
-        assert!(!t.capabilities.supports_guidance);
+        assert!(t.capabilities.supports_guidance);
         // Turbo inherits the Base img2img `Reference` surface via clone.
         assert_eq!(t.capabilities.conditioning, b.capabilities.conditioning);
         assert_eq!(
@@ -1277,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_guidance_on_turbo_and_negative_prompt() {
+    fn validate_accepts_experimental_turbo_cfg_and_negative_prompt() {
         assert!(validate_request(
             &descriptor_turbo(),
             &GenerationRequest {
@@ -1285,7 +1297,7 @@ mod tests {
                 ..req(512, 512)
             }
         )
-        .is_err());
+        .is_ok());
         assert!(validate_request(
             &descriptor(),
             &GenerationRequest {
@@ -1293,7 +1305,7 @@ mod tests {
                 ..req(512, 512)
             }
         )
-        .is_err());
+        .is_ok());
     }
 
     #[test]

@@ -400,6 +400,7 @@ pub struct SanaGenerateRequest<'a> {
     pub sampler: Option<&'a str>,
     /// Optional curated epic-7114 scheduler name re-shaping σ over the same `mu = ln(shift)`.
     pub scheduler: Option<&'a str>,
+    pub scheduler_shift: Option<f32>,
     /// Optional img2img source. A positive `strength` encodes and renoises it; zero is txt2img.
     pub init_image: Option<&'a Image>,
     pub strength: Option<f32>,
@@ -433,6 +434,7 @@ impl<'a> SanaGenerateRequest<'a> {
             seed: None,
             sampler: None,
             scheduler: None,
+            scheduler_shift: None,
             init_image: None,
             strength: None,
         }
@@ -616,7 +618,15 @@ impl SanaPipeline {
 
         // Static shift=3.0 schedule (scheduler_config.json), resolution-independent. An unset scheduler
         // keeps it byte-exact; a curated name re-shapes σ over the same mu=ln(3).
-        let sigmas = sana_sigmas(req.scheduler, steps);
+        let native = sana_sigmas(req.scheduler, steps);
+        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+            req.scheduler,
+            req.scheduler_shift,
+            SCHEDULE_SHIFT.ln(),
+            steps,
+            &native,
+        )
+        .map_err(|error| CandleError::Msg(error.to_string()))?;
 
         let noise = create_noise(device, seed, req.width, req.height)?;
         let start_step = resolve_init_start(req.init_image, steps, req.strength);
@@ -768,7 +778,15 @@ pub(crate) fn generate_base_staged(
     revalidate_before_load(&mut check)?;
     let transformer =
         load_staged_transformer(root, device, SanaTransformerConfig::sana_1600m(), memory)?;
-    let sigmas = sana_sigmas(req.scheduler, steps);
+    let native = sana_sigmas(req.scheduler, steps);
+    let sigmas = candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler,
+        req.scheduler_shift,
+        SCHEDULE_SHIFT.ln(),
+        steps,
+        &native,
+    )
+    .map_err(|error| CandleError::Msg(error.to_string()))?;
     let mut latents = Vec::with_capacity(seeds.len());
     for seed in seeds {
         if cancel.is_cancelled() {

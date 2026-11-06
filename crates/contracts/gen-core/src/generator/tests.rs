@@ -3450,3 +3450,20 @@ fn effective_reference_image_short_edge_defaults_to_upstreams_2048() {
         );
     }
 }
+
+#[test]
+fn schedule_shift_requires_positive_native_float() {
+    for shift in [0.0, -1.0] {
+        let request = GenerationRequest {
+            scheduler_shift: Some(shift),
+            ..base_req()
+        };
+        let error = caps().validate_request("m", &request).unwrap_err();
+        assert!(error.to_string().contains("scheduler_shift must be > 0"));
+    }
+    let request = GenerationRequest {
+        scheduler_shift: Some(18.375),
+        ..base_req()
+    };
+    assert!(caps().validate_request("m", &request).is_ok());
+}

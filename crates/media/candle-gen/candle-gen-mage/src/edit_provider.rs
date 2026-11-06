@@ -188,6 +188,7 @@ impl MageEdit {
             guidance,
             seed,
             None,
+            None,
             cancel,
             on_progress,
         )
@@ -204,6 +205,7 @@ impl MageEdit {
         steps: usize,
         guidance: f32,
         seed: u64,
+        scheduler_shift: Option<f32>,
         memory: Option<GenerationMemory>,
         cancel: &candle_gen::gen_core::runtime::CancelFlag,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
@@ -232,6 +234,7 @@ impl MageEdit {
             steps,
             guidance,
             seed,
+            scheduler_shift,
             memory,
             cancel,
             on_progress,
@@ -293,7 +296,7 @@ impl MageEdit {
             .reshape((1, references.len() * gh * gw, LATENT_CHANNELS))?
             .to_dtype(DType::BF16)?;
         let positive = text_encoder.encode_edit(instruction, references)?;
-        let negative = (guidance > 1.0)
+        let negative = (guidance != 1.0)
             .then(|| text_encoder.encode_edit(negative_instruction, references))
             .transpose()?;
         Ok(MageEditEncoded {
@@ -313,6 +316,7 @@ impl MageEdit {
         steps: usize,
         guidance: f32,
         seed: u64,
+        scheduler_shift: Option<f32>,
         memory: Option<GenerationMemory>,
         cancel: &candle_gen::gen_core::runtime::CancelFlag,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
@@ -327,6 +331,7 @@ impl MageEdit {
             steps,
             guidance,
             seed,
+            scheduler_shift,
             memory,
             cancel,
             on_progress,
@@ -364,7 +369,7 @@ impl MageEdit {
         }
         let ref_tokens = ref_tokens.to_device(&self.device)?.to_dtype(DType::BF16)?;
         let positive = self.text.encode_edit(instruction, references)?;
-        let negative = (guidance > 1.0)
+        let negative = (guidance != 1.0)
             .then(|| self.text.encode_edit(negative_instruction, references))
             .transpose()?;
         Self::sample_encoded(
@@ -383,6 +388,7 @@ impl MageEdit {
             guidance,
             seed,
             None,
+            None,
             cancel,
             on_progress,
         )
@@ -399,6 +405,7 @@ impl MageEdit {
         steps: usize,
         guidance: f32,
         seed: u64,
+        scheduler_shift: Option<f32>,
         memory: Option<GenerationMemory>,
         cancel: &candle_gen::gen_core::runtime::CancelFlag,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
@@ -430,7 +437,15 @@ impl MageEdit {
         let mut target = noise
             .permute((0, 2, 3, 1))?
             .reshape((1, gh * gw, LATENT_CHANNELS))?;
-        let ladder = scheduler::sigmas(steps)?;
+        let native = scheduler::sigmas(steps)?;
+        let ladder = candle_gen::resolve_flow_schedule_with_shift(
+            None,
+            scheduler_shift,
+            6.0f32.ln(),
+            steps,
+            &native,
+        )
+        .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
         let attention_budget = memory
             .filter(|memory| memory.chunk_attention)
             .and_then(|memory| memory.attention_chunk_size)

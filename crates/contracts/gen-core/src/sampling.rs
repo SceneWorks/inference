@@ -55,6 +55,87 @@ pub use solvers::{
 };
 pub use unified::{apply_coeffs, DenoiseFn, Euler, Sampler};
 
+/// Resolve a flow schedule with an optional multiplicative time-shift override.
+/// An absent override preserves the provider's native schedule byte for byte. With the native
+/// scheduler selected, re-shift its existing grid rather than replacing its spacing or step count.
+pub fn flow_schedule_with_shift(
+    scheduler_name: Option<&str>,
+    native_mu: f32,
+    shift: Option<f32>,
+    steps: usize,
+    native: &[f32],
+) -> crate::Result<Vec<f32>> {
+    if let Some(shift) = shift {
+        if !shift.is_finite() || shift <= 0.0 {
+            return Err(crate::Error::Unsupported(
+                "scheduler shift must be finite and > 0".into(),
+            ));
+        }
+    }
+    let mu = shift.map(f32::ln).unwrap_or(native_mu);
+    if let Some(scheduler) = scheduler_name.and_then(Scheduler::from_name) {
+        let sampling = FlowModelSampling::with_shift(TimestepConvention::Sigma, mu);
+        return Ok(schedule_sigmas(scheduler, &sampling, steps));
+    }
+    let Some(shift) = shift else {
+        return Ok(native.to_vec());
+    };
+    let ratio = f64::from(shift) / f64::from(native_mu).exp();
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return Err(crate::Error::Unsupported(
+            "native flow shift must be finite".into(),
+        ));
+    }
+    Ok(native
+        .iter()
+        .map(|&sigma| {
+            if sigma == 0.0 || sigma == 1.0 {
+                sigma
+            } else {
+                (ratio * f64::from(sigma) / (1.0 + (ratio - 1.0) * f64::from(sigma))) as f32
+            }
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod flow_shift_tests {
+    use super::*;
+    #[test]
+    fn shift_preserves_default_grid_and_changes_native_and_curated_schedules() {
+        let native = [1.0, 0.75, 0.0];
+        assert_eq!(
+            flow_schedule_with_shift(None, 3.0_f32.ln(), None, 2, &native).unwrap(),
+            native
+        );
+        let shifted = flow_schedule_with_shift(None, 3.0_f32.ln(), Some(6.0), 2, &native).unwrap();
+        assert_eq!((shifted[0], shifted[2]), (1.0, 0.0));
+        assert!((shifted[1] - 6.0 / 7.0).abs() < 1e-6);
+        let original =
+            flow_schedule_with_shift(Some("normal"), 3.0_f32.ln(), None, 2, &native).unwrap();
+        let shifted =
+            flow_schedule_with_shift(Some("normal"), 3.0_f32.ln(), Some(6.0), 2, &native).unwrap();
+        assert_ne!(original, shifted);
+        for scheduler in ["normal", "karras", "exponential", "sgm_uniform"] {
+            let prior =
+                flow_schedule_with_shift(Some(scheduler), 3.0_f32.ln(), None, 8, &native).unwrap();
+            let from_prior =
+                flow_schedule_with_shift(Some(scheduler), 3.0_f32.ln(), Some(6.0), 8, &prior)
+                    .unwrap();
+            let direct =
+                flow_schedule_with_shift(Some(scheduler), 3.0_f32.ln(), Some(6.0), 8, &native)
+                    .unwrap();
+            assert_eq!(
+                from_prior, direct,
+                "{scheduler} must be built at the requested shift"
+            );
+        }
+        for invalid in [0.0, -1.0, f32::INFINITY, f32::NAN] {
+            assert!(flow_schedule_with_shift(None, 0.0, Some(invalid), 2, &native).is_err());
+        }
+    }
+}
+
 /// The scalar coefficients of one denoise step. The backend applies
 /// `x_next = a_x·x + a_out·model_output + a_noise·ε`, scaling the model input by `c_in` first.
 #[derive(Clone, Copy, Debug, PartialEq)]

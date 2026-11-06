@@ -67,6 +67,8 @@ fn frac_diff(a: &Image, b: &Image) -> f32 {
 
 fn render(pipe: &BooguPipeline, sampler: Option<&str>, scheduler: Option<&str>) -> Image {
     let opts = TurboOptions {
+        guidance: 0.0,
+        scheduler_shift: None,
         height: H,
         width: W,
         steps: STEPS,

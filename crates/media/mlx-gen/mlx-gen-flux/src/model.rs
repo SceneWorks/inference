@@ -819,6 +819,17 @@ impl Flux1 {
             self.variant.requires_sigma_shift(),
             req.scheduler.as_deref(),
         )?;
+        let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+            req.scheduler.as_deref(),
+            req.scheduler_shift,
+            crate::pipeline::linear_sigma_mu(
+                req.width,
+                req.height,
+                self.variant.requires_sigma_shift(),
+            ),
+            steps,
+            &sigmas,
+        )?;
         // PiD decode overlay (epic 7840, sc-7846) + `from_ldm` early-stop (sc-8048): when `use_pid` is
         // set AND a PiD overlay was loaded, decode (and 4× super-resolve) the latent through PiD instead
         // of the native VAE; errors loudly if `use_pid` was requested without a loaded overlay (no

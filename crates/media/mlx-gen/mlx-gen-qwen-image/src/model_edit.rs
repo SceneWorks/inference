@@ -331,7 +331,7 @@ impl QwenImageEdit {
         &self,
         vl: &QwenVisionLanguageEncoder,
         req: &GenerationRequest,
-        is_lightning: bool,
+        cfg_off: bool,
     ) -> Result<(Array, Option<Array>)> {
         // The fork's `use_picture_prefix=False` edit template carries a single `<|image_pad|>`, so
         // only the **first** reference enters the prompt embeds; its block-diagonal vision output is
@@ -348,7 +348,7 @@ impl QwenImageEdit {
             .collect();
         let vision = vl.encode_vision(&pre.pixel_values, &grids)?;
         let pos = self.encode_edit(vl, &req.prompt, pre.n_image_tokens, &vision)?;
-        let neg = if is_lightning {
+        let neg = if cfg_off {
             None
         } else {
             Some(self.encode_edit(
@@ -430,7 +430,7 @@ impl QwenImageEdit {
         // the few-step recipe (its matching Edit Lightning LoRA must be supplied via `spec.adapters`),
         // else the production resolution-dependent schedule.
         let (out_w, out_h) = (req.width, req.height);
-        let params = resolve_run_params(req, out_w, out_h);
+        let params = resolve_run_params(req, out_w, out_h)?;
         // Phase A: reference + prompts → conditioning embeds (epic 10834 Phase 1, sc-11006; sc-11125).
         // Under `Sequential` the shared seam loads the Qwen2.5-VL encoder, runs the vision tower over
         // the reference + the LM over pos/neg, materializes, then DROPS it + `clear_cache()` so its
@@ -441,7 +441,7 @@ impl QwenImageEdit {
             req.use_pid,
             on_progress,
             |vl: &QwenVisionLanguageEncoder| {
-                let encoded = self.encode_phase_a(vl, req, params.is_lightning)?;
+                let encoded = self.encode_phase_a(vl, req, params.guidance == 1.0)?;
                 crate::pipeline::finish_conditioning(req, MODEL_ID, || {
                     match &encoded.1 {
                         Some(neg) => mlx_rs::transforms::eval([&encoded.0, neg])?,

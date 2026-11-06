@@ -37,8 +37,8 @@ fn registered_turbo_renders_1024_at_exact_four_step_defaults() {
     let descriptor = generator.descriptor();
     assert_eq!(descriptor.id, "mage_flow_turbo");
     assert_eq!(descriptor.capabilities.max_count, MAX_COUNT);
-    assert!(!descriptor.capabilities.supports_guidance);
-    assert!(!descriptor.capabilities.supports_negative_prompt);
+    assert!(descriptor.capabilities.supports_guidance);
+    assert!(descriptor.capabilities.supports_negative_prompt);
 
     let request = GenerationRequest {
         prompt: "a small red fox sleeping beneath a snow-covered pine tree".into(),

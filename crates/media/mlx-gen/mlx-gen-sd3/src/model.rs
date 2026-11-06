@@ -455,7 +455,8 @@ impl Sd3Large {
                 let scheduler = FlowMatchEuler::from_sigmas(pipeline::resolve_sd3_sigmas(
                     req.scheduler.as_deref(),
                     steps,
-                ))?;
+                    req.scheduler_shift,
+                )?)?;
 
                 let attention = crate::memory_strategy::attention_plan(req);
                 let transformer_window = crate::memory_strategy::transformer_window(req)?;
@@ -552,15 +553,17 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
             req.width, req.height
         )));
     }
-    // F-094a: a negative prompt is only honored when CFG is active (guidance != 1.0, which runs the
-    // uncond forward). An explicit `guidance <= 1.0` alongside a negative prompt would silently
-    // discard the negative — reject the combination with a typed error instead of the silent no-op
-    // (Turbo already rejects `guidance`/`negative_prompt` wholesale via the shared floor's capability
-    // checks; this is the true-CFG analogue for a guidance value that disables CFG).
-    if req.negative_prompt.is_some() && req.guidance.is_some_and(|g| g <= 1.0) {
+    // Standard CFG has no negative contribution exactly at scale one. Other finite
+    // values, including inverse guidance, remain experimental but meaningful.
+    let variant = match id {
+        crate::config::SD3_5_LARGE_TURBO_ID => Sd3Variant::LargeTurbo,
+        crate::config::SD3_5_MEDIUM_ID => Sd3Variant::Medium,
+        _ => Sd3Variant::Large,
+    };
+    let effective_guidance = req.guidance.unwrap_or(variant.default_guidance());
+    if req.negative_prompt.is_some() && effective_guidance == 1.0 {
         return Err(Error::Msg(format!(
-            "{id}: a negative prompt requires guidance > 1.0 (guidance <= 1.0 disables CFG, so the \
-             negative prompt would be ignored); raise guidance or drop the negative prompt"
+            "{id}: a negative prompt requires guidance != 1.0; change guidance or drop the negative prompt"
         )));
     }
     Ok(())
@@ -1168,13 +1171,13 @@ mod tests {
             ..base.clone()
         };
         let err = validate_request(&d, &g1).unwrap_err().to_string();
-        assert!(err.contains("guidance > 1.0"), "got: {err}");
-        // guidance < 1.0 is likewise rejected with a negative prompt.
+        assert!(err.contains("guidance != 1.0"), "got: {err}");
+        // Inverse guidance retains the unconditional contribution.
         let g0 = GenerationRequest {
             guidance: Some(0.5),
             ..base.clone()
         };
-        assert!(validate_request(&d, &g0).is_err());
+        assert!(validate_request(&d, &g0).is_ok());
         // guidance > 1.0 + a negative prompt is fine (CFG on, negative honored).
         let g2 = GenerationRequest {
             guidance: Some(4.5),
@@ -1195,8 +1198,8 @@ mod tests {
         assert_eq!(d.family, "sd3");
         assert_eq!(d.modality, Modality::Image);
         assert!(!d.capabilities.supports_true_cfg);
-        assert!(!d.capabilities.supports_guidance);
-        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_negative_prompt);
     }
 
     #[test]
@@ -1210,21 +1213,29 @@ mod tests {
     }
 
     #[test]
-    fn turbo_rejects_guidance_and_negative_prompt() {
-        // On Turbo, supplying guidance or a negative prompt is a validation error (CFG-off variant).
+    fn turbo_accepts_experimental_guidance_and_negative_prompt() {
+        // Explicit experimental CFG enables negative conditioning; omitted/unit guidance stays off.
         let d = turbo_descriptor();
         let with_guidance = GenerationRequest {
             prompt: "a fox".into(),
             guidance: Some(3.5),
             ..Default::default()
         };
-        assert!(validate_request(&d, &with_guidance).is_err());
+        assert!(validate_request(&d, &with_guidance).is_ok());
         let with_neg = GenerationRequest {
             prompt: "a fox".into(),
             negative_prompt: Some("blurry".into()),
+            guidance: Some(1.5),
             ..Default::default()
         };
-        assert!(validate_request(&d, &with_neg).is_err());
+        assert!(validate_request(&d, &with_neg).is_ok());
+        for guidance in [None, Some(1.0)] {
+            let off = GenerationRequest {
+                guidance,
+                ..with_neg.clone()
+            };
+            assert!(validate_request(&d, &off).is_err());
+        }
         // A plain txt2img request (no guidance/neg) passes.
         let plain = GenerationRequest {
             prompt: "a fox".into(),
