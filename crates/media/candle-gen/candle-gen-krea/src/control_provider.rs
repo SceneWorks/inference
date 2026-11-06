@@ -661,6 +661,29 @@ fn validate_request(req: &Krea2ControlRequest) -> Result<()> {
     if req.prompt.trim().is_empty() {
         return Err(CandleError::Msg("krea control: prompt is required".into()));
     }
+    if req.guidance.is_some_and(|guidance| !guidance.is_finite()) {
+        return Err(CandleError::Msg(
+            "krea control: guidance must be finite".into(),
+        ));
+    }
+    if req
+        .scheduler_shift
+        .is_some_and(|shift| !shift.is_finite() || shift <= 0.0)
+    {
+        return Err(CandleError::Msg(
+            "krea control: scheduler shift must be finite and positive".into(),
+        ));
+    }
+    if req.guidance.unwrap_or(0.0) == 0.0
+        && req
+            .negative_prompt
+            .as_ref()
+            .is_some_and(|text| !text.trim().is_empty())
+    {
+        return Err(CandleError::Msg(
+            "krea control: a negative prompt requires nonzero CFG".into(),
+        ));
+    }
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(CandleError::Msg(format!(
             "krea control: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
@@ -921,6 +944,33 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&ok).is_ok());
+    }
+
+    #[test]
+    fn experimental_sampling_is_validated_before_control_encoding() {
+        for (guidance, expected) in [
+            (None, false),
+            (Some(0.0), false),
+            (Some(1.5), true),
+            (Some(-0.5), true),
+            (Some(f32::NAN), false),
+        ] {
+            let request = Krea2ControlRequest {
+                prompt: "p".into(),
+                negative_prompt: Some("blurry".into()),
+                guidance,
+                ..Default::default()
+            };
+            assert_eq!(validate_request(&request).is_ok(), expected);
+        }
+        for shift in [0.0, -1.0, f32::INFINITY] {
+            let request = Krea2ControlRequest {
+                prompt: "p".into(),
+                scheduler_shift: Some(shift),
+                ..Default::default()
+            };
+            assert!(validate_request(&request).is_err());
+        }
     }
 
     /// The size/steps guards fire.
