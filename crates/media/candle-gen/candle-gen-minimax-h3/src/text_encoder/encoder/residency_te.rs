@@ -505,6 +505,18 @@ fn production_prompt_resident_window_first_difference() -> Result<()> {
                 .collect::<Vec<_>>()
         )
     );
+    assert_eq!(attention_mask.dims(), [1, ROWS]);
+    assert_eq!(attention_mask.dtype(), DType::U32);
+    let mask_values = attention_mask
+        .flatten_all()?
+        .force_contiguous()?
+        .to_vec1::<u32>()?;
+    assert_eq!(mask_values.len(), ROWS);
+    assert!(mask_values.iter().all(|&value| value == 1));
+    let native_mask_identity = json!({
+        "shape":attention_mask.dims(),"dtype":"U32","elements":mask_values.len(),
+        "sha256":format!("{:x}",Sha256::digest(mask_values.iter().flat_map(|value|value.to_le_bytes()).collect::<Vec<_>>()))
+    });
     crate::nn::reset_attention_execution_report();
     let (mut resident, resident_context, same_policy) = with_workspace(
         &device,
@@ -609,7 +621,7 @@ fn production_prompt_resident_window_first_difference() -> Result<()> {
     let accepted = same_policy["exact"] == true && finite;
     let evidence = json!({"kind":"h3-residency-te/v1","schemaVersion":1,"accepted":accepted,
         "source":{"manifestSha256":MANIFEST_SHA,"manifest":manifest,"verifiedAssets":verified,"requestSha256":REQUEST_SHA},
-        "input":{"idsShape":ids.dims(),"idsSha256":ids_hash,"attentionMask":tensor_identity(&attention_mask)?,"tokens":ROWS},
+        "input":{"idsShape":ids.dims(),"idsSha256":ids_hash,"attentionMask":native_mask_identity,"tokens":ROWS},
         "planning":plan,"same_policy":same_policy,"workspace_default_vs_32m":observation,
         "completedLayerPairs":50,"completedDefaultResidentLayers":50,"materializedAttentionCalls":routes.materialized_calls,
         "actualF32ReducedPrecision":candle_gen::candle_core::cuda::gemm_reduced_precision_f32(),
