@@ -217,6 +217,7 @@ fn real_weight_pulid() {
         id_weight: 1.0,
         sampler: None,
         scheduler: None,
+        scheduler_shift: None,
         seed: 12345,
         // Native VAE: this harness validates the face-identity pipeline, not the optional PiD SR (sc-8044).
         use_pid: false,
