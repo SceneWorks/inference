@@ -135,7 +135,13 @@ pub fn sd3_sigmas(steps: usize, shift: f32) -> Vec<f32> {
             };
             // linspace(1.0, 1/steps, steps)
             let sigma = 1.0 - frac * (1.0 - min_sigma);
-            shift * sigma / (1.0 + (shift - 1.0) * sigma)
+            // The endpoint is invariant. For small positive shifts, f32 rounds `shift - 1`
+            // to -1, which would otherwise turn this first node into a division by zero.
+            if sigma == 1.0 {
+                1.0
+            } else {
+                shift * sigma / (1.0 + (shift - 1.0) * sigma)
+            }
         })
         .collect();
     out.push(0.0);
@@ -1097,6 +1103,21 @@ mod tests {
             shifted[mid],
             unshifted[mid]
         );
+    }
+
+    #[test]
+    fn small_positive_shift_preserves_finite_schedule_endpoints() {
+        for shift in [1e-8, 1e-20, f32::MIN_POSITIVE] {
+            for steps in [1, 4, 50] {
+                for scheduler in [None, Some("normal")] {
+                    let sigmas = resolve_sd3_sigmas(scheduler, steps, shift);
+                    assert_eq!(sigmas.first(), Some(&1.0), "{shift} {scheduler:?}");
+                    assert_eq!(sigmas.last(), Some(&0.0), "{shift} {scheduler:?}");
+                    assert!(sigmas.iter().all(|sigma| sigma.is_finite()));
+                    assert!(sigmas.windows(2).all(|pair| pair[0] >= pair[1]));
+                }
+            }
+        }
     }
 
     #[test]
