@@ -27,7 +27,7 @@
 //! # This lane materializes attention scores; MLX's does not
 //!
 //! MLX calls a fused `scaled_dot_product_attention` that streams the scores. candle has no such
-//! masked kernel, so attention routes through [`crate::nn::sdpa_masked`] and the shared
+//! masked kernel, so attention routes through `crate::nn::sdpa_masked` and the shared
 //! materializing attention plan. At **64 heads** the `[1, 64, S, S]` score tensor crosses `i32::MAX` at
 //! S ≈ 5793 — well inside the presentation lengths a long `fl2va` prompt with two keyframe vision
 //! blocks can reach — so the budgeted split is load-bearing here, not a precaution.
