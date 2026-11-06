@@ -52,15 +52,73 @@ pub struct CudaWorkingSet {
     pub hidden: u64,
     pub heads: u64,
     pub head_dim: u64,
+    pub rotary_dim: u64,
     pub ffn_inner: u64,
     pub element_bytes: u64,
     pub projection_decode_bytes: u64,
 }
 impl CudaWorkingSet {
+    fn attention_tables_bytes(self, rows: u64) -> Result<u64> {
+        // MmRopeTables retains two F32 [S,R] tables across every block. The existing
+        // 64-byte row envelope also covers device positions (12), inverse permutation (4),
+        // resident local/class indices (8), active AdaLN/timestep indices (8), and one
+        // gather/scatter U32 upload (4). Host F64 position rows and Vec indices are excluded.
+        times(rows, plus(times(8, self.rotary_dim)?, 64)?)
+    }
     pub fn carried_attention_bytes(self, rows: u64) -> Result<u64> {
         plus(
             times(times(times(2, self.hidden)?, rows)?, self.element_bytes)?,
-            times(rows, plus(times(8, self.head_dim)?, 64)?)?,
+            self.attention_tables_bytes(rows)?,
+        )
+    }
+    fn qk_norm_peak(self, rows: u64, inner: u64) -> Result<u64> {
+        // DitAttention's shadowed original Q/K/V stay alive through the inner scope. During
+        // the second rms_weighted, normalized Q is also retained: four stream buffers.
+        // nn::rms_weighted retains xf and normed through the final weighted cast. F32 xf
+        // aliases K only on an F32 stream; the final cast likewise aliases its F32 input.
+        let f32_inner = times(times(times(rows, self.heads)?, self.head_dim)?, 4)?;
+        let reduction = times(times(rows, self.heads)?, 4)?;
+        let (xf, cast) = if self.element_bytes == 4 {
+            (0, 0)
+        } else {
+            (f32_inner, inner)
+        };
+        let square_reduce = plus(f32_inner, reduction)?;
+        let divide = plus(f32_inner, times(2, reduction)?)?;
+        let weighted_cast = plus(
+            plus(times(2, f32_inner)?, cast)?,
+            times(4, self.head_dim)?, // at most one F32 norm-weight cast
+        )?;
+        plus(
+            plus(times(4, inner)?, xf)?,
+            square_reduce.max(divide).max(weighted_cast),
+        )
+    }
+    fn rotary_peak(self, rows: u64, inner: u64) -> Result<u64> {
+        let rotated = times(
+            times(times(rows, self.heads)?, self.rotary_dim)?,
+            self.element_bytes,
+        )?;
+        let partial = self.rotary_dim != self.head_dim;
+        let head = if partial { rotated } else { 0 };
+        let table_casts = if self.element_bytes == 4 {
+            0
+        } else {
+            times(times(times(2, rows)?, self.rotary_dim)?, self.element_bytes)?
+        };
+        // During the second apply: original QKV, normalized Q/K and already rotated Q
+        // remain (six stream buffers). apply retains head, rotated, both products and
+        // their sum at the multiply-add; partial rotary then cats out+tail into a full
+        // buffer. The head view is a copy only for partial rotary. Narrow views alias.
+        let multiply_add = plus(head, times(4, rotated)?)?;
+        let final_cat = if partial {
+            plus(plus(head, times(2, rotated)?)?, inner)?
+        } else {
+            0 // out is already contiguous
+        };
+        plus(
+            plus(times(6, inner)?, table_casts)?,
+            multiply_add.max(final_cat),
         )
     }
     fn operation_peak(self, rows: u64) -> Result<u64> {
@@ -76,11 +134,26 @@ impl CudaWorkingSet {
                 .query_block_rows(score_row, rows),
             score_row,
         )?;
-        // Scoped block attention retains input/modulated hidden while QKV normalization/rope
-        // or SDPA runs. Materialized SDPA owns contiguous Q/K/V, retained spans and final cat.
+        // Materialized SDPA: caller QKV (3), its own contiguous Q/Kt/V (3), retained
+        // output spans (1) and final cat (1). H3 uses softmax_last_dim, so 16 bytes per
+        // score covers the two score/scaling buffers plus softmax output for F32 or BF16.
+        let materialized = plus(times(8, inner)?, times(16, scores)?)?;
+        // The current vendored fixed-length FlashAttention wrapper allocates an F32
+        // [B,128,H,S] LSE buffer, not [B,H,S]. Its kernel overlaps caller QKV+output;
+        // after return the output's transpose/contiguous overlaps one more full buffer.
+        let flash_lse = times(times(rows, self.heads)?, 128 * 4)?;
+        let fused = plus(times(4, inner)?, flash_lse)?.max(times(5, inner)?);
+        // Head merge retains the original SDPA output and its contiguous merged copy;
+        // to_out then allocates hidden output while caller QKV remain.
+        let output_projection = plus(times(5, inner)?, hidden)?;
+        // Scoped attention retains input and modulated hidden throughout these alternatives.
         let attention = plus(
             times(2, hidden)?,
-            times(10, inner)?.max(plus(times(8, inner)?, times(16, scores)?)?),
+            self.qk_norm_peak(rows, inner)?
+                .max(self.rotary_peak(rows, inner)?)
+                .max(materialized)
+                .max(fused)
+                .max(output_projection),
         )?;
         // SwiGLU chunks bound the expanded projection. Prior output spans and final cat
         // coexist with full hidden input; token-axis chunking never changes the key domain.
@@ -94,7 +167,10 @@ impl CudaWorkingSet {
             )?,
         )?;
         plus(
-            attention.max(ffn).max(times(8, hidden)?),
+            plus(
+                attention.max(ffn).max(times(8, hidden)?),
+                self.attention_tables_bytes(rows)?,
+            )?,
             self.projection_decode_bytes,
         )
     }
@@ -235,6 +311,9 @@ impl WindowAllocation {
         if facts.hidden == 0
             || facts.heads == 0
             || facts.head_dim == 0
+            || facts.rotary_dim == 0
+            || !facts.rotary_dim.is_multiple_of(2)
+            || facts.rotary_dim > facts.head_dim
             || facts.ffn_inner == 0
             || !matches!(facts.element_bytes, 2 | 4)
         {
@@ -733,6 +812,7 @@ mod tests {
             hidden: 16,
             heads: 2,
             head_dim: 8,
+            rotary_dim: 6,
             ffn_inner: 32,
             element_bytes: 2,
             projection_decode_bytes: 512,
@@ -754,6 +834,72 @@ mod tests {
             210
         );
         assert!(facts.operation_peak(u64::MAX).is_err());
+
+        // Source-lifetime regression: the second BF16 RMS norm's final cast retains
+        // 4 stream inputs + xf/normed/weighted F32 (6 stream equivalents) + cast (1).
+        let stock = CudaWorkingSet {
+            hidden: 5376,
+            heads: 56,
+            head_dim: 128,
+            rotary_dim: 96,
+            ffn_inner: 14336,
+            element_bytes: 2,
+            projection_decode_bytes: 0,
+        };
+        let packed = 104_000;
+        let inner = packed * 56 * 128 * 2;
+        assert_eq!(stock.qk_norm_peak(packed, inner).unwrap(), 11 * inner + 512);
+        let rotary = packed * 56 * 96 * 2;
+        let cast_tables = 2 * packed * 96 * 2;
+        assert_eq!(
+            stock.rotary_peak(packed, inner).unwrap(),
+            6 * inner + cast_tables + (5 * rotary).max(inner + 3 * rotary)
+        );
+        // Tables/layout survive both attention and FFN; dequantization is a separate,
+        // simultaneous maximum supplied by the selected weight inventory.
+        let expected = 2 * packed * 5376 * 2 + 11 * inner + 512 + packed * (8 * 96 + 64);
+        assert_eq!(stock.operation_peak(packed).unwrap(), expected);
+        assert_eq!(expected, 18_723_328_512);
+        assert_eq!(
+            CudaWorkingSet {
+                element_bytes: 4,
+                ..stock
+            }
+            .qk_norm_peak(packed, inner * 2)
+            .unwrap(),
+            6 * inner * 2 + 512
+        );
+        // Partial rotary below half a head is dominated by its final full-width cat,
+        // and an F32 stream aliases its already-F32 cos/sin tables.
+        let narrow = CudaWorkingSet {
+            rotary_dim: 2,
+            element_bytes: 4,
+            ..facts
+        };
+        assert_eq!(narrow.rotary_peak(3, 3 * 2 * 8 * 4).unwrap(), 1488);
+        // For short sequences/small heads the vendored 128-wide LSE, not a multiple
+        // of inner, determines fused scratch. This fails if LSE is priced as [B,H,S].
+        assert_eq!(
+            CudaWorkingSet {
+                hidden: 1,
+                heads: 1,
+                ffn_inner: 1,
+                projection_decode_bytes: 0,
+                ..facts
+            }
+            .operation_peak(1)
+            .unwrap(),
+            692
+        );
+        for rotary_dim in [0, 3, 10] {
+            assert!(profile
+                .clone()
+                .with_cuda_working_set(CudaWorkingSet {
+                    rotary_dim,
+                    ..facts
+                })
+                .is_err());
+        }
     }
     #[test]
     fn dense_precompute_cache_grows_by_actual_window_end_and_evicts_adaln() {

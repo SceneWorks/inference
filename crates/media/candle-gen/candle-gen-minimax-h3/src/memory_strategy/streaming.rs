@@ -30,6 +30,7 @@ pub(super) fn dit_window(
         hidden: cfg.hidden_size as u64,
         heads: cfg.num_attention_heads as u64,
         head_dim: cfg.attention_head_dim as u64,
+        rotary_dim: cfg.rotary_dim() as u64,
         ffn_inner: cfg.ffn_dim as u64,
         element_bytes: 2,
         projection_decode_bytes: decode,
