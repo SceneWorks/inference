@@ -183,6 +183,7 @@ fn plan_freezes_schedule_decode_count_and_preparation_inputs() {
         ])
     );
     assert_eq!(plan.denoise_sigmas(), plan.sigmas());
+    assert!(snapshot["pass"].get("inert_splits").is_none());
     req.memory = Some(GenerationMemory::default());
     plan.check_request(&descriptor(), &req).unwrap();
     req.prompt += " changed";
@@ -193,6 +194,230 @@ fn plan_freezes_schedule_decode_count_and_preparation_inputs() {
     assert!(plan
         .check_load(&RenderLoadBinding::from_spec(&other))
         .is_err());
+}
+
+#[test]
+fn inert_phase_boundaries_cover_executed_steps_without_changing_request() {
+    let req = GenerationRequest::default();
+    let plan = RenderPlan::base_image(
+        &descriptor(),
+        &req,
+        pass(vec![1.0, 0.8, 0.6, 0.4, 0.2, 0.0], 5, 0.0),
+    )
+    .unwrap();
+    let one_span = 0..5;
+    assert_eq!(plan.denoise_spans(), std::slice::from_ref(&one_span));
+    assert!(plan.clone().with_inert_split_at(0).is_err());
+    assert!(plan.clone().with_inert_split_at(5).is_err());
+    let split = plan
+        .with_inert_split_at(4)
+        .unwrap()
+        .with_inert_split_at(2)
+        .unwrap()
+        .with_inert_split_at(2)
+        .unwrap();
+    assert_eq!(split.denoise_spans(), [0..2, 2..4, 4..5]);
+    assert_eq!(split.denoise_sigmas(), &[1.0, 0.8, 0.6, 0.4, 0.2, 0.0]);
+    assert_eq!(split.guidance(), 3.5);
+    split.check_request(&descriptor(), &req).unwrap();
+    assert_eq!(
+        serde_json::to_value(&split).unwrap()["pass"]["inert_splits"],
+        serde_json::json!([2, 4])
+    );
+}
+
+#[derive(Default)]
+struct PhaseScope {
+    events: Vec<(bool, MemoryPhase, usize)>,
+    active: Option<usize>,
+    terminal: Vec<MemoryRunOutcome>,
+}
+
+impl MemoryRequestScope for PhaseScope {
+    fn configure_request(&mut self, _: &mut GenerationRequest) -> Result<()> {
+        unreachable!()
+    }
+    fn finish(&mut self, outcome: MemoryRunOutcome) -> Result<()> {
+        self.active = None; // owner-side teardown after a failed phase
+        self.terminal.push(outcome);
+        Ok(())
+    }
+    fn enter_phase(&mut self, phase: MemoryPhase) -> Result<()> {
+        self.events.push((true, phase, 0));
+        Ok(())
+    }
+    fn enter_render_phase(&mut self, phase: MemoryPhase, id: &RenderPhaseIdentity) -> Result<()> {
+        if phase == MemoryPhase::Denoise {
+            assert!(self.active.replace(id.phase).is_none());
+        }
+        assert_eq!(
+            (id.pass, id.geometry.width, id.geometry.height),
+            (0, 1024, 1024)
+        );
+        self.events.push((true, phase, id.phase));
+        Ok(())
+    }
+    fn leave_phase(&mut self, phase: MemoryPhase) -> Result<()> {
+        let index = if phase == MemoryPhase::Denoise {
+            self.active.take().expect("denoise phase was entered")
+        } else {
+            0
+        };
+        self.events.push((false, phase, index));
+        Ok(())
+    }
+    fn configure_decode(&mut self, _: u32, _: u32, _: MemoryGeometry) -> Result<()> {
+        unreachable!()
+    }
+    fn configure_attention(&mut self, _: u32) -> Result<()> {
+        unreachable!()
+    }
+    fn materialize_transformer_window(&mut self, _: u32, _: u32) -> Result<()> {
+        unreachable!()
+    }
+}
+
+#[test]
+#[allow(clippy::drop_non_drop)] // End RenderRun's scope borrow before inspecting the mock.
+fn two_inert_phases_enter_distinct_scopes_in_order_for_each_image() {
+    let req = GenerationRequest {
+        count: 2,
+        seed: Some(11),
+        ..Default::default()
+    };
+    let plan = plan(&req).unwrap().with_inert_split_at(1).unwrap();
+    let mut scope = PhaseScope::default();
+    let run = RenderRun::new(&plan, &req.cancel, Some(&mut scope));
+    run.encode(|| Ok::<_, Error>(())).unwrap();
+    let images = run
+        .images_with_denoise_phases(
+            &mut |_| {},
+            Ok::<_, Error>,
+            |_, seed, _| {
+                run.begin_denoise_phase(0)?;
+                run.end_denoise_phase(0)?;
+                run.begin_denoise_phase(1)?;
+                run.end_denoise_phase(1)?;
+                Ok(seed)
+            },
+            |_, seed, _| Ok(seed),
+        )
+        .unwrap();
+    assert_eq!(images, [11, 12]);
+    drop(run);
+    use MemoryPhase::*;
+    assert_eq!(
+        scope.events,
+        [
+            (true, Conditioning, 0),
+            (false, Conditioning, 0),
+            (true, Denoise, 0),
+            (false, Denoise, 0),
+            (true, Denoise, 1),
+            (false, Denoise, 1),
+            (true, Decode, 0),
+            (false, Decode, 0),
+            (true, Denoise, 0),
+            (false, Denoise, 0),
+            (true, Denoise, 1),
+            (false, Denoise, 1),
+            (true, Decode, 0),
+            (false, Decode, 0),
+        ]
+    );
+    assert!(scope.active.is_none());
+}
+
+#[test]
+#[allow(clippy::drop_non_drop)] // End RenderRun's scope borrow before inspecting the mock.
+fn one_span_phase_path_keeps_one_denoise_scope() {
+    let req = GenerationRequest::default();
+    let plan = plan(&req).unwrap();
+    let mut scope = PhaseScope::default();
+    let run = RenderRun::new(&plan, &req.cancel, Some(&mut scope));
+    run.encode(|| Ok::<_, Error>(())).unwrap();
+    run.images_with_denoise_phases(
+        &mut |_| {},
+        |_| Ok::<_, Error>(()),
+        |_, (), _| {
+            run.begin_denoise_phase(0)?;
+            run.end_denoise_phase(0)?;
+            Ok(())
+        },
+        |_, (), _| Ok(()),
+    )
+    .unwrap();
+    drop(run);
+    use MemoryPhase::*;
+    assert_eq!(
+        scope.events,
+        [
+            (true, Conditioning, 0),
+            (false, Conditioning, 0),
+            (true, Denoise, 0),
+            (false, Denoise, 0),
+            (true, Decode, 0),
+            (false, Decode, 0),
+        ]
+    );
+}
+
+#[test]
+#[allow(clippy::drop_non_drop)] // End RenderRun's scope borrow before owner teardown.
+fn cancellation_during_phase_preserves_cancel_for_owner_teardown() {
+    let req = GenerationRequest::default();
+    let plan = plan(&req).unwrap().with_inert_split_at(1).unwrap();
+    let mut scope = PhaseScope::default();
+    let run = RenderRun::new(&plan, &req.cancel, Some(&mut scope));
+    run.encode(|| Ok::<_, Error>(())).unwrap();
+    let failure = run.images_with_denoise_phases(
+        &mut |_| {},
+        |_| Ok::<_, Error>(()),
+        |_, (), _| {
+            run.begin_denoise_phase(0)?;
+            req.cancel.cancel();
+            Err::<(), Error>(Error::Canceled)
+        },
+        |_, (), _| -> Result<()> { panic!("decode after cancellation") },
+    );
+    assert!(matches!(failure, Err(Error::Canceled)));
+    drop(run);
+    assert_eq!(scope.active, Some(0));
+    scope.finish(MemoryRunOutcome::Canceled).unwrap();
+    assert!(scope.active.is_none());
+    assert_eq!(scope.terminal.len(), 1);
+}
+
+#[test]
+#[allow(clippy::drop_non_drop)] // End RenderRun's scope borrow before owner teardown.
+fn failed_phase_keeps_original_error_for_owner_teardown() {
+    let req = GenerationRequest::default();
+    let plan = plan(&req).unwrap().with_inert_split_at(1).unwrap();
+    let mut scope = PhaseScope::default();
+    let run = RenderRun::new(&plan, &req.cancel, Some(&mut scope));
+    run.encode(|| Ok::<_, Error>(())).unwrap();
+    let failure = run.images_with_denoise_phases(
+        &mut |_| {},
+        |_| Ok::<_, Error>(()),
+        |_, (), _| {
+            run.begin_denoise_phase(0)?;
+            Err::<(), Error>(Error::Msg("original provider fault".into()))
+        },
+        |_, (), _| -> Result<()> { panic!("decode after failed phase") },
+    );
+    assert!(
+        matches!(failure, Err(Error::Msg(ref message)) if message == "original provider fault")
+    );
+    drop(run);
+    assert_eq!(scope.active, Some(0));
+    assert_eq!(scope.events.last(), Some(&(true, MemoryPhase::Denoise, 0)));
+    scope
+        .finish(MemoryRunOutcome::Error {
+            message: "original provider fault".into(),
+        })
+        .unwrap();
+    assert!(scope.active.is_none());
+    assert_eq!(scope.terminal.len(), 1);
 }
 
 #[test]

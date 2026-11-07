@@ -11,13 +11,180 @@
 //! reproduces the legacy [`super::FlowMatchPolicy`] within the epic's N1 parity gate.
 
 use super::LatentOps;
-use crate::Result;
+use crate::{Error, Result};
+use std::ops::Range;
 
 /// A `denoise(x, σ) -> x0` callback the samplers drive — the engine's model wrapper (input scaling →
 /// model forward → prediction-type recombination, see [`super::model_sampling::denoise`]). Boxed
 /// `FnMut` form so the [`Sampler`] trait stays object-safe; `'a` is the closure's borrow.
 pub type DenoiseFn<'a, L> =
     dyn FnMut(&<L as LatentOps>::Latent, f32) -> Result<<L as LatentOps>::Latent> + 'a;
+
+/// Numerical history for one request trajectory. The full pass schedule and the next absolute
+/// step are retained across inert phase boundaries; resetting history leaves the step position
+/// (and therefore stochastic draw addresses) unchanged.
+pub struct SolverRunState<L: LatentOps> {
+    pub(crate) solver: super::Solver,
+    pub(crate) cfg_pp: bool,
+    pub(crate) sigmas: Vec<f32>,
+    pub(crate) next_step: usize,
+    pub(crate) previous_denoised: Option<L::Latent>,
+    pub(crate) previous_derivative: Option<L::Latent>,
+    pub(crate) previous_sample: Option<L::Latent>,
+    pub(crate) previous_interval: Option<f64>,
+    pub(crate) history_steps: usize,
+    seed: Option<u64>,
+    sampling: Option<SamplingIdentity>,
+    variant: Option<[u32; 3]>,
+}
+
+#[derive(PartialEq, Eq)]
+struct SamplingIdentity {
+    prediction: super::PredictionType,
+    /// Captures the convention and coefficient contract at every pass node, bit for bit.
+    nodes: Vec<[u32; 6]>,
+}
+
+impl SamplingIdentity {
+    fn from_model(ms: &dyn super::ModelSampling, sigmas: &[f32]) -> Self {
+        Self {
+            prediction: ms.prediction(),
+            nodes: sigmas
+                .iter()
+                .map(|&sigma| {
+                    let (denoise_x, denoise_out) = ms.denoised_coeffs(sigma);
+                    let (noise, clean) = ms.noise_scaling_coeffs(sigma);
+                    [
+                        ms.timestep(sigma).to_bits(),
+                        ms.input_scale(sigma).to_bits(),
+                        denoise_x.to_bits(),
+                        denoise_out.to_bits(),
+                        noise.to_bits(),
+                        clean.to_bits(),
+                    ]
+                })
+                .collect(),
+        }
+    }
+}
+
+impl<L: LatentOps> SolverRunState<L> {
+    pub fn new(solver: super::Solver, sigmas: &[f32]) -> Self {
+        Self {
+            solver,
+            cfg_pp: false,
+            sigmas: sigmas.to_vec(),
+            next_step: 0,
+            previous_denoised: None,
+            previous_derivative: None,
+            previous_sample: None,
+            previous_interval: None,
+            history_steps: 0,
+            seed: None,
+            sampling: None,
+            variant: None,
+        }
+    }
+
+    pub fn new_cfg_pp(solver: super::Solver, sigmas: &[f32]) -> Self {
+        let mut state = Self::new(solver, sigmas);
+        state.cfg_pp = true;
+        state
+    }
+
+    pub fn next_step(&self) -> usize {
+        self.next_step
+    }
+
+    /// A geometry change, re-noise or explicit Reset clears solver history without rewinding the
+    /// pass's RNG coordinates. The caller owns separate guidance and driver-cache invalidation.
+    pub fn reset_history(&mut self) {
+        self.previous_denoised = None;
+        self.previous_derivative = None;
+        self.previous_sample = None;
+        self.previous_interval = None;
+        self.history_steps = 0;
+    }
+
+    /// Select a different solver only at an explicit Reset boundary. The pass step and bound seed
+    /// remain absolute; the next span binds its own sampling convention.
+    pub fn reset_for_solver(&mut self, solver: super::Solver) {
+        self.reset_history();
+        self.solver = solver;
+        self.cfg_pp = false;
+        self.sampling = None;
+        self.variant = None;
+    }
+
+    /// Enter CFG++ at an explicit Reset boundary. Its guided/unconditional history is distinct
+    /// from the standard solver history, while the pass step remains absolute.
+    pub fn reset_for_cfg_pp(&mut self, solver: super::Solver) {
+        self.reset_history();
+        self.solver = solver;
+        self.cfg_pp = true;
+        self.sampling = None;
+        self.variant = None;
+    }
+
+    pub(crate) fn check_span(
+        &mut self,
+        solver: super::Solver,
+        ms: &dyn super::ModelSampling,
+        sigmas: &[f32],
+        seed: u64,
+        variant: [u32; 3],
+        span: &Range<usize>,
+    ) -> Result<()> {
+        if self.cfg_pp
+            || self.solver != solver
+            || self.sigmas != sigmas
+            || span.start != self.next_step
+            || span.end < span.start
+            || span.end > sigmas.len().saturating_sub(1)
+            || self.seed.is_some_and(|bound| bound != seed)
+            || self.variant.is_some_and(|bound| bound != variant)
+        {
+            return Err(Error::Unsupported(
+                "solver Carry requires one implementation, unchanged pass schedule and contiguous absolute steps".into(),
+            ));
+        }
+        let sampling = SamplingIdentity::from_model(ms, sigmas);
+        if self
+            .sampling
+            .as_ref()
+            .is_some_and(|bound| bound != &sampling)
+        {
+            return Err(Error::Unsupported(
+                "solver Carry requires the same numerical sampling convention".into(),
+            ));
+        }
+        self.seed = Some(seed);
+        self.sampling = Some(sampling);
+        self.variant = Some(variant);
+        Ok(())
+    }
+
+    pub(crate) fn check_cfg_pp_span(
+        &self,
+        solver: super::Solver,
+        sigmas: &[f32],
+        span: &Range<usize>,
+    ) -> Result<()> {
+        if !self.cfg_pp
+            || (self.solver != solver
+                && !(solver == super::Solver::Euler && self.solver == super::Solver::Ddim))
+            || self.sigmas != sigmas
+            || span.start != self.next_step
+            || span.end < span.start
+            || span.end > sigmas.len().saturating_sub(1)
+        {
+            return Err(Error::Unsupported(
+                "CFG++ Carry requires one implementation, unchanged pass schedule and contiguous absolute steps".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// A denoise integrator over a sigma schedule. Implementors call `denoise(x, σ)` — the model wrapper
 /// returning a denoised `x0` estimate — and advance the latents using only [`LatentOps`]. The trait
@@ -27,6 +194,8 @@ pub type DenoiseFn<'a, L> =
 ///
 /// Generic over the backend `L` rather than per-method so the box can be built once per request.
 pub trait Sampler<L: LatentOps> {
+    fn solver(&self) -> super::Solver;
+
     /// Integrate `x` from `sigmas[0]` down to `sigmas[last]` (the schedule carries a trailing `0.0`).
     ///
     /// - `ops`: backend tensor ops.
@@ -46,6 +215,33 @@ pub trait Sampler<L: LatentOps> {
         x: L::Latent,
         sigmas: &[f32],
         seed: u64,
+    ) -> Result<L::Latent> {
+        let mut state = SolverRunState::new(self.solver(), sigmas);
+        self.sample_span(
+            ops,
+            ms,
+            denoise,
+            x,
+            sigmas,
+            seed,
+            0..sigmas.len().saturating_sub(1),
+            &mut state,
+        )
+    }
+
+    /// Integrate a contiguous half-open range of **absolute pass steps**. Every phase supplies
+    /// the same whole-pass schedule, so prior intervals and stochastic draw indices are stable.
+    #[allow(clippy::too_many_arguments)]
+    fn sample_span(
+        &self,
+        ops: &L,
+        ms: &dyn super::ModelSampling,
+        denoise: &mut DenoiseFn<'_, L>,
+        x: L::Latent,
+        sigmas: &[f32],
+        seed: u64,
+        span: Range<usize>,
+        state: &mut SolverRunState<L>,
     ) -> Result<L::Latent>;
 }
 
@@ -78,7 +274,11 @@ pub(crate) fn is_terminal(sigma: f32) -> bool {
 pub struct Euler;
 
 impl<L: LatentOps> Sampler<L> for Euler {
-    fn sample(
+    fn solver(&self) -> super::Solver {
+        super::Solver::Euler
+    }
+
+    fn sample_span(
         &self,
         ops: &L,
         _ms: &dyn super::ModelSampling,
@@ -86,8 +286,11 @@ impl<L: LatentOps> Sampler<L> for Euler {
         mut x: L::Latent,
         sigmas: &[f32],
         _seed: u64,
+        span: Range<usize>,
+        state: &mut SolverRunState<L>,
     ) -> Result<L::Latent> {
-        for i in 0..sigmas.len().saturating_sub(1) {
+        state.check_span(super::Solver::Euler, _ms, sigmas, _seed, [0; 3], &span)?;
+        for i in span.clone() {
             let sigma = sigmas[i];
             ops.observe_solver(super::solvers::SolverObservation::callback(
                 super::Solver::Euler,
@@ -125,6 +328,7 @@ impl<L: LatentOps> Sampler<L> for Euler {
                 false,
             ));
         }
+        state.next_step = span.end;
         Ok(x)
     }
 }
