@@ -248,6 +248,18 @@ fn step_eval(arrays: &[&Array]) -> crate::Result<()> {
     }
 }
 
+/// MLX defers a span's final solver update until it is evaluated. Keep that graph in the
+/// span's admitted memory scope, including when a following span has a different identity.
+fn evaluate_and_end_denoise_phase<T>(
+    run: &gen_core::RenderRun<'_, '_>,
+    phase: usize,
+    output: &T,
+    evaluate: impl FnOnce(&T) -> Result<()>,
+) -> Result<()> {
+    evaluate(output)?;
+    run.end_denoise_phase(phase).map_err(crate::Error::from)
+}
+
 /// The per-eval cancel + progress preamble shared by every curated-solver driver
 /// ([`run_curated_sampler`], [`run_cfgpp_sampler`], [`run_av_curated_sampler`]) — F-068 dedup. Each
 /// driver's `denoise` closure calls this at the top of every model eval, then performs its own
@@ -633,7 +645,7 @@ pub fn run_curated_sampler_with_latent_hook_spans(
             )
             .map_err(crate::Error::from)?;
         if let Some(run) = phase_scope {
-            run.end_denoise_phase(phase).map_err(crate::Error::from)?;
+            evaluate_and_end_denoise_phase(run, phase, &out, |out| step_eval(&[out]))?;
         }
     }
     if state.next_step() != sigmas.len().saturating_sub(1) {
@@ -641,8 +653,11 @@ pub fn run_curated_sampler_with_latent_hook_spans(
             "sampler spans do not cover the executed schedule".into(),
         )));
     }
-    // Force the final step's advancement (never seen by the callback, which evals only inputs).
-    step_eval(&[&out])?;
+    // Legacy unscoped callers retain their exact final evaluation point. Scoped callers have
+    // already evaluated each final advancement before leaving its declared denoise phase.
+    if phase_scope.is_none() {
+        step_eval(&[&out])?;
+    }
     crate::ios_quantum::diagnostic_metadata(
         "curated",
         "solve_complete",
@@ -1323,6 +1338,133 @@ impl DiffusionSampler for FlowMatchSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_span_evaluates_final_output_before_leaving_its_phase() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        use gen_core::render::{PackedImagePass, RenderPhaseIdentity};
+        use gen_core::{
+            Capabilities, GenerationRequest, MemoryGeometry, MemoryPhase, MemoryRequestScope,
+            MemoryRunOutcome, Modality, ModelDescriptor, RenderPlan, RenderRun,
+        };
+
+        struct MockScope {
+            active: Rc<Cell<Option<usize>>>,
+            events: Rc<RefCell<Vec<(usize, &'static str)>>>,
+        }
+
+        impl MemoryRequestScope for MockScope {
+            fn configure_request(&mut self, _: &mut GenerationRequest) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn enter_phase(&mut self, _: MemoryPhase) -> gen_core::Result<()> {
+                Ok(())
+            }
+            fn enter_render_phase(
+                &mut self,
+                phase: MemoryPhase,
+                identity: &RenderPhaseIdentity,
+            ) -> gen_core::Result<()> {
+                if phase == MemoryPhase::Denoise {
+                    assert!(self.active.replace(Some(identity.phase)).is_none());
+                    self.events.borrow_mut().push((identity.phase, "enter"));
+                }
+                Ok(())
+            }
+            fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
+                if phase == MemoryPhase::Denoise {
+                    let phase = self.active.take().expect("denoise phase active");
+                    self.events.borrow_mut().push((phase, "leave"));
+                }
+                Ok(())
+            }
+            fn configure_decode(
+                &mut self,
+                _: u32,
+                _: u32,
+                _: MemoryGeometry,
+            ) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn configure_attention(&mut self, _: u32) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn materialize_transformer_window(&mut self, _: u32, _: u32) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn finish(&mut self, _: MemoryRunOutcome) -> gen_core::Result<()> {
+                Ok(())
+            }
+        }
+
+        let request = GenerationRequest::default();
+        let descriptor = ModelDescriptor {
+            id: "scope_fixture",
+            backend: "mock",
+            family: "test",
+            modality: Modality::Image,
+            capabilities: Capabilities::default(),
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+        };
+        let plan = RenderPlan::base_image(
+            &descriptor,
+            &request,
+            PackedImagePass {
+                pixel_stride: 16,
+                token_width: 64,
+                sampler: "euler",
+                guidance: 3.5,
+                sigmas: vec![1.0, 0.5, 0.0],
+                executed_steps: 2,
+                capture_sigma: 0.0,
+            },
+        )
+        .unwrap()
+        .with_inert_split_at(1)
+        .unwrap();
+        let active = Rc::new(Cell::new(None));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut scope = MockScope {
+            active: active.clone(),
+            events: events.clone(),
+        };
+        let run = RenderRun::new(&plan, &request.cancel, Some(&mut scope));
+        run.encode(|| Ok::<_, crate::Error>(())).unwrap();
+        run.images_with_denoise_phases(
+            &mut |_| {},
+            Ok::<_, crate::Error>,
+            |_, _, _| {
+                for phase in 0..2 {
+                    run.begin_denoise_phase(phase).map_err(crate::Error::from)?;
+                    evaluate_and_end_denoise_phase(&run, phase, &phase, |output| {
+                        assert_eq!(active.get(), Some(phase));
+                        events.borrow_mut().push((*output, "evaluate"));
+                        Ok(())
+                    })?;
+                }
+                Ok::<_, crate::Error>(())
+            },
+            |_, _, _| Ok::<_, crate::Error>(()),
+        )
+        .unwrap();
+        assert_eq!(active.get(), None);
+        assert_eq!(
+            *events.borrow(),
+            [
+                (0, "enter"),
+                (0, "evaluate"),
+                (0, "leave"),
+                (1, "enter"),
+                (1, "evaluate"),
+                (1, "leave"),
+            ]
+        );
+    }
 
     fn sdxl_sched() -> AlphaSchedule {
         AlphaSchedule::scaled_linear(1000, 0.00085, 0.012)
