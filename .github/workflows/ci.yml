@@ -936,6 +936,11 @@ jobs:
           for package in "${packages[@]}"; do
             if [[ "$package" == mlx-llm ]]; then packages+=(--features mlx-llm/campaign); break; fi
           done
+          # mlx-gen's integration binary imports opt-in host comparison helpers; keep the
+          # package test graph explicit without enabling them in production defaults.
+          for package in "${packages[@]}"; do
+            if [[ "$package" == mlx-gen ]]; then packages+=(--features mlx-gen/test-support); break; fi
+          done
           # Keep the opt-in CV forward path compiled without executing learned code.
           for package in "${packages[@]}"; do
             if [[ "$package" == sceneworks-gen-cv ]]; then packages+=(--features sceneworks-gen-cv/mlx); fi
