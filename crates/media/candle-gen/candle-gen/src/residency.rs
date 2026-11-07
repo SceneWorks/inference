@@ -16,6 +16,10 @@ pub struct CandleResidencyRuntime;
 impl gen_core::ResidencyRuntime for CandleResidencyRuntime {
     type Error = CandleError;
 
+    fn is_process_poisoned(error: &Self::Error) -> bool {
+        matches!(error, CandleError::ProcessPoisoned(_))
+    }
+
     fn after_component_drop() {}
 }
 
@@ -82,8 +86,14 @@ fn run_sequential_with_sync<Text, Heavy, Encoded, Out>(
 /// Synchronize queued device work before the component borrowed by `result`'s producer is dropped.
 /// Preserve the phase body's primary error when both the work and synchronization fail.
 pub fn synchronize_result<T>(device: &Device, result: Result<T>) -> Result<T> {
-    let synchronized = device.synchronize().map_err(CandleError::from);
-    finish_synchronized_phase(result, synchronized)
+    synchronize_result_with(result, || device.synchronize().map_err(CandleError::from))
+}
+
+fn synchronize_result_with<T>(result: Result<T>, sync: impl FnOnce() -> Result<()>) -> Result<T> {
+    if matches!(&result, Err(CandleError::ProcessPoisoned(_))) {
+        return result;
+    }
+    finish_synchronized_phase(result, sync())
 }
 
 /// Drive a video-specific three-component lifecycle while keeping at most one component resident.
@@ -140,6 +150,28 @@ mod tests {
     use super::*;
     use gen_core::LoadPhase;
     use std::cell::RefCell;
+
+    #[test]
+    fn process_poison_skips_sync_but_ordinary_results_still_sync() {
+        let calls = std::cell::Cell::new(0);
+        let sync = || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        let poisoned: Result<()> = Err(CandleError::ProcessPoisoned("device lost".into()));
+        assert!(matches!(
+            synchronize_result_with(poisoned, sync),
+            Err(CandleError::ProcessPoisoned(ref detail)) if detail == "device lost"
+        ));
+        assert_eq!(calls.get(), 0);
+        assert!(matches!(
+            synchronize_result_with::<()>(Err(CandleError::Msg("ordinary".into())), sync),
+            Err(CandleError::Msg(_))
+        ));
+        assert_eq!(calls.get(), 1);
+        assert!(synchronize_result_with(Ok(()), sync).is_ok());
+        assert_eq!(calls.get(), 2);
+    }
 
     struct Witness<'a> {
         name: &'static str,

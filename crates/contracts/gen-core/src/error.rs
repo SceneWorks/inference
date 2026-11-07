@@ -35,6 +35,8 @@ pub enum Error {
 
     /// The provider has identified an unrecoverable process-local backend state. The worker must
     /// retire its generator owner after this request; ordinary backend failures must not use it.
+    /// A provider emitting this must contain or forget its own GPU-backed locals before return:
+    /// the shared residency owner can protect only components it still owns at that boundary.
     #[error("process poisoned: {0}")]
     ProcessPoisoned(String),
 

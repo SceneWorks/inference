@@ -461,10 +461,13 @@ impl Flux1 {
     }
 
     fn finish_streamed_generation<T>(&self, streamed: bool, result: Result<T>) -> Result<T> {
+        if matches!(&result, Err(Error::ProcessPoisoned(_))) {
+            return result;
+        }
         if streamed {
-            // Always run after the residency driver has released the heavy phase, including on a
-            // block fault, cancellation, or forward error. A source mutation outranks the earlier
-            // error because the model's admitted behavioral identity is no longer trustworthy.
+            // Run after the residency driver has released the heavy phase, including on a block
+            // fault, cancellation, or ordinary forward error. A source mutation outranks those
+            // errors; explicit process poison must retain its typed retirement signal.
             self.verify_stream_inventory()?;
         }
         result
@@ -1915,6 +1918,13 @@ mod tests {
 
         std::fs::write(root.join("tokenizer_2/tokenizer.json"), b"tokenizer-v2").unwrap();
         assert!(model.finish_streamed_generation(true, Ok(())).is_err());
+        assert!(matches!(
+            model.finish_streamed_generation::<()>(
+                true,
+                Err(Error::ProcessPoisoned("device lost".into()))
+            ),
+            Err(Error::ProcessPoisoned(ref detail)) if detail == "device lost"
+        ));
         std::fs::remove_dir_all(root).ok();
     }
 }
