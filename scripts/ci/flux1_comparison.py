@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from scripts.ci import model_inference_proofs as proof
 from scripts.ci.flux1_pair import evidence, fixture, overlay
-from scripts.ci.model_proof_resources import execution_claim
+from scripts.ci.model_proof_resources import CudaClaimRejected, CudaReleaseRejected, execution_claim
 from scripts.media_campaign_supervisor import SupervisionError, load_policy, run_guarded
 
 BASE = overlay.BASE
@@ -194,6 +195,43 @@ def hardware(backend, policy):
     return dict(zip(fields, values))
 
 
+def remove_work(work, temporary):
+    """Remove only the tree created by this attempt. Git packs can be read-only on Windows."""
+    if work.parent != temporary:
+        raise ValueError("comparison cleanup requires a direct child of RUNNER_TEMP")
+
+    def unlink_readonly(function, name, error):
+        if function is not os.unlink or getattr(error, "winerror", None) != 5:
+            raise error
+        path = Path(name)
+        proof.unlinked_path(path, work)
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & stat.S_IWRITE:
+            raise error
+        # Git may create pack/idx files without Windows' write bit. Never
+        # chmod a reparse point or a file linked to another checkout.
+        path.chmod(info.st_mode | stat.S_IWRITE)
+        function(name)
+
+    for attempt, delay in enumerate((0, 0.25, 1.0)):
+        if delay:
+            time.sleep(delay)
+        proof.unlinked_path(work, temporary)
+        if not work.exists():
+            return
+        if sys.platform != "win32":
+            shutil.rmtree(work)
+            return
+        try:
+            shutil.rmtree(work, onexc=unlink_readonly)
+            return
+        except OSError as error:
+            # Access denied, sharing violation, lock violation. Some Git or
+            # antivirus handles outlive their owner briefly on the runner.
+            if getattr(error, "winerror", None) not in (5, 32, 33) or attempt == 2:
+                raise
+
+
 def execute(args, contract):
     backend, tier = args.backend, contract["tier"]
     proof.require_host(backend, dict(os.environ), "nax" if backend == "mlx" else "hosted")
@@ -204,6 +242,7 @@ def execute(args, contract):
                "host": platform.platform(), "runner_name": os.environ["RUNNER_NAME"], "arms": {}, "logs": {}}
     work = tmp / f"f1p-{receipt['run_id']}-{receipt['run_attempt']}"
     created_work = False
+    primary_error = None
     try:
         proof.unlinked_path(work, tmp)
         work.mkdir()
@@ -283,8 +322,11 @@ def execute(args, contract):
             if fixture.snapshot_identity(paths[variant], variant, tier) != receipt["fixtures"][variant]:
                 raise ValueError("snapshot changed during A/B")
         receipt["accepted"] = True
-    except Exception as exc:
+    except BaseException as exc:
+        primary_error = exc
         receipt["failure"] = str(exc)
+        if isinstance(exc, (CudaClaimRejected, CudaReleaseRejected)):
+            receipt["cuda_diagnostic"] = exc.diagnostic
         raise
     finally:
         errors = retain_logs(work, artifact, receipt) if created_work else []
@@ -293,8 +335,17 @@ def execute(args, contract):
             receipt["log_errors"] = errors
             receipt["accepted"] = False
         write(artifact / "receipt.json", receipt)
-        if created_work and work.exists() and not work.is_symlink():
-            shutil.rmtree(work)
+        if created_work:
+            try:
+                remove_work(work, tmp)
+            except (OSError, ValueError) as cleanup_error:
+                receipt["cleanup_failure"] = str(cleanup_error)
+                receipt["accepted"] = False
+                write(artifact / "receipt.json", receipt)
+                if primary_error is not None:
+                    primary_error.add_note(f"Comparison cleanup also failed: {cleanup_error}")
+                elif not failed_retention:
+                    raise
         if failed_retention:
             raise ValueError("comparison log publication failed: " + ", ".join(errors))
 
