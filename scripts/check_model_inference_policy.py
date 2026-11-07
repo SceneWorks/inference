@@ -793,7 +793,8 @@ class RunGraph:
             # Their bodies use buffers/tokens only; no ORT session or learned call.
             # SW-F329 appends source/byte/lifecycle arithmetic and frozen-cache ownership
             # controls. Their reviewed bodies execute no learned forward or inference kernel.
-            controls_sha = '4cc3ef5d57afc3be7f84350c2491c8d81496e6d1533bf141ba0fb12239b4b246'
+            # SW-6933 adds fixed-plan mocks, pre-load validation and CPU-stream sigma arithmetic.
+            controls_sha = '476d2a5e052af23829e4f7d4fad67bb121da89e3306a5b634c6b0f59e716809f'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha

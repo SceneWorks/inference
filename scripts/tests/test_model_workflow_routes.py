@@ -65,7 +65,10 @@ class ModelWorkflowRoutes(unittest.TestCase):
         proof = document('model-inference-proofs.yml')
         events = proof.get('on', proof.get(True))
         self.assertEqual(set(events), {'workflow_dispatch'})
-        self.assertEqual(set(events['workflow_dispatch']['inputs']), {'backend', 'request'})
+        inputs = events['workflow_dispatch']['inputs']
+        self.assertEqual(set(inputs), {'backend', 'request', 'flux1_pair'})
+        self.assertEqual(inputs['flux1_pair']['options'], ['none', 'tier1', 'tier2'])
+        self.assertEqual(inputs['flux1_pair']['default'], 'none')
         self.assertNotIn('concurrency', proof)
         bridge = document('real-weights.yml')
         inputs = bridge.get('on', bridge.get(True))['workflow_dispatch']['inputs']

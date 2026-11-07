@@ -145,7 +145,7 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
     }
 }
 
-fn validate_load_contract(provider_id: &str, spec: &LoadSpec) -> CoreResult<()> {
+pub(crate) fn validate_load_contract(provider_id: &str, spec: &LoadSpec) -> CoreResult<()> {
     if !is_known_provider(provider_id) {
         return Err(CoreError::Unsupported(format!(
             "unknown FLUX.1 provider {provider_id}"
@@ -160,6 +160,11 @@ fn validate_load_contract(provider_id: &str, spec: &LoadSpec) -> CoreResult<()> 
     {
         return Err(CoreError::Unsupported(format!(
             "{provider_id}: FLUX.1 memory routes require a bf16/Q4/Q8 snapshot directory"
+        )));
+    }
+    if matches!(spec.ip_adapter, Some(mlx_gen::WeightsSource::File(_))) {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: ip_adapter expects a directory (ip_adapter.safetensors + image_encoder/), not a single file"
         )));
     }
     let unsupported_common = !spec.extra_controls.is_empty()

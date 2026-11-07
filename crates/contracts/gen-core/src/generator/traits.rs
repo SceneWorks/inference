@@ -173,6 +173,21 @@ pub trait Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput>;
 
+    /// Execute the already compiled plan using the caller's configured, admitted scope.
+    /// The scope owner finishes it exactly once after this method returns.
+    fn generate_planned(
+        &self,
+        _request: &GenerationRequest,
+        _plan: &crate::RenderPlan,
+        _scope: Option<&mut dyn MemoryRequestScope>,
+        _on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationReport> {
+        Err(Error::Unsupported(format!(
+            "{} has no render-plan executor",
+            self.descriptor().id
+        )))
+    }
+
     /// **Incremental / low-latency audio synthesis** (sc-12846) — the streaming counterpart of
     /// [`generate`](Self::generate), the audio analog of `core_llm`'s token-streaming
     /// [`TextLlm::generate`](crate::core_llm::TextLlm::generate). A realtime/streaming provider

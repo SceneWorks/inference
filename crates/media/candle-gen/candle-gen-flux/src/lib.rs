@@ -124,8 +124,8 @@ mod ip_validate;
 
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, WeightsSource,
+    self, Capabilities, GenerationOutput, GenerationReport, GenerationRequest, Generator, LoadSpec,
+    Modality, ModelDescriptor, Progress, RenderPlan, RenderPlanRegistration, WeightsSource,
 };
 
 use pipeline::{Pipeline, SeqHeavy, SeqTextEncoders};
@@ -229,6 +229,7 @@ pub struct FluxGenerator {
     bounded_host_decode: Arc<Mutex<bool>>,
     loaded_quant: Option<gen_core::Quant>,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
+    load_binding: gen_core::RenderLoadBinding,
 }
 
 impl Generator for FluxGenerator {
@@ -267,30 +268,7 @@ impl Generator for FluxGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        // The shared capability floor: the descriptor advertises no conditioning and (for schnell) no
-        // guidance / negative prompt, so any of those is rejected here (distilled-model honesty).
-        self.descriptor
-            .capabilities
-            .validate_request(self.variant.model_id(), req)?;
-        let id = self.variant.model_id();
-        if req.prompt.is_empty() {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: prompt must not be empty"
-            )));
-        }
-        // An explicit `steps: Some(0)` would VAE-decode pure noise — reject loudly (txt2img-only).
-        if req.steps == Some(0) {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
-            )));
-        }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        Ok(())
+        validate_base_request(self.variant, req)
     }
 
     fn generate(
@@ -298,7 +276,22 @@ impl Generator for FluxGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        let plan = compile_base_plan(self.variant, req)?;
+        self.generate_planned(req, &plan, None, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("FLUX.1 base render produced no images".into()))
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationReport> {
         self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&self.load_binding)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         let stage_residency = req
             .memory
@@ -308,47 +301,160 @@ impl Generator for FluxGenerator {
             .memory
             .as_ref()
             .is_some_and(|memory| memory.stream_transformer_blocks);
-        if req.memory.as_ref().is_some_and(|memory| {
-            memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
-        }) && !stage_residency
-        {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{}: bounded decode, attention, and transformer residency require request-scoped staged residency",
-                self.variant.model_id()
-            )));
-        }
-        if req.use_pid
-            && req.memory.is_some_and(|memory| {
-                memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
-            })
-        {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{}: optimized native-VAE memory strategies do not support PiD decode",
-                self.variant.model_id()
-            )));
-        }
         *candle_gen::lock_recover(&self.stream_cancel) = req.cancel.clone();
         *candle_gen::lock_recover(&self.bounded_host_decode) =
             req.memory.is_some_and(|memory| memory.tile_vae_decode);
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
         let result = self.residency.run_request_scoped(
             stage_residency,
             stream_transformer_blocks,
             &req.cancel,
             req.use_pid,
             on_progress,
-            |text| self.pipe.encode_residency(text, &req.prompt),
+            |text| run.encode(|| self.pipe.encode_residency(text, &req.prompt)),
             |_| Ok(self.pipe.device().synchronize()?),
             |heavy, encoded, on_progress| {
-                let result = self.pipe.render_residency(req, heavy, encoded, on_progress);
+                let result =
+                    self.pipe
+                        .render_residency(req, plan, &run, heavy, encoded, on_progress);
                 candle_gen::synchronize_result(self.pipe.device(), result)
             },
         );
         *candle_gen::lock_recover(&self.bounded_host_decode) = false;
         *candle_gen::lock_recover(&self.stream_cancel) = gen_core::CancelFlag::default();
         let images = result?;
-        Ok(GenerationOutput::Images(images))
+        Ok(GenerationReport::from_output(GenerationOutput::Images(
+            images,
+        )))
     }
 }
+
+/// The same request floor is used before load by the registry plan compiler and by a loaded
+/// generator.  No tensor or checkpoint is touched on this path.
+fn validate_base_request(variant: Variant, req: &GenerationRequest) -> gen_core::Result<()> {
+    // The shared capability floor: the descriptor advertises no conditioning and (for schnell) no
+    // guidance / negative prompt, so any of those is rejected here (distilled-model honesty).
+    descriptor_for(variant)
+        .capabilities
+        .validate_request(variant.model_id(), req)?;
+    let id = variant.model_id();
+    if req.prompt.is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: prompt must not be empty"
+        )));
+    }
+    // An explicit `steps: Some(0)` would VAE-decode pure noise — reject loudly (txt2img-only).
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
+        )));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+    if req.memory.as_ref().is_some_and(|memory| {
+        memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
+    }) && !stage_residency
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+                "{}: bounded decode, attention, and transformer residency require request-scoped staged residency",
+                variant.model_id()
+            )));
+    }
+    if req.use_pid
+        && req.memory.is_some_and(|memory| {
+            memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks
+        })
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: optimized native-VAE memory strategies do not support PiD decode",
+            variant.model_id()
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve the base FLUX.1 schedule and request defaults while the provider is still unloaded.
+/// A plan is bound to one variant and one request, so the heavy path cannot silently choose a
+/// different seed, solver, guidance or step count after memory admission.
+fn compile_base_plan(variant: Variant, req: &GenerationRequest) -> gen_core::Result<RenderPlan> {
+    validate_base_request(variant, req)?;
+    let sigmas = pipeline::base_schedule(variant, req)?;
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let guidance = if variant.supports_guidance() {
+        req.guidance.unwrap_or(variant.default_guidance())
+    } else {
+        0.0
+    };
+    RenderPlan::base_image(
+        &descriptor_for(variant),
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 64,
+            sampler: req.sampler.as_deref().unwrap_or("euler"),
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma: 0.0,
+        },
+    )
+}
+
+fn compile_schnell_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<RenderPlan>> {
+    validate_base_load_spec(Variant::Schnell, spec)?;
+    validate_preload_pid(spec, req, Variant::Schnell)?;
+    compile_base_plan(Variant::Schnell, req).map(Some)
+}
+
+fn compile_dev_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<RenderPlan>> {
+    validate_base_load_spec(Variant::Dev, spec)?;
+    validate_preload_pid(spec, req, Variant::Dev)?;
+    compile_base_plan(Variant::Dev, req).map(Some)
+}
+
+fn validate_preload_pid(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+    variant: Variant,
+) -> gen_core::Result<()> {
+    if !req.use_pid {
+        return Ok(());
+    }
+    if spec.pid.is_none() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)",
+            variant.model_id()
+        )));
+    }
+    if req.pid_capture_sigma.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: pid_capture_sigma (from_ldm early-stop) is not wired for this latent space yet",
+            variant.model_id()
+        )));
+    }
+    Ok(())
+}
+
+const SCHNELL_RENDER_PLAN: RenderPlanRegistration = RenderPlanRegistration {
+    provider_id: FLUX1_SCHNELL_ID,
+    compile: compile_schnell_plan,
+};
+
+const DEV_RENDER_PLAN: RenderPlanRegistration = RenderPlanRegistration {
+    provider_id: FLUX1_DEV_ID,
+    compile: compile_dev_plan,
+};
 
 /// The descriptor for a FLUX.1 `variant` — the surface sc-3694 actually wires: txt2img only (no
 /// conditioning / LoRA / quantization advertised — those are the Python fallback's job until candle
@@ -408,13 +514,17 @@ pub fn descriptor_dev() -> ModelDescriptor {
     descriptor_for(Variant::Dev)
 }
 
-/// Construct a lazy candle FLUX generator for `variant` from a [`LoadSpec`]. `spec.weights` must be a
+/// Validate the base FLUX.1 load shape before compiling a plan or constructing the lazy generator.
+/// `spec.weights` must be a
 /// [`WeightsSource::Dir`] pointing at a black-forest-labs `FLUX.1-{schnell,dev}` snapshot (root
 /// `flux1-*.safetensors` + `ae.safetensors`, plus the `text_encoder/`, `text_encoder_2/`,
 /// `tokenizer_2/` subdirs). LoRA adapters, on-the-fly quantization, and control/IP-adapter overlays
 /// are rejected — none are wired in this slice, so refusing is more honest than silently dropping
 /// them (the worker falls back to Python).
-fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+fn validate_base_load_spec(
+    variant: Variant,
+    spec: &LoadSpec,
+) -> gen_core::Result<std::path::PathBuf> {
     let id = variant.model_id();
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -435,6 +545,13 @@ fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn G
             "candle {id} does not support control / IP-adapter overlays yet (txt2img only)"
         )));
     }
+    Ok(root)
+}
+
+/// Construct the lazy base generator after the shared pre-load shape check.
+fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    let id = variant.model_id();
+    let root = validate_base_load_spec(variant, spec)?;
     // FLUX is a bf16 model; load at bf16 regardless of the CPU-default dtype. The device is the
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
@@ -485,6 +602,7 @@ fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn G
         bounded_host_decode,
         loaded_quant,
         memory_strategy,
+        load_binding: gen_core::RenderLoadBinding::from_spec(spec),
     }))
 }
 
@@ -514,7 +632,9 @@ pub fn register_providers(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     let registry = registry
         .register_generator(SCHNELL_REGISTRATION)
-        .register_generator(DEV_REGISTRATION);
+        .register_generator(DEV_REGISTRATION)
+        .register_render_plan(SCHNELL_RENDER_PLAN)
+        .register_render_plan(DEV_RENDER_PLAN);
     #[cfg(feature = "cuda")]
     let registry = register_memory_contract_surfaces(registry)
         .register_memory_behavior(SCHNELL_MEMORY_BEHAVIOR)
@@ -608,6 +728,79 @@ mod explicit_registry_tests {
 mod tests {
     use super::*;
     use candle_gen::gen_core::{Conditioning, ConditioningKind, Image, LoadSpec, WeightsSource};
+
+    /// Both base variants compile their complete trajectory without reading a checkpoint.  This
+    /// freezes the same seed, guidance and native schedule the old per-seed render resolved after
+    /// loading text and heavy components.
+    #[test]
+    fn base_flux_plan_is_tensor_free_and_variant_exact() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let registry = provider_registry().unwrap();
+        for (variant, expected_steps, expected_guidance) in
+            [(Variant::Schnell, 4, 0.0), (Variant::Dev, 25, 3.5)]
+        {
+            let req = GenerationRequest {
+                prompt: "a blue lamp".into(),
+                seed: Some(91),
+                width: 1024,
+                height: 768,
+                count: 2,
+                ..Default::default()
+            };
+            let plan = registry
+                .compile_render_plan(variant.model_id(), &spec, &req)
+                .unwrap()
+                .expect("base FLUX.1 must have a pre-load plan");
+            assert_eq!(plan.base_seed(), 91);
+            assert_eq!(plan.guidance(), expected_guidance);
+            assert_eq!(plan.sigmas().len(), expected_steps + 1);
+            assert_eq!(plan.capture_sigma(), 0.0);
+            plan.check_request(&descriptor_for(variant), &req).unwrap();
+
+            let mut different = req.clone();
+            different.width = 768;
+            assert!(plan
+                .check_request(&descriptor_for(variant), &different)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn base_plan_rejects_unloadable_spec_and_unwired_pid_before_weights() {
+        use candle_gen::gen_core::Quant;
+        let registry = provider_registry().unwrap();
+        let req = GenerationRequest {
+            prompt: "a blue lamp".into(),
+            seed: Some(91),
+            ..Default::default()
+        };
+        let file = LoadSpec::new(WeightsSource::File("/nonexistent/flux.safetensors".into()));
+        let quant = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(Quant::Q8);
+        let control = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_control(WeightsSource::Dir("/nonexistent/control".into()));
+        for id in [FLUX1_SCHNELL_ID, FLUX1_DEV_ID] {
+            for spec in [&file, &quant, &control] {
+                assert!(registry.compile_render_plan(id, spec, &req).is_err());
+            }
+            let pid_req = GenerationRequest {
+                use_pid: true,
+                ..req.clone()
+            };
+            let no_pid = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+            assert!(registry.compile_render_plan(id, &no_pid, &pid_req).is_err());
+            let with_pid = no_pid.with_pid(
+                WeightsSource::File("/nonexistent/pid.safetensors".into()),
+                WeightsSource::Dir("/nonexistent/gemma".into()),
+            );
+            let early_capture = GenerationRequest {
+                pid_capture_sigma: Some(0.2),
+                ..pid_req
+            };
+            assert!(registry
+                .compile_render_plan(id, &with_pid, &early_capture)
+                .is_err());
+        }
+    }
 
     /// `from_model_id` is the exact inverse of `model_id`, and answers nothing for an id it does
     /// not own. The memory contract selects its trunk geometry through it (sc-22661), so a version

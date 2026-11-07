@@ -738,6 +738,15 @@ impl MemoryRequestScope for FluxMemoryScope {
         self.ensure_active()
     }
 
+    fn enter_render_phase(
+        &mut self,
+        phase: MemoryPhase,
+        identity: &gen_core::render::RenderPhaseIdentity,
+    ) -> gen_core::Result<()> {
+        self.validate_geometry(identity.geometry)?;
+        self.enter_phase(phase)
+    }
+
     fn leave_phase(&mut self, _phase: MemoryPhase) -> gen_core::Result<()> {
         self.ensure_active()
     }

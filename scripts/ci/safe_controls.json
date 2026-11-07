@@ -989,6 +989,142 @@
         "win32"
       ],
       "reason": "Pure frozen JSON/header metadata, scalar geometry and shared schedule construction only. No Tensor, model, adapter materialization, payload read, numerical kernel or accelerator execution."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "render::tests::sequential_images_wrap_seed_and_drive_real_scope_per_operation",
+      "source": "crates/contracts/gen-core/src/render/tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Tensor-free fixed-pass compiler or mock lifecycle; closures use scalar seeds and memory-scope event records."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "render::tests::cancel_during_denoise_prevents_decode_and_all_later_images",
+      "source": "crates/contracts/gen-core/src/render/tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Tensor-free fixed-pass compiler or mock lifecycle; closures use scalar seeds and memory-scope event records."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "render::tests::failed_init_does_not_enter_the_denoise_scope",
+      "source": "crates/contracts/gen-core/src/render/tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "The mock initialization returns an error before producing a scalar latent. The assertion checks no denoise phase begins."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "render::tests::plan_freezes_schedule_decode_count_and_preparation_inputs",
+      "source": "crates/contracts/gen-core/src/render/tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Tensor-free fixed-pass compiler or mock lifecycle; closures use scalar seeds and memory-scope event records."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "render::tests::invalid_schedules_and_unaligned_geometry_refuse_before_any_stage",
+      "source": "crates/contracts/gen-core/src/render/tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Tensor-free fixed-pass compiler or mock lifecycle; closures use scalar seeds and memory-scope event records."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "render::tests::owner_refuses_a_second_encode_or_out_of_order_trajectory",
+      "source": "crates/contracts/gen-core/src/render/tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Tensor-free fixed-pass compiler or mock lifecycle; closures use scalar seeds and memory-scope event records."
+    },
+    {
+      "package": "mlx-gen-flux",
+      "kind": "lib",
+      "target": "mlx_gen_flux",
+      "test": "model::tests::registry_freezes_the_native_mlx_schedule_without_opening_weights",
+      "source": "crates/media/mlx-gen/mlx-gen-flux/src/model.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Only linspace and scalar schedule arithmetic execute on a CPU stream. The unfetched model directory is never opened."
+    },
+    {
+      "package": "mlx-gen-flux",
+      "kind": "lib",
+      "target": "mlx_gen_flux",
+      "test": "model::tests::pre_load_plan_refuses_invalid_inputs_without_opening_any_weights",
+      "source": "crates/media/mlx-gen/mlx-gen-flux/src/model.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Only registration and request/load metadata validation execute. Input errors and the unmigrated IP route return before any schedule or model is loaded."
+    },
+    {
+      "package": "candle-gen-flux",
+      "kind": "lib",
+      "target": "candle_gen_flux",
+      "test": "tests::base_flux_plan_is_tensor_free_and_variant_exact",
+      "source": "crates/media/candle-gen/candle-gen-flux/src/lib.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Only descriptor, load metadata, scalar schedule nodes and request identity are inspected. No generator or device is loaded."
+    },
+    {
+      "package": "candle-gen-flux",
+      "kind": "lib",
+      "target": "candle_gen_flux",
+      "test": "tests::base_plan_rejects_unloadable_spec_and_unwired_pid_before_weights",
+      "source": "crates/media/candle-gen/candle-gen-flux/src/lib.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Only descriptor, load metadata, scalar schedule nodes and request identity are inspected. No generator or device is loaded."
     }
   ]
 }
