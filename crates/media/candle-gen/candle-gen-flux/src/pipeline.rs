@@ -67,7 +67,9 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{Module, VarBuilder};
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::gen_core::{
+    self, AdapterSpec, GenerationRequest, Image, PidWeights, Progress, RenderPlan, RenderRun,
+};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
@@ -137,6 +139,27 @@ pub fn flow_mu(variant: Variant, seq_len: usize) -> f32 {
     let m = (MAX_SHIFT - BASE_SHIFT) / (4096.0 - 256.0);
     let b = BASE_SHIFT - m * 256.0;
     (m * seq_len as f64 + b) as f32
+}
+
+/// Tensor-free schedule compiler for the registered base FLUX.1 routes. The packed image sequence
+/// length is exactly `(height / 16) * (width / 16)` after the provider's stride check. This is the
+/// same value `State::new` obtains from the seeded latent in the legacy per-image render path.
+pub(crate) fn base_schedule(variant: Variant, req: &GenerationRequest) -> Result<Vec<f32>> {
+    let steps = req.steps.unwrap_or(variant.default_steps()) as usize;
+    let seq_len = (req.height as usize / 16) * (req.width as usize / 16);
+    let native = if variant.is_dev() {
+        get_schedule(steps, Some((seq_len, BASE_SHIFT, MAX_SHIFT)))
+    } else {
+        get_schedule(steps, None)
+    };
+    let native: Vec<f32> = native.into_iter().map(|sigma| sigma as f32).collect();
+    Ok(candle_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        flow_mu(variant, seq_len),
+        steps,
+        &native,
+    )?)
 }
 
 /// A FLUX pipeline handle: the snapshot `root`, the variant, and the compute device/dtype (bf16).
@@ -715,8 +738,7 @@ impl Pipeline {
         &self,
         dit: DitRef,
         state: &State,
-        timesteps: &[f64],
-        guidance: f64,
+        plan: &RenderPlan,
         seed: u64,
         req: &GenerationRequest,
         preview: &candle_gen::preview::PreviewHook<'_>,
@@ -725,19 +747,7 @@ impl Pipeline {
         candle_gen::check_cancel(&req.cancel)?;
         let b_sz = state.img.dim(0)?;
         let dev = &self.device;
-        let guidance_t = Tensor::full(guidance as f32, b_sz, dev)?;
-        // The native schedule is candle's verbatim `get_schedule(..)` (the byte-exact N1 default), in
-        // f32 descending with a trailing 0.0; the curated `scheduler` axis re-strides it over `mu`.
-        let native: Vec<f32> = timesteps.iter().map(|&t| t as f32).collect();
-        let mu = flow_mu(self.variant, state.img.dim(1)?);
-        let steps = native.len().saturating_sub(1);
-        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-            req.scheduler.as_deref(),
-            req.scheduler_shift,
-            mu,
-            steps,
-            &native,
-        )?;
+        let guidance_t = Tensor::full(plan.guidance(), b_sz, dev)?;
         // Guidance is only consumed by the dev DiT; schnell's DiT ignores the tensor. The packed DiT
         // takes the same shape (`Option<&Tensor>` — `None` for schnell, since `guidance_embed` is off).
         let packed_guidance = if self.variant.supports_guidance() {
@@ -748,9 +758,9 @@ impl Pipeline {
         let prepared =
             dit.prepare_conditioning(&state.img, &state.img_ids, &state.txt, &state.txt_ids)?;
         candle_gen::run_flow_sampler(
-            req.sampler.as_deref(),
+            Some(plan.sampler()),
             TimestepConvention::Sigma,
-            &sigmas,
+            plan.denoise_sigmas(),
             state.img.clone(),
             seed,
             &req.cancel,
@@ -1405,20 +1415,12 @@ impl Pipeline {
     pub(crate) fn render_residency(
         &self,
         req: &GenerationRequest,
+        plan: &RenderPlan,
+        run: &RenderRun<'_, '_>,
         heavy: &SeqHeavy,
         encoded: (Tensor, Tensor),
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
-        let steps = req
-            .steps
-            .map(|s| s as usize)
-            .unwrap_or(self.variant.default_steps() as usize);
-        let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let guidance: f64 = if self.variant.supports_guidance() {
-            req.guidance.unwrap_or(self.variant.default_guidance()) as f64
-        } else {
-            0.0
-        };
         let lat_h = (req.height as usize).div_ceil(16) * 2;
         let lat_w = (req.width as usize).div_ceil(16) * 2;
 
@@ -1427,79 +1429,88 @@ impl Pipeline {
         let pid_decoder = candle_gen_pid::resolve_pid_decoder(
             heavy.pid.as_deref(),
             req,
-            base_seed,
+            plan.base_seed(),
             self.variant.model_id(),
         )?;
 
         // Per-image denoise + decode.
-        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-            let noise = crate::flux1_load::seeded_noise(
-                seed,
-                LATENT_CHANNELS,
-                lat_h,
-                lat_w,
-                &self.device,
-                self.dtype,
-            )?;
-            let state = State::new(&t5_emb, &clip_emb, &noise)?;
-            let timesteps = if self.variant.is_dev() {
-                get_schedule(steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)))
-            } else {
-                get_schedule(steps, None)
-            };
-            // Per-step latent preview (epic 16948, sc-16956), built per image from the SAME
-            // `(width, height)` the decode below is given — one source for the hook's geometry and the
-            // render's. Per image, not per batch: each seed is its own driver call and therefore its own
-            // trajectory, numbered from frame 1.
-            let preview = crate::preview::hook(&req.preview, req.width, req.height);
-            let latents = self.denoise(
-                heavy.dit.as_ref(),
-                &state,
-                &timesteps,
-                guidance,
-                seed,
-                req,
-                &preview,
-                on_progress,
-            )?;
-            on_progress(Progress::Decoding);
-            if heavy.bounded_host_decode {
-                let memory = req.memory.unwrap_or_default();
-                let host_latents = bounded_host_latent_transfer(
-                    &latents,
-                    req.height as usize,
-                    req.width as usize,
-                    &req.cancel,
-                    memory
-                        .decode_tile_edge
-                        .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
-                    memory
-                        .decode_overlap
-                        .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
-                )?;
-                let decoded = match &heavy.vae {
-                    LoadedVae::Stock(vae) => vae.decode(&host_latents)?.to_dtype(DType::F32)?,
-                    LoadedVae::Packed(vae) => vae.decode(&host_latents)?.to_dtype(DType::F32)?,
-                };
-                return to_image(&decoded);
-            }
-            match &heavy.vae {
-                LoadedVae::Stock(vae) => self.decode(
-                    vae,
-                    pid_decoder.as_ref(),
-                    &latents,
-                    req.height as usize,
-                    req.width as usize,
-                ),
-                LoadedVae::Packed(vae) => self.decode_packed(
-                    vae,
-                    pid_decoder.as_ref(),
-                    &latents,
-                    req.height as usize,
-                    req.width as usize,
-                ),
-            }
-        })
+        run.images(
+            on_progress,
+            |seed| {
+                crate::flux1_load::seeded_noise(
+                    seed,
+                    LATENT_CHANNELS,
+                    lat_h,
+                    lat_w,
+                    &self.device,
+                    self.dtype,
+                )
+            },
+            |seed, noise, on_progress| {
+                let state = State::new(&t5_emb, &clip_emb, &noise)?;
+                let planned_tokens = (req.width as usize / 16) * (req.height as usize / 16);
+                if state.img.dim(1)? != planned_tokens {
+                    return Err(CandleError::Msg(format!(
+                        "FLUX.1 packed image geometry changed after plan compilation: expected {planned_tokens} tokens"
+                    )));
+                }
+                // Per-step latent preview (epic 16948, sc-16956), built per image from the SAME
+                // `(width, height)` the decode below is given — one source for the hook's geometry and the
+                // render's. Per image, not per batch: each seed is its own driver call and therefore its own
+                // trajectory, numbered from frame 1.
+                let preview = crate::preview::hook(&req.preview, req.width, req.height);
+                self.denoise(
+                    heavy.dit.as_ref(),
+                    &state,
+                    plan,
+                    seed,
+                    req,
+                    &preview,
+                    on_progress,
+                )
+            },
+            |_, latents, on_progress| {
+                on_progress(Progress::Decoding);
+                if heavy.bounded_host_decode {
+                    let memory = req.memory.unwrap_or_default();
+                    let host_latents = bounded_host_latent_transfer(
+                        &latents,
+                        req.height as usize,
+                        req.width as usize,
+                        &req.cancel,
+                        memory
+                            .decode_tile_edge
+                            .unwrap_or(crate::memory_strategy::DECODE_TILE_EDGE),
+                        memory
+                            .decode_overlap
+                            .unwrap_or(crate::memory_strategy::DECODE_OVERLAP),
+                    )?;
+                    let decoded = match &heavy.vae {
+                        LoadedVae::Stock(vae) => vae.decode(&host_latents)?.to_dtype(DType::F32)?,
+                        LoadedVae::Packed(vae) => {
+                            vae.decode(&host_latents)?.to_dtype(DType::F32)?
+                        }
+                    };
+                    return to_image(&decoded);
+                }
+                match &heavy.vae {
+                    LoadedVae::Stock(vae) => self.decode(
+                        vae,
+                        pid_decoder.as_ref(),
+                        &latents,
+                        req.height as usize,
+                        req.width as usize,
+                    ),
+                    LoadedVae::Packed(vae) => self.decode_packed(
+                        vae,
+                        pid_decoder.as_ref(),
+                        &latents,
+                        req.height as usize,
+                        req.width as usize,
+                    ),
+                }
+            },
+        )
     }
 }
 
