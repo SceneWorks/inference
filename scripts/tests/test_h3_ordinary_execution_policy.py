@@ -20,6 +20,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -428,9 +429,10 @@ DISCOVERY_SIGNALS = [
     (r"\.open\s*\(", "stream_open"),
 ]
 
-# Modules whose ignored model tests are deliberately reached by the privileged
-# real-weight/generator lanes (`real-weights.yml`), not by the synthetic manual routes.
+# Modules whose ignored model tests use explicit real-weight/native proof routes,
+# including model-inference-proofs.yml, not the synthetic H3 routes above.
 REAL_WEIGHT_MODULES = {
+    ("candle", "text_encoder::encoder::residency_te"),
     ("mlx", "adaln_cold_start"),
     ("mlx", "adaln_evict_real_weights"),
     ("mlx", "audio_vae_encode_parity"),
@@ -452,6 +454,8 @@ REAL_WEIGHT_MODULES = {
     ("mlx", "te_tier_real_weights"),
     ("mlx", "veda_ab"),
     ("mlx", "vram_probe"),
+    ("candle", "dit::layers::residency_component"),
+    ("candle", "dit::layers::residency_arithmetic"),
     ("candle", "real_weights"),
     ("candle", "ref2va_checkpoint"),
     ("candle", "veda_ab"),
@@ -796,15 +800,44 @@ class H3OrdinaryExecutionPolicyTest(unittest.TestCase):
                         )
                     if (path, name) in covered:
                         continue
-                    module = path.stem if path.parent.name == "tests" else str(
-                        path.relative_to(MLX_SRC if backend == "mlx" else CANDLE_SRC)
-                    ).removesuffix(".rs").replace("/", "::")
+                    module = path.stem if path.parent.name == "tests" else path.relative_to(
+                        MLX_SRC if backend == "mlx" else CANDLE_SRC
+                    ).as_posix().removesuffix(".rs").replace("/", "::")
                     self.assertIn(
                         (backend, module),
                         REAL_WEIGHT_MODULES,
                         f"{path.relative_to(ROOT)}::{name} is an ignored {kind} model body "
                         "with no synthetic route and is not a recorded real-weight module",
                     )
+
+    def test_real_weight_module_discovery_keeps_exact_names_and_ignores(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "src"
+            for module, ignored, failure in (
+                ("residency_component", True, None),
+                ("unregistered_component", True, "not a recorded real-weight module"),
+                ("residency_component", False, "is not #[ignore]d"),
+            ):
+                with self.subTest(module=module, ignored=ignored):
+                    path = source_root / "dit" / "layers" / f"{module}.rs"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    attributes = '#[test]\n'
+                    if ignored:
+                        attributes += '#[ignore = "model inference; explicit model-proof workflow"]\n'
+                    path.write_text(attributes + 'fn probe() { MiniMaxH3Dit::load(); }\n', encoding="utf-8")
+                    with mock.patch(__name__ + ".ROOT", root), mock.patch(
+                        __name__ + ".CANDLE_SRC", source_root
+                    ), mock.patch(__name__ + ".h3_source_files", return_value=[path]):
+                        case = H3OrdinaryExecutionPolicyTest(
+                            "test_dynamic_discovery_covers_every_model_or_block_test"
+                        )
+                        result = unittest.TestResult()
+                        case.run(result)
+                    self.assertEqual(result.errors, [])
+                    self.assertEqual(len(result.failures), 0 if failure is None else 1)
+                    if failure is not None:
+                        self.assertIn(failure, result.failures[0][1])
 
     def test_ordinary_jobs_never_execute_h3_model_tests(self) -> None:
         for job, text in jobs(CI.read_text(encoding="utf-8")).items():

@@ -68,6 +68,18 @@ use crate::dit::rope::{MmRope, MmRopeTables};
 use crate::layout::split_gate_value;
 use crate::nn::{rms_weighted, sdpa_planned, silu};
 
+#[cfg(all(feature = "cuda", feature = "model-inference-proof"))]
+#[cfg(test)]
+mod residency_component;
+
+#[cfg(all(feature = "cuda", feature = "model-inference-proof"))]
+#[cfg(test)]
+mod residency_arithmetic;
+
+// Registered in audited-safe without CUDA or model-proof feature prerequisites.
+#[cfg(test)]
+mod residency_arithmetic_metadata;
+
 /// A **forward-time additive LoRA residual** attached to a [`LinearNoBias`] (sc-18728).
 ///
 /// `scale · ((x·a)·b)` with `a` `[in, rank]` (= `downᵀ`) and `b` `[rank, out]` (= `upᵀ` with

@@ -975,6 +975,20 @@
         "win32"
       ],
       "reason": "Exact allocator policy source compiled without CUDA; fake reclaim callbacks and integer byte counters test observation/trim/retry order, immutable caps, failure propagation and no retry loop. No tensor, device, learned forward or numerical kernel executes."
+    },
+    {
+      "package": "candle-gen-minimax-h3",
+      "kind": "lib",
+      "target": "candle_gen_minimax_h3",
+      "test": "dit::layers::residency_arithmetic_metadata::frozen_metadata_rejects_wrong_patch_missing_native_keys_and_wrong_schedule_count",
+      "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/layers/residency_arithmetic_metadata.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Pure frozen JSON/header metadata, scalar geometry and shared schedule construction only. No Tensor, model, adapter materialization, payload read, numerical kernel or accelerator execution."
     }
   ]
 }

@@ -245,6 +245,25 @@ fn runtime_payloads(
     ))
 }
 
+#[cfg(all(test, feature = "cuda", feature = "model-inference-proof"))]
+pub(crate) fn proof_text_encoder_inventory(
+    path: &Path,
+) -> candle_gen::gen_core::Result<(StreamedWeightFacts, u64)> {
+    let facts = text_encoder_stream(path)?.ok_or_else(|| {
+        CoreError::Unsupported("missing source-owned TE inventory for diagnostic".into())
+    })?;
+    let (_, _, decode) = runtime_payloads(path, true)?;
+    Ok((facts, decode))
+}
+
+/// Existing source-owned payload/preparation/dequant inventory, without tensors.
+#[cfg(all(test, feature = "cuda", feature = "model-inference-proof"))]
+pub(crate) fn proof_dit_inventory(
+    path: &Path,
+) -> candle_gen::gen_core::Result<(BTreeMap<String, u64>, u64, u64)> {
+    runtime_payloads(path, false)
+}
+
 pub(super) fn text_encoder_stream(
     path: &Path,
 ) -> candle_gen::gen_core::Result<Option<StreamedWeightFacts>> {

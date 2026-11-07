@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "source_contract_sha256": "2d2352eb4e8657458e778d9dc24318748c2dddf5acb867ff5d4252b405d0056e",
-  "scope": "Source-declared API role/grade registry plus exact Iris frozen-cache source extension; cumulative contract hash binds base contract SHA and extension source. Not runtime evidence.",
+  "source_contract_sha256": "d861abb2679c5096cab8e66bdaa8b4579eb2650f03e6965c48f395dc22f30fe0",
+  "scope": "Source-declared role/grade registry, Iris source extension and explicit H3 fixture verified-content observers. source_contract_sha256 hashes canonical readers/supporting/source-extension metadata; not runtime evidence.",
   "supporting_not_consumption": [
     "candle-audio-yue2::snapshot::verify_component"
   ],
@@ -3896,6 +3896,66 @@
       "role": "tensor-input",
       "grades": [
         "reader-binding"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_component::verified-shards": {
+      "role": "model-weights",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_component::verified-config": {
+      "role": "configuration",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_component::verified-turbo": {
+      "role": "artifact-input",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_te::verified-shards": {
+      "role": "model-weights",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_te::verified-config": {
+      "role": "configuration",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_te::verified-tokenizers": {
+      "role": "tokenizer",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_te::verified-request": {
+      "role": "artifact-input",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_arithmetic::verified-shards": {
+      "role": "model-weights",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_arithmetic::verified-config": {
+      "role": "configuration",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_arithmetic::verified-turbo": {
+      "role": "artifact-input",
+      "grades": [
+        "validated-content"
       ]
     }
   },

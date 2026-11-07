@@ -1,0 +1,1347 @@
+{
+  "kind": "h3-input-protocol-offline-regression/v1",
+  "simulationOnly": true,
+  "historicalRun": "https://github.com/SceneWorks/inference/actions/runs/42280791045",
+  "historicalWorkflowAcceptance": false,
+  "historicalFailure": "input protocol; do not relabel as runtime PASS",
+  "sourceBodySha256": "6ab6c0cbee355f99623c6b3e846a7c3bf82feb8aa40bcf77bb44539d8d2572c3",
+  "actualEvents": [
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "gen-core::weightsmeta::file_tensor_locations_impl",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00001-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030312d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00001-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030312d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "gen-core::weightsmeta::file_tensor_locations_impl",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00002-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030322d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00002-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030322d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "gen-core::weightsmeta::file_tensor_locations_impl",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00003-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030332d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00003-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030332d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "gen-core::weightsmeta::file_tensor_locations_impl",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00004-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030342d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00004-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030342d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "gen-core::weightsmeta::file_tensor_locations_impl",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00005-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030352d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00005-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030352d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "gen-core::weightsmeta::file_tensor_locations_impl",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00006-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030362d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00006-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030362d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "gen-core::weightsmeta::file_tensor_locations_impl",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00007-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030372d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00007-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030372d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "gen-core::weightsmeta::file_tensor_locations_impl",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00008-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030382d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00008-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030382d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "gen-core::weightsmeta::file_tensor_locations_impl",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00009-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030392d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00009-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030392d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "gen-core::weightsmeta::file_tensor_locations_impl",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00010-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031302d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00010-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031302d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "gen-core::weightsmeta::file_tensor_locations_impl",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00011-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031312d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00011-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031312d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "gen-core::weightsmeta::file_tensor_locations_impl",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00012-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031322d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00012-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031322d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "gen-core::weightsmeta::file_tensor_locations_impl",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00013-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031332d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00013-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031332d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "gen-core::weightsmeta::file_tensor_locations_impl",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00014-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031342d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00014-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031342d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-core::safetensors::MmapedSafetensors::new",
+        "role": "tensor-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00001-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030312d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00001-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030312d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-core::safetensors::MmapedSafetensors::new",
+        "role": "tensor-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00002-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030322d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00002-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030322d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-core::safetensors::MmapedSafetensors::new",
+        "role": "tensor-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00003-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030332d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00003-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030332d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-core::safetensors::MmapedSafetensors::new",
+        "role": "tensor-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00004-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030342d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00004-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030342d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-core::safetensors::MmapedSafetensors::new",
+        "role": "tensor-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00005-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030352d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00005-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030352d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-core::safetensors::MmapedSafetensors::new",
+        "role": "tensor-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00006-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030362d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00006-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030362d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-core::safetensors::MmapedSafetensors::new",
+        "role": "tensor-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00007-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030372d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00007-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030372d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-core::safetensors::MmapedSafetensors::new",
+        "role": "tensor-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00008-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030382d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00008-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030382d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-core::safetensors::MmapedSafetensors::new",
+        "role": "tensor-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00009-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030392d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00009-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030392d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-core::safetensors::MmapedSafetensors::new",
+        "role": "tensor-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00010-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031302d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00010-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031302d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-core::safetensors::MmapedSafetensors::new",
+        "role": "tensor-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00011-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031312d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00011-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031312d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-core::safetensors::MmapedSafetensors::new",
+        "role": "tensor-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00012-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031322d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00012-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031322d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-core::safetensors::MmapedSafetensors::new",
+        "role": "tensor-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00013-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031332d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00013-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031332d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-core::safetensors::MmapedSafetensors::new",
+        "role": "tensor-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00014-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031342d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00014-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031342d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-gen-minimax-h3::dit::MiniMaxH3Dit::load_from_dir/configuration",
+        "role": "configuration",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\config.json",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c636f6e6669672e6a736f6e"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\config.json",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c636f6e6669672e6a736f6e"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "crates/media/candle-gen/candle-gen/src/train/merge.rs::read_adapter_capped::std::fs::read@8751",
+        "role": "artifact-input",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--lightx2v--Minimax-h3-Turbo\\snapshots\\5d1d4829fe614c1b93fcfd9cc7718e9ba71f73e1\\minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d6c696768747832762d2d4d696e696d61782d68332d547572626f5c736e617073686f74735c356431643438323966653631346331623933666366643963633737313865396261373166373365315c6d696e696d61785f68335f666c32765f747572626f5f38737465705f76312e305f626631362e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--lightx2v--Minimax-h3-Turbo\\snapshots\\5d1d4829fe614c1b93fcfd9cc7718e9ba71f73e1\\minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d6c696768747832762d2d4d696e696d61782d68332d547572626f5c736e617073686f74735c356431643438323966653631346331623933666366643963633737313865396261373166373365315c6d696e696d61785f68335f666c32765f747572626f5f38737465705f76312e305f626631362e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scope": "dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "packet": {
+        "schema_version": 1,
+        "reader": "candle-gen::Weights::from_files_filtered",
+        "role": "model-weights",
+        "complete": true,
+        "items": [
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00001-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030312d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00001-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030312d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          },
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00002-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030322d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00002-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030322d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          },
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00003-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030332d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00003-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030332d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          },
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00004-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030342d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00004-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030342d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          },
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00005-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030352d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00005-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030352d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          },
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00006-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030362d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00006-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030362d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          },
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00007-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030372d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00007-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030372d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          },
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00008-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030382d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00008-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030382d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          },
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00009-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030392d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00009-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303030392d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          },
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00010-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031302d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00010-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031302d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          },
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00011-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031312d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00011-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031312d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          },
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00012-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031322d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00012-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031322d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          },
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00013-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031332d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00013-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031332d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          },
+          {
+            "literal_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00014-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031342d6f662d30303031342e7361666574656e736f7273"
+            },
+            "absolute_lexical_path": {
+              "display": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00014-of-00014.safetensors",
+              "os_encoded_hex": "443a5c436f6465785c776f726b5c73772d663332392d616363657074616e63652d34323234333634353231332d315c7374616765645c6875625c6d6f64656c732d2d5363656e65576f726b732d2d6d696e696d61782d68332d6d6c785c736e617073686f74735c313337636536363863353561323062633039333566643163663261336465383434386162623766345c71345c7472616e73666f726d65725c646966667573696f6e5f7079746f7263685f6d6f64656c2d30303031342d6f662d30303031342e7361666574656e736f7273"
+            },
+            "os_encoding": "rust-osstr-encoded",
+            "provenance": {
+              "kind": "successful-reader-binding",
+              "content_integrity": "not_attested"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "actualVerifiedAssets": [
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\config.json",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/config.json",
+      "bytes": 613,
+      "sha256": "9208a8892c74a15dcac6828039a528ba13ba2eac0b708ee7d26caef59237ee8d"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--lightx2v--Minimax-h3-Turbo\\snapshots\\5d1d4829fe614c1b93fcfd9cc7718e9ba71f73e1\\minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors",
+      "repo": "lightx2v/Minimax-h3-Turbo",
+      "revision": "5d1d4829fe614c1b93fcfd9cc7718e9ba71f73e1",
+      "relative": "minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors",
+      "bytes": 1383677768,
+      "sha256": "e16ac20824d6e6649b193806f8fb095639bd9946c97b1bb84b4248eab1cc807f"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00001-of-00014.safetensors",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/diffusion_pytorch_model-00001-of-00014.safetensors",
+      "bytes": 1488457995,
+      "sha256": "6d5ba9b4acfc9246cd1df7b3e157a9b101c4458b7ef788ff0e1ec76321831a71"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00002-of-00014.safetensors",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/diffusion_pytorch_model-00002-of-00014.safetensors",
+      "bytes": 1323111315,
+      "sha256": "95321756ababc90fb758cd39fcd2d0366d326b45022cda5cd310236a3344da9b"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00003-of-00014.safetensors",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/diffusion_pytorch_model-00003-of-00014.safetensors",
+      "bytes": 1388138401,
+      "sha256": "f5e70d6d8bc871455944e8f9da7f4d9dd3a0574b124c39226d153edebb2c0797"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00004-of-00014.safetensors",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/diffusion_pytorch_model-00004-of-00014.safetensors",
+      "bytes": 1284962984,
+      "sha256": "5e16bc143946dd2a3a7d6aac4a3277e9ac34431f149f80aee51e88c8b6df05f0"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00005-of-00014.safetensors",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/diffusion_pytorch_model-00005-of-00014.safetensors",
+      "bytes": 1323111403,
+      "sha256": "601fef51b7e0538a425b441f77c38be8b18952442a19324ce03d0d28574f5c8f"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00006-of-00014.safetensors",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/diffusion_pytorch_model-00006-of-00014.safetensors",
+      "bytes": 1388138485,
+      "sha256": "d12865ea0ffd48cfc7d311f8fa8953ec832daf9048f27b8564f22a691bd2f7ad"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00007-of-00014.safetensors",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/diffusion_pytorch_model-00007-of-00014.safetensors",
+      "bytes": 1284962964,
+      "sha256": "a3d7a8aee94ecdd06bb072b635a7c56b53aba7fbb7dd19a87f0c96dcedf1907f"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00008-of-00014.safetensors",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/diffusion_pytorch_model-00008-of-00014.safetensors",
+      "bytes": 1323111415,
+      "sha256": "62ba99fc9679e154a328aaa6170cf74d0c47bdd12dfe6407a92367feb6d16960"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00009-of-00014.safetensors",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/diffusion_pytorch_model-00009-of-00014.safetensors",
+      "bytes": 1388138421,
+      "sha256": "e3fe77de684132940effbfc2479d6e123e40702606b11637366512b2d0a104f1"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00010-of-00014.safetensors",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/diffusion_pytorch_model-00010-of-00014.safetensors",
+      "bytes": 1284962958,
+      "sha256": "580fe2760e245184c6a14c3f842da4aa8e08be2cad88ad352f5bd17f7b52a374"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00011-of-00014.safetensors",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/diffusion_pytorch_model-00011-of-00014.safetensors",
+      "bytes": 1323111395,
+      "sha256": "186000b10654fdbf6c4edb0bdfa406b1847e5d0bf691879d8fe507fe6a37f2b8"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00012-of-00014.safetensors",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/diffusion_pytorch_model-00012-of-00014.safetensors",
+      "bytes": 1388138445,
+      "sha256": "bce82195aaae6c4984f51f1adf2ab32d81da0f41ec228b014c6327d79a533611"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00013-of-00014.safetensors",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/diffusion_pytorch_model-00013-of-00014.safetensors",
+      "bytes": 1284963008,
+      "sha256": "d15dcbc77a87acf2ee3a140a1b259c0255a99a4cdff544dfcd702f32aee1f5e3"
+    },
+    {
+      "path": "\\\\?\\D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\transformer\\diffusion_pytorch_model-00014-of-00014.safetensors",
+      "repo": "SceneWorks/minimax-h3-mlx",
+      "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+      "relative": "q4/transformer/diffusion_pytorch_model-00014-of-00014.safetensors",
+      "bytes": 1306661489,
+      "sha256": "bbbdefdbafe5feb98d48841f9601772df0e1eeefd0a6d26b2cd4b214de21bd71"
+    }
+  ],
+  "actualFrozenManifestSha256": "9df0a1203b8a20d87b81888cb4edeaa34537f50c558aba239a79af5b3c443b01",
+  "teManifestMetadataForSimulatedReceipts": {
+    "schemaVersion": 1,
+    "tierRevision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+    "baseRevision": "6818f6c32d12b210915e44ad56a4228c2608f160",
+    "textEncoderDir": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder",
+    "baseRoot": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--MiniMaxAI--MiniMax-H3\\snapshots\\6818f6c32d12b210915e44ad56a4228c2608f160",
+    "requestPath": "D:\\Codex\\work\\sw-f329\\envelope-outputs\\original-workstation-request.json",
+    "requestSha256": "b5b5ba095203fab1eddb9ba1793162959328e16ee34a0ca6e19d44e2325bce23",
+    "acceptedStagingReceipt": {
+      "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged-models.json",
+      "sha256": "a58d6f7e2d2655a5537b5f7deac02fb95694d5e0a1ec1d47161a14801223d6dd"
+    },
+    "acceptedSourcePair": {
+      "sceneworks": "c8815c7cd46feba2f82562a315d1a44a6c88a9e8",
+      "inference": "2ff0353820e370d004305ae99a035ab38b93de30"
+    },
+    "assets": [
+      {
+        "role": "tier",
+        "repo": "SceneWorks/minimax-h3-mlx",
+        "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+        "relative": "q4/text_encoder/config.json",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder\\config.json",
+        "bytes": 1533,
+        "sha256": "de4a0698c7bbd69501e6a9d33db628a7efbfb2494e6ef3fa620775fc1898daa3"
+      },
+      {
+        "role": "tier",
+        "repo": "SceneWorks/minimax-h3-mlx",
+        "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+        "relative": "q4/text_encoder/model-00001-of-00014.safetensors",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder\\model-00001-of-00014.safetensors",
+        "bytes": 1387288599,
+        "sha256": "c559e8d35a308cee213ad6bafb64ac0d122e137592aba00a212484627aa5b6a7"
+      },
+      {
+        "role": "tier",
+        "repo": "SceneWorks/minimax-h3-mlx",
+        "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+        "relative": "q4/text_encoder/model-00002-of-00014.safetensors",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder\\model-00002-of-00014.safetensors",
+        "bytes": 1371461650,
+        "sha256": "e9fcd69cb2face5254040ab97262f5af77fdf849482ffa3872b5758d80214c05"
+      },
+      {
+        "role": "tier",
+        "repo": "SceneWorks/minimax-h3-mlx",
+        "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+        "relative": "q4/text_encoder/model-00003-of-00014.safetensors",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder\\model-00003-of-00014.safetensors",
+        "bytes": 1371461784,
+        "sha256": "91b3758bb16937db2724cbf12975159281f7cdb20c106532c4f05a1a18d082e4"
+      },
+      {
+        "role": "tier",
+        "repo": "SceneWorks/minimax-h3-mlx",
+        "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+        "relative": "q4/text_encoder/model-00004-of-00014.safetensors",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder\\model-00004-of-00014.safetensors",
+        "bytes": 1371461807,
+        "sha256": "409800b9a40d3dc31ef5dba6a83768e8bb6c4083c2a9d7261697f4a768270c61"
+      },
+      {
+        "role": "tier",
+        "repo": "SceneWorks/minimax-h3-mlx",
+        "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+        "relative": "q4/text_encoder/model-00005-of-00014.safetensors",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder\\model-00005-of-00014.safetensors",
+        "bytes": 1371461807,
+        "sha256": "ae9e6aa4a32f15d2b1968fb5dc2720ec6b6034b8287705b377f3e9ada560acd5"
+      },
+      {
+        "role": "tier",
+        "repo": "SceneWorks/minimax-h3-mlx",
+        "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+        "relative": "q4/text_encoder/model-00006-of-00014.safetensors",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder\\model-00006-of-00014.safetensors",
+        "bytes": 1371461773,
+        "sha256": "cfc65313e11a6f15b4054341bd99529b99072628797a9ebd7b55f34ab5fb7e34"
+      },
+      {
+        "role": "tier",
+        "repo": "SceneWorks/minimax-h3-mlx",
+        "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+        "relative": "q4/text_encoder/model-00007-of-00014.safetensors",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder\\model-00007-of-00014.safetensors",
+        "bytes": 1371461749,
+        "sha256": "7ad216929f6202d5acb9f43f5dfbbc689884b111091601f2696267f10c28bf73"
+      },
+      {
+        "role": "tier",
+        "repo": "SceneWorks/minimax-h3-mlx",
+        "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+        "relative": "q4/text_encoder/model-00008-of-00014.safetensors",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder\\model-00008-of-00014.safetensors",
+        "bytes": 1371461783,
+        "sha256": "87d6f7be840e2351bcad0178b545f17da56c470a2098e5fdbf76ae175d431f0d"
+      },
+      {
+        "role": "tier",
+        "repo": "SceneWorks/minimax-h3-mlx",
+        "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+        "relative": "q4/text_encoder/model-00009-of-00014.safetensors",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder\\model-00009-of-00014.safetensors",
+        "bytes": 1371461791,
+        "sha256": "beb4a89fec21e42cb0e38c5e43fcf7d53ce12e7b37fe3cf35e4463bd56e05900"
+      },
+      {
+        "role": "tier",
+        "repo": "SceneWorks/minimax-h3-mlx",
+        "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+        "relative": "q4/text_encoder/model-00010-of-00014.safetensors",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder\\model-00010-of-00014.safetensors",
+        "bytes": 1371461753,
+        "sha256": "0cb90e23220629cf6e143d110fa0af40a7b6337935fd5fad42ce6fc9bc8ea8eb"
+      },
+      {
+        "role": "tier",
+        "repo": "SceneWorks/minimax-h3-mlx",
+        "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+        "relative": "q4/text_encoder/model-00011-of-00014.safetensors",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder\\model-00011-of-00014.safetensors",
+        "bytes": 1371461793,
+        "sha256": "03c4d31a65a13aa10ef36c9119869a041da3fb4a22897159126789087b9851ee"
+      },
+      {
+        "role": "tier",
+        "repo": "SceneWorks/minimax-h3-mlx",
+        "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+        "relative": "q4/text_encoder/model-00012-of-00014.safetensors",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder\\model-00012-of-00014.safetensors",
+        "bytes": 1371461795,
+        "sha256": "41e834d49b8a25640280fe743580845be5c04e5f464f817ca95e30dc297c0b9d"
+      },
+      {
+        "role": "tier",
+        "repo": "SceneWorks/minimax-h3-mlx",
+        "revision": "137ce668c55a20bc0935fd1cf2a3de8448abb7f4",
+        "relative": "q4/text_encoder/model-00014-of-00014.safetensors",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--SceneWorks--minimax-h3-mlx\\snapshots\\137ce668c55a20bc0935fd1cf2a3de8448abb7f4\\q4\\text_encoder\\model-00014-of-00014.safetensors",
+        "bytes": 2237658755,
+        "sha256": "16ac1bb814c35022f223c4233575d3b7d129b36f017bc503302f083f5181ef3f"
+      },
+      {
+        "role": "base",
+        "repo": "MiniMaxAI/MiniMax-H3",
+        "revision": "6818f6c32d12b210915e44ad56a4228c2608f160",
+        "relative": "tokenizer/tokenizer.json",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--MiniMaxAI--MiniMax-H3\\snapshots\\6818f6c32d12b210915e44ad56a4228c2608f160\\tokenizer\\tokenizer.json",
+        "bytes": 7032403,
+        "sha256": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7"
+      },
+      {
+        "role": "base",
+        "repo": "MiniMaxAI/MiniMax-H3",
+        "revision": "6818f6c32d12b210915e44ad56a4228c2608f160",
+        "relative": "tokenizer/tokenizer_config.json",
+        "path": "D:\\Codex\\work\\sw-f329-acceptance-42243645213-1\\staged\\hub\\models--MiniMaxAI--MiniMax-H3\\snapshots\\6818f6c32d12b210915e44ad56a4228c2608f160\\tokenizer\\tokenizer_config.json",
+        "bytes": 11003,
+        "sha256": "a07e942ac874baa13758de8d1fbdb186683cc03416b5589e1b6671c6b3057c68"
+      }
+    ]
+  },
+  "historicalInputContract": {
+    "fixture_kind": "mixed",
+    "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/layers/residency_component.rs::dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+    "requirements": [
+      {
+        "slot": "actual-q4-projection",
+        "role": "model-weights",
+        "readers": [
+          "candle-gen::Weights::from_files_filtered"
+        ],
+        "minimum_collections": 1,
+        "minimum_items": 1,
+        "required_grade": "reader-binding",
+        "scope": "case"
+      },
+      {
+        "slot": "actual-stock-configuration",
+        "role": "configuration",
+        "readers": [
+          "candle-gen-minimax-h3::dit::MiniMaxH3Dit::load_from_dir/configuration"
+        ],
+        "minimum_collections": 1,
+        "minimum_items": 1,
+        "required_grade": "reader-binding",
+        "scope": "case"
+      },
+      {
+        "slot": "actual-canonical-turbo",
+        "role": "artifact-input",
+        "readers": [
+          "crates/media/candle-gen/candle-gen/src/train/merge.rs::read_adapter_capped::std::fs::read@8751"
+        ],
+        "minimum_collections": 1,
+        "minimum_items": 1,
+        "required_grade": "content",
+        "scope": "case",
+        "expected_sha256": [
+          "e16ac20824d6e6649b193806f8fb095639bd9946c97b1bb84b4248eab1cc807f"
+        ]
+      }
+    ]
+  }
+}
