@@ -67,6 +67,15 @@ pub enum StageTemplate {
     Terminal,
 }
 
+/// Precompiled from each actual source tensor before admission. `storage_bytes` is the
+/// caller-owned tensor's live allocation bound, including a wider original dtype if present.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceImageGeometry {
+    pub width: u32,
+    pub height: u32,
+    pub storage_bytes: u64,
+}
+
 /// All output-affecting request facts and conservative upper bounds are frozen pre-load.
 /// `step_scratch_bytes` is an admission upper bound for all simultaneously live step tensors;
 /// `cache_token_bytes` is the upper bound for each retained KV token across the three caches.
@@ -79,6 +88,7 @@ pub struct ConditionalInput {
     pub height: u32,
     pub cell: u32,
     pub input_images: u32,
+    pub source_images: Vec<SourceImageGeometry>,
     pub prefill_tokens: [u32; CACHE_COUNT],
     pub max_new_tokens: u32,
     pub max_images: u32,
@@ -93,6 +103,10 @@ pub struct ConditionalCeilings {
     pub max_width: u32,
     pub max_height: u32,
     pub max_input_images: u32,
+    pub max_source_width: u32,
+    pub max_source_height: u32,
+    pub max_source_token_grid: u64,
+    pub max_source_live_bytes: u64,
     pub max_token_grid: u64,
     pub max_new_tokens: u32,
     pub max_images: u32,
@@ -105,6 +119,8 @@ pub struct ConditionalCeilings {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConditionalBudget {
     pub image_tokens: u64,
+    pub source_image_tokens: u64,
+    pub source_live_bytes: u64,
     pub cache_token_caps: [u64; CACHE_COUNT],
     pub max_text_rollouts: u32,
     pub max_outer_steps: u32,
@@ -143,11 +159,67 @@ impl ConditionalPlan {
         if input.width > ceilings.max_width
             || input.height > ceilings.max_height
             || input.input_images > ceilings.max_input_images
+            || u32::try_from(input.source_images.len()).map_err(|_| overflow())?
+                != input.input_images
             || input.max_new_tokens > ceilings.max_new_tokens
             || input.max_images > ceilings.max_images
             || input.steps_per_image > ceilings.max_steps_per_image
         {
             return Err(refused("request exceeds an admitted geometry or count cap"));
+        }
+
+        // Both condition and text-uncondition prefixes splice every source image as
+        // `<img><IMG_CONTEXT>×grid</img>`. Price the precompiled source tensor shapes,
+        // retained patch arrays, and concatenated pixel_values before admitting prefill.
+        let mut source_image_tokens = 0u64;
+        let mut source_pixels = 0u64;
+        let mut source_live_bytes = 0u64;
+        for source in &input.source_images {
+            if source.width == 0
+                || source.height == 0
+                || source.width > ceilings.max_source_width
+                || source.height > ceilings.max_source_height
+                || !source.width.is_multiple_of(input.cell)
+                || !source.height.is_multiple_of(input.cell)
+            {
+                return Err(refused("source image geometry exceeds its compiled bounds"));
+            }
+            let tokens = mul(
+                u64::from(source.width / input.cell),
+                u64::from(source.height / input.cell),
+            )?;
+            if tokens > ceilings.max_source_token_grid {
+                return Err(refused("source image token grid exceeds its cap"));
+            }
+            let pixels = mul(u64::from(source.width), u64::from(source.height))?;
+            let f32_rgb_bytes = mul(pixels, mul(IMAGE_CHANNELS, F32_BYTES)?)?;
+            if source.storage_bytes < mul(pixels, IMAGE_CHANNELS)? {
+                return Err(refused(
+                    "source tensor storage bound understates its geometry",
+                ));
+            }
+            source_image_tokens = add(source_image_tokens, tokens)?;
+            source_pixels = add(source_pixels, pixels)?;
+            // Upper bound simultaneous original tensors, conversion/normalization
+            // intermediates, per-image patches, and concatenated pixel_values.
+            source_live_bytes = add(
+                source_live_bytes,
+                add(source.storage_bytes, mul(f32_rgb_bytes, 5)?)?,
+            )?;
+        }
+        if source_live_bytes > ceilings.max_source_live_bytes {
+            return Err(refused("source image live bytes exceed their cap"));
+        }
+        let source_prefix_min = add(
+            add(source_image_tokens, mul(u64::from(input.input_images), 2)?)?,
+            1,
+        )?;
+        if u64::from(input.prefill_tokens[0]) < source_prefix_min
+            || u64::from(input.prefill_tokens[1]) < source_prefix_min
+        {
+            return Err(refused(
+                "source-image prefill tokens understate expanded prefixes",
+            ));
         }
 
         let image_tokens = mul(
@@ -203,7 +275,7 @@ impl ConditionalPlan {
                     input.model_resident_bytes,
                     mul(cache_sum, input.cache_token_bytes)?,
                 )?,
-                retained_image_bytes,
+                add(retained_image_bytes, source_live_bytes)?,
             )?,
             add(input.step_scratch_bytes, image_buffer_bytes)?,
         )?;
@@ -220,6 +292,13 @@ impl ConditionalPlan {
         for tokens in input.prefill_tokens {
             total_work_units = add(total_work_units, mul(u64::from(tokens), u64::from(tokens))?)?;
         }
+        total_work_units = add(
+            total_work_units,
+            add(
+                mul(source_pixels, IMAGE_CHANNELS)?,
+                mul(mul(source_image_tokens, source_image_tokens)?, 2)?,
+            )?,
+        )?;
         total_work_units = add(
             total_work_units,
             mul(u64::from(input.max_new_tokens), cond_cap)?,
@@ -288,6 +367,8 @@ impl ConditionalPlan {
             cache_lifetimes,
             budget: ConditionalBudget {
                 image_tokens,
+                source_image_tokens,
+                source_live_bytes,
                 cache_token_caps,
                 max_text_rollouts,
                 max_outer_steps,
@@ -308,6 +389,14 @@ impl ConditionalPlan {
         self.validate()?;
         if &self.input != input {
             return Err(refused("compiled plan belongs to a different request"));
+        }
+        Ok(())
+    }
+
+    pub fn check_source_images(&self, actual: &[SourceImageGeometry]) -> Result<()> {
+        self.validate()?;
+        if self.input.source_images != actual {
+            return Err(refused("source tensors differ from precompiled geometry"));
         }
         Ok(())
     }
@@ -589,6 +678,10 @@ pub trait ConditionalExecutor {
     type Context;
     type Image;
 
+    /// Must inspect the actual caller-owned tensors before weights load or prefill begins.
+    /// `storage_bytes` includes the original tensor allocation, even for a wider dtype.
+    fn source_images(&self) -> Result<Vec<SourceImageGeometry>>;
+
     fn prefill(
         &mut self,
         plan: &ConditionalPlan,
@@ -624,6 +717,7 @@ pub fn run_conditional<E: ConditionalExecutor>(
     progress: &mut dyn FnMut(Progress),
 ) -> Result<ConditionalOutput<E::Image>> {
     plan.check_input(input)?;
+    plan.check_source_images(&executor.source_images()?)?;
     let mut guard = ConditionalGuard::new(plan)?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);

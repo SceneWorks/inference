@@ -14,6 +14,7 @@ fn input() -> ConditionalInput {
         height: 64,
         cell: 16,
         input_images: 0,
+        source_images: Vec::new(),
         prefill_tokens: [10, 3, 2],
         max_new_tokens: 10,
         max_images: 3,
@@ -28,6 +29,10 @@ fn ceilings() -> ConditionalCeilings {
         max_width: 1024,
         max_height: 1024,
         max_input_images: 4,
+        max_source_width: 1024,
+        max_source_height: 1024,
+        max_source_token_grid: 4096,
+        max_source_live_bytes: 100_000_000,
         max_token_grid: 4096,
         max_new_tokens: 128,
         max_images: 8,
@@ -63,6 +68,7 @@ struct Mock {
     script: VecDeque<TextRollout>,
     cancel: CancelFlag,
     cancel_at: Option<&'static str>,
+    source_images: Vec<SourceImageGeometry>,
 }
 impl Mock {
     fn new(script: Vec<TextRollout>) -> Self {
@@ -71,6 +77,7 @@ impl Mock {
             script: script.into(),
             cancel: CancelFlag::new(),
             cancel_at: None,
+            source_images: Vec::new(),
         }
     }
     fn log(&self, call: String) {
@@ -87,6 +94,9 @@ impl ConditionalExecutor for Mock {
     type Cache = Cache;
     type Context = ();
     type Image = u32;
+    fn source_images(&self) -> Result<Vec<SourceImageGeometry>> {
+        Ok(self.source_images.clone())
+    }
     fn prefill(&mut self, _: &ConditionalPlan) -> Result<((), [Cache; 3])> {
         self.log("prefill".into());
         Ok(((), std::array::from_fn(|_| Cache(self.probe.drops.clone()))))
@@ -321,4 +331,47 @@ fn admission_rejects_caps_overflow_and_forged_plan() {
         p.check_input(&ConditionalInput { seed: 3, ..input() })
             .is_err()
     );
+}
+
+#[test]
+fn source_images_require_real_expanded_prefixes_and_live_storage() {
+    let source = SourceImageGeometry {
+        width: 64,
+        height: 64,
+        storage_bytes: 64 * 64 * 3 * 4,
+    };
+    let mut i = input();
+    i.input_images = 4;
+    i.source_images = vec![source.clone(); 4];
+    i.prefill_tokens = [1, 1, 1];
+    assert!(ConditionalPlan::compile(i.clone(), ceilings()).is_err());
+
+    // Four 16-token grids each add an <img> and </img> marker to both prefixes.
+    i.prefill_tokens = [73, 73, 1];
+    let p = ConditionalPlan::compile(i.clone(), ceilings()).unwrap();
+    assert_eq!(p.budget().source_image_tokens, 64);
+    assert_eq!(p.budget().source_live_bytes, 4 * 6 * 64 * 64 * 3 * 4);
+    assert!(p.budget().peak_live_bytes > plan().budget().peak_live_bytes);
+    assert!(p.budget().total_work_units > plan().budget().total_work_units);
+
+    let mut c = ceilings();
+    c.max_source_live_bytes = p.budget().source_live_bytes - 1;
+    assert!(ConditionalPlan::compile(i.clone(), c).is_err());
+    let mut bad = i.clone();
+    bad.source_images[0].storage_bytes = 1;
+    assert!(ConditionalPlan::compile(bad, ceilings()).is_err());
+    let mut bad = i.clone();
+    bad.source_images[0].width = 65;
+    assert!(ConditionalPlan::compile(bad, ceilings()).is_err());
+    let mut bad = i.clone();
+    bad.source_images.pop();
+    assert!(ConditionalPlan::compile(bad, ceilings()).is_err());
+
+    let mut mock = Mock::new(vec![segment(0, RolloutStop::End)]);
+    let (result, _) = run(&mut mock, &p);
+    assert!(result.is_err());
+    assert!(mock.calls().is_empty()); // mismatch is refused before any provider callback
+    mock.source_images = vec![source; 4];
+    let (result, _) = run(&mut mock, &p);
+    assert!(result.is_ok());
 }
