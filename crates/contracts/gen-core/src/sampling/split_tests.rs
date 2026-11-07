@@ -12,17 +12,19 @@ use std::cell::RefCell;
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Trace {
     callbacks: Vec<(Vec<u32>, u32)>,
-    events: Vec<(
-        Solver,
-        usize,
-        SolverObservationKind,
-        Vec<u32>,
-        [bool; 3],
-        bool,
-        bool,
-    )>,
+    events: Vec<TraceEvent>,
     draws: Vec<usize>,
 }
+
+type TraceEvent = (
+    Solver,
+    usize,
+    SolverObservationKind,
+    Vec<u32>,
+    [bool; 3],
+    bool,
+    bool,
+);
 
 #[derive(Default)]
 struct ObservedOps(RefCell<Trace>);
@@ -72,7 +74,7 @@ fn sigmas() -> [f32; 6] {
     [0.96, 0.77, 0.59, 0.34, 0.17, 0.0]
 }
 
-fn denoise(ops: &ObservedOps, x: &Vec<f32>, sigma: f32) -> Result<Vec<f32>> {
+fn denoise(ops: &ObservedOps, x: &[f32], sigma: f32) -> Result<Vec<f32>> {
     ops.0
         .borrow_mut()
         .callbacks
@@ -80,7 +82,7 @@ fn denoise(ops: &ObservedOps, x: &Vec<f32>, sigma: f32) -> Result<Vec<f32>> {
     Ok(x.iter().map(|v| v * 0.7 + 0.11 * sigma).collect())
 }
 
-fn cfgpp_denoise(ops: &ObservedOps, x: &Vec<f32>, sigma: f32) -> Result<(Vec<f32>, Vec<f32>)> {
+fn cfgpp_denoise(ops: &ObservedOps, x: &[f32], sigma: f32) -> Result<(Vec<f32>, Vec<f32>)> {
     ops.0
         .borrow_mut()
         .callbacks

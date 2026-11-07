@@ -5,9 +5,9 @@ use mlx_gen::gen_core;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    run_flow_sampler_with_latent_hook, Conditioning, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress,
-    Residency, Result, SamplerRun, TimestepConvention, WeightsSource,
+    run_flow_sampler_with_latent_hook_spans, Conditioning, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy,
+    Precision, Progress, Residency, Result, SamplerRun, TimestepConvention, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_z_image::vae::Vae;
@@ -841,6 +841,7 @@ impl Flux1 {
             _ => None,
         };
         let denoise_sigmas = plan.denoise_sigmas();
+        let denoise_spans = plan.denoise_spans();
         // Route the flow-match denoise through the unified curated-sampler framework (epic 7114 P3):
         // the default `flow_match` / `hyper` profile maps to Euler (the legacy `x + v·Δσ` step, within
         // the N1 parity tolerance), and the curated menu (heun / dpmpp_2m / uni_pc / …) becomes
@@ -850,14 +851,14 @@ impl Flux1 {
         // render by the RAII guard (F-007): the render thread's prior setting is restored on drop.
         let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
-        let images = run.images(
+        let images = run.images_with_denoise_phases(
             on_progress,
             |seed| create_noise(seed, req.width, req.height),
             |seed, latents, on_progress| {
                 // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress are handled inside
                 // `run_flow_sampler`.
                 let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
-                run_flow_sampler_with_latent_hook(
+                run_flow_sampler_with_latent_hook_spans(
                     SamplerRun {
                         sampler_name: Some(sampler_name),
                         sigmas: denoise_sigmas,
@@ -867,6 +868,8 @@ impl Flux1 {
                     },
                     TimestepConvention::Sigma,
                     latents,
+                    &denoise_spans,
+                    Some(run),
                     |latents, sigma| {
                         crate::preview::emit_preview(
                             &req.preview,

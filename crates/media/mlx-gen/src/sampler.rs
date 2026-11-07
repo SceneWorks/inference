@@ -519,10 +519,34 @@ pub fn run_curated_sampler_with_latent_hook(
     run: SamplerRun<'_>,
     ms: &dyn gen_core::sampling::ModelSampling,
     latents: Array,
+    on_latent: impl FnMut(&Array, f32),
+    predict: impl FnMut(&Array, f32) -> Result<Array>,
+) -> Result<Array> {
+    let steps = run.sigmas.len().saturating_sub(1);
+    let span = 0..steps;
+    run_curated_sampler_with_latent_hook_spans(
+        run,
+        ms,
+        latents,
+        std::slice::from_ref(&span),
+        None,
+        on_latent,
+        predict,
+    )
+}
+
+/// One request trajectory over precompiled inert phase spans. All spans use the same callback,
+/// progress/preview observers and request-owned solver state.
+pub fn run_curated_sampler_with_latent_hook_spans(
+    run: SamplerRun<'_>,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    latents: Array,
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
     mut on_latent: impl FnMut(&Array, f32),
     mut predict: impl FnMut(&Array, f32) -> Result<Array>,
 ) -> Result<Array> {
-    use gen_core::sampling::{denoise as gc_denoise, Sampler, Solver};
+    use gen_core::sampling::{denoise as gc_denoise, Sampler, Solver, SolverRunState};
 
     let SamplerRun {
         sampler_name,
@@ -537,6 +561,7 @@ pub fn run_curated_sampler_with_latent_hook(
     // N3: a curated name routes to its solver; an unknown name / non-solver alias falls back to Euler.
     let solver = canonical_solver(sampler_name, Solver::Euler);
     let sampler: Box<dyn Sampler<MlxLatentOps>> = solver.boxed();
+    let mut state = SolverRunState::new(solver, sigmas);
     let mut step_observer = CuratedStepObserver::new(solver);
     let mut evaluations = 0u64;
 
@@ -590,9 +615,32 @@ pub fn run_curated_sampler_with_latent_hook(
         })
     };
 
-    let out = sampler
-        .sample(&ops, ms, &mut denoise_fn, latents, sigmas, seed)
-        .map_err(crate::Error::from)?;
+    let mut out = latents;
+    for (phase, span) in spans.iter().enumerate() {
+        if let Some(run) = phase_scope {
+            run.begin_denoise_phase(phase).map_err(crate::Error::from)?;
+        }
+        out = sampler
+            .sample_span(
+                &ops,
+                ms,
+                &mut denoise_fn,
+                out,
+                sigmas,
+                seed,
+                span.clone(),
+                &mut state,
+            )
+            .map_err(crate::Error::from)?;
+        if let Some(run) = phase_scope {
+            run.end_denoise_phase(phase).map_err(crate::Error::from)?;
+        }
+    }
+    if state.next_step() != sigmas.len().saturating_sub(1) {
+        return Err(crate::Error::from(gen_core::Error::Unsupported(
+            "sampler spans do not cover the executed schedule".into(),
+        )));
+    }
     // Force the final step's advancement (never seen by the callback, which evals only inputs).
     step_eval(&[&out])?;
     crate::ios_quantum::diagnostic_metadata(
@@ -769,6 +817,27 @@ pub fn run_flow_sampler_with_latent_hook(
 ) -> Result<Array> {
     let ms = gen_core::sampling::FlowModelSampling::new(conv);
     run_curated_sampler_with_latent_hook(run, &ms, latents, on_latent, predict)
+}
+
+pub fn run_flow_sampler_with_latent_hook_spans(
+    run: SamplerRun<'_>,
+    conv: TimestepConvention,
+    latents: Array,
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
+    on_latent: impl FnMut(&Array, f32),
+    predict: impl FnMut(&Array, f32) -> Result<Array>,
+) -> Result<Array> {
+    let ms = gen_core::sampling::FlowModelSampling::new(conv);
+    run_curated_sampler_with_latent_hook_spans(
+        run,
+        &ms,
+        latents,
+        spans,
+        phase_scope,
+        on_latent,
+        predict,
+    )
 }
 
 // =================================================================================================
@@ -1502,6 +1571,105 @@ mod tests {
             assert!(
                 out.as_slice::<f32>().iter().all(|v| v.is_finite()),
                 "{name} produced non-finite output"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn flow_driver_inert_spans_preserve_every_solver_output_and_progress() {
+        const CHILD: &str = "MLX_GEN_INERT_SPAN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sampler::tests::flow_driver_inert_spans_preserve_every_solver_output_and_progress",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        let sigmas = [0.96, 0.77, 0.59, 0.34, 0.17, 0.0];
+        let initial = arr(&[0.2, -0.5, 1.0, 0.3]);
+        for solver in gen_core::sampling::Solver::ALL {
+            let cancel = CancelFlag::new();
+            let mut expected_progress = Vec::new();
+            let mut expected_predict = Vec::new();
+            let mut expected_latent = Vec::new();
+            let expected = run_flow_sampler_with_latent_hook(
+                SamplerRun {
+                    sampler_name: Some(solver.name()),
+                    sigmas: &sigmas,
+                    seed: 104729,
+                    cancel: &cancel,
+                    on_progress: &mut |event| {
+                        if let Progress::Step { current, total } = event {
+                            expected_progress.push((current, total));
+                        }
+                    },
+                },
+                TimestepConvention::Sigma,
+                initial.clone(),
+                |x, sigma| expected_latent.push((sigma.to_bits(), x.as_slice::<f32>().to_vec())),
+                |x, timestep| {
+                    expected_predict.push((timestep.to_bits(), x.as_slice::<f32>().to_vec()));
+                    stub_velocity(x)
+                },
+            )
+            .unwrap();
+            let mut split_progress = Vec::new();
+            let mut split_predict = Vec::new();
+            let mut split_latent = Vec::new();
+            let split = run_flow_sampler_with_latent_hook_spans(
+                SamplerRun {
+                    sampler_name: Some(solver.name()),
+                    sigmas: &sigmas,
+                    seed: 104729,
+                    cancel: &cancel,
+                    on_progress: &mut |event| {
+                        if let Progress::Step { current, total } = event {
+                            split_progress.push((current, total));
+                        }
+                    },
+                },
+                TimestepConvention::Sigma,
+                initial.clone(),
+                &[0..2, 2..4, 4..5],
+                None,
+                |x, sigma| split_latent.push((sigma.to_bits(), x.as_slice::<f32>().to_vec())),
+                |x, timestep| {
+                    split_predict.push((timestep.to_bits(), x.as_slice::<f32>().to_vec()));
+                    stub_velocity(x)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                split.as_slice::<f32>(),
+                expected.as_slice::<f32>(),
+                "{}",
+                solver.name()
+            );
+            assert_eq!(
+                split_progress,
+                expected_progress,
+                "{} progress",
+                solver.name()
+            );
+            assert_eq!(
+                split_predict,
+                expected_predict,
+                "{} callbacks",
+                solver.name()
+            );
+            assert_eq!(split_latent, expected_latent, "{} previews", solver.name());
+            assert_eq!(
+                split_latent.len(),
+                sigmas.len() - 1,
+                "{} preview count",
+                solver.name()
             );
         }
     }

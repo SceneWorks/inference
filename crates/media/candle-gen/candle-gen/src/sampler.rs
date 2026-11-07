@@ -194,9 +194,41 @@ pub fn run_curated_sampler(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
     preview: Option<&PreviewHook<'_>>,
+    predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let span = 0..sigmas.len().saturating_sub(1);
+    run_curated_sampler_spans(
+        sampler_name,
+        ms,
+        sigmas,
+        std::slice::from_ref(&span),
+        None,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        preview,
+        predict,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_curated_sampler_spans(
+    sampler_name: Option<&str>,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    sigmas: &[f32],
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
+    latents: Tensor,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: Option<&PreviewHook<'_>>,
     mut predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
 ) -> Result<Tensor> {
-    use gen_core::sampling::{denoise as gc_denoise, sampler_by_name, Euler, Sampler};
+    use gen_core::sampling::{
+        denoise as gc_denoise, sampler_by_name, Euler, Sampler, SolverRunState,
+    };
 
     let ops = CandleLatentOps;
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
@@ -204,6 +236,7 @@ pub fn run_curated_sampler(
     let sampler: Box<dyn Sampler<CandleLatentOps>> = sampler_name
         .and_then(sampler_by_name::<CandleLatentOps>)
         .unwrap_or_else(|| Box::new(Euler));
+    let mut state = SolverRunState::new(sampler.solver(), sigmas);
     // Built HERE, not by the family, so frame numbering can only ever key off the schedule this
     // driver actually integrates. `None` allocates nothing and adds no per-eval work.
     let previews = preview.map(|hook| (hook, PreviewCounter::new(sigmas)));
@@ -226,9 +259,33 @@ pub fn run_curated_sampler(
         })
     };
 
-    sampler
-        .sample(&ops, ms, &mut denoise_fn, latents, sigmas, seed)
-        .map_err(CandleError::from)
+    let mut out = latents;
+    for (phase, span) in spans.iter().enumerate() {
+        if let Some(run) = phase_scope {
+            run.begin_denoise_phase(phase).map_err(CandleError::from)?;
+        }
+        out = sampler
+            .sample_span(
+                &ops,
+                ms,
+                &mut denoise_fn,
+                out,
+                sigmas,
+                seed,
+                span.clone(),
+                &mut state,
+            )
+            .map_err(CandleError::from)?;
+        if let Some(run) = phase_scope {
+            run.end_denoise_phase(phase).map_err(CandleError::from)?;
+        }
+    }
+    if state.next_step() != sigmas.len().saturating_sub(1) {
+        return Err(CandleError::from(gen_core::Error::Unsupported(
+            "sampler spans do not cover the executed schedule".into(),
+        )));
+    }
+    Ok(out)
 }
 
 /// Drive a curated solver over a flow-match (rectified-flow) sigma schedule — the thin
@@ -260,6 +317,36 @@ pub fn run_flow_sampler(
         sampler_name,
         &ms,
         sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        preview,
+        predict,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_flow_sampler_spans(
+    sampler_name: Option<&str>,
+    conv: TimestepConvention,
+    sigmas: &[f32],
+    spans: &[std::ops::Range<usize>],
+    phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
+    latents: Tensor,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: Option<&PreviewHook<'_>>,
+    predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let ms = gen_core::sampling::FlowModelSampling::new(conv);
+    run_curated_sampler_spans(
+        sampler_name,
+        &ms,
+        sigmas,
+        spans,
+        phase_scope,
         latents,
         seed,
         cancel,
@@ -852,7 +939,7 @@ mod tests {
 
     // --- Curated-sampler driver (epic 7114 P4, sc-7123): the per-engine adoption seam ---------------
 
-    use super::{run_curated_sampler, run_flow_sampler};
+    use super::{run_curated_sampler, run_flow_sampler, run_flow_sampler_spans};
     use candle_core::DType;
     use gen_core::sampling::{AlphaSchedule, DiscreteModelSampling, EdmModelSampling, Scheduler};
     use gen_core::{CancelFlag, Progress};
@@ -894,6 +981,72 @@ mod tests {
             max_abs_diff_slices(&vec1(&out), &vec1(&legacy)) < 1e-4,
             "driver euler diverged from inline flow loop"
         );
+    }
+
+    #[test]
+    fn flow_driver_inert_spans_preserve_every_solver_output_and_progress() {
+        let sigmas = [0.96, 0.77, 0.59, 0.34, 0.17, 0.0];
+        let initial = t(&[0.2, -0.5, 1.0, 0.3]);
+        for solver in gen_core::sampling::Solver::ALL {
+            let cancel = CancelFlag::new();
+            let mut reference_progress = Vec::new();
+            let mut reference_predict = Vec::new();
+            let reference = run_flow_sampler(
+                Some(solver.name()),
+                TimestepConvention::Sigma,
+                &sigmas,
+                initial.clone(),
+                104729,
+                &cancel,
+                &mut |event| {
+                    if let Progress::Step { current, total } = event {
+                        reference_progress.push((current, total));
+                    }
+                },
+                None,
+                |x, timestep| {
+                    reference_predict.push((timestep.to_bits(), vec1(x)));
+                    Ok(x.affine(0.25, 0.1)?)
+                },
+            )
+            .unwrap();
+            let mut split_progress = Vec::new();
+            let mut split_predict = Vec::new();
+            let split = run_flow_sampler_spans(
+                Some(solver.name()),
+                TimestepConvention::Sigma,
+                &sigmas,
+                &[0..2, 2..4, 4..5],
+                None,
+                initial.clone(),
+                104729,
+                &cancel,
+                &mut |event| {
+                    if let Progress::Step { current, total } = event {
+                        split_progress.push((current, total));
+                    }
+                },
+                None,
+                |x, timestep| {
+                    split_predict.push((timestep.to_bits(), vec1(x)));
+                    Ok(x.affine(0.25, 0.1)?)
+                },
+            )
+            .unwrap();
+            assert_eq!(vec1(&split), vec1(&reference), "{} output", solver.name());
+            assert_eq!(
+                split_progress,
+                reference_progress,
+                "{} progress",
+                solver.name()
+            );
+            assert_eq!(
+                split_predict,
+                reference_predict,
+                "{} callbacks",
+                solver.name()
+            );
+        }
     }
 
     /// Keystone: `run_curated_sampler` over a `DiscreteModelSampling` (ε prediction) with `euler`

@@ -7,6 +7,7 @@ use crate::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
+use std::ops::Range;
 
 pub struct RenderPlanRegistration {
     pub provider_id: &'static str,
@@ -52,6 +53,8 @@ struct ImagePass {
     stages: [Stage; 10],
     sigmas: Vec<f32>,
     phase: ImagePhase,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    inert_splits: Vec<usize>,
     capture_sigma: f32,
 }
 
@@ -259,6 +262,7 @@ impl RenderPlan {
                         token_width,
                     },
                 },
+                inert_splits: Vec::new(),
             },
         })
     }
@@ -321,6 +325,35 @@ impl RenderPlan {
     pub fn denoise_sigmas(&self) -> &[f32] {
         &self.pass.sigmas[self.pass.phase.first_step..=self.pass.phase.end_step]
     }
+
+    /// A proof-only phase boundary with no changes to geometry, model, guidance or schedule.
+    /// It is compiled before load; product Feature controls introduce their own validated phases.
+    #[doc(hidden)]
+    pub fn with_inert_split_at(mut self, step: usize) -> Result<Self> {
+        if step <= self.pass.phase.first_step || step >= self.pass.phase.end_step {
+            return Err(Error::Unsupported(
+                "inert split must lie inside the executed pass steps".into(),
+            ));
+        }
+        if self.pass.inert_splits.binary_search(&step).is_err() {
+            self.pass.inert_splits.push(step);
+            self.pass.inert_splits.sort_unstable();
+        }
+        Ok(self)
+    }
+
+    /// Half-open absolute steps in the executed pass-local schedule. Keeping a single full
+    /// schedule and one request-owned solver state makes inert boundaries numerically invisible.
+    pub fn denoise_spans(&self) -> Vec<Range<usize>> {
+        let mut first = self.pass.phase.first_step;
+        let mut spans = Vec::with_capacity(self.pass.inert_splits.len() + 1);
+        for &split in &self.pass.inert_splits {
+            spans.push(first..split);
+            first = split;
+        }
+        spans.push(first..self.pass.phase.end_step);
+        spans
+    }
 }
 
 /// Physical geometry of the stage about to operate under the request's already selected
@@ -350,6 +383,8 @@ pub struct RenderRun<'p, 's> {
     cancel: &'p CancelFlag,
     state: Cell<RunState>,
     scope: RefCell<Option<&'s mut dyn MemoryRequestScope>>,
+    next_denoise_phase: Cell<usize>,
+    active_denoise_phase: Cell<Option<usize>>,
 }
 
 impl<'p, 's> RenderRun<'p, 's> {
@@ -363,6 +398,23 @@ impl<'p, 's> RenderRun<'p, 's> {
             cancel,
             scope: RefCell::new(scope),
             state: Cell::new(RunState::BeforeEncode),
+            next_denoise_phase: Cell::new(0),
+            active_denoise_phase: Cell::new(None),
+        }
+    }
+
+    fn phase_identity(&self, phase: usize) -> RenderPhaseIdentity {
+        let stream = &self.plan.pass.phase.stream;
+        RenderPhaseIdentity {
+            pass: 0,
+            phase,
+            geometry: crate::MemoryGeometry {
+                width: stream.width,
+                height: stream.height,
+                batch: 1,
+                frames: self.plan.inputs.frames,
+                reference_count: self.plan.inputs.references,
+            },
         }
     }
 
@@ -375,18 +427,7 @@ impl<'p, 's> RenderRun<'p, 's> {
             return Err(Error::Canceled.into());
         }
         if let Some(scope) = self.scope.borrow_mut().as_deref_mut() {
-            let stream = &self.plan.pass.phase.stream;
-            let identity = RenderPhaseIdentity {
-                pass: 0,
-                phase: 0,
-                geometry: crate::MemoryGeometry {
-                    width: stream.width,
-                    height: stream.height,
-                    batch: 1,
-                    frames: self.plan.inputs.frames,
-                    reference_count: self.plan.inputs.references,
-                },
-            };
+            let identity = self.phase_identity(0);
             scope.enter_render_phase(phase, &identity)?;
         }
         // A failed stage leaves teardown to the scope's owner, preserving the original error.
@@ -410,6 +451,42 @@ impl<'p, 's> RenderRun<'p, 's> {
 
     pub fn plan(&self) -> &RenderPlan {
         self.plan
+    }
+
+    /// Enter the next declared denoise span on the owner thread. A failed body leaves scope
+    /// teardown to the owner, as in `phase`; the next image cannot start with an active span.
+    pub fn begin_denoise_phase(&self, phase: usize) -> Result<()> {
+        if self.state.get() != RunState::Rendering
+            || self.active_denoise_phase.get().is_some()
+            || phase != self.next_denoise_phase.get()
+            || phase > self.plan.pass.inert_splits.len()
+        {
+            return Err(Error::Unsupported(
+                "denoise phase is out of order or outside the compiled plan".into(),
+            ));
+        }
+        if self.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        if let Some(scope) = self.scope.borrow_mut().as_deref_mut() {
+            scope.enter_render_phase(MemoryPhase::Denoise, &self.phase_identity(phase))?;
+        }
+        self.active_denoise_phase.set(Some(phase));
+        Ok(())
+    }
+
+    pub fn end_denoise_phase(&self, phase: usize) -> Result<()> {
+        if self.active_denoise_phase.get() != Some(phase) {
+            return Err(Error::Unsupported(
+                "denoise phase end does not match its active phase".into(),
+            ));
+        }
+        if let Some(scope) = self.scope.borrow_mut().as_deref_mut() {
+            scope.leave_phase(MemoryPhase::Denoise)?;
+        }
+        self.active_denoise_phase.set(None);
+        self.next_denoise_phase.set(phase + 1);
+        Ok(())
     }
 
     pub fn encode<T, E: From<Error>>(
@@ -445,6 +522,46 @@ impl<'p, 's> RenderRun<'p, 's> {
                 let initial = init(seed)?;
                 let denoised =
                     self.phase(MemoryPhase::Denoise, || denoise(seed, initial, progress))?;
+                self.phase(MemoryPhase::Decode, || decode(seed, denoised, progress))
+            })
+            .collect();
+        self.state.set(RunState::Finished);
+        images
+    }
+
+    /// The phase-aware FLUX path keeps one image trajectory while each declared denoise span
+    /// enters/leaves its own memory scope through `begin_denoise_phase`/`end_denoise_phase`.
+    /// Preparation and decode remain once per image, and the existing one-span `images` path
+    /// remains available to callers without explicit phase driving.
+    pub fn images_with_denoise_phases<I, D, O, E: From<Error>>(
+        &self,
+        progress: &mut dyn FnMut(Progress),
+        mut init: impl FnMut(u64) -> std::result::Result<I, E>,
+        mut denoise: impl FnMut(u64, I, &mut dyn FnMut(Progress)) -> std::result::Result<D, E>,
+        mut decode: impl FnMut(u64, D, &mut dyn FnMut(Progress)) -> std::result::Result<O, E>,
+    ) -> std::result::Result<Vec<O>, E> {
+        self.begin(RunState::Encoded, RunState::Rendering)?;
+        let expected_phases = self.plan.pass.inert_splits.len() + 1;
+        let images = self
+            .plan
+            .count
+            .seeds()
+            .map(|seed| {
+                if self.cancel.is_cancelled() {
+                    return Err(Error::Canceled.into());
+                }
+                self.next_denoise_phase.set(0);
+                self.active_denoise_phase.set(None);
+                let initial = init(seed)?;
+                let denoised = denoise(seed, initial, progress)?;
+                if self.active_denoise_phase.get().is_some()
+                    || self.next_denoise_phase.get() != expected_phases
+                {
+                    return Err(Error::Unsupported(
+                        "denoise did not finish every compiled phase".into(),
+                    )
+                    .into());
+                }
                 self.phase(MemoryPhase::Decode, || decode(seed, denoised, progress))
             })
             .collect();

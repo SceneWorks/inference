@@ -736,6 +736,7 @@ impl Pipeline {
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
+        run: &RenderRun<'_, '_>,
         dit: DitRef,
         state: &State,
         plan: &RenderPlan,
@@ -757,10 +758,12 @@ impl Pipeline {
         };
         let prepared =
             dit.prepare_conditioning(&state.img, &state.img_ids, &state.txt, &state.txt_ids)?;
-        candle_gen::run_flow_sampler(
+        candle_gen::run_flow_sampler_spans(
             Some(plan.sampler()),
             TimestepConvention::Sigma,
             plan.denoise_sigmas(),
+            &plan.denoise_spans(),
+            Some(run),
             state.img.clone(),
             seed,
             &req.cancel,
@@ -1434,7 +1437,7 @@ impl Pipeline {
         )?;
 
         // Per-image denoise + decode.
-        run.images(
+        run.images_with_denoise_phases(
             on_progress,
             |seed| {
                 crate::flux1_load::seeded_noise(
@@ -1460,6 +1463,7 @@ impl Pipeline {
                 // trajectory, numbered from frame 1.
                 let preview = crate::preview::hook(&req.preview, req.width, req.height);
                 self.denoise(
+                    run,
                     heavy.dit.as_ref(),
                     &state,
                     plan,
