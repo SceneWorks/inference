@@ -1,5 +1,7 @@
 //! Weight-free execution contract and owner-local lifecycle for fixed image passes.
 
+pub mod conditional;
+
 use crate::{
     default_seed, CancelFlag, Error, GenerationRequest, LoadSpec, MemoryPhase, MemoryRequestScope,
     ModelDescriptor, Progress, Result,
