@@ -17,14 +17,19 @@ fn input() -> ConditionalInput {
         source_images: Vec::new(),
         prefill_tokens: [10, 3, 2],
         prefill_hidden_width: 4096,
+        prefill_intermediate_width: 12_288,
         prefill_vision_hidden_width: 1024,
         source_patch_size: 8,
         prefill_attention_heads: 32,
+        prefill_kv_heads: 8,
+        prefill_head_dim: 128,
+        prefill_layers: 42,
+        prefill_vocab_size: 151_936,
         max_new_tokens: 10,
         max_images: 3,
         steps_per_image: 4,
         model_resident_bytes: 1000,
-        cache_token_bytes: 32,
+        cache_token_bytes: 344_064,
         step_scratch_bytes: 2000,
     }
 }
@@ -38,15 +43,20 @@ fn ceilings() -> ConditionalCeilings {
         max_source_token_grid: 4096,
         max_source_live_bytes: 100_000_000,
         max_prefill_hidden_width: 8192,
+        max_prefill_intermediate_width: 20_000,
         max_prefill_vision_hidden_width: 4096,
         max_prefill_attention_heads: 64,
+        max_prefill_kv_heads: 32,
+        max_prefill_head_dim: 256,
+        max_prefill_layers: 64,
+        max_prefill_vocab_size: 200_000,
         max_prefill_scratch_bytes: 10_000_000_000,
         max_token_grid: 4096,
         max_new_tokens: 128,
         max_images: 8,
         max_steps_per_image: 50,
         max_cache_tokens_per_cache: 10000,
-        max_peak_bytes: 100_000_000,
+        max_peak_bytes: 10_000_000_000,
         max_total_work: 1_000_000_000,
     }
 }
@@ -112,9 +122,14 @@ impl ConditionalExecutor for Mock {
     fn prefill_model_shape(&self) -> Result<PrefillModelShape> {
         Ok(PrefillModelShape {
             hidden_width: self.prefill_hidden_width,
+            intermediate_width: 12_288,
             vision_hidden_width: 1024,
             source_patch_size: 8,
             attention_heads: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            layers: 42,
+            vocab_size: 151_936,
         })
     }
     fn prefill_token_counts(&self) -> Result<[u32; 3]> {
@@ -417,11 +432,11 @@ fn dense_four_large_source_prefill_is_priced_without_allocating_it() {
     let mut c = ceilings();
     c.max_source_live_bytes = 1_000_000_000;
     c.max_cache_tokens_per_cache = 100_000;
-    c.max_peak_bytes = 100_000_000_000;
+    c.max_peak_bytes = 1_000_000_000_000;
     c.max_total_work = 100_000_000_000;
     c.max_prefill_scratch_bytes = 3_000_000_000;
     assert!(ConditionalPlan::compile(i.clone(), c.clone()).is_err());
-    c.max_prefill_scratch_bytes = 100_000_000_000;
+    c.max_prefill_scratch_bytes = 1_000_000_000_000;
     let p = ConditionalPlan::compile(i, c.clone()).unwrap();
     assert_eq!(p.budget().source_image_tokens, 16_384);
     assert!(p.budget().prefill_scratch_bytes > 3_000_000_000);
@@ -435,4 +450,40 @@ fn dense_four_large_source_prefill_is_priced_without_allocating_it() {
     let (result, _) = run(&mut mock, &p);
     assert!(result.is_err());
     assert!(mock.calls().is_empty());
+}
+
+#[test]
+fn short_prefix_prices_mlp_projection_and_kv_geometry() {
+    let mut i = input();
+    i.prefill_tokens = [20, 3, 2];
+    i.prefill_hidden_width = 128;
+    i.prefill_intermediate_width = 384;
+    i.prefill_vision_hidden_width = 128;
+    i.prefill_attention_heads = 4;
+    i.prefill_kv_heads = 2;
+    i.prefill_head_dim = 32;
+    i.prefill_layers = 2;
+    i.prefill_vocab_size = 32;
+    i.cache_token_bytes = 2 * 2 * 2 * 32 * 4;
+    let p = ConditionalPlan::compile(i.clone(), ceilings()).unwrap();
+    let mlp_bytes = 4 * 20 * 384 * 4;
+    let full_head_score_bytes = 2 * 20 * 20 * 4 * 4;
+    assert!(mlp_bytes > full_head_score_bytes);
+    assert!(p.budget().prefill_scratch_bytes > mlp_bytes);
+    let mut smaller = i.clone();
+    smaller.prefill_intermediate_width = 64;
+    let smaller_plan = ConditionalPlan::compile(smaller, ceilings()).unwrap();
+    assert!(
+        p.budget().prefill_scratch_bytes
+            > smaller_plan.budget().prefill_scratch_bytes + mlp_bytes / 2
+    );
+    let mut c = ceilings();
+    c.max_prefill_scratch_bytes = p.budget().prefill_scratch_bytes - 1;
+    assert!(ConditionalPlan::compile(i.clone(), c).is_err());
+    i.cache_token_bytes -= 1;
+    assert!(ConditionalPlan::compile(i, ceilings()).is_err());
+
+    let default = plan();
+    let lm_head_upcast = 2 * 151_936u64 * 4096 * 4;
+    assert!(default.budget().prefill_scratch_bytes >= lm_head_upcast);
 }

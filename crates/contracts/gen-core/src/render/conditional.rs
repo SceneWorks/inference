@@ -80,9 +80,14 @@ pub struct SourceImageGeometry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrefillModelShape {
     pub hidden_width: u32,
+    pub intermediate_width: u32,
     pub vision_hidden_width: u32,
     pub source_patch_size: u32,
     pub attention_heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub layers: u32,
+    pub vocab_size: u32,
 }
 
 /// All output-affecting request facts and conservative upper bounds are frozen pre-load.
@@ -100,9 +105,14 @@ pub struct ConditionalInput {
     pub source_images: Vec<SourceImageGeometry>,
     pub prefill_tokens: [u32; CACHE_COUNT],
     pub prefill_hidden_width: u32,
+    pub prefill_intermediate_width: u32,
     pub prefill_vision_hidden_width: u32,
     pub source_patch_size: u32,
     pub prefill_attention_heads: u32,
+    pub prefill_kv_heads: u32,
+    pub prefill_head_dim: u32,
+    pub prefill_layers: u32,
+    pub prefill_vocab_size: u32,
     pub max_new_tokens: u32,
     pub max_images: u32,
     pub steps_per_image: u32,
@@ -121,8 +131,13 @@ pub struct ConditionalCeilings {
     pub max_source_token_grid: u64,
     pub max_source_live_bytes: u64,
     pub max_prefill_hidden_width: u32,
+    pub max_prefill_intermediate_width: u32,
     pub max_prefill_vision_hidden_width: u32,
     pub max_prefill_attention_heads: u32,
+    pub max_prefill_kv_heads: u32,
+    pub max_prefill_head_dim: u32,
+    pub max_prefill_layers: u32,
+    pub max_prefill_vocab_size: u32,
     pub max_prefill_scratch_bytes: u64,
     pub max_token_grid: u64,
     pub max_new_tokens: u32,
@@ -169,10 +184,18 @@ impl ConditionalPlan {
             || input.steps_per_image == 0
             || input.prefill_tokens.contains(&0)
             || input.prefill_hidden_width == 0
+            || input.prefill_intermediate_width == 0
             || input.prefill_vision_hidden_width == 0
             || input.source_patch_size == 0
             || !input.cell.is_multiple_of(input.source_patch_size)
             || input.prefill_attention_heads == 0
+            || input.prefill_kv_heads == 0
+            || input.prefill_head_dim == 0
+            || input.prefill_layers == 0
+            || input.prefill_vocab_size == 0
+            || !input
+                .prefill_attention_heads
+                .is_multiple_of(input.prefill_kv_heads)
             || input.cache_token_bytes == 0
             || input.step_scratch_bytes == 0
         {
@@ -184,8 +207,13 @@ impl ConditionalPlan {
             || input.height > ceilings.max_height
             || input.input_images > ceilings.max_input_images
             || input.prefill_hidden_width > ceilings.max_prefill_hidden_width
+            || input.prefill_intermediate_width > ceilings.max_prefill_intermediate_width
             || input.prefill_vision_hidden_width > ceilings.max_prefill_vision_hidden_width
             || input.prefill_attention_heads > ceilings.max_prefill_attention_heads
+            || input.prefill_kv_heads > ceilings.max_prefill_kv_heads
+            || input.prefill_head_dim > ceilings.max_prefill_head_dim
+            || input.prefill_layers > ceilings.max_prefill_layers
+            || input.prefill_vocab_size > ceilings.max_prefill_vocab_size
             || u32::try_from(input.source_images.len()).map_err(|_| overflow())?
                 != input.input_images
             || input.max_new_tokens > ceilings.max_new_tokens
@@ -260,32 +288,57 @@ impl ConditionalPlan {
         // Candle's one-hot source scatter materializes both host `p` and device `p_arr`
         // at [S,n_ctx]. MLX can also retain both around its dtype conversion. Price the
         // largest of the sequential prefixes, vision features, dense host/device block
-        // masks, one full-head attention score bound, and concurrent [S,H]/[N,V]
-        // intermediates at f32 even when a provider uses a narrower dtype.
+        // masks, full-head score/softmax buffers, Q/K/V and MLP intermediates, and one
+        // widened projection weight at f32 even when the resident store is narrower.
         let prefill_sequence = u64::from(*input.prefill_tokens.iter().max().unwrap());
         let hidden = u64::from(input.prefill_hidden_width);
+        let intermediate = u64::from(input.prefill_intermediate_width);
+        let heads = u64::from(input.prefill_attention_heads);
+        let kv_heads = u64::from(input.prefill_kv_heads);
+        let head_dim = u64::from(input.prefill_head_dim);
+        let vision_hidden = u64::from(input.prefill_vision_hidden_width);
         let dense_scatter = mul(mul(prefill_sequence, source_image_tokens)?, F32_BYTES)?;
         let embed = mul(mul(prefill_sequence, hidden)?, F32_BYTES)?;
         let vision = mul(mul(source_image_tokens, hidden)?, F32_BYTES)?;
         let mask = mul(mul(prefill_sequence, prefill_sequence)?, F32_BYTES)?;
-        let vision_patch = mul(
+        let vision_patch = mul(mul(source_patch_tokens, vision_hidden)?, F32_BYTES)?;
+        let mlp = mul(mul(prefill_sequence, intermediate)?, F32_BYTES)?;
+        let q = mul(mul(prefill_sequence, mul(heads, head_dim)?)?, F32_BYTES)?;
+        let kv = mul(mul(prefill_sequence, mul(kv_heads, head_dim)?)?, F32_BYTES)?;
+        let merge = u64::from(input.cell / input.source_patch_size);
+        let projection_elements = [
+            mul(hidden, intermediate)?,
+            mul(hidden, u64::from(input.prefill_vocab_size))?,
+            mul(hidden, hidden)?,
+            mul(hidden, mul(heads, head_dim)?)?,
+            mul(hidden, mul(kv_heads, head_dim)?)?,
+            mul(mul(hidden, vision_hidden)?, mul(merge, merge)?)?,
             mul(
-                source_patch_tokens,
-                u64::from(input.prefill_vision_hidden_width),
+                vision_hidden,
+                mul(
+                    IMAGE_CHANNELS,
+                    mul(
+                        u64::from(input.source_patch_size),
+                        u64::from(input.source_patch_size),
+                    )?,
+                )?,
             )?,
-            F32_BYTES,
-        )?;
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+        let widened_projection = mul(projection_elements, F32_BYTES)?;
         let prefill_scratch_bytes = add(
             add(
-                add(mul(dense_scatter, 2)?, mul(embed, 5)?)?,
-                add(vision, mul(vision_patch, 5)?)?,
+                add(mul(dense_scatter, 2)?, mul(embed, 12)?)?,
+                add(mul(vision, 4)?, mul(vision_patch, 8)?)?,
             )?,
             add(
-                mul(
-                    mask,
-                    add(2, mul(u64::from(input.prefill_attention_heads), 2)?)?,
+                add(mul(mask, add(2, mul(heads, 2)?)?)?, mul(mlp, 4)?)?,
+                add(
+                    add(mul(q, 8)?, mul(kv, 12)?)?,
+                    add(mul(widened_projection, 2)?, mul(prefill_sequence, 32)?)?,
                 )?,
-                mul(prefill_sequence, 32)?,
             )?,
         )?;
         if prefill_scratch_bytes > ceilings.max_prefill_scratch_bytes {
@@ -310,6 +363,18 @@ impl ConditionalPlan {
         )?;
         let tu_cap = add(u64::from(input.prefill_tokens[1]), future_blocks)?;
         let iu_cap = u64::from(input.prefill_tokens[2]); // fixed image-uncondition prefix
+        let min_cache_token_bytes = mul(
+            mul(
+                mul(u64::from(input.prefill_layers), 2)?,
+                mul(kv_heads, head_dim)?,
+            )?,
+            F32_BYTES,
+        )?;
+        if input.cache_token_bytes < min_cache_token_bytes {
+            return Err(refused(
+                "retained KV token byte bound understates model geometry",
+            ));
+        }
         let cache_token_caps = [cond_cap, tu_cap, iu_cap];
         if cache_token_caps
             .iter()
@@ -492,9 +557,14 @@ impl ConditionalPlan {
     pub fn check_prefill_shape(&self, actual: PrefillModelShape) -> Result<()> {
         self.validate()?;
         if self.input.prefill_hidden_width != actual.hidden_width
+            || self.input.prefill_intermediate_width != actual.intermediate_width
             || self.input.prefill_vision_hidden_width != actual.vision_hidden_width
             || self.input.source_patch_size != actual.source_patch_size
             || self.input.prefill_attention_heads != actual.attention_heads
+            || self.input.prefill_kv_heads != actual.kv_heads
+            || self.input.prefill_head_dim != actual.head_dim
+            || self.input.prefill_layers != actual.layers
+            || self.input.prefill_vocab_size != actual.vocab_size
         {
             return Err(refused("model shape differs from precompiled prefill"));
         }
