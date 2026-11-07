@@ -1,0 +1,232 @@
+{
+  "inference": {
+    "commit": "2b09938e33370915d4f853389961709b8bbf8bf9",
+    "areas": {
+      "crates/media/mlx-gen": {
+        "source": {
+          "files": 1338,
+          "lines": 720725
+        },
+        "test": {
+          "files": 901,
+          "lines": 264754
+        }
+      },
+      "crates/media/candle-gen": {
+        "source": {
+          "files": 748,
+          "lines": 546280
+        },
+        "test": {
+          "files": 337,
+          "lines": 121224
+        }
+      },
+      "crates/llm": {
+        "source": {
+          "files": 178,
+          "lines": 195625
+        },
+        "test": {
+          "files": 98,
+          "lines": 40798
+        }
+      },
+      "crates/audio": {
+        "source": {
+          "files": 313,
+          "lines": 126312
+        },
+        "test": {
+          "files": 60,
+          "lines": 33505
+        }
+      },
+      "crates/kernels": {
+        "source": {
+          "files": 29,
+          "lines": 15608
+        },
+        "test": {
+          "files": 0,
+          "lines": 0
+        }
+      },
+      "crates/contracts": {
+        "source": {
+          "files": 336,
+          "lines": 213405
+        },
+        "test": {
+          "files": 39,
+          "lines": 11790
+        }
+      },
+      "crates/bundles": {
+        "source": {
+          "files": 9,
+          "lines": 15475
+        },
+        "test": {
+          "files": 1,
+          "lines": 278
+        }
+      },
+      "ios-host": {
+        "source": {
+          "files": 7,
+          "lines": 6895
+        },
+        "test": {
+          "files": 4,
+          "lines": 2669
+        }
+      },
+      "scripts": {
+        "source": {
+          "files": 514,
+          "lines": 85760
+        },
+        "test": {
+          "files": 168,
+          "lines": 67925
+        }
+      },
+      "tests": {
+        "source": {
+          "files": 0,
+          "lines": 0
+        },
+        "test": {
+          "files": 0,
+          "lines": 0
+        }
+      }
+    }
+  },
+  "SceneWorks": {
+    "commit": "5a28d413dd9f579cc9607d44f252a045d025bd8e",
+    "areas": {
+      "crates/sceneworks-worker": {
+        "source": {
+          "files": 314,
+          "lines": 395535
+        },
+        "test": {
+          "files": 68,
+          "lines": 44278
+        }
+      },
+      "crates/sceneworks-core": {
+        "source": {
+          "files": 166,
+          "lines": 200508
+        },
+        "test": {
+          "files": 48,
+          "lines": 68996
+        }
+      },
+      "crates/sceneworks-memory-adapter": {
+        "source": {
+          "files": 54,
+          "lines": 44510
+        },
+        "test": {
+          "files": 26,
+          "lines": 18434
+        }
+      },
+      "crates/sceneworks-image-quality": {
+        "source": {
+          "files": 2,
+          "lines": 1539
+        },
+        "test": {
+          "files": 0,
+          "lines": 0
+        }
+      },
+      "crates/sceneworks-mcp": {
+        "source": {
+          "files": 4,
+          "lines": 5029
+        },
+        "test": {
+          "files": 6,
+          "lines": 2485
+        }
+      },
+      "apps/rust-api": {
+        "source": {
+          "files": 101,
+          "lines": 79973
+        },
+        "test": {
+          "files": 72,
+          "lines": 102268
+        }
+      },
+      "apps/rust-worker": {
+        "source": {
+          "files": 1,
+          "lines": 8
+        },
+        "test": {
+          "files": 0,
+          "lines": 0
+        }
+      },
+      "apps/web": {
+        "source": {
+          "files": 534,
+          "lines": 140098
+        },
+        "test": {
+          "files": 387,
+          "lines": 123449
+        }
+      },
+      "apps/desktop": {
+        "source": {
+          "files": 23,
+          "lines": 14722
+        },
+        "test": {
+          "files": 7,
+          "lines": 754
+        }
+      },
+      "packages": {
+        "source": {
+          "files": 0,
+          "lines": 0
+        },
+        "test": {
+          "files": 0,
+          "lines": 0
+        }
+      },
+      "scripts": {
+        "source": {
+          "files": 236,
+          "lines": 100757
+        },
+        "test": {
+          "files": 150,
+          "lines": 76188
+        }
+      },
+      "tests": {
+        "source": {
+          "files": 0,
+          "lines": 0
+        },
+        "test": {
+          "files": 15,
+          "lines": 11743
+        }
+      }
+    }
+  }
+}
