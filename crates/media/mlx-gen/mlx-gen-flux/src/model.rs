@@ -959,11 +959,15 @@ fn compile_trajectory(
     Ok(gen_core::RenderPlan::packed_image_trajectory(
         &descriptor_for(variant),
         req,
-        sampler_name,
-        guidance,
-        sigmas,
-        keep - 1,
-        capture_sigma,
+        gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: crate::pipeline::PACKED_TOKEN_WIDTH as u32,
+            sampler: sampler_name,
+            guidance,
+            sigmas,
+            executed_steps: keep - 1,
+            capture_sigma,
+        },
     )?)
 }
 

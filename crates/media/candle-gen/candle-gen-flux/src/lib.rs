@@ -393,11 +393,15 @@ fn compile_base_plan(variant: Variant, req: &GenerationRequest) -> gen_core::Res
     RenderPlan::base_image(
         &descriptor_for(variant),
         req,
-        req.sampler.as_deref().unwrap_or("euler"),
-        guidance,
-        sigmas,
-        executed_steps,
-        0.0,
+        gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 64,
+            sampler: req.sampler.as_deref().unwrap_or("euler"),
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma: 0.0,
+        },
     )
 }
 

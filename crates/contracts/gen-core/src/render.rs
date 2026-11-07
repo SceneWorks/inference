@@ -14,13 +14,11 @@ pub struct RenderPlanRegistration {
 }
 
 /// A serialized plan exposes the actual execution order, including once-per-request encoding
-/// and the subset repeated for each sequential image. Fixed stages without reference inputs
-/// consume no components at the reference boundary.
+/// and the subset repeated for each sequential image. This noise-start pass has no reference stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 enum Stage {
     PromptPrep,
     Encode,
-    Reference,
     Schedule,
     Init,
     Enter,
@@ -51,7 +49,7 @@ struct ImagePhase {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct ImagePass {
-    stages: [Stage; 11],
+    stages: [Stage; 10],
     sigmas: Vec<f32>,
     phase: ImagePhase,
     capture_sigma: f32,
@@ -143,6 +141,18 @@ impl CountPlan {
         base_seed
     }
 }
+/// Family-resolved packing, solver and schedule for one image pass. The compiler
+/// validates these values before the provider can materialize its components.
+pub struct PackedImagePass<'a> {
+    pub pixel_stride: u32,
+    pub token_width: u32,
+    pub sampler: &'a str,
+    pub guidance: f32,
+    pub sigmas: Vec<f32>,
+    pub executed_steps: usize,
+    pub capture_sigma: f32,
+}
+
 /// Complete resolved base image pass. Tensor operations, callbacks and mutable trajectory
 /// state stay with the executor. Only the plan can travel across the caller/owner boundary.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -159,26 +169,14 @@ impl RenderPlan {
     pub fn base_image(
         descriptor: &ModelDescriptor,
         req: &GenerationRequest,
-        sampler: &str,
-        guidance: f32,
-        sigmas: Vec<f32>,
-        executed_steps: usize,
-        capture_sigma: f32,
+        pass: PackedImagePass<'_>,
     ) -> Result<Self> {
         if !req.conditioning.is_empty() {
             return Err(Error::Unsupported(
                 "base image plan needs noise-start inputs".into(),
             ));
         }
-        Self::packed_image_trajectory(
-            descriptor,
-            req,
-            sampler,
-            guidance,
-            sigmas,
-            executed_steps,
-            capture_sigma,
-        )
+        Self::packed_image_trajectory(descriptor, req, pass)
     }
 
     /// Inner image trajectory for a provider that already owns its conditioning/injector.
@@ -186,18 +184,24 @@ impl RenderPlan {
     pub fn packed_image_trajectory(
         descriptor: &ModelDescriptor,
         req: &GenerationRequest,
-        sampler: &str,
-        guidance: f32,
-        sigmas: Vec<f32>,
-        executed_steps: usize,
-        capture_sigma: f32,
+        pass: PackedImagePass<'_>,
     ) -> Result<Self> {
-        const STRIDE: u32 = 16;
-        if req.count == 0
+        let PackedImagePass {
+            pixel_stride,
+            token_width,
+            sampler,
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma,
+        } = pass;
+        if pixel_stride == 0
+            || token_width == 0
+            || req.count == 0
             || req.width == 0
             || req.height == 0
-            || !req.width.is_multiple_of(STRIDE)
-            || !req.height.is_multiple_of(STRIDE)
+            || !req.width.is_multiple_of(pixel_stride)
+            || !req.height.is_multiple_of(pixel_stride)
             || !guidance.is_finite()
             || !capture_sigma.is_finite()
             || sigmas.len() < 2
@@ -215,8 +219,8 @@ impl RenderPlan {
                 descriptor.id
             )));
         }
-        let tokens = (req.width / STRIDE)
-            .checked_mul(req.height / STRIDE)
+        let tokens = (req.width / pixel_stride)
+            .checked_mul(req.height / pixel_stride)
             .ok_or_else(|| Error::Unsupported("packed image token count overflow".into()))?;
         Ok(Self {
             backend: descriptor.backend.to_owned(),
@@ -231,7 +235,6 @@ impl RenderPlan {
                 stages: [
                     Stage::PromptPrep,
                     Stage::Encode,
-                    Stage::Reference,
                     Stage::Schedule,
                     Stage::Init,
                     Stage::Enter,
@@ -251,9 +254,9 @@ impl RenderPlan {
                     stream: PackedImageStream {
                         width: req.width,
                         height: req.height,
-                        patch_stride: STRIDE,
+                        patch_stride: pixel_stride,
                         tokens,
-                        token_width: 64,
+                        token_width,
                     },
                 },
             },

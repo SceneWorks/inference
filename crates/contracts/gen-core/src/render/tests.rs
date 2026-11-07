@@ -18,15 +18,19 @@ fn descriptor() -> ModelDescriptor {
 }
 
 fn plan(request: &GenerationRequest) -> Result<RenderPlan> {
-    RenderPlan::base_image(
-        &descriptor(),
-        request,
-        "euler",
-        3.5,
-        vec![1.0, 0.5, 0.0],
-        2,
-        0.0,
-    )
+    RenderPlan::base_image(&descriptor(), request, pass(vec![1.0, 0.5, 0.0], 2, 0.0))
+}
+
+fn pass(sigmas: Vec<f32>, executed_steps: usize, capture_sigma: f32) -> PackedImagePass<'static> {
+    PackedImagePass {
+        pixel_stride: 16,
+        token_width: 64,
+        sampler: "euler",
+        guidance: 3.5,
+        sigmas,
+        executed_steps,
+        capture_sigma,
+    }
 }
 
 #[derive(Default)]
@@ -157,7 +161,7 @@ fn plan_freezes_schedule_decode_count_and_preparation_inputs() {
         serde_json::json!([1.0, 0.5, 0.0])
     );
     assert_eq!(snapshot["pass"]["phase"]["stream"]["tokens"], 1200);
-    assert_eq!(snapshot["pass"]["stages"][7], "Exit");
+    assert_eq!(snapshot["pass"]["stages"][6], "Exit");
     assert_eq!(plan.denoise_sigmas(), plan.sigmas());
     req.memory = Some(GenerationMemory::default());
     plan.check_request(&descriptor(), &req).unwrap();
@@ -181,10 +185,7 @@ fn invalid_schedules_and_unaligned_geometry_refuse_before_any_stage() {
         (vec![1.0, f32::NAN, 0.0], 2, 0.0),
         (vec![1.0, 0.25, 0.0], 1, 0.5),
     ] {
-        assert!(
-            RenderPlan::base_image(&descriptor(), &req, "euler", 0.0, nodes, steps, capture)
-                .is_err()
-        );
+        assert!(RenderPlan::base_image(&descriptor(), &req, pass(nodes, steps, capture)).is_err());
     }
     assert!(plan(&GenerationRequest { width: 17, ..req }).is_err());
 }
