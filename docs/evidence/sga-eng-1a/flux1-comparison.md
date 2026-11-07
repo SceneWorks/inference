@@ -41,12 +41,19 @@ require the terminal performance sampling method.
 
 **Bounded cost.** Per backend and mode: two builds, two pre-load plan inspections
 and four render processes. Each learned process has a maximum deadline of 20
-minutes; the job has the existing six-hour timeout including build and setup.
+minutes. A CUDA claim budgets six such child allowances, one allowance for
+claim acquisition/admission, and a final reserve of 30 seconds plus one
+termination grace and one poll interval. Each child must still fit its original
+deadline before that reserve or it is refused before launch. The job has the
+existing six-hour timeout including build and setup.
 Tier 1 generates about 2.00 GB for dev and 1.98 GB for schnell on CPU. Tier 2
 reads provisioned files from the existing `MLX_GEN_MODELS_ROOT` or
 `CANDLE_GEN_MODELS_ROOT`; missing files fail preflight. The existing supervisor
 bounds child footprint and on CUDA GPU allocations. The existing physical-device
-lease covers the comparison. No automatic retry, per-PR campaign or model
+lease covers the comparison. The artifact keeps each attempted child’s
+bounded, redacted stdout, stderr, supervisor outcome and available observer
+events. The verifier checks each published log’s allowed name, size and digest.
+Failure receipts retain the logs produced before refusal or cleanup. No automatic retry, per-PR campaign or model
 execution in ordinary CI.
 
 For Tier 1 on MLX, use the [secondary Mac planner policy](mlx-route-plan.json)

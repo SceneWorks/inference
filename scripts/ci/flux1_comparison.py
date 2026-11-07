@@ -10,6 +10,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
 from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -56,7 +57,8 @@ def plan(backend, value, head, tier):
     return {"runner": LANES[backend], "asset_setup": "flux1-comparison", "backend": backend,
             "base": BASE, "head": source["revision"], "head_tree": source["tree"],
             "tier": tier, "geometry_sha256": fixture.sha(fixture.HERE / "geometry.tsv"),
-            "request": value, "settings": evidence.SETTINGS}
+            "request": value, "settings": evidence.SETTINGS,
+            "cuda_claim_budget_seconds": cuda_claim_budget(policy)[0] if backend == "candle-cuda" else None}
 
 
 def build(work, sources, arm, backend, tier, env):
@@ -102,7 +104,44 @@ def snapshots(work, tier):
     return paths, identities
 
 
-def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False):
+PHASES = tuple(f"{arm}-{variant}" for arm in ("preflight", *evidence.ARMS) for variant in evidence.VARIANTS)
+RELEASE_RESERVE_SECONDS = 30  # execution_claim's final CUDA idle verification window
+
+
+def cuda_claim_budget(policy):
+    # One child allowance for lock acquisition/admission, one for each sequential
+    # phase, and time for termination and the existing post-idle verification.
+    reserve = RELEASE_RESERVE_SECONDS + policy.term_grace_millis / 1000 + policy.poll_millis / 1000
+    return (len(PHASES) + 1) * policy.deadline_seconds + reserve, reserve
+
+
+def retained_log_limits(policy):
+    return {"stdout.log": policy["stdoutCapBytes"], "stderr.log": policy["stderrCapBytes"],
+            "guard.jsonl": policy["eventCapBytes"], "supervisor.json": 16 * 1024**2}
+
+
+def retain_logs(work, artifact, receipt):
+    records = receipt["logs"]
+    errors = []
+    for phase in PHASES:
+        for suffix, cap in retained_log_limits(receipt["request"]["policy"]).items():
+            source = work / phase / suffix
+            name = phase + "." + suffix
+            try:
+                if not source.exists() and not proof.linked(source):
+                    if receipt["accepted"] and suffix != "guard.jsonl":
+                        errors.append(f"{name}: missing completed child log")
+                    continue
+                records[name] = proof.publish_file(source, artifact / name, work, cap, log=True,
+                                                   destination_root=artifact)
+            except (OSError, ValueError) as error:
+                errors.append(f"{name}: {error}")
+    return errors
+
+
+def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, last_child_start=None):
+    if last_child_start is not None and time.monotonic() >= last_child_start:
+        raise ValueError("insufficient CUDA claim time for another fully guarded child and release")
     out.mkdir()
     fds = ()
     if "SCENEWORKS_METAL_EXECUTION_LOCK_FD" in lease_env:
@@ -115,18 +154,27 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False):
                             cwd=arm_root, env=dict(env, PAIR_OUT=str(out)), policy=policy,
                             stdout_path=out / "stdout.log", stderr_path=stderr_path,
                             event_path=out / "guard.jsonl", pass_fds=fds, require_gpu_sample=not preflight)
-    except SupervisionError:
+    except SupervisionError as error:
+        proof.write_json(out / "supervisor.json", {
+            "reason": error.reason, "detail": error.detail, "pid": error.pid, "admission": error.admission,
+            "host_memory": error.watchdog_host_memory, "child_footprint": error.watchdog_child_footprint,
+            "device_memory": error.watchdog_device_memory,
+        }, owned=out.parent)
         # The supervisor can refuse before spawn. Preserve its reason whether or not
         # it created a log; a failing child may have filled its entire stderr budget.
         try:
+            proof.unlinked_path(stderr_path, out.parent)
+            if not stderr_path.is_file() or stderr_path.stat().st_nlink != 1:
+                raise ValueError("unowned child stderr")
             with stderr_path.open("rb") as log:
                 log.seek(max(0, log.seek(0, os.SEEK_END) - 4000))
                 tail = log.read(4000).decode("utf-8", errors="replace")
-        except OSError:
+        except (OSError, ValueError):
             tail = ""
         if tail:
-            print(tail, file=sys.stderr)
+            print(proof.redact(tail, env), file=sys.stderr)
         raise
+    proof.write_json(out / "supervisor.json", asdict(guard), owned=out.parent)
     return guard, (out / "stdout.log").read_text(encoding="utf-8")
 
 
@@ -153,7 +201,7 @@ def execute(args, contract):
     artifact = proof.owned_output(args.output, tmp)
     receipt = {"schema": 1, "protocol": "flux1-ap13-v1", **contract, "accepted": False,
                "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
-               "host": platform.platform(), "runner_name": os.environ["RUNNER_NAME"], "arms": {}}
+               "host": platform.platform(), "runner_name": os.environ["RUNNER_NAME"], "arms": {}, "logs": {}}
     work = tmp / f"f1p-{receipt['run_id']}-{receipt['run_attempt']}"
     created_work = False
     try:
@@ -193,14 +241,24 @@ def execute(args, contract):
         claim_dir = work / "claim"
         claim_dir.mkdir()
         lease_env = environments["base"]
-        with execution_claim(backend, policy, claim_dir, lease_env) as claim:
+        claim_policy = policy
+        claim_deadline = last_child_start = None
+        if backend == "candle-cuda":
+            budget, reserve = cuda_claim_budget(policy)
+            write(claim_dir / "policy.json", dict(contract["request"]["policy"], deadlineSeconds=budget))
+            claim_policy = load_policy(claim_dir / "policy.json")
+            claim_deadline = time.monotonic() + budget
+            last_child_start = claim_deadline - reserve - policy.deadline_seconds
+        with execution_claim(backend, claim_policy, claim_dir, lease_env,
+                             original_deadline_monotonic=claim_deadline) as claim:
             receipt["physical_claim"] = claim
             receipt["preflight"] = {}
             for variant in evidence.VARIANTS:
                 out = work / ("preflight-" + variant)
                 model = "flux1_" + variant
                 env = dict(environments["head"], PAIR_MODEL=model, PAIR_SNAPSHOT=str(paths[variant]))
-                _, stdout = invoke(exes["head"], work / "head", out, env, policy, lease_env, preflight=True)
+                _, stdout = invoke(exes["head"], work / "head", out, env, policy, lease_env, preflight=True,
+                                   last_child_start=last_child_start)
                 plan_data = json.loads((out / "plan.json").read_text(encoding="utf-8"))
                 evidence.validate_plan(plan_data, variant, backend)
                 if stdout.splitlines().count("FLUX1_PAIR_PREFLIGHT " + model) != 1:
@@ -212,7 +270,8 @@ def execute(args, contract):
                     out = work / (arm + "-" + variant)
                     env = dict(environments[arm], PAIR_MODEL="flux1_" + variant,
                                PAIR_SNAPSHOT=str(paths[variant]))
-                    guard, stdout = invoke(exes[arm], work / arm, out, env, policy, lease_env)
+                    guard, stdout = invoke(exes[arm], work / arm, out, env, policy, lease_env,
+                                           last_child_start=last_child_start)
                     observed = evidence.read_arm(out, stdout, arm, variant, backend, artifact)
                     if arm == "head" and observed["planned_route"] != receipt["preflight"][variant]:
                         raise ValueError("render plan differs from preflight")
@@ -228,10 +287,16 @@ def execute(args, contract):
         receipt["failure"] = str(exc)
         raise
     finally:
+        errors = retain_logs(work, artifact, receipt) if created_work else []
+        failed_retention = bool(errors and receipt["accepted"])
+        if errors:
+            receipt["log_errors"] = errors
+            receipt["accepted"] = False
         write(artifact / "receipt.json", receipt)
-        # Only this attempt's fresh private work tree; receipts and PNGs live outside it.
         if created_work and work.exists() and not work.is_symlink():
             shutil.rmtree(work)
+        if failed_retention:
+            raise ValueError("comparison log publication failed: " + ", ".join(errors))
 
 
 def verify(args, contract):
@@ -247,6 +312,23 @@ def verify(args, contract):
             or r.get("run_attempt") != os.environ["GITHUB_RUN_ATTEMPT"]):
         raise ValueError("comparison receipt identity mismatch")
     allowed = {"receipt.json"}
+    limits = {phase + "." + suffix: cap for phase in PHASES
+              for suffix, cap in retained_log_limits(contract["request"]["policy"]).items()}
+    for name, item in r["logs"].items():
+        if name not in limits or item["path"] != name:
+            raise ValueError("unexpected comparison log identity")
+        log = args.output / name
+        proof.unlinked_path(log, tmp)
+        if (not log.is_file() or log.stat().st_nlink != 1 or log.stat().st_size > limits[name]
+                or log.stat().st_size != item["bytes"] or fixture.sha(log) != item["sha256"]):
+            raise ValueError("invalid comparison log artifact: " + name)
+        allowed.add(name)
+    # guard.jsonl is the optional observer stream monitored by run_guarded.
+    # The actual supervisor result is captured for every completed child.
+    required = {phase + "." + suffix for phase in PHASES
+                for suffix in ("stdout.log", "stderr.log", "supervisor.json")}
+    if r["accepted"] and (r.get("log_errors") or not required <= r["logs"].keys()):
+        raise ValueError("accepted comparison lacks complete verified child logs")
     for arm in evidence.ARMS:
         for variant in evidence.VARIANTS:
             row = r["arms"].get(arm, {}).get("renders", {}).get(variant)

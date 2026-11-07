@@ -161,8 +161,16 @@ class TestSuites(unittest.TestCase):
 
     def test_safe_table_is_nonempty_and_source_bound(self):
         controls = suites.safe_controls()
+        # SW-F331 adds six runner controls and two preload controls per backend.
+        self.assertEqual(len(controls), 82)
+        flux_plan_sources = {
+            "crates/contracts/gen-core/src/render/tests.rs": 6,
+            "crates/media/mlx-gen/mlx-gen-flux/src/model.rs": 2,
+            "crates/media/candle-gen/candle-gen-flux/src/lib.rs": 2,
+        }
+        for source, count in flux_plan_sources.items():
+            self.assertEqual(sum(control["source"] == source for control in controls), count, source)
         # SW-F329 includes five exact CPU-only allocator recovery controls.
-        self.assertEqual(len(controls), 72)
         self.assertEqual(sum(control["package"] == "candle-core" for control in controls), 5)
         self.assertEqual(sum(control["package"] == "sceneworks-gen-cv" for control in controls), 26)
         self.assertTrue(all(control['protocol'] == 'libtest' for control in controls))

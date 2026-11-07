@@ -1,17 +1,21 @@
 """Portable comparison-harness checks. No model, backend or Cargo executable is run."""
-from contextlib import redirect_stderr
+from contextlib import ExitStack, contextmanager, redirect_stderr
 import copy
 import hashlib
 from io import StringIO
 import json
+import math
+import os
 from pathlib import Path
 import struct
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from scripts.ci.flux1_pair import evidence, fixture
 from scripts.ci import flux1_comparison as comparison
+from scripts.media_campaign_supervisor import RunResult
 
 
 class FluxPairTests(unittest.TestCase):
@@ -71,6 +75,104 @@ class FluxPairTests(unittest.TestCase):
                     self.assertEqual(err.getvalue(), "")
                 else:
                     self.assertEqual(err.getvalue(), log[-4000:].decode("utf-8", errors="replace") + "\n")
+
+    def test_partial_and_complete_comparisons_retain_logs_under_one_aggregate_claim(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail), TemporaryDirectory() as tmp, ExitStack() as mocks:
+                root = Path(tmp).resolve()
+                policy = json.loads((comparison.ROOT / "docs/evidence/sga-eng-1a/cuda-route-plan.json")
+                                    .read_text(encoding="utf-8"))["request"]["policy"]
+                policy["deadlineSeconds"] = 120
+                contract = {"tier": "tier1", "request": {"policy": policy}}
+                args = SimpleNamespace(backend="candle-cuda", output=root / "artifact")
+                clock = [1000.]
+                phase_order = []
+
+                @contextmanager
+                def claim(backend, claim_policy, claim_dir, env, *, original_deadline_monotonic=None):
+                    self.assertEqual(backend, "candle-cuda")
+                    if not fail:
+                        self.assertGreater(claim_policy.deadline_seconds, 6 * policy["deadlineSeconds"])
+                        self.assertEqual(original_deadline_monotonic, clock[0] + claim_policy.deadline_seconds)
+                    self.assertEqual(claim_policy.cuda_device_uuid, policy["cudaDeviceUuid"])
+                    yield {"post_execution_verified": True}
+                    self.assertLess(clock[0] + 30, original_deadline_monotonic)
+
+                def child(argv, *, env, policy, stdout_path, stderr_path, event_path, **kwargs):
+                    # Emulate libtest/probe/supervisor artifacts without a subprocess.
+                    self.assertEqual(policy.deadline_seconds, 120)
+                    clock[0] += 40
+                    out = Path(env["PAIR_OUT"])
+                    phase_order.append(out.name)
+                    model = env["PAIR_MODEL"]
+                    dev = model == "flux1_dev"
+                    mu = math.exp(0.5) if dev else 1.0
+                    sigmas = [mu / (mu + 3 / n - 1) for n in (3, 2, 1)] + [0.]
+                    plan = {"provider": model, "backend": "candle", "inputs": {"requested_seed": 104729},
+                            "pass": {"sigmas": sigmas, "phase": {"first_step": 0, "end_step": 3,
+                                "sampler": "euler", "guidance": 3.5 if dev else 0.,
+                                "stream": dict(width=256, height=256, patch_stride=16, tokens=256, token_width=64)}}}
+                    comparison.write(out / "plan.json", plan)
+                    stderr_path.write_text("diagnostic " + env["HF_TOKEN"], encoding="utf-8")
+                    event_path.write_text('{"sample":1}\n', encoding="utf-8")
+                    if "--preflight" in argv:
+                        stdout_path.write_text("FLUX1_PAIR_PREFLIGHT " + model + "\n", encoding="utf-8")
+                    else:
+                        lines = []
+                        for i, sigma in enumerate(sigmas):
+                            bits = struct.pack(">f", sigma).hex()
+                            (out / f"state-{bits}.bin").write_bytes(struct.pack("<f", float(i)) * 16384)
+                            lines.append(f"FLUX1_PAIR_STATE {bits} BF16 candle-cuda")
+                        lines.append("FLUX1_PAIR_COMPLETE " + model)
+                        stdout_path.write_text("\n".join(lines), encoding="utf-8")
+                        if fail:
+                            raise comparison.SupervisionError("child-exit", "probe failed")
+                        comparison.write(out / "progress.json", [[1, 3], [2, 3], [3, 3]])
+                        (out / "output.rgb").write_bytes(bytes(range(256)) * 768)
+                    return RunResult(1, 0, 4096, 2048, 8192, 8192, 40, (), {})
+
+                mocks.enter_context(patch.dict(os.environ, RUNNER_TEMP=str(root), GITHUB_RUN_ID="7",
+                                               GITHUB_RUN_ATTEMPT="1", RUNNER_NAME="mock", HF_TOKEN="mock-secret"))
+                for name, value in (("git", comparison.BASE), ("hardware", {}), ("build", (root / "probe", {})),
+                                    ("snapshots", ({v: root for v in evidence.VARIANTS},
+                                                   {v: {} for v in evidence.VARIANTS}))):
+                    mocks.enter_context(patch.object(comparison, name, return_value=value))
+                mocks.enter_context(patch.object(comparison.fixture, "snapshot_identity", return_value={}))
+                mocks.enter_context(patch.object(comparison.proof, "require_host"))
+                mocks.enter_context(patch.object(comparison, "execution_claim", claim))
+                mocks.enter_context(patch.object(comparison, "time", SimpleNamespace(monotonic=lambda: clock[0]), create=True))
+                mocks.enter_context(patch.object(comparison, "run_guarded", side_effect=child))
+                if fail:
+                    with self.assertRaisesRegex(comparison.SupervisionError, "probe failed"), redirect_stderr(StringIO()):
+                        comparison.execute(args, contract)
+                else:
+                    comparison.execute(args, contract)
+                    self.assertEqual(len(phase_order), 6)
+                    self.assertGreater(clock[0] - 1000., policy["deadlineSeconds"])
+                comparison.verify(args, contract)
+                receipt = json.loads((args.output / "receipt.json").read_text(encoding="utf-8"))
+                self.assertEqual(receipt["accepted"], not fail)
+                self.assertFalse((root / "f1p-7-1").exists())
+                self.assertIn("logs", receipt)
+                for phase in phase_order:
+                    for suffix in ("stdout.log", "stderr.log", "guard.jsonl", "supervisor.json"):
+                        self.assertIn(phase + "." + suffix, receipt["logs"])
+                    self.assertEqual((args.output / (phase + ".stderr.log")).read_text(encoding="utf-8"),
+                                     "diagnostic [REDACTED]")
+                if fail:
+                    result = json.loads((args.output / "base-dev.supervisor.json").read_text(encoding="utf-8"))
+                    self.assertEqual(result["reason"], "child-exit")
+                    self.assertIn("probe failed", receipt["failure"])
+                (args.output / "base-dev.stdout.log").write_bytes(b"tampered")
+                with self.assertRaisesRegex(ValueError, "invalid comparison log"):
+                    comparison.verify(args, contract)
+
+    def test_late_cuda_phase_refuses_before_spawn(self):
+        with TemporaryDirectory() as tmp, patch.object(comparison, "run_guarded") as guard:
+            with patch.object(comparison.time, "monotonic", return_value=200.0):
+                with self.assertRaisesRegex(ValueError, "insufficient CUDA claim time"):
+                    comparison.invoke(Path("unused"), Path(tmp), Path(tmp) / "out", {}, None, {}, last_child_start=200.)
+            guard.assert_not_called()
 
     def test_compiled_plan_and_observed_trajectory_must_match(self):
         with TemporaryDirectory() as tmp:
