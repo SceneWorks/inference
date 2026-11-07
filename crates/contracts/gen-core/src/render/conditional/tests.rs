@@ -16,6 +16,10 @@ fn input() -> ConditionalInput {
         input_images: 0,
         source_images: Vec::new(),
         prefill_tokens: [10, 3, 2],
+        prefill_hidden_width: 4096,
+        prefill_vision_hidden_width: 1024,
+        source_patch_size: 8,
+        prefill_attention_heads: 32,
         max_new_tokens: 10,
         max_images: 3,
         steps_per_image: 4,
@@ -33,6 +37,10 @@ fn ceilings() -> ConditionalCeilings {
         max_source_height: 1024,
         max_source_token_grid: 4096,
         max_source_live_bytes: 100_000_000,
+        max_prefill_hidden_width: 8192,
+        max_prefill_vision_hidden_width: 4096,
+        max_prefill_attention_heads: 64,
+        max_prefill_scratch_bytes: 10_000_000_000,
         max_token_grid: 4096,
         max_new_tokens: 128,
         max_images: 8,
@@ -69,6 +77,8 @@ struct Mock {
     cancel: CancelFlag,
     cancel_at: Option<&'static str>,
     source_images: Vec<SourceImageGeometry>,
+    prefill_hidden_width: u32,
+    prefill_tokens: [u32; 3],
 }
 impl Mock {
     fn new(script: Vec<TextRollout>) -> Self {
@@ -78,6 +88,8 @@ impl Mock {
             cancel: CancelFlag::new(),
             cancel_at: None,
             source_images: Vec::new(),
+            prefill_hidden_width: 4096,
+            prefill_tokens: [10, 3, 2],
         }
     }
     fn log(&self, call: String) {
@@ -96,6 +108,17 @@ impl ConditionalExecutor for Mock {
     type Image = u32;
     fn source_images(&self) -> Result<Vec<SourceImageGeometry>> {
         Ok(self.source_images.clone())
+    }
+    fn prefill_model_shape(&self) -> Result<PrefillModelShape> {
+        Ok(PrefillModelShape {
+            hidden_width: self.prefill_hidden_width,
+            vision_hidden_width: 1024,
+            source_patch_size: 8,
+            attention_heads: 32,
+        })
+    }
+    fn prefill_token_counts(&self) -> Result<[u32; 3]> {
+        Ok(self.prefill_tokens)
     }
     fn prefill(&mut self, _: &ConditionalPlan) -> Result<((), [Cache; 3])> {
         self.log("prefill".into());
@@ -373,5 +396,43 @@ fn source_images_require_real_expanded_prefixes_and_live_storage() {
     assert!(mock.calls().is_empty()); // mismatch is refused before any provider callback
     mock.source_images = vec![source; 4];
     let (result, _) = run(&mut mock, &p);
+    assert!(result.is_err());
+    assert!(mock.calls().is_empty()); // tokenized prefix lengths are checked too
+    mock.prefill_tokens = i.prefill_tokens;
+    let (result, _) = run(&mut mock, &p);
     assert!(result.is_ok());
+}
+
+#[test]
+fn dense_four_large_source_prefill_is_priced_without_allocating_it() {
+    let source = SourceImageGeometry {
+        width: 1024,
+        height: 1024,
+        storage_bytes: 1024 * 1024 * 3 * 4,
+    };
+    let mut i = input();
+    i.input_images = 4;
+    i.source_images = vec![source; 4];
+    i.prefill_tokens = [16_393, 16_393, 1];
+    let mut c = ceilings();
+    c.max_source_live_bytes = 1_000_000_000;
+    c.max_cache_tokens_per_cache = 100_000;
+    c.max_peak_bytes = 100_000_000_000;
+    c.max_total_work = 100_000_000_000;
+    c.max_prefill_scratch_bytes = 3_000_000_000;
+    assert!(ConditionalPlan::compile(i.clone(), c.clone()).is_err());
+    c.max_prefill_scratch_bytes = 100_000_000_000;
+    let p = ConditionalPlan::compile(i, c.clone()).unwrap();
+    assert_eq!(p.budget().source_image_tokens, 16_384);
+    assert!(p.budget().prefill_scratch_bytes > 3_000_000_000);
+    assert!(p.budget().peak_live_bytes > p.budget().prefill_scratch_bytes);
+    c.max_peak_bytes = p.budget().peak_live_bytes - 1;
+    assert!(ConditionalPlan::compile(p.input().clone(), c).is_err());
+
+    let mut mock = Mock::new(vec![segment(0, RolloutStop::End)]);
+    mock.source_images = p.input().source_images.clone();
+    mock.prefill_hidden_width = 2048;
+    let (result, _) = run(&mut mock, &p);
+    assert!(result.is_err());
+    assert!(mock.calls().is_empty());
 }

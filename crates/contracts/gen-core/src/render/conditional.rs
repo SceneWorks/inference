@@ -76,6 +76,15 @@ pub struct SourceImageGeometry {
     pub storage_bytes: u64,
 }
 
+/// Metadata read from the selected model configuration before weight loading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefillModelShape {
+    pub hidden_width: u32,
+    pub vision_hidden_width: u32,
+    pub source_patch_size: u32,
+    pub attention_heads: u32,
+}
+
 /// All output-affecting request facts and conservative upper bounds are frozen pre-load.
 /// `step_scratch_bytes` is an admission upper bound for all simultaneously live step tensors;
 /// `cache_token_bytes` is the upper bound for each retained KV token across the three caches.
@@ -90,6 +99,10 @@ pub struct ConditionalInput {
     pub input_images: u32,
     pub source_images: Vec<SourceImageGeometry>,
     pub prefill_tokens: [u32; CACHE_COUNT],
+    pub prefill_hidden_width: u32,
+    pub prefill_vision_hidden_width: u32,
+    pub source_patch_size: u32,
+    pub prefill_attention_heads: u32,
     pub max_new_tokens: u32,
     pub max_images: u32,
     pub steps_per_image: u32,
@@ -107,6 +120,10 @@ pub struct ConditionalCeilings {
     pub max_source_height: u32,
     pub max_source_token_grid: u64,
     pub max_source_live_bytes: u64,
+    pub max_prefill_hidden_width: u32,
+    pub max_prefill_vision_hidden_width: u32,
+    pub max_prefill_attention_heads: u32,
+    pub max_prefill_scratch_bytes: u64,
     pub max_token_grid: u64,
     pub max_new_tokens: u32,
     pub max_images: u32,
@@ -120,7 +137,9 @@ pub struct ConditionalCeilings {
 pub struct ConditionalBudget {
     pub image_tokens: u64,
     pub source_image_tokens: u64,
+    pub source_patch_tokens: u64,
     pub source_live_bytes: u64,
+    pub prefill_scratch_bytes: u64,
     pub cache_token_caps: [u64; CACHE_COUNT],
     pub max_text_rollouts: u32,
     pub max_outer_steps: u32,
@@ -149,6 +168,11 @@ impl ConditionalPlan {
             || !input.height.is_multiple_of(input.cell)
             || input.steps_per_image == 0
             || input.prefill_tokens.contains(&0)
+            || input.prefill_hidden_width == 0
+            || input.prefill_vision_hidden_width == 0
+            || input.source_patch_size == 0
+            || !input.cell.is_multiple_of(input.source_patch_size)
+            || input.prefill_attention_heads == 0
             || input.cache_token_bytes == 0
             || input.step_scratch_bytes == 0
         {
@@ -159,6 +183,9 @@ impl ConditionalPlan {
         if input.width > ceilings.max_width
             || input.height > ceilings.max_height
             || input.input_images > ceilings.max_input_images
+            || input.prefill_hidden_width > ceilings.max_prefill_hidden_width
+            || input.prefill_vision_hidden_width > ceilings.max_prefill_vision_hidden_width
+            || input.prefill_attention_heads > ceilings.max_prefill_attention_heads
             || u32::try_from(input.source_images.len()).map_err(|_| overflow())?
                 != input.input_images
             || input.max_new_tokens > ceilings.max_new_tokens
@@ -172,6 +199,7 @@ impl ConditionalPlan {
         // `<img><IMG_CONTEXT>×grid</img>`. Price the precompiled source tensor shapes,
         // retained patch arrays, and concatenated pixel_values before admitting prefill.
         let mut source_image_tokens = 0u64;
+        let mut source_patch_tokens = 0u64;
         let mut source_pixels = 0u64;
         let mut source_live_bytes = 0u64;
         for source in &input.source_images {
@@ -199,6 +227,13 @@ impl ConditionalPlan {
                 ));
             }
             source_image_tokens = add(source_image_tokens, tokens)?;
+            source_patch_tokens = add(
+                source_patch_tokens,
+                mul(
+                    u64::from(source.width / input.source_patch_size),
+                    u64::from(source.height / input.source_patch_size),
+                )?,
+            )?;
             source_pixels = add(source_pixels, pixels)?;
             // Upper bound simultaneous original tensors, conversion/normalization
             // intermediates, per-image patches, and concatenated pixel_values.
@@ -220,6 +255,41 @@ impl ConditionalPlan {
             return Err(refused(
                 "source-image prefill tokens understate expanded prefixes",
             ));
+        }
+
+        // Candle's one-hot source scatter materializes both host `p` and device `p_arr`
+        // at [S,n_ctx]. MLX can also retain both around its dtype conversion. Price the
+        // largest of the sequential prefixes, vision features, dense host/device block
+        // masks, one full-head attention score bound, and concurrent [S,H]/[N,V]
+        // intermediates at f32 even when a provider uses a narrower dtype.
+        let prefill_sequence = u64::from(*input.prefill_tokens.iter().max().unwrap());
+        let hidden = u64::from(input.prefill_hidden_width);
+        let dense_scatter = mul(mul(prefill_sequence, source_image_tokens)?, F32_BYTES)?;
+        let embed = mul(mul(prefill_sequence, hidden)?, F32_BYTES)?;
+        let vision = mul(mul(source_image_tokens, hidden)?, F32_BYTES)?;
+        let mask = mul(mul(prefill_sequence, prefill_sequence)?, F32_BYTES)?;
+        let vision_patch = mul(
+            mul(
+                source_patch_tokens,
+                u64::from(input.prefill_vision_hidden_width),
+            )?,
+            F32_BYTES,
+        )?;
+        let prefill_scratch_bytes = add(
+            add(
+                add(mul(dense_scatter, 2)?, mul(embed, 5)?)?,
+                add(vision, mul(vision_patch, 5)?)?,
+            )?,
+            add(
+                mul(
+                    mask,
+                    add(2, mul(u64::from(input.prefill_attention_heads), 2)?)?,
+                )?,
+                mul(prefill_sequence, 32)?,
+            )?,
+        )?;
+        if prefill_scratch_bytes > ceilings.max_prefill_scratch_bytes {
+            return Err(refused("dense source prefill scratch exceeds its cap"));
         }
 
         let image_tokens = mul(
@@ -273,11 +343,14 @@ impl ConditionalPlan {
             add(
                 add(
                     input.model_resident_bytes,
-                    mul(cache_sum, input.cache_token_bytes)?,
+                    mul(mul(cache_sum, input.cache_token_bytes)?, 2)?,
                 )?,
                 add(retained_image_bytes, source_live_bytes)?,
             )?,
-            add(input.step_scratch_bytes, image_buffer_bytes)?,
+            add(
+                add(input.step_scratch_bytes, image_buffer_bytes)?,
+                prefill_scratch_bytes,
+            )?,
         )?;
         if peak_live_bytes > ceilings.max_peak_bytes {
             return Err(refused(
@@ -297,6 +370,19 @@ impl ConditionalPlan {
             add(
                 mul(source_pixels, IMAGE_CHANNELS)?,
                 mul(mul(source_image_tokens, source_image_tokens)?, 2)?,
+            )?,
+        )?;
+        total_work_units = add(
+            total_work_units,
+            add(
+                mul(
+                    mul(prefill_sequence, prefill_sequence)?,
+                    u64::from(input.prefill_attention_heads),
+                )?,
+                mul(
+                    source_patch_tokens,
+                    u64::from(input.prefill_vision_hidden_width),
+                )?,
             )?,
         )?;
         total_work_units = add(
@@ -368,7 +454,9 @@ impl ConditionalPlan {
             budget: ConditionalBudget {
                 image_tokens,
                 source_image_tokens,
+                source_patch_tokens,
                 source_live_bytes,
+                prefill_scratch_bytes,
                 cache_token_caps,
                 max_text_rollouts,
                 max_outer_steps,
@@ -397,6 +485,26 @@ impl ConditionalPlan {
         self.validate()?;
         if self.input.source_images != actual {
             return Err(refused("source tensors differ from precompiled geometry"));
+        }
+        Ok(())
+    }
+
+    pub fn check_prefill_shape(&self, actual: PrefillModelShape) -> Result<()> {
+        self.validate()?;
+        if self.input.prefill_hidden_width != actual.hidden_width
+            || self.input.prefill_vision_hidden_width != actual.vision_hidden_width
+            || self.input.source_patch_size != actual.source_patch_size
+            || self.input.prefill_attention_heads != actual.attention_heads
+        {
+            return Err(refused("model shape differs from precompiled prefill"));
+        }
+        Ok(())
+    }
+
+    pub fn check_prefill_tokens(&self, actual: [u32; CACHE_COUNT]) -> Result<()> {
+        self.validate()?;
+        if self.input.prefill_tokens != actual {
+            return Err(refused("tokenized prefix differs from precompiled prefill"));
         }
         Ok(())
     }
@@ -681,6 +789,10 @@ pub trait ConditionalExecutor {
     /// Must inspect the actual caller-owned tensors before weights load or prefill begins.
     /// `storage_bytes` includes the original tensor allocation, even for a wider dtype.
     fn source_images(&self) -> Result<Vec<SourceImageGeometry>>;
+    /// Read the selected model configuration before any prefill allocation.
+    fn prefill_model_shape(&self) -> Result<PrefillModelShape>;
+    /// Return actual tokenized lengths of the three expanded prefixes before prefill.
+    fn prefill_token_counts(&self) -> Result<[u32; CACHE_COUNT]>;
 
     fn prefill(
         &mut self,
@@ -718,6 +830,8 @@ pub fn run_conditional<E: ConditionalExecutor>(
 ) -> Result<ConditionalOutput<E::Image>> {
     plan.check_input(input)?;
     plan.check_source_images(&executor.source_images()?)?;
+    plan.check_prefill_shape(executor.prefill_model_shape()?)?;
+    plan.check_prefill_tokens(executor.prefill_token_counts()?)?;
     let mut guard = ConditionalGuard::new(plan)?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
