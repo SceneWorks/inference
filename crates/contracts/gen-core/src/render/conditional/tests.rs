@@ -241,11 +241,9 @@ fn zero_image_end_has_no_image_bar_or_cache_leak() {
     assert_eq!(output.receipt.images, 0);
     assert_eq!(output.receipt.actual_outer_steps, 0);
     assert_eq!(output.receipt.reported_final_steps, None);
-    assert!(
-        !events
-            .iter()
-            .any(|p| matches!(p, Progress::Step { .. } | Progress::Decoding))
-    );
+    assert!(!events
+        .iter()
+        .any(|p| matches!(p, Progress::Step { .. } | Progress::Decoding)));
     assert_eq!(mock.probe.drops.get(), 3);
 }
 #[test]
@@ -333,16 +331,12 @@ fn guard_rejects_reuse_and_overdraw() {
     let grant = guard.begin_rollout().unwrap();
     assert_eq!(grant, 10);
     assert!(guard.begin_rollout().is_err());
-    assert!(
-        guard
-            .finish_rollout(&segment(10, RolloutStop::End))
-            .is_err()
-    );
-    assert!(
-        guard
-            .finish_rollout(&segment(0, RolloutStop::Image))
-            .is_ok()
-    );
+    assert!(guard
+        .finish_rollout(&segment(10, RolloutStop::End))
+        .is_err());
+    assert!(guard
+        .finish_rollout(&segment(0, RolloutStop::Image))
+        .is_ok());
     assert!(guard.begin_rollout().is_err());
     assert!(guard.check_step(1, 0).is_err());
 }
@@ -365,10 +359,9 @@ fn admission_rejects_caps_overflow_and_forged_plan() {
     forged["budget"]["max_outer_steps"] = serde_json::json!(99);
     let forged: ConditionalPlan = serde_json::from_value(forged).unwrap();
     assert!(forged.validate().is_err());
-    assert!(
-        p.check_input(&ConditionalInput { seed: 3, ..input() })
-            .is_err()
-    );
+    assert!(p
+        .check_input(&ConditionalInput { seed: 3, ..input() })
+        .is_err());
 }
 
 #[test]
