@@ -229,6 +229,7 @@ pub struct FluxGenerator {
     bounded_host_decode: Arc<Mutex<bool>>,
     loaded_quant: Option<gen_core::Quant>,
     memory_strategy: Option<gen_core::MemoryProviderContract>,
+    load_binding: gen_core::RenderLoadBinding,
 }
 
 impl Generator for FluxGenerator {
@@ -290,6 +291,7 @@ impl Generator for FluxGenerator {
     ) -> gen_core::Result<GenerationReport> {
         self.validate(req)?;
         plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&self.load_binding)?;
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         let stage_residency = req
             .memory
@@ -400,17 +402,44 @@ fn compile_base_plan(variant: Variant, req: &GenerationRequest) -> gen_core::Res
 }
 
 fn compile_schnell_plan(
-    _spec: &LoadSpec,
+    spec: &LoadSpec,
     req: &GenerationRequest,
 ) -> gen_core::Result<Option<RenderPlan>> {
+    validate_base_load_spec(Variant::Schnell, spec)?;
+    validate_preload_pid(spec, req, Variant::Schnell)?;
     compile_base_plan(Variant::Schnell, req).map(Some)
 }
 
 fn compile_dev_plan(
-    _spec: &LoadSpec,
+    spec: &LoadSpec,
     req: &GenerationRequest,
 ) -> gen_core::Result<Option<RenderPlan>> {
+    validate_base_load_spec(Variant::Dev, spec)?;
+    validate_preload_pid(spec, req, Variant::Dev)?;
     compile_base_plan(Variant::Dev, req).map(Some)
+}
+
+fn validate_preload_pid(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+    variant: Variant,
+) -> gen_core::Result<()> {
+    if !req.use_pid {
+        return Ok(());
+    }
+    if spec.pid.is_none() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)",
+            variant.model_id()
+        )));
+    }
+    if req.pid_capture_sigma.is_some() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: pid_capture_sigma (from_ldm early-stop) is not wired for this latent space yet",
+            variant.model_id()
+        )));
+    }
+    Ok(())
 }
 
 const SCHNELL_RENDER_PLAN: RenderPlanRegistration = RenderPlanRegistration {
@@ -481,13 +510,17 @@ pub fn descriptor_dev() -> ModelDescriptor {
     descriptor_for(Variant::Dev)
 }
 
-/// Construct a lazy candle FLUX generator for `variant` from a [`LoadSpec`]. `spec.weights` must be a
+/// Validate the base FLUX.1 load shape before compiling a plan or constructing the lazy generator.
+/// `spec.weights` must be a
 /// [`WeightsSource::Dir`] pointing at a black-forest-labs `FLUX.1-{schnell,dev}` snapshot (root
 /// `flux1-*.safetensors` + `ae.safetensors`, plus the `text_encoder/`, `text_encoder_2/`,
 /// `tokenizer_2/` subdirs). LoRA adapters, on-the-fly quantization, and control/IP-adapter overlays
 /// are rejected — none are wired in this slice, so refusing is more honest than silently dropping
 /// them (the worker falls back to Python).
-fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+fn validate_base_load_spec(
+    variant: Variant,
+    spec: &LoadSpec,
+) -> gen_core::Result<std::path::PathBuf> {
     let id = variant.model_id();
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -508,6 +541,13 @@ fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn G
             "candle {id} does not support control / IP-adapter overlays yet (txt2img only)"
         )));
     }
+    Ok(root)
+}
+
+/// Construct the lazy base generator after the shared pre-load shape check.
+fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    let id = variant.model_id();
+    let root = validate_base_load_spec(variant, spec)?;
     // FLUX is a bf16 model; load at bf16 regardless of the CPU-default dtype. The device is the
     // backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
@@ -558,6 +598,7 @@ fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn G
         bounded_host_decode,
         loaded_quant,
         memory_strategy,
+        load_binding: gen_core::RenderLoadBinding::from_spec(spec),
     }))
 }
 
@@ -716,6 +757,43 @@ mod tests {
             different.width = 768;
             assert!(plan
                 .check_request(&descriptor_for(variant), &different)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn base_plan_rejects_unloadable_spec_and_unwired_pid_before_weights() {
+        use candle_gen::gen_core::Quant;
+        let registry = provider_registry().unwrap();
+        let req = GenerationRequest {
+            prompt: "a blue lamp".into(),
+            seed: Some(91),
+            ..Default::default()
+        };
+        let file = LoadSpec::new(WeightsSource::File("/nonexistent/flux.safetensors".into()));
+        let quant = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(Quant::Q8);
+        let control = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_control(WeightsSource::Dir("/nonexistent/control".into()));
+        for id in [FLUX1_SCHNELL_ID, FLUX1_DEV_ID] {
+            for spec in [&file, &quant, &control] {
+                assert!(registry.compile_render_plan(id, spec, &req).is_err());
+            }
+            let pid_req = GenerationRequest {
+                use_pid: true,
+                ..req.clone()
+            };
+            let no_pid = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+            assert!(registry.compile_render_plan(id, &no_pid, &pid_req).is_err());
+            let with_pid = no_pid.with_pid(
+                WeightsSource::File("/nonexistent/pid.safetensors".into()),
+                WeightsSource::Dir("/nonexistent/gemma".into()),
+            );
+            let early_capture = GenerationRequest {
+                pid_capture_sigma: Some(0.2),
+                ..pid_req
+            };
+            assert!(registry
+                .compile_render_plan(id, &with_pid, &early_capture)
                 .is_err());
         }
     }
