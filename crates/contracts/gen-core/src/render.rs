@@ -6,7 +6,7 @@ use crate::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 pub struct RenderPlanRegistration {
     pub provider_id: &'static str,
@@ -314,6 +314,10 @@ impl RenderPlan {
     pub fn sigmas(&self) -> &[f32] {
         &self.pass.sigmas
     }
+    pub fn packed_tokens(&self) -> usize {
+        self.pass.phase.stream.tokens as usize
+    }
+
     pub fn denoise_sigmas(&self) -> &[f32] {
         &self.pass.sigmas[self.pass.phase.first_step..=self.pass.phase.end_step]
     }
@@ -329,12 +333,22 @@ pub struct RenderPhaseIdentity {
     pub geometry: crate::MemoryGeometry,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunState {
+    BeforeEncode,
+    Encoding,
+    Encoded,
+    Rendering,
+    Finished,
+}
+
 /// Owner-local state for an invocation. A provider's existing residency driver temporarily
 /// owns its text and heavy bundles. The two callbacks share one request scope without holding
 /// a dynamic borrow while running provider code or progress callbacks.
 pub struct RenderRun<'p, 's> {
     plan: &'p RenderPlan,
     cancel: &'p CancelFlag,
+    state: Cell<RunState>,
     scope: RefCell<Option<&'s mut dyn MemoryRequestScope>>,
 }
 
@@ -348,6 +362,7 @@ impl<'p, 's> RenderRun<'p, 's> {
             plan,
             cancel,
             scope: RefCell::new(scope),
+            state: Cell::new(RunState::BeforeEncode),
         }
     }
 
@@ -382,6 +397,17 @@ impl<'p, 's> RenderRun<'p, 's> {
         Ok(result)
     }
 
+    fn begin(&self, expected: RunState, next: RunState) -> Result<()> {
+        if self.state.get() != expected {
+            return Err(Error::Unsupported(format!(
+                "render stage {next:?} cannot start from {:?}",
+                self.state.get()
+            )));
+        }
+        self.state.set(next);
+        Ok(())
+    }
+
     pub fn plan(&self) -> &RenderPlan {
         self.plan
     }
@@ -390,7 +416,14 @@ impl<'p, 's> RenderRun<'p, 's> {
         &self,
         body: impl FnOnce() -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
-        self.phase(MemoryPhase::Conditioning, body)
+        self.begin(RunState::BeforeEncode, RunState::Encoding)?;
+        let result = self.phase(MemoryPhase::Conditioning, body);
+        self.state.set(if result.is_ok() {
+            RunState::Encoded
+        } else {
+            RunState::Finished
+        });
+        result
     }
 
     pub fn images<I, D, O, E: From<Error>>(
@@ -400,14 +433,20 @@ impl<'p, 's> RenderRun<'p, 's> {
         mut denoise: impl FnMut(u64, I, &mut dyn FnMut(Progress)) -> std::result::Result<D, E>,
         mut decode: impl FnMut(u64, D, &mut dyn FnMut(Progress)) -> std::result::Result<O, E>,
     ) -> std::result::Result<Vec<O>, E> {
-        let mut images = Vec::with_capacity(self.plan.inputs.count as usize);
-        for seed in self.plan.count.seeds() {
-            let denoised = self.phase(MemoryPhase::Denoise, || {
-                denoise(seed, init(seed)?, progress)
-            })?;
-            images.push(self.phase(MemoryPhase::Decode, || decode(seed, denoised, progress))?);
-        }
-        Ok(images)
+        self.begin(RunState::Encoded, RunState::Rendering)?;
+        let images = self
+            .plan
+            .count
+            .seeds()
+            .map(|seed| {
+                let denoised = self.phase(MemoryPhase::Denoise, || {
+                    denoise(seed, init(seed)?, progress)
+                })?;
+                self.phase(MemoryPhase::Decode, || decode(seed, denoised, progress))
+            })
+            .collect();
+        self.state.set(RunState::Finished);
+        images
     }
 }
 

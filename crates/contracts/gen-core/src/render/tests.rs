@@ -129,6 +129,7 @@ fn cancel_during_denoise_prevents_decode_and_all_later_images() {
     let plan = plan(&req).unwrap();
     let mut scope = Scope::default();
     let run = RenderRun::new(&plan, &req.cancel, Some(&mut scope));
+    run.encode(|| Ok::<_, Error>(())).unwrap();
     let result = run.images(
         &mut |_| {},
         |_| Ok::<_, Error>(()),
@@ -141,7 +142,12 @@ fn cancel_during_denoise_prevents_decode_and_all_later_images() {
     assert!(matches!(result, Err(Error::Canceled)));
     assert_eq!(
         scope.0,
-        [(true, MemoryPhase::Denoise), (false, MemoryPhase::Denoise)]
+        [
+            (true, MemoryPhase::Conditioning),
+            (false, MemoryPhase::Conditioning),
+            (true, MemoryPhase::Denoise),
+            (false, MemoryPhase::Denoise)
+        ]
     );
 }
 
@@ -188,4 +194,24 @@ fn invalid_schedules_and_unaligned_geometry_refuse_before_any_stage() {
         assert!(RenderPlan::base_image(&descriptor(), &req, pass(nodes, steps, capture)).is_err());
     }
     assert!(plan(&GenerationRequest { width: 17, ..req }).is_err());
+}
+
+#[test]
+fn owner_refuses_a_second_encode_or_out_of_order_trajectory() {
+    let req = GenerationRequest::default();
+    let plan = plan(&req).unwrap();
+    let run = RenderRun::new(&plan, &req.cancel, None);
+    let images = || {
+        run.images(
+            &mut |_| {},
+            |_| Ok::<_, Error>(()),
+            |_, (), _| Ok(()),
+            |_, (), _| Ok(()),
+        )
+    };
+    assert!(images().is_err());
+    run.encode(|| Ok::<_, Error>(())).unwrap();
+    assert!(run.encode(|| Ok::<_, Error>(())).is_err());
+    assert_eq!(images().unwrap(), [()]);
+    assert!(images().is_err());
 }

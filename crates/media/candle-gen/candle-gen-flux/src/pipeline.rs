@@ -1448,7 +1448,7 @@ impl Pipeline {
             },
             |seed, noise, on_progress| {
                 let state = State::new(&t5_emb, &clip_emb, &noise)?;
-                let planned_tokens = (req.width as usize / 16) * (req.height as usize / 16);
+                let planned_tokens = plan.packed_tokens();
                 if state.img.dim(1)? != planned_tokens {
                     return Err(CandleError::Msg(format!(
                         "FLUX.1 packed image geometry changed after plan compilation: expected {planned_tokens} tokens"
