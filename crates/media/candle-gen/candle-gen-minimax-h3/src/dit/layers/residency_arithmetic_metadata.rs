@@ -77,6 +77,18 @@ pub(super) fn schedule() -> Result<JointSchedule> {
 #[test]
 fn frozen_metadata_rejects_wrong_patch_missing_native_keys_and_wrong_schedule_count() {
     let frozen: Value = serde_json::from_str(FROZEN).unwrap();
+    for name in frozen["selected"].as_object().unwrap().keys() {
+        assert!(selected(name), "frozen native key must be selected: {name}");
+    }
+    for name in [
+        "transformer_blocks.1.ff.net.0.proj.weight",
+        "transformer_blocks.00.ff.net.0.proj.weight",
+        "time_embedder_extra.linear_1.weight",
+        "norm_out_extra.linear.weight",
+        "token_refiner.refiner_blocks.0.ff.net.0.proj.weight",
+    ] {
+        assert!(!selected(name), "unrelated native key selected: {name}");
+    }
     let cfg = MiniMaxH3DitConfig::from_diffusers_json(&frozen["config"].to_string()).unwrap();
     validate(
         &frozen["config"],

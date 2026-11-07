@@ -76,7 +76,7 @@ mod residency_component;
 #[cfg(test)]
 mod residency_arithmetic;
 
-#[cfg(all(feature = "cuda", feature = "model-inference-proof"))]
+// Registered in audited-safe without CUDA or model-proof feature prerequisites.
 #[cfg(test)]
 mod residency_arithmetic_metadata;
 
