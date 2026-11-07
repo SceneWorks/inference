@@ -1680,7 +1680,7 @@ class WindowsSupervisorTests(unittest.TestCase):
             if parent.supervision_start is None:
                 parent.supervision_start = now
             return now
-        class Probe:
+        class Probe(safety.SystemProbe):
             def host_free(self):
                 return 10**12
             def host_admission(self):
@@ -1688,7 +1688,7 @@ class WindowsSupervisorTests(unittest.TestCase):
             def gpu_free(self):
                 return 10**12
             def tree_footprint(self, owner):
-                amount = owner.footprint_bytes()
+                amount = super().tree_footprint(owner)
                 parent.sampled.append(amount)
                 members = owner.members()
                 parent.membership_samples.append((observed_real_clock(), members))
@@ -1699,7 +1699,7 @@ class WindowsSupervisorTests(unittest.TestCase):
         return safety.run_guarded(
             [sys.executable, "-c", script], cwd=self.root, env=os.environ.copy(),
             policy=policy, stdout_path=self.root / "stdout", stderr_path=self.root / "stderr",
-            probe=Probe(),
+            probe=Probe(policy),
             on_spawn=on_spawn, clock=clock,
         )
 
@@ -1708,6 +1708,44 @@ class WindowsSupervisorTests(unittest.TestCase):
         result = self._run("import time; time.sleep(.1)",
                            on_spawn=lambda pid, pgid: calls.append((pid, pgid)))
         self.assertEqual(calls, [(result.pid, None)])
+
+    def test_exit_between_owned_snapshot_and_footprint_uses_production_probe_normalization(self):
+        from scripts import media_campaign_windows as windows
+        release = self.root / "release"
+        script = (
+            "import pathlib,time; release=pathlib.Path('release'); "
+            "\nwhile not release.exists(): time.sleep(.005)"
+        )
+        original_footprint = windows.WindowsJob.footprint_bytes
+        sampled_jobs = []
+        def exit_during_sample(owner):
+            members = owner.members()
+            self.assertEqual(len(members), 1, "sample must begin with the owned root alive")
+            sampled_jobs.append(members)
+            if len(sampled_jobs) == 1:
+                # Keep the ordinary fake CUDA attribution tick: the child remains
+                # alive until the next footprint call explicitly releases it.
+                return original_footprint(owner)
+            self.assertEqual(len(sampled_jobs), 2)
+            owned_pid = next(iter(members))
+            release.write_text("exit", encoding="ascii")
+            until = time.monotonic() + 2
+            # Job-list removal alone does not signal the process object's exit.
+            # The same real deadline bounds both observations before the fault.
+            while owner.members() or not self._has_exited(owned_pid):
+                self.assertLess(time.monotonic(), until, "released child did not drain and exit")
+                time.sleep(.005)
+            self._assert_exited(owned_pid)
+            # Force the real low-level sample race after an actual owned Job
+            # drain. SystemProbe must normalize it for the supervisor's terminal
+            # root/tree recheck; an unwrapped fixture probe leaks WindowsJobError.
+            raise windows.WindowsJobError("owned Job disappeared during memory sample")
+        with patch.object(windows.WindowsJob, "footprint_bytes", exit_during_sample):
+            result = self._run(script)
+        self.assertEqual(len(sampled_jobs), 2, "exit-during-footprint hook did not execute")
+        self.assertEqual(sampled_jobs, [{result.pid}, {result.pid}])
+        self.assertEqual(result.returncode, 0)
+        self._assert_exited(result.pid)
 
     def _has_exited(self, pid):
         import ctypes
