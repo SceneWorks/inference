@@ -98,14 +98,16 @@ fn pair_write(values: &[f32], sigma: f32, dtype: &str, device: &str) {
         cuda_proof = """let pool = candle_gen::cuda_mempool::MemPool::device_current(0)
         .ok_or("CUDA current memory pool unavailable")?;
     let used_high = pool.used_high().ok_or("CUDA pool used high-water unavailable")?;
+    let used = pool.used().ok_or("CUDA pool used bytes unavailable")?;
     let reserved = pool.reserved().ok_or("CUDA pool reserved bytes unavailable")?;
     let reserved_high = pool.reserved_high().ok_or("CUDA pool reserved high-water unavailable")?;
-    if used_high == 0 || reserved_high == 0 || reserved_high < reserved {
+    if used == 0 || reserved == 0 || used > used_high || used > reserved
+        || used_high > reserved_high || reserved_high < reserved {
         return Err("CUDA pool did not record coherent positive allocation".into());
     }
     let uuid = env::var("CUDA_VISIBLE_DEVICES")?;
     let proof = serde_json::json!({"pid": std::process::id(), "cudaDeviceUuid": uuid,
-        "poolUsedHighBytes": used_high, "poolReservedBytes": reserved,
+        "poolUsedBytes": used, "poolUsedHighBytes": used_high, "poolReservedBytes": reserved,
         "poolReservedHighBytes": reserved_high});
     let pending = dir.join("cuda-pool.pending");
     let final_path = dir.join("cuda-pool.json");

@@ -1,9 +1,11 @@
 """Metadata-only CUDA proof checks; no model or device execution."""
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from scripts.ci.flux1_pair.cuda_probe import PairCudaProbe
 from scripts.media_campaign_supervisor import SupervisionError
@@ -37,7 +39,8 @@ class PairCudaProbeTests(unittest.TestCase):
         self.owner = SimpleNamespace(members=lambda: {123})
 
     def write(self, **changes):
-        row = {"pid": 123, "cudaDeviceUuid": UUID, "poolUsedHighBytes": 80 * MIB,
+        row = {"pid": 123, "cudaDeviceUuid": UUID, "poolUsedBytes": 70 * MIB,
+               "poolUsedHighBytes": 80 * MIB,
                "poolReservedBytes": 100 * MIB, "poolReservedHighBytes": 120 * MIB}
         row.update(changes)
         self.path.write_text(json.dumps(row), encoding="utf-8")
@@ -53,8 +56,10 @@ class PairCudaProbeTests(unittest.TestCase):
 
     def test_rejects_wrong_or_absent_owner_uuid_and_zero_or_unknown_counters(self):
         for change in ({"pid": 456}, {"cudaDeviceUuid": "GPU-00000000-0000-0000-0000-000000000000"},
-                       {"poolUsedHighBytes": 0}, {"poolReservedHighBytes": 0},
+                       {"poolUsedBytes": 0}, {"poolUsedHighBytes": 0},
+                       {"poolReservedBytes": 0}, {"poolReservedHighBytes": 0},
                        {"poolReservedBytes": None}, {"poolReservedBytes": 130 * MIB},
+                       {"poolUsedBytes": 110 * MIB},
                        {"poolUsedHighBytes": 130 * MIB}, {"poolReservedHighBytes": 300 * MIB}):
             with self.subTest(change=change):
                 self.write(**change)
@@ -88,6 +93,35 @@ class PairCudaProbeTests(unittest.TestCase):
                 self.path.write_text(content, encoding="utf-8")
                 with self.assertRaises(SupervisionError):
                     self.probe.gpu_free_and_tree_bytes(self.owner)
+
+    def test_rejects_path_replacement_between_identity_and_open(self):
+        self.write()
+        replacement = Path(self.tmp.name) / "replacement.json"
+        replacement.write_text(self.path.read_text(encoding="utf-8"), encoding="utf-8")
+        actual_open = os.open
+
+        def swap_then_open(path, flags):
+            os.replace(replacement, self.path)
+            return actual_open(path, flags)
+
+        with patch("scripts.ci.flux1_pair.cuda_probe.os.open", side_effect=swap_then_open):
+            with self.assertRaises(SupervisionError):
+                self.probe.gpu_free_and_tree_bytes(self.owner)
+
+    def test_rejects_symlink_swap_between_identity_and_open(self):
+        self.write()
+        target = Path(self.tmp.name) / "target.json"
+        target.write_text(self.path.read_text(encoding="utf-8"), encoding="utf-8")
+        actual_open = os.open
+
+        def swap_then_open(path, flags):
+            self.path.unlink()
+            self.path.symlink_to(target)
+            return actual_open(path, flags)
+
+        with patch("scripts.ci.flux1_pair.cuda_probe.os.open", side_effect=swap_then_open):
+            with self.assertRaises(SupervisionError):
+                self.probe.gpu_free_and_tree_bytes(self.owner)
 
 
 if __name__ == "__main__":

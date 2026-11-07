@@ -129,7 +129,8 @@ class FluxPairTests(unittest.TestCase):
                         lines.append("FLUX1_PAIR_COMPLETE " + model)
                         stdout_path.write_text("\n".join(lines), encoding="utf-8")
                         comparison.write(out / "cuda-pool.json", {"pid": 1, "cudaDeviceUuid": policy.cuda_device_uuid,
-                                                                  "poolUsedHighBytes": 1, "poolReservedBytes": 1,
+                                                                  "poolUsedBytes": 1, "poolUsedHighBytes": 1,
+                                                                  "poolReservedBytes": 1,
                                                                   "poolReservedHighBytes": 1})
                         if fail:
                             raise comparison.SupervisionError("child-exit", "probe failed")
