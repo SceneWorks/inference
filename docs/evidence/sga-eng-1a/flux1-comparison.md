@@ -13,6 +13,10 @@ Each tier and backend has an independent receipt.
 | Tier 1, migration batch | Deterministic synthetic BF16 weights from the immutable [snapshot header inventory](../../../scripts/ci/flux1_pair/headers.json) and [tensor geometry](../../../scripts/ci/flux1_pair/geometry.tsv). One full-width double and single FLUX block, one full-width CLIP and T5 block, full VAE. This compares the actual provider pipeline at reduced depth. |
 | Tier 2, feature end | Complete 19/38-block Q4 snapshots. Dev uses `SceneWorks/flux1-dev-mlx@323fd12d79f78ad444e882e8d8e871914584f2b9/q4` (9,614,909,969 input bytes), schnell uses `SceneWorks/flux1-schnell-mlx@bba3ae01dfd94089f173c05edd4e1a4c551f2599/q4` (9,609,145,903 bytes). Input hashes must match the committed snapshot files before and after the pair. MLX uses its Q4 load option; Candle autodetects its packed snapshot. This witness covers the two plain T2I rows. |
 
+Re-derive every retained tensor location and shape using the pinned HF cache
+with `python3 scripts/ci/flux1_pair/fixture.py "$HUB"`. This reads safetensors
+headers only; neither source weight payloads nor generated tensors enter Git.
+
 **Frozen comparison.** One resident load per process; seed 104729, prompt “red
 kite”, 256×256, count one, three Euler outer steps, variant-native scheduler,
 dev guidance 3.5, schnell no guidance, no adapters, reference, memory rung

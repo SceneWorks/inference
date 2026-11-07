@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 import random
+import re
 import struct
 
 HERE = Path(__file__).resolve().parent
@@ -123,3 +124,36 @@ def snapshot_identity(root, variant, tier):
         provenance = {k: v for k, v in provenance.items() if k != "q4_files"}
     return {"tier": tier, "variant": variant, "source_snapshot": provenance,
             "depths": depths, "files": digests}
+
+
+def verify_source_headers(hub):
+    """Re-derive every retained row from upstream headers without reading a tensor payload."""
+    sources = json.loads((HERE / "headers.json").read_text(encoding="utf-8"))
+    for variant, spec in sources.items():
+        root = hub / ("models--" + spec["repo"].replace("/", "--")) / "snapshots" / spec["snapshot"] / "bf16"
+        observed = {c: {} for c in COMPONENTS}
+        for relative, expected in spec["headers"].items():
+            with (root / relative).open("rb") as f:
+                length, = struct.unpack("<Q", f.read(8))
+                if not 0 < length < 16 * 1024**2:
+                    raise ValueError("invalid safetensors header length")
+                header = f.read(length)
+            if hashlib.sha256(header).hexdigest() != expected:
+                raise ValueError("source header changed: " + relative)
+            component = relative.split("/", 1)[0]
+            for key, tensor in json.loads(header).items():
+                if key == "__metadata__" or re.search(r"(?:transformer_blocks|encoder\.layers|encoder\.block)\.[1-9]\d*\.", key):
+                    continue
+                if tensor["dtype"] != "BF16" or key in observed[component]:
+                    raise ValueError("unexpected dtype or duplicate tensor in source headers")
+                observed[component][key] = tensor["shape"]
+        if observed != geometry(variant):
+            raise ValueError("source headers disagree with the frozen geometry: " + variant)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Recheck the frozen model geometry using only local snapshot headers.")
+    parser.add_argument("hub", type=Path)
+    verify_source_headers(parser.parse_args().hub)
+    print("All retained dev/schnell tensors match their pinned BF16 headers.")

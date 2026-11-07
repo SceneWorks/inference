@@ -118,6 +118,22 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False):
     return guard, (out / "stdout.log").read_text(encoding="utf-8")
 
 
+def hardware(backend, policy):
+    if backend == "mlx":
+        def sysctl(name):
+            return subprocess.check_output(["/usr/sbin/sysctl", "-n", name], text=True, timeout=10).strip()
+        return {"chip": sysctl("machdep.cpu.brand_string"), "physical_memory_bytes": int(sysctl("hw.memsize")),
+                "os_build": sysctl("kern.osversion")}
+    from scripts.media_campaign_windows import trusted_nvidia_smi
+    fields = ["name", "uuid", "index", "memory.total", "driver_version"]
+    command = [trusted_nvidia_smi(), "--id=" + policy.cuda_device_uuid, "--query-gpu=" + ",".join(fields),
+               "--format=csv,noheader,nounits"]
+    values = subprocess.check_output(command, text=True, timeout=15).strip().split(", ")
+    if len(values) != len(fields) or values[1] != policy.cuda_device_uuid:
+        raise ValueError("hardware inventory does not match the selected physical CUDA device")
+    return dict(zip(fields, values))
+
+
 def execute(args, contract):
     backend, tier = args.backend, contract["tier"]
     proof.require_host(backend, dict(os.environ), "nax" if backend == "mlx" else "hosted")
@@ -139,6 +155,7 @@ def execute(args, contract):
         policy_path = work / "policy.json"
         write(policy_path, contract["request"]["policy"])
         policy = load_policy(policy_path)
+        receipt["hardware"] = hardware(backend, policy)
         # Both executables finish linking before either arm's first render.
         exes, environments = {}, {}
         for arm in evidence.ARMS:
