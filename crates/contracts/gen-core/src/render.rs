@@ -233,9 +233,9 @@ impl RenderPlan {
             },
             pass: ImagePass {
                 stages: [
+                    Stage::Schedule,
                     Stage::PromptPrep,
                     Stage::Encode,
-                    Stage::Schedule,
                     Stage::Init,
                     Stage::Enter,
                     Stage::Denoise,
@@ -439,9 +439,12 @@ impl<'p, 's> RenderRun<'p, 's> {
             .count
             .seeds()
             .map(|seed| {
-                let denoised = self.phase(MemoryPhase::Denoise, || {
-                    denoise(seed, init(seed)?, progress)
-                })?;
+                if self.cancel.is_cancelled() {
+                    return Err(Error::Canceled.into());
+                }
+                let initial = init(seed)?;
+                let denoised =
+                    self.phase(MemoryPhase::Denoise, || denoise(seed, initial, progress))?;
                 self.phase(MemoryPhase::Decode, || decode(seed, denoised, progress))
             })
             .collect();

@@ -794,7 +794,7 @@ class RunGraph:
             # SW-F329 appends source/byte/lifecycle arithmetic and frozen-cache ownership
             # controls. Their reviewed bodies execute no learned forward or inference kernel.
             # SW-6933 adds fixed-plan mocks, pre-load validation and CPU-stream sigma arithmetic.
-            controls_sha = 'a8e2ed7ce79cd49cd56be4581f7a1ff0db984fbbb7f089f621bbe8458d46bef2'
+            controls_sha = '476d2a5e052af23829e4f7d4fad67bb121da89e3306a5b634c6b0f59e716809f'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha

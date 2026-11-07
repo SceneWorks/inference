@@ -1022,6 +1022,20 @@
       "package": "sceneworks-gen-core",
       "kind": "lib",
       "target": "gen_core",
+      "test": "render::tests::failed_init_does_not_enter_the_denoise_scope",
+      "source": "crates/contracts/gen-core/src/render/tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "The mock initialization returns an error before producing a scalar latent. The assertion checks no denoise phase begins."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
       "test": "render::tests::plan_freezes_schedule_decode_count_and_preparation_inputs",
       "source": "crates/contracts/gen-core/src/render/tests.rs",
       "protocol": "libtest",

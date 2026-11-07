@@ -167,7 +167,21 @@ fn plan_freezes_schedule_decode_count_and_preparation_inputs() {
         serde_json::json!([1.0, 0.5, 0.0])
     );
     assert_eq!(snapshot["pass"]["phase"]["stream"]["tokens"], 1200);
-    assert_eq!(snapshot["pass"]["stages"][6], "Exit");
+    assert_eq!(
+        snapshot["pass"]["stages"],
+        serde_json::json!([
+            "Schedule",
+            "PromptPrep",
+            "Encode",
+            "Init",
+            "Enter",
+            "Denoise",
+            "Exit",
+            "PostLatent",
+            "Decode",
+            "Output"
+        ])
+    );
     assert_eq!(plan.denoise_sigmas(), plan.sigmas());
     req.memory = Some(GenerationMemory::default());
     plan.check_request(&descriptor(), &req).unwrap();
@@ -214,4 +228,29 @@ fn owner_refuses_a_second_encode_or_out_of_order_trajectory() {
     assert!(run.encode(|| Ok::<_, Error>(())).is_err());
     assert_eq!(images().unwrap(), [()]);
     assert!(images().is_err());
+}
+
+#[test]
+fn failed_init_does_not_enter_the_denoise_scope() {
+    let req = GenerationRequest::default();
+    let plan = plan(&req).unwrap();
+    let mut scope = Scope::default();
+    let run = RenderRun::new(&plan, &req.cancel, Some(&mut scope));
+    run.encode(|| Ok::<_, Error>(())).unwrap();
+    let failure = run
+        .images(
+            &mut |_| {},
+            |_| Err::<(), _>(Error::Msg("init failed".into())),
+            |_, (), _| -> Result<()> { panic!("denoise after failed init") },
+            |_, (), _| -> Result<()> { panic!("decode after failed init") },
+        )
+        .unwrap_err();
+    assert_eq!(failure.to_string(), "init failed");
+    assert_eq!(
+        scope.0,
+        [
+            (true, MemoryPhase::Conditioning),
+            (false, MemoryPhase::Conditioning)
+        ]
+    );
 }
