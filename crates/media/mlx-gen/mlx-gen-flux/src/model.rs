@@ -1574,6 +1574,36 @@ mod tests {
     }
 
     #[test]
+    fn registry_freezes_the_native_mlx_schedule_without_opening_weights() {
+        let registry = crate::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/missing/flux".into()));
+        for variant in [FluxVariant::Schnell, FluxVariant::Dev] {
+            let req = GenerationRequest {
+                prompt: "base".into(),
+                seed: Some(7),
+                count: 2,
+                steps: Some(4),
+                width: 640,
+                height: 480,
+                ..Default::default()
+            };
+            let plan = registry
+                .compile_render_plan(variant.id(), &spec, &req)
+                .unwrap()
+                .expect("both base variants compile before load");
+            let native =
+                crate::pipeline::build_linear_sigmas(4, 640, 480, variant.requires_sigma_shift())
+                    .unwrap();
+            assert_eq!(plan.denoise_sigmas(), native);
+            assert_eq!(plan.packed_tokens(), 1200);
+            assert_eq!(plan.base_seed(), 7);
+            plan.check_request(&descriptor_for(variant), &req).unwrap();
+            plan.check_load(&gen_core::RenderLoadBinding::from_spec(&spec))
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn pre_load_plan_refuses_invalid_inputs_without_opening_any_weights() {
         let registry = crate::provider_registry().unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir("/missing/flux".into()));
