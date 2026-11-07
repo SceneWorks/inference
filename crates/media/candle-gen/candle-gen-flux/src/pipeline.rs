@@ -764,6 +764,7 @@ impl Pipeline {
             plan.denoise_sigmas(),
             &plan.denoise_spans(),
             Some(run),
+            true,
             state.img.clone(),
             seed,
             &req.cancel,
@@ -1450,6 +1451,9 @@ impl Pipeline {
                 )
             },
             |seed, noise, on_progress| {
+                // State packing allocates device tensors inside the first denoise phase.
+                // The sampler closes this phase after its first span.
+                run.begin_denoise_phase(0)?;
                 let state = State::new(&t5_emb, &clip_emb, &noise)?;
                 let planned_tokens = plan.packed_tokens();
                 if state.img.dim(1)? != planned_tokens {

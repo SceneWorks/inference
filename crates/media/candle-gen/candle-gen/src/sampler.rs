@@ -203,6 +203,7 @@ pub fn run_curated_sampler(
         sigmas,
         std::slice::from_ref(&span),
         None,
+        false,
         latents,
         seed,
         cancel,
@@ -219,6 +220,8 @@ pub fn run_curated_sampler_spans(
     sigmas: &[f32],
     spans: &[std::ops::Range<usize>],
     phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
+    // The provider entered phase 0 before preparing its device tensors. The driver still closes it.
+    first_phase_active: bool,
     latents: Tensor,
     seed: u64,
     cancel: &CancelFlag,
@@ -262,7 +265,9 @@ pub fn run_curated_sampler_spans(
     let mut out = latents;
     for (phase, span) in spans.iter().enumerate() {
         if let Some(run) = phase_scope {
-            run.begin_denoise_phase(phase).map_err(CandleError::from)?;
+            if phase != 0 || !first_phase_active {
+                run.begin_denoise_phase(phase).map_err(CandleError::from)?;
+            }
         }
         out = sampler
             .sample_span(
@@ -333,6 +338,7 @@ pub fn run_flow_sampler_spans(
     sigmas: &[f32],
     spans: &[std::ops::Range<usize>],
     phase_scope: Option<&gen_core::RenderRun<'_, '_>>,
+    first_phase_active: bool,
     latents: Tensor,
     seed: u64,
     cancel: &CancelFlag,
@@ -347,6 +353,7 @@ pub fn run_flow_sampler_spans(
         sigmas,
         spans,
         phase_scope,
+        first_phase_active,
         latents,
         seed,
         cancel,
@@ -944,6 +951,135 @@ mod tests {
     use gen_core::sampling::{AlphaSchedule, DiscreteModelSampling, EdmModelSampling, Scheduler};
     use gen_core::{CancelFlag, Progress};
 
+    #[test]
+    fn preopened_first_span_covers_preparation_and_closes_before_next_span() {
+        use gen_core::render::{PackedImagePass, RenderPhaseIdentity};
+        use gen_core::{
+            Capabilities, GenerationRequest, MemoryGeometry, MemoryPhase, MemoryRequestScope,
+            MemoryRunOutcome, Modality, ModelDescriptor, RenderPlan, RenderRun,
+        };
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct Scope(Rc<RefCell<Vec<String>>>);
+        impl MemoryRequestScope for Scope {
+            fn configure_request(&mut self, _: &mut GenerationRequest) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn finish(&mut self, _: MemoryRunOutcome) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn enter_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
+                self.0.borrow_mut().push(format!("enter {phase:?}"));
+                Ok(())
+            }
+            fn enter_render_phase(
+                &mut self,
+                phase: MemoryPhase,
+                id: &RenderPhaseIdentity,
+            ) -> gen_core::Result<()> {
+                self.0
+                    .borrow_mut()
+                    .push(format!("enter {phase:?} {}", id.phase));
+                Ok(())
+            }
+            fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
+                self.0.borrow_mut().push(format!("leave {phase:?}"));
+                Ok(())
+            }
+            fn configure_decode(
+                &mut self,
+                _: u32,
+                _: u32,
+                _: MemoryGeometry,
+            ) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn configure_attention(&mut self, _: u32) -> gen_core::Result<()> {
+                unreachable!()
+            }
+            fn materialize_transformer_window(&mut self, _: u32, _: u32) -> gen_core::Result<()> {
+                unreachable!()
+            }
+        }
+
+        let descriptor = ModelDescriptor {
+            id: "phase_scope_fixture",
+            backend: "candle",
+            family: "test",
+            modality: Modality::Image,
+            capabilities: Capabilities::default(),
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+        };
+        let req = GenerationRequest::default();
+        let plan = RenderPlan::base_image(
+            &descriptor,
+            &req,
+            PackedImagePass {
+                pixel_stride: 16,
+                token_width: 64,
+                sampler: "euler",
+                guidance: 3.5,
+                sigmas: vec![1.0, 0.5, 0.0],
+                executed_steps: 2,
+                capture_sigma: 0.0,
+            },
+        )
+        .unwrap()
+        .with_inert_split_at(1)
+        .unwrap();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut scope = Scope(Rc::clone(&events));
+        let run = RenderRun::new(&plan, &req.cancel, Some(&mut scope));
+        run.encode(|| Ok::<_, gen_core::Error>(())).unwrap();
+        run.images_with_denoise_phases(
+            &mut |_| {},
+            |_| Ok::<_, CandleError>(t(&[0.2, -0.5])),
+            |seed, latents, progress| {
+                run.begin_denoise_phase(0).map_err(CandleError::from)?;
+                events.borrow_mut().push("prepare".into());
+                run_flow_sampler_spans(
+                    Some("euler"),
+                    TimestepConvention::Sigma,
+                    plan.denoise_sigmas(),
+                    &plan.denoise_spans(),
+                    Some(&run),
+                    true,
+                    latents,
+                    seed,
+                    &req.cancel,
+                    progress,
+                    None,
+                    |x, _| {
+                        events.borrow_mut().push("predict".into());
+                        Ok(x.affine(0.25, 0.1)?)
+                    },
+                )
+            },
+            |_, latents, _| Ok::<_, CandleError>(latents),
+        )
+        .unwrap();
+        assert_eq!(
+            &*events.borrow(),
+            &[
+                "enter Conditioning 0",
+                "leave Conditioning",
+                "enter Denoise 0",
+                "prepare",
+                "predict",
+                "leave Denoise",
+                "enter Denoise 1",
+                "predict",
+                "leave Denoise",
+                "enter Decode 0",
+                "leave Decode",
+            ]
+        );
+    }
+
     /// N1 keystone: `run_flow_sampler` with the default `euler` over a FLOW schedule reproduces the
     /// legacy inline flow-match loop `img += v·(σ_{i+1} − σ_i)` within tolerance (the `to_d` round-trip
     /// is an f32-cancellation). This is the per-engine default-parity contract every flow engine relies
@@ -1018,6 +1154,7 @@ mod tests {
                 &sigmas,
                 &[0..2, 2..4, 4..5],
                 None,
+                false,
                 initial.clone(),
                 104729,
                 &cancel,
