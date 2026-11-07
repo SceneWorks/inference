@@ -20,7 +20,7 @@ on:
         type: string
   workflow_dispatch:
     inputs:
-      profile:
+      mode:
         description: Simulator runtime boundary or build-only physical-iOS catalog size
         type: choice
         options: [runtime-boundary, catalog-size]
@@ -44,7 +44,7 @@ permissions:
 jobs:
   runtime-boundary:
     name: Build, install and launch with explicit unsupported MLX runtime
-    if: github.event_name == 'workflow_dispatch' && inputs.profile != 'catalog-size'
+    if: github.event_name == 'workflow_dispatch' && inputs.mode != 'catalog-size'
     runs-on: [self-hosted, macOS, ARM64, nax]
     timeout-minutes: 240
     env:
@@ -155,7 +155,7 @@ jobs:
 
   catalog-size:
     name: Link paired release iOS catalog partitions
-    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'catalog-size'
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'catalog-size'
     runs-on: macos-15
     timeout-minutes: 120
     env:

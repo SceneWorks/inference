@@ -34,7 +34,7 @@ macOS runner, and uploads one JSON receipt after both succeed.
 
 ```sh
 gh workflow run ios-simulator-sana.yml --repo SceneWorks/inference --ref "$FEATURE_BRANCH" \
-  -f profile=catalog-size -f source_sha=2b09938e33370915d4f853389961709b8bbf8bf9
+  -f mode=catalog-size -f source_sha=2b09938e33370915d4f853389961709b8bbf8bf9
 ```
 
 The exact consumer calls the public `runtime_ios::catalog().snapshot()` and links
