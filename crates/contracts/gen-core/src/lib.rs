@@ -77,6 +77,8 @@ mod moss_image_assets;
 pub mod moss_image_edit;
 pub mod numeric;
 pub mod registry;
+pub mod render;
+pub use render::{RenderPlan, RenderPlanRegistration, RenderRun};
 pub mod residency;
 pub mod runtime;
 pub use load_activity::{
