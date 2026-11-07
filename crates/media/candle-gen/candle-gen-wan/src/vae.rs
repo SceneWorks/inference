@@ -1383,7 +1383,7 @@ mod budget_tests {
         const CHILD: &str = "SCENEWORKS_WAN_POISON_BRIDGE_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let _ = candle_error(CandleError::ProcessPoisoned("device context lost".into()));
-            unreachable!("process poison must abort before the caller resumes");
+            std::process::exit(101);
         }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -1393,7 +1393,16 @@ mod budget_tests {
             .env(CHILD, "1")
             .status()
             .unwrap();
-        assert!(!status.success());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(6), "expected SIGABRT, got {status}");
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(!status.success());
+            assert_ne!(status.code(), Some(101), "the bridge returned or panicked");
+        }
     }
 
     #[test]
