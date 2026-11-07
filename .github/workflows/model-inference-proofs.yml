@@ -10,10 +10,19 @@ on:
         required: true
         default: mlx
         options: [mlx, candle-cpu, candle-metal, candle-cuda]
+      flux1_pair:
+        description: Compare the FLUX.1 batch against its pre-migration source in this same job
+        type: choice
+        options: [none, tier1, tier2]
+        default: none
       request:
         description: 'JSON with registered selection and explicit supervisor policy; optional runner="nax" for provisioned assets'
         type: string
         required: true
+
+env:
+  FLUX1_PAIR_TIER: ${{ inputs.flux1_pair }}
+  MODEL_PROOF_SCRIPT: ${{ (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2') && 'flux1_comparison.py' || 'model_inference_proofs.py' }}
 
 permissions:
   contents: read
@@ -51,7 +60,7 @@ jobs:
           MODEL_PROOF_BACKEND: ${{ inputs.backend }}
           MODEL_PROOF_REQUEST: ${{ inputs.request }}
         run: |
-          "$REVIEWED_PYTHON" -I scripts/ci/model_inference_proofs.py --plan \
+          "$REVIEWED_PYTHON" -I "scripts/ci/$MODEL_PROOF_SCRIPT" --plan \
             --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
             --expected-sha "$GITHUB_SHA" > "$RUNNER_TEMP/model-proof-plan.json"
           "$REVIEWED_PYTHON" -I -c 'import json,os; p=json.load(open(os.path.join(os.environ["RUNNER_TEMP"],"model-proof-plan.json"),encoding="utf-8")); matrix={"include":[{"runner":p["runner"],"asset_setup":p["asset_setup"]}]}; open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8").write("matrix="+json.dumps(matrix,separators=(",",":"))+"\n")'
@@ -66,6 +75,7 @@ jobs:
       max-parallel: 1
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
+      FLUX1_HUB: ${{ inputs.backend == 'mlx' && vars.MLX_GEN_MODELS_ROOT || vars.CANDLE_GEN_MODELS_ROOT }}
       MODEL_PROOF_BACKEND: ${{ inputs.backend }}
       MODEL_PROOF_REQUEST: ${{ inputs.request }}
       MACOSX_DEPLOYMENT_TARGET: '15.0'
@@ -82,6 +92,13 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check out the exact pre-migration engine for the paired proof
+        if: matrix.asset_setup == 'flux1-comparison'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: 2b09938e33370915d4f853389961709b8bbf8bf9
+          path: flux1-baseline
           persist-credentials: false
       - name: Select Git Bash on Windows
         if: runner.os == 'Windows'
@@ -188,7 +205,7 @@ jobs:
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; else PYTHON="$REVIEWED_PYTHON"; fi
-          "$PYTHON" -I scripts/ci/model_inference_proofs.py \
+          "$PYTHON" -I "scripts/ci/$MODEL_PROOF_SCRIPT" \
             --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
             --expected-sha "$GITHUB_SHA" --output "$MODEL_PROOF_EVIDENCE"
       - name: Run exact registered model tests under external guards (Windows CUDA)
@@ -202,14 +219,14 @@ jobs:
             exit /b 1
           )
           set "RUSTC_WRAPPER="
-          "%REVIEWED_PYTHON%" -I scripts\ci\model_inference_proofs.py --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%MODEL_PROOF_EVIDENCE%"
+          "%REVIEWED_PYTHON%" -I "scripts\ci\%MODEL_PROOF_SCRIPT%" --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%MODEL_PROOF_EVIDENCE%"
       - name: Validate owned evidence tree before any upload
         id: evidence
         if: always()
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; elif [[ "$RUNNER_OS" == Windows ]]; then PYTHON="$REVIEWED_PYTHON"; else PYTHON="$REVIEWED_PYTHON"; fi
-          "$PYTHON" -I scripts/ci/model_inference_proofs.py --verify-artifacts \
+          "$PYTHON" -I "scripts/ci/$MODEL_PROOF_SCRIPT" --verify-artifacts \
             --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
             --expected-sha "$GITHUB_SHA" --output "$MODEL_PROOF_EVIDENCE"
       - name: Upload exact case evidence, safe generated outputs, logs and summary
