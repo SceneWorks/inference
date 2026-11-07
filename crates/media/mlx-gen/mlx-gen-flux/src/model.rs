@@ -79,6 +79,7 @@ fn load_variant(variant: FluxVariant, spec: &LoadSpec) -> Result<Box<dyn Generat
 pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
     // Precision + snapshot-dir guard up front for BOTH policies (fail fast).
     resolve_root(variant, spec)?;
+    crate::memory_strategy::validate_load_contract(variant.id(), spec)?;
     let stream_inventory = crate::artifact_inventory::verified_stream_inventory(variant.id(), spec);
     // F-181: a `Sequential` + `spec.quantize` load over a *dense* snapshot re-quantizes the whole
     // model on every generate; `Resident` quantizes once. Warn for that combination only.
@@ -90,15 +91,10 @@ pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
 
     // Optional XLabs IP-Adapter (epic 3621), loaded from `LoadSpec::ip_adapter`, held warm-resident.
     // The plain txt2img path is unaffected when absent.
-    let ip_adapter = match &spec.ip_adapter {
-        Some(WeightsSource::Dir(p)) => Some(loader::load_flux_ip_adapter(p)?),
-        Some(WeightsSource::File(_)) => {
-            return Err(Error::Msg(format!(
-                "{}: ip_adapter expects a directory (ip_adapter.safetensors + image_encoder/), not a single file",
-                variant.id()
-            )))
-        }
-        None => None,
+    let ip_adapter = if let Some(WeightsSource::Dir(path)) = &spec.ip_adapter {
+        Some(loader::load_flux_ip_adapter(path)?)
+    } else {
+        None
     };
 
     let memory_strategy =
@@ -977,7 +973,7 @@ pub(crate) fn compile_base(
     req: &GenerationRequest,
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_request(&descriptor_for(variant), req)?;
-    resolve_root(variant, spec)?;
+    crate::memory_strategy::validate_load_contract(variant.id(), spec)?;
     if single_reference(req)?.is_some() {
         if spec.ip_adapter.is_none() {
             return Err(gen_core::Error::Unsupported(format!(
@@ -1593,6 +1589,18 @@ mod tests {
             assert!(error.to_string().contains("multiples of 16"), "{error}");
         }
         req.width = 512;
+        let invalid_overlay = spec
+            .clone()
+            .with_control(WeightsSource::Dir("/missing/control".into()));
+        assert!(registry
+            .compile_render_plan(FluxVariant::Dev.id(), &invalid_overlay, &req)
+            .is_err());
+        let file_overlay = spec
+            .clone()
+            .with_ip_adapter(WeightsSource::File("/missing/ip".into()));
+        assert!(registry
+            .compile_render_plan(FluxVariant::Dev.id(), &file_overlay, &req)
+            .is_err());
         req.conditioning = vec![reference(Some(0.5))];
         let error = registry
             .compile_render_plan(FluxVariant::Dev.id(), &spec, &req)
