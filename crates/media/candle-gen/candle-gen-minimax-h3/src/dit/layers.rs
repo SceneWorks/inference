@@ -76,6 +76,10 @@ mod residency_component;
 #[cfg(test)]
 mod residency_arithmetic;
 
+#[cfg(all(feature = "cuda", feature = "model-inference-proof"))]
+#[cfg(test)]
+mod residency_arithmetic_metadata;
+
 /// A **forward-time additive LoRA residual** attached to a [`LinearNoBias`] (sc-18728).
 ///
 /// `scale · ((x·a)·b)` with `a` `[in, rank]` (= `downᵀ`) and `b` `[rank, out]` (= `upᵀ` with

@@ -1,0 +1,315 @@
+{
+  "provenance": {
+    "manifestSha256": "9df0a1203b8a20d87b81888cb4edeaa34537f50c558aba239a79af5b3c443b01",
+    "configSha256": "9208a8892c74a15dcac6828039a528ba13ba2eac0b708ee7d26caef59237ee8d",
+    "scope": "Actual frozen config and safetensors header metadata only; no tensor payload copied",
+    "requestSha256": "b5b5ba095203fab1eddb9ba1793162959328e16ee34a0ca6e19d44e2325bce23"
+  },
+  "config": {
+    "_class_name": "MiniMaxH3Transformer3DModel",
+    "_diffusers_version": "0.36.0.dev0",
+    "num_attention_heads": 56,
+    "attention_head_dim": 128,
+    "hidden_size": 5376,
+    "num_layers": 50,
+    "num_refiner_layers": 2,
+    "ffn_dim": 14336,
+    "in_channels": 24,
+    "audio_in_channels": 32,
+    "patch_size": [
+      1,
+      2,
+      2
+    ],
+    "text_dim": 5120,
+    "freq_dim": 256,
+    "time_embed_hidden_dim": 5376,
+    "time_embed_dim": 2688,
+    "rope_freq_dim": 16,
+    "rope_theta": 10000.0,
+    "norm_eps": 1e-05,
+    "qk_norm_eps": 1e-05,
+    "final_norm_eps": 1e-05,
+    "quantization": {
+      "bits": 4,
+      "group_size": 64
+    }
+  },
+  "selected": {
+    "norm_out.linear.bias": {
+      "dtype": "BF16",
+      "shape": [
+        10752
+      ]
+    },
+    "norm_out.linear.weight": {
+      "dtype": "BF16",
+      "shape": [
+        10752,
+        2688
+      ]
+    },
+    "norm_out.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        5376
+      ]
+    },
+    "time_embedder.linear_1.bias": {
+      "dtype": "F32",
+      "shape": [
+        5376
+      ]
+    },
+    "time_embedder.linear_1.weight": {
+      "dtype": "F32",
+      "shape": [
+        5376,
+        256
+      ]
+    },
+    "time_embedder.linear_2.bias": {
+      "dtype": "F32",
+      "shape": [
+        2688
+      ]
+    },
+    "time_embedder.linear_2.weight": {
+      "dtype": "F32",
+      "shape": [
+        2688,
+        5376
+      ]
+    },
+    "transformer_blocks.0.adaln_proj.linear.bias": {
+      "dtype": "BF16",
+      "shape": [
+        96768
+      ]
+    },
+    "transformer_blocks.0.adaln_proj.linear.biases": {
+      "dtype": "BF16",
+      "shape": [
+        96768,
+        42
+      ]
+    },
+    "transformer_blocks.0.adaln_proj.linear.scales": {
+      "dtype": "BF16",
+      "shape": [
+        96768,
+        42
+      ]
+    },
+    "transformer_blocks.0.adaln_proj.linear.weight": {
+      "dtype": "U32",
+      "shape": [
+        96768,
+        336
+      ]
+    },
+    "transformer_blocks.0.attn.norm_k.weight": {
+      "dtype": "BF16",
+      "shape": [
+        128
+      ]
+    },
+    "transformer_blocks.0.attn.norm_q.weight": {
+      "dtype": "BF16",
+      "shape": [
+        128
+      ]
+    },
+    "transformer_blocks.0.attn.to_k.biases": {
+      "dtype": "BF16",
+      "shape": [
+        7168,
+        84
+      ]
+    },
+    "transformer_blocks.0.attn.to_k.scales": {
+      "dtype": "BF16",
+      "shape": [
+        7168,
+        84
+      ]
+    },
+    "transformer_blocks.0.attn.to_k.weight": {
+      "dtype": "U32",
+      "shape": [
+        7168,
+        672
+      ]
+    },
+    "transformer_blocks.0.attn.to_out.0.biases": {
+      "dtype": "BF16",
+      "shape": [
+        5376,
+        112
+      ]
+    },
+    "transformer_blocks.0.attn.to_out.0.scales": {
+      "dtype": "BF16",
+      "shape": [
+        5376,
+        112
+      ]
+    },
+    "transformer_blocks.0.attn.to_out.0.weight": {
+      "dtype": "U32",
+      "shape": [
+        5376,
+        896
+      ]
+    },
+    "transformer_blocks.0.attn.to_q.biases": {
+      "dtype": "BF16",
+      "shape": [
+        7168,
+        84
+      ]
+    },
+    "transformer_blocks.0.attn.to_q.scales": {
+      "dtype": "BF16",
+      "shape": [
+        7168,
+        84
+      ]
+    },
+    "transformer_blocks.0.attn.to_q.weight": {
+      "dtype": "U32",
+      "shape": [
+        7168,
+        672
+      ]
+    },
+    "transformer_blocks.0.attn.to_v.biases": {
+      "dtype": "BF16",
+      "shape": [
+        7168,
+        84
+      ]
+    },
+    "transformer_blocks.0.attn.to_v.scales": {
+      "dtype": "BF16",
+      "shape": [
+        7168,
+        84
+      ]
+    },
+    "transformer_blocks.0.attn.to_v.weight": {
+      "dtype": "U32",
+      "shape": [
+        7168,
+        672
+      ]
+    },
+    "transformer_blocks.0.ff.net.0.proj.biases": {
+      "dtype": "BF16",
+      "shape": [
+        28672,
+        84
+      ]
+    },
+    "transformer_blocks.0.ff.net.0.proj.scales": {
+      "dtype": "BF16",
+      "shape": [
+        28672,
+        84
+      ]
+    },
+    "transformer_blocks.0.ff.net.0.proj.weight": {
+      "dtype": "U32",
+      "shape": [
+        28672,
+        672
+      ]
+    },
+    "transformer_blocks.0.ff.net.2.biases": {
+      "dtype": "BF16",
+      "shape": [
+        5376,
+        224
+      ]
+    },
+    "transformer_blocks.0.ff.net.2.scales": {
+      "dtype": "BF16",
+      "shape": [
+        5376,
+        224
+      ]
+    },
+    "transformer_blocks.0.ff.net.2.weight": {
+      "dtype": "U32",
+      "shape": [
+        5376,
+        1792
+      ]
+    },
+    "transformer_blocks.0.norm1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        5376
+      ]
+    },
+    "transformer_blocks.0.norm2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        5376
+      ]
+    }
+  },
+  "turboFfn": {
+    "transformer_blocks.0.ff.net.0.proj.lora_A.default.weight": {
+      "dtype": "BF16",
+      "shape": [
+        128,
+        5376
+      ]
+    },
+    "transformer_blocks.0.ff.net.0.proj.lora_B.default.weight": {
+      "dtype": "BF16",
+      "shape": [
+        28672,
+        128
+      ]
+    },
+    "transformer_blocks.0.ff.net.2.lora_A.default.weight": {
+      "dtype": "BF16",
+      "shape": [
+        128,
+        14336
+      ]
+    },
+    "transformer_blocks.0.ff.net.2.lora_B.default.weight": {
+      "dtype": "BF16",
+      "shape": [
+        5376,
+        128
+      ]
+    }
+  },
+  "turboMetadata": {
+    "format": "pt",
+    "floating_dtype": "bfloat16",
+    "alpha": "8"
+  },
+  "geometry": {
+    "frames": 345,
+    "latentHeight": 48,
+    "latentWidth": 84,
+    "textRows": 588,
+    "audioChannels": 2,
+    "latentFrames": 102,
+    "audioLatents": 575,
+    "videoRows": 102816,
+    "audioRows": 1150,
+    "packedRows": 104554
+  },
+  "schedule": {
+    "evaluations": 8,
+    "sigmaPointsIncludingTerminal": 9,
+    "videoShift": 12.0,
+    "audioShift": 3.0
+  }
+}

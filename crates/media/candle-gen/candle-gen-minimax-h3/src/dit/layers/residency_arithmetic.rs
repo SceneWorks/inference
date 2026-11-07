@@ -1,6 +1,7 @@
 //! Ignored actual-source AdaLN/FFN preparation diagnostic. No production math changes.
+use super::residency_arithmetic_metadata as metadata;
 use super::*;
-use crate::denoise::{JointGeometry, JointSchedule, PackedLayout};
+use crate::denoise::PackedLayout;
 use crate::dit::adaln::{AdaLnCache, AdaLnResidency};
 use crate::dit::block::{AdaLnModulation, DitBlock};
 use crate::dit::heads::{AdaLayerNormOut, NormOutModulation, TimestepEmbedder};
@@ -533,6 +534,42 @@ fn verified_fixture() -> Result<FixtureInputs> {
         )?);
     }
     let config_bytes = std::fs::read(&config_path).map_err(error)?;
+    // Validate every selected native key/dtype/shape and actual Turbo FFN
+    // factor header BEFORE any Tensor or model preparation.
+    let mut selected_headers = serde_json::Map::new();
+    for file in &files {
+        for (name, view) in candle_gen::loader::mmap_safetensors(file)?.tensors() {
+            if selected(&name) {
+                assert!(selected_headers
+                    .insert(
+                        name,
+                        json!({"dtype":format!("{:?}",view.dtype()),"shape":view.shape()})
+                    )
+                    .is_none());
+            }
+        }
+    }
+    let turbo_headers = candle_gen::loader::mmap_safetensors(&adapter_path)?
+        .tensors()
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("transformer_blocks.0.ff."))
+        .map(|(name, view)| {
+            (
+                name,
+                json!({"dtype":format!("{:?}",view.dtype()),"shape":view.shape()}),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    metadata::validate(
+        &serde_json::from_slice(&config_bytes).map_err(error)?,
+        &Value::Object(selected_headers),
+        &Value::Object(turbo_headers),
+        &serde_json::to_value(
+            candle_gen::gen_core::weightsmeta::safetensors_file_metadata(&adapter_path)
+                .map_err(error)?,
+        )
+        .map_err(error)?,
+    )?;
     let config = MiniMaxH3DitConfig::from_diffusers_json(
         std::str::from_utf8(&config_bytes).map_err(error)?,
     )?;
@@ -546,6 +583,10 @@ fn verified_fixture() -> Result<FixtureInputs> {
         ),
         (HIDDEN, HEADS, HEAD_DIM, 50, 16)
     );
+    metadata::geometry(&config)?;
+    let schedule = crate::denoise::adaln_schedule(&metadata::schedule()?)?;
+    assert_eq!((schedule.num_steps(), schedule.num_row_classes()), (8, 4));
+    assert_eq!(schedule.num_distinct_timesteps(), 17);
 
     Ok(FixtureInputs {
         directory,
@@ -575,9 +616,7 @@ fn identity(tensor: &Tensor) -> Result<Value> {
 }
 
 fn selected(name: &str) -> bool {
-    name.starts_with("transformer_blocks.0.")
-        || name.starts_with("time_embedder.")
-        || name.starts_with("norm_out.")
+    metadata::selected(name)
 }
 
 fn native_selected(files: &[PathBuf], device: &Device) -> Result<Weights> {
@@ -1039,7 +1078,7 @@ fn nonfinite_paths(value: &Value, path: &str, out: &mut Vec<String>) {
 
 fn packed_layout(cfg: &MiniMaxH3DitConfig, device: &Device) -> Result<PackedLayout> {
     PackedLayout::build(
-        JointGeometry::new(345, 96, 168)?,
+        metadata::geometry(cfg)?,
         cfg.patch_size,
         &vec![crate::denoise::TEXT_TAG; 588],
         2,
@@ -1067,7 +1106,7 @@ fn production_adaln_ffn_preparation_parity() -> Result<()> {
     std::fs::create_dir_all(&output).map_err(error)?;
     assert_eq!(
         (cfg.ffn_dim, cfg.time_embed_dim, cfg.patch_size),
-        (14336, 2688, [1, 4, 4])
+        (14336, 2688, [1, 2, 2])
     );
     let plan = planning(&directory, &cfg, &manifest)?; // Before ANY model/tensor preparation.
     crate::nn::reset_attention_execution_report();
@@ -1098,13 +1137,29 @@ fn production_adaln_ffn_preparation_parity() -> Result<()> {
     let norm = model.projections().norm_out.clone();
     let rope = model.rope().clone();
     drop(model);
-    let schedule = crate::denoise::adaln_schedule(&JointSchedule::new(8)?)?;
+    let schedule = crate::denoise::adaln_schedule(&metadata::schedule()?)?;
     assert_eq!(schedule.num_steps(), 8);
     let device = Device::new_cuda(0)?;
     assert!(candle_gen::candle_core::cuda::proof_pool::snapshot(0)?.is_none());
     let layout = packed_layout(&cfg, &device)?;
     let copied_layout = packed_layout(&cfg, &device)?;
     assert_eq!(layout.seq_len(), ROWS);
+    assert_eq!(
+        (
+            layout.video_indices().len(),
+            layout.audio_indices().len(),
+            layout.text_indices().len()
+        ),
+        (102816, 1150, 588)
+    );
+    assert_eq!(
+        (
+            copied_layout.video_indices().len(),
+            copied_layout.audio_indices().len(),
+            copied_layout.text_indices().len()
+        ),
+        (102816, 1150, 588)
+    );
     let direct32 = with_workspace(&device, Some(BUDGET as usize), || {
         direct_stage(&files, &cfg, &mut host_block, &schedule, &layout, &device)
     })?;
@@ -1187,7 +1242,7 @@ fn production_adaln_ffn_preparation_parity() -> Result<()> {
     let mut nonfinite = Vec::new();
     nonfinite_paths(&observation, "workspaceDefaultVs32", &mut nonfinite);
     let attention = crate::nn::attention_execution_report();
-    let evidence = json!({"kind":"h3-residency-arithmetic/v1","actualF32ReducedPrecision":candle_gen::candle_core::cuda::gemm_reduced_precision_f32(),"manifestSha256":EXPECTED_MANIFEST_SHA256,"acceptedSourcePair":manifest["acceptedSourcePair"],"verifiedAssets":verified,"planning":plan,"input":input_identity,"activationProvenance":"synthetic fixed integer LCG rounded once to BF16; NOT captured render activation","activationRecipe":{"multiplier":1664525,"increment":1013904223,"offset":42,"modulus":65521,"center":32760,"divisor":32768,"rounding":"once to BF16"},"schedule":{"steps":8,"distinctTimesteps":schedule.distinct_timesteps(),"key":schedule.key().to_string()},"dispatch":{"productionResidentElements":BUDGET,"productionWindowElements":BUDGET,"rows":ROWS,"width":28672,"chunkRows":1170,"fullChunks":89,"tailRows":424,"legacyChangedM":"no such actual C4 branch; omitted"},"rootConstruction":{"precomputeOrder":"Resident timeMLP -> AdaLNcache/evict -> norm_out; window timeMLP -> norm_out -> AdaLNwindow; preserved","rawProjectionObservation":"lossless inverse layout of actual six projected modulation tables; no extra AdaLN GEMM","activationObservation":"stateless SiLU/BF16 replay on actual captured temb after production projection, not internal handle","adapterPreparation":"Production read_adapter loads CPU tensors; transpose/alpha-rank fold occur on CPU before destination to_device for Resident as well as streamed LoRA","rotary":"MmRope retains host Vec<f64>; tables compute host f64 from F32 positions then upload independently","timeProject":"timestep_sincos regenerates host F32 frequencies/angles/sin/cos on every forward; no retained device frequency buffer","timeProjectObservation":"independently rebuilt stateless production constructor; internal forward handle not exposed","tables":"independent actual packed-layout construction, not shared deterministic substitutes"},"workspace":{"stream":"same actual stream; SetStream reset between arms","samePolicyBytes":BUDGET,"defaultVersus32":"observational only","proofPoolInstalled":false},"samePolicy":same,"workspaceDefaultVs32":observation,"firstDifference":failed.first(),"differenceOrder":"declared diagnostic semantic boundaries: preparation, root inputs/tables, timestep/AdaLN/norm_out, then sequential FFN projection/activation/output; NOT a captured render divergence","allDifferences":failed,"completed":{"directPrecomputeAndEvictStages":2,"windowPrecomputeStages":1,"additionalAdaLnBoundaryForwards":0,"productionFfnForwards":3,"pairedBoundaryChunks":90,"attentionCalls":attention.flash_calls+attention.materialized_calls},"readback":{"maximumElements":MAX_READBACK_ELEMENTS,"isolatedOffset":0,"actualTypedStorageEqualsChunk":true,"maximumF32TransferBytes":4*MAX_READBACK_ELEMENTS},"exactSamePolicy":failed.is_empty()});
+    let evidence = json!({"kind":"h3-residency-arithmetic/v1","actualF32ReducedPrecision":candle_gen::candle_core::cuda::gemm_reduced_precision_f32(),"manifestSha256":EXPECTED_MANIFEST_SHA256,"acceptedSourcePair":manifest["acceptedSourcePair"],"verifiedAssets":verified,"planning":plan,"input":input_identity,"activationProvenance":"synthetic fixed integer LCG rounded once to BF16; NOT captured render activation","activationRecipe":{"multiplier":1664525,"increment":1013904223,"offset":42,"modulus":65521,"center":32760,"divisor":32768,"rounding":"once to BF16"},"metadataPreflight":serde_json::from_str::<Value>(metadata::FROZEN).map_err(error)?,"schedule":{"steps":8,"distinctTimesteps":schedule.distinct_timesteps(),"key":schedule.key().to_string()},"dispatch":{"productionResidentElements":BUDGET,"productionWindowElements":BUDGET,"rows":ROWS,"width":28672,"chunkRows":1170,"fullChunks":89,"tailRows":424,"legacyChangedM":"no such actual C4 branch; omitted"},"rootConstruction":{"precomputeOrder":"Resident timeMLP -> AdaLNcache/evict -> norm_out; window timeMLP -> norm_out -> AdaLNwindow; preserved","rawProjectionObservation":"lossless inverse layout of actual six projected modulation tables; no extra AdaLN GEMM","activationObservation":"stateless SiLU/BF16 replay on actual captured temb after production projection, not internal handle","adapterPreparation":"Production read_adapter loads CPU tensors; transpose/alpha-rank fold occur on CPU before destination to_device for Resident as well as streamed LoRA","rotary":"MmRope retains host Vec<f64>; tables compute host f64 from F32 positions then upload independently","timeProject":"timestep_sincos regenerates host F32 frequencies/angles/sin/cos on every forward; no retained device frequency buffer","timeProjectObservation":"independently rebuilt stateless production constructor; internal forward handle not exposed","tables":"independent actual packed-layout construction, not shared deterministic substitutes"},"workspace":{"stream":"same actual stream; SetStream reset between arms","samePolicyBytes":BUDGET,"defaultVersus32":"observational only","proofPoolInstalled":false},"samePolicy":same,"workspaceDefaultVs32":observation,"firstDifference":failed.first(),"differenceOrder":"declared diagnostic semantic boundaries: preparation, root inputs/tables, timestep/AdaLN/norm_out, then sequential FFN projection/activation/output; NOT a captured render divergence","allDifferences":failed,"completed":{"directPrecomputeAndEvictStages":2,"windowPrecomputeStages":1,"additionalAdaLnBoundaryForwards":0,"productionFfnForwards":3,"pairedBoundaryChunks":90,"attentionCalls":attention.flash_calls+attention.materialized_calls},"readback":{"maximumElements":MAX_READBACK_ELEMENTS,"isolatedOffset":0,"actualTypedStorageEqualsChunk":true,"maximumF32TransferBytes":4*MAX_READBACK_ELEMENTS},"exactSamePolicy":failed.is_empty()});
     std::fs::write(
         output.join("residency-arithmetic.json"),
         serde_json::to_vec_pretty(&evidence).map_err(error)?,
