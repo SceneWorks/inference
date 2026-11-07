@@ -14,6 +14,8 @@ pub(crate) use execution::active_context;
 pub use execution::begin_request;
 pub use routes::MEMORY_BEHAVIOR;
 #[cfg(all(test, feature = "cuda", feature = "model-inference-proof"))]
+pub(crate) use streaming::proof_dit_inventory;
+#[cfg(all(test, feature = "cuda", feature = "model-inference-proof"))]
 pub(crate) use streaming::proof_text_encoder_inventory;
 pub use streaming::{host_peak_bytes, streaming_host_peak_bytes};
 

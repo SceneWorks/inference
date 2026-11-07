@@ -311202,5 +311202,216 @@
     "optional_environment": [
       "H3_RESIDENCY_TE_MANIFEST"
     ]
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
+    "fqn": "dit::layers::residency_arithmetic::production_adaln_ffn_preparation_parity",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/layers/residency_arithmetic.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cuda",
+    "expected_devices": [
+      "candle-cuda"
+    ],
+    "cargo_features": [
+      "cuda",
+      "flash-attn",
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Frozen actual stock q4 block0 unpruned AdaLN logical[96768,2688], native F32 timestep MLP, BF16 norm_out and actual canonical Turbo FFN factors. Actual eight-step joint schedule. Independent production packed-position rotary construction. FullS104554 BF16 fixed-LCG SYNTHETIC activation, not a captured render. Both actual production budgets32Mi:1170x89+424; no fictitious legacy contrast. Mandatory manifest9df0a1203b8a20d87b81888cb4edeaa34537f50c558aba239a79af5b3c443b01 and accepted CGPU/M4 staging receipt a58d6f7e2d2655a5537b5f7deac02fb95694d5e0a1ec1d47161a14801223d6dd, all16 consumed file hashes before preparation. No attention/Veda/denoise/VAE/fullclip.",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/layers/residency_arithmetic.rs::dit::layers::residency_arithmetic::production_adaln_ffn_preparation_parity",
+    "required_environment": [
+      "MODEL_PROOF_OUTPUT_DIR"
+    ],
+    "external_asset_environment": [
+      "H3_RESIDENCY_ARITHMETIC_MANIFEST"
+    ],
+    "device_witness": "Actual learned CUDA timestep/AdaLN and full-length FFN projections,90 executed spans per original forward and90 paired boundary chunks. One late BODY after serialized every-element metrics, exact same-policy assertions and finite workspace observations.",
+    "output_contract": "Every-element typed BF16/F32 hashes/maxAbs/relativePeak/RMS/nonfinite. Exact same32-policy canonical CPU-prepared/copy versus GPU-direct native preparation/root/modulation/FFN outputs and actual Turbo factor handles. Full production outputs must equal diagnostic operator-sequence boundary traces on all90chunks. Library-default versus32MiB actual timestep/AdaLN/norm_out/FFN is finite-only observation, with no invented tolerance or whole-E5/fit claim. Source-owned checked32GiB GPU/128GiB host planning before model/device; activation readbacks isolated <=1Mi elements.",
+    "configuration_controls": [
+      "SCENEWORKS_CUDA_PROOF_POOL_BYTES"
+    ],
+    "default_configuration": "fixed_cuda",
+    "configuration_kind": "source-controls",
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/layers/residency_arithmetic.rs::dit::layers::residency_arithmetic::production_adaln_ffn_preparation_parity/fixed_cuda",
+        "environment": {
+          "SCENEWORKS_CUDA_PROOF_POOL_BYTES": null
+        },
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "required_cuda_physical_index": 1,
+        "scope": "One real-source arithmetic diagnostic on logicalCUDA0 mapped to explicitly selected physical GPU; no proof-pool auto-binding or production policy mutation.",
+        "required_work": [
+          "Mandatory frozen original config/Turbo/all14shards with actual hashes; original CPU installer is authoritative for residual factors. Native F32 roots never coerced toBF16.",
+          "Actual eight-step JointSchedule/AdaLN schedule, unpruned block0 full logical[96768,2688], direct precompute-and-evict versus actual window modulation/copy/assemble. No curve replacement.",
+          "Exact same32MiB roots/runtime tables/raw AdaLN/modulation/norm_out and fullS104554 FFN direct/copy with actual packed/factor equality; ninety1170/tail424 spans and all raw/activation/output boundaries.",
+          "Source-predeclared librarydefault versus32MiB actual root/precompute/FFN observations, same-stream reset/RAII teardown; no numeric acceptance waiver. Metrics serialize before exact assertions."
+        ]
+      },
+      "fixed_cuda_gpu0": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/layers/residency_arithmetic.rs::dit::layers::residency_arithmetic::production_adaln_ffn_preparation_parity/fixed_cuda_gpu0",
+        "environment": {
+          "SCENEWORKS_CUDA_PROOF_POOL_BYTES": null
+        },
+        "cargo_features": [
+          "cuda",
+          "flash-attn",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "required_cuda_physical_index": 0,
+        "scope": "One real-source arithmetic diagnostic on logicalCUDA0 mapped to explicitly selected physical GPU; no proof-pool auto-binding or production policy mutation.",
+        "required_work": [
+          "Mandatory frozen original config/Turbo/all14shards with actual hashes; original CPU installer is authoritative for residual factors. Native F32 roots never coerced toBF16.",
+          "Actual eight-step JointSchedule/AdaLN schedule, unpruned block0 full logical[96768,2688], direct precompute-and-evict versus actual window modulation/copy/assemble. No curve replacement.",
+          "Exact same32MiB roots/runtime tables/raw AdaLN/modulation/norm_out and fullS104554 FFN direct/copy with actual packed/factor equality; ninety1170/tail424 spans and all raw/activation/output boundaries.",
+          "Source-predeclared librarydefault versus32MiB actual root/precompute/FFN observations, same-stream reset/RAII teardown; no numeric acceptance waiver. Metrics serialize before exact assertions."
+        ]
+      }
+    },
+    "input_contract": {
+      "fixture_kind": "mixed",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/layers/residency_component.rs::dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity",
+      "requirements": [
+        {
+          "slot": "actual-native-filtered-components",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 14,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "actual-stock-configuration",
+          "role": "configuration",
+          "readers": [
+            "candle-gen-minimax-h3::dit::MiniMaxH3Dit::load_from_dir/configuration"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "actual-turbo-loader-binding",
+          "role": "artifact-input",
+          "readers": [
+            "crates/media/candle-gen/candle-gen/src/train/merge.rs::read_adapter_capped::std::fs::read@8751"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "actual-shard-mmaps",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::new"
+          ],
+          "minimum_collections": 14,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "actual-source-header-inventory",
+          "role": "configuration",
+          "readers": [
+            "gen-core::weightsmeta::file_tensor_locations_impl"
+          ],
+          "minimum_collections": 14,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "verified-complete-shards",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen-minimax-h3::residency_arithmetic::verified-shards"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 14,
+          "required_grade": "validated-content",
+          "scope": "case",
+          "expected_sha256": [
+            "6d5ba9b4acfc9246cd1df7b3e157a9b101c4458b7ef788ff0e1ec76321831a71",
+            "95321756ababc90fb758cd39fcd2d0366d326b45022cda5cd310236a3344da9b",
+            "f5e70d6d8bc871455944e8f9da7f4d9dd3a0574b124c39226d153edebb2c0797",
+            "5e16bc143946dd2a3a7d6aac4a3277e9ac34431f149f80aee51e88c8b6df05f0",
+            "601fef51b7e0538a425b441f77c38be8b18952442a19324ce03d0d28574f5c8f",
+            "d12865ea0ffd48cfc7d311f8fa8953ec832daf9048f27b8564f22a691bd2f7ad",
+            "a3d7a8aee94ecdd06bb072b635a7c56b53aba7fbb7dd19a87f0c96dcedf1907f",
+            "62ba99fc9679e154a328aaa6170cf74d0c47bdd12dfe6407a92367feb6d16960",
+            "e3fe77de684132940effbfc2479d6e123e40702606b11637366512b2d0a104f1",
+            "580fe2760e245184c6a14c3f842da4aa8e08be2cad88ad352f5bd17f7b52a374",
+            "186000b10654fdbf6c4edb0bdfa406b1847e5d0bf691879d8fe507fe6a37f2b8",
+            "bce82195aaae6c4984f51f1adf2ab32d81da0f41ec228b014c6327d79a533611",
+            "d15dcbc77a87acf2ee3a140a1b259c0255a99a4cdff544dfcd702f32aee1f5e3",
+            "bbbdefdbafe5feb98d48841f9601772df0e1eeefd0a6d26b2cd4b214de21bd71"
+          ]
+        },
+        {
+          "slot": "verified-stock-configuration",
+          "role": "configuration",
+          "readers": [
+            "candle-gen-minimax-h3::residency_arithmetic::verified-config"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "validated-content",
+          "scope": "case",
+          "expected_sha256": [
+            "9208a8892c74a15dcac6828039a528ba13ba2eac0b708ee7d26caef59237ee8d"
+          ]
+        },
+        {
+          "slot": "actual-canonical-turbo",
+          "role": "artifact-input",
+          "readers": [
+            "candle-gen-minimax-h3::residency_arithmetic::verified-turbo"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "validated-content",
+          "scope": "case",
+          "expected_sha256": [
+            "e16ac20824d6e6649b193806f8fb095639bd9946c97b1bb84b4248eab1cc807f"
+          ]
+        }
+      ]
+    },
+    "output_artifacts": [
+      "residency-arithmetic.json"
+    ],
+    "optional_environment": [
+      "H3_RESIDENCY_ARITHMETIC_MANIFEST"
+    ]
   }
 ]

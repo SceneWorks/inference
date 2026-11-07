@@ -16,6 +16,7 @@ FIXTURE = ROOT / 'scripts/tests/fixtures/h3-residency-c3-input-events.json'
 REGISTRY = ROOT / 'scripts/ci/model-inference-proofs.json'
 C3 = 'dit::layers::residency_component::production_q4_turbo_workspace_and_qk_parity'
 TE = 'text_encoder::encoder::residency_te::production_prompt_resident_window_first_difference'
+AR = 'dit::layers::residency_arithmetic::production_adaln_ffn_preparation_parity'
 
 
 def packets_text(packets):
@@ -47,7 +48,7 @@ class H3VerifiedInputProtocol(unittest.TestCase):
     def setUpClass(cls):
         cls.fixture = json.loads(FIXTURE.read_text(encoding='utf-8'))
         rows = json.loads(REGISTRY.read_text(encoding='utf-8'))
-        cls.rows = {row['fqn']: row for row in rows if row['fqn'] in (C3, TE)}
+        cls.rows = {row['fqn']: row for row in rows if row['fqn'] in (C3, TE, AR)}
 
     def augmented_c3(self):
         events = copy.deepcopy(self.fixture['actualEvents'])
@@ -87,6 +88,25 @@ class H3VerifiedInputProtocol(unittest.TestCase):
                 events.append(simulated_event(TE, reader, requirement['role'], selected, '', weak=True))
         return events
 
+    def simulated_arithmetic(self):
+        # These are SIMULATED branch-shape packets, not new arithmetic runtime
+        # observations or a relabeling of the historical C3 receipt.
+        events = copy.deepcopy(self.fixture['actualEvents'])
+        for event in events:
+            event['scope'] = AR
+        template = next(event for event in events if event['packet']['reader'] == 'candle-gen::Weights::from_files_filtered')
+        events = [event for event in events if event is not template]
+        events.extend(copy.deepcopy(template) for _ in range(4))
+        assets = self.fixture['actualVerifiedAssets']
+        groups = {'verified-shards': [a for a in assets if a['relative'].startswith('q4/transformer/') and a['relative'].endswith('.safetensors')],
+                  'verified-config': [a for a in assets if a['relative'] == 'q4/transformer/config.json'],
+                  'verified-turbo': [a for a in assets if a['relative'].startswith('minimax_h3_fl2v_turbo_8step')]}
+        for requirement in self.rows[AR]['input_contract']['requirements']:
+            if requirement['required_grade'] == 'validated-content':
+                reader = requirement['readers'][0]
+                events.append(simulated_event(AR, reader, requirement['role'], groups[reader.split('::')[-1]], self.fixture['actualFrozenManifestSha256']))
+        return events
+
     def test_actual_c3_remains_failed_under_its_original_content_contract(self):
         self.assertTrue(self.fixture['simulationOnly'])
         self.assertFalse(self.fixture['historicalWorkflowAcceptance'])
@@ -118,15 +138,34 @@ class H3VerifiedInputProtocol(unittest.TestCase):
         self.assertEqual((mmap['minimum_collections'], mmap['minimum_items']), (13, 1))
         self.assertFalse(assessment['checkpoint_byte_integrity_attested'])
 
+    def test_simulated_arithmetic_complete_paths_do_not_falsely_count_repeated_same_path_reads(self):
+        events = self.simulated_arithmetic()
+        assessment = grader.assess_inputs(self.rows[AR], packets_text(events))
+        self.assertEqual(len(assessment['required_input_slots']), 8)
+        self.assertFalse(assessment['checkpoint_byte_integrity_attested'])
+        # The grader deduplicates identical complete path observations. Native
+        # dtype groups and workspace execution belong to the actual BODY, not
+        # an invented claim that four identical path packets are distinct inputs.
+        self.assertEqual(self.rows[AR]['input_contract']['requirements'][0]['minimum_collections'], 1)
+        index = next(i for i, event in enumerate(events) if event['packet']['reader'] == 'candle-gen::Weights::from_files_filtered')
+        grader.assess_inputs(self.rows[AR], packets_text(events[:index] + events[index + 1:]))
+
+    def test_arithmetic_failed_metrics_marker_precedes_assertions_and_success_body(self):
+        source = (ROOT / self.rows[AR]['source']).read_text(encoding='utf-8')
+        marker = source.index('println!("H3_RESIDENCY_ARITHMETIC_DIAGNOSTIC')
+        self.assertLess(source.index('output.join("residency-arithmetic.json")'), marker)
+        self.assertLess(marker, source.index('same-policy arithmetic preparation diverged'))
+        self.assertLess(source.index('workspace observation produced nonfinite values'), source.index('MODEL_INFERENCE_BODY_COMPLETED ' + AR))
+
     def test_simulated_missing_underlying_reader_cannot_be_rescued_by_verified_content(self):
-        for fqn, events in ((C3, self.augmented_c3()), (TE, self.simulated_te())):
+        for fqn, events in ((C3, self.augmented_c3()), (TE, self.simulated_te()), (AR, self.simulated_arithmetic())):
             for reader in {r['readers'][0] for r in self.rows[fqn]['input_contract']['requirements']
                            if r['required_grade'] == 'reader-binding'}:
                 with self.subTest(fqn=fqn, reader=reader), self.assertRaises(ValueError):
                     grader.assess_inputs(self.rows[fqn], packets_text([e for e in events if e['packet']['reader'] != reader]))
 
     def test_simulated_partial_wrong_digest_wrong_reader_or_incomplete_content_refuses(self):
-        for fqn, base in ((C3, self.augmented_c3()), (TE, self.simulated_te())):
+        for fqn, base in ((C3, self.augmented_c3()), (TE, self.simulated_te()), (AR, self.simulated_arithmetic())):
             for index, event in enumerate(base):
                 if event['packet']['items'][0]['provenance']['kind'] != 'validated-content':
                     continue

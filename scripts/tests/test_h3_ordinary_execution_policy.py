@@ -455,6 +455,7 @@ REAL_WEIGHT_MODULES = {
     ("mlx", "veda_ab"),
     ("mlx", "vram_probe"),
     ("candle", "dit::layers::residency_component"),
+    ("candle", "dit::layers::residency_arithmetic"),
     ("candle", "real_weights"),
     ("candle", "ref2va_checkpoint"),
     ("candle", "veda_ab"),

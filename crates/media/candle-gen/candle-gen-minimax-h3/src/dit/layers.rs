@@ -72,6 +72,10 @@ use crate::nn::{rms_weighted, sdpa_planned, silu};
 #[cfg(test)]
 mod residency_component;
 
+#[cfg(all(feature = "cuda", feature = "model-inference-proof"))]
+#[cfg(test)]
+mod residency_arithmetic;
+
 /// A **forward-time additive LoRA residual** attached to a [`LinearNoBias`] (sc-18728).
 ///
 /// `scale · ((x·a)·b)` with `a` `[in, rank]` (= `downᵀ`) and `b` `[rank, out]` (= `upᵀ` with

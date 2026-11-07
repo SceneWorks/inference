@@ -307,6 +307,13 @@ impl MiniMaxH3Dit {
         self.blocks.len()
     }
 
+    /// Read-only diagnostic access to the actual canonically loaded/adapted block.
+    #[cfg(all(feature = "cuda", feature = "model-inference-proof"))]
+    #[cfg(test)]
+    pub(crate) fn proof_block(&self, index: usize) -> Option<&DitBlock> {
+        self.blocks.get(index)
+    }
+
     /// Whether every block still holds its AdaLN projection.
     pub fn holds_adaln(&self) -> bool {
         self.blocks.iter().all(DitBlock::holds_adaln)

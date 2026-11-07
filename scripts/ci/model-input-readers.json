@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_contract_sha256": "54caa23a1f25aa218ccaae8617d8cc4edfd14f53da073c40ff608be57022d1dd",
+  "source_contract_sha256": "d861abb2679c5096cab8e66bdaa8b4579eb2650f03e6965c48f395dc22f30fe0",
   "scope": "Source-declared role/grade registry, Iris source extension and explicit H3 fixture verified-content observers. source_contract_sha256 hashes canonical readers/supporting/source-extension metadata; not runtime evidence.",
   "supporting_not_consumption": [
     "candle-audio-yue2::snapshot::verify_component"
@@ -3935,6 +3935,24 @@
       ]
     },
     "candle-gen-minimax-h3::residency_te::verified-request": {
+      "role": "artifact-input",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_arithmetic::verified-shards": {
+      "role": "model-weights",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_arithmetic::verified-config": {
+      "role": "configuration",
+      "grades": [
+        "validated-content"
+      ]
+    },
+    "candle-gen-minimax-h3::residency_arithmetic::verified-turbo": {
       "role": "artifact-input",
       "grades": [
         "validated-content"
