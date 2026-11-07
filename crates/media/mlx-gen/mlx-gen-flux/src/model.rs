@@ -5,9 +5,9 @@ use mlx_gen::gen_core;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, run_flow_sampler_with_latent_hook, Conditioning, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy,
-    Precision, Progress, Residency, Result, SamplerRun, TimestepConvention, WeightsSource,
+    run_flow_sampler_with_latent_hook, Conditioning, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress,
+    Residency, Result, SamplerRun, TimestepConvention, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_z_image::vae::Vae;
@@ -543,6 +543,22 @@ impl Generator for Flux1 {
             .map_err(Into::into)
     }
 
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
+        Ok(gen_core::GenerationReport::from_output(
+            self.run_with_injector(req, None, &run, on_progress)?,
+        ))
+    }
+
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
         Some(&self.memory_strategy)
     }
@@ -605,6 +621,18 @@ impl Flux1 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        let plan = compile_trajectory(self.variant, req)?;
+        let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
+        self.run_with_injector(req, injector, &run, on_progress)
+    }
+
+    fn run_with_injector(
+        &self,
+        req: &GenerationRequest,
+        injector: Option<&dyn crate::transformer::DitImageInjector>,
+        run: &gen_core::RenderRun<'_, '_>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
         let transformer_window = self.requested_transformer_window(req, injector)?;
         let streamable = transformer_window.is_some();
         let stage_residency = matches!(self.loaded_spec.offload_policy, OffloadPolicy::Sequential);
@@ -618,7 +646,7 @@ impl Flux1 {
             &req.cancel,
             req.use_pid,
             on_progress,
-            |text: &FluxTextOwned| text.encode(&req.prompt),
+            |text: &FluxTextOwned| run.encode(|| text.encode(&req.prompt)),
             // Materialize the embeds while the encoders are still alive (Sequential only) — MLX is lazy,
             // so an un-evaluated embed keeps the encoders referenced and the drop would free nothing.
             |encoded| {
@@ -647,6 +675,7 @@ impl Flux1 {
                     mlx_gen::attention::AttentionPlan::UNBOUNDED
                 };
                 self.run_denoise_with(
+                    run,
                     req,
                     &heavy.vae,
                     heavy.pid.as_ref(),
@@ -689,6 +718,8 @@ impl Flux1 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        let plan = compile_trajectory(self.variant, req)?;
+        let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
         let transformer_window = self.requested_transformer_window(req, Some(pos_injector))?;
         let streamable = transformer_window.is_some();
         // Staged residency lifecycle (sc-10840): the phase-A encode covers BOTH the positive and
@@ -700,9 +731,11 @@ impl Flux1 {
             req.use_pid,
             on_progress,
             |text: &FluxTextOwned| {
-                let (pos_embeds, pos_pooled) = text.encode(&req.prompt)?;
-                let (neg_embeds, neg_pooled) = text.encode(neg_prompt)?;
-                Ok((pos_embeds, pos_pooled, neg_embeds, neg_pooled))
+                run.encode(|| {
+                    let (pos_embeds, pos_pooled) = text.encode(&req.prompt)?;
+                    let (neg_embeds, neg_pooled) = text.encode(neg_prompt)?;
+                    Ok((pos_embeds, pos_pooled, neg_embeds, neg_pooled))
+                })
             },
             |encoded| {
                 let Some((pos_embeds, pos_pooled, neg_embeds, neg_pooled)) = encoded else {
@@ -728,6 +761,7 @@ impl Flux1 {
                     mlx_gen::attention::AttentionPlan::UNBOUNDED
                 };
                 self.run_denoise_with(
+                    &run,
                     req,
                     &heavy.vae,
                     heavy.pid.as_ref(),
@@ -784,63 +818,22 @@ impl Flux1 {
     /// render closure passes either the warm-resident bundle or the just-loaded `Sequential` one
     /// (sc-10840). `validate` is done by the public callers before the residency seam runs, so it is
     /// not re-checked here.
+    #[allow(clippy::too_many_arguments)]
     fn run_denoise_with(
         &self,
+        run: &gen_core::RenderRun<'_, '_>,
         req: &GenerationRequest,
         vae: &Vae,
         pid: Option<&PidEngine>,
         on_progress: &mut dyn FnMut(Progress),
         mut velocity_fn: impl FnMut(&Array, usize, f32, f32) -> Result<Array>,
     ) -> Result<GenerationOutput> {
-        let base_seed = req.seed.unwrap_or_else(default_seed);
-        // Sampler selection (sc-2908). FLUX is flow-match: the base render and the few-step `hyper`
-        // profile share the SAME flow-match schedule (mflux's `LinearScheduler`) — `hyper` only
-        // changes the default step count + guidance (the acceleration is a distilled LoRA the caller
-        // loads at `scale≈0.125` via `spec.adapters`, not a different scheduler). An unset sampler is
-        // the base flow-match path; `validate_request` rejects any name not in the descriptor.
-        let sampler_name = req.sampler.as_deref().unwrap_or(DEFAULT_SAMPLER);
-        let (def_steps, def_guidance) = profile_defaults(self.variant, sampler_name);
-        let steps = req.steps.unwrap_or(def_steps) as usize;
-        let guidance = if self.variant.supports_guidance() {
-            req.guidance.unwrap_or(def_guidance)
-        } else {
-            0.0
-        };
-        // The FLUX diffusion path is MIXED precision, matching the mflux reference (sc-2787): the
-        // latents (`create_noise` → f32) and the main residual stream stay f32; only the CLIP pooled
-        // embedding + the time/text/guidance conditioning run bf16 (in the encoders / `TimeTextEmbed`).
-        // So latents are NOT cast to bf16 — that would diverge from the fork.
-        // Native `LinearScheduler` schedule is the byte-exact default (epic 7114 N1); a curated
-        // `req.scheduler` re-shapes σ over FLUX.1's own resolution-dependent mu (schnell: unshifted).
-        let sigmas = build_sigmas_with(
-            steps,
-            req.width,
-            req.height,
-            self.variant.requires_sigma_shift(),
-            req.scheduler.as_deref(),
-        )?;
-        let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
-            req.scheduler.as_deref(),
-            req.scheduler_shift,
-            crate::pipeline::linear_sigma_mu(
-                req.width,
-                req.height,
-                self.variant.requires_sigma_shift(),
-            ),
-            steps,
-            &sigmas,
-        )?;
-        // PiD decode overlay (epic 7840, sc-7846) + `from_ldm` early-stop (sc-8048): when `use_pid` is
-        // set AND a PiD overlay was loaded, decode (and 4× super-resolve) the latent through PiD instead
-        // of the native VAE; errors loudly if `use_pid` was requested without a loaded overlay (no
-        // silent VAE fallback). `None` → the native VAE, the byte-exact default. When `pid_capture_sigma`
-        // additionally asks for an early exit on this flow-match schedule (flux is `vp_frame=false`, so
-        // the schedule σ *is* the degrade σ), stop the denoise at the achieved-σ step and hand PiD the
-        // partially-denoised x_k; otherwise the clean σ=0 full-denoise path (`capture_sigma = 0`, full
-        // schedule). One decoder is shared across the `count` loop (same prompt → same caption embeds);
-        // per-image variation comes from the per-seed denoised latent. (flux is txt2img here — no
-        // img2img blend in this path — so `start_step = 0`.)
-        let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+        let plan = run.plan();
+        let base_seed = plan.base_seed();
+        let capture_sigma = plan.capture_sigma();
+        let sampler_name = plan.sampler();
+        let guidance = plan.guidance();
+        let sigmas = plan.sigmas();
         let pid_decoder =
             resolve_pid_decoder_at_sigma(pid, req, base_seed, self.descriptor.id, capture_sigma)?;
         // Native VAE tiling is a clean-base mechanism. PiD keeps its own checked decode route and
@@ -851,7 +844,7 @@ impl Flux1 {
             }
             _ => None,
         };
-        let denoise_sigmas = &sigmas[..keep];
+        let denoise_sigmas = plan.denoise_sigmas();
         // Route the flow-match denoise through the unified curated-sampler framework (epic 7114 P3):
         // the default `flow_match` / `hyper` profile maps to Euler (the legacy `x + v·Δσ` step, within
         // the N1 parity tolerance), and the curated menu (heun / dpmpp_2m / uni_pc / …) becomes
@@ -861,69 +854,145 @@ impl Flux1 {
         // render by the RAII guard (F-007): the render thread's prior setting is restored on drop.
         let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
-            let seed = base_seed.wrapping_add(i as u64);
-            let latents = create_noise(seed, req.width, req.height)?;
-            // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress are handled inside
-            // `run_flow_sampler`.
-            let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
-            let final_latents = run_flow_sampler_with_latent_hook(
-                SamplerRun {
-                    sampler_name: Some(sampler_name),
-                    sigmas: denoise_sigmas,
-                    seed,
-                    cancel: &req.cancel,
-                    on_progress,
-                },
-                TimestepConvention::Sigma,
-                latents,
-                |latents, sigma| {
-                    crate::preview::emit_preview(
-                        &req.preview,
-                        &previews,
-                        denoise_sigmas,
-                        sigma,
-                        latents,
-                        req.width,
-                        req.height,
-                    );
-                },
-                |x_in, timestep| {
-                    // The curated samplers expose no step index, but the CFG-scheduling consumers
-                    // (`timestep_to_start_cfg`) need one — derive it as the count of schedule nodes
-                    // already descended past (exact for the single-eval default sampler).
-                    let step_idx = sigmas.iter().filter(|&&s| s > timestep).count();
-                    velocity_fn(x_in, step_idx, timestep, guidance)
-                },
-            )?;
-            on_progress(Progress::Decoding);
-            let unpacked = unpack_latents(&final_latents, req.width, req.height)?;
-            let decoded = decode_latents_via_seam(
-                vae,
-                pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
-                self.descriptor.denoiser_output_latent_space,
-                &unpacked,
-                native_tiling.as_ref(),
-                &req.cancel,
-            )?;
-            // A fault probe must observe the selected lazy decode before returning its synthetic
-            // error. Normal untiled requests retain their historical materialization path.
-            if req.memory.is_some_and(|memory| {
-                memory.calibration_fault_harness_authorized
-                    && memory.calibration_error_phase == Some(gen_core::MemoryPhase::Decode)
-            }) {
-                decoded.eval()?;
-            }
-            crate::memory_strategy::calibration_fault(
-                req,
-                gen_core::MemoryPhase::Decode,
-                self.descriptor.id,
-            )?;
-            images.push(decoded_to_image(&decoded)?);
-        }
+        let images = run.images(
+            on_progress,
+            |seed| create_noise(seed, req.width, req.height),
+            |seed, latents, on_progress| {
+                // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress are handled inside
+                // `run_flow_sampler`.
+                let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
+                run_flow_sampler_with_latent_hook(
+                    SamplerRun {
+                        sampler_name: Some(sampler_name),
+                        sigmas: denoise_sigmas,
+                        seed,
+                        cancel: &req.cancel,
+                        on_progress,
+                    },
+                    TimestepConvention::Sigma,
+                    latents,
+                    |latents, sigma| {
+                        crate::preview::emit_preview(
+                            &req.preview,
+                            &previews,
+                            denoise_sigmas,
+                            sigma,
+                            latents,
+                            req.width,
+                            req.height,
+                        );
+                    },
+                    |x_in, timestep| {
+                        // The curated samplers expose no step index, but the CFG-scheduling consumers
+                        // (`timestep_to_start_cfg`) need one — derive it as the count of schedule nodes
+                        // already descended past (exact for the single-eval default sampler).
+                        let step_idx = sigmas.iter().filter(|&&s| s > timestep).count();
+                        velocity_fn(x_in, step_idx, timestep, guidance)
+                    },
+                )
+            },
+            |_, final_latents, on_progress| {
+                on_progress(Progress::Decoding);
+                let unpacked = unpack_latents(&final_latents, req.width, req.height)?;
+                let decoded = decode_latents_via_seam(
+                    vae,
+                    pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
+                    self.descriptor.denoiser_output_latent_space,
+                    &unpacked,
+                    native_tiling.as_ref(),
+                    &req.cancel,
+                )?;
+                // A fault probe must observe the selected lazy decode before returning its synthetic
+                // error. Normal untiled requests retain their historical materialization path.
+                if req.memory.is_some_and(|memory| {
+                    memory.calibration_fault_harness_authorized
+                        && memory.calibration_error_phase == Some(gen_core::MemoryPhase::Decode)
+                }) {
+                    decoded.eval()?;
+                }
+                crate::memory_strategy::calibration_fault(
+                    req,
+                    gen_core::MemoryPhase::Decode,
+                    self.descriptor.id,
+                )?;
+                decoded_to_image(&decoded)
+            },
+        )?;
         Ok(GenerationOutput::Images(images))
     }
+}
+
+/// Freeze the provider-native schedule before any encoder, transformer or VAE moves.
+fn compile_trajectory(
+    variant: FluxVariant,
+    req: &GenerationRequest,
+) -> Result<gen_core::RenderPlan> {
+    let sampler_name = req.sampler.as_deref().unwrap_or(DEFAULT_SAMPLER);
+    let (def_steps, def_guidance) = profile_defaults(variant, sampler_name);
+    let steps = req.steps.unwrap_or(def_steps) as usize;
+    let guidance = if variant.supports_guidance() {
+        req.guidance.unwrap_or(def_guidance)
+    } else {
+        0.0
+    };
+    // The FLUX diffusion path is MIXED precision, matching the mflux reference (sc-2787): the
+    // latents (`create_noise` → f32) and the main residual stream stay f32; only the CLIP pooled
+    // embedding + the time/text/guidance conditioning run bf16 (in the encoders / `TimeTextEmbed`).
+    // So latents are NOT cast to bf16 — that would diverge from the fork.
+    // Native `LinearScheduler` schedule is the byte-exact default (epic 7114 N1); a curated
+    // `req.scheduler` re-shapes σ over FLUX.1's own resolution-dependent mu (schnell: unshifted).
+    let sigmas = build_sigmas_with(
+        steps,
+        req.width,
+        req.height,
+        variant.requires_sigma_shift(),
+        req.scheduler.as_deref(),
+    )?;
+    let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        crate::pipeline::linear_sigma_mu(req.width, req.height, variant.requires_sigma_shift()),
+        steps,
+        &sigmas,
+    )?;
+    let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+    Ok(gen_core::RenderPlan::packed_image_trajectory(
+        &descriptor_for(variant),
+        req,
+        sampler_name,
+        guidance,
+        sigmas,
+        keep - 1,
+        capture_sigma,
+    )?)
+}
+
+pub(crate) fn compile_base(
+    variant: FluxVariant,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    validate_request(&descriptor_for(variant), req)?;
+    resolve_root(variant, spec)?;
+    if single_reference(req)?.is_some() {
+        if spec.ip_adapter.is_none() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{}: reference image needs an IP-adapter",
+                variant.id()
+            )));
+        }
+        return Ok(None);
+    }
+    if req.cancel.is_cancelled() {
+        return Err(gen_core::Error::Canceled);
+    }
+    if req.use_pid && spec.pid.is_none() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: PiD decode needs a loaded overlay",
+            variant.id()
+        )));
+    }
+    Ok(Some(compile_trajectory(variant, req)?))
 }
 
 /// Decode the final unpacked FLUX latent through the native VAE or a request-selected PiD
@@ -1502,6 +1571,35 @@ mod tests {
         assert!(
             matches!(model.validate(&req), Err(gen_core::Error::Unsupported(message)) if message.contains("cannot be combined"))
         );
+    }
+
+    #[test]
+    fn pre_load_plan_refuses_invalid_inputs_without_opening_any_weights() {
+        let registry = crate::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/missing/flux".into()));
+        let mut req = GenerationRequest {
+            prompt: "base".into(),
+            width: 321,
+            ..Default::default()
+        };
+        for variant in [FluxVariant::Dev, FluxVariant::Schnell] {
+            let error = registry
+                .compile_render_plan(variant.id(), &spec, &req)
+                .unwrap_err();
+            assert!(error.to_string().contains("multiples of 16"), "{error}");
+        }
+        req.width = 512;
+        req.conditioning = vec![reference(Some(0.5))];
+        let error = registry
+            .compile_render_plan(FluxVariant::Dev.id(), &spec, &req)
+            .unwrap_err();
+        assert!(error.to_string().contains("IP-adapter"), "{error}");
+        // The shipped MLX XLabs entry remains outside the base plan.
+        let spec = spec.with_ip_adapter(WeightsSource::Dir("/missing/ip".into()));
+        assert!(registry
+            .compile_render_plan(FluxVariant::Dev.id(), &spec, &req)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

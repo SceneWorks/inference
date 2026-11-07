@@ -41,7 +41,7 @@ pub const KREA_CONVROT_DIT_COMPONENT: &str = "krea_convrot_dit";
 /// entry — before calling `load`, and a missing component is a load-time contract error
 /// ([`crate::control::require_component`]), never a mid-render fetch. (The previously-reserved
 /// sc-2340 hub-fetch direction is permanently rejected.)
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum WeightsSource {
     /// A directory of (possibly sharded) `.safetensors`.
     Dir(PathBuf),

@@ -65,6 +65,8 @@ struct ImageInputs {
     height: u32,
     count: u32,
     requested_seed: Option<u64>,
+    frames: u32,
+    references: u32,
     steps: Option<u32>,
     sampler: Option<String>,
     scheduler: Option<String>,
@@ -83,6 +85,8 @@ impl From<&GenerationRequest> for ImageInputs {
             height: req.height,
             count: req.count,
             requested_seed: req.seed,
+            frames: req.frames.unwrap_or(1),
+            references: req.memory_reference_count(),
             steps: req.steps,
             sampler: req.sampler.clone(),
             scheduler: req.scheduler.clone(),
@@ -94,6 +98,51 @@ impl From<&GenerationRequest> for ImageInputs {
     }
 }
 
+/// Dependencies of base FLUX preparation at load. The cache/loader independently enforces
+/// its prepared source pins and admitted offload policy. Neither pins nor tensors are cloned.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RenderLoadBinding {
+    weights: crate::WeightsSource,
+    resolved_route: Option<String>,
+    quant: Option<crate::Quant>,
+    precision: crate::Precision,
+    adapters: Vec<crate::AdapterSpec>,
+    ip_adapter: Option<crate::WeightsSource>,
+    pid: Option<crate::PidWeights>,
+}
+
+impl RenderLoadBinding {
+    pub fn from_spec(spec: &LoadSpec) -> Self {
+        Self {
+            weights: spec.weights.clone(),
+            resolved_route: spec.resolved_route.clone(),
+            quant: spec.quantize,
+            precision: spec.precision,
+            adapters: spec.adapters.clone(),
+            ip_adapter: spec.ip_adapter.clone(),
+            pid: spec.pid.clone(),
+        }
+    }
+}
+
+/// Count and seed order belong to the plan. Each image gets its own preview sequence
+/// and is decoded before the next image's initial noise is drawn.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+enum CountPlan {
+    SequentialWrappingSeeds { count: u32, base_seed: u64 },
+}
+
+impl CountPlan {
+    fn seeds(&self) -> impl Iterator<Item = u64> {
+        let Self::SequentialWrappingSeeds { count, base_seed } = *self;
+        (0..count).map(move |index| base_seed.wrapping_add(u64::from(index)))
+    }
+
+    fn base_seed(&self) -> u64 {
+        let Self::SequentialWrappingSeeds { base_seed, .. } = *self;
+        base_seed
+    }
+}
 /// Complete resolved base image pass. Tensor operations, callbacks and mutable trajectory
 /// state stay with the executor. Only the plan can travel across the caller/owner boundary.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -101,7 +150,8 @@ pub struct RenderPlan {
     backend: String,
     provider: String,
     inputs: ImageInputs,
-    base_seed: u64,
+    preparation: Option<RenderLoadBinding>,
+    count: CountPlan,
     pass: ImagePass,
 }
 
@@ -172,7 +222,11 @@ impl RenderPlan {
             backend: descriptor.backend.to_owned(),
             provider: descriptor.id.to_owned(),
             inputs: ImageInputs::from(req),
-            base_seed: req.seed.unwrap_or_else(default_seed),
+            preparation: None,
+            count: CountPlan::SequentialWrappingSeeds {
+                count: req.count,
+                base_seed: req.seed.unwrap_or_else(default_seed),
+            },
             pass: ImagePass {
                 stages: [
                     Stage::PromptPrep,
@@ -224,8 +278,26 @@ impl RenderPlan {
         }
         Ok(())
     }
+    pub(crate) fn bind_load(mut self, spec: &LoadSpec) -> Self {
+        self.preparation = Some(RenderLoadBinding::from_spec(spec));
+        self
+    }
+
+    pub fn check_load(&self, loaded: &RenderLoadBinding) -> Result<()> {
+        if self
+            .preparation
+            .as_ref()
+            .is_some_and(|expected| expected != loaded)
+        {
+            return Err(Error::Unsupported(
+                "render plan belongs to a different model or adapter stack".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn base_seed(&self) -> u64 {
-        self.base_seed
+        self.count.base_seed()
     }
     pub fn guidance(&self) -> f32 {
         self.pass.phase.guidance
@@ -242,6 +314,16 @@ impl RenderPlan {
     pub fn denoise_sigmas(&self) -> &[f32] {
         &self.pass.sigmas[self.pass.phase.first_step..=self.pass.phase.end_step]
     }
+}
+
+/// Physical geometry of the stage about to operate under the request's already selected
+/// memory rung. Sequential images process one trajectory at a time, including when the
+/// admission reservation covers the whole count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderPhaseIdentity {
+    pub pass: usize,
+    pub phase: usize,
+    pub geometry: crate::MemoryGeometry,
 }
 
 /// Owner-local state for an invocation. A provider's existing residency driver temporarily
@@ -275,7 +357,19 @@ impl<'p, 's> RenderRun<'p, 's> {
             return Err(Error::Canceled.into());
         }
         if let Some(scope) = self.scope.borrow_mut().as_deref_mut() {
-            scope.enter_phase(phase)?;
+            let stream = &self.plan.pass.phase.stream;
+            let identity = RenderPhaseIdentity {
+                pass: 0,
+                phase: 0,
+                geometry: crate::MemoryGeometry {
+                    width: stream.width,
+                    height: stream.height,
+                    batch: 1,
+                    frames: self.plan.inputs.frames,
+                    reference_count: self.plan.inputs.references,
+                },
+            };
+            scope.enter_render_phase(phase, &identity)?;
         }
         // A failed stage leaves teardown to the scope's owner, preserving the original error.
         let result = body()?;
@@ -304,8 +398,7 @@ impl<'p, 's> RenderRun<'p, 's> {
         mut decode: impl FnMut(u64, D, &mut dyn FnMut(Progress)) -> std::result::Result<O, E>,
     ) -> std::result::Result<Vec<O>, E> {
         let mut images = Vec::with_capacity(self.plan.inputs.count as usize);
-        for index in 0..self.plan.inputs.count {
-            let seed = self.plan.base_seed.wrapping_add(u64::from(index));
+        for seed in self.plan.count.seeds() {
             let denoised = self.phase(MemoryPhase::Denoise, || {
                 denoise(seed, init(seed)?, progress)
             })?;
@@ -314,3 +407,6 @@ impl<'p, 's> RenderRun<'p, 's> {
         Ok(images)
     }
 }
+
+#[cfg(test)]
+mod tests;

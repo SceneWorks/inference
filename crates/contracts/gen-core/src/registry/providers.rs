@@ -72,7 +72,7 @@ impl ProviderRegistry {
             return Ok(None);
         };
         self.ensure_quant_supported(id, spec, "generator")?;
-        (planner.compile)(spec, request)
+        Ok((planner.compile)(spec, request)?.map(|plan| plan.bind_load(spec)))
     }
 
     /// Every validated portable family checkpoint adapter in this platform catalog.
