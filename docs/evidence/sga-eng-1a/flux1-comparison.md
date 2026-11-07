@@ -22,7 +22,7 @@ kite”, 256×256, count one, three Euler outer steps, variant-native scheduler,
 dev guidance 3.5, schnell no guidance, no adapters, reference, memory rung
 or decoder override. Preserve backend-native mixed precision, latent RNG and
 schedule. The CUDA cuBLAS workspace setting is `:4096:8` for both arms. MLX uses
-its unified-memory allocator, Candle its native CUDA allocator. No cross-backend
+its unified-memory allocator and shipping macOS 26.2 NAX deployment floor; Candle uses its native CUDA allocator. No cross-backend
 numerical or memory comparison is performed.
 
 Both executables are built before the first render. Head preflight on both

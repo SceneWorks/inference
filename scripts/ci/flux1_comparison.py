@@ -80,7 +80,8 @@ def build(work, sources, arm, backend, tier, env):
     binary = target / "debug" / ("flux1-pair.exe" if os.name == "nt" else "flux1-pair")
     return binary, {"revision": sha, "tree": git(root, "rev-parse", "HEAD^{tree}"),
                     "overlay_sha256": hashlib.sha256(changes).hexdigest(), "toolchain": tc,
-                    "binary_sha256": fixture.sha(binary), "build_command": cmd}
+                    "binary_sha256": fixture.sha(binary), "build_command": cmd,
+                    "macos_deployment_target": env.get("MACOSX_DEPLOYMENT_TARGET") if backend == "mlx" else None}
 
 
 def snapshots(work, tier):
@@ -162,6 +163,10 @@ def execute(args, contract):
             env = os.environ.copy()
             env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
             env["CARGO_INCREMENTAL"] = "0"
+            if backend == "mlx":
+                # The proof route is the secondary NAX Mac; use the shipping
+                # matrix-unit deployment floor instead of the hosted CI floor.
+                env["MACOSX_DEPLOYMENT_TARGET"] = "26.2"
             if backend == "candle-cuda":
                 env.update(CUDA_VISIBLE_DEVICES=policy.cuda_device_uuid, CUDA_DEVICE_ORDER="PCI_BUS_ID")
             binary, build_info = build(work, sources, arm, backend, tier, env)
