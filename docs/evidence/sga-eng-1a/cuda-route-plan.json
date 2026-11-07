@@ -1,0 +1,52 @@
+{
+  "runner": [
+    "self-hosted",
+    "windows",
+    "cuda",
+    "real-weights"
+  ],
+  "asset_setup": "none",
+  "backend": "candle-cuda",
+  "request": {
+    "selection": "candle-gen-flux/integration/conformance::flux_schnell_conformance",
+    "configuration": "fixed_cuda",
+    "policy": {
+      "schemaVersion": 1,
+      "deadlineSeconds": 1200,
+      "pollMillis": 1000,
+      "termGraceMillis": 5000,
+      "hostFreeReserveBytes": 8589934592,
+      "childFootprintCapBytes": 25769803776,
+      "stdoutCapBytes": 16777216,
+      "stderrCapBytes": 16777216,
+      "eventCapBytes": 16777216,
+      "backend": "windows-cuda",
+      "cudaDeviceUuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+      "gpuFreeReserveBytes": 2147483648,
+      "childGpuCapBytes": 19327352832
+    }
+  },
+  "selected": 1,
+  "bindings": [
+    "candle-gen-flux/integration/conformance::flux_schnell_conformance"
+  ],
+  "configurations": {
+    "candle-gen-flux/integration/conformance::flux_schnell_conformance": {
+      "name": "fixed_cuda",
+      "source_identity": "crates/media/candle-gen/candle-gen-flux/tests/conformance.rs::conformance::flux_schnell_conformance/fixed_cuda",
+      "environment": {},
+      "cargo_features": [
+        "cuda",
+        "model-inference-proof"
+      ],
+      "backend": "candle-cuda",
+      "expected_devices": [
+        "candle-cuda"
+      ],
+      "scope": "whole selected source case",
+      "required_work": [
+        "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+      ]
+    }
+  }
+}

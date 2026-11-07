@@ -1,4 +1,4 @@
-name: iOS simulator SANA runtime boundary
+name: iOS validation
 
 # E8: never called by PR/push CI. The iOS simulator cannot execute MLX Metal inference;
 # this witnesses build/install/launch and an explicit unsupported-runtime response only.
@@ -20,9 +20,14 @@ on:
         type: string
   workflow_dispatch:
     inputs:
+      profile:
+        description: Simulator runtime boundary or build-only physical-iOS catalog size
+        type: choice
+        options: [runtime-boundary, catalog-size]
+        default: runtime-boundary
       simulator:
-        description: Exact iPhone simulator model name available on whichever Mac runner claims the job
-        required: true
+        description: Exact iPhone simulator model for runtime-boundary
+        required: false
         type: string
       snapshot:
         description: Legacy carrier field; ignored by the model-free runtime-boundary check
@@ -39,7 +44,7 @@ permissions:
 jobs:
   runtime-boundary:
     name: Build, install and launch with explicit unsupported MLX runtime
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.profile != 'catalog-size'
     runs-on: [self-hosted, macOS, ARM64, nax]
     timeout-minutes: 240
     env:
@@ -146,4 +151,48 @@ jobs:
         with:
           name: ios-simulator-sana-${{ github.sha }}-${{ github.run_id }}
           path: ${{ runner.temp }}/ios-simulator-sana
+          if-no-files-found: error
+
+  catalog-size:
+    name: Link paired release iOS catalog partitions
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'catalog-size'
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      CARGO_PROFILE_RELEASE_STRIP: none
+      CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP: none
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - name: Validate immutable source
+        shell: bash
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          persist-credentials: false
+      - name: Install target and Metal compiler
+        working-directory: source
+        run: |
+          rustup target add aarch64-apple-ios
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal --version
+      - name: Link both catalog entry points without launching
+        working-directory: source
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ios-catalog-build
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          python3 ../scripts/ios/catalog_size.py "$RUNNER_TEMP/ios-catalog-size.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ios-catalog-size-${{ inputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios-catalog-size.json
           if-no-files-found: error
