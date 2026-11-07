@@ -20,6 +20,7 @@ fn input() -> ConditionalInput {
         prefill_intermediate_width: 12_288,
         prefill_vision_hidden_width: 1024,
         source_patch_size: 8,
+        source_merge_size: 2,
         prefill_attention_heads: 32,
         prefill_kv_heads: 8,
         prefill_head_dim: 128,
@@ -50,6 +51,7 @@ fn ceilings() -> ConditionalCeilings {
         max_prefill_head_dim: 256,
         max_prefill_layers: 64,
         max_prefill_vocab_size: 200_000,
+        max_source_merge_size: 8,
         max_prefill_scratch_bytes: 10_000_000_000,
         max_token_grid: 4096,
         max_new_tokens: 128,
@@ -125,6 +127,7 @@ impl ConditionalExecutor for Mock {
             intermediate_width: 12_288,
             vision_hidden_width: 1024,
             source_patch_size: 8,
+            source_merge_size: 2,
             attention_heads: 32,
             kv_heads: 8,
             head_dim: 128,
@@ -479,4 +482,50 @@ fn short_prefix_prices_mlp_projection_and_kv_geometry() {
     let default = plan();
     let lm_head_upcast = 2 * 151_936u64 * 4096 * 4;
     assert!(default.budget().prefill_scratch_bytes >= lm_head_upcast);
+}
+
+#[test]
+fn text_uncondition_cache_includes_both_image_delimiters() {
+    let mut i = input();
+    i.max_new_tokens = 0;
+    i.prefill_tokens = [1, 3, 2];
+    let mut c = ceilings();
+    c.max_cache_tokens_per_cache = 57;
+    let p = ConditionalPlan::compile(i.clone(), c.clone()).unwrap();
+    assert_eq!(p.budget().image_tokens, 16);
+    assert_eq!(p.budget().cache_token_caps, [52, 57, 2]);
+    c.max_cache_tokens_per_cache = 56;
+    assert!(ConditionalPlan::compile(i, c).is_err());
+}
+
+#[test]
+fn cancellation_from_conditioning_progress_skips_rollout() {
+    let p = plan();
+    let mut mock = Mock::new(vec![segment(0, RolloutStop::End)]);
+    let cancel = mock.cancel.clone();
+    let progress_cancel = cancel.clone();
+    let mut events = Vec::new();
+    let result = run_conditional(&p, p.input(), &cancel, &mut mock, &mut |event| {
+        events.push(event);
+        if event == Progress::ConditioningComplete {
+            progress_cancel.cancel();
+        }
+    });
+    assert!(matches!(result, Err(Error::Canceled)));
+    assert_eq!(events, [Progress::ConditioningComplete]);
+    assert_eq!(mock.calls(), ["prefill"]);
+    assert_eq!(mock.probe.drops.get(), 3);
+}
+
+#[test]
+fn output_cell_must_match_verified_patch_times_merge_without_sources() {
+    let mut i = input();
+    i.cell = 32;
+    assert!(ConditionalPlan::compile(i.clone(), ceilings()).is_err());
+    i.source_merge_size = 4;
+    let p = ConditionalPlan::compile(i, ceilings()).unwrap();
+    let mut mock = Mock::new(vec![segment(0, RolloutStop::End)]);
+    let (result, _) = run(&mut mock, &p);
+    assert!(result.is_err());
+    assert!(mock.calls().is_empty());
 }

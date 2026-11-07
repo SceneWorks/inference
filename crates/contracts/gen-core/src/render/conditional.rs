@@ -83,6 +83,7 @@ pub struct PrefillModelShape {
     pub intermediate_width: u32,
     pub vision_hidden_width: u32,
     pub source_patch_size: u32,
+    pub source_merge_size: u32,
     pub attention_heads: u32,
     pub kv_heads: u32,
     pub head_dim: u32,
@@ -108,6 +109,7 @@ pub struct ConditionalInput {
     pub prefill_intermediate_width: u32,
     pub prefill_vision_hidden_width: u32,
     pub source_patch_size: u32,
+    pub source_merge_size: u32,
     pub prefill_attention_heads: u32,
     pub prefill_kv_heads: u32,
     pub prefill_head_dim: u32,
@@ -138,6 +140,7 @@ pub struct ConditionalCeilings {
     pub max_prefill_head_dim: u32,
     pub max_prefill_layers: u32,
     pub max_prefill_vocab_size: u32,
+    pub max_source_merge_size: u32,
     pub max_prefill_scratch_bytes: u64,
     pub max_token_grid: u64,
     pub max_new_tokens: u32,
@@ -187,7 +190,8 @@ impl ConditionalPlan {
             || input.prefill_intermediate_width == 0
             || input.prefill_vision_hidden_width == 0
             || input.source_patch_size == 0
-            || !input.cell.is_multiple_of(input.source_patch_size)
+            || input.source_merge_size == 0
+            || input.source_patch_size.checked_mul(input.source_merge_size) != Some(input.cell)
             || input.prefill_attention_heads == 0
             || input.prefill_kv_heads == 0
             || input.prefill_head_dim == 0
@@ -214,6 +218,7 @@ impl ConditionalPlan {
             || input.prefill_head_dim > ceilings.max_prefill_head_dim
             || input.prefill_layers > ceilings.max_prefill_layers
             || input.prefill_vocab_size > ceilings.max_prefill_vocab_size
+            || input.source_merge_size > ceilings.max_source_merge_size
             || u32::try_from(input.source_images.len()).map_err(|_| overflow())?
                 != input.input_images
             || input.max_new_tokens > ceilings.max_new_tokens
@@ -352,7 +357,9 @@ impl ConditionalPlan {
         if image_tokens > ceilings.max_token_grid {
             return Err(refused("image token grid exceeds its cap"));
         }
-        let image_block = add(image_tokens, 1)?; // the generated <img> splice and image block
+        // Condition rollout budgets the stop token that opens an image. TU has no rollout:
+        // its cache receives both `<img>` and the generated grid plus `</img>`.
+        let image_block = add(image_tokens, 1)?;
         let future_blocks = mul(u64::from(input.max_images), image_block)?;
         let cond_cap = add(
             add(
@@ -361,7 +368,10 @@ impl ConditionalPlan {
             )?,
             future_blocks,
         )?;
-        let tu_cap = add(u64::from(input.prefill_tokens[1]), future_blocks)?;
+        let tu_cap = add(
+            u64::from(input.prefill_tokens[1]),
+            mul(u64::from(input.max_images), add(image_tokens, 2)?)?,
+        )?;
         let iu_cap = u64::from(input.prefill_tokens[2]); // fixed image-uncondition prefix
         let min_cache_token_bytes = mul(
             mul(
@@ -560,6 +570,7 @@ impl ConditionalPlan {
             || self.input.prefill_intermediate_width != actual.intermediate_width
             || self.input.prefill_vision_hidden_width != actual.vision_hidden_width
             || self.input.source_patch_size != actual.source_patch_size
+            || self.input.source_merge_size != actual.source_merge_size
             || self.input.prefill_attention_heads != actual.attention_heads
             || self.input.prefill_kv_heads != actual.kv_heads
             || self.input.prefill_head_dim != actual.head_dim
@@ -922,6 +933,9 @@ pub fn run_conditional<E: ConditionalExecutor>(
         }
         let granted = guard.begin_rollout()?;
         progress(Progress::ConditioningComplete);
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let segment = executor.rollout(&mut context, &mut caches, granted)?;
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
