@@ -775,7 +775,9 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         let heavy = match (self.loaders.load_heavy)(use_pid, streamable, Some(cancel)) {
             Ok(heavy) => heavy,
             Err(error) => {
-                if !R::is_process_poisoned(&error) {
+                if R::is_process_poisoned(&error) {
+                    std::mem::forget(encoded);
+                } else {
                     R::after_component_drop();
                 }
                 return Err(error);
@@ -898,7 +900,9 @@ where
     let heavy = match load_heavy() {
         Ok(heavy) => heavy,
         Err(error) => {
-            if !R::is_process_poisoned(&error) {
+            if R::is_process_poisoned(&error) {
+                std::mem::forget(encoded);
+            } else {
                 R::after_component_drop();
             }
             return Err(error);
@@ -965,6 +969,13 @@ mod tests {
         }
     }
 
+    struct EncodedDrop(Arc<AtomicUsize>);
+    impl Drop for EncodedDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     #[test]
     fn typed_poison_skips_component_drop_and_cleanup_at_each_two_phase_fault() {
         for fault in ["encode", "load-heavy", "render"] {
@@ -972,6 +983,8 @@ mod tests {
             let log = Arc::new(Mutex::new(Vec::new()));
             let text_log = Arc::clone(&log);
             let heavy_log = Arc::clone(&log);
+            let encoded_drops = Arc::new(AtomicUsize::new(0));
+            let encoded_drops_for_encode = Arc::clone(&encoded_drops);
             let materialize_calls = AtomicUsize::new(0);
             let result: Result<(), Error> = run_two_phase::<PoisonRuntime, _, _, _, _>(
                 &CancelFlag::new(),
@@ -986,7 +999,7 @@ mod tests {
                     if fault == "encode" {
                         Err(Error::ProcessPoisoned(fault.into()))
                     } else {
-                        Ok(())
+                        Ok((fault == "load-heavy").then(|| EncodedDrop(encoded_drops_for_encode)))
                     }
                 },
                 |_| {
@@ -1024,6 +1037,7 @@ mod tests {
                 usize::from(fault != "encode"),
                 "fault={fault}"
             );
+            assert_eq!(encoded_drops.load(Ordering::SeqCst), 0, "fault={fault}");
         }
     }
 
@@ -1095,11 +1109,13 @@ mod tests {
 
     #[test]
     fn typed_poison_skips_three_phase_fences_and_owned_component_drops() {
-        for fault in ["encode", "denoise", "decode"] {
+        for fault in ["encode", "load-heavy", "denoise", "decode"] {
             THREE_POISON_CLEANUPS.store(0, Ordering::SeqCst);
             let log = Arc::new(Mutex::new(Vec::new()));
             let text_log = Arc::clone(&log);
             let heavy_log = Arc::clone(&log);
+            let encoded_drops = Arc::new(AtomicUsize::new(0));
+            let encoded_drops_for_encode = Arc::clone(&encoded_drops);
             let owner = Residency::<Witness, ThreeWitness, ThreePoisonRuntime>::request_scoped(
                 move |_| {
                     Ok(Witness {
@@ -1108,16 +1124,20 @@ mod tests {
                     })
                 },
                 move |_, _| {
-                    Ok(ThreeWitness {
-                        dit: Witness {
-                            name: "drop-dit",
-                            log: Arc::clone(&heavy_log),
-                        },
-                        ae: Witness {
-                            name: "drop-ae",
-                            log: Arc::clone(&heavy_log),
-                        },
-                    })
+                    if fault == "load-heavy" {
+                        Err(Error::ProcessPoisoned(fault.into()))
+                    } else {
+                        Ok(ThreeWitness {
+                            dit: Witness {
+                                name: "drop-dit",
+                                log: Arc::clone(&heavy_log),
+                            },
+                            ae: Witness {
+                                name: "drop-ae",
+                                log: Arc::clone(&heavy_log),
+                            },
+                        })
+                    }
                 },
             );
             let result: Result<(), Error> = owner.run_staged_request_scoped_with_prepare(
@@ -1132,14 +1152,14 @@ mod tests {
                     if fault == "encode" {
                         Err(Error::ProcessPoisoned(fault.into()))
                     } else {
-                        Ok(())
+                        Ok((fault == "load-heavy").then(|| EncodedDrop(encoded_drops_for_encode)))
                     }
                 },
                 |_| {
                     log.lock().unwrap().push("encoded-fence");
                     Ok(())
                 },
-                |_, (), _| {
+                |_, _, _| {
                     if fault == "denoise" {
                         Err(Error::ProcessPoisoned(fault.into()))
                     } else {
@@ -1155,6 +1175,7 @@ mod tests {
             assert!(matches!(result, Err(Error::ProcessPoisoned(ref detail)) if detail == fault));
             let expected = match fault {
                 "encode" => vec![],
+                "load-heavy" => vec!["encoded-fence", "drop-text"],
                 "denoise" => vec!["encoded-fence", "drop-text"],
                 _ => vec!["encoded-fence", "drop-text", "mid-fence", "drop-dit"],
             };
@@ -1163,11 +1184,12 @@ mod tests {
                 THREE_POISON_CLEANUPS.load(Ordering::SeqCst),
                 match fault {
                     "encode" => 0,
-                    "denoise" => 1,
+                    "load-heavy" | "denoise" => 1,
                     _ => 2,
                 },
                 "fault={fault}"
             );
+            assert_eq!(encoded_drops.load(Ordering::SeqCst), 0, "fault={fault}");
         }
     }
     fn prepared_three_owner(
