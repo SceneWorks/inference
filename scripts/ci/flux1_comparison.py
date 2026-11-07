@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from scripts.ci import model_inference_proofs as proof
 from scripts.ci.flux1_pair import evidence, fixture, overlay
+from scripts.ci.flux1_pair.cuda_probe import PairCudaProbe
 from scripts.ci.model_proof_resources import CudaClaimRejected, CudaReleaseRejected, execution_claim
 from scripts.media_campaign_supervisor import SupervisionError, load_policy, run_guarded
 
@@ -125,7 +126,11 @@ def retain_logs(work, artifact, receipt):
     records = receipt["logs"]
     errors = []
     for phase in PHASES:
-        for suffix, cap in retained_log_limits(receipt["request"]["policy"]).items():
+        limits = retained_log_limits(receipt["request"]["policy"])
+        if (receipt["request"]["policy"]["backend"] == "windows-cuda"
+                and not phase.startswith("preflight-")):
+            limits["cuda-pool.json"] = 4096
+        for suffix, cap in limits.items():
             source = work / phase / suffix
             name = phase + "." + suffix
             try:
@@ -154,7 +159,9 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False, la
         guard = run_guarded([str(binary), *(["--preflight"] if preflight else [])],
                             cwd=arm_root, env=dict(env, PAIR_OUT=str(out)), policy=policy,
                             stdout_path=out / "stdout.log", stderr_path=stderr_path,
-                            event_path=out / "guard.jsonl", pass_fds=fds, require_gpu_sample=not preflight)
+                            event_path=out / "guard.jsonl", pass_fds=fds, require_gpu_sample=not preflight,
+                            probe=PairCudaProbe(policy, out / "cuda-pool.json")
+                            if policy is not None and policy.backend == "windows-cuda" and os.name == "nt" and not preflight else None)
     except SupervisionError as error:
         proof.write_json(out / "supervisor.json", {
             "reason": error.reason, "detail": error.detail, "pid": error.pid, "admission": error.admission,
@@ -365,6 +372,9 @@ def verify(args, contract):
     allowed = {"receipt.json"}
     limits = {phase + "." + suffix: cap for phase in PHASES
               for suffix, cap in retained_log_limits(contract["request"]["policy"]).items()}
+    if contract["request"]["policy"]["backend"] == "windows-cuda":
+        limits.update({phase + ".cuda-pool.json": 4096 for phase in PHASES
+                       if not phase.startswith("preflight-")})
     for name, item in r["logs"].items():
         if name not in limits or item["path"] != name:
             raise ValueError("unexpected comparison log identity")
@@ -378,6 +388,9 @@ def verify(args, contract):
     # The actual supervisor result is captured for every completed child.
     required = {phase + "." + suffix for phase in PHASES
                 for suffix in ("stdout.log", "stderr.log", "supervisor.json")}
+    if contract["request"]["policy"]["backend"] == "windows-cuda":
+        required.update(phase + ".cuda-pool.json" for phase in PHASES
+                        if not phase.startswith("preflight-"))
     if r["accepted"] and (r.get("log_errors") or not required <= r["logs"].keys()):
         raise ValueError("accepted comparison lacks complete verified child logs")
     for arm in evidence.ARMS:

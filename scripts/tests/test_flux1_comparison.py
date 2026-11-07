@@ -128,6 +128,9 @@ class FluxPairTests(unittest.TestCase):
                             lines.append(f"FLUX1_PAIR_STATE {bits} BF16 candle-cuda")
                         lines.append("FLUX1_PAIR_COMPLETE " + model)
                         stdout_path.write_text("\n".join(lines), encoding="utf-8")
+                        comparison.write(out / "cuda-pool.json", {"pid": 1, "cudaDeviceUuid": policy.cuda_device_uuid,
+                                                                  "poolUsedHighBytes": 1, "poolReservedBytes": 1,
+                                                                  "poolReservedHighBytes": 1})
                         if fail:
                             raise comparison.SupervisionError("child-exit", "probe failed")
                         comparison.write(out / "progress.json", [[1, 3], [2, 3], [3, 3]])
@@ -166,6 +169,8 @@ class FluxPairTests(unittest.TestCase):
                 for phase in phase_order:
                     for suffix in ("stdout.log", "stderr.log", "guard.jsonl", "supervisor.json"):
                         self.assertIn(phase + "." + suffix, receipt["logs"])
+                    if not phase.startswith("preflight-"):
+                        self.assertIn(phase + ".cuda-pool.json", receipt["logs"])
                     self.assertEqual((args.output / (phase + ".stderr.log")).read_text(encoding="utf-8"),
                                      "diagnostic [REDACTED]")
                 if fail:

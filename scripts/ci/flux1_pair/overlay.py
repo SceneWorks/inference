@@ -93,10 +93,36 @@ fn pair_write(values: &[f32], sigma: f32, dtype: &str, device: &str) {
     let report = generator.generate_planned(&request, &plan, None, &mut progress)?;
     let output = report.output.ok_or("missing planned output")?;"""
     template = (HERE / "probe.rs.in").read_text(encoding="utf-8")
+    cuda_proof = ""
+    if not mlx:
+        cuda_proof = """let pool = candle_gen::cuda_mempool::MemPool::device_current(0)
+        .ok_or("CUDA current memory pool unavailable")?;
+    let used_high = pool.used_high().ok_or("CUDA pool used high-water unavailable")?;
+    let reserved = pool.reserved().ok_or("CUDA pool reserved bytes unavailable")?;
+    let reserved_high = pool.reserved_high().ok_or("CUDA pool reserved high-water unavailable")?;
+    if used_high == 0 || reserved_high == 0 || reserved_high < reserved {
+        return Err("CUDA pool did not record coherent positive allocation".into());
+    }
+    let uuid = env::var("CUDA_VISIBLE_DEVICES")?;
+    let proof = serde_json::json!({"pid": std::process::id(), "cudaDeviceUuid": uuid,
+        "poolUsedHighBytes": used_high, "poolReservedBytes": reserved,
+        "poolReservedHighBytes": reserved_high});
+    let pending = dir.join("cuda-pool.pending");
+    let final_path = dir.join("cuda-pool.json");
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&pending)?;
+    use std::io::Write;
+    file.write_all(&serde_json::to_vec(&proof)?)?;
+    file.sync_all()?;
+    if final_path.exists() { return Err("CUDA pool proof destination exists".into()); }
+    fs::rename(pending, final_path)?;
+    // The supervisor polls every second. Keep the owned CUDA context alive across ticks.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    drop(generator);"""
     spec = "let spec = spec.with_quant(mlx_gen::gen_core::Quant::Q4);" if mlx and tier == "tier2" else ""
     body = template.replace("@ENGINE@", engine).replace("@PROVIDER@", engine + "_flux")
     destination = root / family / "src/bin/flux1-pair.rs"
     destination.parent.mkdir(exist_ok=True)
     with destination.open("x", encoding="utf-8") as out:
-        out.write(body.replace("@TIER_SPEC@", spec).replace("@GENERATE@", generate))
+        out.write(body.replace("@TIER_SPEC@", spec).replace("@GENERATE@", generate)
+                  .replace("@CUDA_PROOF@", cuda_proof))
     return family.split("/")[-1]
