@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.ci import model_inference_proofs as proof
 from scripts.ci.flux1_pair import evidence, fixture, overlay
 from scripts.ci.model_proof_resources import execution_claim
-from scripts.media_campaign_supervisor import load_policy, run_guarded
+from scripts.media_campaign_supervisor import SupervisionError, load_policy, run_guarded
 
 BASE = overlay.BASE
 TIERS = ("tier1", "tier2")
@@ -109,13 +109,24 @@ def invoke(binary, arm_root, out, env, policy, lease_env, *, preflight=False):
         fd = lease_env["SCENEWORKS_METAL_EXECUTION_LOCK_FD"]
         env["SCENEWORKS_METAL_EXECUTION_LOCK_FD"] = fd
         fds = (int(fd),)
-    guard = run_guarded([str(binary), *(["--preflight"] if preflight else [])],
-                        cwd=arm_root, env=dict(env, PAIR_OUT=str(out)), policy=policy,
-                        stdout_path=out / "stdout.log", stderr_path=out / "stderr.log",
-                        event_path=out / "guard.jsonl", pass_fds=fds, require_gpu_sample=not preflight)
-    if guard.returncode:
-        print((out / "stderr.log").read_text(encoding="utf-8", errors="replace")[-4000:], file=sys.stderr)
-        raise ValueError(f"{out.name} exited {guard.returncode}")
+    stderr_path = out / "stderr.log"
+    try:
+        guard = run_guarded([str(binary), *(["--preflight"] if preflight else [])],
+                            cwd=arm_root, env=dict(env, PAIR_OUT=str(out)), policy=policy,
+                            stdout_path=out / "stdout.log", stderr_path=stderr_path,
+                            event_path=out / "guard.jsonl", pass_fds=fds, require_gpu_sample=not preflight)
+    except SupervisionError:
+        # The supervisor can refuse before spawn. Preserve its reason whether or not
+        # it created a log; a failing child may have filled its entire stderr budget.
+        try:
+            with stderr_path.open("rb") as log:
+                log.seek(max(0, log.seek(0, os.SEEK_END) - 4000))
+                tail = log.read(4000).decode("utf-8", errors="replace")
+        except OSError:
+            tail = ""
+        if tail:
+            print(tail, file=sys.stderr)
+        raise
     return guard, (out / "stdout.log").read_text(encoding="utf-8")
 
 

@@ -1,6 +1,8 @@
 """Portable comparison-harness checks. No model, backend or Cargo executable is run."""
+from contextlib import redirect_stderr
 import copy
 import hashlib
+from io import StringIO
 import json
 from pathlib import Path
 import struct
@@ -48,6 +50,27 @@ class FluxPairTests(unittest.TestCase):
                 comparison.plan("mlx", dict(request, policy=dict(policy, deadlineSeconds=1201)), head, "tier1")
             with self.assertRaises(ValueError):
                 comparison.plan("mlx", request, comparison.BASE, "tier1")
+
+    def test_guard_failure_preserves_reason_and_prints_only_available_stderr_tail(self):
+        for reason, log in [("child-exit", b"not-in-tail" + b"x" * 4000 + b"failure-\xff"),
+                            ("spawn-failure", None)]:
+            with self.subTest(reason=reason), TemporaryDirectory() as tmp:
+                failure = comparison.SupervisionError(reason, "original reason")
+
+                def fail_guard(*args, **kwargs):
+                    if log is not None:
+                        kwargs["stderr_path"].write_bytes(log)
+                    raise failure
+
+                err = StringIO()
+                with patch.object(comparison, "run_guarded", side_effect=fail_guard), redirect_stderr(err):
+                    with self.assertRaises(comparison.SupervisionError) as raised:
+                        comparison.invoke(Path("unused"), Path(tmp), Path(tmp) / "out", {}, None, {})
+                self.assertIs(raised.exception, failure)
+                if log is None:
+                    self.assertEqual(err.getvalue(), "")
+                else:
+                    self.assertEqual(err.getvalue(), log[-4000:].decode("utf-8", errors="replace") + "\n")
 
     def test_compiled_plan_and_observed_trajectory_must_match(self):
         with TemporaryDirectory() as tmp:
