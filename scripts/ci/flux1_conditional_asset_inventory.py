@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import time
 
@@ -18,6 +19,9 @@ sys.path.insert(0, str(ROOT))
 from scripts.ci.flux1_pair.conditional import CASES, require_pid_gemma_footprint
 
 RUNNERS = {"nax-macos-2", "cuda-windows", "cuda-windows-2"}
+LANES = {"nax-macos-2": ["self-hosted", "macOS", "ARM64", "rw-llm"],
+         "cuda-windows": ["self-hosted", "Windows", "X64", "cuda", "real-weights", "cuda-windows"],
+         "cuda-windows-2": ["self-hosted", "Windows", "X64", "cuda", "real-weights", "cuda-windows-2"]}
 MAX_ENTRIES = 250_000
 MAX_CANDIDATES_PER_ROLE = 16
 MAX_GEMMA_FILES = 5_000
@@ -201,17 +205,46 @@ def inventory(hub, runner):
             "roles": roles, "cases": cases}
 
 
+def plan_request(backend, request, expected_sha, tier):
+    if type(request) is not dict or set(request) != {"selection", "runner"} or request["selection"] != "flux1-asset-inventory":
+        raise ValueError("inventory needs exact selection and runner")
+    runner = request["runner"]
+    if runner not in RUNNERS or backend != ("mlx" if runner == "nax-macos-2" else "candle-cuda"):
+        raise ValueError("inventory backend and selected runner differ")
+    if tier != "none":
+        raise ValueError("asset inventory requires flux1_pair=none")
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    if expected_sha != head:
+        raise ValueError("inventory source SHA differs from checked-out branch")
+    return {"runner": LANES[runner], "asset_setup": "flux1-asset-inventory", "selected_runner": runner,
+            "backend": backend, "source_sha": head}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runner", choices=sorted(RUNNERS), required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--plan", action="store_true")
+    parser.add_argument("--backend", choices=("mlx", "candle-cuda"), required=True)
+    parser.add_argument("--request-env", required=True)
+    parser.add_argument("--expected-sha", required=True)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    if os.environ.get("RUNNER_NAME") != args.runner:
+    try:
+        request = json.loads(os.environ[args.request_env])
+        plan = plan_request(args.backend, request, args.expected_sha, os.environ.get("FLUX1_PAIR_TIER", "none"))
+    except (KeyError, ValueError, subprocess.CalledProcessError) as error:
+        parser.error(str(error))
+    if args.plan:
+        print(json.dumps(plan, sort_keys=True))
+        return
+    if args.output is None:
+        parser.error("--output is required for inventory")
+    if os.environ.get("RUNNER_NAME") != plan["selected_runner"]:
         parser.error("selected runner differs from actual runner")
     root = os.environ.get("FLUX1_HUB")
     if not root:
         parser.error("FLUX1_HUB is required")
-    result = inventory(root, args.runner)
+    result = inventory(root, plan["selected_runner"])
+    result["source_sha"] = plan["source_sha"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 

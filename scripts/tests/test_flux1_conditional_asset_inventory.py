@@ -83,6 +83,11 @@ class ConditionalAssetInventory(unittest.TestCase):
             put(directory, shards[1], b"second")
             conditional.require_pid_gemma_footprint(directory, {
                 "config.json", "tokenizer.json", "model.safetensors.index.json", *shards})
+            put(directory, "model.safetensors.index.json",
+                b" " * (conditional.MAX_PID_GEMMA_INDEX_BYTES + 1))
+            with self.assertRaisesRegex(ValueError, "exceeds byte limit"):
+                conditional.require_pid_gemma_footprint(directory, {
+                    "config.json", "tokenizer.json", "model.safetensors.index.json", *shards})
 
     def test_fixed_roles_and_complete_gemma_map_from_confined_snapshot(self):
         with TemporaryDirectory() as tmp:
@@ -146,13 +151,28 @@ class ConditionalAssetInventory(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "budget exceeded"):
                     assets.inventory(hub, "nax-macos-2")
             output = root / "inventory.json"
-            command = [sys.executable, "-I", str(Path(assets.__file__)), "--runner", "nax-macos-2",
-                       "--output", str(output)]
-            env = dict(os.environ, RUNNER_NAME="nax-macos-2", FLUX1_HUB=str(hub))
+            sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=assets.ROOT, text=True).strip()
+            command = [sys.executable, "-I", str(Path(assets.__file__)), "--backend", "mlx",
+                       "--request-env", "MODEL_PROOF_REQUEST", "--expected-sha", sha, "--output", str(output)]
+            env = dict(os.environ, RUNNER_NAME="nax-macos-2", FLUX1_HUB=str(hub), FLUX1_PAIR_TIER="none",
+                       MODEL_PROOF_REQUEST=json.dumps({"selection": "flux1-asset-inventory",
+                                                       "runner": "nax-macos-2"}))
+            plan = subprocess.run(command[:-2] + ["--plan"], env=env, capture_output=True, text=True, check=True)
+            self.assertEqual(json.loads(plan.stdout)["selected_runner"], "nax-macos-2")
             subprocess.run(command, env=env, check=True)
             self.assertEqual(json.loads(output.read_text())["runner"], "nax-macos-2")
             env["RUNNER_NAME"] = "nax-macos"
             self.assertNotEqual(subprocess.run(command, env=env, capture_output=True).returncode, 0)
+            with self.assertRaisesRegex(ValueError, "backend and selected runner differ"):
+                assets.plan_request("candle-cuda", {"selection": "flux1-asset-inventory",
+                                                     "runner": "nax-macos-2"}, sha, "none")
+            with self.assertRaisesRegex(ValueError, "flux1_pair=none"):
+                assets.plan_request("mlx", {"selection": "flux1-asset-inventory",
+                                            "runner": "nax-macos-2"}, sha, "conditional-tier1")
+            windows = assets.plan_request("candle-cuda", {"selection": "flux1-asset-inventory",
+                                                         "runner": "cuda-windows-2"}, sha, "none")
+            self.assertIn("cuda-windows-2", windows["runner"])
+            self.assertIn("real-weights", windows["runner"])
 
 
 if __name__ == "__main__":

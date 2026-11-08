@@ -33,6 +33,8 @@ CASES = {
                   ("pulid", "eva", "scrfd", "arcface", "bisenet", "pid_decoder", "pid_gemma")),
 }
 
+MAX_PID_GEMMA_INDEX_BYTES = 4 * 1024 * 1024
+
 
 def pid_gemma_shards(files):
     """Check the path-level Gemma footprint before hosted plan acceptance."""
@@ -55,8 +57,15 @@ def require_pid_gemma_footprint(directory, files):
         return
     index = directory / "model.safetensors.index.json"
     try:
-        weights = json.loads(index.read_text(encoding="utf-8"))["weight_map"]
-    except (OSError, ValueError, KeyError, TypeError, UnicodeError) as error:
+        with index.open("rb") as source:
+            raw = source.read(MAX_PID_GEMMA_INDEX_BYTES + 1)
+    except OSError as error:
+        raise ValueError("PiD Gemma shard index is invalid") from error
+    if len(raw) > MAX_PID_GEMMA_INDEX_BYTES:
+        raise ValueError("PiD Gemma shard index exceeds byte limit")
+    try:
+        weights = json.loads(raw)["weight_map"]
+    except (ValueError, KeyError, TypeError, UnicodeError) as error:
         raise ValueError("PiD Gemma shard index is invalid") from error
     shards = set(weights.values()) if isinstance(weights, dict) and all(
         isinstance(name, str) for name in weights.values()) else set()
