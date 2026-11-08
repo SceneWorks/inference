@@ -9,7 +9,7 @@ use candle_gen::gen_core::{
     self, GenerationMemory, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
     MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
-    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
     MemoryPrerequisiteScope, MemoryProfileGates, MemoryProfileTier, MemoryProviderContract,
     MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategyPrerequisite,
@@ -29,6 +29,19 @@ pub const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
 pub const TRANSFORMER_BLOCKS: u32 = 57;
 pub const CALIBRATION_FINGERPRINT: &str =
     "flux1-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v1";
+
+/// The XLabs reference route is the public character-image path plus the ordinary text route.
+/// Keep the admitted mode identity intact for evidence and scope keying.
+pub(crate) fn accepts_ip_public_mode(mode: &MemoryMode) -> bool {
+    matches!(mode, MemoryMode::TextToImage)
+        || matches!(mode, MemoryMode::Other(name) if name == "character_image")
+}
+
+/// Strict ControlNet also serves public style variations over a pose/canny/depth control source.
+pub(crate) fn accepts_control_public_mode(mode: &MemoryMode) -> bool {
+    accepts_ip_public_mode(mode)
+        || matches!(mode, MemoryMode::Other(name) if name == "style_variations")
+}
 
 fn streamable(spec: &LoadSpec) -> bool {
     matches!(spec.load_shape, LoadShape::DeferredMaterialization)
@@ -971,6 +984,31 @@ pub(crate) fn assert_conditioned_plan_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conditioned_public_modes_are_provider_specific() {
+        for mode in [
+            MemoryMode::TextToImage,
+            MemoryMode::Other("character_image".into()),
+        ] {
+            assert!(accepts_ip_public_mode(&mode), "IP {mode:?}");
+            assert!(accepts_control_public_mode(&mode), "Control {mode:?}");
+        }
+        let style = MemoryMode::Other("style_variations".into());
+        assert!(
+            !accepts_ip_public_mode(&style),
+            "IP style is not a public route"
+        );
+        assert!(accepts_control_public_mode(&style), "Control style route");
+        for mode in [
+            MemoryMode::ImageToImage,
+            MemoryMode::Edit,
+            MemoryMode::Other("unregistered_mode".into()),
+        ] {
+            assert!(!accepts_ip_public_mode(&mode), "IP {mode:?}");
+            assert!(!accepts_control_public_mode(&mode), "Control {mode:?}");
+        }
+    }
     use gen_core::{MemorySelection, MemoryStrategyParameters};
 
     /// AC (epic SC-22657, E2): the FLUX.1 contract publishes the geometry the loader actually

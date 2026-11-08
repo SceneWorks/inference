@@ -5,14 +5,30 @@ import os
 from pathlib import Path
 import struct
 from tempfile import TemporaryDirectory
+import tomllib
 import unittest
 from unittest.mock import patch
 
 from scripts.ci import flux1_conditional_comparison as comparison
-from scripts.ci.flux1_pair import conditional, conditional_evidence
+from scripts.ci.flux1_pair import conditional, conditional_evidence, conditional_probe
 
 
 class ConditionalComparison(unittest.TestCase):
+    def test_probe_manifests_promote_image_without_duplicate_dependency(self):
+        for package, family in (("mlx-gen-flux", "mlx-gen"), ("mlx-gen-pulid", "mlx-gen"),
+                                ("candle-gen-flux", "candle-gen"),
+                                ("candle-gen-pulid", "candle-gen")):
+            with self.subTest(package=package):
+                path = (comparison.ROOT / "crates/media" / family / package / "Cargo.toml")
+                source = path.read_text(encoding="utf-8")
+                changed = conditional_probe.proof_manifest(source, package)
+                parsed = tomllib.loads(changed)
+                self.assertEqual(changed.count("\nimage = { workspace = true }\n"), 1)
+                self.assertIn("image", parsed["dependencies"])
+                self.assertNotIn("image", parsed["dev-dependencies"])
+                self.assertEqual(changed.count("\nserde_json = { workspace = true }\n"), 1)
+                self.assertIn("serde_json", parsed["dependencies"])
+
     def test_fixed_case_matrix_rejects_missing_or_unpinned_assets(self):
         self.assertEqual(len(conditional.CASES), 11)
         for case, (_, backends, roles) in conditional.CASES.items():

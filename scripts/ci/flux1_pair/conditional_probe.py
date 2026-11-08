@@ -213,6 +213,20 @@ def generate_source(backend, arm, case):
             .replace("@CUDA_PROOF@", "" if mlx else cuda_proof()))
 
 
+def proof_manifest(body, package):
+    """Promote the existing image dev dependency for this isolated proof binary."""
+    dependencies = "image = { workspace = true }\n"
+    if package == "mlx-gen-pulid":
+        dependencies = "serde_json = { workspace = true }\n" + dependencies
+    anchor = "\n[dependencies]\n"
+    image_dev = "\nimage = { workspace = true }\n"
+    if (body.count(anchor) != 1 or body.count(image_dev) != 1
+            or body.index(image_dev) < body.index("[dev-dependencies]")):
+        raise ValueError("proof package has no unique image dev dependency: " + package)
+    body = body.replace(image_dev, "\n")
+    return body.replace(anchor, anchor + dependencies)
+
+
 def install(root, backend, arm, tier, case):
     if tier != "tier1":
         raise ValueError("conditional FLUX.1 comparison is Tier 1 only")
@@ -224,15 +238,9 @@ def install(root, backend, arm, tier, case):
     base_bin.unlink()
     package = conditional.family(case, backend)
     manifest = f"crates/media/{family}/{package}/Cargo.toml"
-    dependencies = "image = { workspace = true }\n"
-    if package == "mlx-gen-pulid":
-        dependencies = "serde_json = { workspace = true }\n" + dependencies
     manifest_path = root / manifest
-    body = manifest_path.read_text(encoding="utf-8")
-    anchor = "\n[dependencies]\n"
-    if body.count(anchor) != 1:
-        raise ValueError("proof package has no unique dependencies section: " + package)
-    manifest_path.write_text(body.replace(anchor, anchor + dependencies), encoding="utf-8")
+    manifest_path.write_text(proof_manifest(manifest_path.read_text(encoding="utf-8"), package),
+                             encoding="utf-8")
     # Adding proof-only direct dependencies can change this package's lockfile dependency list.
     # Resolve from the committed cache without network, then the actual build stays --locked.
     subprocess.run(["cargo", "metadata", "--offline", "--format-version", "1"], cwd=root,

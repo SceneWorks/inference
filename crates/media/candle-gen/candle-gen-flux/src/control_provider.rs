@@ -40,9 +40,9 @@ use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{
     AdapterSpec, Conditioning, ControlKind, GenerationMemory, GenerationRequest, Image, LoadSpec,
-    MemoryGeometry, MemoryMode, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemoryRunOutcome, ModelDescriptor, PreviewSink, Progress, RenderLoadBinding, RenderPlan,
-    RenderRun, WeightsSource,
+    MemoryGeometry, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    ModelDescriptor, PreviewSink, Progress, RenderLoadBinding, RenderPlan, RenderRun,
+    WeightsSource,
 };
 use candle_gen::preview::PreviewHook;
 use candle_gen::{CandleError, Result};
@@ -212,7 +212,7 @@ pub struct Flux1DevControl {
 }
 
 fn validate_control_memory_context(context: &MemoryRunContext) -> Result<()> {
-    if context.mode != MemoryMode::TextToImage
+    if !crate::memory_strategy::accepts_control_public_mode(&context.mode)
         || context.overlay.as_deref() != Some("control")
         || !context.has_reference
         || context.use_pid
@@ -222,7 +222,7 @@ fn validate_control_memory_context(context: &MemoryRunContext) -> Result<()> {
         || context.geometry.reference_count != 1
     {
         return Err(CandleError::Msg(
-            "FLUX.1 ControlNet memory context is not one text-to-image control request".into(),
+            "FLUX.1 ControlNet memory context is not one supported public control request".into(),
         ));
     }
     Ok(())

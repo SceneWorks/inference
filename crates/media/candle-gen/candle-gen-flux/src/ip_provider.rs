@@ -23,9 +23,9 @@ use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{
     AdapterSpec, Conditioning, ConditioningKind, GenerationMemory, GenerationRequest, Image,
-    LoadSpec, MemoryGeometry, MemoryMode, MemoryProviderContract, MemoryRequestScope,
-    MemoryRunContext, MemoryRunOutcome, ModelDescriptor, PreviewSink, Progress, RenderLoadBinding,
-    RenderPlan, RenderRun, WeightsSource,
+    LoadSpec, MemoryGeometry, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemoryRunOutcome, ModelDescriptor, PreviewSink, Progress, RenderLoadBinding, RenderPlan,
+    RenderRun, WeightsSource,
 };
 use candle_gen::preview::PreviewHook;
 use candle_gen::weights::Weights;
@@ -200,7 +200,7 @@ pub struct IpAdapterFlux {
 }
 
 fn validate_ip_memory_context(context: &MemoryRunContext) -> Result<()> {
-    if context.mode != MemoryMode::TextToImage
+    if !crate::memory_strategy::accepts_ip_public_mode(&context.mode)
         || context.overlay.as_deref() != Some("identity")
         || !context.has_reference
         || context.use_pid
@@ -210,7 +210,7 @@ fn validate_ip_memory_context(context: &MemoryRunContext) -> Result<()> {
         || context.geometry.reference_count != 1
     {
         return Err(CandleError::Msg(
-            "FLUX.1 IP memory context is not one text-to-image identity reference".into(),
+            "FLUX.1 IP memory context is not one supported public identity reference".into(),
         ));
     }
     Ok(())
