@@ -619,9 +619,10 @@ impl PulidFlux {
             contract,
             context,
         );
-        let run = RenderRun::new(plan, &req.cancel, Some(scope.as_mut()));
-        let result = self.generate_inner(req, reference, plan, &run, on_progress);
-        drop(run);
+        let result = {
+            let run = RenderRun::new(plan, &req.cancel, Some(scope.as_mut()));
+            self.generate_inner(req, reference, plan, &run, on_progress)
+        };
         let outcome = match &result {
             Ok(_) => MemoryRunOutcome::Complete,
             Err(CandleError::Canceled) => MemoryRunOutcome::Canceled,
