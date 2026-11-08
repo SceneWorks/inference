@@ -1,5 +1,7 @@
 """Weights-free checks for the manual conditional asset inventory protocol."""
 import hashlib
+from contextlib import redirect_stderr
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -21,6 +23,41 @@ def put(root, relative, content=b"fixed"):
 
 
 class ConditionalAssetInventory(unittest.TestCase):
+    def test_unrelated_hub_tree_is_skipped_and_scan_reports_progress(self):
+        with TemporaryDirectory() as tmp:
+            hub = Path(tmp) / "hub"
+            hub.mkdir()
+            unrelated = hub / "models--other--ordinary/snapshots" / ("a" * 40)
+            for index in range(100):
+                put(hub, unrelated.relative_to(hub) / f"deep/{index}/model.safetensors")
+            target = put(hub, "models--guozinan--PuLID/snapshots/" + "b" * 40 +
+                         "/pulid_flux_v0.9.1.safetensors", b"pulid")
+            log = StringIO()
+            with patch.object(assets, "MAX_ENTRIES", 20), redirect_stderr(log):
+                result = assets.inventory(hub, "nax-macos-2")
+            self.assertEqual(result["roles"]["pulid"]["candidates"][0]["path"], str(target.resolve()))
+            self.assertLess(result["entries_scanned"], 20)
+            self.assertNotIn("models--other--ordinary", " ".join(result["search_roots"]))
+            self.assertIn("selected_roots=1", log.getvalue())
+            self.assertIn("role=pulid", log.getvalue())
+
+    def test_expired_budget_and_selected_cache_symlink_fail_fast(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hub = root / "hub"
+            hub.mkdir()
+            put(hub, "models--guozinan--PuLID/snapshots/" + "a" * 40 +
+                "/pulid_flux_v0.9.1.safetensors")
+            with patch.object(assets, "MAX_SECONDS", -1):
+                with self.assertRaisesRegex(ValueError, "budget exceeded"):
+                    assets.inventory(hub, "nax-macos-2")
+            external = root / "external"
+            external.mkdir()
+            (hub / "models--guozinan--PuLID").rename(external / "pulid")
+            (hub / "models--guozinan--PuLID").symlink_to(external / "pulid", target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "selected model cache directory is a symlink"):
+                assets.inventory(hub, "nax-macos-2")
+
     def test_huggingface_gemma_snapshot_links_stage_from_confined_blobs(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -128,8 +165,8 @@ class ConditionalAssetInventory(unittest.TestCase):
             root = Path(tmp)
             hub = root / "hub"
             hub.mkdir()
-            put(hub, "flux-a/control.safetensors")
-            put(hub, "flux-b/control.safetensors")
+            put(hub, "flux1-a/control.safetensors")
+            put(hub, "flux1-b/control.safetensors")
             result = assets.inventory(hub, "nax-macos-2")
             self.assertEqual(result["roles"]["control"]["status"], "ambiguous")
             self.assertEqual(result["roles"]["pulid"]["status"], "missing")
@@ -137,7 +174,7 @@ class ConditionalAssetInventory(unittest.TestCase):
             self.assertIn("pulid", result["missing_roles"])
             self.assertFalse(result["cases"]["control-pose"]["ready"])
             external = put(root, "external.safetensors")
-            (hub / "flux-a/ip_adapter.safetensors").symlink_to(external)
+            (hub / "flux1-a/ip_adapter.safetensors").symlink_to(external)
             with self.assertRaisesRegex(ValueError, "escapes configured model hub"):
                 assets.inventory(hub, "nax-macos-2")
 
@@ -146,7 +183,7 @@ class ConditionalAssetInventory(unittest.TestCase):
             root = Path(tmp)
             hub = root / "hub"
             hub.mkdir()
-            put(hub, "flux/control.safetensors", b"control")
+            put(hub, "flux1/control.safetensors", b"control")
             with patch.object(assets, "MAX_HASH_BYTES", 2):
                 with self.assertRaisesRegex(ValueError, "budget exceeded"):
                     assets.inventory(hub, "nax-macos-2")

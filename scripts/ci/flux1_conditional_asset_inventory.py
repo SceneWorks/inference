@@ -28,6 +28,16 @@ MAX_GEMMA_FILES = 5_000
 MAX_HASH_BYTES = 120 * 1024**3
 MAX_SECONDS = 1_200
 SHA = re.compile(r"[0-9a-f]{40}")
+SOURCE_MARKERS = ("flux.1", "flux1", "flux-ip", "pid-flux", "pulid", "controlnet-union-pro",
+                  "clip-vit-large-patch14", "gemma-2-2b-it", "eva", "face", "antelope",
+                  "facexlib", "insightface", "instantid")
+LOOSE_ROOTS = {"flux1", "flux.1", "pulid", "pid", "face", "converted", "conditional-assets"}
+GEMMA_REPOS = ("models--google--gemma-2-2b-it", "models--efficient-large-model--gemma-2-2b-it",
+               "models--sceneworks--gemma-2-2b-it")
+
+
+def progress(message):
+    print("FLUX1_ASSET_INVENTORY " + message, file=sys.stderr, flush=True)
 
 
 def role_for(path):
@@ -71,10 +81,17 @@ class Budget:
     def __init__(self):
         self.started = time.monotonic()
         self.bytes = 0
+        self.last_report = self.started
+        self.stage = "discovery"
 
     def check(self, extra=0):
-        if time.monotonic() - self.started > MAX_SECONDS or self.bytes + extra > MAX_HASH_BYTES:
-            raise ValueError("asset inventory time/byte budget exceeded")
+        now = time.monotonic()
+        if now - self.started > MAX_SECONDS or self.bytes + extra > MAX_HASH_BYTES:
+            raise ValueError(f"asset inventory time/byte budget exceeded at {self.stage}; "
+                             f"elapsed_seconds={int(now - self.started)} hash_bytes={self.bytes}")
+        if now - self.last_report >= 60:
+            progress(f"elapsed_seconds={int(now - self.started)} hash_bytes={self.bytes} stage={self.stage}")
+            self.last_report = now
 
 
 def confined(path, hub):
@@ -85,6 +102,8 @@ def confined(path, hub):
 
 
 def digest(path, hub, budget):
+    budget.stage = "hash " + str(path.relative_to(hub))
+    budget.check()
     resolved = confined(path, hub)
     if not resolved.is_file():
         raise ValueError("asset candidate is not a file: " + str(path))
@@ -125,39 +144,77 @@ def gemma_files(directory, hub, budget):
     return files
 
 
+def search_roots(hub, budget):
+    """Inspect only FLUX.1-related HF snapshots and named loose asset directories.
+
+    A Hub cache stores payloads under opaque `blobs/` names. Snapshot symlinks expose the
+    candidate filenames, so walking every blob and unrelated model tree adds no discovery.
+    """
+    roots = []
+    immediate = sorted(hub.iterdir())
+    if len(immediate) > MAX_ENTRIES:
+        raise ValueError("asset inventory entry budget exceeded")
+    for child in immediate:
+        budget.check()
+        name = child.name.lower()
+        if name.startswith("models--") and any(marker in name for marker in SOURCE_MARKERS):
+            if child.is_symlink():
+                raise ValueError("selected model cache directory is a symlink: " + str(child))
+            snapshots = child / "snapshots"
+            if snapshots.is_symlink():
+                raise ValueError("selected snapshot directory is a symlink: " + str(snapshots))
+            if snapshots.is_dir():
+                roots.append(snapshots)
+        elif name in LOOSE_ROOTS or name.startswith(("flux1-", "flux.1-", "pulid-", "pid-", "face-", "converted-")):
+            if child.is_symlink():
+                raise ValueError("selected loose asset directory is a symlink: " + str(child))
+            if child.is_dir():
+                roots.append(child)
+    progress(f"selected_roots={len(roots)} hub_entries={len(immediate)}")
+    return roots, immediate
+
+
 def candidates(hub, budget):
     found = {role: [] for _, _, roles in CASES.values() for role in roles}
-    entries = 0
+    roots, immediate = search_roots(hub, budget)
+    entries = len(immediate)
     def fail_walk(error):
         raise error
 
-    for base, dirs, names in os.walk(hub, followlinks=False, onerror=fail_walk):
-        dirs.sort()
-        names.sort()
-        for name in dirs[:]:
-            path = Path(base) / name
-            if name == "snapshots" and any(model in str(path).lower() for model in (
-                    "models--google--gemma-2-2b-it", "models--efficient-large-model--gemma-2-2b-it",
-                    "models--sceneworks--gemma-2-2b-it")):
-                for snapshot in sorted(path.iterdir()):
-                    if snapshot.is_dir() and SHA.fullmatch(snapshot.name):
-                        found["pid_gemma"].append(snapshot)
-            if path.is_symlink():
-                dirs.remove(name)
-        entries += len(dirs) + len(names)
-        if entries > MAX_ENTRIES:
-            raise ValueError("asset inventory entry budget exceeded")
-        budget.check()
-        for name in names:
-            path = Path(base) / name
+    for path in immediate:
+        if path.is_file():
             role = role_for(path)
             if role:
                 found[role].append(path)
-                if len(found[role]) > MAX_CANDIDATES_PER_ROLE:
-                    raise ValueError("too many candidates for role: " + role)
+    for root in roots:
+        budget.stage = "scan " + str(root.relative_to(hub))
+        progress(f"scanning={root.relative_to(hub)}")
+        if root.name == "snapshots" and root.parent.name.lower() in GEMMA_REPOS:
+            for snapshot in sorted(root.iterdir()):
+                budget.check()
+                if snapshot.is_dir() and SHA.fullmatch(snapshot.name):
+                    found["pid_gemma"].append(snapshot)
+        for base, dirs, names in os.walk(root, followlinks=False, onerror=fail_walk):
+            dirs.sort()
+            names.sort()
+            for name in dirs[:]:
+                if (Path(base) / name).is_symlink():
+                    dirs.remove(name)
+            entries += len(dirs) + len(names)
+            if entries > MAX_ENTRIES:
+                raise ValueError("asset inventory entry budget exceeded")
+            budget.check()
+            for name in names:
+                path = Path(base) / name
+                role = role_for(path)
+                if role:
+                    found[role].append(path)
+                    if len(found[role]) > MAX_CANDIDATES_PER_ROLE:
+                        raise ValueError("too many candidates for role: " + role)
     if len(found["pid_gemma"]) > MAX_CANDIDATES_PER_ROLE:
         raise ValueError("too many candidates for role: pid_gemma")
-    return found, entries
+    progress(f"discovered_entries={entries} candidates={sum(len(paths) for paths in found.values())}")
+    return found, entries, roots
 
 
 def inventory(hub, runner):
@@ -167,11 +224,12 @@ def inventory(hub, runner):
     if not hub.is_dir():
         raise ValueError("configured model hub is not a directory")
     budget = Budget()
-    found, entries = candidates(hub, budget)
+    found, entries, roots = candidates(hub, budget)
     roles = {}
     for role, paths in sorted(found.items()):
         rows = []
         for path in paths:
+            progress(f"role={role} candidate={path.relative_to(hub)}")
             resolved = confined(path, hub)
             rev, provenance = revision(path)
             row = {"path": str(path), "resolved": str(resolved), "revision": rev,
@@ -198,6 +256,7 @@ def inventory(hub, runner):
                            "roles": list(required)}
     return {"schema": 1, "protocol": "flux1-conditional-asset-inventory-v1", "runner": runner,
             "backend": backend, "hub": str(hub), "entries_scanned": entries,
+            "search_roots": [str(root.relative_to(hub)) for root in roots],
             "hash_bytes": budget.bytes, "revision_note": "snapshot path is a provenance label; SHA-256 is authoritative",
             "missing_roles": sorted(role for role, row in roles.items() if row["status"] == "missing"),
             "ambiguous_roles": sorted(role for role, row in roles.items() if row["status"] == "ambiguous"),
