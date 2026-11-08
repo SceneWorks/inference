@@ -1178,13 +1178,11 @@ pub(crate) fn compile_base(
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_request(&descriptor_for(variant), req)?;
     crate::memory_strategy::validate_load_contract(variant.id(), spec)?;
-    if single_reference(req)?.is_some() {
-        if spec.ip_adapter.is_none() {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{}: reference image needs an IP-adapter",
-                variant.id()
-            )));
-        }
+    if single_reference(req)?.is_some() && spec.ip_adapter.is_none() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: reference image needs an IP-adapter",
+            variant.id()
+        )));
     }
     if req.cancel.is_cancelled() {
         return Err(gen_core::Error::Canceled);

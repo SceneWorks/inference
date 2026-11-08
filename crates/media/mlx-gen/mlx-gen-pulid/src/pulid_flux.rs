@@ -300,13 +300,25 @@ fn select_reference_face(conditioning: &[Conditioning]) -> Result<(&Image, f32)>
     })
 }
 
+/// Constructor-built models already own their identity stack; freeze only the request trajectory.
+fn compile_constructed_plan(req: &GenerationRequest) -> gen_core::Result<gen_core::RenderPlan> {
+    descriptor().capabilities.validate_request(MODEL_ID, req)?;
+    select_reference_face(&req.conditioning)?;
+    if req.cancel.is_cancelled() {
+        return Err(gen_core::Error::Canceled);
+    }
+    Ok(mlx_gen_flux::model::compile_trajectory_for(
+        FluxVariant::Dev,
+        &descriptor(),
+        req,
+    )?)
+}
+
 /// Freeze the face source, identity slots, sampling and CFG controls before loading PuLID.
 pub(crate) fn compile_plan(
     spec: &LoadSpec,
     req: &GenerationRequest,
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
-    descriptor().capabilities.validate_request(MODEL_ID, req)?;
-    select_reference_face(&req.conditioning)?;
     let identity = spec.identity.as_ref().ok_or_else(|| {
         gen_core::Error::Unsupported("pulid_flux needs identity weights before load".into())
     })?;
@@ -320,13 +332,20 @@ pub(crate) fn compile_plan(
             "pulid_flux PiD decode needs a loaded overlay".into(),
         ));
     }
-    if req.cancel.is_cancelled() {
-        return Err(gen_core::Error::Canceled);
+    Ok(Some(compile_constructed_plan(req)?.bind_load(spec)))
+}
+
+fn compile_generate_plan(
+    spec: &LoadSpec,
+    registry_loaded: bool,
+    req: &GenerationRequest,
+) -> gen_core::Result<gen_core::RenderPlan> {
+    if registry_loaded {
+        compile_plan(spec, req)?
+            .ok_or_else(|| gen_core::Error::Unsupported("PuLID plan is unavailable".into()))
+    } else {
+        compile_constructed_plan(req)
     }
-    Ok(Some(
-        mlx_gen_flux::model::compile_trajectory_for(FluxVariant::Dev, &descriptor(), req)?
-            .bind_load(spec),
-    ))
 }
 
 impl Generator for PulidFlux {
@@ -355,8 +374,8 @@ impl Generator for PulidFlux {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        let plan = compile_plan(&self.loaded_spec, req)?
-            .ok_or_else(|| gen_core::Error::Unsupported("PuLID plan is unavailable".into()))?;
+        let plan =
+            compile_generate_plan(&self.loaded_spec, self.identity_inventory.is_some(), req)?;
         self.generate_planned(req, &plan, None, on_progress)?
             .output
             .ok_or_else(|| gen_core::Error::Msg("PuLID render produced no image".into()))
@@ -654,6 +673,35 @@ pub(crate) const MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
 mod tests {
     use super::*;
     use mlx_gen::{IdentityWeights, LoadShape, OffloadPolicy, Quant};
+
+    #[test]
+    fn constructed_model_plans_without_identity_paths_but_keeps_request_binding() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/constructed-pulid".into()));
+        let mut req = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![3; 64 * 64 * 3],
+                },
+                strength: Some(1.0),
+            }],
+            ..Default::default()
+        };
+        let plan = compile_generate_plan(&spec, false, &req).unwrap();
+        plan.check_request(&descriptor(), &req).unwrap();
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&spec))
+            .unwrap();
+        assert!(compile_generate_plan(&spec, true, &req).is_err());
+        if let Conditioning::Reference { image, .. } = &mut req.conditioning[0] {
+            image.pixels[0] ^= 1;
+        }
+        assert!(plan.check_request(&descriptor(), &req).is_err());
+    }
 
     #[test]
     fn pulid_plan_binds_face_and_identity_slots_before_load() {
