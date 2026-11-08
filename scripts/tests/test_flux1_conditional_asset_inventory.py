@@ -151,18 +151,18 @@ class ConditionalAssetInventory(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "budget exceeded"):
                     assets.inventory(hub, "nax-macos-2")
             output = root / "inventory.json"
-            sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=assets.ROOT, text=True).strip()
+            sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=assets.ROOT, text=True, encoding="utf-8").strip()
             command = [sys.executable, "-I", str(Path(assets.__file__)), "--backend", "mlx",
                        "--request-env", "MODEL_PROOF_REQUEST", "--expected-sha", sha, "--output", str(output)]
             env = dict(os.environ, RUNNER_NAME="nax-macos-2", FLUX1_HUB=str(hub), FLUX1_PAIR_TIER="none",
                        MODEL_PROOF_REQUEST=json.dumps({"selection": "flux1-asset-inventory",
                                                        "runner": "nax-macos-2"}))
-            plan = subprocess.run(command[:-2] + ["--plan"], env=env, capture_output=True, text=True, check=True)
+            plan = subprocess.run(command[:-2] + ["--plan"], env=env, capture_output=True, text=True, encoding="utf-8", check=True)
             self.assertEqual(json.loads(plan.stdout)["selected_runner"], "nax-macos-2")
             subprocess.run(command, env=env, check=True)
-            self.assertEqual(json.loads(output.read_text())["runner"], "nax-macos-2")
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["runner"], "nax-macos-2")
             env["RUNNER_NAME"] = "nax-macos"
-            self.assertNotEqual(subprocess.run(command, env=env, capture_output=True).returncode, 0)
+            self.assertNotEqual(subprocess.run(command, env=env, capture_output=True, encoding="utf-8").returncode, 0)
             with self.assertRaisesRegex(ValueError, "backend and selected runner differ"):
                 assets.plan_request("candle-cuda", {"selection": "flux1-asset-inventory",
                                                      "runner": "nax-macos-2"}, sha, "none")
