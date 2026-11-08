@@ -271,8 +271,9 @@ fn plan_descriptor() -> ModelDescriptor {
     // descriptor's 256..=2048 range.
     descriptor.capabilities.min_size = SIZE_MULTIPLE;
     descriptor.capabilities.max_size = u32::MAX;
-    descriptor.capabilities.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGrid {
+    descriptor.capabilities.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGridArea {
         multiple: SIZE_MULTIPLE,
+        max_cells: u32::MAX,
     };
     descriptor.id = "pulid_flux";
     descriptor.capabilities.conditioning = vec![ConditioningKind::Reference];

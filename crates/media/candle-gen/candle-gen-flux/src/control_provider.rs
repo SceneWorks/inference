@@ -259,8 +259,9 @@ fn control_descriptor() -> ModelDescriptor {
     // registered base txt2img route's 256..=2048 range does not apply here.
     descriptor.capabilities.min_size = SIZE_MULTIPLE;
     descriptor.capabilities.max_size = u32::MAX;
-    descriptor.capabilities.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGrid {
+    descriptor.capabilities.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGridArea {
         multiple: SIZE_MULTIPLE,
+        max_cells: u32::MAX,
     };
     descriptor.control_kinds = Some(candle_gen::gen_core::AcceptedControlKinds::Only(vec![
         ControlKind::Pose,
@@ -839,6 +840,15 @@ mod tests {
             ..req.clone()
         };
         compile_control_plan(&paths, &spec, &large, &image).unwrap();
+        let overflowing_grid = Flux1ControlRequest {
+            width: 1_048_576,
+            height: 1_048_576,
+            ..req.clone()
+        };
+        let error = compile_control_plan(&paths, &spec, &overflowing_grid, &image)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("packed image grid exceeds"), "{error}");
         for name in ["flow_match", "flow_match_euler"] {
             let mut alias = req.clone();
             alias.sampler = Some(name.into());

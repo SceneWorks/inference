@@ -250,8 +250,9 @@ fn ip_descriptor(variant: Variant) -> ModelDescriptor {
     // the registered txt2img route's 256..=2048 size restriction.
     descriptor.capabilities.min_size = SIZE_MULTIPLE;
     descriptor.capabilities.max_size = u32::MAX;
-    descriptor.capabilities.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGrid {
+    descriptor.capabilities.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGridArea {
         multiple: SIZE_MULTIPLE,
+        max_cells: u32::MAX,
     };
     descriptor.id = if variant.is_dev() {
         "flux1_dev_ip_adapter"
@@ -763,8 +764,9 @@ mod tests {
             assert_eq!(descriptor.capabilities.max_size, u32::MAX);
             assert_eq!(
                 descriptor.capabilities.size_floor,
-                candle_gen::gen_core::SizeFloor::RangeCheckedOnGrid {
-                    multiple: SIZE_MULTIPLE
+                candle_gen::gen_core::SizeFloor::RangeCheckedOnGridArea {
+                    multiple: SIZE_MULTIPLE,
+                    max_cells: u32::MAX
                 }
             );
         }
