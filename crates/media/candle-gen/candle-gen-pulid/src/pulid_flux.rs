@@ -853,9 +853,18 @@ mod tests {
             .is_err());
         let pid_req = PulidFluxRequest {
             use_pid: true,
-            ..req
+            ..req.clone()
         };
         assert!(compile_pulid_plan(&paths, &spec, &pid_req, &reference).is_err());
+        let mut missing_overlay = spec.clone();
+        missing_overlay.identity = None;
+        assert!(compile_pulid_plan(&paths, &missing_overlay, &req, &reference).is_err());
+        let mut invalid = req.clone();
+        invalid.steps = 0;
+        assert!(compile_pulid_plan(&paths, &spec, &invalid, &reference).is_err());
+        invalid.steps = req.steps;
+        invalid.width = 513;
+        assert!(compile_pulid_plan(&paths, &spec, &invalid, &reference).is_err());
     }
 
     /// `steps == 0` and a non-multiple-of-16 size are fast typed errors (never a decoded pure-noise

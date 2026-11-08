@@ -681,9 +681,18 @@ mod tests {
             .is_err());
         let bad = Flux1ControlRequest {
             control_kind: "other".into(),
-            ..req
+            ..req.clone()
         };
         assert!(compile_control_plan(&paths, &spec, &bad, &image).is_err());
+        let mut missing_overlay = spec.clone();
+        missing_overlay.control = None;
+        assert!(compile_control_plan(&paths, &missing_overlay, &req, &image).is_err());
+        let mut invalid = req.clone();
+        invalid.steps = 0;
+        assert!(compile_control_plan(&paths, &spec, &invalid, &image).is_err());
+        invalid.steps = req.steps;
+        invalid.width = 513;
+        assert!(compile_control_plan(&paths, &spec, &invalid, &image).is_err());
     }
 
     /// The request defaults match the dev control production knobs (1024², 25 steps, guidance 3.5, pose).

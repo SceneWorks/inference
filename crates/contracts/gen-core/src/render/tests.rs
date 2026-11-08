@@ -100,6 +100,17 @@ fn packed_image_plan_refuses_multiple_or_unsupported_conditioning() {
             };
             2
         ],
+        vec![
+            Conditioning::Reference {
+                image: image.clone(),
+                strength: None,
+            },
+            Conditioning::Control {
+                image: image.clone(),
+                kind: ControlKind::Pose,
+                scale: Some(0.7),
+            },
+        ],
         vec![Conditioning::Depth { image }],
     ] {
         let request = GenerationRequest {

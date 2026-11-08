@@ -628,6 +628,15 @@ mod tests {
         assert!(plan
             .check_load(&RenderLoadBinding::from_spec(&changed))
             .is_err());
+        let mut missing_overlay = spec.clone();
+        missing_overlay.ip_adapter = None;
+        assert!(compile_ip_plan(&paths, &missing_overlay, &req, &reference).is_err());
+        let mut invalid = req.clone();
+        invalid.steps = 0;
+        assert!(compile_ip_plan(&paths, &spec, &invalid, &reference).is_err());
+        invalid.steps = req.steps;
+        invalid.width = 513;
+        assert!(compile_ip_plan(&paths, &spec, &invalid, &reference).is_err());
     }
 
     /// The empty-prompt guard (sc-9171, the sc-8646 bug class): an empty or whitespace-only prompt is
