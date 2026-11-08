@@ -343,6 +343,10 @@ impl Flux1DevControl {
         let spans = plan.denoise_spans();
         let sampler_name = plan.sampler();
         let guidance = plan.guidance();
+        // Sequential residency drops text weights before loading the VAE. Keep one Conditioning
+        // phase open across that handoff so the control-image VAE encode is included without
+        // retaining the text weights beside its large packed latent.
+        run.begin_conditioning()?;
         self.residency.run_request_scoped(
             matches!(self.loaded_spec.offload_policy, OffloadPolicy::Sequential),
             false,
@@ -350,7 +354,7 @@ impl Flux1DevControl {
             // The control variant has no PiD overlay; `use_pid` is inert for the heavy loader.
             req.use_pid,
             on_progress,
-            |text: &FluxTextOwned| run.encode(|| text.encode(&req.prompt)),
+            |text: &FluxTextOwned| text.encode(&req.prompt),
             |encoded| {
                 let Some((prompt_embeds, pooled_prompt_embeds)) = encoded else {
                     return Ok(());
@@ -363,6 +367,8 @@ impl Flux1DevControl {
                 // after the encoders were dropped and the VAE loaded under `Sequential`.
                 let control_latent =
                     Self::encode_control_latent(&heavy.vae, control_image, req.width, req.height)?;
+                mlx_rs::transforms::eval([&control_latent])?;
+                run.end_conditioning()?;
 
                 // Compiled elementwise glue (sc-2963), shared with the base flux1 path. Scoped +
                 // restored on drop by the RAII guard (F-007).

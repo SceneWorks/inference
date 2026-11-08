@@ -589,14 +589,48 @@ impl<'p, 's> RenderRun<'p, 's> {
         &self,
         body: impl FnOnce() -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
+        self.begin_conditioning()?;
+        let result = body();
+        match result {
+            Ok(value) => {
+                self.end_conditioning()?;
+                Ok(value)
+            }
+            Err(error) => {
+                // As with `phase`, the request-scope owner tears down a failed stage.
+                self.state.set(RunState::Finished);
+                Err(error)
+            }
+        }
+    }
+
+    /// Open Conditioning across a staged residency handoff. The owner can encode text, shed its
+    /// weights, load the VAE/identity stack, then close this same phase after source preparation.
+    pub fn begin_conditioning(&self) -> Result<()> {
         self.begin(RunState::BeforeEncode, RunState::Encoding)?;
-        let result = self.phase(MemoryPhase::Conditioning, body);
-        self.state.set(if result.is_ok() {
-            RunState::Encoded
-        } else {
-            RunState::Finished
-        });
-        result
+        if self.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        if let Some(scope) = self.scope.borrow_mut().as_deref_mut() {
+            scope.enter_render_phase(MemoryPhase::Conditioning, &self.phase_identity(0))?;
+        }
+        Ok(())
+    }
+
+    pub fn end_conditioning(&self) -> Result<()> {
+        if self.state.get() != RunState::Encoding {
+            return Err(Error::Unsupported(
+                "conditioning phase is not active".into(),
+            ));
+        }
+        if self.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        if let Some(scope) = self.scope.borrow_mut().as_deref_mut() {
+            scope.leave_phase(MemoryPhase::Conditioning)?;
+        }
+        self.state.set(RunState::Encoded);
+        Ok(())
     }
 
     pub fn images<I, D, O, E: From<Error>>(

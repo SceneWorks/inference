@@ -421,12 +421,6 @@ impl PulidFlux {
             return Err(Error::Canceled);
         }
         let (image, id_weight) = self.reference_face(req)?;
-        let id_embedding = self.compute_id_embedding(
-            &image.pixels,
-            image.height as usize,
-            image.width as usize,
-            &req.cancel,
-        )?;
         let mk_ca = |emb: Array| {
             PulidCa::from_weights(
                 &self.pulid,
@@ -451,37 +445,51 @@ impl PulidFlux {
         flux_req.negative_prompt = None;
         flux_req.true_cfg = None; // PuLID drives real-CFG itself; the backbone forbids it
 
-        // The CA-module builds + (for real-CFG) the uncond IDFormer pass still precede the backbone
-        // encodes; honor a cancel that arrived during the identity tower before starting them.
-        if req.cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
+        // The owner now prepares the face/EVA/IDFormer branch after staged T5/CLIP weights have
+        // dropped, inside the same Conditioning phase as text. This avoids retaining the large
+        // identity arrays beside text encoding and keeps the measured phase complete.
         let true_cfg = req.true_cfg.unwrap_or(1.0);
         let result = if true_cfg > 1.0 + 1e-3 {
             // Real-CFG (sc-3075): positive (id) + negative (uncond id) branches + a negative prompt.
-            let pos = mk_ca(id_embedding)?;
-            let neg = mk_ca(self.compute_uncond_id_embedding()?)?;
             let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
             let start_cfg = req
                 .timestep_to_start_cfg
                 .map(|v| v as usize)
                 .unwrap_or(DEFAULT_TIMESTEP_TO_START_CFG);
-            self.flux.generate_with_injector_cfg_planned(
+            self.flux.generate_with_prepared_injector_cfg_planned(
                 &flux_req,
-                &pos,
-                &neg,
                 neg_prompt,
                 true_cfg,
                 start_cfg,
                 run,
+                || {
+                    let pos = self.compute_id_embedding(
+                        &image.pixels,
+                        image.height as usize,
+                        image.width as usize,
+                        &req.cancel,
+                    )?;
+                    let neg = self.compute_uncond_id_embedding()?;
+                    mlx_rs::transforms::eval([&pos, &neg])?;
+                    Ok((mk_ca(pos)?, mk_ca(neg)?))
+                },
                 on_progress,
             )
         } else {
             // Fake-CFG (true_cfg = 1.0): single forward (sc-3074), bit-identical to that path.
-            self.flux.generate_with_injector_planned(
+            self.flux.generate_with_prepared_injector_planned(
                 &flux_req,
-                &mk_ca(id_embedding)?,
                 run,
+                || {
+                    let id_embedding = self.compute_id_embedding(
+                        &image.pixels,
+                        image.height as usize,
+                        image.width as usize,
+                        &req.cancel,
+                    )?;
+                    mlx_rs::transforms::eval([&id_embedding])?;
+                    mk_ca(id_embedding)
+                },
                 on_progress,
             )
         };

@@ -517,30 +517,45 @@ impl Generator for Flux1 {
                     self.descriptor.id
                 ))
             })?;
-            let embeds = encoder.encode(image)?;
             let scale = strength.unwrap_or(DEFAULT_IP_SCALE).clamp(0.0, 1.0);
-            let pos = FluxIpInjector::new(adapter, &embeds, scale)?;
             match req.true_cfg {
                 Some(cfg) if self.variant.supports_guidance() => {
                     // The negative IP branch uses a black image, not a missing injector.
-                    let black_embeds = encoder.encode_black()?;
-                    let neg = FluxIpInjector::new(adapter, &black_embeds, scale)?;
                     let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
-                    self.run_with_injector_cfg(
+                    self.generate_with_prepared_injector_cfg_planned(
                         req,
-                        &pos,
-                        &neg,
                         neg_prompt,
                         cfg.clamp(TRUE_CFG_MIN, TRUE_CFG_MAX),
                         0,
                         &run,
+                        || {
+                            let embeds = encoder.encode(image)?;
+                            let black_embeds = encoder.encode_black()?;
+                            mlx_rs::transforms::eval([&embeds, &black_embeds])?;
+                            let pos = FluxIpInjector::new(adapter, &embeds, scale)?;
+                            let neg = FluxIpInjector::new(adapter, &black_embeds, scale)?;
+                            pos.materialize_tokens()?;
+                            neg.materialize_tokens()?;
+                            Ok((pos, neg))
+                        },
                         on_progress,
                     )?
                 }
-                _ => self.run_with_injector(req, Some(&pos), &run, on_progress)?,
+                _ => self.generate_with_prepared_injector_planned(
+                    req,
+                    &run,
+                    || {
+                        let embeds = encoder.encode(image)?;
+                        mlx_rs::transforms::eval([&embeds])?;
+                        let injector = FluxIpInjector::new(adapter, &embeds, scale)?;
+                        injector.materialize_tokens()?;
+                        Ok(injector)
+                    },
+                    on_progress,
+                )?,
             }
         } else {
-            self.run_with_injector(req, None, &run, on_progress)?
+            self.run_with_injector(req, None, &run, false, on_progress)?
         };
         Ok(gen_core::GenerationReport::from_output(output))
     }
@@ -609,7 +624,7 @@ impl Flux1 {
         self.validate(req)?;
         let plan = compile_trajectory(self.variant, req)?.bind_load(&self.loaded_spec);
         let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
-        self.run_with_injector(req, injector, &run, on_progress)
+        self.run_with_injector(req, injector, &run, false, on_progress)
     }
 
     /// PuLID validates its own descriptor and source-bound plan, then delegates the same FLUX
@@ -622,7 +637,7 @@ impl Flux1 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        self.run_with_injector(req, Some(injector), run, on_progress)
+        self.run_with_injector(req, Some(injector), run, false, on_progress)
     }
 
     fn run_with_injector(
@@ -630,9 +645,50 @@ impl Flux1 {
         req: &GenerationRequest,
         injector: Option<&dyn crate::transformer::DitImageInjector>,
         run: &gen_core::RenderRun<'_, '_>,
+        conditioning_started: bool,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        let transformer_window = self.requested_transformer_window(req, injector)?;
+        self.run_with_prepared_injector(
+            req,
+            run,
+            conditioning_started,
+            || Ok(injector),
+            |prepared| *prepared,
+            on_progress,
+        )
+    }
+
+    /// PuLID prepares its owned identity injector only after staged text weights have dropped.
+    /// The same Conditioning phase remains open across that residency handoff.
+    pub fn generate_with_prepared_injector_planned<I: crate::transformer::DitImageInjector>(
+        &self,
+        req: &GenerationRequest,
+        run: &gen_core::RenderRun<'_, '_>,
+        prepare: impl FnOnce() -> Result<I>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.validate(req)?;
+        run.begin_conditioning()?;
+        self.run_with_prepared_injector(
+            req,
+            run,
+            true,
+            prepare,
+            |prepared| Some(prepared),
+            on_progress,
+        )
+    }
+
+    fn run_with_prepared_injector<I>(
+        &self,
+        req: &GenerationRequest,
+        run: &gen_core::RenderRun<'_, '_>,
+        conditioning_started: bool,
+        prepare: impl FnOnce() -> Result<I>,
+        borrow: impl for<'a> Fn(&'a I) -> Option<&'a dyn crate::transformer::DitImageInjector>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let transformer_window = self.requested_transformer_window(req, None)?;
         let streamable = transformer_window.is_some();
         let stage_residency = matches!(self.loaded_spec.offload_policy, OffloadPolicy::Sequential);
         // Staged residency lifecycle (sc-10840): under `Sequential` the seam loads the T5 + CLIP
@@ -645,7 +701,13 @@ impl Flux1 {
             &req.cancel,
             req.use_pid,
             on_progress,
-            |text: &FluxTextOwned| run.encode(|| text.encode(&req.prompt)),
+            |text: &FluxTextOwned| {
+                if conditioning_started {
+                    text.encode(&req.prompt)
+                } else {
+                    run.encode(|| text.encode(&req.prompt))
+                }
+            },
             // Materialize the embeds while the encoders are still alive (Sequential only) — MLX is lazy,
             // so an un-evaluated embed keeps the encoders referenced and the drop would free nothing.
             |encoded| {
@@ -656,6 +718,11 @@ impl Flux1 {
                 Ok(())
             },
             |heavy, (prompt_embeds, pooled_prompt_embeds), on_progress| {
+                let prepared = prepare()?;
+                if conditioning_started {
+                    run.end_conditioning()?;
+                }
+                let injector = borrow(&prepared);
                 let transformer = &heavy.transformer;
                 let block_window = transformer.block_window(
                     transformer_window,
@@ -727,6 +794,7 @@ impl Flux1 {
             true_cfg,
             timestep_to_start_cfg,
             &run,
+            false,
             on_progress,
         )
     }
@@ -753,6 +821,7 @@ impl Flux1 {
             true_cfg,
             timestep_to_start_cfg,
             run,
+            false,
             on_progress,
         )
     }
@@ -767,9 +836,68 @@ impl Flux1 {
         true_cfg: f32,
         timestep_to_start_cfg: usize,
         run: &gen_core::RenderRun<'_, '_>,
+        conditioning_started: bool,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        let transformer_window = self.requested_transformer_window(req, Some(pos_injector))?;
+        self.run_with_prepared_injector_cfg(
+            req,
+            neg_prompt,
+            true_cfg,
+            timestep_to_start_cfg,
+            run,
+            conditioning_started,
+            || Ok((pos_injector, neg_injector)),
+            |prepared| (prepared.0, prepared.1),
+            on_progress,
+        )
+    }
+
+    /// PuLID builds both positive and unconditional identity branches after text weights drop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_prepared_injector_cfg_planned<I: crate::transformer::DitImageInjector>(
+        &self,
+        req: &GenerationRequest,
+        neg_prompt: &str,
+        true_cfg: f32,
+        timestep_to_start_cfg: usize,
+        run: &gen_core::RenderRun<'_, '_>,
+        prepare: impl FnOnce() -> Result<(I, I)>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.validate(req)?;
+        run.begin_conditioning()?;
+        self.run_with_prepared_injector_cfg(
+            req,
+            neg_prompt,
+            true_cfg,
+            timestep_to_start_cfg,
+            run,
+            true,
+            prepare,
+            |prepared| (&prepared.0, &prepared.1),
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_with_prepared_injector_cfg<I>(
+        &self,
+        req: &GenerationRequest,
+        neg_prompt: &str,
+        true_cfg: f32,
+        timestep_to_start_cfg: usize,
+        run: &gen_core::RenderRun<'_, '_>,
+        conditioning_started: bool,
+        prepare: impl FnOnce() -> Result<I>,
+        borrow: impl for<'a> Fn(
+            &'a I,
+        ) -> (
+            &'a dyn crate::transformer::DitImageInjector,
+            &'a dyn crate::transformer::DitImageInjector,
+        ),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let transformer_window = self.requested_transformer_window(req, None)?;
         let streamable = transformer_window.is_some();
         // Staged residency lifecycle (sc-10840): the phase-A encode covers BOTH the positive and
         // negative prompts, so both text encoders drop together before the DiT load under `Sequential`.
@@ -780,11 +908,16 @@ impl Flux1 {
             req.use_pid,
             on_progress,
             |text: &FluxTextOwned| {
-                run.encode(|| {
+                let encode_text = || {
                     let (pos_embeds, pos_pooled) = text.encode(&req.prompt)?;
                     let (neg_embeds, neg_pooled) = text.encode(neg_prompt)?;
                     Ok((pos_embeds, pos_pooled, neg_embeds, neg_pooled))
-                })
+                };
+                if conditioning_started {
+                    encode_text()
+                } else {
+                    run.encode(encode_text)
+                }
             },
             |encoded| {
                 let Some((pos_embeds, pos_pooled, neg_embeds, neg_pooled)) = encoded else {
@@ -794,6 +927,11 @@ impl Flux1 {
                 Ok(())
             },
             |heavy, (pos_embeds, pos_pooled, neg_embeds, neg_pooled), on_progress| {
+                let prepared = prepare()?;
+                if conditioning_started {
+                    run.end_conditioning()?;
+                }
+                let (pos_injector, neg_injector) = borrow(&prepared);
                 let transformer = &heavy.transformer;
                 let block_window = transformer.block_window(
                     transformer_window,

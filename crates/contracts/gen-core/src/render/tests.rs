@@ -187,6 +187,87 @@ impl MemoryRequestScope for Scope {
 }
 
 #[test]
+fn split_conditioning_covers_text_handoff_and_source_preparation_before_denoise() {
+    use std::{cell::RefCell, rc::Rc};
+
+    struct TraceScope(Rc<RefCell<Vec<&'static str>>>);
+    impl MemoryRequestScope for TraceScope {
+        fn configure_request(&mut self, _: &mut GenerationRequest) -> Result<()> {
+            unreachable!()
+        }
+        fn finish(&mut self, _: MemoryRunOutcome) -> Result<()> {
+            unreachable!()
+        }
+        fn enter_phase(&mut self, _: MemoryPhase) -> Result<()> {
+            unreachable!()
+        }
+        fn enter_render_phase(
+            &mut self,
+            phase: MemoryPhase,
+            _: &RenderPhaseIdentity,
+        ) -> Result<()> {
+            self.0.borrow_mut().push(match phase {
+                MemoryPhase::Conditioning => "conditioning-enter",
+                MemoryPhase::Denoise => "denoise-enter",
+                MemoryPhase::Decode => "decode-enter",
+            });
+            Ok(())
+        }
+        fn leave_phase(&mut self, phase: MemoryPhase) -> Result<()> {
+            self.0.borrow_mut().push(match phase {
+                MemoryPhase::Conditioning => "conditioning-leave",
+                MemoryPhase::Denoise => "denoise-leave",
+                MemoryPhase::Decode => "decode-leave",
+            });
+            Ok(())
+        }
+        fn configure_decode(&mut self, _: u32, _: u32, _: MemoryGeometry) -> Result<()> {
+            unreachable!()
+        }
+        fn configure_attention(&mut self, _: u32) -> Result<()> {
+            unreachable!()
+        }
+        fn materialize_transformer_window(&mut self, _: u32, _: u32) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    let request = GenerationRequest::default();
+    let plan = plan(&request).unwrap();
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let mut scope = TraceScope(Rc::clone(&trace));
+    let run = RenderRun::new(&plan, &request.cancel, Some(&mut scope));
+    run.begin_conditioning().unwrap();
+    assert!(run.begin_conditioning().is_err());
+    trace.borrow_mut().push("text-encode");
+    trace.borrow_mut().push("text-drop");
+    trace.borrow_mut().push("source-encode");
+    run.end_conditioning().unwrap();
+    assert!(run.end_conditioning().is_err());
+    run.images(
+        &mut |_| {},
+        |_| Ok::<_, Error>(()),
+        |_, _, _| Ok::<_, Error>(()),
+        |_, _, _| Ok::<_, Error>(()),
+    )
+    .unwrap();
+    assert_eq!(
+        *trace.borrow(),
+        [
+            "conditioning-enter",
+            "text-encode",
+            "text-drop",
+            "source-encode",
+            "conditioning-leave",
+            "denoise-enter",
+            "denoise-leave",
+            "decode-enter",
+            "decode-leave",
+        ]
+    );
+}
+
+#[test]
 fn sequential_images_wrap_seed_and_drive_real_scope_per_operation() {
     let req = GenerationRequest {
         seed: Some(u64::MAX),
