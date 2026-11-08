@@ -245,6 +245,7 @@ fn ip_descriptor(variant: Variant) -> ModelDescriptor {
         Variant::Dev => crate::descriptor_dev(),
         Variant::Schnell => crate::descriptor_schnell(),
     };
+    crate::add_conditioned_native_aliases(&mut descriptor);
     descriptor.id = if variant.is_dev() {
         "flux1_dev_ip_adapter"
     } else {
@@ -743,6 +744,32 @@ mod tests {
         };
         let plan = compile_ip_plan(&paths, &spec, &req, &reference).unwrap();
         assert_eq!(plan.base_seed(), 13);
+        for name in ["flow_match", "flow_match_euler"] {
+            let mut alias = req.clone();
+            alias.sampler = Some(name.into());
+            assert_eq!(
+                compile_ip_plan(&paths, &spec, &alias, &reference)
+                    .unwrap()
+                    .sampler(),
+                name
+            );
+        }
+        for name in ["native", "flow_match", "flow_match_euler"] {
+            let mut alias = req.clone();
+            alias.scheduler = Some(name.into());
+            assert_eq!(
+                compile_ip_plan(&paths, &spec, &alias, &reference)
+                    .unwrap()
+                    .denoise_sigmas(),
+                plan.denoise_sigmas()
+            );
+        }
+        for (sampler, scheduler) in [(Some("unknown"), None), (None, Some("unknown"))] {
+            let mut invalid = req.clone();
+            invalid.sampler = sampler.map(str::to_owned);
+            invalid.scheduler = scheduler.map(str::to_owned);
+            assert!(compile_ip_plan(&paths, &spec, &invalid, &reference).is_err());
+        }
         crate::memory_strategy::assert_conditioned_plan_trace(&plan, &req.cancel);
         reference.pixels[0] ^= 1;
         assert!(plan

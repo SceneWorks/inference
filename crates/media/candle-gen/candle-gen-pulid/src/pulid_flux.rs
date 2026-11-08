@@ -266,6 +266,7 @@ fn validate_pulid_spec(
 
 fn plan_descriptor() -> ModelDescriptor {
     let mut descriptor = candle_gen_flux::descriptor_dev();
+    candle_gen_flux::add_conditioned_native_aliases(&mut descriptor);
     descriptor.id = "pulid_flux";
     descriptor.capabilities.conditioning = vec![ConditioningKind::Reference];
     descriptor.capabilities.max_count = 1;
@@ -920,6 +921,32 @@ mod tests {
         };
         let plan = compile_pulid_plan(&paths, &spec, &req, &reference).unwrap();
         assert_eq!(plan.base_seed(), 17);
+        for name in ["flow_match", "flow_match_euler"] {
+            let mut alias = req.clone();
+            alias.sampler = Some(name.into());
+            assert_eq!(
+                compile_pulid_plan(&paths, &spec, &alias, &reference)
+                    .unwrap()
+                    .sampler(),
+                name
+            );
+        }
+        for name in ["native", "flow_match", "flow_match_euler"] {
+            let mut alias = req.clone();
+            alias.scheduler = Some(name.into());
+            assert_eq!(
+                compile_pulid_plan(&paths, &spec, &alias, &reference)
+                    .unwrap()
+                    .denoise_sigmas(),
+                plan.denoise_sigmas()
+            );
+        }
+        for (sampler, scheduler) in [(Some("unknown"), None), (None, Some("unknown"))] {
+            let mut invalid = req.clone();
+            invalid.sampler = sampler.map(str::to_owned);
+            invalid.scheduler = scheduler.map(str::to_owned);
+            assert!(compile_pulid_plan(&paths, &spec, &invalid, &reference).is_err());
+        }
         let mut trace = PhaseTrace::default();
         let run = RenderRun::new(&plan, &req.cancel, Some(&mut trace));
         run.encode(|| Ok::<_, candle_gen::gen_core::Error>(()))

@@ -407,6 +407,19 @@ fn compile_base_plan(variant: Variant, req: &GenerationRequest) -> gen_core::Res
 
 /// Compile the same native FLUX trajectory for a bespoke conditioned provider. Its descriptor
 /// and full load contract remain owned by that provider; no base txt2img capability is implied.
+pub fn add_conditioned_native_aliases(descriptor: &mut ModelDescriptor) {
+    // Bespoke Control/IP/PuLID routes historically pass these names to the shared flow driver,
+    // where they select Euler over the native FLUX schedule. Keep the registered base menu intact.
+    descriptor.capabilities.samplers = candle_gen::menu_with_aliases(
+        std::mem::take(&mut descriptor.capabilities.samplers),
+        &["flow_match", "flow_match_euler"],
+    );
+    descriptor.capabilities.schedulers = candle_gen::menu_with_aliases(
+        std::mem::take(&mut descriptor.capabilities.schedulers),
+        &["native", "flow_match", "flow_match_euler"],
+    );
+}
+
 pub fn compile_conditioned_plan(
     variant: Variant,
     descriptor: &ModelDescriptor,

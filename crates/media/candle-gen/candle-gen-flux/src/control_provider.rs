@@ -253,6 +253,7 @@ fn validate_control_spec(
 
 fn control_descriptor() -> ModelDescriptor {
     let mut descriptor = crate::descriptor_dev();
+    crate::add_conditioned_native_aliases(&mut descriptor);
     descriptor.id = "flux1_dev_control";
     descriptor.control_kinds = Some(candle_gen::gen_core::AcceptedControlKinds::Only(vec![
         ControlKind::Pose,
@@ -825,6 +826,32 @@ mod tests {
         let plan = compile_control_plan(&paths, &spec, &req, &image).unwrap();
         assert_eq!(plan.denoise_sigmas().len(), 5);
         assert_eq!(plan.base_seed(), 11);
+        for name in ["flow_match", "flow_match_euler"] {
+            let mut alias = req.clone();
+            alias.sampler = Some(name.into());
+            assert_eq!(
+                compile_control_plan(&paths, &spec, &alias, &image)
+                    .unwrap()
+                    .sampler(),
+                name
+            );
+        }
+        for name in ["native", "flow_match", "flow_match_euler"] {
+            let mut alias = req.clone();
+            alias.scheduler = Some(name.into());
+            assert_eq!(
+                compile_control_plan(&paths, &spec, &alias, &image)
+                    .unwrap()
+                    .denoise_sigmas(),
+                plan.denoise_sigmas()
+            );
+        }
+        for (sampler, scheduler) in [(Some("unknown"), None), (None, Some("unknown"))] {
+            let mut invalid = req.clone();
+            invalid.sampler = sampler.map(str::to_owned);
+            invalid.scheduler = scheduler.map(str::to_owned);
+            assert!(compile_control_plan(&paths, &spec, &invalid, &image).is_err());
+        }
         crate::memory_strategy::assert_conditioned_plan_trace(&plan, &req.cancel);
         plan.check_load(&RenderLoadBinding::from_spec(&spec))
             .unwrap();
