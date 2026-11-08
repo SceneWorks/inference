@@ -23,6 +23,20 @@ def put(root, relative, content=b"fixed"):
 
 
 class ConditionalAssetInventory(unittest.TestCase):
+    def test_nvidia_pid_snapshot_decoder_is_discovered(self):
+        with TemporaryDirectory() as tmp:
+            hub = Path(tmp) / "hub"
+            hub.mkdir()
+            decoder = put(hub, "models--nvidia--PiD/snapshots/" + "a" * 40 +
+                          "/flux_2k.safetensors", b"decoder")
+            result = assets.inventory(hub, "nax-macos-2")
+            row = result["roles"]["pid_decoder"]["candidates"][0]
+            self.assertEqual(result["roles"]["pid_decoder"]["status"], "unique")
+            self.assertEqual(row["path"], str(decoder.resolve()))
+            self.assertEqual(row["sha256"], hashlib.sha256(b"decoder").hexdigest())
+            self.assertEqual(row["revision"], "a" * 40)
+            self.assertEqual(result["search_roots"], ["models--nvidia--PiD/snapshots"])
+
     def test_unrelated_hub_tree_is_skipped_and_scan_reports_progress(self):
         with TemporaryDirectory() as tmp:
             hub = Path(tmp) / "hub"

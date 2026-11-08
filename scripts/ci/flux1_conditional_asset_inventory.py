@@ -28,7 +28,7 @@ MAX_GEMMA_FILES = 5_000
 MAX_HASH_BYTES = 120 * 1024**3
 MAX_SECONDS = 1_200
 SHA = re.compile(r"[0-9a-f]{40}")
-SOURCE_MARKERS = ("flux.1", "flux1", "flux-ip", "pid-flux", "pulid", "controlnet-union-pro",
+SOURCE_MARKERS = ("flux.1", "flux1", "flux-ip", "pid-flux", "models--nvidia--pid", "pulid", "controlnet-union-pro",
                   "clip-vit-large-patch14", "gemma-2-2b-it", "eva", "face", "antelope",
                   "facexlib", "insightface", "instantid")
 LOOSE_ROOTS = {"flux1", "flux.1", "pulid", "pid", "face", "converted", "conditional-assets"}
