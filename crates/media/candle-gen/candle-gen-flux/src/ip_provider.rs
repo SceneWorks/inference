@@ -16,12 +16,16 @@
 //! registered `flux1_*` descriptors stay txt2img-only.
 
 use candle_core::{DType, Device, Tensor};
-use candle_transformers::models::flux::sampling::{get_schedule, State};
+use candle_transformers::models::flux::sampling::State;
 use std::path::{Path, PathBuf};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{AdapterSpec, GenerationMemory, Image, PreviewSink, Progress};
+use candle_gen::gen_core::{
+    AdapterSpec, Conditioning, ConditioningKind, GenerationMemory, GenerationRequest, Image,
+    LoadSpec, ModelDescriptor, PreviewSink, Progress, RenderLoadBinding, RenderPlan, RenderRun,
+    WeightsSource,
+};
 use candle_gen::preview::PreviewHook;
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
@@ -29,7 +33,6 @@ use candle_gen::{CandleError, Result};
 use crate::flux1_load;
 use crate::ip_adapter::{FluxIpAdapter, FluxIpInjector};
 use crate::ip_image_encoder::FluxIpImageEncoder;
-use crate::pipeline::{flow_mu, BASE_SHIFT, MAX_SHIFT};
 use crate::ref_backbone::{FluxRefBackbone, FluxRefHeavy};
 use crate::Variant;
 
@@ -49,6 +52,7 @@ pub const DEFAULT_IP_SCALE: f32 = 0.7;
 use crate::SIZE_MULTIPLE;
 
 /// Paths to the FLUX IP-Adapter checkpoints.
+#[derive(Clone)]
 pub struct IpAdapterFluxPaths {
     /// The black-forest-labs FLUX.1 snapshot dir (`flux1-{dev,schnell}.safetensors`, `ae.safetensors`,
     /// `text_encoder/`, `text_encoder_2/`, `tokenizer_2/`). The variant is detected from which DiT file
@@ -187,6 +191,100 @@ pub struct IpAdapterFlux {
     backbone: FluxRefBackbone,
     ip_encoder: FluxIpImageEncoder,
     adapter: FluxIpAdapter,
+    loaded_paths: IpAdapterFluxPaths,
+    loaded_spec: LoadSpec,
+}
+
+fn validate_ip_spec(
+    paths: &IpAdapterFluxPaths,
+    spec: &LoadSpec,
+) -> candle_gen::gen_core::Result<()> {
+    if spec.weights != WeightsSource::Dir(paths.flux_base.clone())
+        || spec.ip_adapter != Some(WeightsSource::File(paths.ip_adapter.clone()))
+        || !matches!(spec.components.get("flux_ip_image_encoder"), Some(WeightsSource::Dir(path) | WeightsSource::File(path)) if *path == paths.image_encoder)
+        || spec.components.len() != 1
+        || spec.adapters != paths.adapters
+        || spec.control.is_some()
+        || !spec.extra_controls.is_empty()
+        || spec.identity.is_some()
+        || spec.pid.is_some()
+        || spec.text_encoder.is_some()
+        || spec.quantize.is_some()
+        || spec.precision != candle_gen::gen_core::Precision::Bf16
+    {
+        return Err(candle_gen::gen_core::Error::Unsupported(
+            "FLUX.1 IP load contract differs from resolved paths".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ip_descriptor(variant: Variant) -> ModelDescriptor {
+    let mut descriptor = match variant {
+        Variant::Dev => crate::descriptor_dev(),
+        Variant::Schnell => crate::descriptor_schnell(),
+    };
+    descriptor.id = if variant.is_dev() {
+        "flux1_dev_ip_adapter"
+    } else {
+        "flux1_schnell_ip_adapter"
+    };
+    descriptor.capabilities.conditioning = vec![ConditioningKind::Reference];
+    descriptor.capabilities.max_count = 1;
+    descriptor
+}
+
+fn typed_ip_request(
+    req: &IpAdapterFluxRequest,
+    reference: &Image,
+    variant: Variant,
+) -> candle_gen::gen_core::Result<GenerationRequest> {
+    let steps = u32::try_from(req.steps).map_err(|_| {
+        candle_gen::gen_core::Error::Unsupported("FLUX.1 IP step count exceeds u32".into())
+    })?;
+    Ok(GenerationRequest {
+        prompt: req.prompt.clone(),
+        width: req.width,
+        height: req.height,
+        count: 1,
+        steps: Some(steps),
+        seed: Some(req.seed),
+        guidance: variant.supports_guidance().then_some(req.guidance),
+        sampler: req.sampler.clone(),
+        scheduler: req.scheduler.clone(),
+        scheduler_shift: req.scheduler_shift,
+        conditioning: vec![Conditioning::Reference {
+            image: reference.clone(),
+            strength: Some(req.ip_adapter_scale),
+        }],
+        memory: Some(req.memory),
+        preview: req.preview.clone(),
+        cancel: req.cancel.clone(),
+        ..Default::default()
+    })
+}
+
+/// Freeze the XLabs reference, encoder, adapter, variant and native trajectory before load.
+pub fn compile_ip_plan(
+    paths: &IpAdapterFluxPaths,
+    spec: &LoadSpec,
+    req: &IpAdapterFluxRequest,
+    reference: &Image,
+) -> candle_gen::gen_core::Result<RenderPlan> {
+    validate_ip_spec(paths, spec)?;
+    let variant = detect_variant(&paths.flux_base)
+        .map_err(|error| candle_gen::gen_core::Error::Unsupported(error.to_string()))?;
+    let typed = typed_ip_request(req, reference, variant)?;
+    let descriptor = ip_descriptor(variant);
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, &typed)?;
+    validate_request(req)
+        .map_err(|error| candle_gen::gen_core::Error::Unsupported(error.to_string()))?;
+    if req.cancel.is_cancelled() {
+        return Err(candle_gen::gen_core::Error::Canceled);
+    }
+    crate::compile_conditioned_plan(variant, &descriptor, spec, &typed)
 }
 
 impl IpAdapterFlux {
@@ -197,6 +295,24 @@ impl IpAdapterFlux {
     }
 
     pub fn load_with_memory(paths: &IpAdapterFluxPaths, memory: GenerationMemory) -> Result<Self> {
+        let encoder = if paths.image_encoder.is_dir() {
+            WeightsSource::Dir(paths.image_encoder.clone())
+        } else {
+            WeightsSource::File(paths.image_encoder.clone())
+        };
+        let spec = LoadSpec::new(WeightsSource::Dir(paths.flux_base.clone()))
+            .with_ip_adapter(WeightsSource::File(paths.ip_adapter.clone()))
+            .with_component("flux_ip_image_encoder", encoder)
+            .with_adapters(paths.adapters.clone());
+        Self::load_with_memory_spec(paths, memory, &spec)
+    }
+
+    pub fn load_with_memory_spec(
+        paths: &IpAdapterFluxPaths,
+        memory: GenerationMemory,
+        spec: &LoadSpec,
+    ) -> Result<Self> {
+        validate_ip_spec(paths, spec)?;
         let device = candle_gen::default_device()?;
         let dtype = DTYPE;
         let root = paths.flux_base.clone();
@@ -245,6 +361,8 @@ impl IpAdapterFlux {
             backbone,
             ip_encoder,
             adapter,
+            loaded_paths: paths.clone(),
+            loaded_spec: spec.clone(),
         })
     }
 
@@ -256,6 +374,21 @@ impl IpAdapterFlux {
         reference: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        let plan = compile_ip_plan(&self.loaded_paths, &self.loaded_spec, req, reference)?;
+        self.generate_planned(req, reference, &plan, on_progress)
+    }
+
+    pub fn generate_planned(
+        &self,
+        req: &IpAdapterFluxRequest,
+        reference: &Image,
+        plan: &RenderPlan,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let typed = typed_ip_request(req, reference, self.variant)?;
+        plan.check_request(&ip_descriptor(self.variant), &typed)?;
+        plan.check_load(&RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        let run = RenderRun::new(plan, &req.cancel, None);
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -264,18 +397,21 @@ impl IpAdapterFlux {
         // Conditioning: text (T5 seq + CLIP pooled) and the reference image tokens (computed once).
         self.backbone
             .validate_native_vae_request(false, &req.cancel)?;
-        let (t5_emb, clip_emb) = self.backbone.encode_text_with_memory_and_progress(
-            &req.prompt,
-            &req.cancel,
-            on_progress,
-        )?;
-        candle_gen::check_cancel(&req.cancel)?;
-        let embeds = self
-            .ip_encoder
-            .image_embeds(reference)?
-            .to_dtype(self.dtype)?;
-        candle_gen::check_cancel(&req.cancel)?;
-        let tokens = self.adapter.tokens(&embeds)?;
+        let (t5_emb, clip_emb, tokens) = run.encode(|| {
+            let (t5, clip) = self.backbone.encode_text_with_memory_and_progress(
+                &req.prompt,
+                &req.cancel,
+                on_progress,
+            )?;
+            candle_gen::check_cancel(&req.cancel)?;
+            let embeds = self
+                .ip_encoder
+                .image_embeds(reference)?
+                .to_dtype(self.dtype)?;
+            candle_gen::check_cancel(&req.cancel)?;
+            let tokens = self.adapter.tokens(&embeds)?;
+            Ok::<_, CandleError>((t5, clip, tokens))
+        })?;
         let injector = FluxIpInjector::new(&self.adapter, tokens, req.ip_adapter_scale as f64);
         let heavy = self.backbone.load_heavy(&req.cancel)?;
 
@@ -283,54 +419,56 @@ impl IpAdapterFlux {
         // deterministic, launch-portable CPU-seeded initial noise (shared FLUX.1 helper, sc-9003).
         let lat_h = (req.height as usize).div_ceil(16) * 2;
         let lat_w = (req.width as usize).div_ceil(16) * 2;
-        let noise = flux1_load::seeded_noise(
-            req.seed,
-            LATENT_CHANNELS,
-            lat_h,
-            lat_w,
-            &self.device,
-            self.dtype,
-        )?;
-
-        let state = State::new(&t5_emb, &clip_emb, &noise)?;
-        let timesteps = if self.variant.is_dev() {
-            get_schedule(req.steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)))
-        } else {
-            get_schedule(req.steps, None)
-        };
-        let guidance: f64 = if self.variant.supports_guidance() {
-            req.guidance as f64
-        } else {
-            0.0
-        };
-
-        // Per-step latent preview (epic 16948, sc-16956), bound to the SAME `(width, height)` the
-        // decode below is given. The XLabs reference tokens are injected inside the DiT forward and
-        // never join the running latent, so the strip shows the target image alone.
-        let preview = crate::preview::hook(&req.preview, req.width, req.height);
-        let latents = self.denoise(
-            req,
-            &state,
-            &timesteps,
-            guidance,
-            &injector,
-            heavy.as_ref(),
-            req.seed,
-            &preview,
-            &req.cancel,
+        let images = run.images_with_denoise_phases(
             on_progress,
+            |seed| {
+                flux1_load::seeded_noise(
+                    seed,
+                    LATENT_CHANNELS,
+                    lat_h,
+                    lat_w,
+                    &self.device,
+                    self.dtype,
+                )
+            },
+            |seed, noise, on_progress| {
+                run.begin_denoise_phase(0)?;
+                let state = State::new(&t5_emb, &clip_emb, &noise)?;
+                if state.img.dim(1)? != plan.packed_tokens() {
+                    return Err(CandleError::Msg(
+                        "FLUX.1 IP packed geometry changed after planning".into(),
+                    ));
+                }
+                let preview = crate::preview::hook(&req.preview, req.width, req.height);
+                self.denoise(
+                    req,
+                    &state,
+                    plan,
+                    &run,
+                    &injector,
+                    heavy.as_ref(),
+                    seed,
+                    &preview,
+                    &req.cancel,
+                    on_progress,
+                )
+            },
+            |_, latents, on_progress| {
+                on_progress(Progress::Decoding);
+                self.backbone.decode_with_memory(
+                    heavy.as_ref(),
+                    &latents,
+                    req.height as usize,
+                    req.width as usize,
+                    None,
+                    &req.cancel,
+                )
+            },
         )?;
-        on_progress(Progress::Decoding);
-        // IP-Adapter lane does not carry a PiD decoder (base txt2img is the shipping PiD path, epic 7840
-        // / sc-7853); native FLUX VAE decode.
-        self.backbone.decode_with_memory(
-            heavy.as_ref(),
-            &latents,
-            req.height as usize,
-            req.width as usize,
-            None,
-            &req.cancel,
-        )
+        images
+            .into_iter()
+            .next()
+            .ok_or_else(|| CandleError::Msg("FLUX.1 IP plan produced no image".into()))
     }
 
     /// The flow-match denoise with the XLabs IP injector, routed through the unified curated
@@ -347,10 +485,10 @@ impl IpAdapterFlux {
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
-        req: &IpAdapterFluxRequest,
+        _req: &IpAdapterFluxRequest,
         state: &State,
-        timesteps: &[f64],
-        guidance: f64,
+        render_plan: &RenderPlan,
+        run: &RenderRun<'_, '_>,
         injector: &FluxIpInjector,
         heavy: Option<&FluxRefHeavy>,
         seed: u64,
@@ -360,19 +498,7 @@ impl IpAdapterFlux {
     ) -> Result<Tensor> {
         candle_gen::check_cancel(cancel)?;
         let b_sz = state.img.dim(0)?;
-        let guidance_t = Tensor::full(guidance as f32, b_sz, &self.device)?;
-        // Native schedule = candle's verbatim `get_schedule(..)` (f32 descending, trailing 0.0); the
-        // IP request exposes no curated knob, so this defaults to the byte-exact native flow path.
-        let native: Vec<f32> = timesteps.iter().map(|&t| t as f32).collect();
-        let mu = flow_mu(self.variant, state.img.dim(1)?);
-        let steps = native.len().saturating_sub(1);
-        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-            req.scheduler.as_deref(),
-            req.scheduler_shift,
-            mu,
-            steps,
-            &native,
-        )?;
+        let guidance_t = Tensor::full(render_plan.guidance(), b_sz, &self.device)?;
         let prepared = self.backbone.prepare_conditioning(
             heavy,
             &state.img,
@@ -380,10 +506,13 @@ impl IpAdapterFlux {
             &state.txt,
             &state.txt_ids,
         )?;
-        candle_gen::run_flow_sampler(
-            req.sampler.as_deref(),
+        candle_gen::run_flow_sampler_spans(
+            Some(render_plan.sampler()),
             TimestepConvention::Sigma,
-            &sigmas,
+            render_plan.denoise_sigmas(),
+            &render_plan.denoise_spans(),
+            Some(run),
+            true,
             state.img.clone(),
             seed,
             cancel,
@@ -448,6 +577,58 @@ fn validate_request(req: &IpAdapterFluxRequest) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ip_plan_binds_reference_and_encoder_before_loading_weights() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(Variant::Dev.transformer_file()),
+            b"header only",
+        )
+        .unwrap();
+        let paths = IpAdapterFluxPaths {
+            flux_base: root.path().to_path_buf(),
+            ip_adapter: "/missing/ip.safetensors".into(),
+            image_encoder: "/missing/clip".into(),
+            adapters: Vec::new(),
+        };
+        let spec = LoadSpec::new(WeightsSource::Dir(paths.flux_base.clone()))
+            .with_ip_adapter(WeightsSource::File(paths.ip_adapter.clone()))
+            .with_component(
+                "flux_ip_image_encoder",
+                WeightsSource::Dir(paths.image_encoder.clone()),
+            );
+        let req = IpAdapterFluxRequest {
+            prompt: "a portrait".into(),
+            width: 512,
+            height: 512,
+            steps: 4,
+            seed: 13,
+            ..Default::default()
+        };
+        let mut reference = Image {
+            width: 16,
+            height: 16,
+            pixels: vec![3; 16 * 16 * 3],
+        };
+        let plan = compile_ip_plan(&paths, &spec, &req, &reference).unwrap();
+        assert_eq!(plan.base_seed(), 13);
+        reference.pixels[0] ^= 1;
+        assert!(plan
+            .check_request(
+                &ip_descriptor(Variant::Dev),
+                &typed_ip_request(&req, &reference, Variant::Dev).unwrap()
+            )
+            .is_err());
+        let mut changed = spec.clone();
+        changed.components.insert(
+            "flux_ip_image_encoder".into(),
+            WeightsSource::Dir("/other/clip".into()),
+        );
+        assert!(plan
+            .check_load(&RenderLoadBinding::from_spec(&changed))
+            .is_err());
+    }
 
     /// The empty-prompt guard (sc-9171, the sc-8646 bug class): an empty or whitespace-only prompt is
     /// a clean validation error — never a degenerate all-pad T5 / bare CLIP encode — while a real

@@ -303,6 +303,19 @@ fn plan_freezes_schedule_decode_count_and_preparation_inputs() {
     assert!(plan
         .check_load(&RenderLoadBinding::from_spec(&changed_policy))
         .is_err());
+    let mut changed_component = spec.clone();
+    changed_component.components.insert(
+        "flux_ip_image_encoder".into(),
+        WeightsSource::Dir("/fixture/encoder".into()),
+    );
+    assert!(plan
+        .check_load(&RenderLoadBinding::from_spec(&changed_component))
+        .is_err());
+    let mut changed_shape = spec.clone();
+    changed_shape.load_shape = crate::LoadShape::DeferredMaterialization;
+    assert!(plan
+        .check_load(&RenderLoadBinding::from_spec(&changed_shape))
+        .is_err());
 }
 
 #[test]

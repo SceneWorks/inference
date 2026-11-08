@@ -405,6 +405,37 @@ fn compile_base_plan(variant: Variant, req: &GenerationRequest) -> gen_core::Res
     )
 }
 
+/// Compile the same native FLUX trajectory for a bespoke conditioned provider. Its descriptor
+/// and full load contract remain owned by that provider; no base txt2img capability is implied.
+pub fn compile_conditioned_plan(
+    variant: Variant,
+    descriptor: &ModelDescriptor,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<RenderPlan> {
+    let sigmas = pipeline::base_schedule(variant, req)?;
+    let executed_steps = sigmas.len().saturating_sub(1);
+    let guidance = if variant.supports_guidance() {
+        req.guidance.unwrap_or(variant.default_guidance())
+    } else {
+        0.0
+    };
+    RenderPlan::packed_image_trajectory(
+        descriptor,
+        req,
+        gen_core::render::PackedImagePass {
+            pixel_stride: SIZE_MULTIPLE,
+            token_width: 64,
+            sampler: req.sampler.as_deref().unwrap_or("euler"),
+            guidance,
+            sigmas,
+            executed_steps,
+            capture_sigma: 0.0,
+        },
+    )
+    .map(|plan| plan.bind_load(spec))
+}
+
 fn compile_schnell_plan(
     spec: &LoadSpec,
     req: &GenerationRequest,

@@ -179,11 +179,15 @@ pub struct RenderLoadBinding {
     quant: Option<crate::Quant>,
     precision: crate::Precision,
     sequential_offload: bool,
+    deferred_materialization: bool,
+    load_shape_declaration: String,
     adapters: Vec<crate::AdapterSpec>,
     control: Option<crate::WeightsSource>,
     extra_controls: Vec<crate::WeightsSource>,
     ip_adapter: Option<crate::WeightsSource>,
     identity: Option<[Option<crate::WeightsSource>; 3]>,
+    text_encoder: Option<crate::WeightsSource>,
+    components: std::collections::BTreeMap<String, crate::WeightsSource>,
     pid: Option<crate::PidWeights>,
 }
 
@@ -195,6 +199,11 @@ impl RenderLoadBinding {
             quant: spec.quantize,
             precision: spec.precision,
             sequential_offload: matches!(spec.offload_policy, crate::OffloadPolicy::Sequential),
+            deferred_materialization: matches!(
+                spec.load_shape,
+                crate::LoadShape::DeferredMaterialization
+            ),
+            load_shape_declaration: format!("{:?}", spec.load_shape_declaration_result),
             adapters: spec.adapters.clone(),
             control: spec.control.clone(),
             extra_controls: spec.extra_controls.clone(),
@@ -206,6 +215,8 @@ impl RenderLoadBinding {
                     identity.face_dir.clone(),
                 ]
             }),
+            text_encoder: spec.text_encoder.clone(),
+            components: spec.components.clone(),
             pid: spec.pid.clone(),
         }
     }
@@ -369,7 +380,8 @@ impl RenderPlan {
         }
         Ok(())
     }
-    pub(crate) fn bind_load(mut self, spec: &LoadSpec) -> Self {
+    /// Freeze the exact load contract for a direct provider that is not registry loaded.
+    pub fn bind_load(mut self, spec: &LoadSpec) -> Self {
         self.preparation = Some(RenderLoadBinding::from_spec(spec));
         self
     }
