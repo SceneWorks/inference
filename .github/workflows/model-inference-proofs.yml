@@ -13,7 +13,7 @@ on:
       flux1_pair:
         description: Compare the FLUX.1 batch against its pre-migration source in this same job
         type: choice
-        options: [none, tier1, tier2]
+        options: [none, tier1, tier2, conditional-tier1]
         default: none
       request:
         description: 'JSON with registered selection and explicit supervisor policy; optional runner="nax" for provisioned assets'
@@ -22,7 +22,7 @@ on:
 
 env:
   FLUX1_PAIR_TIER: ${{ inputs.flux1_pair }}
-  MODEL_PROOF_SCRIPT: ${{ (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2') && 'flux1_comparison.py' || 'model_inference_proofs.py' }}
+  MODEL_PROOF_SCRIPT: ${{ inputs.flux1_pair == 'conditional-tier1' && 'flux1_conditional_comparison.py' || (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2') && 'flux1_comparison.py' || 'model_inference_proofs.py' }}
 
 permissions:
   contents: read

@@ -67,7 +67,7 @@ class ModelWorkflowRoutes(unittest.TestCase):
         self.assertEqual(set(events), {'workflow_dispatch'})
         inputs = events['workflow_dispatch']['inputs']
         self.assertEqual(set(inputs), {'backend', 'request', 'flux1_pair'})
-        self.assertEqual(inputs['flux1_pair']['options'], ['none', 'tier1', 'tier2'])
+        self.assertEqual(inputs['flux1_pair']['options'], ['none', 'tier1', 'tier2', 'conditional-tier1'])
         self.assertEqual(inputs['flux1_pair']['default'], 'none')
         self.assertNotIn('concurrency', proof)
         bridge = document('real-weights.yml')
