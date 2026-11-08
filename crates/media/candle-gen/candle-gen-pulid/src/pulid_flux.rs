@@ -30,8 +30,8 @@ use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{
     Conditioning, ConditioningKind, GenerationMemory, GenerationRequest, IdentityWeights, Image,
-    LoadSpec, MemoryProviderContract, MemoryRunContext, ModelDescriptor, PidWeights, PreviewSink,
-    Progress, RenderLoadBinding, RenderPlan, RenderRun, WeightsSource,
+    LoadSpec, MemoryProviderContract, MemoryRunContext, MemoryRunOutcome, ModelDescriptor,
+    PidWeights, PreviewSink, Progress, RenderLoadBinding, RenderPlan, RenderRun, WeightsSource,
 };
 use candle_gen::preview::PreviewHook;
 use candle_gen::weights::Weights;
@@ -613,9 +613,25 @@ impl PulidFlux {
         crate::memory_strategy::validate_context_from_loaded(contract, context)
             .map_err(|error| CandleError::Msg(error.to_string()))?;
         self.check_plan(req, reference, plan)?;
-        let run = RenderRun::new(plan, &req.cancel, None);
+        let mut scope = candle_gen_flux::memory_strategy::reference_backbone_request_scope(
+            "pulid_flux",
+            self.device.clone(),
+            contract,
+            context,
+        );
+        let run = RenderRun::new(plan, &req.cancel, Some(scope.as_mut()));
         let result = self.generate_inner(req, reference, plan, &run, on_progress);
-        let synchronized = self.device.synchronize().map_err(CandleError::Candle);
+        drop(run);
+        let outcome = match &result {
+            Ok(_) => MemoryRunOutcome::Complete,
+            Err(CandleError::Canceled) => MemoryRunOutcome::Canceled,
+            Err(error) => MemoryRunOutcome::Error {
+                message: error.to_string(),
+            },
+        };
+        let synchronized = scope
+            .finish(outcome)
+            .map_err(|error| CandleError::Msg(error.to_string()));
         match (result, synchronized) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
@@ -814,7 +830,71 @@ fn validate_request_geometry(
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct PhaseTrace(Vec<(bool, candle_gen::gen_core::MemoryPhase)>);
+
+    impl candle_gen::gen_core::MemoryRequestScope for PhaseTrace {
+        fn configure_request(
+            &mut self,
+            _: &mut GenerationRequest,
+        ) -> candle_gen::gen_core::Result<()> {
+            unreachable!()
+        }
+        fn enter_phase(
+            &mut self,
+            _: candle_gen::gen_core::MemoryPhase,
+        ) -> candle_gen::gen_core::Result<()> {
+            unreachable!()
+        }
+        fn enter_render_phase(
+            &mut self,
+            phase: candle_gen::gen_core::MemoryPhase,
+            identity: &candle_gen::gen_core::render::RenderPhaseIdentity,
+        ) -> candle_gen::gen_core::Result<()> {
+            assert_eq!((identity.pass, identity.phase), (0, 0));
+            assert_eq!(
+                (
+                    identity.geometry.batch,
+                    identity.geometry.frames,
+                    identity.geometry.reference_count
+                ),
+                (1, 1, 1)
+            );
+            self.0.push((true, phase));
+            Ok(())
+        }
+        fn leave_phase(
+            &mut self,
+            phase: candle_gen::gen_core::MemoryPhase,
+        ) -> candle_gen::gen_core::Result<()> {
+            self.0.push((false, phase));
+            Ok(())
+        }
+        fn configure_decode(
+            &mut self,
+            _: u32,
+            _: u32,
+            _: candle_gen::gen_core::MemoryGeometry,
+        ) -> candle_gen::gen_core::Result<()> {
+            unreachable!()
+        }
+        fn configure_attention(&mut self, _: u32) -> candle_gen::gen_core::Result<()> {
+            unreachable!()
+        }
+        fn materialize_transformer_window(
+            &mut self,
+            _: u32,
+            _: u32,
+        ) -> candle_gen::gen_core::Result<()> {
+            unreachable!()
+        }
+        fn finish(&mut self, _: MemoryRunOutcome) -> candle_gen::gen_core::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
+    #[allow(clippy::drop_non_drop)]
     fn pulid_plan_binds_face_identity_and_pid_before_weights() {
         let paths = PulidFluxPaths {
             flux_base: "/missing/flux-dev".into(),
@@ -839,6 +919,34 @@ mod tests {
         };
         let plan = compile_pulid_plan(&paths, &spec, &req, &reference).unwrap();
         assert_eq!(plan.base_seed(), 17);
+        let mut trace = PhaseTrace::default();
+        let run = RenderRun::new(&plan, &req.cancel, Some(&mut trace));
+        run.encode(|| Ok::<_, candle_gen::gen_core::Error>(()))
+            .unwrap();
+        run.images_with_denoise_phases(
+            &mut |_| {},
+            |_| Ok::<_, candle_gen::gen_core::Error>(()),
+            |_, _, _| {
+                run.begin_denoise_phase(0)?;
+                run.end_denoise_phase(0)?;
+                Ok::<_, candle_gen::gen_core::Error>(())
+            },
+            |_, _, _| Ok::<_, candle_gen::gen_core::Error>(()),
+        )
+        .unwrap();
+        drop(run);
+        use candle_gen::gen_core::MemoryPhase;
+        assert_eq!(
+            trace.0,
+            vec![
+                (true, MemoryPhase::Conditioning),
+                (false, MemoryPhase::Conditioning),
+                (true, MemoryPhase::Denoise),
+                (false, MemoryPhase::Denoise),
+                (true, MemoryPhase::Decode),
+                (false, MemoryPhase::Decode),
+            ]
+        );
         reference.pixels[0] ^= 1;
         assert!(plan
             .check_request(

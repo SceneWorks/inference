@@ -40,8 +40,9 @@ use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{
     AdapterSpec, Conditioning, ControlKind, GenerationMemory, GenerationRequest, Image, LoadSpec,
-    ModelDescriptor, PreviewSink, Progress, RenderLoadBinding, RenderPlan, RenderRun,
-    WeightsSource,
+    MemoryGeometry, MemoryMode, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemoryRunOutcome, ModelDescriptor, PreviewSink, Progress, RenderLoadBinding, RenderPlan,
+    RenderRun, WeightsSource,
 };
 use candle_gen::preview::PreviewHook;
 use candle_gen::{CandleError, Result};
@@ -206,6 +207,25 @@ pub struct Flux1DevControl {
     branch: FluxControlNet,
     loaded_paths: Flux1ControlPaths,
     loaded_spec: LoadSpec,
+    memory_contract: Option<MemoryProviderContract>,
+    admitted_context: Option<MemoryRunContext>,
+}
+
+fn validate_control_memory_context(context: &MemoryRunContext) -> Result<()> {
+    if context.mode != MemoryMode::TextToImage
+        || context.overlay.as_deref() != Some("control")
+        || !context.has_reference
+        || context.use_pid
+        || context.has_phases
+        || context.geometry.batch != 1
+        || context.geometry.frames != 1
+        || context.geometry.reference_count != 1
+    {
+        return Err(CandleError::Msg(
+            "FLUX.1 ControlNet memory context is not one text-to-image control request".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_control_spec(
@@ -330,6 +350,35 @@ impl Flux1DevControl {
         memory: GenerationMemory,
         spec: &LoadSpec,
     ) -> Result<Self> {
+        Self::load_internal(paths, memory, None, None, spec)
+    }
+
+    pub fn load_with_memory_context_spec(
+        paths: &Flux1ControlPaths,
+        context: MemoryRunContext,
+        spec: &LoadSpec,
+    ) -> Result<Self> {
+        validate_control_spec(paths, spec).map_err(|error| CandleError::Msg(error.to_string()))?;
+        validate_control_memory_context(&context)?;
+        let contract = crate::memory_strategy::provider_contract("flux1_dev", spec)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let tier = crate::memory_strategy::resolved_numeric_tier(spec, "flux1_dev")
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        crate::memory_strategy::validate_context(&contract, &context, tier.quant)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let memory = contract
+            .generation_memory(&context.selection)
+            .unwrap_or_default();
+        Self::load_internal(paths, memory, Some(contract), Some(context), spec)
+    }
+
+    fn load_internal(
+        paths: &Flux1ControlPaths,
+        memory: GenerationMemory,
+        memory_contract: Option<MemoryProviderContract>,
+        admitted_context: Option<MemoryRunContext>,
+        spec: &LoadSpec,
+    ) -> Result<Self> {
         validate_control_spec(paths, spec).map_err(|error| CandleError::Msg(error.to_string()))?;
         let device = candle_gen::default_device()?;
         let dtype = DTYPE;
@@ -361,6 +410,8 @@ impl Flux1DevControl {
             branch,
             loaded_paths: paths.clone(),
             loaded_spec: spec.clone(),
+            memory_contract,
+            admitted_context,
         })
     }
 
@@ -409,10 +460,119 @@ impl Flux1DevControl {
         plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        if self.admitted_context.is_some() {
+            return Err(CandleError::Msg(
+                "FLUX.1 ControlNet admitted model requires a memory context".into(),
+            ));
+        }
+        self.generate_with_injector_planned_scoped(
+            req,
+            control_image,
+            injector,
+            plan,
+            None,
+            on_progress,
+        )
+    }
+
+    pub fn generate_with_memory_context_planned(
+        &self,
+        context: &MemoryRunContext,
+        req: &Flux1ControlRequest,
+        control_image: &Image,
+        plan: &RenderPlan,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        self.generate_with_injector_memory_context_planned(
+            context,
+            req,
+            control_image,
+            None,
+            plan,
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_injector_memory_context_planned(
+        &self,
+        context: &MemoryRunContext,
+        req: &Flux1ControlRequest,
+        control_image: &Image,
+        injector: Option<&dyn DitImageInjector>,
+        plan: &RenderPlan,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let admitted = self.admitted_context.as_ref().ok_or_else(|| {
+            CandleError::Msg("FLUX.1 ControlNet model has no admitted memory context".into())
+        })?;
+        let contract = self.memory_contract.as_ref().ok_or_else(|| {
+            CandleError::Msg("FLUX.1 ControlNet model lost its memory contract".into())
+        })?;
+        validate_control_memory_context(context)?;
+        if admitted != context
+            || context.geometry
+                != (MemoryGeometry {
+                    width: req.width,
+                    height: req.height,
+                    batch: 1,
+                    frames: 1,
+                    reference_count: 1,
+                })
+            || req.memory != self.memory
+        {
+            return Err(CandleError::Msg(
+                "FLUX.1 ControlNet request changed after memory admission".into(),
+            ));
+        }
+        contract
+            .validate_selection(&context.selection)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let mut scope = crate::memory_strategy::FluxMemoryScope::new(
+            "flux1_dev_control",
+            self.device.clone(),
+            contract,
+            context,
+        );
+        let result = self.generate_with_injector_planned_scoped(
+            req,
+            control_image,
+            injector,
+            plan,
+            Some(&mut scope),
+            on_progress,
+        );
+        let outcome = match &result {
+            Ok(_) => MemoryRunOutcome::Complete,
+            Err(CandleError::Canceled) => MemoryRunOutcome::Canceled,
+            Err(error) => MemoryRunOutcome::Error {
+                message: error.to_string(),
+            },
+        };
+        let cleanup = scope
+            .finish(outcome)
+            .map_err(|error| CandleError::Msg(error.to_string()));
+        match (result, cleanup) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(image), Ok(())) => Ok(image),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_with_injector_planned_scoped(
+        &self,
+        req: &Flux1ControlRequest,
+        control_image: &Image,
+        injector: Option<&dyn DitImageInjector>,
+        plan: &RenderPlan,
+        scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         let typed = typed_control_request(req, control_image)?;
         plan.check_request(&control_descriptor(), &typed)?;
         plan.check_load(&RenderLoadBinding::from_spec(&self.loaded_spec))?;
-        let run = RenderRun::new(plan, &req.cancel, None);
+        let run = RenderRun::new(plan, &req.cancel, scope);
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -665,6 +825,7 @@ mod tests {
         let plan = compile_control_plan(&paths, &spec, &req, &image).unwrap();
         assert_eq!(plan.denoise_sigmas().len(), 5);
         assert_eq!(plan.base_seed(), 11);
+        crate::memory_strategy::assert_conditioned_plan_trace(&plan, &req.cancel);
         plan.check_load(&RenderLoadBinding::from_spec(&spec))
             .unwrap();
         image.pixels[0] ^= 1;
