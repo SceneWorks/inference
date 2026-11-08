@@ -253,13 +253,22 @@ jobs:
       MODEL_PROOF_REQUEST: ${{ inputs.request }}
       FLUX1_PAIR_TIER: ${{ inputs.flux1_pair }}
     steps:
-      - name: Require exact selected runner before scanning
+      - name: Require exact selected macOS runner before scanning
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           if [[ "$RUNNER_NAME" != "$INVENTORY_RUNNER" ]]; then
             echo "::error::Selected runner differs from actual runner"
             exit 1
           fi
+      - name: Require exact selected Windows runner before scanning
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          if not "%RUNNER_NAME%"=="%INVENTORY_RUNNER%" (
+            echo ::error::Selected runner differs from actual runner
+            exit /b 1
+          )
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.sha }}
