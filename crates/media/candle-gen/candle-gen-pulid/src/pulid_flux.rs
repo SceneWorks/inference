@@ -459,6 +459,13 @@ impl PulidFlux {
     /// `use_pid` errors loudly. Face likeness may shift under the generative decode — the user's per-gen
     /// call. Call after [`load`](Self::load).
     pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
+        if self.loaded_spec.pid.as_ref().is_some_and(|expected| {
+            expected.checkpoint != pid.checkpoint || expected.gemma != pid.gemma
+        }) {
+            return Err(CandleError::Unsupported(
+                "PuLID PiD decoder differs from the pre-load plan".into(),
+            ));
+        }
         self.pid = Some(PidEngine::from_spec(pid, "flux", &self.device)?);
         self.loaded_spec.pid = Some(pid.clone());
         Ok(self)
@@ -622,6 +629,11 @@ impl PulidFlux {
         reference: &Image,
         plan: &RenderPlan,
     ) -> Result<()> {
+        if req.use_pid && self.pid.is_none() {
+            return Err(CandleError::Unsupported(
+                "PuLID PiD decode was planned but the decoder was not attached".into(),
+            ));
+        }
         let typed = typed_pulid_request(req, reference)?;
         plan.check_request(&plan_descriptor(), &typed)?;
         plan.check_load(&RenderLoadBinding::from_spec(&self.loaded_spec))?;
