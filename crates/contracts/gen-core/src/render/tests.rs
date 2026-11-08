@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
-    Capabilities, GenerationMemory, MemoryGeometry, MemoryRunOutcome, Modality, WeightsSource,
+    Capabilities, Conditioning, ControlKind, GenerationMemory, Image, MemoryGeometry,
+    MemoryRunOutcome, Modality, WeightsSource,
 };
 
 fn descriptor() -> ModelDescriptor {
@@ -31,6 +32,104 @@ fn pass(sigmas: Vec<f32>, executed_steps: usize, capture_sigma: f32) -> PackedIm
         executed_steps,
         capture_sigma,
     }
+}
+
+#[test]
+fn packed_image_plan_freezes_reference_and_control_content_before_load() {
+    let image = Image {
+        width: 16,
+        height: 16,
+        pixels: vec![7; 16 * 16 * 3],
+    };
+    for conditioning in [
+        Conditioning::Reference {
+            image: image.clone(),
+            strength: Some(0.5),
+        },
+        Conditioning::Control {
+            image: image.clone(),
+            kind: ControlKind::Pose,
+            scale: Some(0.7),
+        },
+    ] {
+        let mut request = GenerationRequest {
+            conditioning: vec![conditioning],
+            ..Default::default()
+        };
+        let compiled = RenderPlan::packed_image_trajectory(
+            &descriptor(),
+            &request,
+            pass(vec![1.0, 0.5, 0.0], 2, 0.0),
+        )
+        .unwrap();
+        assert!(compiled.check_request(&descriptor(), &request).is_ok());
+        match &mut request.conditioning[0] {
+            Conditioning::Reference { image, .. } | Conditioning::Control { image, .. } => {
+                image.pixels[0] ^= 1;
+            }
+            _ => unreachable!(),
+        }
+        assert!(compiled.check_request(&descriptor(), &request).is_err());
+        match &mut request.conditioning[0] {
+            Conditioning::Reference { image, strength } => {
+                image.pixels[0] ^= 1;
+                *strength = Some(0.75);
+            }
+            Conditioning::Control { image, scale, .. } => {
+                image.pixels[0] ^= 1;
+                *scale = Some(0.25);
+            }
+            _ => unreachable!(),
+        }
+        assert!(compiled.check_request(&descriptor(), &request).is_err());
+    }
+}
+
+#[test]
+fn packed_image_plan_refuses_multiple_or_unsupported_conditioning() {
+    let image = Image {
+        width: 16,
+        height: 16,
+        pixels: vec![0; 16 * 16 * 3],
+    };
+    for conditioning in [
+        vec![
+            Conditioning::Reference {
+                image: image.clone(),
+                strength: None,
+            };
+            2
+        ],
+        vec![Conditioning::Depth { image }],
+    ] {
+        let request = GenerationRequest {
+            conditioning,
+            ..Default::default()
+        };
+        assert!(RenderPlan::packed_image_trajectory(
+            &descriptor(),
+            &request,
+            pass(vec![1.0, 0.5, 0.0], 2, 0.0),
+        )
+        .is_err());
+    }
+    let malformed = GenerationRequest {
+        conditioning: vec![Conditioning::Reference {
+            image: Image {
+                width: 16,
+                height: 16,
+                pixels: vec![0; 3],
+            },
+            strength: None,
+        }],
+        ..Default::default()
+    };
+    assert!(RenderPlan::packed_image_trajectory(
+        &descriptor(),
+        &malformed,
+        pass(vec![1.0, 0.5, 0.0], 2, 0.0),
+    )
+    .is_err());
 }
 
 #[derive(Default)]
@@ -193,6 +292,16 @@ fn plan_freezes_schedule_decode_count_and_preparation_inputs() {
     let other = LoadSpec::new(WeightsSource::Dir("/fixture/other".into()));
     assert!(plan
         .check_load(&RenderLoadBinding::from_spec(&other))
+        .is_err());
+    let mut changed_control = spec.clone();
+    changed_control.control = Some(WeightsSource::File("/fixture/control".into()));
+    assert!(plan
+        .check_load(&RenderLoadBinding::from_spec(&changed_control))
+        .is_err());
+    let mut changed_policy = spec.clone();
+    changed_policy.offload_policy = crate::OffloadPolicy::Sequential;
+    assert!(plan
+        .check_load(&RenderLoadBinding::from_spec(&changed_policy))
         .is_err());
 }
 

@@ -3,8 +3,8 @@
 pub mod conditional;
 
 use crate::{
-    default_seed, CancelFlag, Error, GenerationRequest, LoadSpec, MemoryPhase, MemoryRequestScope,
-    ModelDescriptor, Progress, Result,
+    default_seed, CancelFlag, Conditioning, ControlKind, Error, GenerationRequest, Image, LoadSpec,
+    MemoryPhase, MemoryRequestScope, ModelDescriptor, Progress, Result,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -70,18 +70,83 @@ struct ImageInputs {
     requested_seed: Option<u64>,
     frames: u32,
     references: u32,
+    conditioning: PackedImageConditioning,
     steps: Option<u32>,
     sampler: Option<String>,
     scheduler: Option<String>,
     scheduler_shift: Option<f32>,
     guidance: Option<f32>,
+    guidance_method: Option<String>,
+    true_cfg_bits: Option<u32>,
+    timestep_to_start_cfg: Option<u32>,
     use_pid: bool,
     pid_capture_sigma: Option<f32>,
 }
 
-impl From<&GenerationRequest> for ImageInputs {
-    fn from(req: &GenerationRequest) -> Self {
-        Self {
+/// Only the FLUX.1 image routes adopted by the first runner wave can enter a packed pass.
+/// Bind the actual bytes and controls before load so a queued request cannot swap its source.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+enum PackedImageConditioning {
+    None,
+    Reference {
+        width: u32,
+        height: u32,
+        pixels_sha256: [u8; 32],
+        strength_bits: Option<u32>,
+    },
+    Control {
+        width: u32,
+        height: u32,
+        pixels_sha256: [u8; 32],
+        kind: String,
+        scale_bits: Option<u32>,
+    },
+}
+
+fn image_digest(image: &Image) -> Result<[u8; 32]> {
+    let expected = u64::from(image.width)
+        .checked_mul(u64::from(image.height))
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| Error::Unsupported("conditioning image geometry overflows".into()))?;
+    if image.width == 0 || image.height == 0 || expected != image.pixels.len() as u64 {
+        return Err(Error::Unsupported(
+            "conditioning image needs width × height × 3 RGB bytes".into(),
+        ));
+    }
+    Ok(Sha256::digest(&image.pixels).into())
+}
+
+impl TryFrom<&GenerationRequest> for ImageInputs {
+    type Error = Error;
+
+    fn try_from(req: &GenerationRequest) -> Result<Self> {
+        let conditioning = match req.conditioning.as_slice() {
+            [] => PackedImageConditioning::None,
+            [Conditioning::Reference { image, strength }] => PackedImageConditioning::Reference {
+                width: image.width,
+                height: image.height,
+                pixels_sha256: image_digest(image)?,
+                strength_bits: strength.map(f32::to_bits),
+            },
+            [Conditioning::Control { image, kind, scale }] => PackedImageConditioning::Control {
+                width: image.width,
+                height: image.height,
+                pixels_sha256: image_digest(image)?,
+                kind: match kind {
+                    ControlKind::Pose => "pose".to_owned(),
+                    ControlKind::Canny => "canny".to_owned(),
+                    ControlKind::Depth => "depth".to_owned(),
+                    ControlKind::Other(value) => format!("other:{value}"),
+                },
+                scale_bits: scale.map(f32::to_bits),
+            },
+            _ => {
+                return Err(Error::Unsupported(
+                    "packed image plan needs one supported image conditioning input".into(),
+                ))
+            }
+        };
+        Ok(Self {
             prompt_sha256: Sha256::digest(req.prompt.as_bytes()).into(),
             negative_prompt: req.negative_prompt.clone(),
             width: req.width,
@@ -90,14 +155,18 @@ impl From<&GenerationRequest> for ImageInputs {
             requested_seed: req.seed,
             frames: req.frames.unwrap_or(1),
             references: req.memory_reference_count(),
+            conditioning,
             steps: req.steps,
             sampler: req.sampler.clone(),
             scheduler: req.scheduler.clone(),
             scheduler_shift: req.scheduler_shift,
             guidance: req.guidance,
+            guidance_method: req.guidance_method.clone(),
+            true_cfg_bits: req.true_cfg.map(f32::to_bits),
+            timestep_to_start_cfg: req.timestep_to_start_cfg,
             use_pid: req.use_pid,
             pid_capture_sigma: req.pid_capture_sigma,
-        }
+        })
     }
 }
 
@@ -109,8 +178,12 @@ pub struct RenderLoadBinding {
     resolved_route: Option<String>,
     quant: Option<crate::Quant>,
     precision: crate::Precision,
+    sequential_offload: bool,
     adapters: Vec<crate::AdapterSpec>,
+    control: Option<crate::WeightsSource>,
+    extra_controls: Vec<crate::WeightsSource>,
     ip_adapter: Option<crate::WeightsSource>,
+    identity: Option<[Option<crate::WeightsSource>; 3]>,
     pid: Option<crate::PidWeights>,
 }
 
@@ -121,8 +194,18 @@ impl RenderLoadBinding {
             resolved_route: spec.resolved_route.clone(),
             quant: spec.quantize,
             precision: spec.precision,
+            sequential_offload: matches!(spec.offload_policy, crate::OffloadPolicy::Sequential),
             adapters: spec.adapters.clone(),
+            control: spec.control.clone(),
+            extra_controls: spec.extra_controls.clone(),
             ip_adapter: spec.ip_adapter.clone(),
+            identity: spec.identity.as_ref().map(|identity| {
+                [
+                    identity.encoder.clone(),
+                    identity.eva.clone(),
+                    identity.face_dir.clone(),
+                ]
+            }),
             pid: spec.pid.clone(),
         }
     }
@@ -230,7 +313,7 @@ impl RenderPlan {
         Ok(Self {
             backend: descriptor.backend.to_owned(),
             provider: descriptor.id.to_owned(),
-            inputs: ImageInputs::from(req),
+            inputs: ImageInputs::try_from(req)?,
             preparation: None,
             count: CountPlan::SequentialWrappingSeeds {
                 count: req.count,
@@ -278,8 +361,7 @@ impl RenderPlan {
     ) -> Result<()> {
         if descriptor.id != self.provider
             || descriptor.backend != self.backend
-            || !req.conditioning.is_empty()
-            || self.inputs != ImageInputs::from(req)
+            || self.inputs != ImageInputs::try_from(req)?
         {
             return Err(Error::Unsupported(
                 "compiled render plan does not match this request/provider".into(),

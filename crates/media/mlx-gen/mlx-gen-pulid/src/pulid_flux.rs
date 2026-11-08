@@ -300,6 +300,36 @@ fn select_reference_face(conditioning: &[Conditioning]) -> Result<(&Image, f32)>
     })
 }
 
+/// Freeze the face source, identity slots, sampling and CFG controls before loading PuLID.
+pub(crate) fn compile_plan(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    descriptor().capabilities.validate_request(MODEL_ID, req)?;
+    select_reference_face(&req.conditioning)?;
+    let identity = spec.identity.as_ref().ok_or_else(|| {
+        gen_core::Error::Unsupported("pulid_flux needs identity weights before load".into())
+    })?;
+    if identity.encoder.is_none() || identity.eva.is_none() || identity.face_dir.is_none() {
+        return Err(gen_core::Error::Unsupported(
+            "pulid_flux needs encoder, EVA and face identity weights before load".into(),
+        ));
+    }
+    if req.use_pid && spec.pid.is_none() {
+        return Err(gen_core::Error::Unsupported(
+            "pulid_flux PiD decode needs a loaded overlay".into(),
+        ));
+    }
+    if req.cancel.is_cancelled() {
+        return Err(gen_core::Error::Canceled);
+    }
+    Ok(Some(mlx_gen_flux::model::compile_trajectory_for(
+        FluxVariant::Dev,
+        &descriptor(),
+        req,
+    )?))
+}
+
 impl Generator for PulidFlux {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -326,7 +356,27 @@ impl Generator for PulidFlux {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        let plan = compile_plan(&self.loaded_spec, req)?
+            .ok_or_else(|| gen_core::Error::Unsupported("PuLID plan is unavailable".into()))?;
+        self.generate_planned(req, &plan, None, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("PuLID render produced no image".into()))
+    }
+
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
+        Ok(gen_core::GenerationReport::from_output(
+            self.generate_impl(req, &run, on_progress)?,
+        ))
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -355,6 +405,7 @@ impl PulidFlux {
     fn generate_impl(
         &self,
         req: &GenerationRequest,
+        run: &gen_core::RenderRun<'_, '_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.verify_identity_inventory()?;
@@ -416,19 +467,24 @@ impl PulidFlux {
                 .timestep_to_start_cfg
                 .map(|v| v as usize)
                 .unwrap_or(DEFAULT_TIMESTEP_TO_START_CFG);
-            self.flux.generate_with_injector_cfg(
+            self.flux.generate_with_injector_cfg_planned(
                 &flux_req,
                 &pos,
                 &neg,
                 neg_prompt,
                 true_cfg,
                 start_cfg,
+                run,
                 on_progress,
             )
         } else {
             // Fake-CFG (true_cfg = 1.0): single forward (sc-3074), bit-identical to that path.
-            self.flux
-                .generate_with_injector(&flux_req, Some(&mk_ca(id_embedding)?), on_progress)
+            self.flux.generate_with_injector_planned(
+                &flux_req,
+                &mk_ca(id_embedding)?,
+                run,
+                on_progress,
+            )
         };
         self.verify_identity_inventory()?;
         result
@@ -591,6 +647,57 @@ pub(crate) const MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
 mod tests {
     use super::*;
     use mlx_gen::{IdentityWeights, LoadShape, OffloadPolicy, Quant};
+
+    #[test]
+    fn pulid_plan_binds_face_and_identity_slots_before_load() {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/missing/flux".into()));
+        spec.identity = Some(IdentityWeights {
+            encoder: Some(WeightsSource::File("/missing/pulid".into())),
+            eva: Some(WeightsSource::File("/missing/eva".into())),
+            face_dir: Some(WeightsSource::Dir("/missing/face".into())),
+        });
+        let mut req = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![3; 64 * 64 * 3],
+                },
+                strength: Some(1.5),
+            }],
+            ..Default::default()
+        };
+        let plan = compile_plan(&spec, &req)
+            .unwrap()
+            .expect("PuLID reference needs a pre-load trajectory");
+        plan.check_request(&descriptor(), &req).unwrap();
+        let mut changed_spec = spec.clone();
+        changed_spec.identity.as_mut().unwrap().eva =
+            Some(WeightsSource::File("/different/eva".into()));
+        assert!(plan
+            .check_load(&gen_core::RenderLoadBinding::from_spec(&changed_spec))
+            .is_err());
+        if let Conditioning::Reference { image, .. } = &mut req.conditioning[0] {
+            image.pixels[0] ^= 1;
+        }
+        assert!(plan.check_request(&descriptor(), &req).is_err());
+        req.conditioning.push(Conditioning::Reference {
+            image: Image {
+                width: 64,
+                height: 64,
+                pixels: vec![0; 64 * 64 * 3],
+            },
+            strength: None,
+        });
+        assert!(compile_plan(&spec, &req).is_err());
+        req.conditioning.pop();
+        spec.identity.as_mut().unwrap().face_dir = None;
+        assert!(compile_plan(&spec, &req).is_err());
+    }
 
     /// The load error string, matched (not `unwrap_err` — `Box<dyn Generator>` isn't `Debug`).
     fn load_err(spec: &LoadSpec) -> String {
