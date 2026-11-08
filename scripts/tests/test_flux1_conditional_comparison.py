@@ -80,6 +80,30 @@ class ConditionalComparison(unittest.TestCase):
             self.assertEqual(conditional.REFERENCE_SHA256,
                              hashlib.sha256(Path(staged["reference_image"]["staged"]).read_bytes()).hexdigest())
 
+    def test_literal_tilde_hub_is_expanded_and_still_confines_assets(self):
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            hub = home / "hub"
+            hub.mkdir()
+            inside = hub / "overlay.safetensors"
+            inside.write_bytes(b"inside")
+            outside = home / "outside.safetensors"
+            outside.write_bytes(b"outside")
+            digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+            (home / "inside-proof").mkdir()
+            (home / "outside-proof").mkdir()
+            with patch.dict(os.environ, HOME=str(home), FLUX1_HUB="~/hub"):
+                _, staged = conditional.prepare_assets(home / "inside-proof", comparison.ROOT,
+                                                       {"control": {"path": str(inside),
+                                                                    "sha256": digest(inside),
+                                                                    "revision": "caller-commit"}})
+                self.assertEqual(Path(staged["control"]["staged"]).read_bytes(), b"inside")
+                with self.assertRaisesRegex(ValueError, "outside the configured model hub"):
+                    conditional.prepare_assets(home / "outside-proof", comparison.ROOT,
+                                               {"control": {"path": str(outside),
+                                                            "sha256": digest(outside),
+                                                            "revision": "caller-commit"}})
+
     def test_preload_plan_rejects_wrong_source_or_route(self):
         scale_bits = struct.unpack("<I", struct.pack("<f", 0.7))[0]
         plan = {"provider": "flux1_dev_control", "backend": "mlx",

@@ -69,7 +69,7 @@ def case_metadata(case, backend, assets):
 
 def prepare_assets(work, source, assets):
     """Verify every external byte and copy it into the owned proof directory."""
-    hub = Path(os.environ["FLUX1_HUB"]).resolve(strict=True)
+    hub = Path(os.environ["FLUX1_HUB"]).expanduser().resolve(strict=True)
     staged = work / "conditional-assets"
     staged.mkdir()
     rows = {}
