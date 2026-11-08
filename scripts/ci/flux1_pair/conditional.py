@@ -5,6 +5,7 @@ face-analysis weights stay real: synthetic face-detector weights cannot produce 
 reference identity. Both isolated arms receive the same hashed files and source image.
 """
 import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
@@ -33,6 +34,37 @@ CASES = {
 }
 
 
+def pid_gemma_shards(files):
+    """Check the path-level Gemma footprint before hosted plan acceptance."""
+    if not {"config.json", "tokenizer.json"} <= set(files):
+        raise ValueError("PiD Gemma needs config.json and tokenizer.json")
+    if "gemma-2-2b-it.safetensors" in files or "model.safetensors" in files:
+        return None
+    if "model.safetensors.index.json" not in files:
+        raise ValueError("PiD Gemma needs a merged checkpoint or indexed shards")
+    shards = {name for name in files if re.fullmatch(r"model-\d{5}-of-\d{5}\.safetensors", name)}
+    if not shards:
+        raise ValueError("PiD Gemma indexed shards are incomplete")
+    return shards
+
+
+def require_pid_gemma_footprint(directory, files):
+    """Require the files consumed by both PiD Gemma loaders before calling a case ready."""
+    available = pid_gemma_shards(files)
+    if available is None:
+        return
+    index = directory / "model.safetensors.index.json"
+    try:
+        weights = json.loads(index.read_text(encoding="utf-8"))["weight_map"]
+    except (OSError, ValueError, KeyError, TypeError, UnicodeError) as error:
+        raise ValueError("PiD Gemma shard index is invalid") from error
+    shards = set(weights.values()) if isinstance(weights, dict) and all(
+        isinstance(name, str) for name in weights.values()) else set()
+    if not shards or not all(re.fullmatch(r"model-\d{5}-of-\d{5}\.safetensors", name)
+                             for name in shards) or shards != available:
+        raise ValueError("PiD Gemma indexed shards are incomplete")
+
+
 def case_metadata(case, backend, assets):
     if case not in CASES or backend not in CASES[case][1]:
         raise ValueError("conditional FLUX.1 case is unavailable on this backend")
@@ -59,6 +91,7 @@ def case_metadata(case, backend, assets):
                     or not re.fullmatch(r"[0-9a-f]{64}", digest)
                     for name, digest in files.items())):
                 raise ValueError("PiD Gemma needs a complete relative-file digest map")
+            pid_gemma_shards(files)
         elif not isinstance(row["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", row["sha256"]):
             raise ValueError("conditional asset needs a lowercase SHA-256: " + role)
         if not isinstance(row["revision"], str) or not 1 <= len(row["revision"]) <= 128:
@@ -81,18 +114,27 @@ def prepare_assets(work, source, assets):
         if role == "pid_gemma":
             if not resolved.is_dir():
                 raise ValueError("PiD Gemma asset must be a directory")
-            actual_files = {p.relative_to(resolved).as_posix() for p in resolved.rglob("*") if p.is_file()}
+            actual_files = set()
+            def fail_walk(error):
+                raise error
+            for base, dirs, names in os.walk(resolved, followlinks=False, onerror=fail_walk):
+                if any((Path(base) / name).is_symlink() for name in dirs):
+                    raise ValueError("PiD Gemma has a symlink directory")
+                actual_files.update((Path(base) / name).relative_to(resolved).as_posix() for name in names)
             if actual_files != set(row["files"]):
                 raise ValueError("PiD Gemma file inventory changed")
             for name, digest in row["files"].items():
+                if PurePosixPath(name).is_absolute() or ".." in PurePosixPath(name).parts or "\\" in name:
+                    raise ValueError("PiD Gemma file name escapes snapshot")
                 path = (resolved / name).resolve(strict=True)
-                if not path.is_relative_to(resolved) or sha(path) != digest:
+                if not path.is_relative_to(hub) or sha(path) != digest:
                     raise ValueError("PiD Gemma file changed: " + name)
                 destination = staged / "pid_gemma" / name
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(path, destination)
                 if sha(destination) != digest:
                     raise ValueError("staged PiD Gemma file changed: " + name)
+            require_pid_gemma_footprint(staged / "pid_gemma", actual_files)
             rows[role] = {**row, "resolved": str(resolved), "staged": str(staged / "pid_gemma"),
                           "staging": "copy", "bytes": sum((staged / "pid_gemma" / name).stat().st_size
                                                     for name in row["files"])}

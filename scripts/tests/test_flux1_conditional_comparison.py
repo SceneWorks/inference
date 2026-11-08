@@ -35,7 +35,9 @@ class ConditionalComparison(unittest.TestCase):
             for backend in backends:
                 with self.subTest(case=case, backend=backend):
                     prefix = "C:\\models\\" if backend == "candle-cuda" else "/models/"
-                    assets = {role: ({"path": prefix + "gemma", "files": {"config.json": "a" * 64},
+                    assets = {role: ({"path": prefix + "gemma", "files": {
+                                      "config.json": "a" * 64, "tokenizer.json": "a" * 64,
+                                      "gemma-2-2b-it.safetensors": "a" * 64},
                                       "revision": "commit-1"} if role == "pid_gemma" else
                                      {"path": prefix + "weights", "sha256": "a" * 64,
                                       "revision": "commit-1"}) for role in roles}
@@ -50,6 +52,11 @@ class ConditionalComparison(unittest.TestCase):
                     broken.pop(role)
                     with self.assertRaises(ValueError):
                         conditional.case_metadata(case, backend, broken)
+                    if role == "pid_gemma":
+                        broken = dict(assets)
+                        broken[role] = dict(assets[role], files={"config.json": "a" * 64})
+                        with self.assertRaisesRegex(ValueError, "PiD Gemma needs"):
+                            conditional.case_metadata(case, backend, broken)
         with self.assertRaises(ValueError):
             conditional.case_metadata("ip-dev-cfg", "candle-cuda", {})
 
@@ -63,11 +70,15 @@ class ConditionalComparison(unittest.TestCase):
             gemma = hub / "gemma"
             gemma.mkdir()
             (gemma / "config.json").write_bytes(b"fixed config")
+            (gemma / "tokenizer.json").write_bytes(b"fixed tokenizer")
+            (gemma / "gemma-2-2b-it.safetensors").write_bytes(b"fixed weights")
             digest = lambda data: hashlib.sha256(data).hexdigest()
             rows = {"control": {"path": str(file), "sha256": digest(file.read_bytes()),
                                    "revision": "caller-commit"},
                     "pid_gemma": {"path": str(gemma),
-                                  "files": {"config.json": digest(b"fixed config")},
+                                  "files": {"config.json": digest(b"fixed config"),
+                                            "tokenizer.json": digest(b"fixed tokenizer"),
+                                            "gemma-2-2b-it.safetensors": digest(b"fixed weights")},
                                   "revision": "caller-commit"}}
             source = comparison.ROOT
             with patch.dict(os.environ, FLUX1_HUB=str(hub)):

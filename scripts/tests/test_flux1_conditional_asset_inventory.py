@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.ci import flux1_conditional_asset_inventory as assets
+from scripts.ci.flux1_pair import conditional
 
 
 def put(root, relative, content=b"fixed"):
@@ -20,6 +21,69 @@ def put(root, relative, content=b"fixed"):
 
 
 class ConditionalAssetInventory(unittest.TestCase):
+    def test_huggingface_gemma_snapshot_links_stage_from_confined_blobs(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hub = root / "hub"
+            snapshot = hub / "models--Efficient-Large-Model--gemma-2-2b-it/snapshots" / ("b" * 40)
+            snapshot.mkdir(parents=True)
+            for name, content in (("config.json", b"config"), ("tokenizer.json", b"tokenizer"),
+                                  ("gemma-2-2b-it.safetensors", b"weights")):
+                blob = put(hub, "models--Efficient-Large-Model--gemma-2-2b-it/blobs/" + name, content)
+                (snapshot / name).symlink_to(blob)
+            result = assets.inventory(hub, "nax-macos-2")
+            row = result["roles"]["pid_gemma"]["candidates"][0]
+            self.assertEqual(result["roles"]["pid_gemma"]["status"], "unique")
+            work = root / "proof"
+            work.mkdir()
+            with patch.dict(os.environ, FLUX1_HUB=str(hub)):
+                _, staged = conditional.prepare_assets(work, assets.ROOT,
+                                                       {"pid_gemma": {"path": row["path"],
+                                                                      "files": row["files"],
+                                                                      "revision": row["revision"]}})
+            self.assertEqual((Path(staged["pid_gemma"]["staged"]) / "gemma-2-2b-it.safetensors").read_bytes(),
+                             b"weights")
+            external = put(root, "external.safetensors", b"other")
+            (snapshot / "gemma-2-2b-it.safetensors").unlink()
+            (snapshot / "gemma-2-2b-it.safetensors").symlink_to(external)
+            with self.assertRaisesRegex(ValueError, "escapes configured model hub"):
+                assets.inventory(hub, "nax-macos-2")
+
+    def test_config_only_gemma_is_incomplete_and_cannot_stage(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hub = root / "hub"
+            snapshot = hub / "models--google--gemma-2-2b-it/snapshots" / ("a" * 40)
+            put(hub, snapshot.relative_to(hub) / "config.json", b"config")
+            result = assets.inventory(hub, "nax-macos-2")
+            self.assertEqual(result["roles"]["pid_gemma"]["status"], "incomplete")
+            self.assertIn("pid_gemma", result["incomplete_roles"])
+            self.assertFalse(result["cases"]["pulid-pid"]["ready"])
+            work = root / "proof"
+            work.mkdir()
+            with patch.dict(os.environ, FLUX1_HUB=str(hub)):
+                with self.assertRaisesRegex(ValueError, "PiD Gemma needs"):
+                    conditional.prepare_assets(work, assets.ROOT,
+                                               {"pid_gemma": {"path": str(snapshot),
+                                                              "files": {"config.json": hashlib.sha256(b"config").hexdigest()},
+                                                              "revision": "cache-snapshot"}})
+
+    def test_indexed_gemma_requires_every_declared_shard(self):
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            put(directory, "config.json", b"config")
+            put(directory, "tokenizer.json", b"tokenizer")
+            shards = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors")
+            put(directory, shards[0], b"first")
+            put(directory, "model.safetensors.index.json",
+                json.dumps({"weight_map": {"a": shards[0], "b": shards[1]}}).encode())
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                conditional.require_pid_gemma_footprint(directory, {
+                    "config.json", "tokenizer.json", "model.safetensors.index.json", shards[0]})
+            put(directory, shards[1], b"second")
+            conditional.require_pid_gemma_footprint(directory, {
+                "config.json", "tokenizer.json", "model.safetensors.index.json", *shards})
+
     def test_fixed_roles_and_complete_gemma_map_from_confined_snapshot(self):
         with TemporaryDirectory() as tmp:
             hub = Path(tmp) / "hub"
@@ -36,7 +100,8 @@ class ConditionalAssetInventory(unittest.TestCase):
             put(hub, "pid/flux_2k.safetensors")
             gemma = "models--google--gemma-2-2b-it/snapshots/" + rev
             put(hub, gemma + "/config.json", b"config")
-            put(hub, gemma + "/sub/model.safetensors", b"gemma")
+            put(hub, gemma + "/tokenizer.json", b"tokenizer")
+            put(hub, gemma + "/gemma-2-2b-it.safetensors", b"gemma")
             result = assets.inventory(hub, "nax-macos-2")
             self.assertEqual(result["missing_roles"], [])
             self.assertEqual(result["ambiguous_roles"], [])
@@ -49,7 +114,8 @@ class ConditionalAssetInventory(unittest.TestCase):
             self.assertEqual(control_row["revision_provenance"], "huggingface-cache-snapshot-path")
             files = result["roles"]["pid_gemma"]["candidates"][0]["files"]
             self.assertEqual(files, {"config.json": hashlib.sha256(b"config").hexdigest(),
-                                     "sub/model.safetensors": hashlib.sha256(b"gemma").hexdigest()})
+                                     "tokenizer.json": hashlib.sha256(b"tokenizer").hexdigest(),
+                                     "gemma-2-2b-it.safetensors": hashlib.sha256(b"gemma").hexdigest()})
             self.assertNotIn("pulid-real", assets.inventory(hub, "cuda-windows")["cases"])
 
     def test_missing_ambiguous_and_symlink_escape(self):

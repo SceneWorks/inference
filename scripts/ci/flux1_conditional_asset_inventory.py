@@ -15,7 +15,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from scripts.ci.flux1_pair.conditional import CASES
+from scripts.ci.flux1_pair.conditional import CASES, require_pid_gemma_footprint
 
 RUNNERS = {"nax-macos-2", "cuda-windows", "cuda-windows-2"}
 MAX_ENTRIES = 250_000
@@ -118,8 +118,6 @@ def gemma_files(directory, hub, budget):
             if len(files) >= MAX_GEMMA_FILES:
                 raise ValueError("PiD Gemma file budget exceeded")
             files[relative] = digest(path, hub, budget)[0]
-    if not files or "config.json" not in files:
-        raise ValueError("PiD Gemma candidate lacks config.json or files")
     return files
 
 
@@ -132,9 +130,11 @@ def candidates(hub, budget):
     for base, dirs, names in os.walk(hub, followlinks=False, onerror=fail_walk):
         dirs.sort()
         names.sort()
-        for name in dirs:
+        for name in dirs[:]:
             path = Path(base) / name
-            if name == "snapshots" and "models--google--gemma-2-2b-it" in str(path).lower():
+            if name == "snapshots" and any(model in str(path).lower() for model in (
+                    "models--google--gemma-2-2b-it", "models--efficient-large-model--gemma-2-2b-it",
+                    "models--sceneworks--gemma-2-2b-it")):
                 for snapshot in sorted(path.iterdir()):
                     if snapshot.is_dir() and SHA.fullmatch(snapshot.name):
                         found["pid_gemma"].append(snapshot)
@@ -174,10 +174,17 @@ def inventory(hub, runner):
                    "revision_provenance": provenance}
             if role == "pid_gemma":
                 row["files"] = gemma_files(path, hub, budget)
+                try:
+                    require_pid_gemma_footprint(path, row["files"])
+                    row["complete"] = True
+                except ValueError as error:
+                    row["complete"] = False
+                    row["incomplete_reason"] = str(error)
             else:
                 row["sha256"], row["bytes"] = digest(path, hub, budget)
             rows.append(row)
-        roles[role] = {"status": "missing" if not rows else "unique" if len(rows) == 1 else "ambiguous",
+        roles[role] = {"status": "missing" if not rows else "ambiguous" if len(rows) > 1 else
+                       "incomplete" if role == "pid_gemma" and not rows[0]["complete"] else "unique",
                        "candidates": rows}
     cases = {}
     backend = "mlx" if runner == "nax-macos-2" else "candle-cuda"
@@ -190,6 +197,7 @@ def inventory(hub, runner):
             "hash_bytes": budget.bytes, "revision_note": "snapshot path is a provenance label; SHA-256 is authoritative",
             "missing_roles": sorted(role for role, row in roles.items() if row["status"] == "missing"),
             "ambiguous_roles": sorted(role for role, row in roles.items() if row["status"] == "ambiguous"),
+            "incomplete_roles": sorted(role for role, row in roles.items() if row["status"] == "incomplete"),
             "roles": roles, "cases": cases}
 
 
