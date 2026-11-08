@@ -65,6 +65,9 @@ class ConditionalAssetInventory(unittest.TestCase):
             with patch.object(assets, "MAX_SECONDS", -1):
                 with self.assertRaisesRegex(ValueError, "budget exceeded"):
                     assets.inventory(hub, "nax-macos-2")
+            with patch.object(assets, "MAX_METADATA_SECONDS", -1):
+                with self.assertRaisesRegex(ValueError, "budget exceeded"):
+                    assets.inventory(hub, "nax-macos-2", metadata_only=True)
             external = root / "external"
             external.mkdir()
             (hub / "models--guozinan--PuLID").rename(external / "pulid")
@@ -210,6 +213,14 @@ class ConditionalAssetInventory(unittest.TestCase):
                                                        "runner": "nax-macos-2"}))
             plan = subprocess.run(command[:-2] + ["--plan"], env=env, capture_output=True, text=True, encoding="utf-8", check=True)
             self.assertEqual(json.loads(plan.stdout)["selected_runner"], "nax-macos-2")
+            metadata_request = {"selection": "flux1-asset-inventory", "runner": "nax-macos-2",
+                                "mode": "metadata"}
+            self.assertEqual(assets.plan_request("mlx", metadata_request, sha, "none")["mode"], "metadata")
+            with patch.object(assets, "digest", side_effect=AssertionError("metadata read weight bytes")):
+                metadata = assets.inventory(hub, "nax-macos-2", metadata_only=True)
+            self.assertFalse(metadata["hashes_complete"])
+            self.assertNotIn("sha256", metadata["roles"]["control"]["candidates"][0])
+            self.assertFalse(metadata["cases"]["control-pose"]["ready"])
             subprocess.run(command, env=env, check=True)
             self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["runner"], "nax-macos-2")
             env["RUNNER_NAME"] = "nax-macos"

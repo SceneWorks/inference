@@ -5,11 +5,13 @@ No download, model load, or inference takes place here. The output is a candidat
 manifest for operator review; byte digests, not cache revision labels, are authoritative.
 """
 import argparse
+import faulthandler
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -27,6 +29,7 @@ MAX_CANDIDATES_PER_ROLE = 16
 MAX_GEMMA_FILES = 5_000
 MAX_HASH_BYTES = 120 * 1024**3
 MAX_SECONDS = 1_200
+MAX_METADATA_SECONDS = 300
 SHA = re.compile(r"[0-9a-f]{40}")
 SOURCE_MARKERS = ("flux.1", "flux1", "flux-ip", "pid-flux", "models--nvidia--pid", "pulid", "controlnet-union-pro",
                   "clip-vit-large-patch14", "gemma-2-2b-it", "eva", "face", "antelope",
@@ -78,15 +81,16 @@ def revision(path):
 
 
 class Budget:
-    def __init__(self):
+    def __init__(self, max_seconds=None):
         self.started = time.monotonic()
         self.bytes = 0
         self.last_report = self.started
         self.stage = "discovery"
+        self.max_seconds = MAX_SECONDS if max_seconds is None else max_seconds
 
     def check(self, extra=0):
         now = time.monotonic()
-        if now - self.started > MAX_SECONDS or self.bytes + extra > MAX_HASH_BYTES:
+        if now - self.started > self.max_seconds or self.bytes + extra > MAX_HASH_BYTES:
             raise ValueError(f"asset inventory time/byte budget exceeded at {self.stage}; "
                              f"elapsed_seconds={int(now - self.started)} hash_bytes={self.bytes}")
         if now - self.last_report >= 60:
@@ -144,6 +148,32 @@ def gemma_files(directory, hub, budget):
     return files
 
 
+def gemma_metadata(directory, hub, budget):
+    """List confined Gemma file names and sizes without reading model bytes."""
+    resolved = confined(directory, hub)
+    if not resolved.is_dir():
+        raise ValueError("PiD Gemma candidate is not a directory")
+    files = {}
+    def fail_walk(error):
+        raise error
+    for base, dirs, names in os.walk(directory, followlinks=False, onerror=fail_walk):
+        dirs.sort()
+        names.sort()
+        for name in dirs:
+            if (Path(base) / name).is_symlink():
+                raise ValueError("PiD Gemma has a symlink directory")
+        for name in names:
+            budget.check()
+            if len(files) >= MAX_GEMMA_FILES:
+                raise ValueError("PiD Gemma file budget exceeded")
+            path = Path(base) / name
+            target = confined(path, hub)
+            if not target.is_file():
+                raise ValueError("PiD Gemma entry is not a file")
+            files[path.relative_to(directory).as_posix()] = target.stat().st_size
+    return files
+
+
 def search_roots(hub, budget):
     """Inspect only FLUX.1-related HF snapshots and named loose asset directories.
 
@@ -151,9 +181,17 @@ def search_roots(hub, budget):
     candidate filenames, so walking every blob and unrelated model tree adds no discovery.
     """
     roots = []
-    immediate = sorted(hub.iterdir())
-    if len(immediate) > MAX_ENTRIES:
-        raise ValueError("asset inventory entry budget exceeded")
+    immediate = []
+    progress("enumerating_hub_root")
+    with os.scandir(hub) as entries:
+        for entry in entries:
+            immediate.append(Path(entry.path))
+            if len(immediate) > MAX_ENTRIES:
+                raise ValueError("asset inventory entry budget exceeded")
+            budget.check()
+            if len(immediate) % 100 == 0:
+                progress(f"hub_entries_seen={len(immediate)}")
+    immediate.sort()
     for child in immediate:
         budget.check()
         name = child.name.lower()
@@ -217,13 +255,14 @@ def candidates(hub, budget):
     return found, entries, roots
 
 
-def inventory(hub, runner):
+def inventory(hub, runner, metadata_only=False):
     if runner not in RUNNERS:
         raise ValueError("runner is not an approved conditional proof host")
+    progress(f"resolve_hub mode={'metadata' if metadata_only else 'hash'}")
     hub = Path(hub).expanduser().resolve(strict=True)
     if not hub.is_dir():
         raise ValueError("configured model hub is not a directory")
-    budget = Budget()
+    budget = Budget(MAX_METADATA_SECONDS if metadata_only else None)
     found, entries, roots = candidates(hub, budget)
     roles = {}
     for role, paths in sorted(found.items()):
@@ -235,15 +274,25 @@ def inventory(hub, runner):
             row = {"path": str(path), "resolved": str(resolved), "revision": rev,
                    "revision_provenance": provenance}
             if role == "pid_gemma":
-                row["files"] = gemma_files(path, hub, budget)
+                if metadata_only:
+                    row["file_bytes"] = gemma_metadata(path, hub, budget)
+                    footprint = row["file_bytes"]
+                else:
+                    row["files"] = gemma_files(path, hub, budget)
+                    footprint = row["files"]
                 try:
-                    require_pid_gemma_footprint(path, row["files"])
+                    require_pid_gemma_footprint(path, footprint)
                     row["complete"] = True
                 except ValueError as error:
                     row["complete"] = False
                     row["incomplete_reason"] = str(error)
             else:
-                row["sha256"], row["bytes"] = digest(path, hub, budget)
+                if metadata_only:
+                    if not resolved.is_file():
+                        raise ValueError("asset candidate is not a file: " + str(path))
+                    row["bytes"] = resolved.stat().st_size
+                else:
+                    row["sha256"], row["bytes"] = digest(path, hub, budget)
             rows.append(row)
         roles[role] = {"status": "missing" if not rows else "ambiguous" if len(rows) > 1 else
                        "incomplete" if role == "pid_gemma" and not rows[0]["complete"] else "unique",
@@ -252,10 +301,11 @@ def inventory(hub, runner):
     backend = "mlx" if runner == "nax-macos-2" else "candle-cuda"
     for case, (_, backends, required) in CASES.items():
         if backend in backends:
-            cases[case] = {"ready": all(roles[role]["status"] == "unique" for role in required),
+            cases[case] = {"ready": not metadata_only and all(roles[role]["status"] == "unique" for role in required),
                            "roles": list(required)}
     return {"schema": 1, "protocol": "flux1-conditional-asset-inventory-v1", "runner": runner,
-            "backend": backend, "hub": str(hub), "entries_scanned": entries,
+            "backend": backend, "hub": str(hub), "mode": "metadata" if metadata_only else "hash",
+            "hashes_complete": not metadata_only, "entries_scanned": entries,
             "search_roots": [str(root.relative_to(hub)) for root in roots],
             "hash_bytes": budget.bytes, "revision_note": "snapshot path is a provenance label; SHA-256 is authoritative",
             "missing_roles": sorted(role for role, row in roles.items() if row["status"] == "missing"),
@@ -265,8 +315,12 @@ def inventory(hub, runner):
 
 
 def plan_request(backend, request, expected_sha, tier):
-    if type(request) is not dict or set(request) != {"selection", "runner"} or request["selection"] != "flux1-asset-inventory":
-        raise ValueError("inventory needs exact selection and runner")
+    if (type(request) is not dict or set(request) not in ({"selection", "runner"}, {"selection", "runner", "mode"})
+            or request["selection"] != "flux1-asset-inventory"):
+        raise ValueError("inventory needs exact selection, runner and optional mode")
+    mode = request.get("mode", "hash")
+    if mode not in {"hash", "metadata"}:
+        raise ValueError("inventory mode must be hash or metadata")
     runner = request["runner"]
     if runner not in RUNNERS or backend != ("mlx" if runner == "nax-macos-2" else "candle-cuda"):
         raise ValueError("inventory backend and selected runner differ")
@@ -276,7 +330,7 @@ def plan_request(backend, request, expected_sha, tier):
     if expected_sha != head:
         raise ValueError("inventory source SHA differs from checked-out branch")
     return {"runner": LANES[runner], "asset_setup": "flux1-asset-inventory", "selected_runner": runner,
-            "backend": backend, "source_sha": head}
+            "backend": backend, "source_sha": head, "mode": mode}
 
 
 def main():
@@ -287,8 +341,17 @@ def main():
     parser.add_argument("--expected-sha", required=True)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if not args.plan:
+        progress("cli_start")
+        faulthandler.dump_traceback_later(120, repeat=True, file=sys.stderr)
     try:
         request = json.loads(os.environ[args.request_env])
+        if not args.plan and hasattr(signal, "SIGALRM"):
+            def interrupt(_signum, _frame):
+                raise TimeoutError("asset inventory hard deadline reached")
+            signal.signal(signal.SIGALRM, interrupt)
+            mode = request.get("mode") if isinstance(request, dict) else None
+            signal.alarm((MAX_METADATA_SECONDS if mode == "metadata" else MAX_SECONDS) + 60)
         plan = plan_request(args.backend, request, args.expected_sha, os.environ.get("FLUX1_PAIR_TIER", "none"))
     except (KeyError, ValueError, subprocess.CalledProcessError) as error:
         parser.error(str(error))
@@ -302,7 +365,13 @@ def main():
     root = os.environ.get("FLUX1_HUB")
     if not root:
         parser.error("FLUX1_HUB is required")
-    result = inventory(root, plan["selected_runner"])
+    progress(f"start runner={plan['selected_runner']} mode={plan['mode']}")
+    try:
+        result = inventory(root, plan["selected_runner"], metadata_only=plan["mode"] == "metadata")
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+        if hasattr(signal, "SIGALRM"):
+            signal.alarm(0)
     result["source_sha"] = plan["source_sha"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n", encoding="utf-8")
