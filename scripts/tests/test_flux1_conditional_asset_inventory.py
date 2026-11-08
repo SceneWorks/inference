@@ -23,6 +23,18 @@ def put(root, relative, content=b"fixed"):
 
 
 class ConditionalAssetInventory(unittest.TestCase):
+    def test_generic_hub_root_control_and_ip_do_not_claim_flux_roles(self):
+        with TemporaryDirectory() as tmp:
+            hub = Path(tmp) / "hub"
+            hub.mkdir()
+            put(hub, "control.safetensors", b"unattributed control")
+            put(hub, "ip_adapter.safetensors", b"unattributed adapter")
+            result = assets.inventory(hub, "nax-macos-2", metadata_only=True)
+            self.assertEqual(result["roles"]["control"]["status"], "missing")
+            self.assertEqual(result["roles"]["ip_adapter"]["status"], "missing")
+            self.assertEqual(result["roles"]["control"]["candidates"], [])
+            self.assertEqual(result["roles"]["ip_adapter"]["candidates"], [])
+
     def test_discovery_never_enumerates_hub_root(self):
         with TemporaryDirectory() as tmp:
             hub = Path(tmp) / "hub"

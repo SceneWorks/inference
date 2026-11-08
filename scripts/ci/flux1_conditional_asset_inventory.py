@@ -51,8 +51,7 @@ SOURCE_REPOS = (
     "models--SceneWorks--instantid-mlx",
 )
 LOOSE_ROOTS = {"flux1", "flux.1", "pulid", "pid", "face", "converted", "conditional-assets"}
-ROOT_FILES = (("control", "control.safetensors"), ("ip_adapter", "ip_adapter.safetensors"),
-              ("pulid", "pulid_flux_v0.9.1.safetensors"), ("pulid", "pulid.safetensors"),
+ROOT_FILES = (("pulid", "pulid_flux_v0.9.1.safetensors"), ("pulid", "pulid.safetensors"),
               ("eva", "eva02_clip_l_336.safetensors"), ("eva", "eva02_clip_l_14_336.safetensors"),
               ("eva", "eva02_clip_l336.safetensors"), ("eva", "eva.safetensors"),
               ("scrfd", "scrfd_10g.safetensors"), ("arcface", "arcface_iresnet100.safetensors"),
