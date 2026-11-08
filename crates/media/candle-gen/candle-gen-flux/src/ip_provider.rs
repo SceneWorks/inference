@@ -246,6 +246,13 @@ fn ip_descriptor(variant: Variant) -> ModelDescriptor {
         Variant::Schnell => crate::descriptor_schnell(),
     };
     crate::add_conditioned_native_aliases(&mut descriptor);
+    // IP Adapter's existing render contract is the FLUX pack stride, without
+    // the registered txt2img route's 256..=2048 size restriction.
+    descriptor.capabilities.min_size = SIZE_MULTIPLE;
+    descriptor.capabilities.max_size = u32::MAX;
+    descriptor.capabilities.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGrid {
+        multiple: SIZE_MULTIPLE,
+    };
     descriptor.id = if variant.is_dev() {
         "flux1_dev_ip_adapter"
     } else {
@@ -744,6 +751,23 @@ mod tests {
         };
         let plan = compile_ip_plan(&paths, &spec, &req, &reference).unwrap();
         assert_eq!(plan.base_seed(), 13);
+        let large = IpAdapterFluxRequest {
+            width: 2304,
+            height: 1024,
+            ..req.clone()
+        };
+        compile_ip_plan(&paths, &spec, &large, &reference).unwrap();
+        for variant in [Variant::Dev, Variant::Schnell] {
+            let descriptor = ip_descriptor(variant);
+            assert_eq!(descriptor.capabilities.min_size, SIZE_MULTIPLE);
+            assert_eq!(descriptor.capabilities.max_size, u32::MAX);
+            assert_eq!(
+                descriptor.capabilities.size_floor,
+                candle_gen::gen_core::SizeFloor::RangeCheckedOnGrid {
+                    multiple: SIZE_MULTIPLE
+                }
+            );
+        }
         for name in ["flow_match", "flow_match_euler"] {
             let mut alias = req.clone();
             alias.sampler = Some(name.into());

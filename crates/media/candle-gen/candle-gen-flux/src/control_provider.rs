@@ -255,6 +255,13 @@ fn control_descriptor() -> ModelDescriptor {
     let mut descriptor = crate::descriptor_dev();
     crate::add_conditioned_native_aliases(&mut descriptor);
     descriptor.id = "flux1_dev_control";
+    // The bespoke ControlNet route accepts any positive on-stride geometry; the
+    // registered base txt2img route's 256..=2048 range does not apply here.
+    descriptor.capabilities.min_size = SIZE_MULTIPLE;
+    descriptor.capabilities.max_size = u32::MAX;
+    descriptor.capabilities.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGrid {
+        multiple: SIZE_MULTIPLE,
+    };
     descriptor.control_kinds = Some(candle_gen::gen_core::AcceptedControlKinds::Only(vec![
         ControlKind::Pose,
         ControlKind::Canny,
@@ -826,6 +833,12 @@ mod tests {
         let plan = compile_control_plan(&paths, &spec, &req, &image).unwrap();
         assert_eq!(plan.denoise_sigmas().len(), 5);
         assert_eq!(plan.base_seed(), 11);
+        let large = Flux1ControlRequest {
+            width: 2304,
+            height: 1024,
+            ..req.clone()
+        };
+        compile_control_plan(&paths, &spec, &large, &image).unwrap();
         for name in ["flow_match", "flow_match_euler"] {
             let mut alias = req.clone();
             alias.sampler = Some(name.into());

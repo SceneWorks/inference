@@ -267,6 +267,13 @@ fn validate_pulid_spec(
 fn plan_descriptor() -> ModelDescriptor {
     let mut descriptor = candle_gen_flux::descriptor_dev();
     candle_gen_flux::add_conditioned_native_aliases(&mut descriptor);
+    // PuLID's legacy size gate is the FLUX pack stride, not the base txt2img
+    // descriptor's 256..=2048 range.
+    descriptor.capabilities.min_size = SIZE_MULTIPLE;
+    descriptor.capabilities.max_size = u32::MAX;
+    descriptor.capabilities.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGrid {
+        multiple: SIZE_MULTIPLE,
+    };
     descriptor.id = "pulid_flux";
     descriptor.capabilities.conditioning = vec![ConditioningKind::Reference];
     descriptor.capabilities.max_count = 1;
@@ -920,6 +927,12 @@ mod tests {
             pixels: vec![5; 16 * 16 * 3],
         };
         let plan = compile_pulid_plan(&paths, &spec, &req, &reference).unwrap();
+        let large = PulidFluxRequest {
+            width: 2304,
+            height: 1024,
+            ..req.clone()
+        };
+        compile_pulid_plan(&paths, &spec, &large, &reference).unwrap();
         assert_eq!(plan.base_seed(), 17);
         for name in ["flow_match", "flow_match_euler"] {
             let mut alias = req.clone();
