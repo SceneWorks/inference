@@ -9,7 +9,7 @@
 //!   128, SwiGLU 16384, 3-axis interleaved RoPE `[32,48,48]`, `DoubleSharedModulation`, and a
 //!   `text_fusion` front-end that aggregates the 12 selected Qwen3-VL hidden layers) driven by a
 //!   Qwen3-VL-4B condition encoder and the Qwen-Image VAE. TDM-distilled few-step (8 steps),
-//!   **CFG-free** (guidance inert), up to 2048².
+//!   **CFG-free** (guidance inert), up to 4096 pixels per side, including img2img refinement.
 //! * **`krea_2_raw`** (sc-9994 / epic 9992) — the undistilled 12B base run as a **full classifier-free
 //!   guidance** generator: a real guidance scale + optional user negative prompt, 52 steps, resolution-
 //!   dynamic mu ([`pipeline::render_base`]). The SAME id is also the Krea LoRA *training* base (Path 1:
@@ -301,9 +301,10 @@ pub const CONTROL_MEMORY_CALIBRATION_FINGERPRINT: &str = "sc-16013-krea-control-
 /// `wan::config::SIZE_MULTIPLE_14B`; the control provider imports this same crate-root const so no copy
 /// can drift from the check.
 pub const SIZE_MULTIPLE: u32 = 16;
-/// Resolution bounds (W/H). Turbo renders up to 2048²; the catalog/worker gate the UI options tighter.
+/// Resolution bounds (W/H), including the img2img second pass used by Hires.fix. The preset
+/// ladder stops at 2048, but the dynamically shaped DiT and tiled Qwen VAE also serve 4K refinement.
 const RES_MIN: u32 = 256;
-const RES_MAX: u32 = 2048;
+const RES_MAX: u32 = 4096;
 /// Max images per request (the image-model standard, shared with the other families).
 const MAX_COUNT: u32 = 8;
 
@@ -6157,8 +6158,46 @@ mod tests {
             d.capabilities.supported_quants,
             &[Quant::Q4, Quant::Q8, Quant::Nvfp4]
         );
-        assert_eq!(d.capabilities.max_size, 2048);
+        assert_eq!(d.capabilities.max_size, 4096);
         assert_eq!(TURBO_STEPS, 8);
+    }
+
+    #[test]
+    fn validate_accepts_4k_hires_refinement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
+        let registry = crate::provider_registry().unwrap();
+        for id in [KREA_2_TURBO_ID, KREA_2_RAW_ID] {
+            let generator = registry.load(id, &spec).unwrap();
+            for (width, height) in [(4096, 2816), (2816, 4096), (4096, 4096)] {
+                let request = GenerationRequest {
+                    prompt: "a lighthouse".into(),
+                    width,
+                    height,
+                    conditioning: vec![Conditioning::Reference {
+                        image: Image {
+                            width: 16,
+                            height: 16,
+                            pixels: vec![127; 16 * 16 * 3],
+                        },
+                        strength: Some(0.3),
+                    }],
+                    ..Default::default()
+                };
+                generator.validate(&request).unwrap_or_else(|error| {
+                    panic!("{id} must accept Hires.fix at {width}x{height}: {error}")
+                });
+                for (width, height) in [(4112, height), (width, 4112), (4095, height)] {
+                    assert!(generator
+                        .validate(&GenerationRequest {
+                            width,
+                            height,
+                            ..request.clone()
+                        })
+                        .is_err());
+                }
+            }
+        }
     }
 
     #[test]

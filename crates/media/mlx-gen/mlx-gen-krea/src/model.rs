@@ -251,11 +251,12 @@ pub(crate) fn runtime_vision_encoder_contract() -> mlx_gen::gen_core::VisionEnco
 
 /// Max images per request (the image-model standard, shared with the other MLX families).
 const MAX_COUNT: u32 = 8;
-/// Resolution bounds (W/H). Turbo renders up to 2048²; the catalog/worker gate the UI options tighter.
+/// Resolution bounds (W/H), including the img2img second pass used by Hires.fix. The preset
+/// ladder stops at 2048, but the dynamically shaped DiT and tiled Qwen VAE also serve 4K refinement.
 const RES_MIN: u32 = 256;
 /// `pub(crate)` so the pose-control lane's load-time branch-quant gate (sc-11748) can size its
 /// worst-case-resolution estimate against the largest render the model can serve.
-pub(crate) const RES_MAX: u32 = 2048;
+pub(crate) const RES_MAX: u32 = 4096;
 /// patch_size(2)·vae_downsample(8) = 16 — patchify requires W/H divisible by this. Exposed as the
 /// pinned-engine stride SceneWorks ties each advertised Krea image bucket to (sc-12612), mirroring
 /// `wan::config::SIZE_MULTIPLE_14B`. `validate_request` enforces exactly this value, so the const
@@ -3291,6 +3292,42 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_4k_hires_refinement() {
+        for descriptor in [descriptor(), raw_descriptor()] {
+            for (width, height) in [(4096, 2816), (2816, 4096), (4096, 4096)] {
+                let request = GenerationRequest {
+                    conditioning: vec![Conditioning::Reference {
+                        image: Image {
+                            width: 16,
+                            height: 16,
+                            pixels: vec![127; 16 * 16 * 3],
+                        },
+                        strength: Some(0.3),
+                    }],
+                    ..req(width, height)
+                };
+                validate_request(&descriptor, &request).unwrap_or_else(|error| {
+                    panic!(
+                        "{} must accept Hires.fix at {width}x{height}: {error}",
+                        descriptor.id
+                    )
+                });
+                for (width, height) in [(4112, height), (width, 4112), (4095, height)] {
+                    assert!(validate_request(
+                        &descriptor,
+                        &GenerationRequest {
+                            width,
+                            height,
+                            ..request.clone()
+                        }
+                    )
+                    .is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn validate_rejects_empty_prompt_and_bad_size() {
         assert!(validate_request(&descriptor(), &GenerationRequest::default()).is_err());
         for (w, h) in [(1000, 1000), (257, 256)] {
@@ -3300,7 +3337,7 @@ mod tests {
             assert!(e.contains("multiple of 16"), "{w}x{h} got: {e}");
         }
         assert!(validate_request(&descriptor(), &req(128, 128)).is_err()); // below min
-        assert!(validate_request(&descriptor(), &req(2064, 256)).is_err()); // above max
+        assert!(validate_request(&descriptor(), &req(4112, 256)).is_err()); // above max
     }
 
     #[test]
