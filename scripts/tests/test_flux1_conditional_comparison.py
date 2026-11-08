@@ -14,6 +14,15 @@ from scripts.ci.flux1_pair import conditional, conditional_evidence, conditional
 
 
 class ConditionalComparison(unittest.TestCase):
+    def test_candle_pulid_probes_freeze_the_comparison_sampler(self):
+        for case in conditional.CASES:
+            if not case.startswith("pulid-") or "candle-cuda" not in conditional.CASES[case][1]:
+                continue
+            with self.subTest(case=case):
+                setup = conditional_probe.candle_setup(case)
+                self.assertIn('sampler: Some("euler".into())', setup)
+                self.assertEqual(conditional_evidence.SETTINGS["sampler"], "euler")
+
     def test_probe_manifests_promote_image_without_duplicate_dependency(self):
         for package, family in (("mlx-gen-flux", "mlx-gen"), ("mlx-gen-pulid", "mlx-gen"),
                                 ("candle-gen-flux", "candle-gen"),

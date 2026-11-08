@@ -132,7 +132,7 @@ def candle_setup(case):
     }});
     {pid_setup}
     let req = PulidFluxRequest {{ prompt: "red kite portrait".into(), width: 256, height: 256,
-        steps: 3, guidance: 3.5, id_weight: 1.0, seed: 104729,
+        steps: 3, sampler: Some("euler".into()), guidance: 3.5, id_weight: 1.0, seed: 104729,
         use_pid: {str(pid).lower()}, ..Default::default() }};'''
 
 

@@ -279,6 +279,7 @@ pub(crate) fn compile_control(
         steps,
         &sigmas,
     )?;
+    let executed_steps = sigmas.len().saturating_sub(1);
     Ok(Some(
         gen_core::RenderPlan::packed_image_trajectory(
             &descriptor,
@@ -289,7 +290,7 @@ pub(crate) fn compile_control(
                 sampler,
                 guidance: req.guidance.unwrap_or(DEFAULT_GUIDANCE),
                 capture_sigma: 0.0,
-                executed_steps: steps,
+                executed_steps,
                 sigmas,
             },
         )?
@@ -633,6 +634,17 @@ mod tests {
         assert_eq!(plan.denoise_sigmas(), native);
         assert_eq!(plan.base_seed(), 11);
         plan.check_request(&descriptor_dev_control(), &req).unwrap();
+        let mut restrided = req.clone();
+        restrided.steps = Some(30);
+        restrided.scheduler = Some("ddim_uniform".into());
+        let restrided_plan = registry
+            .compile_render_plan(FLUX1_DEV_CONTROL_ID, &spec, &restrided)
+            .unwrap()
+            .expect("re-strided control schedule remains valid");
+        assert_eq!(restrided_plan.denoise_sigmas().len() - 1, 31);
+        restrided_plan
+            .check_request(&descriptor_dev_control(), &restrided)
+            .unwrap();
         if let Conditioning::Control { scale, .. } = &mut req.conditioning[0] {
             *scale = None;
         }
