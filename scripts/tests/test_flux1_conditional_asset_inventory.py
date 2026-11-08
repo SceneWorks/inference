@@ -23,6 +23,54 @@ def put(root, relative, content=b"fixed"):
 
 
 class ConditionalAssetInventory(unittest.TestCase):
+    def test_discovery_never_enumerates_hub_root(self):
+        with TemporaryDirectory() as tmp:
+            hub = Path(tmp) / "hub"
+            hub.mkdir()
+            target = put(hub, "models--guozinan--PuLID/snapshots/" + "a" * 40 +
+                         "/pulid_flux_v0.9.1.safetensors", b"identity")
+            actual_scandir = os.scandir
+
+            def guarded_scandir(path):
+                if Path(path) == hub:
+                    raise AssertionError("Hub root enumerated")
+                return actual_scandir(path)
+
+            with patch.object(assets.os, "scandir", side_effect=guarded_scandir):
+                result = assets.inventory(hub, "nax-macos-2", metadata_only=True)
+            self.assertEqual(result["roles"]["pulid"]["candidates"][0]["path"], str(target.resolve()))
+
+    def test_explicit_host_specific_root_and_invalid_roots(self):
+        with TemporaryDirectory() as tmp:
+            hub = Path(tmp) / "hub"
+            hub.mkdir()
+            target = put(hub, "models--custom--face-conversion/snapshots/" + "a" * 40 +
+                         "/scrfd_10g.safetensors", b"face")
+            self.assertEqual(assets.inventory(hub, "nax-macos-2")["roles"]["scrfd"]["status"], "missing")
+            result = assets.inventory(hub, "nax-macos-2", extra_roots=("models--custom--face-conversion",))
+            self.assertEqual(result["roles"]["scrfd"]["candidates"][0]["path"], str(target.resolve()))
+            self.assertEqual(result["requested_extra_roots"], ["models--custom--face-conversion"])
+            for bad in (["../escape"], ["face/subdir"], ["."], ["face", "face"], [{}]):
+                with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "single-segment"):
+                    assets.inventory(hub, "nax-macos-2", extra_roots=bad)
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            (hub / "custom-face").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "selected loose asset directory is a symlink"):
+                assets.inventory(hub, "nax-macos-2", extra_roots=("custom-face",))
+
+    def test_documented_scene_works_pulid_snapshot_and_root_alias(self):
+        with TemporaryDirectory() as tmp:
+            hub = Path(tmp) / "hub"
+            hub.mkdir()
+            eva = put(hub, "models--SceneWorks--pulid-flux-mlx/snapshots/" + "a" * 40 +
+                      "/eva02_clip_l_336.safetensors", b"eva")
+            decoder = put(hub, "pid_decoder.safetensors", b"decoder")
+            result = assets.inventory(hub, "nax-macos-2", metadata_only=True)
+            self.assertEqual(result["roles"]["eva"]["candidates"][0]["path"], str(eva.resolve()))
+            self.assertEqual(result["roles"]["pid_decoder"]["candidates"][0]["path"],
+                             str(decoder.resolve()))
+
     def test_nvidia_pid_snapshot_decoder_is_discovered(self):
         with TemporaryDirectory() as tmp:
             hub = Path(tmp) / "hub"
@@ -184,7 +232,7 @@ class ConditionalAssetInventory(unittest.TestCase):
             hub.mkdir()
             put(hub, "flux1-a/control.safetensors")
             put(hub, "flux1-b/control.safetensors")
-            result = assets.inventory(hub, "nax-macos-2")
+            result = assets.inventory(hub, "nax-macos-2", extra_roots=("flux1-a", "flux1-b"))
             self.assertEqual(result["roles"]["control"]["status"], "ambiguous")
             self.assertEqual(result["roles"]["pulid"]["status"], "missing")
             self.assertIn("control", result["ambiguous_roles"])
@@ -193,7 +241,7 @@ class ConditionalAssetInventory(unittest.TestCase):
             external = put(root, "external.safetensors")
             (hub / "flux1-a/ip_adapter.safetensors").symlink_to(external)
             with self.assertRaisesRegex(ValueError, "escapes configured model hub"):
-                assets.inventory(hub, "nax-macos-2")
+                assets.inventory(hub, "nax-macos-2", extra_roots=("flux1-a", "flux1-b"))
 
     def test_hash_budget_and_exact_runner_cli(self):
         with TemporaryDirectory() as tmp:

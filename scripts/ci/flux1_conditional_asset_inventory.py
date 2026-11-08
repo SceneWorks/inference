@@ -31,12 +31,44 @@ MAX_HASH_BYTES = 120 * 1024**3
 MAX_SECONDS = 1_200
 MAX_METADATA_SECONDS = 300
 SHA = re.compile(r"[0-9a-f]{40}")
-SOURCE_MARKERS = ("flux.1", "flux1", "flux-ip", "pid-flux", "models--nvidia--pid", "pulid", "controlnet-union-pro",
-                  "clip-vit-large-patch14", "gemma-2-2b-it", "eva", "face", "antelope",
-                  "facexlib", "insightface", "instantid")
+# Probe these documented cache repositories by exact name. Listing the Hub root can block on a
+# large shared cache before the normal time budget gets a chance to run.
+SOURCE_REPOS = (
+    "models--Shakker-Labs--FLUX.1-dev-ControlNet-Union-Pro-2.0",
+    "models--XLabs-AI--flux-ip-adapter",
+    "models--openai--clip-vit-large-patch14",
+    "models--guozinan--PuLID",
+    "models--QuanSun--EVA-CLIP",
+    "models--nvidia--PiD",
+    "models--google--gemma-2-2b-it",
+    "models--Efficient-Large-Model--gemma-2-2b-it",
+    "models--SceneWorks--gemma-2-2b-it",
+    "models--SceneWorks--flux1-dev-mlx",
+    "models--SceneWorks--flux1-schnell-mlx",
+    "models--black-forest-labs--FLUX.1-dev",
+    "models--SceneWorks--pid-flux",
+    "models--SceneWorks--pulid-flux-mlx",
+    "models--SceneWorks--instantid-mlx",
+)
 LOOSE_ROOTS = {"flux1", "flux.1", "pulid", "pid", "face", "converted", "conditional-assets"}
+ROOT_FILES = (("control", "control.safetensors"), ("ip_adapter", "ip_adapter.safetensors"),
+              ("pulid", "pulid_flux_v0.9.1.safetensors"), ("pulid", "pulid.safetensors"),
+              ("eva", "eva02_clip_l_336.safetensors"), ("eva", "eva02_clip_l_14_336.safetensors"),
+              ("eva", "eva02_clip_l336.safetensors"), ("eva", "eva.safetensors"),
+              ("scrfd", "scrfd_10g.safetensors"), ("arcface", "arcface_iresnet100.safetensors"),
+              ("bisenet", "bisenet_parsing.safetensors"),
+              ("pid_decoder", "flux_2k.safetensors"), ("pid_decoder", "pid_decoder.safetensors"))
 GEMMA_REPOS = ("models--google--gemma-2-2b-it", "models--efficient-large-model--gemma-2-2b-it",
                "models--sceneworks--gemma-2-2b-it")
+
+
+def validate_extra_roots(roots):
+    if (type(roots) is not list or len(roots) > 16
+            or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name)
+                   or name in {".", ".."} for name in roots)
+            or len(set(roots)) != len(roots)):
+        raise ValueError("inventory roots must be distinct single-segment cache names")
+    return roots
 
 
 def progress(message):
@@ -174,28 +206,19 @@ def gemma_metadata(directory, hub, budget):
     return files
 
 
-def search_roots(hub, budget):
+def search_roots(hub, budget, extra_roots=()):
     """Inspect only FLUX.1-related HF snapshots and named loose asset directories.
 
     A Hub cache stores payloads under opaque `blobs/` names. Snapshot symlinks expose the
     candidate filenames, so walking every blob and unrelated model tree adds no discovery.
     """
     roots = []
-    immediate = []
-    progress("enumerating_hub_root")
-    with os.scandir(hub) as entries:
-        for entry in entries:
-            immediate.append(Path(entry.path))
-            if len(immediate) > MAX_ENTRIES:
-                raise ValueError("asset inventory entry budget exceeded")
-            budget.check()
-            if len(immediate) % 100 == 0:
-                progress(f"hub_entries_seen={len(immediate)}")
-    immediate.sort()
-    for child in immediate:
+    names = sorted(set(SOURCE_REPOS) | LOOSE_ROOTS | set(validate_extra_roots(list(extra_roots))))
+    progress(f"probing_explicit_roots={len(names)}")
+    for name in names:
         budget.check()
-        name = child.name.lower()
-        if name.startswith("models--") and any(marker in name for marker in SOURCE_MARKERS):
+        child = hub / name
+        if name.lower().startswith("models--"):
             if child.is_symlink():
                 raise ValueError("selected model cache directory is a symlink: " + str(child))
             snapshots = child / "snapshots"
@@ -203,27 +226,25 @@ def search_roots(hub, budget):
                 raise ValueError("selected snapshot directory is a symlink: " + str(snapshots))
             if snapshots.is_dir():
                 roots.append(snapshots)
-        elif name in LOOSE_ROOTS or name.startswith(("flux1-", "flux.1-", "pulid-", "pid-", "face-", "converted-")):
+        else:
             if child.is_symlink():
                 raise ValueError("selected loose asset directory is a symlink: " + str(child))
             if child.is_dir():
                 roots.append(child)
-    progress(f"selected_roots={len(roots)} hub_entries={len(immediate)}")
-    return roots, immediate
+    files = [(role, hub / name) for role, name in ROOT_FILES if (hub / name).is_file()]
+    progress(f"selected_roots={len(roots)} root_files={len(files)}")
+    return roots, files
 
 
-def candidates(hub, budget):
+def candidates(hub, budget, extra_roots=()):
     found = {role: [] for _, _, roles in CASES.values() for role in roles}
-    roots, immediate = search_roots(hub, budget)
-    entries = len(immediate)
+    roots, root_files = search_roots(hub, budget, extra_roots)
+    entries = len(roots) + len(root_files)
     def fail_walk(error):
         raise error
 
-    for path in immediate:
-        if path.is_file():
-            role = role_for(path)
-            if role:
-                found[role].append(path)
+    for role, path in root_files:
+        found[role].append(path)
     for root in roots:
         budget.stage = "scan " + str(root.relative_to(hub))
         progress(f"scanning={root.relative_to(hub)}")
@@ -255,7 +276,7 @@ def candidates(hub, budget):
     return found, entries, roots
 
 
-def inventory(hub, runner, metadata_only=False):
+def inventory(hub, runner, metadata_only=False, extra_roots=()):
     if runner not in RUNNERS:
         raise ValueError("runner is not an approved conditional proof host")
     progress(f"resolve_hub mode={'metadata' if metadata_only else 'hash'}")
@@ -263,7 +284,7 @@ def inventory(hub, runner, metadata_only=False):
     if not hub.is_dir():
         raise ValueError("configured model hub is not a directory")
     budget = Budget(MAX_METADATA_SECONDS if metadata_only else None)
-    found, entries, roots = candidates(hub, budget)
+    found, entries, roots = candidates(hub, budget, extra_roots)
     roles = {}
     for role, paths in sorted(found.items()):
         rows = []
@@ -307,6 +328,7 @@ def inventory(hub, runner, metadata_only=False):
             "backend": backend, "hub": str(hub), "mode": "metadata" if metadata_only else "hash",
             "hashes_complete": not metadata_only, "entries_scanned": entries,
             "search_roots": [str(root.relative_to(hub)) for root in roots],
+            "requested_extra_roots": list(extra_roots),
             "hash_bytes": budget.bytes, "revision_note": "snapshot path is a provenance label; SHA-256 is authoritative",
             "missing_roles": sorted(role for role, row in roles.items() if row["status"] == "missing"),
             "ambiguous_roles": sorted(role for role, row in roles.items() if row["status"] == "ambiguous"),
@@ -315,12 +337,14 @@ def inventory(hub, runner, metadata_only=False):
 
 
 def plan_request(backend, request, expected_sha, tier):
-    if (type(request) is not dict or set(request) not in ({"selection", "runner"}, {"selection", "runner", "mode"})
+    if (type(request) is not dict or not {"selection", "runner"} <= set(request)
+            or set(request) - {"selection", "runner", "mode", "roots"}
             or request["selection"] != "flux1-asset-inventory"):
         raise ValueError("inventory needs exact selection, runner and optional mode")
     mode = request.get("mode", "hash")
     if mode not in {"hash", "metadata"}:
         raise ValueError("inventory mode must be hash or metadata")
+    roots = validate_extra_roots(request.get("roots", []))
     runner = request["runner"]
     if runner not in RUNNERS or backend != ("mlx" if runner == "nax-macos-2" else "candle-cuda"):
         raise ValueError("inventory backend and selected runner differ")
@@ -330,7 +354,7 @@ def plan_request(backend, request, expected_sha, tier):
     if expected_sha != head:
         raise ValueError("inventory source SHA differs from checked-out branch")
     return {"runner": LANES[runner], "asset_setup": "flux1-asset-inventory", "selected_runner": runner,
-            "backend": backend, "source_sha": head, "mode": mode}
+            "backend": backend, "source_sha": head, "mode": mode, "roots": roots}
 
 
 def main():
@@ -367,7 +391,8 @@ def main():
         parser.error("FLUX1_HUB is required")
     progress(f"start runner={plan['selected_runner']} mode={plan['mode']}")
     try:
-        result = inventory(root, plan["selected_runner"], metadata_only=plan["mode"] == "metadata")
+        result = inventory(root, plan["selected_runner"], metadata_only=plan["mode"] == "metadata",
+                           extra_roots=plan["roots"])
     finally:
         faulthandler.cancel_dump_traceback_later()
         if hasattr(signal, "SIGALRM"):
