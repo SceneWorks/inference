@@ -489,7 +489,7 @@ impl Generator for Flux1 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let plan = compile_trajectory(self.variant, req)?;
+        let plan = compile_trajectory(self.variant, req)?.bind_load(&self.loaded_spec);
         self.generate_planned(req, &plan, None, on_progress)?
             .output
             .ok_or_else(|| gen_core::Error::Msg("FLUX.1 render produced no images".into()))
@@ -607,7 +607,7 @@ impl Flux1 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        let plan = compile_trajectory(self.variant, req)?;
+        let plan = compile_trajectory(self.variant, req)?.bind_load(&self.loaded_spec);
         let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
         self.run_with_injector(req, injector, &run, on_progress)
     }
@@ -717,7 +717,7 @@ impl Flux1 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        let plan = compile_trajectory(self.variant, req)?;
+        let plan = compile_trajectory(self.variant, req)?.bind_load(&self.loaded_spec);
         let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
         self.run_with_injector_cfg(
             req,
@@ -1057,7 +1057,7 @@ pub(crate) fn compile_base(
             variant.id()
         )));
     }
-    Ok(Some(compile_trajectory(variant, req)?))
+    Ok(Some(compile_trajectory(variant, req)?.bind_load(spec)))
 }
 
 /// Decode the final unpacked FLUX latent through the native VAE or a request-selected PiD

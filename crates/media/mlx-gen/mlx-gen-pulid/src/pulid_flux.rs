@@ -323,11 +323,10 @@ pub(crate) fn compile_plan(
     if req.cancel.is_cancelled() {
         return Err(gen_core::Error::Canceled);
     }
-    Ok(Some(mlx_gen_flux::model::compile_trajectory_for(
-        FluxVariant::Dev,
-        &descriptor(),
-        req,
-    )?))
+    Ok(Some(
+        mlx_gen_flux::model::compile_trajectory_for(FluxVariant::Dev, &descriptor(), req)?
+            .bind_load(spec),
+    ))
 }
 
 impl Generator for PulidFlux {

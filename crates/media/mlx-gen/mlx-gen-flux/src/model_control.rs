@@ -279,19 +279,22 @@ pub(crate) fn compile_control(
         steps,
         &sigmas,
     )?;
-    Ok(Some(gen_core::RenderPlan::packed_image_trajectory(
-        &descriptor,
-        req,
-        gen_core::render::PackedImagePass {
-            pixel_stride: SIZE_MULTIPLE,
-            token_width: crate::pipeline::PACKED_TOKEN_WIDTH as u32,
-            sampler,
-            guidance: req.guidance.unwrap_or(DEFAULT_GUIDANCE),
-            capture_sigma: 0.0,
-            executed_steps: steps,
-            sigmas,
-        },
-    )?))
+    Ok(Some(
+        gen_core::RenderPlan::packed_image_trajectory(
+            &descriptor,
+            req,
+            gen_core::render::PackedImagePass {
+                pixel_stride: SIZE_MULTIPLE,
+                token_width: crate::pipeline::PACKED_TOKEN_WIDTH as u32,
+                sampler,
+                guidance: req.guidance.unwrap_or(DEFAULT_GUIDANCE),
+                capture_sigma: 0.0,
+                executed_steps: steps,
+                sigmas,
+            },
+        )?
+        .bind_load(spec),
+    ))
 }
 
 impl Flux1DevControl {
