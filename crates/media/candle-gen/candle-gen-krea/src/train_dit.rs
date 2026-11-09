@@ -52,7 +52,8 @@ use std::sync::Arc;
 use crate::config::Krea2Config;
 use candle_gen::quant::QLinear as SharedQLinear;
 
-use crate::loader::{linear, linear_detect, rms_scale_weight, Weights};
+use crate::loader::{linear, linear_detect, linear_detect_planned, rms_scale_weight, Weights};
+use crate::nvfp4_dit::{DitPlan, Nvfp4Quant};
 use crate::quant::QLinear as KreaQLinear;
 use crate::transformer::block::{RmsScale, SwiGlu, TextFusionTransformer};
 use crate::transformer::rope::RopeTables;
@@ -146,19 +147,20 @@ fn lora_proj(w: &Weights, path: &str, bias: bool) -> Result<ComposableLinear> {
 pub(crate) enum ComposableLinear {
     Adapt(LoraLinear),
     ConvRot(KreaQLinear),
+    NativeNvfp4(KreaQLinear),
 }
 
 impl ComposableLinear {
     fn lora(&self) -> Option<&LoraLinear> {
         match self {
             Self::Adapt(linear) => Some(linear),
-            Self::ConvRot(_) => None,
+            Self::ConvRot(_) | Self::NativeNvfp4(_) => None,
         }
     }
     fn lora_mut(&mut self) -> Option<&mut LoraLinear> {
         match self {
             Self::Adapt(linear) => Some(linear),
-            Self::ConvRot(_) => None,
+            Self::ConvRot(_) | Self::NativeNvfp4(_) => None,
         }
     }
 
@@ -169,7 +171,7 @@ impl ComposableLinear {
     ) -> candle_gen::Result<()> {
         match self {
             Self::Adapt(linear) => f(path, linear),
-            Self::ConvRot(linear) => match linear.as_additive_mut() {
+            Self::ConvRot(linear) | Self::NativeNvfp4(linear) => match linear.as_additive_mut() {
                 Some(linear) => f(path, linear),
                 None => Ok(()),
             },
@@ -186,7 +188,7 @@ impl Module for ComposableLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Adapt(linear) => linear.forward(x),
-            Self::ConvRot(linear) => linear.forward(x),
+            Self::ConvRot(linear) | Self::NativeNvfp4(linear) => linear.forward(x),
         }
     }
 }
@@ -243,13 +245,20 @@ pub(crate) fn lora_proj_packed(w: &Weights, path: &str, bias: bool) -> Result<Co
 
 /// The projection loader a [`KreaTrainDit`] build uses: the packed-detecting [`lora_proj_packed`] on the
 /// control-INFERENCE path (`packed = true`, codes stay in VRAM), else the dense trainable [`lora_proj`].
-type ProjLoader = fn(&Weights, &str, bool) -> Result<ComposableLinear>;
-
-fn proj_loader(packed: bool) -> ProjLoader {
-    if packed {
-        lora_proj_packed
-    } else {
-        lora_proj
+fn proj_loader(
+    packed: bool,
+    plan: &DitPlan,
+) -> impl Fn(&Weights, &str, bool) -> Result<ComposableLinear> + '_ {
+    move |weights, path, bias| {
+        if packed && weights.is_native_nvfp4() {
+            Ok(ComposableLinear::NativeNvfp4(linear_detect_planned(
+                weights, path, bias, plan,
+            )?))
+        } else if packed {
+            lora_proj_packed(weights, path, bias)
+        } else {
+            lora_proj(weights, path, bias)
+        }
     }
 }
 
@@ -277,6 +286,7 @@ struct TrainAttention {
 }
 
 impl TrainAttention {
+    #[allow(clippy::too_many_arguments)]
     fn load(
         w: &Weights,
         prefix: &str,
@@ -285,8 +295,9 @@ impl TrainAttention {
         head_dim: usize,
         eps: f64,
         packed: bool,
+        plan: &DitPlan,
     ) -> Result<Self> {
-        let proj = proj_loader(packed);
+        let proj = proj_loader(packed, plan);
         Ok(Self {
             projections: None,
             q: proj(w, &format!("{prefix}.to_q"), false)?,
@@ -415,6 +426,7 @@ impl TrainBlock {
         hidden: usize,
         eps: f64,
         packed: bool,
+        plan: &DitPlan,
     ) -> Result<Self> {
         let sst = w
             .get(&format!("{prefix}.scale_shift_table"))?
@@ -431,8 +443,9 @@ impl TrainBlock {
                 head_dim,
                 eps,
                 packed,
+                plan,
             )?,
-            mlp: SwiGlu::load(w, &format!("{prefix}.ff"))?,
+            mlp: SwiGlu::load_planned(w, &format!("{prefix}.ff"), plan)?,
             eps,
         })
     }
@@ -560,6 +573,49 @@ pub struct KreaTrainDit {
 }
 
 impl KreaTrainDit {
+    /// Actual native NVFP4 projection regimes in the control-capable transformer.
+    pub fn nvfp4_report(&self) -> crate::nvfp4_dit::Nvfp4Report {
+        let mut report = crate::nvfp4_dit::Nvfp4Report::default();
+        let mut add = |projection: &KreaQLinear| {
+            if let Some(linear) = projection.nvfp4() {
+                report.add(linear);
+            }
+        };
+        for projection in [
+            &self.img_in,
+            &self.time_embed_l1,
+            &self.time_embed_l2,
+            &self.time_mod_proj,
+            &self.txt_in_l1,
+            &self.txt_in_l2,
+            &self.final_linear,
+        ] {
+            if let ComposableLinear::NativeNvfp4(projection) = projection {
+                add(projection);
+            }
+        }
+        for block in &self.blocks {
+            for projection in [
+                &block.attn.q,
+                &block.attn.k,
+                &block.attn.v,
+                &block.attn.gate,
+                &block.attn.o,
+            ] {
+                if let ComposableLinear::NativeNvfp4(projection) = projection {
+                    add(projection);
+                }
+            }
+            for (_, projection) in block.mlp.projections("ff") {
+                add(projection);
+            }
+        }
+        for (_, projection) in self.text_fusion.projections() {
+            add(projection);
+        }
+        report
+    }
+
     /// Build the composable DiT for **training** (the control-branch trainer / LoRA trainer): every
     /// adaptable projection is a dense `Var`-trainable [`LoraLinear`], so a packed tier is dequantized to
     /// dense on load. This is the historical `load`; the control **inference** provider should use
@@ -589,7 +645,14 @@ impl KreaTrainDit {
         );
         let (theads, tkv) = (cfg.text_num_attention_heads, cfg.text_num_kv_heads);
         let hidden = cfg.hidden_size;
-        let proj = proj_loader(packed);
+        let plan = if packed && w.is_native_nvfp4() {
+            DitPlan::nvfp4(Nvfp4Quant::Mixed)
+                .with_num_layers(cfg.num_layers)
+                .with_nvfp4_context(candle_gen::quant::Nvfp4Context::new(w.device())?)
+        } else {
+            DitPlan::baseline().with_num_layers(cfg.num_layers)
+        };
+        let proj = proj_loader(packed, &plan);
 
         let final_sstable = w
             .get("final_layer.scale_shift_table")?
@@ -610,7 +673,7 @@ impl KreaTrainDit {
             txt_in_norm: RmsScale::load(w, "txt_in.norm.weight", eps)?,
             txt_in_l1: proj(w, "txt_in.linear_1", true)?,
             txt_in_l2: proj(w, "txt_in.linear_2", true)?,
-            text_fusion: TextFusionTransformer::load(
+            text_fusion: TextFusionTransformer::load_planned(
                 w,
                 cfg.num_layerwise_text_blocks,
                 cfg.num_refiner_text_blocks,
@@ -618,6 +681,7 @@ impl KreaTrainDit {
                 tkv,
                 hd,
                 eps,
+                &plan,
             )?,
             blocks: (0..cfg.num_layers)
                 .map(|i| {
@@ -630,6 +694,7 @@ impl KreaTrainDit {
                         hidden,
                         eps,
                         packed,
+                        &plan,
                     )
                 })
                 .collect::<Result<_>>()?,
@@ -1045,6 +1110,39 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_nvfp4_control_constructor_consumes_packed_rows_across_the_transformer() {
+        use candle_gen::candle_core::{DType, Device};
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, cfg) = crate::testfix::tiny_native_nvfp4_fixture(&tmp);
+        let weights = crate::loader::Weights::from_native_file_forcing_packed_nvfp4(
+            &path,
+            &Device::Cpu,
+            DType::F32,
+            crate::native_mapping::DeclaredLogicalShapes::FromConfig(&cfg),
+        )
+        .unwrap();
+        let dit = super::KreaTrainDit::load_inference(&weights, &cfg).unwrap();
+        let report = dit.nvfp4_report();
+        assert_eq!(
+            report.n_quantized, 3,
+            "attention, FFN, and text-fusion rows use the planned loader"
+        );
+        assert_eq!(
+            report.dequant_bf16, 3,
+            "CPU construction retains the honest hardware fallback"
+        );
+        assert_eq!(report.fp4_lit, 0);
+        let error = super::KreaTrainDit::load(&weights, &cfg)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("packed-native"),
+            "training must not silently consume native inference rows: {error}"
+        );
+    }
+
     use super::*;
     use crate::adapters::{install_additive, AdditiveDit};
     use candle_gen::gen_core::{AdapterKind, AdapterSpec};

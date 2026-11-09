@@ -220,6 +220,12 @@ pub struct Krea2Control {
 }
 
 impl Krea2Control {
+    /// Projection regimes of the resident native transformer after a completed render.
+    pub fn nvfp4_report(&self) -> Result<Option<crate::nvfp4_dit::Nvfp4Report>> {
+        self.residency
+            .with_resident_parts(|_, heavy| heavy.dit.nvfp4_report())
+    }
+
     /// Retain both phase loaders. The first warm request populates the shared pair; a staged request
     /// loads and releases each phase within `generate`.
     pub fn load(paths: &Krea2ControlPaths) -> Result<Self> {
@@ -466,6 +472,7 @@ fn load_control_heavy(
     device: &Device,
 ) -> Result<Krea2ControlHeavy> {
     let cfg = Krea2Config::from_snapshot(root)?;
+    let mut branch_tier = branch_tier;
     let mut dit = match control_dit_source(convrot_dit, native_dit)? {
         ControlDitSource::Snapshot => {
             let mut dit_w = Weights::from_dir(&root.join("transformer"), device, DType::BF16)?;
@@ -506,6 +513,10 @@ fn load_control_heavy(
                 DType::BF16,
                 crate::native_mapping::DeclaredLogicalShapes::FromConfig(&cfg),
             )?;
+            if dit_w.is_native_nvfp4() {
+                branch_tier =
+                    candle_gen::gen_core::tier_integrity::control_branch_tier(Some(Quant::Nvfp4));
+            }
             crate::convert::validate_native_transformer(&dit_w, &cfg)?;
             let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
             let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;

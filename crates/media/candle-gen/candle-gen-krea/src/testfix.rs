@@ -291,6 +291,81 @@ pub(crate) fn tiny_native_transformer_fixture(
     (root, native_path, cfg)
 }
 
+/// Full native transformer with NVFP4 rows in attention, feed-forward and text fusion.
+/// Constructor-only tests force packed residency to catch accidental dense reads on every path.
+pub(crate) fn tiny_native_nvfp4_fixture(tmp: &tempfile::TempDir) -> (PathBuf, Krea2Config) {
+    let (_, path, cfg) = tiny_native_transformer_fixture(tmp);
+    let bytes = std::fs::read(&path).unwrap();
+    let tensors = ::safetensors::SafeTensors::deserialize(&bytes).unwrap();
+    let mut owned: std::collections::BTreeMap<String, (::safetensors::Dtype, Vec<usize>, Vec<u8>)> =
+        tensors
+            .tensors()
+            .into_iter()
+            .map(|(name, tensor)| {
+                (
+                    name,
+                    (
+                        tensor.dtype(),
+                        tensor.shape().to_vec(),
+                        tensor.data().to_vec(),
+                    ),
+                )
+            })
+            .collect();
+    let mut layers = serde_json::Map::new();
+    for key in [
+        "transformer_blocks.0.attn.to_q.weight",
+        "transformer_blocks.0.ff.gate.weight",
+        "text_fusion.layerwise_blocks.0.attn.to_q.weight",
+    ] {
+        let native = format!(
+            "model.diffusion_model.{}",
+            crate::loader::convrot_diffusers_to_native(key).unwrap()
+        );
+        let (_, shape, _) = owned.remove(&native).unwrap();
+        let (rows, cols) = (shape[0], shape[1]);
+        let base = native.strip_suffix(".weight").unwrap();
+        let scale_shape = candle_gen::gen_core::nvfp4_scale_shape([rows, cols]).to_vec();
+        let scales = vec![0x38; scale_shape.iter().product()];
+        owned.insert(
+            format!("{base}.weight_scale"),
+            (::safetensors::Dtype::F8_E4M3, scale_shape, scales),
+        );
+        owned.insert(
+            format!("{base}.weight_scale_2"),
+            (
+                ::safetensors::Dtype::F32,
+                vec![],
+                0.01f32.to_le_bytes().to_vec(),
+            ),
+        );
+        layers.insert(base.to_owned(), serde_json::json!({"format":"nvfp4"}));
+        owned.insert(
+            native,
+            (
+                ::safetensors::Dtype::U8,
+                vec![rows, cols / 2],
+                vec![0x11; rows * cols / 2],
+            ),
+        );
+    }
+    let views = owned
+        .iter()
+        .map(|(name, (dtype, shape, bytes))| {
+            (
+                name.clone(),
+                ::safetensors::tensor::TensorView::new(*dtype, shape.clone(), bytes).unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let metadata = HashMap::from([(
+        "_quantization_metadata".to_owned(),
+        serde_json::json!({"format_version":"1.0","layers":layers}).to_string(),
+    )]);
+    ::safetensors::serialize_to_file(views, Some(metadata), &path).unwrap();
+    (path, cfg)
+}
+
 /// Serialize a built tensor map to a `.safetensors` inside `tmp` and load it as a [`KreaTrainDit`].
 /// Returns `(dit, path)`; `tmp` owns the file and removes it on drop.
 fn serialize_and_load(
