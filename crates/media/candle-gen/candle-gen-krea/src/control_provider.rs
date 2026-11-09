@@ -236,6 +236,14 @@ impl Krea2Control {
         paths: &Krea2ControlPaths,
         text_encoder: Option<WeightsSource>,
     ) -> Result<Self> {
+        Self::load_with_transformer_quant(paths, text_encoder, None)
+    }
+
+    fn load_with_transformer_quant(
+        paths: &Krea2ControlPaths,
+        text_encoder: Option<WeightsSource>,
+        transformer_quant: Option<Quant>,
+    ) -> Result<Self> {
         // NOTE: the former "INT8-ConvRot does not support LoRA/LoKr" rejection is gone on purpose —
         // sc-18477 wired `install_additive` into the ConvRot arm of `load_control_heavy`, so the
         // combination is now implemented rather than merely accepted. The remaining guard is the
@@ -266,6 +274,7 @@ impl Krea2Control {
                     &heavy_root,
                     heavy_convrot_dit.as_deref(),
                     heavy_native_dit.as_deref(),
+                    transformer_quant,
                     &heavy_control,
                     &heavy_adapters,
                     heavy_branch_tier,
@@ -300,7 +309,7 @@ impl Krea2Control {
                 .get(candle_gen::gen_core::KREA_CONVROT_DIT_COMPONENT)
                 .map(|source| required_file_path(source, "krea control ConvRot DiT"))
                 .transpose()?;
-            Self::load_with_text_encoder(
+            Self::load_with_transformer_quant(
                 &Krea2ControlPaths {
                     root: paths.root.clone(),
                     convrot_dit,
@@ -315,6 +324,7 @@ impl Krea2Control {
                     offload_policy: paths.offload_policy,
                 },
                 spec.text_encoder.clone(),
+                spec.quantize,
             )
         })?;
         model.prepared_spec = Some(spec.clone());
@@ -465,6 +475,7 @@ fn load_control_heavy(
     root: &Path,
     convrot_dit: Option<&Path>,
     native_dit: Option<&Path>,
+    transformer_quant: Option<Quant>,
     control: &Path,
     adapters: &[AdapterSpec],
     branch_tier: Option<Quant>,
@@ -506,26 +517,11 @@ fn load_control_heavy(
             dit
         }
         ControlDitSource::Native(native_dit) => {
-            // sc-20651: config in scope so the compiled plan unpads a block-padded import.
-            let mut dit_w = Weights::from_native_file_for(
-                native_dit,
-                device,
-                DType::BF16,
-                crate::native_mapping::DeclaredLogicalShapes::FromConfig(&cfg),
-            )?;
-            if dit_w.is_native_nvfp4() {
+            let (dit, native_nvfp4) =
+                load_control_native_dit(native_dit, &cfg, adapters, transformer_quant, device)?;
+            if native_nvfp4 {
                 branch_tier =
                     candle_gen::gen_core::tier_integrity::control_branch_tier(Some(Quant::Nvfp4));
-            }
-            crate::convert::validate_native_transformer(&dit_w, &cfg)?;
-            let diff = crate::adapters::fold_diff_patch(&mut dit_w, adapters)?;
-            let mut dit = KreaTrainDit::load_inference(&dit_w, &cfg)?;
-            if !adapters.is_empty() {
-                crate::adapters::install_additive_with_diff(
-                    &mut dit,
-                    adapters,
-                    &diff.applied_by_spec,
-                )?;
             }
             dit
         }
@@ -556,6 +552,45 @@ fn load_control_heavy(
         vae,
         vae_encoder,
     })
+}
+
+/// The imported pose trunk uses the generation lane's CPU-stage/fold ordering, so a
+/// Q4/Q8 request never constructs a complete dense transformer on the compute device.
+pub(crate) fn load_control_native_dit(
+    native_dit: &Path,
+    cfg: &Krea2Config,
+    adapters: &[AdapterSpec],
+    quant: Option<Quant>,
+    device: &Device,
+) -> Result<(KreaTrainDit, bool)> {
+    let source_device = if matches!(quant, Some(Quant::Q4 | Quant::Q8)) {
+        &Device::Cpu
+    } else {
+        device
+    };
+    let mut weights = Weights::from_native_file_for(
+        native_dit,
+        source_device,
+        DType::BF16,
+        crate::native_mapping::DeclaredLogicalShapes::FromConfig(cfg),
+    )?;
+    let native_nvfp4 = weights.is_native_nvfp4();
+    if native_nvfp4 && matches!(quant, Some(Quant::Q4 | Quant::Q8)) {
+        return Err(CandleError::Msg(
+            "Krea Kitchen NVFP4 weights cannot be requantized as Q4/Q8".into(),
+        ));
+    }
+    crate::convert::validate_native_transformer(&weights, cfg)?;
+    let diff = crate::adapters::fold_diff_patch(&mut weights, adapters)?;
+    let mut dit = KreaTrainDit::load_inference(&weights, cfg)?;
+    if let Some(quant) = quant.filter(|_| !native_nvfp4) {
+        dit.quantize_imported_onto(quant, device)?;
+    }
+    if !adapters.is_empty() {
+        crate::adapters::install_additive_with_diff(&mut dit, adapters, &diff.applied_by_spec)?;
+    }
+    device.synchronize()?;
+    Ok((dit, native_nvfp4))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

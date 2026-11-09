@@ -3704,7 +3704,7 @@ pub fn register_memory_contract_surfaces(
         )
         // The direct CUDA control runtime composes the registered Krea base with a native control
         // overlay in SceneWorks; it is a real route, but not a standalone gen-core Generator.
-        .register_composed_memory_strategy(CONTROL_MEMORY_REGISTRATION)
+        .register_memory_strategy(CONTROL_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_nvfp4_memory_contract_surface_specs,
             provider_id: "krea_2_turbo_control",

@@ -151,6 +151,50 @@ pub(crate) enum ComposableLinear {
 }
 
 impl ComposableLinear {
+    fn quantize_onto(&mut self, quant: gen_core::Quant, device: &Device) -> Result<()> {
+        match self {
+            Self::Adapt(linear) => {
+                linear
+                    .quantize_base_onto(quant, device)
+                    .map_err(|error| match error {
+                        candle_gen::CandleError::Candle(error) => error,
+                        other => candle_gen::candle_core::Error::Msg(other.to_string()),
+                    })
+            }
+            Self::ConvRot(linear) | Self::NativeNvfp4(linear) => {
+                linear.quantize_onto(quant, device)
+            }
+        }
+    }
+
+    /// Move an unadapted dense global leaf before inference adapters are installed.
+    fn move_unadapted_dense(&mut self, device: &Device) -> Result<()> {
+        let Self::Adapt(linear) = self else {
+            candle_gen::candle_core::bail!(
+                "Krea control global projection must be dense before migration"
+            );
+        };
+        let dense = linear.dense_base().ok_or_else(|| {
+            candle_gen::candle_core::Error::Msg(
+                "Krea control global projection is already packed".into(),
+            )
+        })?;
+        let base = candle_gen::candle_nn::Linear::new(
+            dense.weight().to_device(device)?,
+            dense
+                .bias()
+                .map(|bias| bias.to_device(device))
+                .transpose()?,
+        );
+        *linear = LoraLinear::from_linear(
+            base,
+            linear.in_features(),
+            linear.out_features(),
+            linear.path().to_owned(),
+        );
+        Ok(())
+    }
+
     fn lora(&self) -> Option<&LoraLinear> {
         match self {
             Self::Adapt(linear) => Some(linear),
@@ -573,6 +617,67 @@ pub struct KreaTrainDit {
 }
 
 impl KreaTrainDit {
+    /// Match the generation transformer's CPU-staged Q4/Q8 fold: quantize the trunk and
+    /// text-fusion projections directly onto the compute device, keeping global leaves dense.
+    /// This load-time operation precedes user-adapter installation and any prepared conditioning.
+    pub(crate) fn quantize_imported_onto(
+        &mut self,
+        quant: gen_core::Quant,
+        device: &Device,
+    ) -> Result<()> {
+        if !matches!(quant, gen_core::Quant::Q4 | gen_core::Quant::Q8) {
+            candle_gen::candle_core::bail!(
+                "Krea imported control cannot quantize a dense transformer as {quant:?}"
+            );
+        }
+        if !self.conditioning_preparable {
+            candle_gen::candle_core::bail!(
+                "Krea imported control must quantize before installing adapters"
+            );
+        }
+        for block in &mut self.blocks {
+            block.attn.projections = None;
+            for projection in [
+                &mut block.attn.q,
+                &mut block.attn.k,
+                &mut block.attn.v,
+                &mut block.attn.gate,
+                &mut block.attn.o,
+            ] {
+                projection.quantize_onto(quant, device)?;
+            }
+            block.mlp.quantize_onto(quant, device)?;
+            for tensor in [
+                &mut block.scale_shift_table,
+                &mut block.prenorm,
+                &mut block.postnorm,
+                &mut block.attn.norm_q,
+                &mut block.attn.norm_k,
+            ] {
+                *tensor = tensor.to_device(device)?;
+            }
+        }
+        self.text_fusion.quantize_onto(quant, device)?;
+        for projection in [
+            &mut self.img_in,
+            &mut self.time_embed_l1,
+            &mut self.time_embed_l2,
+            &mut self.time_mod_proj,
+            &mut self.txt_in_l1,
+            &mut self.txt_in_l2,
+            &mut self.final_linear,
+        ] {
+            projection.move_unadapted_dense(device)?;
+        }
+        self.txt_in_norm.move_to_device(device)?;
+        self.final_norm = self.final_norm.to_device(device)?;
+        self.final_sstable = self.final_sstable.to_device(device)?;
+        self.device = device.clone();
+        self.rope_cache = RopeCache::new(ROPE_CACHE_CAP);
+        self.lifecycle = Arc::new(());
+        Ok(())
+    }
+
     /// Actual native NVFP4 projection regimes in the control-capable transformer.
     pub fn nvfp4_report(&self) -> crate::nvfp4_dit::Nvfp4Report {
         let mut report = crate::nvfp4_dit::Nvfp4Report::default();
@@ -1110,6 +1215,99 @@ impl crate::adapters::AdditiveDit for KreaTrainDit {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn imported_control_quantizes_trunk_and_text_fusion_but_keeps_global_leaves_dense() {
+        use candle_gen::gen_core::Quant;
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, path, mut cfg) = crate::testfix::tiny_native_transformer_fixture(&tmp);
+        // Keep GGUF block boundaries valid in this deliberately tiny transformer.
+        cfg.intermediate_size = 32;
+        cfg.text_intermediate_size = 32;
+        let mut tensors = candle_gen::candle_core::safetensors::load(&path, &Device::Cpu).unwrap();
+        for prefix in [
+            "transformer_blocks.0",
+            "text_fusion.layerwise_blocks.0",
+            "text_fusion.refiner_blocks.0",
+        ] {
+            for leaf in ["gate", "up", "down"] {
+                let native = crate::loader::convrot_diffusers_to_native(&format!(
+                    "{prefix}.ff.{leaf}.weight"
+                ))
+                .unwrap();
+                tensors.insert(
+                    format!("model.diffusion_model.{native}"),
+                    Tensor::zeros((32, 32), DType::F32, &Device::Cpu).unwrap(),
+                );
+            }
+        }
+        candle_gen::candle_core::safetensors::save(&tensors, &path).unwrap();
+        for quant in [Quant::Q4, Quant::Q8] {
+            let (dit, native_nvfp4) = crate::control_provider::load_control_native_dit(
+                &path,
+                &cfg,
+                &[],
+                Some(quant),
+                &Device::Cpu,
+            )
+            .unwrap();
+            assert!(!native_nvfp4);
+            let block = &dit.blocks[0];
+            for projection in [
+                &block.attn.q,
+                &block.attn.k,
+                &block.attn.v,
+                &block.attn.gate,
+                &block.attn.o,
+            ] {
+                assert!(
+                    projection.lora().unwrap().is_packed(),
+                    "{quant:?} attention stays packed"
+                );
+            }
+            for (name, projection) in block
+                .mlp
+                .projections("ff")
+                .into_iter()
+                .chain(dit.text_fusion.projections())
+            {
+                assert!(projection.is_packed(), "{quant:?} {name} stays packed");
+            }
+            for projection in [
+                &dit.img_in,
+                &dit.time_embed_l1,
+                &dit.time_embed_l2,
+                &dit.time_mod_proj,
+                &dit.txt_in_l1,
+                &dit.txt_in_l2,
+                &dit.final_linear,
+            ] {
+                assert!(
+                    projection.lora().unwrap().dense_base().is_some(),
+                    "global leaves follow generation's dense floor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn imported_control_refuses_requantizing_native_nvfp4() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, cfg) = crate::testfix::tiny_native_nvfp4_fixture(&tmp);
+        for quant in [gen_core::Quant::Q4, gen_core::Quant::Q8] {
+            let error = crate::control_provider::load_control_native_dit(
+                &path,
+                &cfg,
+                &[],
+                Some(quant),
+                &Device::Cpu,
+            )
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(error.contains("cannot be requantized"), "{error}");
+        }
+    }
+
     #[test]
     fn native_nvfp4_control_constructor_consumes_packed_rows_across_the_transformer() {
         use candle_gen::candle_core::{DType, Device};
