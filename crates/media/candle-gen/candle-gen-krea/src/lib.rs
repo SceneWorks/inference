@@ -86,6 +86,7 @@ mod control_trainer;
 // control-branch overlay on the frozen Turbo base and renders a pose-conditioned image. The
 // deployable form of the sc-8460 spike inference harness; the worker `KreaControl` route calls it.
 pub mod control_provider;
+mod control_registry;
 
 // Shared test-only tiny-DiT fixture (training + control tests).
 #[cfg(test)]
@@ -3402,15 +3403,17 @@ fn build_krea_control_memory_strategy_contract(
     // probe alike, and both used to publish `MemoryAssetFacts::default()` on a fully materialized
     // control load. The weights-free surface keeps the zero facts by calling `_for_tier` directly.
     contract.asset_facts = control_asset_facts(spec)?;
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        contract.calibration = None;
+    }
     Ok(contract)
 }
 
 /// Load-exact per-component asset facts for a materialized **control** load (SC-22667 review).
 ///
 /// The control route validates its own spec shape (`control_provider::load_with_spec`): the base is
-/// the runtime snapshot **directory** (a `File` base is rejected there), the ConvRot DiT arrives as
-/// `KREA_CONVROT_DIT_COMPONENT`, a native DiT only through runtime paths the spec cannot carry, and
-/// `spec.control` names the pose branch — an auxiliary overlay outside these base fields. The
+/// a runtime snapshot directory or an imported `File` with a `base_snapshot` companion. The ConvRot
+/// DiT arrives as `KREA_CONVROT_DIT_COMPONENT`, and `spec.control` names the pose branch. The
 /// components it then materializes differ from the generation routes in two widths, both read off
 /// `control_provider.rs`: the text encoder opens f32 (`load_control_text`) and the autoencoder is
 /// built encoder-and-decoder (`load_control_heavy`: `load_vae` + `QwenVaeEncoder::new`).
@@ -3418,22 +3421,22 @@ fn build_krea_control_memory_strategy_contract(
 /// A spec whose snapshot is not on disk — the registry's sentinel surface, a fixture — publishes
 /// the zero facts, exactly as the generation routes' weights-free builders do.
 fn control_asset_facts(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryAssetFacts> {
-    let WeightsSource::Dir(root) = &spec.weights else {
-        return Ok(gen_core::MemoryAssetFacts::default());
-    };
+    let (root, native_dit) = resolved_base_and_native(spec, KREA_2_TURBO_CONTROL_ID)?;
     if !root.is_dir() {
         return Ok(gen_core::MemoryAssetFacts::default());
     }
     let convrot_dit = convrot_selector(spec, KREA_2_TURBO_CONTROL_ID)?;
     // The same encoder-contract resolution `resolve_control_text_encoder_source` performs; a source
     // that does not validate is a load `Krea2Control::load` refuses, and contributes no signal here.
-    let Ok(encoder_source) = ENCODER_CONTRACT.source_for_load(spec, root) else {
+    let Ok(encoder_source) = ENCODER_CONTRACT.source_for_load(spec, &root) else {
         return Ok(gen_core::MemoryAssetFacts::default());
     };
     loaded_asset_facts(
         KREA_2_TURBO_CONTROL_ID,
-        root,
-        None,
+        &root,
+        native_dit
+            .as_ref()
+            .map(gen_core::PinnedWeightsFile::loader_path),
         convrot_dit.as_deref(),
         &encoder_source,
     )
@@ -3587,10 +3590,7 @@ pub fn register_providers(
         .register_generator(RAW_REGISTRATION)
         .register_generator(EDIT_REGISTRATION)
         .register_generator(TURBO_EDIT_REGISTRATION)
-        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
-            route_id: "krea_2_turbo_control",
-            provider_id: KREA_2_TURBO_ID,
-        });
+        .register_generator(control_registry::REGISTRATION);
     #[cfg(feature = "cuda")]
     let registry = register_memory_contract_surfaces(registry)
         .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
@@ -3601,6 +3601,14 @@ pub fn register_providers(
     registry
         .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::TransformerFile,
+                    operation: gen_core::ImportedModelOperation::Pose,
+                    provider_id: KREA_2_TURBO_CONTROL_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
                 gen_core::CheckpointBackendBindingRegistration {
                     backend: gen_core::CheckpointBackend::Candle,
                     source: gen_core::ImportedModelSource::TransformerFile,
@@ -3696,7 +3704,7 @@ pub fn register_memory_contract_surfaces(
         )
         // The direct CUDA control runtime composes the registered Krea base with a native control
         // overlay in SceneWorks; it is a real route, but not a standalone gen-core Generator.
-        .register_composed_memory_strategy(CONTROL_MEMORY_REGISTRATION)
+        .register_memory_strategy(CONTROL_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_nvfp4_memory_contract_surface_specs,
             provider_id: "krea_2_turbo_control",
@@ -4167,7 +4175,8 @@ mod explicit_registry_tests {
                 "krea_2_turbo",
                 "krea_2_raw",
                 "krea_2_edit",
-                "krea_2_turbo_edit"
+                "krea_2_turbo_edit",
+                "krea_2_turbo_control"
             ]
         );
         assert_eq!(explicit_trainers, ["krea_2_raw", "krea_2_control"]);
