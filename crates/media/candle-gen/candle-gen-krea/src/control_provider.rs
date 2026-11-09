@@ -12,8 +12,7 @@
 //! applied identically train/infer). `control_scale = 0` is engine-proven **byte-identical** to the
 //! un-branched base generation at the same seed (the spike's identity contract).
 //!
-//! Bespoke provider (NOT gen-core-registered), worker-invoked by name — the candle pattern for
-//! conditioned surfaces (mirrors [`crate::control_train`]'s trainer and the FLUX.2 control provider).
+//! Native provider callable directly by the worker and through the gen-core registry bridge.
 //! Krea 2 Turbo is CFG-free + distilled few-step: a single guidance-inert forward per step, no
 //! negative pass. The base DiT keeps a packed q4/q8 tier packed in VRAM (dequant-on-forward, sc-11727)
 //! and the control-branch overlay is packed to the tier the base tier implies (`branch_tier`, sc-11743
@@ -61,6 +60,7 @@ pub const DEFAULT_CONTROL_SCALE: f32 = 0.6;
 
 /// Paths to the Krea 2 control checkpoints: the Krea 2 Turbo diffusers snapshot dir (`text_encoder/`,
 /// `transformer/`, `vae/`, `tokenizer/`) + the trained control-branch overlay (a single `.safetensors`).
+#[derive(Clone)]
 pub struct Krea2ControlPaths {
     /// Krea 2 Turbo diffusers snapshot dir (the deployed base the overlay applies on).
     pub root: PathBuf,
@@ -213,7 +213,7 @@ struct Krea2ControlHeavy {
 /// A loaded Krea 2 control model whose residency value exclusively owns either the warm text/heavy pair
 /// or the deferred phase loaders. Sequential bounds peak at `max(Qwen3-VL, DiT + branch + VAE)`.
 pub struct Krea2Control {
-    device: Device,
+    pub(crate) device: Device,
     residency: candle_gen::Residency<Krea2ControlText, Krea2ControlHeavy>,
     /// Complete caller-prepared identity retained for deferred warm/staged materialization.
     prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
@@ -298,10 +298,10 @@ impl Krea2Control {
                 &Krea2ControlPaths {
                     root: paths.root.clone(),
                     convrot_dit,
-                    // `validate_spec_root` above rejects a `File` base, so a native DiT can only
-                    // arrive through the runtime paths — carry the caller's selection rather than
-                    // silently dropping it to `None`.
-                    native_dit: paths.native_dit.clone(),
+                    native_dit: match &spec.weights {
+                        WeightsSource::File(path) => Some(path.clone()),
+                        WeightsSource::Dir(_) => paths.native_dit.clone(),
+                    },
                     control,
                     adapters: spec.adapters.clone(),
                     branch_tier: paths.branch_tier,
@@ -384,9 +384,15 @@ fn validate_spec_root(
             runtime_root.display(),
             admitted_root.display()
         ))),
-        WeightsSource::File(_) => Err(CandleError::Msg(format!(
-            "{label}: admitted base must be the runtime snapshot directory"
-        ))),
+        WeightsSource::File(_) => match spec
+            .components
+            .get(candle_gen::gen_core::BASE_SNAPSHOT_COMPONENT)
+        {
+            Some(WeightsSource::Dir(root)) if root == runtime_root => Ok(()),
+            _ => Err(CandleError::Msg(format!(
+                "{label}: imported transformer requires the admitted base_snapshot directory"
+            ))),
+        },
     }
 }
 
@@ -738,6 +744,55 @@ fn control_image_to_nchw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_primary_is_sealed_before_deferred_pose_materialization() {
+        let (fixture, mut paths) = validation_complete_paths(OffloadPolicy::Resident);
+        let native = fixture.path().join("native.safetensors");
+        let control = fixture.path().join("control.safetensors");
+        std::fs::write(&native, b"before").unwrap();
+        std::fs::write(&control, b"overlay").unwrap();
+        paths.control = control.clone();
+        let mut spec = candle_gen::gen_core::LoadSpec::new(WeightsSource::File(native.clone()))
+            .with_component(
+                candle_gen::gen_core::BASE_SNAPSHOT_COMPONENT,
+                WeightsSource::Dir(paths.root.clone()),
+            )
+            .with_control(WeightsSource::File(control));
+        let selected = WeightsSource::Dir(paths.root.join("text_encoder"));
+        crate::ENCODER_CONTRACT
+            .validate_source_against_base(&selected, &paths.root)
+            .unwrap()
+            .prepare_load_spec(&mut spec)
+            .unwrap();
+        spec.prepare_file_sources().unwrap();
+        let model = Krea2Control::load_with_spec(&paths, &spec).unwrap();
+        std::fs::write(&native, b"after!").unwrap();
+        let request = Krea2ControlRequest {
+            prompt: "a dancer".into(),
+            width: SIZE_MULTIPLE,
+            height: SIZE_MULTIPLE,
+            steps: 1,
+            ..Default::default()
+        };
+        let image = Image {
+            width: SIZE_MULTIPLE,
+            height: SIZE_MULTIPLE,
+            pixels: vec![0; (SIZE_MULTIPLE * SIZE_MULTIPLE * 3) as usize],
+        };
+        let error = model
+            .generate(&request, &image, &mut |_| {
+                panic!("materialized modified primary")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("artifact seal mismatch"), "{error}");
+        let mismatched = spec.clone().with_component(
+            candle_gen::gen_core::BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(fixture.path().join("other-base")),
+        );
+        assert!(validate_spec_root(&paths.root, &mismatched, "control").is_err());
+    }
 
     fn validation_complete_paths(
         offload_policy: OffloadPolicy,
