@@ -22,6 +22,7 @@
 //! a knob.
 
 use std::path::{Path, PathBuf};
+use std::{cell::RefCell, rc::Rc};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
@@ -210,24 +211,121 @@ struct Krea2ControlHeavy {
     vae_encoder: QwenVaeEncoder,
 }
 
-/// A loaded Krea 2 control model whose residency value exclusively owns either the warm text/heavy pair
-/// or the deferred phase loaders. Sequential bounds peak at `max(Qwen3-VL, DiT + branch + VAE)`.
+/// A loaded Krea 2 control model. Resident requests retain the text/heavy pair; sequential requests
+/// retain only the heavy phase and its encoded prompt between poses. Sequential still bounds peak at
+/// `max(Qwen3-VL, DiT + branch + VAE)` and drops the heavy phase before encoding a different prompt.
 pub struct Krea2Control {
     pub(crate) device: Device,
-    residency: candle_gen::Residency<Krea2ControlText, Krea2ControlHeavy>,
+    residency: candle_gen::Residency<Krea2ControlText, Rc<Krea2ControlHeavy>>,
+    staged_cache: StagedPoseCache<Krea2ControlHeavy>,
     /// Complete caller-prepared identity retained for deferred warm/staged materialization.
     prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
+}
+
+type PromptContext = (Tensor, Option<Tensor>);
+
+/// Pose sets change the skeleton and seed, but normally share their text conditioning. Retain only
+/// the heavy phase and encoded context: keeping the encoder too would violate staged admission.
+#[derive(Debug, PartialEq)]
+struct PosePromptKey {
+    prompt: String,
+    negative_prompt: Option<String>,
+    cfg: bool,
+    text_style_gain: Option<u32>,
+}
+
+impl PosePromptKey {
+    fn new(req: &Krea2ControlRequest) -> Self {
+        let cfg = req.guidance.unwrap_or(0.0) != 0.0;
+        Self {
+            prompt: req.prompt.clone(),
+            negative_prompt: cfg.then(|| req.negative_prompt.clone().unwrap_or_default()),
+            cfg,
+            text_style_gain: req.text_style_gain.map(f32::to_bits),
+        }
+    }
+}
+
+struct StagedPoseCache<Heavy> {
+    state: RefCell<Option<(PosePromptKey, Rc<Heavy>, PromptContext)>>,
+}
+
+impl<Heavy> Default for StagedPoseCache<Heavy> {
+    fn default() -> Self {
+        Self {
+            state: RefCell::new(None),
+        }
+    }
+}
+
+impl<Heavy> StagedPoseCache<Heavy> {
+    fn clear(&self) {
+        self.state.borrow_mut().take();
+    }
+
+    fn run<Text>(
+        &self,
+        owner: &candle_gen::Residency<Text, Rc<Heavy>>,
+        req: &Krea2ControlRequest,
+        progress: &mut dyn FnMut(Progress),
+        encode: impl FnOnce(&Text) -> Result<PromptContext>,
+        synchronize: impl FnOnce(Option<&PromptContext>) -> Result<()>,
+        mut render: impl FnMut(&Heavy, PromptContext, &mut dyn FnMut(Progress)) -> Result<Image>,
+    ) -> Result<Image> {
+        candle_gen::check_cancel(&req.cancel)?;
+        let key = PosePromptKey::new(req);
+        if !req.stage_residency {
+            self.clear();
+        } else {
+            let cached = self
+                .state
+                .borrow()
+                .as_ref()
+                .and_then(|(previous, heavy, context)| {
+                    (*previous == key).then(|| (heavy.clone(), context.clone()))
+                });
+            if let Some((heavy, context)) = cached {
+                let result = render(&heavy, context, progress);
+                if result.is_err() {
+                    self.clear();
+                }
+                return result;
+            }
+            // Release the previous prompt's heavy phase before encoding a different prompt.
+            self.clear();
+        }
+        owner.run_request_scoped(
+            req.stage_residency,
+            false,
+            &req.cancel,
+            false,
+            progress,
+            encode,
+            synchronize,
+            |heavy, context, progress| {
+                let retained = context.clone();
+                let result = render(heavy, context, progress);
+                if req.stage_residency && result.is_ok() {
+                    *self.state.borrow_mut() = Some((key, heavy.clone(), retained));
+                }
+                result
+            },
+        )
+    }
 }
 
 impl Krea2Control {
     /// Projection regimes of the resident native transformer after a completed render.
     pub fn nvfp4_report(&self) -> Result<Option<crate::nvfp4_dit::Nvfp4Report>> {
+        if let Some((_, heavy, _)) = self.staged_cache.state.borrow().as_ref() {
+            return Ok(Some(heavy.dit.nvfp4_report()));
+        }
         self.residency
             .with_resident_parts(|_, heavy| heavy.dit.nvfp4_report())
     }
 
     /// Retain both phase loaders. The first warm request populates the shared pair; a staged request
-    /// loads and releases each phase within `generate`.
+    /// releases the encoder and retains the heavy phase for subsequent poses with the same prompt.
     pub fn load(paths: &Krea2ControlPaths) -> Result<Self> {
         Self::load_with_text_encoder(paths, None)
     }
@@ -281,11 +379,13 @@ impl Krea2Control {
                     heavy_chunk_attention,
                     &heavy_device,
                 )
+                .map(Rc::new)
             },
         );
         Ok(Self {
             device,
             residency,
+            staged_cache: StagedPoseCache::default(),
             prepared_spec: None,
         })
     }
@@ -341,11 +441,9 @@ impl Krea2Control {
     ) -> Result<Image> {
         validate_request(req)?;
         read_with_prepared_spec(self.prepared_spec.as_ref(), || {
-            self.residency.run_request_scoped(
-                req.stage_residency,
-                false,
-                &req.cancel,
-                false,
+            self.staged_cache.run(
+                &self.residency,
+                req,
                 on_progress,
                 |text| text.encode(req),
                 |_| Ok(self.device.synchronize()?),
@@ -789,6 +887,124 @@ fn control_image_to_nchw(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn staged_pose_cache_reuses_both_models_until_text_or_policy_changes() {
+        use super::*;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let text_loads = Arc::new(AtomicUsize::new(0));
+        let heavy_loads = Arc::new(AtomicUsize::new(0));
+        struct LiveComponent(Arc<AtomicUsize>);
+        impl Drop for LiveComponent {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let live_text = Arc::new(AtomicUsize::new(0));
+        let live_heavy = Arc::new(AtomicUsize::new(0));
+        let text_live = live_text.clone();
+        let heavy_live = live_heavy.clone();
+        let text_counter = text_loads.clone();
+        let heavy_counter = heavy_loads.clone();
+        let owner = candle_gen::Residency::request_scoped(
+            move |_| {
+                text_counter.fetch_add(1, Ordering::SeqCst);
+                text_live.fetch_add(1, Ordering::SeqCst);
+                Ok(LiveComponent(text_live.clone()))
+            },
+            move |_, _| {
+                heavy_counter.fetch_add(1, Ordering::SeqCst);
+                heavy_live.fetch_add(1, Ordering::SeqCst);
+                Ok(Rc::new(LiveComponent(heavy_live.clone())))
+            },
+        );
+        let cache = StagedPoseCache::default();
+        let mut req = Krea2ControlRequest {
+            prompt: "a dancer".into(),
+            stage_residency: true,
+            ..Default::default()
+        };
+        let run = |req: &Krea2ControlRequest, fail: bool| {
+            cache.run(
+                &owner,
+                req,
+                &mut |_| {},
+                |_| {
+                    if req.stage_residency {
+                        assert_eq!(
+                            live_heavy.load(Ordering::SeqCst),
+                            0,
+                            "release the old render bundle before encoding a changed prompt"
+                        );
+                    }
+                    Ok((Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?, None))
+                },
+                |_| Ok(()),
+                |_, _, _| {
+                    if req.stage_residency {
+                        assert_eq!(
+                            live_text.load(Ordering::SeqCst),
+                            0,
+                            "staged cache must not keep an encoder alongside the render bundle"
+                        );
+                    }
+                    if fail {
+                        Err(CandleError::Msg("render failed".into()))
+                    } else {
+                        Ok(Image {
+                            width: 1,
+                            height: 1,
+                            pixels: vec![0; 3],
+                        })
+                    }
+                },
+            )
+        };
+        run(&req, false).unwrap();
+        req.seed = 42;
+        req.width = 1408;
+        req.steps = 12;
+        run(&req, false).unwrap();
+        assert_eq!(text_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(heavy_loads.load(Ordering::SeqCst), 1);
+        assert!(
+            owner.with_resident_parts(|_, _| ()).unwrap().is_none(),
+            "staged reuse must never retain the encoder"
+        );
+
+        req.prompt = "a different dancer".into();
+        run(&req, false).unwrap();
+        assert_eq!(heavy_loads.load(Ordering::SeqCst), 2);
+        req.guidance = Some(2.0);
+        req.negative_prompt = Some("blurry".into());
+        run(&req, false).unwrap();
+        assert_eq!(text_loads.load(Ordering::SeqCst), 3);
+        req.text_style_gain = Some(0.75);
+        run(&req, false).unwrap();
+        assert_eq!(text_loads.load(Ordering::SeqCst), 4);
+        run(&req, true).unwrap_err();
+        assert!(
+            cache.state.borrow().is_none(),
+            "failed renders must release the cache"
+        );
+        run(&req, false).unwrap();
+        assert_eq!(heavy_loads.load(Ordering::SeqCst), 5);
+
+        req.stage_residency = false;
+        run(&req, false).unwrap();
+        run(&req, false).unwrap();
+        assert_eq!(heavy_loads.load(Ordering::SeqCst), 6);
+        assert!(cache.state.borrow().is_none());
+        assert!(owner.with_resident_parts(|_, _| ()).unwrap().is_some());
+        req.stage_residency = true;
+        run(&req, false).unwrap();
+        run(&req, false).unwrap();
+        assert_eq!(heavy_loads.load(Ordering::SeqCst), 7);
+    }
+
     use super::*;
 
     #[test]
