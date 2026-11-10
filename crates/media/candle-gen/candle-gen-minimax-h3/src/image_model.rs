@@ -32,7 +32,8 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::h3_image as contract;
 use candle_gen::gen_core::{
     Capabilities, ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadShape,
-    LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, Precision, Progress, SizeFloor,
+    LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, Precision, Progress, Quant,
+    SizeFloor,
     StepSupport, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
@@ -69,6 +70,15 @@ pub fn resolve_text_encoder_dir(root: &Path, spec: &LoadSpec) -> PathBuf {
     }
 }
 
+/// The DiT directory a load reads: the staged [`IMAGE_DIT_PARTITION`] component (a packed tier's
+/// `transformer_diffusers/`, SW-7093) when it is a directory, else `root/transformer_diffusers`.
+pub fn resolve_dit_dir(root: &Path, spec: &LoadSpec) -> PathBuf {
+    match spec.components.get(IMAGE_DIT_PARTITION) {
+        Some(WeightsSource::Dir(dir)) => dir.clone(),
+        _ => root.join(IMAGE_DIT_PARTITION),
+    }
+}
+
 /// The upstream default output size when a request names none (`height = width = 2048`).
 pub const DEFAULT_SIZE: u32 = 2048;
 
@@ -101,7 +111,9 @@ pub fn image_descriptor() -> ModelDescriptor {
             ],
             supports_lora: false,
             supports_lokr: false,
-            supported_quants: &[],
+            // Pre-quantized MLX-affine tiers (SW-7093), the artifacts the MLX lane reads: staged as
+            // the DiT component; `spec.quantize` asserts which tier was staged.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // The generator always stages its three components (see the module docs).
             supports_sequential_offload: true,
             max_count: 1,
@@ -124,6 +136,7 @@ pub fn image_descriptor() -> ModelDescriptor {
 pub struct MiniMaxH3Image {
     descriptor: ModelDescriptor,
     root: PathBuf,
+    dit_dir: PathBuf,
     text_encoder_dir: PathBuf,
     device: Device,
     contract: MemoryProviderContract,
@@ -141,11 +154,19 @@ impl MiniMaxH3Image {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| p.clone()),
         };
-        for component in [IMAGE_DIT_PARTITION, IMAGE_VAE_COMPONENT] {
-            require_component_shards(&root.join(component), component)?;
-        }
+        let dit_dir = resolve_dit_dir(&root, spec);
+        require_component_shards(&dit_dir, IMAGE_DIT_PARTITION)?;
+        require_component_shards(&root.join(IMAGE_VAE_COMPONENT), IMAGE_VAE_COMPONENT)?;
         let text_encoder_dir = resolve_text_encoder_dir(&root, spec);
         require_component_shards(&text_encoder_dir, IMAGE_TEXT_ENCODER)?;
+        // The tier is an assertion about what is staged (the marker is authoritative); `None`
+        // asserts nothing and the loaders auto-detect from `.scales`. The group size is checked
+        // either way, and for the text encoder -- MiniMax-H3's own tier artifact -- by H3's check.
+        let tier =
+            crate::model::requested_tier(spec).map_err(|e| CandleError::Msg(e.to_string()))?;
+        crate::tier::require_partition(&dit_dir, tier, IMAGE_DIT_PARTITION)?;
+        crate::tier::MiniMaxH3TierPaths::resolve(&root, None, Some(&text_encoder_dir))
+            .require_text_encoder()?;
         if !root.join("tokenizer").join("tokenizer.json").is_file() {
             return Err(CandleError::Msg(format!(
                 "{IMAGE_MODEL_ID}: the snapshot has no tokenizer/tokenizer.json at {}",
@@ -154,7 +175,7 @@ impl MiniMaxH3Image {
         }
         // The partition must be the IMAGE transformer: H3 video's `transformer/` config would
         // load and run with an audio stream this pipeline never feeds.
-        let cfg = image_dit_config(&root)?;
+        let cfg = image_dit_config_at(&dit_dir)?;
         if cfg.num_pdd_heads() != Some(contract::FIXED_STEPS as usize) {
             return Err(CandleError::Msg(format!(
                 "{IMAGE_MODEL_ID}: `{IMAGE_DIT_PARTITION}` carries {:?} per-step heads; the fixed \
@@ -166,6 +187,7 @@ impl MiniMaxH3Image {
         Ok(Self {
             descriptor: image_descriptor(),
             root,
+            dit_dir,
             text_encoder_dir,
             device: candle_gen::default_device()?,
             contract: crate::image_memory_strategy::contract_for(spec)
@@ -309,11 +331,7 @@ impl MiniMaxH3Image {
 
         // --- 2. denoise --------------------------------------------------------------------
         let phase = PhaseLog::start("dit_load");
-        let dit = MiniMaxH3Dit::load_from_dir(
-            self.root.join(IMAGE_DIT_PARTITION),
-            &self.device,
-            DType::BF16,
-        )?;
+        let dit = MiniMaxH3Dit::load_from_dir(&self.dit_dir, &self.device, DType::BF16)?;
         phase.done();
         let patch = dit.config().patch_size;
         let layout = if reference_latents.is_empty() {
@@ -392,9 +410,15 @@ impl MiniMaxH3Image {
     }
 }
 
-/// Parse `transformer_diffusers/config.json` and require it to be the image transformer.
+/// Parse `transformer_diffusers/config.json` of a snapshot root and require it to be the image
+/// transformer.
 pub fn image_dit_config(root: &Path) -> Result<crate::dit::MiniMaxH3DitConfig> {
-    let path = root.join(IMAGE_DIT_PARTITION).join("config.json");
+    image_dit_config_at(&root.join(IMAGE_DIT_PARTITION))
+}
+
+/// [`image_dit_config`] against an already-resolved (possibly staged tier) DiT directory.
+pub fn image_dit_config_at(dit_dir: &Path) -> Result<crate::dit::MiniMaxH3DitConfig> {
+    let path = dit_dir.join("config.json");
     let text = std::fs::read_to_string(&path).map_err(|e| {
         CandleError::Msg(format!("{IMAGE_MODEL_ID}: reading {}: {e}", path.display()))
     })?;
@@ -480,19 +504,20 @@ pub fn load_image(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Gener
             "{IMAGE_MODEL_ID}: adapters are not wired on this route yet"
         )));
     }
-    if let Some(q) = spec.quantize {
-        return Err(candle_gen::gen_core::Error::Unsupported(format!(
-            "{IMAGE_MODEL_ID}: spec.quantize={q:?} — no quantized tier is published for this \
-             family yet; the render runs the checkpoint's bf16 block store"
-        )));
-    }
+    // Q4 / Q8 are the published MLX-affine tiers; NVFP4 and FP8 are different formats and are
+    // refused by name rather than reconciled against a q4/q8 marker.
+    crate::model::requested_tier(spec)?;
     if spec.load_shape == LoadShape::DeferredMaterialization {
         return Err(candle_gen::gen_core::Error::Unsupported(format!(
             "{IMAGE_MODEL_ID}: block-streamed (deferred) materialization is not wired for this \
              family; use the resident load"
         )));
     }
-    candle_gen::gen_core::reject_unknown_components(spec, &[IMAGE_TEXT_ENCODER], IMAGE_MODEL_ID)?;
+    candle_gen::gen_core::reject_unknown_components(
+        spec,
+        &[IMAGE_TEXT_ENCODER, IMAGE_DIT_PARTITION],
+        IMAGE_MODEL_ID,
+    )?;
     crate::model::reject_unread_slots_for(spec, IMAGE_MODEL_ID)?;
     debug_assert_eq!(spec.precision, Precision::Bf16);
     Ok(Box::new(MiniMaxH3Image::load(spec)?))
@@ -593,8 +618,9 @@ mod tests {
     #[test]
     fn unread_load_slots_are_refused() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-h3-image".into()));
+        // NVFP4 is a different format from the published MLX-affine tiers.
         let mut q = spec.clone();
-        q.quantize = Some(candle_gen::gen_core::Quant::Q4);
+        q.quantize = Some(candle_gen::gen_core::Quant::Nvfp4);
         assert!(matches!(
             load_image(&q),
             Err(candle_gen::gen_core::Error::Unsupported(_))
@@ -642,5 +668,61 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("32"), "{e}");
+    }
+
+    /// SW-7093: Q4 and Q8 are advertised, and the staged `transformer_diffusers` component -- not the
+    /// snapshot root -- is the DiT a tier load reads.
+    #[test]
+    fn the_packed_tiers_are_advertised_and_staged_as_the_dit_component() {
+        assert_eq!(
+            image_descriptor().capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8]
+        );
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        assert_eq!(
+            resolve_dit_dir(Path::new("/snap"), &spec),
+            Path::new("/snap/transformer_diffusers")
+        );
+        spec.components.insert(
+            IMAGE_DIT_PARTITION.into(),
+            WeightsSource::Dir("/tiers/q4/transformer_diffusers".into()),
+        );
+        assert_eq!(
+            resolve_dit_dir(Path::new("/snap"), &spec),
+            Path::new("/tiers/q4/transformer_diffusers")
+        );
+        // The staged key is accepted; any other component is still refused.
+        let mut other = spec.clone();
+        other
+            .components
+            .insert("transformer".into(), WeightsSource::Dir("/x".into()));
+        assert!(load_image(&other).is_err());
+    }
+
+    /// The on-disk `quantization` marker is authoritative: a q4 DiT staged under a Q8 request is
+    /// refused before any tensor is read, and the text encoder resolves to the staged H3 artifact.
+    #[test]
+    fn a_staged_tier_must_agree_with_the_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let comp = |dir: &Path, config: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("config.json"), config).unwrap();
+            std::fs::write(dir.join("m.safetensors"), b"").unwrap();
+        };
+        let root = tmp.path().join("root");
+        comp(&root.join(IMAGE_VAE_COMPONENT), "{}");
+        let dit = tmp.path().join("q4").join(IMAGE_DIT_PARTITION);
+        comp(&dit, r#"{"quantization": {"bits": 4, "group_size": 64}}"#);
+        let te = tmp.path().join("q4").join(IMAGE_TEXT_ENCODER);
+        comp(&te, r#"{"quantization": {"bits": 4, "group_size": 64}}"#);
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+        spec.components
+            .insert(IMAGE_DIT_PARTITION.into(), WeightsSource::Dir(dit));
+        spec.components
+            .insert(IMAGE_TEXT_ENCODER.into(), WeightsSource::Dir(te.clone()));
+        assert_eq!(resolve_text_encoder_dir(Path::new("/unused"), &spec), te);
+        spec.quantize = Some(Quant::Q8);
+        let e = load_image(&spec).err().expect("q4 staged, q8 asked");
+        assert!(e.to_string().contains("bits 4"), "{e}");
     }
 }

@@ -129,6 +129,7 @@ pub mod blocks;
 pub mod chunking;
 pub mod conditioning;
 pub mod config;
+pub mod convert;
 pub mod decoder;
 pub mod denoise;
 pub mod dit;

@@ -25,7 +25,6 @@ use mlx_gen::gen_core::{
     MemoryStrategySupport, WeightsSource,
 };
 
-use crate::h3_image::dit::IMAGE_DIT_COMPONENT;
 use crate::h3_image::model::IMAGE_MODEL_ID;
 use crate::image_vae::{
     bounded_decode_parameters, IMAGE_DECODE_OVERLAP, IMAGE_DECODE_TILE_EDGE, IMAGE_VAE_COMPONENT,
@@ -72,7 +71,7 @@ fn asset_facts(spec: &LoadSpec) -> MemoryAssetFacts {
     let conditioning: u64 = crate::text_encoder::TE_SHARDS
         .map(|i| safetensors_path_bytes(te_dir.join(format!("model-{i:05}-of-00014.safetensors"))))
         .sum();
-    let transformer = safetensors_path_bytes(root.join(IMAGE_DIT_COMPONENT));
+    let transformer = safetensors_path_bytes(crate::h3_image::tier::resolve_dit_dir(root, spec));
     let decoder = safetensors_path_bytes(root.join(IMAGE_VAE_COMPONENT));
     MemoryAssetFacts {
         base_bytes: conditioning

@@ -13,12 +13,14 @@
 //! | [`layout`] | the `text2image` / `edit` packed sequences: positions, tags |
 //! | [`dit`] | [`dit::MiniMaxH3ImageDit`] (644 tensors) and the per-step [`dit::ImageDenoiser`] |
 //! | [`model`] | the generator: descriptor, load, validate, staged generate |
+//! | [`tier`] | q8 / q4 DiT tier resolution; the text encoder is H3's own tier artifact |
 //! | [`memory`] | the shared-ladder contract: staged residency + bounded decode |
 
 pub mod dit;
 pub mod layout;
 pub mod memory;
 pub mod model;
+pub mod tier;
 
 pub use dit::{
     image_row_classes, velocity_euler_delta, ImageDenoiser, MiniMaxH3ImageDit, IMAGE_DIT_COMPONENT,

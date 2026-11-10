@@ -45,7 +45,7 @@ use mlx_gen::gen_core::h3_image::{
 };
 use mlx_gen::gen_core::{
     reject_unknown_components, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Precision, Progress, StepSupport,
+    Generator, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, StepSupport,
     WeightsSource,
 };
 use mlx_gen::{default_seed, Error, Result};
@@ -76,6 +76,7 @@ pub const MAX_COUNT: u32 = 8;
 pub struct MiniMaxH3Image {
     descriptor: ModelDescriptor,
     root: PathBuf,
+    dit_dir: PathBuf,
     text_encoder_dir: PathBuf,
     dtype: Dtype,
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
@@ -109,7 +110,9 @@ pub fn descriptor() -> ModelDescriptor {
             ],
             supports_lora: false,
             supports_lokr: false,
-            supported_quants: &[],
+            // Pre-quantized tiers only (SW-7093): packed offline by
+            // `crate::convert::quantize_minimax_h3_image_dit`, staged as the DiT component.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // Upstream requires only a positive size: no maximum area or edge.
             min_size: 1,
             max_size: u32::MAX,
@@ -146,20 +149,20 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             )))
         }
     };
-    reject_unknown_components(spec, &[TEXT_ENCODER_COMPONENT], IMAGE_MODEL_ID)?;
-    if spec.quantize.is_some() {
-        return Err(Error::Unsupported(format!(
-            "{IMAGE_MODEL_ID}: only the published bf16 checkpoint loads on MLX; no packed tier exists"
-        )));
-    }
+    reject_unknown_components(
+        spec,
+        &[TEXT_ENCODER_COMPONENT, IMAGE_DIT_COMPONENT],
+        IMAGE_MODEL_ID,
+    )?;
     if !spec.adapters.is_empty() {
         return Err(Error::Unsupported(format!(
             "{IMAGE_MODEL_ID}: adapters are not supported"
         )));
     }
     let text_encoder_dir = resolve_text_encoder_dir(&root, spec);
+    let dit_dir = crate::h3_image::tier::resolve_dit_dir(&root, spec);
     let mut probes: Vec<PathBuf> = vec![
-        root.join(IMAGE_DIT_COMPONENT).join("config.json"),
+        dit_dir.join("config.json"),
         root.join(IMAGE_VAE_COMPONENT).join("config.json"),
         root.join("tokenizer").join("tokenizer.json"),
         root.join("tokenizer").join("tokenizer_config.json"),
@@ -179,6 +182,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             )));
         }
     }
+    crate::h3_image::tier::reconcile(&dit_dir, &text_encoder_dir, spec)?;
     let dtype = match spec.precision {
         Precision::Fp32 => Dtype::Float32,
         _ => Dtype::Bfloat16,
@@ -187,6 +191,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(MiniMaxH3Image {
         descriptor: descriptor(),
         root,
+        dit_dir,
         text_encoder_dir,
         dtype,
         memory_strategy,
@@ -578,7 +583,7 @@ impl MiniMaxH3Image {
 
         // --- 2. denoise --------------------------------------------------------------------
         on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::Renderer));
-        let dit = MiniMaxH3ImageDit::load(&self.root, self.dtype)?;
+        let dit = MiniMaxH3ImageDit::load_dir(&self.dit_dir, self.dtype)?;
         debug_assert_eq!(patch, dit.config().base.patch_size);
         let layout = if reference_latents.is_empty() {
             ImageLayout::t2i(

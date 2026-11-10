@@ -339,7 +339,7 @@ fn task_component_dirs(task: MiniMaxH3Task) -> &'static [&'static str] {
 /// produce the actionable "missing `<component>/config.json`" error against the root —
 /// `mlx_gen_minimax_h3::model`'s `resolve_dit_dir` makes the identical choice for the identical
 /// reason.
-fn staged_component_dir<'a>(spec: &'a LoadSpec, component: &str) -> Option<&'a Path> {
+pub(crate) fn staged_component_dir<'a>(spec: &'a LoadSpec, component: &str) -> Option<&'a Path> {
     match spec.components.get(component) {
         Some(WeightsSource::Dir(p)) => Some(p.as_path()),
         _ => None,
@@ -368,7 +368,9 @@ fn staged_component_dir<'a>(spec: &'a LoadSpec, component: &str) -> Option<&'a P
 /// forbids, so it is a typed refusal at the registry boundary instead. This model publishes no NVFP4
 /// tier — `mlx_gen_minimax_h3::convert` packs MLX affine `q4`/`q8` only — so there is nothing to
 /// route it to.
-fn requested_tier(spec: &LoadSpec) -> candle_gen::gen_core::Result<Option<crate::tier::Tier>> {
+pub(crate) fn requested_tier(
+    spec: &LoadSpec,
+) -> candle_gen::gen_core::Result<Option<crate::tier::Tier>> {
     match spec.quantize {
         None => Ok(None),
         Some(Quant::Q4) => Ok(Some(crate::tier::Tier::Q4)),

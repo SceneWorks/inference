@@ -12,6 +12,7 @@ pub mod h3_adapter_memory;
 pub mod h3_audio_config;
 pub mod h3_chunking;
 pub mod h3_conditioning_memory;
+pub mod h3_image_tier;
 pub mod h3_keyframe;
 pub mod h3_memory;
 pub mod h3_reference;
