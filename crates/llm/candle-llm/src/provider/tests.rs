@@ -5643,3 +5643,82 @@ mod prefix_cache {
         println!("\nMODEL_INFERENCE_BODY_COMPLETED provider::tests::prefix_cache::a_request_keeps_its_snapshot_only_when_admission_holds_it");
     }
 }
+
+/// SW-7099: a ModelOpt NVFP4 qwen3_5 snapshot is priced as the load builds it — every published
+/// triple staged at its logical shape as the resident NVFP4 operand, the triples themselves held
+/// on the host and never cast — and a device that cannot serve NVFP4 refuses it by name instead
+/// of reading the packed codes as dense weights.
+#[test]
+fn a_modelopt_nvfp4_snapshot_is_priced_as_staged_nvfp4_and_refused_off_blackwell() {
+    use crate::primitives::projection::nvfp4_device_bytes;
+    use candle_core::{DType, Device};
+    let dense = qwen35_snapshot(false, false, true);
+    let mut tensors =
+        candle_core::safetensors::load(dense.path().join("model.safetensors"), &Device::Cpu)
+            .unwrap();
+    let keys: Vec<String> = tensors.keys().cloned().collect();
+    let (mut expected, mut converted) = (0u64, 0usize);
+    for key in keys {
+        let quantized = crate::models::qwen35::quantizes_tensor(&key) || key == "lm_head.weight";
+        let (rows, cols) = match tensors[&key].dims2() {
+            Ok(dims) if quantized => dims,
+            _ => continue,
+        };
+        let Some(bytes) = nvfp4_device_bytes(rows, cols) else {
+            continue;
+        };
+        let stem = key.strip_suffix(".weight").unwrap().to_string();
+        tensors.insert(
+            key.clone(),
+            Tensor::zeros((rows, cols / 2), DType::U8, &Device::Cpu).unwrap(),
+        );
+        tensors.insert(
+            format!("{stem}.weight_scale"),
+            Tensor::zeros((rows, cols / 16), DType::U8, &Device::Cpu).unwrap(),
+        );
+        tensors.insert(
+            format!("{stem}.weight_scale_2"),
+            Tensor::new(1.0f32, &Device::Cpu).unwrap(),
+        );
+        tensors.insert(
+            format!("{stem}.input_scale"),
+            Tensor::new(1.0f32, &Device::Cpu).unwrap(),
+        );
+        expected += bytes;
+        converted += 1;
+    }
+    assert!(
+        converted > 0,
+        "the synthetic decoder has NVFP4-eligible projections"
+    );
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dense.path().join("config.json")).unwrap())
+            .unwrap();
+    config["quantization_config"] = serde_json::json!({
+        "quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16,
+    });
+    let dir = dense.path();
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
+
+    let estimate = super::LlamaProvider::load_memory_estimate(&spec_at(dir, None), true).unwrap();
+    assert_eq!(estimate.quantized_copy_bytes, expected);
+
+    if crate::backend::backend_capabilities().nvfp4.supported {
+        return; // A Blackwell host loads it; the refusal is the other hosts' half.
+    }
+    match super::LlamaProvider::load(&spec_at(dir, None)) {
+        Err(error) => {
+            let error = error.to_string();
+            assert!(
+                error.contains("nvfp4: ") && error.contains("ModelOpt"),
+                "{error}"
+            );
+        }
+        Ok(_) => panic!("a ModelOpt NVFP4 snapshot loaded without an NVFP4 device"),
+    }
+    match super::LlamaProvider::load(&spec_at(dir, Some(core_llm::Quantize::Q8))) {
+        Err(error) => assert!(error.to_string().contains("ModelOpt"), "{error}"),
+        Ok(_) => panic!("a ModelOpt NVFP4 snapshot was re-quantized to Q8"),
+    }
+}

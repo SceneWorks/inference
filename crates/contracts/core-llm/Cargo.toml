@@ -32,6 +32,9 @@ serde = { workspace = true }
 minijinja = { version = "2", features = ["json", "preserve_order", "fuel"] }
 # Python-compatible str methods (.strip()/.startswith()/…) that HF templates rely on.
 minijinja-contrib = { version = "2", features = ["pycompat"] }
+# Verifies the MiniMax-H3-Image-PE prompt files against their manifest digests (SW-7099): the
+# licensed prompts are read from the model's own snapshot, never vendored.
+sha2 = { workspace = true }
 
 # NO tensor dependency and NO gen-ai dependency — this crate must build standalone on any platform.
 

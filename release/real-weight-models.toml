@@ -3343,3 +3343,37 @@ profiles = ["supra2"]
 environment = ["SUPRA2_VAE_SNAPSHOT"]
 download_files = ["config.json", "diffusion_pytorch_model.safetensors"]
 expected_files = ["config.json", "diffusion_pytorch_model.safetensors"]
+
+# SW-7099 (feature SW-F363): the MiniMax-H3-Image prompt expander as published — ModelOpt NVFP4
+# weights, its vision tower, tokenizer/chat template and the `prompt/` files the adapter
+# (`core_llm::minimax_h3_image_pe`) verifies against `prompt/manifest.json`. The
+# `minimax-h3-image-pe` profile runs it natively on the Blackwell CUDA box, converts it to the
+# bf16 / Q8 / Q4 tiers on both runners and scores each tier against the NVFP4 run.
+[[models]]
+key = "minimax-h3-image-pe"
+repository = "MiniMaxAI/MiniMax-H3-Image-PE"
+revision = "35603d4b63949afa12cb098227fffefedf081afa"
+license = "LicenseRef-MiniMax-H3-Image-Community"
+size_class = "large"
+profiles = ["minimax-h3-image-pe"]
+environment = ["MINIMAX_PE_SNAPSHOT"]
+download_files = ["*.json", "*.jinja", "*.safetensors", "prompt/*", "prompt/t2i/*", "prompt/edit/*"]
+expected_files = [
+  "config.json",
+  "generation_config.json",
+  "hf_quant_config.json",
+  "model.safetensors.index.json",
+  "model-00001-of-00004.safetensors",
+  "model-00002-of-00004.safetensors",
+  "model-00003-of-00004.safetensors",
+  "model-00004-of-00004.safetensors",
+  "processor_config.json",
+  "chat_template.jinja",
+  "tokenizer.json",
+  "tokenizer_config.json",
+  "prompt/manifest.json",
+  "prompt/t2i/system_prompt.txt",
+  "prompt/t2i/task_prompt.txt",
+  "prompt/t2i/request_params.json",
+  "prompt/edit/task_prompt.txt",
+]

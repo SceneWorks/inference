@@ -690,6 +690,27 @@ pub const MINIMAX_H3: ComponentLicense = ComponentLicense {
     retrieved: "2026-08-12",
 };
 
+/// `MiniMaxAI/MiniMax-H3-Image-PE` — MiniMax-H3-Image's prompt expander (SW-7099): a fine-tune of
+/// Qwen3.8-27B published as ModelOpt NVFP4, run on the LLM lane (`core_llm::minimax_h3_image_pe`)
+/// natively on Blackwell CUDA and through converted bf16 / Q8 / Q4 tiers elsewhere. One
+/// declaration covers the weights and the `prompt/` files the expander reads.
+///
+/// **Not Apache-2.0** although its base is: the MiniMax-H3-Image LICENSE's closing note puts the
+/// prompt-enhancer model under the Agreement "for the avoidance of doubt". See
+/// [`MINIMAX_H3_IMAGE_COMMUNITY`](super::families::MINIMAX_H3_IMAGE_COMMUNITY).
+pub const MINIMAX_H3_IMAGE_PE: ComponentLicense = ComponentLicense {
+    component: "minimax_h3_image_pe",
+    source_url: "https://huggingface.co/MiniMaxAI/MiniMax-H3-Image-PE",
+    gated: false,
+    declared: "minimax-h3-image-community-license-agreement",
+    family: "minimax-h3-image-community",
+    attribution: Some(
+        "MiniMax-H3-Image is licensed under the MiniMax-H3-Image Community License Agreement, \
+         Copyright \u{a9} 2026 MiniMax. All Rights Reserved.",
+    ),
+    retrieved: "2026-11-10",
+};
+
 /// `genmo/mochi-1-preview`.
 pub const MOCHI_1_PREVIEW: ComponentLicense = ComponentLicense {
     component: "mochi_1_preview",
@@ -1403,6 +1424,7 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     KREA_REALTIME_VIDEO,
     LTX_2_3,
     MINIMAX_H3,
+    MINIMAX_H3_IMAGE_PE,
     MOCHI_1_PREVIEW,
     MOSS_IMAGE_BASE,
     MOSS_IMAGE_SFT,
@@ -1466,8 +1488,9 @@ mod tests {
     #[test]
     fn every_row_is_in_the_slice_and_resolves_by_key() {
         // The sync preserves the 77 shared rows plus all three FLUX3 and all three MOSS rows;
-        // sc-24213 adds Supra2-IMG, Flan-T5-Base and sd-vae-ft-mse: 83 -> 86.
-        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 86);
+        // sc-24213 adds Supra2-IMG, Flan-T5-Base and sd-vae-ft-mse: 83 -> 86. SW-7099 adds
+        // MiniMax-H3-Image-PE: 87.
+        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 87);
         for row in MEDIA_COMPONENT_LICENSES {
             assert_eq!(
                 resolve_component(MEDIA_COMPONENT_LICENSES, row.component),
@@ -1869,7 +1892,9 @@ mod tests {
         // sc-26323 read the frozen MOSS bundles on 2026-10-18; see
         // docs/licensing/sc-26323-moss-image-licence-evidence.md. sc-24213 read the Supra2-IMG,
         // Flan-T5-Base and sd-vae-ft-mse cards on 2026-10-20; see
-        // docs/licensing/sc-24213-supra2-img-licence-evidence.md.
+        // docs/licensing/sc-24213-supra2-img-licence-evidence.md. SW-7099 read the
+        // MiniMax-H3-Image LICENSE and the PE card on 2026-11-10; see
+        // docs/licensing/sw-7099-minimax-h3-image-pe-licence-evidence.md.
         const EVIDENCE_PACK_DATES: &[&str] = &[
             "2026-08-02",
             "2026-08-12",
@@ -1880,6 +1905,7 @@ mod tests {
             "2026-10-16",
             "2026-10-18",
             "2026-10-20",
+            "2026-11-10",
         ];
         for row in MEDIA_COMPONENT_LICENSES {
             assert!(

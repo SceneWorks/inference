@@ -117,6 +117,11 @@ fn dense_weight(w: &Weights, key: &str, dtype: DType) -> Result<Tensor> {
              quantized projection may be stored as GGML blocks"
         )));
     }
+    if core_llm::modelopt::quantized_stem(key, |k| w.contains(k)).is_some() {
+        return Err(Error::Config(format!(
+            "ModelOpt NVFP4 tensor `{key}` holds packed codes and cannot be read as a dense weight"
+        )));
+    }
     Ok(t.to_dtype(dtype)?)
 }
 
@@ -129,6 +134,9 @@ fn keyed_projection(
     format: Option<&ProjectionFormat>,
     device: &Device,
 ) -> Result<Projection> {
+    if let Some(p) = crate::modelopt::modelopt_projection(w, key, format, device)? {
+        return Ok(p);
+    }
     let t = w.require(key)?;
     if is_ggml_block_tensor(t) {
         let stem = key.strip_suffix(".weight").unwrap_or(key);
@@ -3297,6 +3305,10 @@ impl Qwen35Model {
                         ));
                     };
                     Projection::load_as(weight.clone(), None, format)?
+                } else if let Some(head) =
+                    crate::modelopt::modelopt_projection(w, &head_key, format, &device)?
+                {
+                    head
                 } else {
                     Projection::load_as(req(head_key)?, None, format)?
                 },
