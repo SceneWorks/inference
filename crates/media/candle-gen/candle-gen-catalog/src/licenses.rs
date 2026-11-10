@@ -925,6 +925,9 @@ mod tests {
             // The MiniMax-H3-Image prompt expander runs on the LLM lane (SW-7099), not as a media
             // provider id.
             "minimax_h3_image_pe",
+            // SW-7090: MiniMax-H3-Image registers on MLX first; the Candle registration (SW-7091)
+            // maps this row and drops the pin.
+            "minimax_h3_image",
         ]);
         for elsewhere in &pinned_elsewhere {
             assert!(

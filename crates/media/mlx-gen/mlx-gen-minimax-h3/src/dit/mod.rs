@@ -27,6 +27,7 @@
 //! | [`adaln`] | the schedule-keyed modulation precompute and the **26.02 GB evict** (sc-17145) |
 //! | [`refiner`] | the 2-layer text token refiner |
 //! | [`qkv`] | the published fused-QKV transform, as an executable contract |
+//! | [`heads`] | the input/output projections, incl. MiniMax-H3-Image's per-step [`PddHeads`] |
 //!
 //! Deliberately **not** here: the joint denoise loop and the packed-sequence assembly, which are
 //! [`crate::denoise`] (sc-17146); and, each owned by a later story, the pipeline and the
@@ -55,11 +56,11 @@ pub mod rope;
 
 pub use adaln::{AdaLnCache, AdaLnResidency, ScheduleKey, TimestepSchedule};
 pub use block::{AdaLnModulation, AdaLnProjection, DitBlock};
-pub use config::{MiniMaxH3DitConfig, MODALITY_NUM, MODULATION_PARAMS};
+pub use config::{MiniMaxH3DitConfig, MiniMaxH3ImageDitConfig, MODALITY_NUM, MODULATION_PARAMS};
 pub use gen_core_h3::pruned_adaln::PruningIdentity;
 pub use heads::{
-    timestep_sincos, AdaLayerNormOut, DitProjections, LinearBias, NormOutModulation,
-    TimestepEmbedder,
+    pdd_head_index, timestep_sincos, AdaLayerNormOut, DitProjections, ImageDitProjections,
+    LinearBias, NormOutModulation, PddHeads, TimestepEmbedder,
 };
 pub use layers::{DitAttention, DitFeedForward, LinearNoBias, RmsNorm};
 pub use model::{JointDit, MiniMaxH3Dit, PUBLISHED_DIT_TENSORS};

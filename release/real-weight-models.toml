@@ -2696,6 +2696,29 @@ expected_files = [
   "vae_diffusers/diffusion_pytorch_model.safetensors",
 ]
 
+# SW-7090 — MiniMax-H3-Image's DiT (`transformer_diffusers/`, `MiniMaxH3ImageTransformer2DModel`,
+# 66 GB bf16 in 12 shards) and its tokenizer, for the first-step DiT parity and the 2048² t2i
+# render in the `minimax-h3-image` profile. The native `transformer/` copy and this repository's
+# own `text_encoder/` are left out: the text encoder is MiniMax-H3's byte-identical copy, read from
+# the `minimax-h3-text-encoder` row.
+[[models]]
+key = "minimax-h3-image-dit"
+repository = "MiniMaxAI/MiniMax-H3-Image"
+revision = "492fd8c4eca666f1085f57e30738c1e0d86b3439"
+license = "MiniMax-H3-Image Community License Agreement"
+size_class = "very-large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_IMAGE_SNAPSHOT"]
+download_files = ["transformer_diffusers/*", "tokenizer/*"]
+expected_files = [
+  "transformer_diffusers/config.json",
+  "transformer_diffusers/diffusion_pytorch_model.safetensors.index.json",
+  "transformer_diffusers/diffusion_pytorch_model-00001-of-00012.safetensors",
+  "transformer_diffusers/diffusion_pytorch_model-00012-of-00012.safetensors",
+  "tokenizer/tokenizer.json",
+  "tokenizer/tokenizer_config.json",
+]
+
 # ── MiniMax-H3 VRAM campaign (sc-20754) ──────────────────────────────────────────────────────────
 #
 # A dedicated exact allow-list keeps the normal `minimax-h3` header/decode slice small. The CUDA

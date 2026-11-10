@@ -1489,17 +1489,17 @@ jobs:
         id: candle_cuda_parent_preflight
         continue-on-error: true
         shell: cmd
-        run: '"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-qwen38-parent --load-profile candle-dense-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-qwen38-parent-preflight.json"'
+        run: call scripts\ci\real-weights\qwen38-bonsai-candle\preflight-candle-cuda-parent-before-provisioning.cmd
       - name: Preflight Candle CUDA Bonsai before provisioning
         id: candle_cuda_bonsai_preflight
         continue-on-error: true
         shell: cmd
-        run: '"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --load-profile candle-packed-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-bonsai-gguf-preflight.json"'
+        run: call scripts\ci\real-weights\qwen38-bonsai-candle\preflight-candle-cuda-bonsai-before-provisioning.cmd
       - name: Preflight Candle CUDA baseline before provisioning
         id: candle_cuda_baseline_preflight
         continue-on-error: true
         shell: cmd
-        run: '"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-qwen3vl-baseline --load-profile candle-dense-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\candle-cuda-qwen3vl-baseline-preflight.json"'
+        run: call scripts\ci\real-weights\qwen38-bonsai-candle\preflight-candle-cuda-baseline-before-provisioning.cmd
       - name: Preflight Candle format routes before provisioning
         id: candle_format_preflight
         shell: cmd
@@ -4902,6 +4902,8 @@ jobs:
         run: scripts/ci/report_runner_disk_headroom.sh MLX_GEN_MODELS_ROOT
       - name: Materialize and produce the image VAE reference
         run: source scripts/ci/real-weights/mlx-minimax-h3-image/materialize-and-produce-the-image-vae-reference.sh
+      - name: Materialize the DiT and produce its reference
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image/materialize-the-dit-and-produce-its-reference.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: minimax-h3-image-vae-reference
@@ -4909,6 +4911,8 @@ jobs:
           if-no-files-found: error
       - name: Run the image VAE gates
         run: source scripts/ci/real-weights/mlx-minimax-h3-image/run-the-image-vae-gates.sh
+      - name: Run the DiT parity and the 2048 render
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image/run-the-dit-parity-and-the-2048-render.sh
 
   candle-minimax-h3-image:
     needs: [validate-selection, mlx-minimax-h3-image]

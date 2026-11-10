@@ -690,6 +690,27 @@ pub const MINIMAX_H3: ComponentLicense = ComponentLicense {
     retrieved: "2026-08-12",
 };
 
+/// `MiniMaxAI/MiniMax-H3-Image` (SW-7090) — the text-to-image DiT (`transformer_diffusers/`),
+/// the 2-D VAE (`vae_diffusers/`) and the tokenizer, under the MiniMax-H3-Image Community License
+/// Agreement (card front matter `license: other`, `license_name:
+/// minimax-h3-image-community-license-agreement`; the LICENSE is the one SW-7099 read). Evidence:
+/// `docs/licensing/sw-7090-minimax-h3-image-licence-evidence.md`.
+///
+/// The Qwen3-VL-32B text encoder is **not** covered here, as for [`MINIMAX_H3`]: it is the
+/// byte-identical upstream copy under Apache-2.0 ([`QWEN3_VL_32B_INSTRUCT`]).
+pub const MINIMAX_H3_IMAGE: ComponentLicense = ComponentLicense {
+    component: "minimax_h3_image",
+    source_url: "https://huggingface.co/MiniMaxAI/MiniMax-H3-Image",
+    gated: false,
+    declared: "minimax-h3-image-community-license-agreement",
+    family: "minimax-h3-image-community",
+    attribution: Some(
+        "MiniMax-H3-Image is licensed under the MiniMax-H3-Image Community License Agreement, \
+         Copyright \u{a9} 2026 MiniMax. All Rights Reserved.",
+    ),
+    retrieved: "2026-11-10",
+};
+
 /// `MiniMaxAI/MiniMax-H3-Image-PE` — MiniMax-H3-Image's prompt expander (SW-7099): a fine-tune of
 /// Qwen3.8-27B published as ModelOpt NVFP4, run on the LLM lane (`core_llm::minimax_h3_image_pe`)
 /// natively on Blackwell CUDA and through converted bf16 / Q8 / Q4 tiers elsewhere. One
@@ -1424,6 +1445,7 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     KREA_REALTIME_VIDEO,
     LTX_2_3,
     MINIMAX_H3,
+    MINIMAX_H3_IMAGE,
     MINIMAX_H3_IMAGE_PE,
     MOCHI_1_PREVIEW,
     MOSS_IMAGE_BASE,
@@ -1489,8 +1511,8 @@ mod tests {
     fn every_row_is_in_the_slice_and_resolves_by_key() {
         // The sync preserves the 77 shared rows plus all three FLUX3 and all three MOSS rows;
         // sc-24213 adds Supra2-IMG, Flan-T5-Base and sd-vae-ft-mse: 83 -> 86. SW-7099 adds
-        // MiniMax-H3-Image-PE: 87.
-        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 87);
+        // MiniMax-H3-Image-PE: 87. SW-7090 adds MiniMax-H3-Image: 88.
+        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 88);
         for row in MEDIA_COMPONENT_LICENSES {
             assert_eq!(
                 resolve_component(MEDIA_COMPONENT_LICENSES, row.component),

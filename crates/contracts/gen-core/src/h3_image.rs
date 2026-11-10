@@ -190,9 +190,74 @@ pub fn validate_request(
     Ok(())
 }
 
+/// Per-row modality tag of an image row (`MINIMAX_H3_IMAGE_TAG`, modular_pipeline.py). Tags index
+/// the transformer's AdaLN table, so the values are a checkpoint contract: image rows reuse H3's
+/// video slot.
+pub const IMAGE_TAG: i32 = 0;
+/// Per-row modality tag of a text row (`MINIMAX_H3_TEXT_TAG`).
+pub const TEXT_TAG: i32 = 1;
+/// VAE spatial compression: one latent cell per 16x16 pixels.
+pub const VAE_SPATIAL_RATIO: u32 = 16;
+
+/// The `text2image` presentation's token ids: the prompt tokenized verbatim (no chat template, no
+/// special tokens) and truncated to [`MAX_PROMPT_TOKENS`] (encoders.py,
+/// `MiniMaxH3ImageTextEncoderStep`). An empty presentation is refused, as upstream refuses an empty
+/// prompt.
+pub fn t2i_prompt_ids(mut ids: Vec<i32>) -> Result<Vec<i32>, Error> {
+    if ids.is_empty() {
+        return Err(Error::Unsupported(
+            "MiniMax-H3-Image needs a non-empty prompt: the packed sequence has no text rows \
+             without one"
+                .into(),
+        ));
+    }
+    ids.truncate(MAX_PROMPT_TOKENS);
+    Ok(ids)
+}
+
+/// The `(latent_height, latent_width)` a `width x height` canvas packs to. The canvas must be a
+/// [`SIZE_STRIDE`] multiple, which [`generation_canvas`] guarantees.
+pub fn latent_grid(canvas_width: u32, canvas_height: u32) -> Result<(u32, u32), Error> {
+    if canvas_width == 0
+        || canvas_height == 0
+        || !canvas_width.is_multiple_of(SIZE_STRIDE)
+        || !canvas_height.is_multiple_of(SIZE_STRIDE)
+    {
+        return Err(Error::Msg(format!(
+            "MiniMax-H3-Image canvas {canvas_width}x{canvas_height} must be a positive multiple of \
+             {SIZE_STRIDE}"
+        )));
+    }
+    Ok((
+        canvas_height / VAE_SPATIAL_RATIO,
+        canvas_width / VAE_SPATIAL_RATIO,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_ids_truncate_at_4096_and_refuse_empty() {
+        assert_eq!(t2i_prompt_ids(vec![5, 6]).unwrap(), vec![5, 6]);
+        let long: Vec<i32> = (0..5000).collect();
+        let kept = t2i_prompt_ids(long).unwrap();
+        assert_eq!(kept.len(), MAX_PROMPT_TOKENS);
+        assert_eq!(kept[4095], 4095);
+        assert!(matches!(
+            t2i_prompt_ids(Vec::new()),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn latent_grid_is_the_canvas_over_16() {
+        assert_eq!(latent_grid(2048, 2048).unwrap(), (128, 128));
+        assert_eq!(latent_grid(1664, 2496).unwrap(), (156, 104));
+        assert!(latent_grid(1000, 1000).is_err());
+        assert_eq!((IMAGE_TAG, TEXT_TAG), (0, 1));
+    }
 
     #[test]
     fn table_entries_are_stride_aligned_near_16mp() {

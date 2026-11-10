@@ -573,6 +573,226 @@ impl DitProjections {
     }
 }
 
+/// MiniMax-H3-**Image**'s per-step output heads (`pdd_proj_out.{i}`): one
+/// `hidden_size → in_channels · prod(patch)` projection per distilled sampling step, replacing
+/// H3's single `proj_out`. **float32** in the published checkpoint (`_keep_in_fp32_modules`).
+///
+/// The checkpoint is distilled with Parallel Decoding Distillation, which keeps one head per step,
+/// so the forward of step `i` must project with head `i`: [`Self::select`] is the only way to
+/// reach a head, and it refuses an index outside the table instead of clamping it.
+#[derive(Debug, Clone)]
+pub struct PddHeads {
+    heads: Vec<LinearBias>,
+}
+
+impl PddHeads {
+    /// Load `pdd_proj_out.{0..count}`, each at its published dtype and shape-checked.
+    pub fn from_weights(
+        w: &mut Weights,
+        prefix: &str,
+        count: i32,
+        hidden_size: i32,
+        patch_dim: i32,
+    ) -> Result<Self> {
+        if count <= 0 {
+            return Err(Error::Msg(format!(
+                "minimax-h3-image dit {prefix}: needs at least one head, got {count}"
+            )));
+        }
+        let heads = (0..count)
+            .map(|i| LinearBias::from_weights(w, &format!("{prefix}.{i}"), hidden_size, patch_dim))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { heads })
+    }
+
+    /// The `2 · count` tensor names.
+    pub fn names(prefix: &str, count: i32) -> Vec<String> {
+        (0..count)
+            .flat_map(|i| LinearBias::names(&format!("{prefix}.{i}")))
+            .collect()
+    }
+
+    /// Heads in the table — the number of steps the sampler runs.
+    pub fn len(&self) -> usize {
+        self.heads.len()
+    }
+
+    /// Always `false` for a loaded table ([`Self::from_weights`] refuses zero heads).
+    pub fn is_empty(&self) -> bool {
+        self.heads.is_empty()
+    }
+
+    /// The head sampling step `step` projects with.
+    pub fn select(&self, step: usize) -> Result<&LinearBias> {
+        pdd_head_index(step, self.heads.len()).map(|i| &self.heads[i])
+    }
+
+    /// Device bytes held.
+    pub fn nbytes(&self) -> usize {
+        self.heads.iter().map(LinearBias::nbytes).sum()
+    }
+}
+
+/// Which PDD head step `step` uses: head `step`, exactly — never a clamp or a wrap, because a step
+/// past the table means the sampler and the checkpoint disagree on how many steps there are.
+pub fn pdd_head_index(step: usize, heads: usize) -> Result<usize> {
+    if step < heads {
+        Ok(step)
+    } else {
+        Err(Error::Msg(format!(
+            "minimax-h3-image dit: sampling step {step} has no output head; the checkpoint was \
+             distilled to {heads} steps, one head each"
+        )))
+    }
+}
+
+/// **MiniMax-H3-Image's input/output tensors** — H3's [`DitProjections`] without the audio pair,
+/// with [`PddHeads`] in place of the single `proj_out`. 11 + `2 · num_pdd_heads` tensors (23 at the
+/// shipped six heads); with the 600 block and 21 refiner tensors that is the published 644.
+///
+/// The shared pieces are H3's own types — [`LinearBias`], [`TimestepEmbedder`],
+/// [`AdaLayerNormOut`] — so the image family carries no copy of any layer, and H3's projection set
+/// (which requires its audio heads at load) is untouched.
+#[derive(Debug, Clone)]
+pub struct ImageDitProjections {
+    /// Patchified image rows → the residual stream. **float32**.
+    pub proj_in: LinearBias,
+    /// The text encoder's 5120-wide context → the residual stream. bfloat16.
+    pub context_embedder: LinearBias,
+    /// `time_proj` + `time_embedder`. **float32**.
+    pub time_embedder: TimestepEmbedder,
+    /// The packed sequence's final modulated norm. bfloat16.
+    pub norm_out: AdaLayerNormOut,
+    /// One output head per distilled sampling step. **float32**.
+    pub pdd_heads: PddHeads,
+}
+
+impl ImageDitProjections {
+    /// The checkpoint prefix of the per-step heads.
+    pub const PDD_PREFIX: &'static str = "pdd_proj_out";
+
+    /// Tensors besides the heads: `proj_in` 2, `context_embedder` 2, `time_embedder` 4,
+    /// `norm_out` 3.
+    pub const SHARED_TENSOR_COUNT: usize = 11;
+
+    /// Load every input/output tensor at its published dtype.
+    pub fn from_weights(
+        w: &mut Weights,
+        cfg: &crate::dit::config::MiniMaxH3ImageDitConfig,
+    ) -> Result<Self> {
+        cfg.validate()?;
+        let base = &cfg.base;
+        Ok(Self {
+            proj_in: LinearBias::from_weights(
+                w,
+                "proj_in",
+                base.video_patch_dim(),
+                base.hidden_size,
+            )?,
+            context_embedder: LinearBias::from_weights(
+                w,
+                "context_embedder",
+                base.text_dim,
+                base.hidden_size,
+            )?,
+            time_embedder: TimestepEmbedder::from_weights(w, "time_embedder", base)?,
+            norm_out: AdaLayerNormOut::from_weights(w, "norm_out", base)?,
+            pdd_heads: PddHeads::from_weights(
+                w,
+                Self::PDD_PREFIX,
+                cfg.num_pdd_heads,
+                base.hidden_size,
+                base.video_patch_dim(),
+            )?,
+        })
+    }
+
+    /// Every tensor name these projections consume.
+    pub fn names(cfg: &crate::dit::config::MiniMaxH3ImageDitConfig) -> Vec<String> {
+        let mut v = LinearBias::names("proj_in").to_vec();
+        v.extend(LinearBias::names("context_embedder"));
+        v.extend(TimestepEmbedder::names("time_embedder"));
+        v.extend(AdaLayerNormOut::names("norm_out"));
+        v.extend(PddHeads::names(Self::PDD_PREFIX, cfg.num_pdd_heads));
+        v
+    }
+
+    /// Device bytes held.
+    pub fn nbytes(&self) -> usize {
+        self.proj_in.nbytes()
+            + self.context_embedder.nbytes()
+            + self.time_embedder.nbytes()
+            + self.norm_out.nbytes()
+            + self.pdd_heads.nbytes()
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use crate::dit::config::MiniMaxH3ImageDitConfig;
+
+    /// 11 shared + 12 head tensors, no audio, and no H3 `proj_out`: with 50·12 block and 21 refiner
+    /// tensors that is the 644 the published `transformer_diffusers` index carries.
+    #[test]
+    fn the_image_projection_names_are_the_published_top_level_set() {
+        let cfg = MiniMaxH3ImageDitConfig::default();
+        let names = ImageDitProjections::names(&cfg);
+        assert_eq!(names.len(), ImageDitProjections::SHARED_TENSOR_COUNT + 12);
+        assert_eq!(cfg.base.num_layers * 12 + 21 + names.len() as i32, 644);
+        assert!(!names.iter().any(|n| n.contains("audio")), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with("proj_out")),
+            "{names:?}"
+        );
+        for expect in [
+            "pdd_proj_out.0.weight",
+            "pdd_proj_out.5.bias",
+            "norm_out.linear.weight",
+            "time_embedder.linear_2.bias",
+        ] {
+            assert!(names.iter().any(|n| n == expect), "{expect} missing");
+        }
+    }
+
+    /// Step `i` projects with head `i`; a step past the table is an error, not a clamp.
+    #[test]
+    fn step_i_selects_head_i_and_nothing_else() {
+        for step in 0..6 {
+            assert_eq!(pdd_head_index(step, 6).unwrap(), step);
+        }
+        let e = pdd_head_index(6, 6).unwrap_err().to_string();
+        assert!(e.contains("6 steps"), "{e}");
+    }
+
+    /// Each head is a distinct tensor and `select` returns the one at its own index.
+    #[test]
+    fn select_returns_the_head_loaded_at_that_index() {
+        let mut w = Weights::empty();
+        for i in 0..3 {
+            let v = i as f32 + 1.0;
+            w.insert(
+                format!("pdd_proj_out.{i}.weight"),
+                Array::from_slice(&[v; 8], &[2, 4]),
+            );
+            w.insert(
+                format!("pdd_proj_out.{i}.bias"),
+                Array::from_slice(&[v; 2], &[2]),
+            );
+        }
+        let heads = PddHeads::from_weights(&mut w, "pdd_proj_out", 3, 4, 2).unwrap();
+        assert_eq!(heads.len(), 3);
+        for i in 0..3 {
+            let b: Vec<f32> = heads.select(i).unwrap().bias().as_slice::<f32>().to_vec();
+            assert_eq!(b, vec![i as f32 + 1.0; 2]);
+        }
+        assert!(heads.select(3).is_err());
+        assert!(PddHeads::from_weights(&mut w, "pdd_proj_out", 0, 4, 2).is_err());
+        // A wrong head width is refused at load.
+        assert!(PddHeads::from_weights(&mut w, "pdd_proj_out", 3, 4, 3).is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

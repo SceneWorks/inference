@@ -110,6 +110,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_ltx::register_providers(registry);
     let registry = mlx_gen_mage::register_providers(registry);
     let registry = mlx_gen_minimax_h3::register_providers(registry);
+    let registry = mlx_gen_minimax_h3::h3_image::register_providers(registry);
     let registry = mlx_gen_mochi::register_providers(registry);
     let registry = mlx_gen_moss_image::register_providers(registry);
     let registry = mlx_gen_pulid::register_providers(registry);
@@ -894,6 +895,10 @@ mod tests {
                 // external decoder can consume it, so the descriptor deliberately advertises
                 // nothing and fails closed against every decoder swap.
                 "minimax_h3" => None,
+                // MiniMax-H3-Image's 24-channel single-frame latent is decoded only by its own
+                // 2-D ViT VAE (`vae_diffusers/`); no shared latent space describes it, so the
+                // descriptor advertises none and every external decoder swap fails closed.
+                "minimax_h3_image" => None,
                 family => panic!(
                     "{} has unclassified latent lineage for registered family {family}",
                     descriptor.id
@@ -1068,8 +1073,10 @@ mod tests {
         // sc-26323 adds the MOSS Base/SFT providers and their contract fixtures: 67/64.
         // sc-24213 adds `supra2_img` (resident-only dense f32, with a contract fixture) — 67/64 ->
         // 68/65.
-        assert_eq!(registry.memory_strategy_registrations().len(), 68);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 65);
+        // SW-7090 adds `minimax_h3_image` (StagedResidency and BoundedDecode implemented, rungs 3
+        // and 4 `Missing`), with a contract fixture — 68/65 -> 69/66.
+        assert_eq!(registry.memory_strategy_registrations().len(), 69);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 66);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
@@ -1115,9 +1122,11 @@ mod tests {
         // sc-24213's `supra2_img` publishes exactly one surface: the dense tier, resident, eager
         // (its loader refuses quantization, sequential offload and deferred materialization) — +1.
         // MOSS Base and SFT each witness bf16 + resident + eager — one surface apiece.
+        // SW-7090's `minimax_h3_image` publishes one surface: the dense tier, resident, eager (its
+        // loader refuses quantization and has no deferred shape) — +1.
         assert_eq!(
             surfaces.len(),
-            53 * 12 + 6 + 3 + 2 * 3 + 12 + 4 + 4 + 6 + 6 + 2 + 1
+            53 * 12 + 6 + 3 + 2 * 3 + 12 + 4 + 4 + 6 + 6 + 2 + 1 + 1
         );
         // The MLX catalog's only composed memory routes are Iris depth (a provider-specific API)
         // and Iris restoration (a transform): real routes with no gen-core generator registration.
@@ -1948,6 +1957,7 @@ mod tests {
                 "mage_flow_edit_base",
                 "mage_flow_edit_turbo",
                 "minimax_h3",
+                "minimax_h3_image",
                 "mochi_1",
                 "moss_image_base",
                 "moss_image_sft",
@@ -2044,8 +2054,9 @@ mod tests {
         // sc-26239 adds `flux3_klein_base` (a generator with its own complete row): 77 / 67.
         // sc-26323 adds both MOSS providers: 79 distinct ids / 69 complete rows.
         // sc-24213 adds `supra2_img` (its own complete row): 80 / 70.
-        assert_eq!(distinct.len(), 80);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 70);
+        // SW-7090 adds `minimax_h3_image` (a generator with its own complete row): 81 / 71.
+        assert_eq!(distinct.len(), 81);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 71);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface

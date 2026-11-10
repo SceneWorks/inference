@@ -195,6 +195,7 @@ pub mod cost;
 pub mod decoder;
 pub mod denoise;
 pub mod dit;
+pub mod h3_image;
 pub mod image_vae;
 pub mod keyframe;
 pub mod layout;
