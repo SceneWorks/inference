@@ -30,8 +30,8 @@ use std::path::Path;
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::gen_core::h3_image::REFERENCE_NOISE_AUG;
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::gen_core::h3_image::REFERENCE_NOISE_AUG;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 

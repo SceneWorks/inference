@@ -33,8 +33,7 @@ use candle_gen::gen_core::h3_image as contract;
 use candle_gen::gen_core::{
     Capabilities, ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadShape,
     LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, Precision, Progress, Quant,
-    SizeFloor,
-    StepSupport, WeightsSource,
+    SizeFloor, StepSupport, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 use gen_core_h3::h3_schedule::SigmaSchedule;
