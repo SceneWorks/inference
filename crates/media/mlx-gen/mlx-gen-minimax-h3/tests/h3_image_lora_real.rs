@@ -576,6 +576,48 @@ fn h3_image_adaln_and_output_head_loras_reach_the_denoiser() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("proj_out"), "{error}");
+
+    // Native ComfyUI spellings: renamed to their diffusers modules, and the single native output
+    // head fans out to all six per-step heads.
+    let mut t = Vec::new();
+    for (k, (stem, out, inp)) in [
+        (
+            "diffusion_model.final_layer.video_out",
+            b.video_patch_dim(),
+            b.hidden_size,
+        ),
+        ("diffusion_model.condition_proj", b.hidden_size, b.text_dim),
+        (
+            "diffusion_model.video_patch_proj",
+            b.hidden_size,
+            b.video_patch_dim(),
+        ),
+        (
+            "diffusion_model.time_embedder.proj_in",
+            b.time_embed_hidden_dim,
+            b.freq_dim,
+        ),
+        (
+            "diffusion_model.final_layer.adaln_proj.linear",
+            2 * b.hidden_size,
+            b.time_embed_dim,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let s = 71 + 10 * k as u32;
+        t.push((format!("{stem}.lora_A.weight"), seeded(&[RANK, inp], s)));
+        t.push((format!("{stem}.lora_B.weight"), seeded(&[out, RANK], s + 1)));
+    }
+    let native = dir.path().join("native-comfy.safetensors");
+    write(&native, t, &[("alpha", &RANK.to_string())]);
+    let report = apply_minimax_h3_adapters(&mut dit, &[spec(native, 1.0)]).expect("native install");
+    assert_eq!(
+        report.applied,
+        6 + 4,
+        "video_out fans out to six heads; four renames"
+    );
     crate::model_inference_device::record_model_inference_device();
     println!(
         "MODEL_INFERENCE_BODY_COMPLETED h3_image_lora_real::h3_image_adaln_and_output_head_loras_reach_the_denoiser"

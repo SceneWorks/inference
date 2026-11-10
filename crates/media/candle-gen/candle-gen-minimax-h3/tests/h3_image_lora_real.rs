@@ -480,6 +480,38 @@ fn h3_image_adaln_and_output_head_loras_reach_the_denoiser_cuda() {
         .to_string();
     assert!(error.contains("proj_out"), "{error}");
 
+    let mut t = Vec::new();
+    for (k, (stem, out, inp)) in [
+        ("diffusion_model.final_layer.video_out", patch_dim, hidden),
+        ("diffusion_model.condition_proj", hidden, cfg.text_dim),
+        ("diffusion_model.video_patch_proj", hidden, patch_dim),
+        (
+            "diffusion_model.time_embedder.proj_in",
+            cfg.time_embed_hidden_dim,
+            cfg.freq_dim,
+        ),
+        (
+            "diffusion_model.final_layer.adaln_proj.linear",
+            2 * hidden,
+            cfg.time_embed_dim,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let s = 71 + 10 * k as u32;
+        t.push((format!("{stem}.lora_A.weight"), seeded(&[RANK, inp], s)));
+        t.push((format!("{stem}.lora_B.weight"), seeded(&[out, RANK], s + 1)));
+    }
+    let native = dir.path().join("native-comfy.safetensors");
+    write(&native, &t, &[("alpha", &RANK.to_string())]);
+    let report = apply_minimax_h3_adapters(&mut dit, &[spec(native, 1.0)]).expect("native install");
+    assert_eq!(
+        report.applied,
+        6 + 4,
+        "video_out fans out to six heads; four renames"
+    );
+
     #[cfg(feature = "model-inference-proof")]
     println!(
         "\nMODEL_INFERENCE_BODY_COMPLETED h3_image_lora_real::h3_image_adaln_and_output_head_loras_reach_the_denoiser_cuda"

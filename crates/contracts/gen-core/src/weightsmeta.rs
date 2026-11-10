@@ -1489,7 +1489,7 @@ pub fn classify_minimax_h3_lora_key_space<'a>(
 /// | --- | --- |
 /// | `transformer_blocks_{i}_`, `blocks_{i}_` | `attn_to_{q,k,v}`, `attn_to_out_0`, `ff_net_0_proj`, `ff_net_2`, `attn_qkv_proj`, `attn_out_proj`, `mlp_fc1`, `mlp_fc2`, `adaln_proj_linear` |
 /// | `token_refiner_refiner_blocks_{i}_`, `token_refiner_blocks_{i}_` | the same |
-/// | *(top level)* | `proj_in`, `context_embedder`, `time_embedder_linear_{1,2}`, `norm_out_linear`, `pdd_proj_out_{i}` |
+/// | *(top level)* | `proj_in`, `context_embedder`, `time_embedder_linear_{1,2}`, `norm_out_linear`, `pdd_proj_out_{i}`; native `condition_proj`, `video_patch_proj`, `time_embedder_proj_{in,out}`, `final_layer_adaln_proj_linear`, `final_layer_video_out` |
 ///
 /// The roles are `.lora_down.weight`, `.lora_up.weight` and `.alpha`. The block index is not range
 /// checked here; the model decides whether block `i` exists, and an absent one is an unmatched
@@ -1507,6 +1507,14 @@ pub fn minimax_h3_kohya_key_to_dotted(key: &str) -> Option<String> {
         "time_embedder_linear_1" => Some("time_embedder.linear_1".to_owned()),
         "time_embedder_linear_2" => Some("time_embedder.linear_2".to_owned()),
         "norm_out_linear" => Some("norm_out.linear".to_owned()),
+        // The native (`transformer/`, ComfyUI) spellings of the same modules; the installs rename
+        // them to the diffusers names (`condition_proj` → `context_embedder`, …) and fan
+        // `final_layer.video_out` out to the per-step heads.
+        "condition_proj" | "video_patch_proj" => Some(stem.to_owned()),
+        "time_embedder_proj_in" => Some("time_embedder.proj_in".to_owned()),
+        "time_embedder_proj_out" => Some("time_embedder.proj_out".to_owned()),
+        "final_layer_adaln_proj_linear" => Some("final_layer.adaln_proj.linear".to_owned()),
+        "final_layer_video_out" => Some("final_layer.video_out".to_owned()),
         _ => stem
             .strip_prefix("pdd_proj_out_")
             .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
@@ -2371,17 +2379,42 @@ mod tests {
         }
         let err = rewrite_minimax_h3_kohya_keys([
             "lora_unet_blocks_0_mlp_fc1.lora_down.weight",
-            "lora_unet_video_patch_proj.lora_down.weight",
-            "lora_unet_condition_proj.lora_up.weight",
+            "lora_unet_final_layer_norm.lora_down.weight",
+            "lora_unet_rope_inv_freq.lora_up.weight",
         ])
         .unwrap_err();
         assert_eq!(
             err,
             vec![
-                "lora_unet_condition_proj.lora_up.weight".to_owned(),
-                "lora_unet_video_patch_proj.lora_down.weight".to_owned(),
+                "lora_unet_final_layer_norm.lora_down.weight".to_owned(),
+                "lora_unet_rope_inv_freq.lora_up.weight".to_owned(),
             ]
         );
+        for (key, want) in [
+            ("lora_unet_condition_proj.alpha", "condition_proj.alpha"),
+            (
+                "lora_unet_video_patch_proj.lora_down.weight",
+                "video_patch_proj.lora_down.weight",
+            ),
+            (
+                "lora_unet_time_embedder_proj_out.lora_up.weight",
+                "time_embedder.proj_out.lora_up.weight",
+            ),
+            (
+                "lora_unet_final_layer_adaln_proj_linear.lora_down.weight",
+                "final_layer.adaln_proj.linear.lora_down.weight",
+            ),
+            (
+                "lora_unet_final_layer_video_out.alpha",
+                "final_layer.video_out.alpha",
+            ),
+        ] {
+            assert_eq!(
+                minimax_h3_kohya_key_to_dotted(key).as_deref(),
+                Some(want),
+                "{key}"
+            );
+        }
     }
 
     /// SW-7096: only the trainer's own module stamp selects the strict census; a community kohya

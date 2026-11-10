@@ -432,12 +432,36 @@ pub fn image_adapter_target_paths(cfg: &MiniMaxH3DitConfig) -> Vec<String> {
 /// Strip a known namespace prefix. The turbo files need no renaming beyond this: their module paths
 /// are already the checkpoint's own.
 pub fn normalize_minimax_h3_key(key: &str) -> String {
-    PREFIXES
+    let stem = PREFIXES
         .iter()
         .find_map(|p| key.strip_prefix(p))
-        .unwrap_or(key)
+        .unwrap_or(key);
+    NATIVE_TOP_LEVEL
+        .iter()
+        .find_map(|(native, diffusers)| (stem == *native).then_some(*diffusers))
+        .unwrap_or(stem)
         .to_string()
 }
+
+/// The native (`transformer/`, ComfyUI) names of the top-level linears and their diffusers names
+/// (SW-7096). Each pair is a pure rename: the published H3-Image `transformer/` and
+/// `transformer_diffusers/` tensors are byte-identical under it (checked tensor by tensor, and the
+/// renames diffusers' `convert_minimax_h3_to_diffusers.py` applies). `final_layer.video_out` is
+/// not here: it is the base single output head, which a PDD release replaces per step — see
+/// [`NATIVE_OUTPUT_HEAD`].
+pub const NATIVE_TOP_LEVEL: [(&str, &str); 5] = [
+    ("condition_proj", "context_embedder"),
+    ("video_patch_proj", "proj_in"),
+    ("time_embedder.proj_in", "time_embedder.linear_1"),
+    ("time_embedder.proj_out", "time_embedder.linear_2"),
+    ("final_layer.adaln_proj.linear", "norm_out.linear"),
+];
+
+/// The native single output head (SW-7096). On MiniMax-H3-Image it applies to **every** per-step
+/// head `pdd_proj_out.{i}`: the PDD heads replace this head step by step, and ComfyUI — the loader
+/// that consumes native-named LoRAs — patches a single-head `video_out` LoRA onto the base row
+/// block every step's head is built from. A host with no per-step heads leaves it unmatched.
+pub const NATIVE_OUTPUT_HEAD: &str = "final_layer.video_out";
 
 /// Split a key into `(module_path, role)`, or `None` when it is not a LoRA factor key at all.
 pub fn classify_key(key: &str) -> Option<(String, Role)> {
@@ -1295,6 +1319,26 @@ fn apply_one_lora(
         // unreachable — see [`convert_comfyui_key_space`].
         let alpha = resolve_target_alpha(parts.alpha, blob_alpha, file_alpha);
         let segs: Vec<&str> = path.split('.').collect();
+        if path == NATIVE_OUTPUT_HEAD {
+            let fold = alpha_rank_fold(alpha, rank);
+            let a = down.t()?.contiguous()?.to_device(&device)?;
+            let b = up
+                .t()?
+                .contiguous()?
+                .affine(fold as f64, 0.0)?
+                .to_device(&device)?;
+            let mut heads = 0usize;
+            while let Some(lin) = host.adaptable_mut(&["pdd_proj_out", &heads.to_string()]) {
+                lin.push_lora(a.clone(), b.clone(), scale as f64)?;
+                heads += 1;
+            }
+            if heads == 0 {
+                report.unmatched_paths.push(path);
+            } else {
+                report.applied += heads;
+            }
+            continue;
+        }
         let Some(lin) = host.adaptable_mut(&segs) else {
             report.unmatched_paths.push(path);
             continue;
@@ -1483,6 +1527,80 @@ fn has_lokr_keys(tensors: &HashMap<String, Tensor>) -> bool {
 #[cfg(test)]
 mod alias_tests {
     use super::*;
+
+    /// SW-7096: every linear of the published native `transformer/` routes to a diffusers module
+    /// of `transformer_diffusers/` with the matching shape — read off the committed header fixture
+    /// (names, dtypes and shapes only). The fused qkv splits into three equal row thirds, `fc1`
+    /// keeps its shape (its halves swap), `final_layer.video_out` fans out to every per-step head,
+    /// and the one non-linear `final_layer.norm` is no target.
+    #[test]
+    fn every_native_linear_routes_to_a_diffusers_module_of_its_shape() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../contracts/gen-core/tests/fixtures/adapters/h3_image_native_vs_diffusers_header.json"
+        )))
+        .unwrap();
+        let shape = |side: &str, key: &str| -> Option<Vec<u64>> {
+            fixture[side][key][1]
+                .as_array()
+                .map(|a| a.iter().map(|d| d.as_u64().unwrap()).collect())
+        };
+        let mut routed = Vec::new();
+        let mut linears = 0;
+        for key in fixture["native"].as_object().unwrap().keys() {
+            let Some(stem) = key.strip_suffix(".weight") else {
+                continue;
+            };
+            let native = shape("native", key).unwrap();
+            if native.len() != 2 {
+                // Norm gains and the like: not linears, so never a LoRA target.
+                continue;
+            }
+            linears += 1;
+            let path = normalize_comfy_container(&normalize_minimax_h3_key(&format!(
+                "diffusion_model.{stem}"
+            )));
+            let targets: Vec<(String, Vec<u64>)> = if path == NATIVE_OUTPUT_HEAD {
+                (0..6)
+                    .map(|i| (format!("pdd_proj_out.{i}"), native.clone()))
+                    .collect()
+            } else if let Some((container, leaf)) = split_comfy_leaf(&path) {
+                match leaf {
+                    ComfyLeaf::Qkv => ["to_q", "to_k", "to_v"]
+                        .iter()
+                        .map(|n| {
+                            (
+                                format!("{container}.attn.{n}"),
+                                vec![native[0] / 3, native[1]],
+                            )
+                        })
+                        .collect(),
+                    ComfyLeaf::OutProj => {
+                        vec![(format!("{container}.attn.to_out.0"), native.clone())]
+                    }
+                    ComfyLeaf::Fc1 => vec![(format!("{container}.ff.net.0.proj"), native.clone())],
+                    ComfyLeaf::Fc2 => vec![(format!("{container}.ff.net.2"), native.clone())],
+                }
+            } else {
+                vec![(path.clone(), native.clone())]
+            };
+            for (target, want) in targets {
+                assert_eq!(
+                    shape("diffusers", &format!("{target}.weight")),
+                    Some(want),
+                    "{key} -> {target}"
+                );
+                routed.push(target);
+            }
+        }
+        assert_eq!(
+            linears, 19,
+            "block 0 (5), two refiner blocks (8), and six top-level linears"
+        );
+        assert!(routed.iter().any(|t| t == "norm_out.linear"));
+        assert!(routed.iter().any(|t| t == "pdd_proj_out.5"));
+        assert!(!routed.iter().any(|t| t.contains("norm_out.norm")));
+    }
 
     /// SW-7096: a generic kohya file is rewritten on both module spellings, every target leaves
     /// with an explicit alpha, and an unknown layout is refused naming each unmatched key.
