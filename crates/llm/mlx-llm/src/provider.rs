@@ -1170,6 +1170,22 @@ fn materialize_decoder(weights: &mut Weights, groups: &[Vec<Array>]) -> CoreResu
     Ok(())
 }
 
+/// The by-name refusal of a ModelOpt NVFP4 snapshot (SW-7099): MLX does not execute NVFP4, and a
+/// ModelOpt checkpoint's projections are packed U8 codes, so it loads only a converted tier. A
+/// missing or unreadable config is left to the loader's own error.
+fn modelopt_refusal(dir: &Path) -> CoreResult<()> {
+    let Some(config) = read_json(dir, "config.json") else {
+        return Ok(());
+    };
+    match core_llm::modelopt::modelopt_nvfp4(&config) {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err(CoreError::Unsupported(
+            core_llm::modelopt::dense_runtime_refusal("MLX"),
+        )),
+        Err(why) => Err(CoreError::Unsupported(why)),
+    }
+}
+
 impl LlamaProvider {
     fn new_execution_fence() -> core_llm::text_llm::OwnedExecutionFence<mlx_rs::Stream> {
         core_llm::text_llm::OwnedExecutionFence::new(
@@ -1784,6 +1800,9 @@ impl LlamaProvider {
                     .into(),
             ));
         }
+        // SW-7099: a ModelOpt NVFP4 snapshot is refused by name before admission too — MLX loads
+        // the tier converted from it, never its packed U8 codes as dense weights.
+        modelopt_refusal(Path::new(&spec.source))?;
         // sc-24135: NVFP4 is refused by name before admission, so a memory refusal cannot mask it.
         let quant = spec.quantize.map(quant_spec).transpose()?;
         let required = crate::load_memory::required_bytes(spec)?;

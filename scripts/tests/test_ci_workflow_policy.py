@@ -880,9 +880,11 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 41 since sc-26214 added the dispatch-only `mlx-veda` job;
         # 42 since sc-26234 added the dispatch-only `mlx-flux3-klein` job;
         # 43 since sc-24217 added the dispatch-only `mlx-supra2` job;
-        # 44 since SW-7089 added the dispatch-only `mlx-minimax-h3-image` job.
-        MACOS_HUB_LOCK: 44,
+        # 44 since SW-7089 added the dispatch-only `mlx-minimax-h3-image` job;
+        # 45 since SW-7099 added the dispatch-only `mlx-minimax-h3-image-pe` job.
+        MACOS_HUB_LOCK: 45,
         # 21 since SW-7089 added the dispatch-only `candle-minimax-h3-image` job;
+        # 22 since SW-7099 added the dispatch-only `candle-minimax-h3-image-pe` job;
         # 20 since sc-24214 added the dispatch-only `candle-supra2` job;
         # 19 since sc-26235 added the dispatch-only `candle-flux3-klein` job;
         # 18 since sc-25901 added the dispatch-only `candle-qwen-image-2-1-turbo` job;
@@ -893,7 +895,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
         # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
         # 11 since sc-18932 added the `candle-minimax-h3` job.
-        WINDOWS_HUB_LOCK: 21,
+        WINDOWS_HUB_LOCK: 22,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -1524,13 +1526,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # `candle-qwen-image-2-1-turbo`; 41 macOS after sc-26214 added `mlx-veda`; 42 macOS after
         # sc-26234 added `mlx-flux3-klein`; 19 Windows after sc-26235 added `candle-flux3-klein`;
         # 20 Windows after sc-24214 added `candle-supra2`; 43 macOS after sc-24217 added `mlx-supra2`;
-        # 44 macOS / 21 Windows after SW-7089 added `mlx-minimax-h3-image` / `candle-minimax-h3-image`.
+        # 44 macOS / 21 Windows after SW-7089 added `mlx-minimax-h3-image` / `candle-minimax-h3-image`;
+        # 45 macOS / 22 Windows after SW-7099 added the MiniMax-H3-Image-PE pair.
         # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 44)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 21)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 45)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 22)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(

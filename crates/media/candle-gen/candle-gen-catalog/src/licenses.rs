@@ -922,6 +922,9 @@ mod tests {
             "qwen_image_lightning",
             "qwen_image_edit_2511_lightning",
             "xlabs_flux_ip_adapter",
+            // The MiniMax-H3-Image prompt expander runs on the LLM lane (SW-7099), not as a media
+            // provider id.
+            "minimax_h3_image_pe",
         ]);
         for elsewhere in &pinned_elsewhere {
             assert!(

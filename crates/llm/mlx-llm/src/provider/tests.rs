@@ -6758,3 +6758,27 @@ fn no_dense_kv_copy_survives_a_paged_compressed_attention_call() {
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED provider::tests::no_dense_kv_copy_survives_a_paged_compressed_attention_call");
 }
+
+/// SW-7099: a ModelOpt NVFP4 snapshot is refused by name before admission or any weight read —
+/// MLX loads the converted tier, never the packed U8 codes as dense weights.
+#[test]
+fn a_modelopt_nvfp4_snapshot_is_refused_by_name_before_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16},
+    });
+    std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+    let spec = core_llm::LoadSpec::dense(dir.path().display().to_string());
+    match super::LlamaProvider::load(&spec) {
+        Err(core_llm::Error::Unsupported(why)) => {
+            assert!(
+                why.starts_with("nvfp4: ") && why.contains("ModelOpt"),
+                "{why}"
+            )
+        }
+        Err(other) => panic!("expected the by-name refusal, got {other}"),
+        Ok(_) => panic!("a ModelOpt NVFP4 snapshot loaded on MLX"),
+    }
+}

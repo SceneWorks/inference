@@ -279,6 +279,55 @@ impl Nvfp4Weight {
         }
     }
 
+    /// Stage an already-packed host weight (a pre-quantized checkpoint's own codes, e.g.
+    /// [`Nvfp4Tensor::from_modelopt_parts`](crate::Nvfp4Tensor::from_modelopt_parts)) as a resident
+    /// NVFP4 weight on `device`, **without requantizing it**. Same eligibility and device gates as
+    /// [`Self::quantize`].
+    pub fn from_packed(
+        weight: &crate::Nvfp4Tensor,
+        bias: Option<Tensor>,
+        device: &Device,
+        ctx: &Nvfp4Context,
+    ) -> Result<Self> {
+        let (rows, cols) = (weight.rows, weight.cols);
+        if let Err(refusal) = nvfp4_shape_refusal(rows, cols) {
+            candle_core::bail!("{refusal}");
+        }
+        #[cfg(feature = "cuda")]
+        {
+            if !weight.cols_padded.is_multiple_of(NVFP4_K_ALIGN) {
+                candle_core::bail!(
+                    "{NVFP4_CAPABILITY}: packed weight K {} is not a multiple of {NVFP4_K_ALIGN}",
+                    weight.cols_padded
+                );
+            }
+            let lt = ctx.handle_for(device).map_err(|why| {
+                candle_core::Error::Msg(format!(
+                    "{NVFP4_CAPABILITY}: no NVFP4 handle for the weight's device ({why:?})"
+                ))
+            })?;
+            let staged = lt.stage_nvfp4(weight)?;
+            Ok(Self {
+                rows,
+                cols,
+                bias,
+                lt: std::sync::Arc::clone(lt),
+                staged,
+                device: device.clone(),
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (bias, ctx);
+            candle_core::bail!(
+                "{}",
+                Nvfp4Refusal::NotCudaDevice {
+                    device: format!("{:?}", device.location()),
+                }
+            )
+        }
+    }
+
     /// `y = x·Wᵀ (+ b)` through the W4A4 FP4 GEMM. Accepts a rank-≥1 activation `[..., in]` and
     /// returns `[..., out]` in the activation's dtype.
     ///
