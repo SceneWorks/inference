@@ -480,7 +480,7 @@ pub fn parse_edit(answer: &str, aspect: &AspectSelection) -> Result<Expansion, S
 ///
 /// **Metric.** Each tier runs the set greedily (temperature 0, everything else the published
 /// recipe), as the NVFP4 reference does. Per case it records whether the reply parses, whether its
-/// aspect ratio equals the reference's, and the chrF score ([`chrf`], character 6-gram F-score,
+/// aspect ratio equals the reference's, and the chrF score ([`quality::chrf`], character 6-gram F-score,
 /// β = 2) of its `expanded_caption` against the reference's. chrF is used because the caption is
 /// the only thing the image model consumes, it is robust to the small rewordings a quantized
 /// model makes once its greedy path diverges, and it needs no second model to judge. A greedy
