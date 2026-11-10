@@ -2,8 +2,8 @@
 //! t2i and edit-with-references on this backend) and AC2 (each converted tier states its quality
 //! against the NVFP4 original on a fixed prompt set).
 //!
-//! One `#[ignore]`d test runs `core_llm::minimax_h3_image_pe::quality`'s fixed set greedily on
-//! the tier at `MINIMAX_PE_TIER` and writes one JSON document. Labelled `nvfp4`, the run IS the
+//! One `#[ignore]`d test runs `core_llm::minimax_h3_image_pe::quality`'s fixed set — the
+//! published sampling recipe, seeded per case — on the tier at `MINIMAX_PE_TIER` and writes one JSON document. Labelled `nvfp4`, the run IS the
 //! reference (the published ModelOpt weights, natively on a Blackwell card); any other label is
 //! scored against the reference document by caption chrF, aspect-ratio agreement and parse rate.
 //! The test fails when any case does not produce a schema-valid expansion; the quality numbers

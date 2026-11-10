@@ -478,14 +478,18 @@ pub fn parse_edit(answer: &str, aspect: &AspectSelection) -> Result<Expansion, S
 /// The prompts are this repository's own text (never MiniMax's). Edit references are drawn
 /// procedurally, so the set needs no image files.
 ///
-/// **Metric.** Each tier runs the set greedily (temperature 0, everything else the published
-/// recipe), as the NVFP4 reference does. Per case it records whether the reply parses, whether its
-/// aspect ratio equals the reference's, and the chrF score ([`quality::chrf`], character 6-gram F-score,
-/// β = 2) of its `expanded_caption` against the reference's. chrF is used because the caption is
-/// the only thing the image model consumes, it is robust to the small rewordings a quantized
-/// model makes once its greedy path diverges, and it needs no second model to judge. A greedy
-/// token-by-token comparison is not used: a 27B reasoning model's thinking diverges within a few
-/// hundred tokens under any quantization, which says nothing about the caption it settles on.
+/// **Metric.** Each tier runs the set with the **published** sampling recipe (temperature 1.0,
+/// top-p 0.95, top-k 20, 4096 new tokens), seeded per case ([`quality::QUALITY_SEED`]), as the
+/// NVFP4 reference does. Greedy decoding is not used: the card publishes a sampling recipe only,
+/// the Qwen3.8 base card lists the same values for thinking mode, and a greedy thinking trace
+/// can run out the 4096-token budget before it answers (SW-7099 run 42885269431, `edit-0`). Per
+/// case it records whether the reply parses, whether its aspect ratio equals the reference's, and
+/// the chrF score ([`quality::chrf`], character 6-gram F-score, β = 2) of its `expanded_caption`
+/// against the reference's. chrF is used because the caption is the only thing the image model
+/// consumes, it tolerates the rewordings two sampled runs make, and it needs no second model to
+/// judge. A token-by-token comparison is not used: a 27B reasoning model's sampled thinking
+/// diverges within a few hundred tokens under any quantization, which says nothing about the
+/// caption it settles on.
 pub mod quality {
     use super::{reduced_ratio, AspectSelection, EditReference};
     use crate::message::ImageRef;
@@ -634,11 +638,48 @@ pub mod quality {
         pub error: Option<String>,
         /// Tokens generated (thinking and answer).
         pub generated_tokens: u32,
+        /// Why generation stopped (`stop`, `length`, …), when the backend says.
+        pub finish_reason: Option<String>,
+        /// The last [`THINKING_TAIL_CHARS`] characters of the reasoning trace, kept as evidence
+        /// for a reply that broke the schema (a looping or unfinished trace shows here).
+        pub thinking_tail: Option<String>,
     }
 
-    /// Run the whole set on `llm` greedily (temperature 0; every other knob the published
-    /// recipe), as both the NVFP4 reference and each tier do. A generation error fails the run;
-    /// a reply that breaks the schema is recorded as unparsed.
+    /// Base seed of the quality set; case `i` of the run uses `QUALITY_SEED + i`, so a rerun on
+    /// one backend and tier reproduces its samples.
+    pub const QUALITY_SEED: u64 = 0x5EED_7099;
+
+    /// How much of a failed reply's reasoning trace the evidence keeps.
+    pub const THINKING_TAIL_CHARS: usize = 800;
+
+    /// Judge a finished reply: the parsed expansion, or why it is refused. A reply that stopped on
+    /// the token budget is named as a truncation — in the reasoning trace (no answer text at all)
+    /// or in the answer — never reported as the JSON error an empty or cut answer would produce.
+    pub fn judge_reply(
+        answer: &str,
+        finish: Option<crate::FinishReason>,
+        max_new_tokens: u32,
+        parse: &dyn Fn(&str) -> Result<super::Expansion, String>,
+    ) -> Result<super::Expansion, String> {
+        match parse(answer) {
+            Ok(expansion) => Ok(expansion),
+            Err(_) if finish == Some(crate::FinishReason::Length) && answer.trim().is_empty() => {
+                Err(format!(
+                    "truncated: the {max_new_tokens}-token budget ran out inside the reasoning \
+                     trace, before any answer"
+                ))
+            }
+            Err(why) if finish == Some(crate::FinishReason::Length) => Err(format!(
+                "truncated: the {max_new_tokens}-token budget ran out inside the answer ({why})"
+            )),
+            Err(why) => Err(why),
+        }
+    }
+
+    /// Run the whole set on `llm` with the published recipe, seeded per case
+    /// ([`QUALITY_SEED`]), as both the NVFP4 reference and each tier do. A generation error fails
+    /// the run; a reply that breaks the schema (truncations included, [`judge_reply`]) is
+    /// recorded as unparsed.
     pub fn run_set(
         llm: &dyn crate::TextLlm,
         files: &super::PromptFiles,
@@ -649,17 +690,27 @@ pub mod quality {
                        mut req: crate::TextLlmRequest,
                        parse: &dyn Fn(&str) -> Result<super::Expansion, String>|
          -> crate::Result<()> {
-            req.sampling = crate::Sampling::greedy();
+            req.seed = Some(QUALITY_SEED + runs.len() as u64);
             let out = llm.complete(&req)?;
-            let (expansion, error) = match parse(&out.text) {
+            let judged = judge_reply(&out.text, out.finish_reason, req.max_new_tokens, parse);
+            let (expansion, error) = match judged {
                 Ok(e) => (Some(e), None),
                 Err(e) => (None, Some(e)),
+            };
+            let thinking_tail = match (&error, &out.thinking) {
+                (Some(_), Some(t)) => {
+                    let skip = t.chars().count().saturating_sub(THINKING_TAIL_CHARS);
+                    Some(t.chars().skip(skip).collect())
+                }
+                _ => None,
             };
             runs.push(CaseRun {
                 id,
                 expansion,
                 error,
                 generated_tokens: out.usage.generated_tokens,
+                finish_reason: out.finish_reason.map(|f| format!("{f:?}").to_lowercase()),
+                thinking_tail,
             });
             Ok(())
         };
@@ -687,6 +738,8 @@ pub mod quality {
                     "aspect_ratio": r.expansion.as_ref().map(|e| &e.aspect_ratio),
                     "error": r.error,
                     "generated_tokens": r.generated_tokens,
+                    "finish_reason": r.finish_reason,
+                    "thinking_tail": r.thinking_tail,
                 })
             })
             .collect();
@@ -957,12 +1010,16 @@ mod tests {
                 expansion: Some(e("A red bicycle.", "3:2")),
                 error: None,
                 generated_tokens: 9,
+                finish_reason: Some("stop".into()),
+                thinking_tail: None,
             },
             CaseRun {
                 id: "edit-0".into(),
                 expansion: Some(e("An apple.", "16:9")),
                 error: None,
                 generated_tokens: 7,
+                finish_reason: Some("stop".into()),
+                thinking_tail: None,
             },
         ];
         let doc = runs_to_json("nvfp4", &reference);
@@ -988,6 +1045,34 @@ mod tests {
             ..reference[0].clone()
         }];
         assert!(compare(&missing, &back).is_err());
+    }
+
+    #[test]
+    fn a_reply_cut_by_the_budget_is_a_truncation_not_a_json_error() {
+        use crate::FinishReason;
+        use quality::judge_reply;
+        let ratios = vec!["1:1".to_string()];
+        let parse = |t: &str| parse_t2i(t, &ratios);
+        let thinking_only = judge_reply("", Some(FinishReason::Length), 4096, &parse).unwrap_err();
+        assert!(
+            thinking_only.starts_with("truncated:") && thinking_only.contains("reasoning trace"),
+            "{thinking_only}"
+        );
+        let cut = judge_reply(
+            r#"{"expanded_caption":"A ca"#,
+            Some(FinishReason::Length),
+            4096,
+            &parse,
+        )
+        .unwrap_err();
+        assert!(
+            cut.starts_with("truncated:") && cut.contains("inside the answer"),
+            "{cut}"
+        );
+        let stopped = judge_reply("", Some(FinishReason::Stop), 4096, &parse).unwrap_err();
+        assert!(stopped.contains("not JSON"), "{stopped}");
+        let ok = r#"{"expanded_caption":"A cat.","aspect_ratio":"1:1"}"#;
+        assert!(judge_reply(ok, Some(FinishReason::Length), 4096, &parse).is_ok());
     }
 
     #[test]
