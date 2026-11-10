@@ -20,8 +20,25 @@ Two forwards, both of the denoise loop's own call (``pdd_step_index=i`` and the 
 * ``step0`` — the first sampling step (``t = 0``, head 0);
 * ``step3`` — step 3 (``t = 0.25``, head 3), so the gate also proves step ``i`` reaches head ``i``.
 
+Both forwards also record the reference's own intermediate stages through forward hooks, so a gate
+that misses its bound can say WHERE the error enters (``diag.step{i}.*``):
+
+* ``temb`` — ``time_embedder(time_proj(t))``, ``[1, time_embed_dim]`` float32;
+* ``norm_out.shift`` / ``norm_out.scale`` — the halves of ``norm_out.linear(silu(temb))``;
+* ``block0.adaln`` — block 0's six AdaLN tables stacked in the reference's chunk order,
+  ``[6, MODALITY_NUM, hidden_size]``;
+* ``hidden.block{k}`` — the residual stream after block ``k`` for every ``k`` in the
+  ``diag_layers`` metadata (first, middle, last), ``[1, seq_len, hidden_size]``;
+* ``pre_head`` — ``norm_out``'s output, the input of head ``i``, ``[1, seq_len, hidden_size]``.
+
+Step 3 above runs on the step-0 noise rows, which no sampler shows the model at ``t = 0.25``. The
+producer therefore also walks the released sampler from those rows (steps 0, 1, 2 with the
+``euler_update_form = "velocity"`` update ``x + (sigma_i - sigma_{i+1}) * v`` in float32) and
+records the step-3 input it reaches and the step-3 velocity there (``diag.traj.rows3`` /
+``diag.traj.out3``) — an on-trajectory comparison the gates print next to the asserted one.
+
 Hash-pinned: the output carries ``producer_sha256``, the SHA-256 of THIS file's bytes, and the Rust
-gate compares it to the committed copy. The output is a few MB and is not committed.
+gate compares it to the committed copy. The output is a few tens of MB and is not committed.
 
 Run (CPU torch; needs ~70 GB of host RAM for the bf16 DiT):
 
@@ -140,6 +157,46 @@ def t2i_layout(num_text: int, latent_h: int, latent_w: int, patch: tuple[int, in
     return position_ids.to(torch.float32), token_tags, torch.arange(num_text, seq), torch.arange(num_text)
 
 
+class StageTaps:
+    """Forward hooks recording the reference's own intermediate tensors (see the module docs)."""
+
+    def __init__(self, model, layers: tuple[int, ...]):
+        self.layers = layers
+        self.armed = False
+        self.seen: dict[str, torch.Tensor] = {}
+        self.handles = [
+            model.time_embedder.register_forward_hook(self._put("temb")),
+            model.norm_out.linear.register_forward_hook(self._put("norm_out.linear")),
+            model.transformer_blocks[0].adaln_proj.register_forward_hook(self._put("block0.adaln")),
+            model.norm_out.register_forward_hook(self._put("pre_head")),
+        ]
+        self.handles += [
+            model.transformer_blocks[k].register_forward_hook(self._put(f"hidden.block{k}")) for k in layers
+        ]
+
+    def _put(self, key: str):
+        def hook(_module, _inputs, output):
+            if self.armed:
+                self.seen[key] = output
+
+        return hook
+
+    def take(self, step: int) -> dict[str, np.ndarray]:
+        seen, self.seen = self.seen, {}
+        f32 = lambda t: t.detach().to(torch.float32).numpy().copy()  # noqa: E731
+        shift, scale = seen["norm_out.linear"].chunk(2, dim=-1)
+        out = {
+            f"diag.step{step}.temb": f32(seen["temb"]),
+            f"diag.step{step}.norm_out.shift": f32(shift),
+            f"diag.step{step}.norm_out.scale": f32(scale),
+            f"diag.step{step}.block0.adaln": f32(torch.stack(seen["block0.adaln"])),
+            f"diag.step{step}.pre_head": f32(seen["pre_head"]),
+        }
+        for k in self.layers:
+            out[f"diag.step{step}.hidden.block{k}"] = f32(seen[f"hidden.block{k}"])
+        return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="output .safetensors path (keep it OUTSIDE the repo)")
@@ -171,26 +228,46 @@ def main() -> None:
     seq = position_ids.shape[0]
     timesteps = torch.tensor([1.0 - s for s in SIGMAS[:-1]], dtype=torch.float32)
 
+    # The released sampler's grid: sigma recovered from each float32 timestep, terminal 0.
+    sigmas = torch.cat([1.0 - timesteps, torch.zeros(1)])
+    diag_layers = (0, cfg.num_layers // 2 - 1, cfg.num_layers - 1)
+    taps = StageTaps(model, diag_layers)
+
+    def forward(rows: torch.Tensor, step: int) -> torch.Tensor:
+        out = model(
+            hidden_states=rows,
+            encoder_hidden_states=context,
+            timestep=timesteps[step : step + 1],
+            timestep_indices=torch.zeros(seq, dtype=torch.long),
+            token_tags=token_tags,
+            position_ids=position_ids,
+            image_indices=image_indices,
+            text_indices=text_indices,
+            pdd_step_index=step,
+            return_dict=False,
+        )[0]
+        print(
+            f"step {step} (t={timesteps[step].item():.6f}, head {step}): {tuple(out.shape)} "
+            f"std {out.float().std().item():.6f} L2 {out.float().flatten().norm().item():.6f}"
+        )
+        return out.to(torch.float32)
+
     outputs = {}
+    diag = {}
     with torch.no_grad():
         for step in STEPS:
-            out = model(
-                hidden_states=image_rows,
-                encoder_hidden_states=context,
-                timestep=timesteps[step : step + 1],
-                timestep_indices=torch.zeros(seq, dtype=torch.long),
-                token_tags=token_tags,
-                position_ids=position_ids,
-                image_indices=image_indices,
-                text_indices=text_indices,
-                pdd_step_index=step,
-                return_dict=False,
-            )[0]
-            outputs[step] = out.to(torch.float32)
-            print(
-                f"step {step} (t={timesteps[step].item():.6f}, head {step}): {tuple(out.shape)} "
-                f"std {out.float().std().item():.6f} L2 {out.float().flatten().norm().item():.6f}"
-            )
+            taps.armed = True
+            outputs[step] = forward(image_rows, step)
+            taps.armed = False
+            diag.update(taps.take(step))
+        # On-trajectory step 3: the sampler's own x_3, reached from the same noise rows.
+        rows = image_rows
+        velocity = outputs[0]
+        for step in range(1, 4):
+            rows = rows + (sigmas[step - 1] - sigmas[step]) * velocity
+            velocity = forward(rows, step)
+        diag["diag.traj.rows3"] = rows.numpy().copy()
+        diag["diag.traj.out3"] = velocity.numpy().copy()
 
     tensors = {
         "in.rows": image_rows.numpy().copy(),
@@ -198,6 +275,7 @@ def main() -> None:
     }
     for step, out in outputs.items():
         tensors[f"out.step{step}"] = out.numpy().copy()
+    tensors.update(diag)
     meta = {
         "provenance": "converted-checkpoint",
         "reference": "diffusers.MiniMaxH3ImageTransformer2DModel",
@@ -210,6 +288,7 @@ def main() -> None:
         "latent_hw": f"{LATENT_HW[0]}x{LATENT_HW[1]}",
         "steps": ",".join(str(s) for s in STEPS),
         "timesteps": ",".join(f"{timesteps[s].item():.9g}" for s in STEPS),
+        "diag_layers": ",".join(str(k) for k in diag_layers),
         "producer": "crates/media/mlx-gen/tools/dump_minimax_h3_image_dit_real.py",
         "producer_sha256": producer_sha256,
         "story": "SW-7090",

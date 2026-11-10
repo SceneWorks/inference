@@ -30,7 +30,7 @@ use crate::common;
 
 use std::collections::BTreeSet;
 
-use common::{flat, read_snapshot_file, rel, safetensors_keys, snapshot, std_dev};
+use common::{flat, l2_norm, read_snapshot_file, rel, safetensors_keys, snapshot, std_dev};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::loader::sorted_safetensors;
@@ -1688,6 +1688,22 @@ const IMAGE_DIT_MEAN_TOL: f32 = 2e-2;
 const IMAGE_DIT_PRODUCER: &[u8] =
     include_bytes!("../../../mlx-gen/tools/dump_minimax_h3_image_dit_real.py");
 
+/// One diagnostic line for the image DiT gate: a named stage's peak- and mean-relative error and
+/// rel-L2 against the reference's own tensor. Printed, never asserted — the bounds stay on the
+/// velocity alone.
+fn image_dit_stage_line(step: usize, stage: &str, got: &Tensor, want: &Tensor) -> String {
+    let got = got
+        .to_dtype(DType::F32)
+        .and_then(|t| t.to_device(&Device::Cpu))
+        .expect("stage to host");
+    assert_eq!(got.dims(), want.dims(), "step {step} {stage} shape");
+    let (peak, mean) = rel(&got, want);
+    let l2 = l2_norm(&(&got - want).expect("diff")) / l2_norm(want).max(1e-12);
+    format!(
+        "image DiT step {step} stage {stage:<16} peak {peak:.3e} mean {mean:.3e} rel-L2 {l2:.3e}"
+    )
+}
+
 /// The snapshot root holding `transformer_diffusers/` (the `minimax-h3-image-t2i` row).
 fn image_dit_snapshot() -> std::path::PathBuf {
     let raw = std::env::var("MINIMAX_H3_IMAGE_SNAPSHOT").unwrap_or_default();
@@ -1712,10 +1728,14 @@ fn image_dit_snapshot() -> std::path::PathBuf {
 /// match diffusers' `MiniMaxH3ImageTransformer2DModel` on the published weights, over the exact
 /// inputs of the reference SW-7090's macOS job produces (`dit-reference.safetensors`, shared by
 /// both backends). The timesteps this crate derives are held to the producer's.
+///
+/// Before asserting, every step prints its error at each stage the reference recorded (`temb`,
+/// `norm_out` shift/scale, block 0's AdaLN tables, the residual stream after the `diag_layers`,
+/// `norm_out`'s output) and the on-trajectory step-3 velocity, so a miss says where it enters.
 #[test]
 #[ignore = "needs a real MiniMax-H3-Image snapshot (transformer_diffusers/) + a reference (MINIMAX_H3_IMAGE_DIT_REFERENCE); 66 GB bf16 DiT"]
 fn image_dit_first_step_matches_the_official_diffusers_transformer() {
-    use candle_gen_minimax_h3::dit::{ImageDit, MiniMaxH3Dit, MiniMaxH3DitConfig};
+    use candle_gen_minimax_h3::dit::{ImageDit, ImageDitTrace, MiniMaxH3Dit, MiniMaxH3DitConfig};
     use candle_gen_minimax_h3::{ImageLayout, ImageVelocity, IMAGE_DIT_PARTITION};
     use gen_core_h3::h3_schedule::SigmaSchedule;
     use sha2::{Digest, Sha256};
@@ -1779,16 +1799,107 @@ fn image_dit_first_step_matches_the_official_diffusers_transformer() {
     let rows = reference.tensor("in.rows").to_device(&dev).expect("rows");
     let mut model = ImageDit::new(dit, &layout, &context, schedule.timesteps()).expect("ImageDit");
     assert!(model.released_bytes() > 0, "adaln_proj was evicted");
-    let run = |model: &mut ImageDit, step: usize| -> Tensor {
-        model
-            .forward(step, &rows)
-            .expect("forward")
-            .to_dtype(DType::F32)
+    let diag_layers: Vec<usize> = reference
+        .meta("diag_layers")
+        .expect("the reference records its diag_layers")
+        .split(',')
+        .map(|k| k.parse().unwrap())
+        .collect();
+    let host = |t: &Tensor| -> Tensor {
+        t.to_dtype(DType::F32)
             .and_then(|t| t.to_device(&Device::Cpu))
             .expect("to host")
     };
+    let run = |model: &mut ImageDit, step: usize| -> Tensor {
+        let mut trace = ImageDitTrace::new(&diag_layers);
+        let got = host(
+            &model
+                .forward_traced(step, &rows, &mut trace)
+                .expect("forward"),
+        );
+        let d = |name: &str| reference.tensor(&format!("diag.step{step}.{name}"));
+        let g = model
+            .adaln_cache()
+            .schedule()
+            .global_timestep_index(step, 0)
+            .expect("timestep row") as usize;
+        let mods = model
+            .adaln_cache()
+            .modulation(0)
+            .expect("block 0 modulation");
+        let block0 = Tensor::stack(
+            &mods
+                .tables()
+                .map(|t| t.narrow(0, g * 3, 3).expect("rows"))
+                .collect::<Vec<_>>(),
+            0,
+        )
+        .expect("stack");
+        let norm_out = model.norm_out_modulation();
+        let mut lines = vec![
+            image_dit_stage_line(
+                step,
+                "temb",
+                &model.temb().narrow(0, g, 1).expect("row"),
+                &d("temb"),
+            ),
+            image_dit_stage_line(
+                step,
+                "norm_out.shift",
+                &norm_out.shift.narrow(0, g, 1).expect("row"),
+                &d("norm_out.shift"),
+            ),
+            image_dit_stage_line(
+                step,
+                "norm_out.scale",
+                &norm_out.scale.narrow(0, g, 1).expect("row"),
+                &d("norm_out.scale"),
+            ),
+            image_dit_stage_line(step, "block0.adaln", &block0, &d("block0.adaln")),
+        ];
+        for (layer, hidden) in &trace.hidden {
+            lines.push(image_dit_stage_line(
+                step,
+                &format!("hidden.block{layer}"),
+                hidden,
+                &d(&format!("hidden.block{layer}")),
+            ));
+        }
+        lines.push(image_dit_stage_line(
+            step,
+            "pre_head",
+            trace.pre_head.as_ref().expect("the trace records norm_out"),
+            &d("pre_head"),
+        ));
+        lines.push(image_dit_stage_line(
+            step,
+            "velocity",
+            &got,
+            &reference.tensor(&format!("out.step{step}")),
+        ));
+        for line in lines {
+            println!("{line}");
+        }
+        got
+    };
     let got0 = run(&mut model, 0);
     let got3 = run(&mut model, 3);
+    // Diagnostic: step 3 on the sampler's own x_3 (reached by the reference from the same noise
+    // rows), next to the asserted off-trajectory step 3.
+    let traj_rows = reference
+        .tensor("diag.traj.rows3")
+        .to_device(&dev)
+        .expect("trajectory rows");
+    let traj = host(&model.forward(3, &traj_rows).expect("on-trajectory forward"));
+    println!(
+        "{}",
+        image_dit_stage_line(
+            3,
+            "on-trajectory",
+            &traj,
+            &reference.tensor("diag.traj.out3")
+        )
+    );
     let want0 = reference.tensor("out.step0");
     let want3 = reference.tensor("out.step3");
     assert_eq!(got0.dims(), want0.dims());
@@ -1813,7 +1924,7 @@ fn image_dit_first_step_matches_the_official_diffusers_transformer() {
         between > IMAGE_DIT_PEAK_TOL && cross > IMAGE_DIT_PEAK_TOL,
         "steps 0 and 3 must be distinguishable for the head check to mean anything"
     );
-    assert_eq!(model.forwards(), 2);
+    assert_eq!(model.forwards(), 3);
     #[cfg(feature = "model-inference-proof")]
     println!(
         "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_dit_first_step_matches_the_official_diffusers_transformer"

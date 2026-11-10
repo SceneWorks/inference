@@ -21,7 +21,7 @@ pub mod memory;
 pub mod model;
 
 pub use dit::{
-    velocity_euler_delta, ImageDenoiser, MiniMaxH3ImageDit, IMAGE_DIT_COMPONENT,
+    velocity_euler_delta, ImageDenoiser, ImageDitTrace, MiniMaxH3ImageDit, IMAGE_DIT_COMPONENT,
     PUBLISHED_IMAGE_DIT_TENSORS,
 };
 pub use layout::ImageLayout;

@@ -552,7 +552,15 @@ impl MiniMaxH3Dit {
         }
 
         // 2. The stack.
-        let x = self.run_stack(x, packed.adaln_indices, packed.tables, blocks, veda, cancel)?;
+        let x = self.run_stack(
+            x,
+            packed.adaln_indices,
+            packed.tables,
+            blocks,
+            veda,
+            cancel,
+            None,
+        )?;
         // 3. The shared output norm, then the two heads over their own rows. Gathering before
         //    projecting is bit-identical to the reference's project-then-gather (both heads are
         //    row-wise affine maps) and skips the text rows' outputs, which it discards.
@@ -586,6 +594,10 @@ impl MiniMaxH3Dit {
 
     /// The 50-block stack over an already-scattered packed sequence `x` — the one block loop both
     /// [`Self::forward_packed`] (H3 video) and [`Self::forward_image`] (MiniMax-H3-Image) run.
+    ///
+    /// `observe`, when given, sees the residual stream after every layer (`layer`, output) — the
+    /// stage taps the image DiT's real-weight parity gate reports with.
+    #[allow(clippy::too_many_arguments)]
     fn run_stack(
         &self,
         x: Tensor,
@@ -594,6 +606,7 @@ impl MiniMaxH3Dit {
         blocks: BlockModulation<'_>,
         veda: Option<(&crate::veda::VedaRuntime, usize)>,
         cancel: Option<&CancelFlag>,
+        mut observe: Option<&mut LayerObserver<'_>>,
     ) -> Result<Tensor> {
         // The AdaLN index bounds-check runs ONCE here rather than per block: it is a blocking D2H
         // readback, and all 50 blocks gather with the same index tensor against same-shaped
@@ -609,7 +622,7 @@ impl MiniMaxH3Dit {
         };
         crate::dit::block::check_adaln_indices(adaln_indices, modulation_rows)?;
         let sync_between_layers = layer_cancel_needs_sync(x.dims()[1]);
-        let apply = |mut x: Tensor, range: std::ops::Range<usize>| -> Result<Tensor> {
+        let mut apply = |mut x: Tensor, range: std::ops::Range<usize>| -> Result<Tensor> {
             for layer in range {
                 let transferred;
                 let block = if self.stream_window.is_some() {
@@ -658,6 +671,9 @@ impl MiniMaxH3Dit {
                         cancel,
                     )?,
                 };
+                if let Some(observe) = observe.as_mut() {
+                    observe(layer, &x)?;
+                }
             }
             Ok(x)
         };
@@ -695,6 +711,20 @@ impl MiniMaxH3Dit {
         pdd_step: usize,
         cancel: Option<&CancelFlag>,
     ) -> Result<Tensor> {
+        self.forward_image_traced(packed, blocks, norm_out, pdd_step, cancel, None)
+    }
+
+    /// [`Self::forward_image`], also recording the stages `trace` asks for (the residual stream
+    /// after its listed layers, and `norm_out`'s output — the head's input).
+    pub fn forward_image_traced(
+        &self,
+        packed: &ImageForward<'_>,
+        blocks: BlockModulation<'_>,
+        norm_out: &NormOutModulation,
+        pdd_step: usize,
+        cancel: Option<&CancelFlag>,
+        mut trace: Option<&mut ImageDitTrace>,
+    ) -> Result<Tensor> {
         if self.cfg.has_audio() {
             return Err(CandleError::Msg(
                 "minimax-h3 dit: forward_image needs the image transformer; this is the \
@@ -715,17 +745,63 @@ impl MiniMaxH3Dit {
             (&image, packed.image_indices, "image"),
         ])?;
         drop(image);
-        let x = self.run_stack(x, packed.adaln_indices, packed.tables, blocks, None, cancel)?;
+        let mut record = |layer: usize, x: &Tensor| -> Result<()> {
+            if let Some(trace) = trace.as_deref_mut() {
+                if trace.layers.contains(&layer) {
+                    trace.hidden.push((layer, x.clone()));
+                }
+            }
+            Ok(())
+        };
+        let x = self.run_stack(
+            x,
+            packed.adaln_indices,
+            packed.tables,
+            blocks,
+            None,
+            cancel,
+            Some(&mut record),
+        )?;
         let x = self
             .projections
             .norm_out
             .apply(&x, norm_out, packed.timestep_indices)?;
+        if let Some(trace) = trace {
+            trace.pre_head = Some(x.clone());
+        }
         let seq_len = x.dims()[1];
         head.forward(&crate::denoise::packing::gather_rows(
             &x,
             packed.image_indices,
             seq_len,
         )?)
+    }
+}
+
+/// What [`MiniMaxH3Dit`]'s block loop calls after every layer when observed: `(layer, output)`.
+type LayerObserver<'a> = dyn FnMut(usize, &Tensor) -> Result<()> + 'a;
+
+/// The intermediate stages one [`MiniMaxH3Dit::forward_image_traced`] records: the residual stream
+/// after each of [`Self::layers`] (`[1, seq_len, hidden_size]`, in layer order) and `norm_out`'s
+/// output over the whole packed sequence. Diagnostic only — the real-weight parity gate compares
+/// each against the reference's own tensors so a miss names the stage it enters at.
+#[derive(Debug, Default)]
+pub struct ImageDitTrace {
+    /// Layers whose output to record.
+    pub layers: Vec<usize>,
+    /// `(layer, residual stream after it)` for every recorded layer.
+    pub hidden: Vec<(usize, Tensor)>,
+    /// `norm_out`'s output — the step head's input — once the forward has run.
+    pub pre_head: Option<Tensor>,
+}
+
+impl ImageDitTrace {
+    /// A trace recording the residual stream after each of `layers`.
+    pub fn new(layers: &[usize]) -> Self {
+        Self {
+            layers: layers.to_vec(),
+            ..Self::default()
+        }
     }
 }
 
@@ -1234,6 +1310,7 @@ pub struct ImageDit {
     text_rows: Tensor,
     cache: AdaLnCache,
     norm_out: NormOutModulation,
+    temb: Tensor,
     row_classes: Vec<u32>,
     token_tags: Vec<u32>,
     text_indices: Vec<u32>,
@@ -1316,13 +1393,13 @@ impl ImageDit {
         })?;
         // `norm_out`'s table from the SAME `temb` the block stack's was projected from.
         let norm_out = dit.projections.norm_out.modulation(&temb)?;
-        drop(temb);
         Ok(Self {
             dit,
             tables,
             text_rows,
             cache,
             norm_out,
+            temb,
             row_classes: vec![0; layout.seq_len()],
             token_tags: layout.token_tags().to_vec(),
             text_indices: layout.text_indices().to_vec(),
@@ -1352,10 +1429,41 @@ impl ImageDit {
     pub fn dit(&self) -> &MiniMaxH3Dit {
         &self.dit
     }
-}
 
-impl crate::image_pipeline::ImageVelocity for ImageDit {
-    fn forward(&mut self, step: usize, image_rows: &Tensor) -> Result<Tensor> {
+    /// The timestep embedding the whole run's modulation was projected from —
+    /// `[num_distinct_timesteps, time_embed_dim]`, rows in
+    /// [`TimestepSchedule::distinct_timesteps`] order.
+    pub fn temb(&self) -> &Tensor {
+        &self.temb
+    }
+
+    /// The block stack's precomputed modulation (and the schedule it is keyed on).
+    pub fn adaln_cache(&self) -> &AdaLnCache {
+        &self.cache
+    }
+
+    /// `norm_out`'s per-timestep `(shift, scale)` table.
+    pub fn norm_out_modulation(&self) -> &NormOutModulation {
+        &self.norm_out
+    }
+
+    /// One step's velocity, also recording the stages `trace` asks for — the diagnostic twin of
+    /// [`crate::image_pipeline::ImageVelocity::forward`], counted as a forward the same way.
+    pub fn forward_traced(
+        &mut self,
+        step: usize,
+        image_rows: &Tensor,
+        trace: &mut ImageDitTrace,
+    ) -> Result<Tensor> {
+        self.forward_inner(step, image_rows, Some(trace))
+    }
+
+    fn forward_inner(
+        &mut self,
+        step: usize,
+        image_rows: &Tensor,
+        trace: Option<&mut ImageDitTrace>,
+    ) -> Result<Tensor> {
         self.forwards += 1;
         let device = self.dit.device.clone();
         let adaln_indices = self.cache.schedule().adaln_indices(
@@ -1374,13 +1482,20 @@ impl crate::image_pipeline::ImageVelocity for ImageDit {
             text_indices: &self.text_indices,
             image_indices: &self.image_indices,
         };
-        self.dit.forward_image(
+        self.dit.forward_image_traced(
             &packed,
             BlockModulation::Cached(&self.cache),
             &self.norm_out,
             step,
             self.cancel.as_ref(),
+            trace,
         )
+    }
+}
+
+impl crate::image_pipeline::ImageVelocity for ImageDit {
+    fn forward(&mut self, step: usize, image_rows: &Tensor) -> Result<Tensor> {
+        self.forward_inner(step, image_rows, None)
     }
 }
 
