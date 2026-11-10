@@ -4890,7 +4890,7 @@ jobs:
     name: MLX H3-Image VAE
     if: inputs.profile == 'minimax-h3-image'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
-    timeout-minutes: 120
+    timeout-minutes: 360
     env:
       MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
     steps:

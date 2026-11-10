@@ -1041,7 +1041,7 @@ fn the_video_sigma_shift_is_overridable_and_defaults_to_the_published_grid() {
         };
         let e = validate_request(&caps, &req).unwrap_err().to_string();
         assert!(
-            e.contains("scheduler_shift") && e.contains("positive"),
+            e.contains("scheduler_shift") && e.contains("must be > 0"),
             "shift {bad}: {e}"
         );
     }
