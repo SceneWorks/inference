@@ -4907,6 +4907,8 @@ jobs:
           name: minimax-h3-image-vae-reference
           path: ${{ runner.temp }}/minimax-h3-image-vae-reference
           if-no-files-found: error
+      - name: Set up the MLX build environment
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image/set-up-the-mlx-build-environment.sh
       - name: Run the image VAE gates
         run: source scripts/ci/real-weights/mlx-minimax-h3-image/run-the-image-vae-gates.sh
 
