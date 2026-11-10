@@ -4,6 +4,8 @@
 # reference VAE latents, the 3-reference first-step DiT parity — and a 3-reference edit render.
 # Name-selected with `--exact` plus a pass-count assertion, so a rename cannot go
 # vacuously green; one process per test, so each heavy test starts from a reaped allocator.
+# SW-7096 adds the LoRA gates: three community layouts fold identically on the real DiT, ten
+# stacked files keep their scales, and a block streamed through DitBlockStream carries the LoRA.
 set -o pipefail
 export MINIMAX_H3_IMAGE_RENDER_OUT="$RUNNER_TEMP/minimax-h3-image-2048.png"
 export MINIMAX_H3_IMAGE_EDIT_RENDER_OUT="$RUNNER_TEMP/minimax-h3-image-edit.png"
@@ -51,4 +53,13 @@ for tier in q8 q4; do
     exit 1
   fi
   rm -rf "${MINIMAX_H3_IMAGE_TIERS_ROOT:?}/$tier"
+done
+# SW-7096 LoRA gates (run after the tiers; they need only the dense image snapshot).
+for name in h3_image_lora_layouts_fold_identically_on_the_real_dit h3_image_streamed_blocks_carry_the_lora_like_resident_ones h3_image_adaln_and_output_head_loras_reach_the_denoiser; do
+  out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
+    h3_image_lora_real::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+  if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+    echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+    exit 1
+  fi
 done

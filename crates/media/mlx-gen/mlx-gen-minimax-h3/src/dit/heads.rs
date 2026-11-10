@@ -82,6 +82,77 @@ pub const TIME_PROJ_DOWNSCALE_FREQ_SHIFT: f64 = 0.0;
 pub struct LinearBias {
     weight: Array,
     bias: Array,
+    /// Forward-time LoRA/LoKr residuals on this projection (SW-7096). Empty unless an install
+    /// routes here — only the image DiT does.
+    adapters: ResidualSlot,
+}
+
+/// The adapter residuals of a projection whose base is not an
+/// [`AdaptableLinear`](mlx_gen::adapters::AdaptableLinear) (SW-7096) — the raw weight/bias
+/// [`LinearBias`] the mixed-precision I/O heads use.
+///
+/// The slot is an `AdaptableLinear` over a **shape-only** base (a lazy zero array that is never
+/// evaluated), so the shared install can push LoRA and LoKr residuals onto it exactly as onto a
+/// block leaf and read the logical `[out, in]` shape a LoKr needs. Only its residuals run: the
+/// owning projection computes its base itself, then [`Self::apply`] adds `Σ residual(x)` under the
+/// same rules the shared seam uses (a zero-scale adapter is skipped; each residual is narrowed to
+/// the base output's dtype before the add).
+#[derive(Clone, Default)]
+pub struct ResidualSlot(Option<Box<mlx_gen::adapters::AdaptableLinear>>);
+
+impl std::fmt::Debug for ResidualSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ResidualSlot")
+            .field(&self.0.as_ref().map_or(0, |slot| slot.adapters().len()))
+            .finish()
+    }
+}
+
+impl ResidualSlot {
+    /// The slot for an `[out, in]` projection, created on first use.
+    pub fn slot_mut(
+        &mut self,
+        out_features: i32,
+        in_features: i32,
+    ) -> Option<&mut mlx_gen::adapters::AdaptableLinear> {
+        if self.0.is_none() {
+            let base = Array::zeros::<f32>(&[out_features, in_features]).ok()?;
+            self.0 = Some(Box::new(mlx_gen::adapters::AdaptableLinear::dense(
+                base, None,
+            )));
+        }
+        self.0.as_deref_mut()
+    }
+
+    /// Residuals held.
+    pub fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, |slot| slot.adapters().len())
+    }
+
+    /// Whether no residual is held.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// `y + Σ residual(x)`; `y` untouched when the slot holds nothing.
+    pub fn apply(&self, x: &Array, mut y: Array) -> Result<Array> {
+        let Some(slot) = &self.0 else {
+            return Ok(y);
+        };
+        for adapter in slot.adapters() {
+            if adapter.is_disabled() {
+                continue;
+            }
+            let residual = adapter.residual(x)?;
+            let residual = if residual.dtype() == y.dtype() {
+                residual
+            } else {
+                residual.as_dtype(y.dtype())?
+            };
+            y = mlx_rs::ops::add(&y, &residual)?;
+        }
+        Ok(y)
+    }
 }
 
 impl LinearBias {
@@ -125,7 +196,22 @@ impl LinearBias {
                 bias.shape()
             )));
         }
-        Ok(Self { weight, bias })
+        Ok(Self {
+            weight,
+            bias,
+            adapters: ResidualSlot::default(),
+        })
+    }
+
+    /// This projection's adapter slot (SW-7096), created on first use at its `[out, in]` shape.
+    pub fn adaptable_mut(&mut self) -> Option<&mut mlx_gen::adapters::AdaptableLinear> {
+        let (out, inp) = (self.weight.shape()[0], self.weight.shape()[1]);
+        self.adapters.slot_mut(out, inp)
+    }
+
+    /// Residuals installed on this projection.
+    pub fn adapter_count(&self) -> usize {
+        self.adapters.len()
     }
 
     /// The two tensor names this projection consumes.
@@ -149,7 +235,10 @@ impl LinearBias {
     /// keeps a float32 head from silently running its matmul at the block stack's bfloat16.
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let x = x.as_dtype(self.weight.dtype())?;
-        mlx_gen::nn::linear(&x, &self.weight, &self.bias)
+        let y = mlx_gen::nn::linear(&x, &self.weight, &self.bias)?;
+        // SW-7096: the residuals read the same cast input the base does — what a PEFT LoRA on
+        // this module sees in the reference, which casts before calling the module.
+        self.adapters.apply(&x, y)
     }
 }
 
@@ -216,6 +305,15 @@ pub struct TimestepEmbedder {
 }
 
 impl TimestepEmbedder {
+    /// `linear_1` / `linear_2` for an adapter install (SW-7096).
+    pub fn linear_mut(&mut self, name: &str) -> Option<&mut LinearBias> {
+        match name {
+            "linear_1" => Some(&mut self.linear_1),
+            "linear_2" => Some(&mut self.linear_2),
+            _ => None,
+        }
+    }
+
     /// Load `{prefix}.linear_1` / `{prefix}.linear_2` (e.g. `time_embedder`).
     pub fn from_weights(w: &mut Weights, prefix: &str, cfg: &MiniMaxH3DitConfig) -> Result<Self> {
         Ok(Self {
@@ -294,6 +392,11 @@ pub struct NormOutModulation {
 }
 
 impl AdaLayerNormOut {
+    /// `linear` for an adapter install (SW-7096); `None` on a pruned topology.
+    pub fn linear_mut(&mut self) -> Option<&mut LinearBias> {
+        self.linear.as_mut()
+    }
+
     /// Load `{prefix}.norm` / `{prefix}.linear` (e.g. `norm_out`).
     pub fn from_weights(w: &mut Weights, prefix: &str, cfg: &MiniMaxH3DitConfig) -> Result<Self> {
         let norm_weight = w.require(&format!("{prefix}.norm.weight"))?.clone();
@@ -623,6 +726,12 @@ impl PddHeads {
     }
 
     /// The head sampling step `step` projects with.
+    /// Head `index` for an adapter install (SW-7096) — `pdd_proj_out.{index}`, one PEFT module per
+    /// head as in the reference's `nn.ModuleList`.
+    pub fn head_mut(&mut self, index: usize) -> Option<&mut LinearBias> {
+        self.heads.get_mut(index)
+    }
+
     pub fn select(&self, step: usize) -> Result<&LinearBias> {
         pdd_head_index(step, self.heads.len()).map(|i| &self.heads[i])
     }
@@ -796,6 +905,72 @@ mod image_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seeded(shape: &[i32], seed: u32) -> Array {
+        let n: i32 = shape.iter().product();
+        let v: Vec<f32> = (0..n as u32)
+            .map(|i| {
+                ((i.wrapping_mul(2_654_435_761) ^ seed.wrapping_mul(40_503)) % 997) as f32 / 997.0
+                    - 0.5
+            })
+            .collect();
+        Array::from_slice(&v, shape)
+    }
+
+    /// SW-7096: a LoRA on a bias-Linear head is `x·Wᵀ + b + scale·(alpha/rank)·x·Aᵀ·Bᵀ` — checked
+    /// against the same projection with the delta MERGED into its weight, an independent route —
+    /// and a zero-scale LoRA is byte-identical to the bare head.
+    #[test]
+    fn a_lora_on_a_bias_linear_head_matches_its_merged_weight() {
+        let (inp, out, r) = (6, 5, 2);
+        let w = seeded(&[out, inp], 1);
+        let b = seeded(&[out], 2);
+        let (down, up) = (seeded(&[r, inp], 3), seeded(&[out, r], 4));
+        let scale = 0.75f32;
+        let mut map = Weights::empty();
+        map.insert("h.weight", w.clone());
+        map.insert("h.bias", b.clone());
+        let mut head = LinearBias::from_weights(&mut map, "h", inp, out).unwrap();
+        let x = seeded(&[1, 3, inp], 5);
+        let bare = head.forward(&x).unwrap();
+        head.adaptable_mut()
+            .unwrap()
+            .push(mlx_gen::adapters::Adapter::Lora {
+                a: down.t(),
+                b: up.t(),
+                scale,
+            });
+        assert_eq!(head.adapter_count(), 1);
+        let got = head.forward(&x).unwrap();
+        let delta = multiply(
+            mlx_rs::ops::matmul(&up, &down).unwrap(),
+            Array::from_f32(scale),
+        )
+        .unwrap();
+        let mut merged_map = Weights::empty();
+        merged_map.insert("h.weight", add(&w, &delta).unwrap());
+        merged_map.insert("h.bias", b);
+        let merged = LinearBias::from_weights(&mut merged_map, "h", inp, out).unwrap();
+        let want = merged.forward(&x).unwrap();
+        let drift = mlx_gen::testing::max_abs_diff_f32(&got, &want);
+        // Metal's f32 GEMM accumulates in a different order for the two routes.
+        assert!(drift < 1e-3, "merged drift {drift:e}");
+        assert!(mlx_gen::testing::max_abs_diff_f32(&got, &bare) > 1e-2);
+
+        let mut off = LinearBias::from_weights(&mut merged_map, "h", inp, out).unwrap();
+        let before = off.forward(&x).unwrap();
+        off.adaptable_mut()
+            .unwrap()
+            .push(mlx_gen::adapters::Adapter::Lora {
+                a: down.t(),
+                b: up.t(),
+                scale: 0.0,
+            });
+        assert_eq!(
+            mlx_gen::testing::max_abs_diff_f32(&off.forward(&x).unwrap(), &before),
+            0.0
+        );
+    }
 
     /// The set is exactly 17 names, all distinct, and none of them belongs to a block or the
     /// refiner. 638 published tensors = 50·12 + 21 + 17.

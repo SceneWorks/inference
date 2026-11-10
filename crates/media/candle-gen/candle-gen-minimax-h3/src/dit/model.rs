@@ -349,6 +349,8 @@ impl MiniMaxH3Dit {
     pub fn adapter_surface(&self) -> crate::adapters::AdaLnSurface {
         match self.curve {
             Some(_) => crate::adapters::AdaLnSurface::PrunedCurve,
+            // SW-7096: the image transformer addresses every linear it has.
+            None if !self.cfg.has_audio() => crate::adapters::AdaLnSurface::ImageAllLinears,
             None => crate::adapters::AdaLnSurface::FullTimestepMlp,
         }
     }
@@ -379,13 +381,41 @@ impl MiniMaxH3Dit {
     /// else — in particular not `adaln_proj`, not the 17 input/output projections, and not any norm.
     /// See [`crate::adapters::adapter_target_paths`], which enumerates exactly this set from the
     /// config and is asserted to resolve here.
+    ///
+    /// **The image transformer adds every other linear it has** (SW-7096): each block's
+    /// `adaln_proj.linear`, `proj_in`, `context_embedder`, `time_embedder.linear_{1,2}`,
+    /// `norm_out.linear` and every `pdd_proj_out.{i}` head (a PEFT `nn.ModuleList`, one module per
+    /// head). The image denoiser precomputes its six timesteps' modulation from `time_embedder`
+    /// once, after the install, so those tables carry the residuals. The video transformer keeps
+    /// the sc-26688 surface above unchanged.
     pub fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut LinearNoBias> {
+        let image = !self.cfg.has_audio() && self.curve.is_none();
         match path {
+            ["transformer_blocks", idx, "adaln_proj", "linear"] if image => {
+                let i: usize = idx.parse().ok()?;
+                let device = self.device.clone();
+                self.blocks.get_mut(i)?.adaln_adaptable_mut(&device)
+            }
             ["transformer_blocks", idx, rest @ ..] => {
                 let i: usize = idx.parse().ok()?;
                 self.blocks.get_mut(i)?.adaptable_mut(rest)
             }
             ["token_refiner", rest @ ..] => self.refiner.adaptable_mut(rest),
+            ["proj_in"] if image => self.projections.proj_in.adaptable_mut(),
+            ["context_embedder"] if image => self.projections.context_embedder.adaptable_mut(),
+            ["time_embedder", linear] if image => self
+                .projections
+                .time_embedder
+                .as_mut()?
+                .linear_mut(linear)?
+                .adaptable_mut(),
+            ["norm_out", "linear"] if image => {
+                self.projections.norm_out.linear_mut()?.adaptable_mut()
+            }
+            ["pdd_proj_out", idx] if image => {
+                let i: usize = idx.parse().ok()?;
+                self.projections.pdd_proj_out.get_mut(i)?.adaptable_mut()
+            }
             _ => None,
         }
     }
@@ -397,6 +427,18 @@ impl MiniMaxH3Dit {
             b.clear_adapters();
         }
         self.refiner.clear_adapters();
+        let p = &mut self.projections;
+        p.proj_in.clear_adapters();
+        p.context_embedder.clear_adapters();
+        if let Some(t) = p.time_embedder.as_mut() {
+            t.clear_adapters();
+        }
+        if let Some(l) = p.norm_out.linear_mut() {
+            l.clear_adapters();
+        }
+        for head in &mut p.pdd_proj_out {
+            head.clear_adapters();
+        }
     }
 
     /// How many projections currently carry at least one residual — the count a caller checks

@@ -338,23 +338,21 @@ impl MiniMaxH3 {
     /// must not be silently downgraded to the resident path.
     ///
     /// That mirror is a **standing obligation on two files**, and it was broken between sc-18662 and
-    /// sc-18650: the adapter guard below existed here with no counterpart in the declaration, so an
+    /// sc-18650: an adapter guard existed here with no counterpart in the declaration, so an
     /// adapter-carrying deferred load advertised rung 4 `Implemented`, was admitted by the safety
     /// check, opened a request scope, had `stream_transformer_blocks` set from that engagement by
-    /// `MemoryProviderContract::generation_memory` — and was then refused right here. Every guard
-    /// below now names the declaration clause it mirrors; adding a guard without one reopens that
-    /// loop.
+    /// `MemoryProviderContract::generation_memory` — and was then refused right here. (SW-7096
+    /// removed both halves of that guard.) Every guard below names the declaration clause it
+    /// mirrors; adding a guard without one reopens that loop.
     ///
     /// * The generator must have been loaded at [`LoadShape::DeferredMaterialization`] — the rung's
-    ///   first shared prerequisite, and half of what
-    ///   [`crate::memory_strategy::streamable`] resolves `Implemented` on. On a resident load the
+    ///   prerequisite, and what [`crate::memory_strategy::streamable`] resolves `Implemented` on. On a resident load the
     ///   rung is `Missing` and streaming is a typed refusal, not a fallback.
-    /// * Adapters are refused. A window rebuilds each block from the staged directory per step, so
-    ///   the forward-time residual factors sc-18724 installs would be dropped from every windowed
-    ///   block — a plausible render the adapter barely touched, which is the exact failure
-    ///   `apply_minimax_h3_adapters`' strict matching exists to prevent. Mirrored by the other half
-    ///   of [`crate::memory_strategy::streamable`], which must live in the declaration because
-    ///   `MemoryRunContext` has no adapter axis for a route gate to read.
+    /// * Adapters are **admitted** (SW-7096). A window rebuilds each block from the staged
+    ///   directory per step, and the block stream re-applies the configured residuals to every
+    ///   rebuilt block ([`crate::block_stream::DitBlockStream::materialize`]), so the windowed
+    ///   render carries the same LoRA the resident one does. Mirrored by
+    ///   [`crate::memory_strategy::streamable`], which no longer reads the adapter list.
     /// * The component scope must be [`TransformerComponent::Both`] — the only declared arm.
     ///   `None` defaults to `Dit` by the shared convention (SC-15794), and `Dit` is deliberately
     ///   outside this provider's published domain: declaring the DiT alone would leave the
@@ -379,13 +377,6 @@ impl MiniMaxH3 {
                 "{MODEL_ID}: transformer streaming (rung 4) requires a \
                  LoadShape::DeferredMaterialization load; this generator was loaded resident, \
                  where the rung is declared Missing"
-            )));
-        }
-        if !self.adapters.is_empty() {
-            return Err(Error::Unsupported(format!(
-                "{MODEL_ID}: transformer streaming rebuilds blocks from the staged tier per \
-                 window, so a configured adapter would be silently dropped from every windowed \
-                 block; run adapters on the resident path"
             )));
         }
         let component = memory
@@ -413,15 +404,20 @@ impl MiniMaxH3 {
     }
 
     /// [`Self::load_task_dit`]'s rung-4 twin: defer the 600 block tensors and hold only the I/O
-    /// projections and the refiner. Adapters were already refused by
-    /// [`Self::requested_transformer_window`]; the assertion keeps the two seams from drifting.
+    /// projections and the refiner.
+    ///
+    /// The adapter install is the **same strict install** the resident twin runs (SW-7096): the
+    /// refiner's residuals land on the resident refiner, and every `transformer_blocks.{i}.…`
+    /// residual lands in the block stream's overlay, which re-applies it to each block a window
+    /// rebuilds. The overlay is evaluated here, once, so no window pulls a lazy adapter read into
+    /// its per-block eval.
     pub(super) fn load_task_dit_deferred(&self, task: MiniMaxH3Task) -> Result<MiniMaxH3Dit> {
-        assert!(
-            self.adapters.is_empty(),
-            "{MODEL_ID}: a deferred DiT load with adapters configured — \
-             requested_transformer_window must refuse this before the load is reached"
-        );
-        MiniMaxH3Dit::load_dir_deferred(self.task_dit_dir(task), self.dtype)
+        let mut dit = MiniMaxH3Dit::load_dir_deferred(self.task_dit_dir(task), self.dtype)?;
+        if !self.adapters.is_empty() {
+            crate::adapters::apply_minimax_h3_adapters(&mut dit, &self.adapters)?;
+            dit.materialize_streamed_adapters()?;
+        }
+        Ok(dit)
     }
 
     /// Map the text-encoder shards a presentation needs, out of the **resolved** text-encoder

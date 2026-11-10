@@ -78,6 +78,9 @@ mod fl2va_conditioning;
 #[path = "fl2va_first_light.rs"]
 mod fl2va_first_light;
 
+#[path = "h3_image_lora_real.rs"]
+mod h3_image_lora_real;
+
 #[path = "h3_image_real.rs"]
 mod h3_image_real;
 

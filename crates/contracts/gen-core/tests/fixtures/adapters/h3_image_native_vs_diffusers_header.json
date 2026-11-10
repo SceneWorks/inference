@@ -1,0 +1,644 @@
+{
+ "diffusers": {
+  "context_embedder.bias": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "context_embedder.weight": [
+   "BF16",
+   [
+    5376,
+    5120
+   ]
+  ],
+  "norm_out.linear.bias": [
+   "BF16",
+   [
+    10752
+   ]
+  ],
+  "norm_out.linear.weight": [
+   "BF16",
+   [
+    10752,
+    2688
+   ]
+  ],
+  "norm_out.norm.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "pdd_proj_out.0.bias": [
+   "F32",
+   [
+    96
+   ]
+  ],
+  "pdd_proj_out.0.weight": [
+   "F32",
+   [
+    96,
+    5376
+   ]
+  ],
+  "pdd_proj_out.1.bias": [
+   "F32",
+   [
+    96
+   ]
+  ],
+  "pdd_proj_out.1.weight": [
+   "F32",
+   [
+    96,
+    5376
+   ]
+  ],
+  "pdd_proj_out.2.bias": [
+   "F32",
+   [
+    96
+   ]
+  ],
+  "pdd_proj_out.2.weight": [
+   "F32",
+   [
+    96,
+    5376
+   ]
+  ],
+  "pdd_proj_out.3.bias": [
+   "F32",
+   [
+    96
+   ]
+  ],
+  "pdd_proj_out.3.weight": [
+   "F32",
+   [
+    96,
+    5376
+   ]
+  ],
+  "pdd_proj_out.4.bias": [
+   "F32",
+   [
+    96
+   ]
+  ],
+  "pdd_proj_out.4.weight": [
+   "F32",
+   [
+    96,
+    5376
+   ]
+  ],
+  "pdd_proj_out.5.bias": [
+   "F32",
+   [
+    96
+   ]
+  ],
+  "pdd_proj_out.5.weight": [
+   "F32",
+   [
+    96,
+    5376
+   ]
+  ],
+  "proj_in.bias": [
+   "F32",
+   [
+    5376
+   ]
+  ],
+  "proj_in.weight": [
+   "F32",
+   [
+    5376,
+    96
+   ]
+  ],
+  "time_embedder.linear_1.bias": [
+   "F32",
+   [
+    5376
+   ]
+  ],
+  "time_embedder.linear_1.weight": [
+   "F32",
+   [
+    5376,
+    256
+   ]
+  ],
+  "time_embedder.linear_2.bias": [
+   "F32",
+   [
+    2688
+   ]
+  ],
+  "time_embedder.linear_2.weight": [
+   "F32",
+   [
+    2688,
+    5376
+   ]
+  ],
+  "token_refiner.final_norm.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "token_refiner.refiner_blocks.0.attn.norm_k.weight": [
+   "BF16",
+   [
+    128
+   ]
+  ],
+  "token_refiner.refiner_blocks.0.attn.norm_q.weight": [
+   "BF16",
+   [
+    128
+   ]
+  ],
+  "token_refiner.refiner_blocks.0.attn.to_k.weight": [
+   "BF16",
+   [
+    7168,
+    5376
+   ]
+  ],
+  "token_refiner.refiner_blocks.0.attn.to_out.0.weight": [
+   "BF16",
+   [
+    5376,
+    7168
+   ]
+  ],
+  "token_refiner.refiner_blocks.0.attn.to_q.weight": [
+   "BF16",
+   [
+    7168,
+    5376
+   ]
+  ],
+  "token_refiner.refiner_blocks.0.attn.to_v.weight": [
+   "BF16",
+   [
+    7168,
+    5376
+   ]
+  ],
+  "token_refiner.refiner_blocks.0.ff.net.0.proj.weight": [
+   "BF16",
+   [
+    28672,
+    5376
+   ]
+  ],
+  "token_refiner.refiner_blocks.0.ff.net.2.weight": [
+   "BF16",
+   [
+    5376,
+    14336
+   ]
+  ],
+  "token_refiner.refiner_blocks.0.norm1.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "token_refiner.refiner_blocks.0.norm2.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "token_refiner.refiner_blocks.1.attn.norm_k.weight": [
+   "BF16",
+   [
+    128
+   ]
+  ],
+  "token_refiner.refiner_blocks.1.attn.norm_q.weight": [
+   "BF16",
+   [
+    128
+   ]
+  ],
+  "token_refiner.refiner_blocks.1.attn.to_k.weight": [
+   "BF16",
+   [
+    7168,
+    5376
+   ]
+  ],
+  "token_refiner.refiner_blocks.1.attn.to_out.0.weight": [
+   "BF16",
+   [
+    5376,
+    7168
+   ]
+  ],
+  "token_refiner.refiner_blocks.1.attn.to_q.weight": [
+   "BF16",
+   [
+    7168,
+    5376
+   ]
+  ],
+  "token_refiner.refiner_blocks.1.attn.to_v.weight": [
+   "BF16",
+   [
+    7168,
+    5376
+   ]
+  ],
+  "token_refiner.refiner_blocks.1.ff.net.0.proj.weight": [
+   "BF16",
+   [
+    28672,
+    5376
+   ]
+  ],
+  "token_refiner.refiner_blocks.1.ff.net.2.weight": [
+   "BF16",
+   [
+    5376,
+    14336
+   ]
+  ],
+  "token_refiner.refiner_blocks.1.norm1.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "token_refiner.refiner_blocks.1.norm2.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "transformer_blocks.0.adaln_proj.linear.bias": [
+   "BF16",
+   [
+    96768
+   ]
+  ],
+  "transformer_blocks.0.adaln_proj.linear.weight": [
+   "BF16",
+   [
+    96768,
+    2688
+   ]
+  ],
+  "transformer_blocks.0.attn.norm_k.weight": [
+   "BF16",
+   [
+    128
+   ]
+  ],
+  "transformer_blocks.0.attn.norm_q.weight": [
+   "BF16",
+   [
+    128
+   ]
+  ],
+  "transformer_blocks.0.attn.to_k.weight": [
+   "BF16",
+   [
+    7168,
+    5376
+   ]
+  ],
+  "transformer_blocks.0.attn.to_out.0.weight": [
+   "BF16",
+   [
+    5376,
+    7168
+   ]
+  ],
+  "transformer_blocks.0.attn.to_q.weight": [
+   "BF16",
+   [
+    7168,
+    5376
+   ]
+  ],
+  "transformer_blocks.0.attn.to_v.weight": [
+   "BF16",
+   [
+    7168,
+    5376
+   ]
+  ],
+  "transformer_blocks.0.ff.net.0.proj.weight": [
+   "BF16",
+   [
+    28672,
+    5376
+   ]
+  ],
+  "transformer_blocks.0.ff.net.2.weight": [
+   "BF16",
+   [
+    5376,
+    14336
+   ]
+  ],
+  "transformer_blocks.0.norm1.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "transformer_blocks.0.norm2.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ]
+ },
+ "layout_facts": {
+  "final_layer.video_out": "the base single head; a PDD release replaces it with pdd_proj_out.{0..5} (values differ); ComfyUI applies a single-head video_out LoRA to the base of every PDD head",
+  "mlp.fc1": "native [gate; value] rows, diffusers ff.net.0.proj [value; gate] (verified byte-for-byte)",
+  "qkv_proj": "raw transformer/ stores fused QKV per-head interleaved; the reference reorders it at load to [q_all; k_all; v_all] (diffusers convert_minimax_h3_to_diffusers.py reorder_interleaved_qkv), so a LoRA trained on the in-memory module is in contiguous thirds",
+  "renames": "condition_proj, video_patch_proj, time_embedder.proj_in/proj_out, final_layer.adaln_proj.linear, out_proj, fc2 are byte-identical to their diffusers counterparts"
+ },
+ "native": {
+  "blocks.0.adaln_proj.linear.bias": [
+   "BF16",
+   [
+    96768
+   ]
+  ],
+  "blocks.0.adaln_proj.linear.weight": [
+   "BF16",
+   [
+    96768,
+    2688
+   ]
+  ],
+  "blocks.0.attn.k_norm.weight": [
+   "BF16",
+   [
+    128
+   ]
+  ],
+  "blocks.0.attn.out_proj.weight": [
+   "BF16",
+   [
+    5376,
+    7168
+   ]
+  ],
+  "blocks.0.attn.q_norm.weight": [
+   "BF16",
+   [
+    128
+   ]
+  ],
+  "blocks.0.attn.qkv_proj.weight": [
+   "BF16",
+   [
+    21504,
+    5376
+   ]
+  ],
+  "blocks.0.mlp.fc1.weight": [
+   "BF16",
+   [
+    28672,
+    5376
+   ]
+  ],
+  "blocks.0.mlp.fc2.weight": [
+   "BF16",
+   [
+    5376,
+    14336
+   ]
+  ],
+  "blocks.0.norm1.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "blocks.0.norm2.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "condition_proj.bias": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "condition_proj.weight": [
+   "BF16",
+   [
+    5376,
+    5120
+   ]
+  ],
+  "final_layer.adaln_proj.linear.bias": [
+   "BF16",
+   [
+    10752
+   ]
+  ],
+  "final_layer.adaln_proj.linear.weight": [
+   "BF16",
+   [
+    10752,
+    2688
+   ]
+  ],
+  "final_layer.norm.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "final_layer.video_out.bias": [
+   "F32",
+   [
+    96
+   ]
+  ],
+  "final_layer.video_out.weight": [
+   "F32",
+   [
+    96,
+    5376
+   ]
+  ],
+  "rope.inv_freq": [
+   "F32",
+   [
+    16
+   ]
+  ],
+  "time_embedder.proj_in.bias": [
+   "F32",
+   [
+    5376
+   ]
+  ],
+  "time_embedder.proj_in.weight": [
+   "F32",
+   [
+    5376,
+    256
+   ]
+  ],
+  "time_embedder.proj_out.bias": [
+   "F32",
+   [
+    2688
+   ]
+  ],
+  "time_embedder.proj_out.weight": [
+   "F32",
+   [
+    2688,
+    5376
+   ]
+  ],
+  "token_refiner.blocks.0.attn.k_norm.weight": [
+   "BF16",
+   [
+    128
+   ]
+  ],
+  "token_refiner.blocks.0.attn.out_proj.weight": [
+   "BF16",
+   [
+    5376,
+    7168
+   ]
+  ],
+  "token_refiner.blocks.0.attn.q_norm.weight": [
+   "BF16",
+   [
+    128
+   ]
+  ],
+  "token_refiner.blocks.0.attn.qkv_proj.weight": [
+   "BF16",
+   [
+    21504,
+    5376
+   ]
+  ],
+  "token_refiner.blocks.0.mlp.fc1.weight": [
+   "BF16",
+   [
+    28672,
+    5376
+   ]
+  ],
+  "token_refiner.blocks.0.mlp.fc2.weight": [
+   "BF16",
+   [
+    5376,
+    14336
+   ]
+  ],
+  "token_refiner.blocks.0.norm1.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "token_refiner.blocks.0.norm2.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "token_refiner.blocks.1.attn.k_norm.weight": [
+   "BF16",
+   [
+    128
+   ]
+  ],
+  "token_refiner.blocks.1.attn.out_proj.weight": [
+   "BF16",
+   [
+    5376,
+    7168
+   ]
+  ],
+  "token_refiner.blocks.1.attn.q_norm.weight": [
+   "BF16",
+   [
+    128
+   ]
+  ],
+  "token_refiner.blocks.1.attn.qkv_proj.weight": [
+   "BF16",
+   [
+    21504,
+    5376
+   ]
+  ],
+  "token_refiner.blocks.1.mlp.fc1.weight": [
+   "BF16",
+   [
+    28672,
+    5376
+   ]
+  ],
+  "token_refiner.blocks.1.mlp.fc2.weight": [
+   "BF16",
+   [
+    5376,
+    14336
+   ]
+  ],
+  "token_refiner.blocks.1.norm1.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "token_refiner.blocks.1.norm2.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "token_refiner.final_norm.weight": [
+   "BF16",
+   [
+    5376
+   ]
+  ],
+  "video_patch_proj.bias": [
+   "F32",
+   [
+    5376
+   ]
+  ],
+  "video_patch_proj.weight": [
+   "F32",
+   [
+    5376,
+    96
+   ]
+  ]
+ },
+ "source": "MiniMaxAI/MiniMax-H3-Image@main safetensors headers (names, dtypes, shapes only; read 2026-11-10 by HTTP range). Blocks 1-49 omitted: identical to block 0."
+}

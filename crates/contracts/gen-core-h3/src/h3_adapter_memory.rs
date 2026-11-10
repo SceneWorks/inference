@@ -272,12 +272,25 @@ fn price_lora(
     targets: &[H3AdapterTarget],
     out: &mut Vec<H3AdapterProjectionMemory>,
 ) -> Result<u64> {
-    let trainer = weightsmeta::classify_minimax_h3_trainer_namespace(
+    // SW-7096: the same key-space decision the installs make — the strict census only for the
+    // stamped trainer export, the shared kohya rewrite for any other `lora_unet_` file.
+    let space = weightsmeta::classify_minimax_h3_lora_key_space(
         file.tensors.iter().map(|h| h.name.as_str()),
         file.metadata.get("ss_network_module").map(String::as_str),
         file.metadata.get("networkType").map(String::as_str),
     )
     .map_err(invalid)?;
+    let trainer = space == weightsmeta::MiniMaxH3LoraKeySpace::Trainer;
+    let kohya = space == weightsmeta::MiniMaxH3LoraKeySpace::Kohya;
+    if kohya {
+        weightsmeta::rewrite_minimax_h3_kohya_keys(file.tensors.iter().map(|h| h.name.as_str()))
+            .map_err(|unmatched| {
+                invalid(format!(
+                    "{} kohya key(s) name no MiniMax-H3 module: {unmatched:?}",
+                    unmatched.len()
+                ))
+            })?;
+    }
     if trainer {
         weightsmeta::validate_minimax_h3_trainer_layout(
             file.tensors
@@ -309,6 +322,9 @@ fn price_lora(
                     )),
                 }
             })
+        } else if kohya {
+            weightsmeta::minimax_h3_kohya_key_to_dotted(&h.name)
+                .and_then(|dotted| lora_key(&dotted))
         } else {
             lora_key(&h.name)
         };
@@ -770,6 +786,83 @@ mod tests {
         // Shared-A rank-six route bounds block-diagonal rank-two conversion as well.
         assert_eq!(p.resident_bytes, 3 * (8 + 12) * 6 * 2 + (8 + 32) * 2 * 6);
         assert_eq!(p.projections.len(), 4);
+    }
+
+    /// SW-7096: a generic kohya file prices through the shared rewrite exactly as its dotted
+    /// twin, and one key naming no module refuses the file rather than pricing part of it.
+    #[test]
+    fn generic_kohya_prices_like_its_dotted_twin_and_refuses_unknown_keys() {
+        let dotted = file(vec![
+            h(
+                "blocks.0.attn.qkv_proj.lora_down.weight",
+                Dtype::BF16,
+                &[6, 8],
+            ),
+            h(
+                "blocks.0.attn.qkv_proj.lora_up.weight",
+                Dtype::BF16,
+                &[36, 6],
+            ),
+            h(
+                "transformer_blocks.0.ff.net.2.lora_down.weight",
+                Dtype::BF16,
+                &[2, 32],
+            ),
+            h(
+                "transformer_blocks.0.ff.net.2.lora_up.weight",
+                Dtype::BF16,
+                &[8, 2],
+            ),
+        ]);
+        let mut kohya = file(vec![
+            h(
+                "lora_unet_blocks_0_attn_qkv_proj.lora_down.weight",
+                Dtype::BF16,
+                &[6, 8],
+            ),
+            h(
+                "lora_unet_blocks_0_attn_qkv_proj.lora_up.weight",
+                Dtype::BF16,
+                &[36, 6],
+            ),
+            h("lora_unet_blocks_0_attn_qkv_proj.alpha", Dtype::F32, &[]),
+            h(
+                "lora_unet_transformer_blocks_0_ff_net_2.lora_down.weight",
+                Dtype::BF16,
+                &[2, 32],
+            ),
+            h(
+                "lora_unet_transformer_blocks_0_ff_net_2.lora_up.weight",
+                Dtype::BF16,
+                &[8, 2],
+            ),
+        ]);
+        kohya
+            .metadata
+            .insert("ss_network_module".into(), "networks.lora".into());
+        let mut targets = ["to_q", "to_k", "to_v"]
+            .into_iter()
+            .map(|n| target(&format!("transformer_blocks.0.attn.{n}"), 8, 12, true))
+            .collect::<Vec<_>>();
+        targets.push(target("transformer_blocks.0.ff.net.2", 32, 8, false));
+        for backend in [MLX, CANDLE] {
+            let want =
+                profile_from_headers(backend, std::slice::from_ref(&dotted), &targets).unwrap();
+            let got =
+                profile_from_headers(backend, std::slice::from_ref(&kohya), &targets).unwrap();
+            assert_eq!(got.resident_bytes, want.resident_bytes);
+            assert_eq!(got.projections.len(), 4);
+        }
+        let mut unknown = kohya.clone();
+        unknown.tensors.push(h(
+            "lora_unet_final_layer_linear.lora_down.weight",
+            Dtype::BF16,
+            &[2, 8],
+        ));
+        let error = profile_from_headers(MLX, &[unknown], &targets)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lora_unet_final_layer_linear"), "{error}");
     }
 
     #[test]

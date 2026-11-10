@@ -2103,6 +2103,39 @@ mod tests {
         );
     }
 
+    /// SW-7096: a configured adapter does not take rung 4 away. The streamed window copies each
+    /// host-resident block **with its installed residuals** to the device
+    /// (`LinearNoBias::copy_to_device`), so the declaration and the admission are the same with
+    /// and without a LoRA — the MLX sibling now holds the same rule.
+    #[test]
+    fn rung_four_stays_implemented_with_adapters_configured() {
+        let spec = weightless_spec().with_adapters(vec![
+            lora_at("/nonexistent/style.safetensors".into()),
+            lora_at("/nonexistent/turbo.safetensors".into()),
+        ]);
+        let contract = weights_free_contract(&spec).expect("weights-free contract");
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        );
+        assert!(contract.lifecycle.transformer_window_materialization);
+        for fixture in routes::registered_fixture(
+            &spec,
+            &contract,
+            MemoryStrategy::BoundedTransformerResidency,
+        )
+        .unwrap()
+        {
+            assert_eq!(
+                safety_check(&spec, &contract, &fixture.context),
+                MemorySafetyDecision::Accept
+            );
+        }
+    }
+
     // --- AC3: weights-free conformance, and a malformed contract fails ---------------------------
 
     /// The same check the registry path runs, on the same fixture factory, in the default lane.

@@ -145,6 +145,11 @@ impl AdaLnProjection {
         self.linear.is_quantized()
     }
 
+    /// The projection's linear, for an adapter install (SW-7096).
+    pub fn linear_mut(&mut self) -> &mut AdaptableLinear {
+        &mut self.linear
+    }
+
     /// `pub(crate)` for rung 4 (sc-18662): [`crate::block_stream::precompute_adaln_windowed`]
     /// materializes projections one window at a time, which is a *different* call site from
     /// [`DitBlock::from_weights`] and cannot go through it — a windowed precompute must load the
@@ -330,6 +335,13 @@ impl DitBlock {
     /// This block's AdaLN projection, or `None` once it has been evicted.
     pub fn adaln_proj(&self) -> Option<&AdaLnProjection> {
         self.adaln_proj.as_ref()
+    }
+
+    /// This block's AdaLN projection's linear, for an adapter install (SW-7096); `None` once
+    /// evicted or on a body-only block. Installed before the precompute, a residual here is part of
+    /// every modulation table the precompute produces.
+    pub fn adaln_linear_mut(&mut self) -> Option<&mut AdaptableLinear> {
+        self.adaln_proj.as_mut().map(AdaLnProjection::linear_mut)
     }
 
     /// Whether this block still holds its AdaLN projection.
@@ -553,6 +565,65 @@ impl AdaptableHost for DitBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SW-7096: an AdaLN projection carrying a LoRA projects the modulation tables its MERGED
+    /// weight would — so the image precompute, which runs after the install, caches the adapted
+    /// tables — and the delta reaches every one of the six tables.
+    #[test]
+    fn an_adaln_lora_projects_the_tables_its_merged_weight_would() {
+        let cfg = MiniMaxH3DitConfig {
+            num_attention_heads: 4,
+            attention_head_dim: 24,
+            hidden_size: 8,
+            ffn_dim: 16,
+            time_embed_dim: 6,
+            ..MiniMaxH3DitConfig::default()
+        };
+        let (out, inp, r) = (cfg.adaln_out_features(), cfg.time_embed_dim, 2);
+        let seeded = |shape: &[i32], seed: u32| {
+            let n: i32 = shape.iter().product();
+            let v: Vec<f32> = (0..n as u32)
+                .map(|i| {
+                    ((i.wrapping_mul(2_654_435_761) ^ seed.wrapping_mul(40_503)) % 997) as f32
+                        / 997.0
+                        - 0.5
+                })
+                .collect();
+            Array::from_slice(&v, shape)
+        };
+        let (w, b) = (seeded(&[out, inp], 1), seeded(&[out], 2));
+        let (down, up) = (seeded(&[r, inp], 3), seeded(&[out, r], 4));
+        let load = |weight: Array| {
+            let mut m = Weights::empty();
+            m.insert("p.weight", weight);
+            m.insert("p.bias", b.clone());
+            AdaLnProjection::from_weights(&mut m, "p", &cfg, Dtype::Float32).unwrap()
+        };
+        let temb = seeded(&[3, inp], 5);
+        let mut adapted = load(w.clone());
+        adapted.linear_mut().push(mlx_gen::adapters::Adapter::Lora {
+            a: down.t(),
+            b: up.t(),
+            scale: 0.5,
+        });
+        let delta = multiply(
+            mlx_rs::ops::matmul(&up, &down).unwrap(),
+            Array::from_f32(0.5),
+        )
+        .unwrap();
+        let merged = load(add(&w, &delta).unwrap());
+        let bare = load(w);
+        let (got, want, base) = (
+            adapted.forward(&temb).unwrap(),
+            merged.forward(&temb).unwrap(),
+            bare.forward(&temb).unwrap(),
+        );
+        for ((g, m), b) in got.tables().zip(want.tables()).zip(base.tables()) {
+            // Metal's f32 GEMM accumulates in a different order for the two routes.
+            assert!(mlx_gen::testing::max_abs_diff_f32(g, m) < 1e-3);
+            assert!(mlx_gen::testing::max_abs_diff_f32(g, b) > 1e-2);
+        }
+    }
 
     /// The published block ships exactly 12 tensors, and none of the attention or feed-forward
     /// ones is a bias.

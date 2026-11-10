@@ -81,6 +81,9 @@ pub struct MiniMaxH3Image {
     dtype: Dtype,
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
     memory_tier: mlx_gen::gen_core::MemoryNumericTier,
+    /// LoRA / LoKr adapters (SW-7096), installed on the DiT each time it is mapped for a render
+    /// and released with it.
+    adapters: Vec<mlx_gen::gen_core::AdapterSpec>,
 }
 
 /// The identity, modality and capability surface.
@@ -108,8 +111,10 @@ pub fn descriptor() -> ModelDescriptor {
                 ConditioningKind::Reference,
                 ConditioningKind::MultiReference,
             ],
-            supports_lora: false,
-            supports_lokr: false,
+            // SW-7096: H3's adapter install over the image DiT's block/refiner surface --
+            // diffusers/PEFT, kohya `lora_unet_`, ComfyUI and LoKr, each at its own scale.
+            supports_lora: true,
+            supports_lokr: true,
             // Pre-quantized tiers only (SW-7093): packed offline by
             // `crate::convert::quantize_minimax_h3_image_dit`, staged as the DiT component.
             supported_quants: &[Quant::Q4, Quant::Q8],
@@ -154,11 +159,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         &[TEXT_ENCODER_COMPONENT, IMAGE_DIT_COMPONENT],
         IMAGE_MODEL_ID,
     )?;
-    if !spec.adapters.is_empty() {
-        return Err(Error::Unsupported(format!(
-            "{IMAGE_MODEL_ID}: adapters are not supported"
-        )));
-    }
     let text_encoder_dir = resolve_text_encoder_dir(&root, spec);
     let dit_dir = crate::h3_image::tier::resolve_dit_dir(&root, spec);
     let mut probes: Vec<PathBuf> = vec![
@@ -196,6 +196,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         dtype,
         memory_strategy,
         memory_tier: mlx_gen::request_scope::loaded_tier(spec),
+        adapters: spec.adapters.clone(),
     }))
 }
 
@@ -583,7 +584,12 @@ impl MiniMaxH3Image {
 
         // --- 2. denoise --------------------------------------------------------------------
         on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::Renderer));
-        let dit = MiniMaxH3ImageDit::load_dir(&self.dit_dir, self.dtype)?;
+        let mut dit = MiniMaxH3ImageDit::load_dir(&self.dit_dir, self.dtype)?;
+        if !self.adapters.is_empty() {
+            // Strict, like H3 video: an unmatched target or a file that matched nothing fails the
+            // render here rather than producing an image the LoRA barely touched.
+            crate::adapters::apply_minimax_h3_adapters(&mut dit, &self.adapters)?;
+        }
         debug_assert_eq!(patch, dit.config().base.patch_size);
         let layout = if reference_latents.is_empty() {
             ImageLayout::t2i(

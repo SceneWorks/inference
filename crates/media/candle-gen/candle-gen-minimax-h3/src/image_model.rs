@@ -109,8 +109,10 @@ pub fn image_descriptor() -> ModelDescriptor {
                 ConditioningKind::Reference,
                 ConditioningKind::MultiReference,
             ],
-            supports_lora: false,
-            supports_lokr: false,
+            // SW-7096: H3's adapter install over the image DiT's block/refiner surface --
+            // diffusers/PEFT, kohya `lora_unet_`, ComfyUI and LoKr, each at its own scale.
+            supports_lora: true,
+            supports_lokr: true,
             // Pre-quantized MLX-affine tiers (SW-7093), the artifacts the MLX lane reads: staged as
             // the DiT component; `spec.quantize` asserts which tier was staged.
             supported_quants: &[Quant::Q4, Quant::Q8],
@@ -331,7 +333,12 @@ impl MiniMaxH3Image {
 
         // --- 2. denoise --------------------------------------------------------------------
         let phase = PhaseLog::start("dit_load");
-        let dit = MiniMaxH3Dit::load_from_dir(&self.dit_dir, &self.device, DType::BF16)?;
+        let mut dit = MiniMaxH3Dit::load_from_dir(&self.dit_dir, &self.device, DType::BF16)?;
+        if !self.spec.adapters.is_empty() {
+            // Strict, like H3 video: an unmatched target or a file that matched nothing fails the
+            // render here rather than producing an image the LoRA barely touched.
+            crate::adapters::apply_minimax_h3_adapters(&mut dit, &self.spec.adapters)?;
+        }
         phase.done();
         let patch = dit.config().patch_size;
         let layout = if reference_latents.is_empty() {
@@ -499,11 +506,6 @@ pub fn validate_image_request(
 
 /// Registry entry point: refuse every `LoadSpec` slot this provider does not read, then load.
 pub fn load_image(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Generator>> {
-    if !spec.adapters.is_empty() {
-        return Err(candle_gen::gen_core::Error::Unsupported(format!(
-            "{IMAGE_MODEL_ID}: adapters are not wired on this route yet"
-        )));
-    }
     // Q4 / Q8 are the published MLX-affine tiers; NVFP4 and FP8 are different formats and are
     // refused by name rather than reconciled against a q4/q8 marker.
     crate::model::requested_tier(spec)?;
@@ -625,13 +627,16 @@ mod tests {
             load_image(&q),
             Err(candle_gen::gen_core::Error::Unsupported(_))
         ));
+        // SW-7096: adapters are a read slot now — an adapter spec over a missing snapshot fails
+        // at the component check, not as an unsupported slot.
         let mut a = spec.clone();
         a.adapters.push(candle_gen::gen_core::AdapterSpec::new(
             "/x.safetensors".into(),
             1.0,
             candle_gen::gen_core::AdapterKind::Lora,
         ));
-        assert!(load_image(&a).is_err());
+        let e = load_image(&a).err().expect("missing snapshot");
+        assert!(e.to_string().contains(IMAGE_DIT_PARTITION), "{e}");
         let mut d = spec.clone();
         d.load_shape = LoadShape::DeferredMaterialization;
         assert!(load_image(&d).is_err());
