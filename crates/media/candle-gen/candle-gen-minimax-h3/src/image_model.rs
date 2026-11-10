@@ -28,22 +28,22 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_gen::candle_core::{DType, Device};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::h3_image as contract;
 use candle_gen::gen_core::{
-    Capabilities, GenerationOutput, GenerationRequest, Generator, LoadShape, LoadSpec,
-    MemoryProviderContract, Modality, ModelDescriptor, Precision, Progress, SizeFloor, StepSupport,
-    WeightsSource,
+    Capabilities, ConditioningKind, GenerationOutput, GenerationRequest, Generator, LoadShape,
+    LoadSpec, MemoryProviderContract, Modality, ModelDescriptor, Precision, Progress, SizeFloor,
+    StepSupport, WeightsSource,
 };
 use candle_gen::{CandleError, Result};
 use gen_core_h3::h3_schedule::SigmaSchedule;
 
 use crate::dit::{ImageDit, MiniMaxH3Dit};
 use crate::image_pipeline::{
-    decoded_to_image, denoise_image, initial_image_rows, latent_grid, unpack_image_rows,
-    ImageLayout,
+    decoded_to_image, denoise_image, initial_image_rows, latent_grid, reference_condition_rows,
+    reference_noise, reference_vae_pixels, resize_reference, unpack_image_rows, ImageLayout,
 };
-use crate::image_vae::{MiniMaxH3ImageVae, IMAGE_VAE_COMPONENT};
+use crate::image_vae::{MiniMaxH3ImageVae, MiniMaxH3ImageVaeEncoder, IMAGE_VAE_COMPONENT};
 use crate::model::{require_component_shards, resolve_seed, run_conditioner, PhaseLog};
 use crate::text_encoder::MiniMaxH3Tokenizer;
 
@@ -93,8 +93,12 @@ pub fn image_descriptor() -> ModelDescriptor {
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,
-            // Text-to-image only on this route; reference editing is a later item.
-            conditioning: Vec::new(),
+            // `edit` (SW-7092): 1..=16 reference images, as single references and/or a
+            // multi-reference list, in request order. No reference is `text2image`.
+            conditioning: vec![
+                ConditioningKind::Reference,
+                ConditioningKind::MultiReference,
+            ],
             supports_lora: false,
             supports_lokr: false,
             supported_quants: &[],
@@ -184,6 +188,69 @@ impl MiniMaxH3Image {
         }
     }
 
+    /// The `edit` conditioning (SW-7092): H3's Qwen3-VL vision tower over every vision-resized
+    /// reference (a 1024 short edge), spliced into the `Picture i: ` + vision-block presentation
+    /// and run through the layer-50 conditioner; then every VAE-resized reference (a
+    /// `[1024, 2048]` short edge) encoded on its own latent grid, its posterior sampled with
+    /// [`reference_noise`] stream 0. Each component is mapped, used, dropped and released in turn.
+    /// Returns the context, its per-row tags and the reference latents `[1, 24, h, w]`.
+    fn encode_edit(
+        &self,
+        prompt: &str,
+        references: &[&candle_gen::gen_core::Image],
+        seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(Tensor, Vec<u32>, Vec<Tensor>)> {
+        let vision_images = references
+            .iter()
+            .map(|r| resize_reference(r, contract::reference_vision_size(r.width, r.height)))
+            .collect::<Result<Vec<_>>>()?;
+        let phase = PhaseLog::start("vision_tower");
+        let vision = crate::text_encoder::load_vision_tower(&self.text_encoder_dir, &self.device)?;
+        let refs: Vec<&candle_gen::gen_core::Image> = vision_images.iter().collect();
+        let grounded = crate::text_encoder::run_vision(&vision, &refs, &self.device)?;
+        drop(vision);
+        drop(vision_images);
+        crate::dit::release_device_memory(&self.device)?;
+        phase.done();
+
+        let phase = PhaseLog::start("text_encoder");
+        let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
+        let (ids, mask, tags) = tok.encode_image_edit(prompt, &grounded.counts, &self.device)?;
+        let context = run_conditioner(
+            &self.text_encoder_dir,
+            &ids,
+            &mask,
+            Some(&grounded),
+            &self.device,
+            on_progress,
+        )?;
+        drop((ids, mask, grounded));
+        phase.done();
+        if context.dims()[1] != tags.len() {
+            return Err(CandleError::Msg(format!(
+                "{IMAGE_MODEL_ID}: the edit context has {} rows but {} modality tags",
+                context.dims()[1],
+                tags.len()
+            )));
+        }
+
+        let phase = PhaseLog::start("image_vae_encode");
+        let patch = image_dit_config(&self.root)?.patch_size;
+        let encoder = MiniMaxH3ImageVaeEncoder::load(&self.root, &self.device)?;
+        let mut latents = Vec::with_capacity(references.len());
+        for (i, r) in references.iter().enumerate() {
+            let image = resize_reference(r, contract::reference_vae_size(r.width, r.height))?;
+            let posterior = encoder.encode(&reference_vae_pixels(&image, &self.device)?)?;
+            let noise = reference_noise(seed, 0, i, posterior.mean().dims(), &self.device)?;
+            latents.push(encoder.reference_latent(&posterior, &noise, (patch[1], patch[2]))?);
+        }
+        drop(encoder);
+        crate::dit::release_device_memory(&self.device)?;
+        phase.done();
+        Ok((context, tags, latents))
+    }
+
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -209,20 +276,33 @@ impl MiniMaxH3Image {
             "minimax-h3-image: text-to-image request"
         );
 
+        let references = contract::edit_reference_images(&req.conditioning)
+            .map_err(|r| CandleError::Msg(r.to_string()))?;
+
         // --- 1. conditioning ---------------------------------------------------------------
-        let phase = PhaseLog::start("text_encoder");
-        let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
-        let (ids, mask) =
-            tok.encode_prompt_truncated(&req.prompt, contract::MAX_PROMPT_TOKENS, &self.device)?;
-        let context = run_conditioner(
-            &self.text_encoder_dir,
-            &ids,
-            &mask,
-            &self.device,
-            on_progress,
-        )?;
-        drop((ids, mask));
-        phase.done();
+        let (context, text_tags, reference_latents) = if references.is_empty() {
+            let phase = PhaseLog::start("text_encoder");
+            let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
+            let (ids, mask) = tok.encode_prompt_truncated(
+                &req.prompt,
+                contract::MAX_PROMPT_TOKENS,
+                &self.device,
+            )?;
+            let context = run_conditioner(
+                &self.text_encoder_dir,
+                &ids,
+                &mask,
+                None,
+                &self.device,
+                on_progress,
+            )?;
+            drop((ids, mask));
+            phase.done();
+            let n = context.dims()[1];
+            (context, vec![contract::TEXT_TAG as u32; n], Vec::new())
+        } else {
+            self.encode_edit(&req.prompt, &references, seed, on_progress)?
+        };
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -236,7 +316,18 @@ impl MiniMaxH3Image {
         )?;
         phase.done();
         let patch = dit.config().patch_size;
-        let layout = ImageLayout::text_to_image(context.dims()[1], latent_h, latent_w, patch)?;
+        let layout = if reference_latents.is_empty() {
+            ImageLayout::text_to_image(context.dims()[1], latent_h, latent_w, patch)?
+        } else {
+            let grids = reference_latents
+                .iter()
+                .map(|l| {
+                    let d = l.dims();
+                    (d[2], d[3])
+                })
+                .collect::<Vec<_>>();
+            ImageLayout::edit(&text_tags, &grids, latent_h, latent_w, patch)?
+        };
         tracing::info!(
             seq_len = layout.seq_len(),
             text = layout.num_text_tokens(),
@@ -246,13 +337,28 @@ impl MiniMaxH3Image {
         let mut model = ImageDit::new(dit, &layout, &context, schedule.timesteps())?;
         model.set_cancel(&req.cancel);
         drop(context);
-        let initial = initial_image_rows(latent_h, latent_w, patch, seed, &self.device)?;
+        let noise = initial_image_rows(latent_h, latent_w, patch, seed, &self.device)?;
+        // An edit's reference rows lead the packed image stream, noised to 0.999 with one draw per
+        // reference after the generated image's own.
+        let initial = if reference_latents.is_empty() {
+            noise
+        } else {
+            let aug = reference_latents
+                .iter()
+                .enumerate()
+                .map(|(i, l)| reference_noise(seed, 1, i, l.dims(), &self.device))
+                .collect::<Result<Vec<_>>>()?;
+            let condition = reference_condition_rows(&reference_latents, &aug, patch)?;
+            Tensor::cat(&[&condition, &noise], 1)?
+        };
+        drop(reference_latents);
         let total = schedule.num_evals() as u32;
         let phase = PhaseLog::start("denoise");
         let rows = denoise_image(
             &mut model,
             &schedule,
             &initial,
+            layout.num_reference_rows(),
             &self.device,
             &req.cancel,
             &mut |completed| {
@@ -333,8 +439,8 @@ impl Generator for MiniMaxH3Image {
 }
 
 /// The request floor plus the H3-Image contract: a non-empty prompt, any positive size (or the
-/// `0 x 0` default), exactly six steps, no guidance other than 1, no negative prompt, no
-/// references.
+/// `0 x 0` default), exactly six steps, no guidance other than 1, no negative prompt, and 0..=16
+/// references of at least 32 px a side with no per-reference strength.
 pub fn validate_image_request(
     descriptor: &ModelDescriptor,
     req: &GenerationRequest,
@@ -354,7 +460,7 @@ pub fn validate_image_request(
         req.negative_prompt
             .as_deref()
             .is_some_and(|n| !n.trim().is_empty()),
-        req.conditioning.len(),
+        contract::edit_reference_images(&req.conditioning)?.len(),
     )?;
     let mut sized = req.clone();
     sized.width = width;
@@ -420,7 +526,13 @@ mod tests {
         assert_eq!(d.backend, "candle");
         let c = &d.capabilities;
         assert!(!c.supports_negative_prompt && !c.supports_guidance && !c.supports_true_cfg);
-        assert!(c.conditioning.is_empty());
+        assert_eq!(
+            c.conditioning,
+            vec![
+                ConditioningKind::Reference,
+                ConditioningKind::MultiReference
+            ]
+        );
         assert_eq!(c.supported_steps, StepSupport::Exact(vec![6]));
         assert_eq!(c.max_count, 1);
         // Not H3 video's 1.03 MP / 2016 caps.
@@ -500,5 +612,35 @@ mod tests {
         // A plain spec over a missing snapshot fails at the component check, naming the path.
         let e = load_image(&spec).err().expect("missing snapshot");
         assert!(e.to_string().contains(IMAGE_DIT_PARTITION), "{e}");
+    }
+
+    fn with_refs(n: usize, w: u32, h: u32) -> GenerationRequest {
+        let mut r = request(1024, 1024);
+        r.conditioning.push(Conditioning::MultiReference {
+            images: (0..n)
+                .map(|_| candle_gen::gen_core::Image {
+                    width: w,
+                    height: h,
+                    pixels: vec![0; (w * h * 3) as usize],
+                })
+                .collect(),
+        });
+        r
+    }
+
+    /// `edit` admits 1..=16 references of at least 32 px a side and refuses 17 or a 31 px one.
+    #[test]
+    fn edit_admits_one_to_sixteen_references_of_at_least_32_px() {
+        let d = image_descriptor();
+        validate_image_request(&d, &with_refs(1, 32, 32)).unwrap();
+        validate_image_request(&d, &with_refs(16, 64, 40)).unwrap();
+        let e = validate_image_request(&d, &with_refs(17, 64, 64))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("17"), "{e}");
+        let e = validate_image_request(&d, &with_refs(2, 31, 64))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("32"), "{e}");
     }
 }

@@ -1907,3 +1907,364 @@ fn image_text_to_image_renders_2048_on_cuda() {
         );
     }
 }
+
+// ── SW-7092: MiniMax-H3-Image edit (1-16 reference images) ──────────────────────────────────────
+
+/// The committed producer whose output the edit gates accept.
+const IMAGE_EDIT_PRODUCER: &[u8] =
+    include_bytes!("../../../mlx-gen/tools/dump_minimax_h3_image_edit_real.py");
+
+/// Peak-relative bound for the f32 reference encode. The posterior mean is the f32 encoder's
+/// (the video encode bound is 2e-4); the latent is after a float16 round, where one flipped
+/// half-precision ulp near the peak alone is ~1e-3 of it.
+const IMAGE_EDIT_MEAN_TOL: f32 = 2e-4;
+const IMAGE_EDIT_LATENT_TOL: f32 = 2e-3;
+
+fn image_edit_reference() -> common::Golden {
+    use sha2::{Digest, Sha256};
+    let raw = std::env::var("MINIMAX_H3_IMAGE_EDIT_REFERENCE").unwrap_or_default();
+    assert!(
+        !raw.is_empty(),
+        "MINIMAX_H3_IMAGE_EDIT_REFERENCE must point at the output of \
+         tools/dump_minimax_h3_image_edit_real.py; this test asserts rather than skips."
+    );
+    let reference = common::Golden::load(&raw);
+    assert_eq!(
+        reference.meta("producer_sha256").unwrap_or_default(),
+        format!("{:x}", Sha256::digest(IMAGE_EDIT_PRODUCER)),
+        "the reference was produced by a different dump_minimax_h3_image_edit_real.py; re-produce it"
+    );
+    assert_eq!(reference.meta("num_references").unwrap_or_default(), "3");
+    reference
+}
+
+/// AC2 (candle): the `edit` presentation built with the snapshot's own tokenizer is the processor
+/// template's (`Picture i: ` + vision block per reference, then the prompt, no chat template), id
+/// for id and tag for tag, as diffusers' `MiniMaxH3ImageEditTextEncoderStep` builds it.
+#[test]
+#[ignore = "needs MINIMAX_H3_IMAGE_SNAPSHOT (tokenizer/) + MINIMAX_H3_IMAGE_EDIT_REFERENCE; tokenizer only"]
+fn image_edit_presentation_matches_the_processor_template() {
+    let root = image_dit_snapshot();
+    let reference = image_edit_reference();
+    let counts: Vec<usize> = reference
+        .meta("vision_tokens")
+        .expect("meta")
+        .split(',')
+        .map(|n| n.parse().unwrap())
+        .collect();
+    let prompt = reference.meta("prompt").expect("meta").to_string();
+    let tok = candle_gen_minimax_h3::text_encoder::MiniMaxH3Tokenizer::from_snapshot(&root)
+        .expect("tokenizer");
+    let (ids, tags) = tok.image_edit_ids(&prompt, &counts).expect("presentation");
+    let want_ids: Vec<u32> = reference
+        .f32("in.token_ids")
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
+    let want_tags: Vec<u32> = reference
+        .f32("in.token_tags")
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
+    println!(
+        "edit presentation: {} rows, vision blocks {counts:?}",
+        ids.len()
+    );
+    assert_eq!(
+        ids, want_ids,
+        "token ids differ from the reference presentation"
+    );
+    assert_eq!(
+        tags, want_tags,
+        "row tags differ from the reference presentation"
+    );
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_edit_presentation_matches_the_processor_template"
+    );
+}
+
+/// AC1 (candle, reference latents): the f32 image VAE encode of the three references matches
+/// diffusers' posterior mean, and the released latent recipe matches its latent.
+#[test]
+#[ignore = "needs MINIMAX_H3_IMAGE_SNAPSHOT (vae_diffusers/) + MINIMAX_H3_IMAGE_EDIT_REFERENCE"]
+fn image_edit_reference_latents_match_the_official_diffusers_vae() {
+    use candle_gen_minimax_h3::{reference_vae_pixels, MiniMaxH3ImageVaeEncoder};
+
+    let root = image_dit_snapshot();
+    let reference = image_edit_reference();
+    let dev = device();
+    let encoder = MiniMaxH3ImageVaeEncoder::load(&root, &dev).expect("encoder");
+    let mut worst = (0f32, 0f32);
+    for i in 0..3 {
+        let shape = reference.shape(&format!("ref{i}.image"));
+        let image = candle_gen::gen_core::Image {
+            width: shape[1] as u32,
+            height: shape[0] as u32,
+            pixels: reference
+                .f32(&format!("ref{i}.image"))
+                .into_iter()
+                .map(|v| v as u8)
+                .collect(),
+        };
+        let posterior = encoder
+            .encode(&reference_vae_pixels(&image, &dev).expect("pixels"))
+            .expect("encode");
+        let want_mean = reference.tensor(&format!("ref{i}.mean"));
+        let mean = posterior
+            .mean()
+            .reshape(want_mean.dims())
+            .and_then(|t| t.to_device(&Device::Cpu))
+            .expect("mean");
+        let noise = reference
+            .tensor(&format!("ref{i}.posterior_noise"))
+            .unsqueeze(2)
+            .and_then(|t| t.to_device(&dev))
+            .expect("noise");
+        let latent = encoder
+            .reference_latent(&posterior, &noise, (2, 2))
+            .expect("latent")
+            .to_device(&Device::Cpu)
+            .expect("latent to host");
+        let want_latent = reference.tensor(&format!("ref{i}.latent"));
+        assert_eq!(
+            latent.dims(),
+            want_latent.dims(),
+            "reference {i} latent shape"
+        );
+        let (pm, _) = rel(&mean, &want_mean);
+        let (pl, _) = rel(&latent, &want_latent);
+        println!(
+            "reference {i} ({}x{} px): posterior mean peak-rel {pm:.3e} (bound \
+             {IMAGE_EDIT_MEAN_TOL:.0e}), latent peak-rel {pl:.3e} (bound {IMAGE_EDIT_LATENT_TOL:.0e})",
+            image.width, image.height
+        );
+        worst = (worst.0.max(pm), worst.1.max(pl));
+    }
+    assert!(
+        worst.0 < IMAGE_EDIT_MEAN_TOL,
+        "posterior mean diverges: {:.3e}",
+        worst.0
+    );
+    assert!(
+        worst.1 < IMAGE_EDIT_LATENT_TOL,
+        "reference latent diverges: {:.3e}",
+        worst.1
+    );
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_edit_reference_latents_match_the_official_diffusers_vae"
+    );
+}
+
+/// AC1 (candle): a 3-reference edit's step-0 (head 0) and step-3 (head 3) DiT outputs match
+/// diffusers' `MiniMaxH3ImageTransformer2DModel` over `[text | 3 references | 512² image]`. The
+/// reference rows are built here from the reference's latents and draws and must equal the
+/// producer's before the DiT runs; the layout and the held `0.999` row class are this crate's.
+#[test]
+#[ignore = "needs MINIMAX_H3_IMAGE_SNAPSHOT (transformer_diffusers/) + MINIMAX_H3_IMAGE_EDIT_REFERENCE; 66 GB bf16 DiT"]
+fn image_edit_first_step_matches_the_official_diffusers_transformer() {
+    use candle_gen_minimax_h3::dit::{ImageDit, MiniMaxH3Dit, MiniMaxH3DitConfig};
+    use candle_gen_minimax_h3::{
+        reference_condition_rows, ImageLayout, ImageVelocity, IMAGE_DIT_PARTITION,
+    };
+    use gen_core_h3::h3_schedule::SigmaSchedule;
+
+    let root = image_dit_snapshot();
+    let reference = image_edit_reference();
+    let dir = root.join(IMAGE_DIT_PARTITION);
+    let cfg = MiniMaxH3DitConfig::from_image_diffusers_json(
+        &std::fs::read_to_string(dir.join("config.json")).expect("config"),
+    )
+    .expect("image config");
+    let tags: Vec<u32> = reference
+        .f32("in.token_tags")
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
+    let hw = reference.meta("latent_hw").expect("meta").to_string();
+    let (lh, lw) = hw.split_once('x').expect("HxW");
+    let (lh, lw): (usize, usize) = (lh.parse().unwrap(), lw.parse().unwrap());
+    let latents: Vec<Tensor> = (0..3)
+        .map(|i| reference.tensor(&format!("ref{i}.latent")))
+        .collect();
+    let aug: Vec<Tensor> = (0..3)
+        .map(|i| reference.tensor(&format!("ref{i}.aug_noise")))
+        .collect();
+    let condition = reference_condition_rows(&latents, &aug, cfg.patch_size).expect("rows");
+    let rows = Tensor::cat(&[&condition, &reference.tensor("in.target_rows")], 1).expect("cat");
+    let (rows_gap, _) = rel(&rows, &reference.tensor("in.rows"));
+    assert!(
+        rows_gap < 1e-6,
+        "packed reference rows differ: {rows_gap:.3e}"
+    );
+    let grids: Vec<(usize, usize)> = latents.iter().map(|l| (l.dims()[2], l.dims()[3])).collect();
+    let layout = ImageLayout::edit(&tags, &grids, lh, lw, cfg.patch_size).expect("layout");
+    assert_eq!(
+        layout.num_reference_rows().to_string(),
+        reference.meta("num_reference_rows").expect("meta")
+    );
+
+    let schedule = SigmaSchedule::h3_image_distilled().expect("schedule");
+    let dev = device();
+    let dit = MiniMaxH3Dit::load_from_dir(&dir, &dev, DType::BF16).expect("load the image DiT");
+    let context = reference
+        .tensor("in.context")
+        .to_dtype(DType::BF16)
+        .and_then(|t| t.to_device(&dev))
+        .expect("context");
+    let rows = rows.to_device(&dev).expect("rows");
+    let mut model = ImageDit::new(dit, &layout, &context, schedule.timesteps()).expect("ImageDit");
+    let run = |model: &mut ImageDit, step: usize| -> Tensor {
+        model
+            .forward(step, &rows)
+            .expect("forward")
+            .to_dtype(DType::F32)
+            .and_then(|t| t.to_device(&Device::Cpu))
+            .expect("to host")
+    };
+    let got0 = run(&mut model, 0);
+    let got3 = run(&mut model, 3);
+    let want0 = reference.tensor("out.step0");
+    let want3 = reference.tensor("out.step3");
+    assert_eq!(got0.dims(), want0.dims());
+    let (p0, m0) = rel(&got0, &want0);
+    let (p3, m3) = rel(&got3, &want3);
+    let (between, _) = rel(&want0, &want3);
+    println!(
+        "image edit DiT vs diffusers (bounds peak {IMAGE_DIT_PEAK_TOL:.0e} / mean \
+         {IMAGE_DIT_MEAN_TOL:.0e}): step0 peak {p0:.3e} mean {m0:.3e}; step3 peak {p3:.3e} mean \
+         {m3:.3e}; reference step0 vs step3 {between:.3e}"
+    );
+    assert!(
+        p0 < IMAGE_DIT_PEAK_TOL && m0 < IMAGE_DIT_MEAN_TOL,
+        "step 0 diverges"
+    );
+    assert!(
+        p3 < IMAGE_DIT_PEAK_TOL && m3 < IMAGE_DIT_MEAN_TOL,
+        "step 3 diverges"
+    );
+    assert!(
+        between > IMAGE_DIT_PEAK_TOL,
+        "steps 0 and 3 must be distinguishable"
+    );
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_edit_first_step_matches_the_official_diffusers_transformer"
+    );
+}
+
+/// The registered `minimax_h3_image` generator runs a 3-reference `edit` end to end on CUDA at a
+/// requested 1024x768 — vision tower + grounded conditioner, the reference VAE encodes, six steps
+/// over `[text | references | image]`, the tiled decode — and returns the requested size. Written
+/// to `MINIMAX_H3_IMAGE_EDIT_RENDER_OUT` when set.
+#[test]
+#[ignore = "needs MINIMAX_H3_IMAGE_SNAPSHOT, MiniMax-H3's text encoder incl. shard 14 (MINIMAX_H3_SNAPSHOT) and CUDA; full edit render"]
+fn image_edit_renders_three_references_on_cuda() {
+    #[cfg(not(feature = "cuda"))]
+    panic!("the edit render runs the 66 GB DiT on the GPU; build with --features cuda");
+    #[cfg(feature = "cuda")]
+    {
+        use candle_gen::gen_core::{
+            Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
+        };
+
+        let root = image_dit_snapshot();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        if !root.join("text_encoder").is_dir() {
+            let h3 =
+                std::path::PathBuf::from(std::env::var("MINIMAX_H3_SNAPSHOT").unwrap_or_default());
+            assert!(
+                h3.join("text_encoder")
+                    .join("model-00014-of-00014.safetensors")
+                    .is_file(),
+                "MINIMAX_H3_SNAPSHOT={} must hold MiniMax-H3's text_encoder/ including shard 14 \
+                 (the vision tower)",
+                h3.display()
+            );
+            spec.components.insert(
+                "text_encoder".into(),
+                WeightsSource::Dir(h3.join("text_encoder")),
+            );
+        }
+        let generator = candle_gen_minimax_h3::image_model::load_image(&spec)
+            .expect("load the minimax_h3_image generator");
+        let reference = |w: u32, h: u32, k: u32| Image {
+            width: w,
+            height: h,
+            pixels: (0..w * h)
+                .flat_map(|p| {
+                    let (x, y) = (p % w, p / w);
+                    [
+                        ((x * 255) / w) as u8,
+                        ((y * 255) / h) as u8,
+                        (((x / (8 + k)) + (y / (8 + k))) % 2 * 200) as u8,
+                    ]
+                })
+                .collect(),
+        };
+        let req = GenerationRequest {
+            prompt: "Place the checkered tile from <Picture 1> on the floor of the room in \
+                     <Picture 2>, with the colours of <Picture 3>"
+                .into(),
+            width: 1024,
+            height: 768,
+            seed: Some(7092),
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: reference(640, 480, 0),
+                    strength: None,
+                },
+                Conditioning::MultiReference {
+                    images: vec![reference(512, 768, 3), reference(1200, 1100, 6)],
+                },
+            ],
+            ..Default::default()
+        };
+        generator.validate(&req).expect("validate");
+        let started = std::time::Instant::now();
+        let mut steps = Vec::new();
+        let output = generator
+            .generate(&req, &mut |p| {
+                if let candle_gen::gen_core::Progress::Step { current, .. } = p {
+                    steps.push(current)
+                }
+            })
+            .expect("render");
+        assert_eq!(steps, vec![1, 2, 3, 4, 5, 6]);
+        let GenerationOutput::Images(images) = output else {
+            panic!("an image generator must return images")
+        };
+        let img = &images[0];
+        assert_eq!(
+            (img.width, img.height),
+            (1024, 768),
+            "the size is the request's"
+        );
+        let n = img.pixels.len() as f64;
+        let mean = img.pixels.iter().map(|&p| f64::from(p)).sum::<f64>() / n;
+        let std = (img
+            .pixels
+            .iter()
+            .map(|&p| (f64::from(p) - mean).powi(2))
+            .sum::<f64>()
+            / n)
+            .sqrt();
+        println!(
+            "3-reference edit at 1024x768 in {:.1} s: mean {mean:.1}, std {std:.1}",
+            started.elapsed().as_secs_f64()
+        );
+        assert!(std > 10.0, "degenerate render: std {std:.1}");
+        if let Ok(out) = std::env::var("MINIMAX_H3_IMAGE_EDIT_RENDER_OUT") {
+            image::RgbImage::from_raw(img.width, img.height, img.pixels.clone())
+                .expect("rgb")
+                .save(&out)
+                .expect("write the render");
+            println!("wrote {out}");
+        }
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_edit_renders_three_references_on_cuda"
+        );
+    }
+}

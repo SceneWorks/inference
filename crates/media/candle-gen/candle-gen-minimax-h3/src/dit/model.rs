@@ -1223,8 +1223,8 @@ pub const PUBLISHED_IMAGE_DIT_TENSORS: usize = 644;
 /// tables and the whole schedule's modulation are built once, and a step is "project, scatter, 50
 /// blocks, norm, the step's head".
 ///
-/// The fixed schedule enumerates every timestep the run evaluates at (six, one row class — text
-/// and image rows share each step's `t`), so construction always takes the precompute-and-evict
+/// The fixed schedule enumerates every timestep the run evaluates at (six, plus an edit's
+/// reference rows' constant `0.999`), so construction always takes the precompute-and-evict
 /// lever: [`AdaLnCache::precompute_and_evict`] projects the six timesteps' modulation for every
 /// block and releases `adaln_proj` (26.02 GB at the shipped geometry, the same tensors H3 video
 /// evicts).
@@ -1290,8 +1290,22 @@ impl ImageDit {
         }
         let device = dit.device.clone();
         let tables = dit.rope.tables_from_rows(layout.position_ids(), &device)?;
-        // One row class (text and image share the step's timestep), one step per head.
-        let schedule = TimestepSchedule::new(timesteps.iter().map(|&t| vec![t]).collect())?;
+        // Row class 0 is the step's timestep, which every text and generated row sits at; an
+        // edit's reference rows are class 1, held at `REFERENCE_NOISE_AUG` for every step
+        // (`MiniMaxH3ImageSetTimestepsStep.row_timestep_plan`). One step per head.
+        let has_references = layout.num_reference_rows() > 0;
+        let schedule = TimestepSchedule::new(
+            timesteps
+                .iter()
+                .map(|&t| {
+                    if has_references {
+                        vec![t, candle_gen::gen_core::h3_image::REFERENCE_NOISE_AUG]
+                    } else {
+                        vec![t]
+                    }
+                })
+                .collect(),
+        )?;
         let mut captured: Option<Tensor> = None;
         let embedder = dit.projections.time_embedder.clone().ok_or_else(|| {
             CandleError::Msg("minimax-h3-image dit: the checkpoint has no timestep MLP".into())
@@ -1323,7 +1337,7 @@ impl ImageDit {
             text_rows,
             cache,
             norm_out,
-            row_classes: vec![0; layout.seq_len()],
+            row_classes: layout.row_classes(),
             token_tags: layout.token_tags().to_vec(),
             text_indices: layout.text_indices().to_vec(),
             image_indices: layout.image_indices().to_vec(),

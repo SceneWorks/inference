@@ -142,6 +142,20 @@ pub enum H3ImageRefusal {
     NegativePrompt,
     #[error("{count} reference images refused: at most {MAX_REFERENCES} are supported")]
     TooManyReferences { count: usize },
+    #[error(
+        "reference image {index} is {width}x{height}: every reference needs at least \
+         {MIN_REFERENCE_EDGE} pixels on each side"
+    )]
+    ReferenceTooSmall {
+        index: usize,
+        width: u32,
+        height: u32,
+    },
+    #[error(
+        "reference image {index} carries strength {strength}: H3-Image edit has no per-reference \
+         strength; omit it"
+    )]
+    ReferenceStrength { index: usize, strength: f32 },
 }
 
 impl From<H3ImageRefusal> for Error {
@@ -258,6 +272,216 @@ pub fn latent_grid(canvas_width: u32, canvas_height: u32) -> Result<(u32, u32), 
         canvas_height / VAE_SPATIAL_RATIO,
         canvas_width / VAE_SPATIAL_RATIO,
     ))
+}
+
+// ── edit (reference images) ─────────────────────────────────────────────────────────────────────
+//
+// Sources (read 2026-11-10): diffusers main `modular_pipelines/minimax_h3_image/`
+// `before_encoder.py` (`bound_short_edge`, `MiniMaxH3ImageEditResizeStep`), `encoders.py`
+// (`MiniMaxH3ImageEditTextEncoderStep`, `MiniMaxH3ImageEditVaeEncoderStep`) and
+// `modular_pipeline.py` (`reference_noise_aug`).
+
+/// The smallest side a reference may have: one canvas multiple (`before_encoder.py:123`).
+pub const MIN_REFERENCE_EDGE: u32 = SIZE_STRIDE;
+/// The VAE copy of a reference keeps its pixels while its short edge is within
+/// `[REFERENCE_MIN_SHORT_EDGE, REFERENCE_MAX_SHORT_EDGE]` (`reference_min_short_edge`).
+pub const REFERENCE_MIN_SHORT_EDGE: u32 = 1024;
+/// Upper bound of the VAE copy's short edge (`reference_max_short_edge`).
+pub const REFERENCE_MAX_SHORT_EDGE: u32 = 2048;
+/// The text-encoder copy of a reference always has this short edge (`vision_min_short_edge` =
+/// `vision_max_short_edge` = 1024).
+pub const VISION_SHORT_EDGE: u32 = 1024;
+/// The `t` the reference rows of an edit are noised to and held at for every step
+/// (`reference_noise_aug`, modular_pipeline.py): just short of clean in H3's `t = 1` clean
+/// convention.
+pub const REFERENCE_NOISE_AUG: f32 = 0.999;
+/// Qwen3-VL merges `2 x 2` vision patches into one token (`merge_size ** 2`).
+pub const VISION_MERGE_TOKENS: usize = 4;
+
+/// The `(width, height)` one consumer of a reference resizes it to (`bound_short_edge`,
+/// before_encoder.py): unchanged when the short edge is within `[min_short_edge, max_short_edge]`,
+/// otherwise scaled at the same aspect so the short edge lands on the nearer bound, both sides
+/// rounded (Python `round`, half to even) to `multiple` and floored at one `multiple`.
+pub fn bound_short_edge(
+    width: u32,
+    height: u32,
+    min_short_edge: u32,
+    max_short_edge: u32,
+    multiple: u32,
+) -> (u32, u32) {
+    let short = width.min(height);
+    if (min_short_edge..=max_short_edge).contains(&short) {
+        return (width, height);
+    }
+    let bound = if short < min_short_edge {
+        min_short_edge
+    } else {
+        max_short_edge
+    };
+    let scale = f64::from(bound) / f64::from(short);
+    let m = f64::from(multiple);
+    let side = |v: u32| ((f64::from(v) * scale / m).round_ties_even() * m).max(m) as u32;
+    (side(width), side(height))
+}
+
+/// The size the VAE copy of a `width x height` reference is resized to.
+pub fn reference_vae_size(width: u32, height: u32) -> (u32, u32) {
+    bound_short_edge(
+        width,
+        height,
+        REFERENCE_MIN_SHORT_EDGE,
+        REFERENCE_MAX_SHORT_EDGE,
+        SIZE_STRIDE,
+    )
+}
+
+/// The size the text-encoder (vision tower) copy of a `width x height` reference is resized to.
+pub fn reference_vision_size(width: u32, height: u32) -> (u32, u32) {
+    bound_short_edge(
+        width,
+        height,
+        VISION_SHORT_EDGE,
+        VISION_SHORT_EDGE,
+        SIZE_STRIDE,
+    )
+}
+
+/// The ordered reference images of an edit request: every [`crate::Conditioning::Reference`] and every
+/// image of every [`crate::Conditioning::MultiReference`], in request order (`<Picture 1>` is the first).
+/// Zero references is a `text2image` request. Refuses a per-reference strength other than the
+/// no-op `1.0`, more than [`MAX_REFERENCES`] images, and a reference under
+/// [`MIN_REFERENCE_EDGE`] on either side. Other conditioning kinds are left to the descriptor's
+/// allowlist.
+pub fn edit_reference_images(
+    conditioning: &[crate::Conditioning],
+) -> Result<Vec<&crate::Image>, H3ImageRefusal> {
+    let mut images = Vec::new();
+    for c in conditioning {
+        match c {
+            crate::Conditioning::Reference { image, strength } => {
+                if let Some(s) = strength.filter(|&s| s != 1.0) {
+                    return Err(H3ImageRefusal::ReferenceStrength {
+                        index: images.len() + 1,
+                        strength: s,
+                    });
+                }
+                images.push(image);
+            }
+            crate::Conditioning::MultiReference { images: many } => images.extend(many.iter()),
+            _ => {}
+        }
+        if images.len() > MAX_REFERENCES {
+            return Err(H3ImageRefusal::TooManyReferences {
+                count: conditioning
+                    .iter()
+                    .map(|c| match c {
+                        crate::Conditioning::Reference { .. } => 1,
+                        crate::Conditioning::MultiReference { images } => images.len(),
+                        _ => 0,
+                    })
+                    .sum(),
+            });
+        }
+    }
+    validate_reference_sizes(images.iter().map(|i| (i.width, i.height)))?;
+    Ok(images)
+}
+
+/// Refuse a reference under [`MIN_REFERENCE_EDGE`] on either side (before_encoder.py:123).
+/// `index` in the refusal is 1-based, the `<Picture N>` the prompt names it by.
+pub fn validate_reference_sizes(
+    sizes: impl IntoIterator<Item = (u32, u32)>,
+) -> Result<(), H3ImageRefusal> {
+    for (i, (width, height)) in sizes.into_iter().enumerate() {
+        if width < MIN_REFERENCE_EDGE || height < MIN_REFERENCE_EDGE {
+            return Err(H3ImageRefusal::ReferenceTooSmall {
+                index: i + 1,
+                width,
+                height,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The label that precedes reference `index`'s (0-based) vision block: `"Picture {index + 1}: "`
+/// with no angle brackets — the `add_vision_id` form of the processor chat template
+/// (`processor/chat_template.json`), unlike the `<Picture N>` the prompt refers to it by.
+pub fn edit_reference_label(index: usize) -> String {
+    format!("Picture {}: ", index + 1)
+}
+
+/// The three special ids a vision block is spelled with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisionBlockIds {
+    pub vision_start: i32,
+    pub image_pad: i32,
+    pub vision_end: i32,
+}
+
+/// The `edit` presentation (`MiniMaxH3ImageEditTextEncoderStep`, encoders.py): per reference, its
+/// [`edit_reference_label`] tokenized verbatim and truncated to [`MAX_PROMPT_TOKENS`], then
+/// `<|vision_start|>`, `vision_tokens[i]` `<|image_pad|>` and `<|vision_end|>`; then the prompt
+/// tokenized verbatim and truncated to [`MAX_PROMPT_TOKENS`]. No chat template, no special tokens.
+/// Returns `(ids, tags)` built in lockstep: label and prompt rows are [`TEXT_TAG`], every row of a
+/// vision block is [`IMAGE_TAG`].
+///
+/// `encode` is the backend tokenizer (`tokenizer(text, add_special_tokens=False)`); it is called
+/// once per label and once for the prompt.
+pub fn edit_presentation(
+    prompt: &str,
+    vision_tokens: &[usize],
+    ids_of: VisionBlockIds,
+    mut encode: impl FnMut(&str) -> Result<Vec<i32>, Error>,
+) -> Result<(Vec<i32>, Vec<i32>), Error> {
+    if vision_tokens.is_empty() {
+        return Err(Error::Unsupported(
+            "MiniMax-H3-Image edit needs at least one reference image".into(),
+        ));
+    }
+    if vision_tokens.len() > MAX_REFERENCES {
+        return Err(H3ImageRefusal::TooManyReferences {
+            count: vision_tokens.len(),
+        }
+        .into());
+    }
+    let mut ids = Vec::new();
+    let mut tags = Vec::new();
+    for (i, &n) in vision_tokens.iter().enumerate() {
+        if n == 0 {
+            return Err(Error::Msg(format!(
+                "MiniMax-H3-Image edit: reference {} contributes no vision tokens",
+                i + 1
+            )));
+        }
+        let mut label = encode(&edit_reference_label(i))?;
+        label.truncate(MAX_PROMPT_TOKENS);
+        tags.extend(std::iter::repeat_n(TEXT_TAG, label.len()));
+        ids.extend(label);
+        ids.push(ids_of.vision_start);
+        ids.extend(std::iter::repeat_n(ids_of.image_pad, n));
+        ids.push(ids_of.vision_end);
+        tags.extend(std::iter::repeat_n(IMAGE_TAG, n + 2));
+    }
+    let prompt_ids = encode(prompt)?;
+    if prompt_ids.is_empty() {
+        return Err(Error::Unsupported(
+            "MiniMax-H3-Image needs a non-empty prompt".into(),
+        ));
+    }
+    let prompt_ids = &prompt_ids[..prompt_ids.len().min(MAX_PROMPT_TOKENS)];
+    tags.extend(std::iter::repeat_n(TEXT_TAG, prompt_ids.len()));
+    ids.extend_from_slice(prompt_ids);
+    Ok((ids, tags))
+}
+
+/// The `(latent_height, latent_width)` of one VAE-resized `width x height` reference after the
+/// encode crops (`MiniMaxH3ImageEditVaeEncoderStep`): pixels cropped at the top left to whole
+/// [`VAE_SPATIAL_RATIO`] cells, then the latent cropped to whole `patch` cells.
+pub fn reference_latent_grid(width: u32, height: u32, patch: (u32, u32)) -> (u32, u32) {
+    let lh = height / VAE_SPATIAL_RATIO;
+    let lw = width / VAE_SPATIAL_RATIO;
+    (lh / patch.0 * patch.0, lw / patch.1 * patch.1)
 }
 
 #[cfg(test)]
@@ -393,5 +617,132 @@ mod tests {
         assert_eq!(SIGMAS[0], 1.0);
         assert_eq!(SIGMAS[6], 0.0);
         assert!(SIGMAS.windows(2).all(|w| w[0] > w[1]));
+    }
+
+    #[test]
+    fn bound_short_edge_keeps_in_range_and_scales_to_the_nearer_bound() {
+        // In range: untouched, even off the 32 grid.
+        assert_eq!(reference_vae_size(1500, 1100), (1500, 1100));
+        // Below 1024: short edge scaled up to 1024, long side rounded to 32.
+        assert_eq!(reference_vae_size(512, 768), (1024, 1536));
+        // Above 2048: down to 2048.
+        assert_eq!(reference_vae_size(4096, 3000), (2784, 2048));
+        // The vision copy is pinned at a 1024 short edge both ways.
+        assert_eq!(reference_vision_size(1500, 1100), (1408, 1024));
+        assert_eq!(reference_vision_size(1024, 1024), (1024, 1024));
+        assert_eq!(reference_vision_size(64, 32), (2048, 1024));
+        // Python round is half-to-even: 1.5 multiples -> 2, 2.5 -> 2.
+        assert_eq!(bound_short_edge(48, 64, 64, 64, 32), (64, 96));
+        assert_eq!(bound_short_edge(80, 32, 32, 32, 32), (80, 32));
+        assert_eq!(bound_short_edge(80, 16, 32, 32, 32), (160, 32));
+    }
+
+    fn img(w: u32, h: u32) -> crate::Image {
+        crate::Image {
+            width: w,
+            height: h,
+            pixels: vec![0; (w * h * 3) as usize],
+        }
+    }
+
+    #[test]
+    fn edit_references_flatten_in_order_and_refuse_17_small_and_strength() {
+        use crate::Conditioning;
+        let conditioning = vec![
+            Conditioning::Reference {
+                image: img(32, 40),
+                strength: None,
+            },
+            Conditioning::MultiReference {
+                images: vec![img(64, 32), img(33, 33)],
+            },
+            Conditioning::Reference {
+                image: img(50, 50),
+                strength: Some(1.0),
+            },
+        ];
+        let refs = edit_reference_images(&conditioning).unwrap();
+        let sizes: Vec<(u32, u32)> = refs.iter().map(|i| (i.width, i.height)).collect();
+        assert_eq!(sizes, vec![(32, 40), (64, 32), (33, 33), (50, 50)]);
+        assert!(edit_reference_images(&[]).unwrap().is_empty());
+
+        let sixteen = vec![Conditioning::MultiReference {
+            images: (0..16).map(|_| img(32, 32)).collect(),
+        }];
+        assert_eq!(edit_reference_images(&sixteen).unwrap().len(), 16);
+        let seventeen = vec![
+            sixteen[0].clone(),
+            Conditioning::Reference {
+                image: img(32, 32),
+                strength: None,
+            },
+        ];
+        assert_eq!(
+            edit_reference_images(&seventeen).unwrap_err(),
+            H3ImageRefusal::TooManyReferences { count: 17 }
+        );
+        let small = vec![Conditioning::MultiReference {
+            images: vec![img(32, 32), img(31, 400)],
+        }];
+        assert_eq!(
+            edit_reference_images(&small).unwrap_err(),
+            H3ImageRefusal::ReferenceTooSmall {
+                index: 2,
+                width: 31,
+                height: 400
+            }
+        );
+        let strength = vec![Conditioning::Reference {
+            image: img(32, 32),
+            strength: Some(0.5),
+        }];
+        assert!(matches!(
+            edit_reference_images(&strength).unwrap_err(),
+            H3ImageRefusal::ReferenceStrength { index: 1, .. }
+        ));
+    }
+
+    /// The presentation is `Picture i: ` + vision block per reference, then the prompt; vision rows
+    /// are image-tagged, labels and prompt text-tagged.
+    #[test]
+    fn edit_presentation_matches_the_reference_layout() {
+        let specials = VisionBlockIds {
+            vision_start: 900,
+            image_pad: 901,
+            vision_end: 902,
+        };
+        let mut seen = Vec::new();
+        let (ids, tags) = edit_presentation("make it red", &[2, 1], specials, |s| {
+            seen.push(s.to_owned());
+            Ok(s.bytes().take(3).map(i32::from).collect())
+        })
+        .unwrap();
+        assert_eq!(seen, vec!["Picture 1: ", "Picture 2: ", "make it red"]);
+        let p = |s: &str| s.bytes().take(3).map(i32::from).collect::<Vec<i32>>();
+        let mut want = p("Picture 1: ");
+        want.extend([900, 901, 901, 902]);
+        want.extend(p("Picture 2: "));
+        want.extend([900, 901, 902]);
+        want.extend(p("make it red"));
+        assert_eq!(ids, want);
+        assert_eq!(tags, vec![1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1]);
+        assert!(edit_presentation("x", &[], specials, |_| Ok(vec![1])).is_err());
+        assert!(edit_presentation("x", &[1; 17], specials, |_| Ok(vec![1])).is_err());
+        assert!(edit_presentation("x", &[0], specials, |_| Ok(vec![1])).is_err());
+        assert!(edit_presentation("", &[1], specials, |_| Ok(vec![])).is_err());
+        // The prompt truncates at 4096 tokens.
+        let (ids, _) = edit_presentation("long", &[1], specials, |s| {
+            Ok(if s == "long" { vec![7; 5000] } else { vec![1] })
+        })
+        .unwrap();
+        assert_eq!(ids.len(), 1 + 3 + MAX_PROMPT_TOKENS);
+    }
+
+    #[test]
+    fn reference_latent_grid_crops_to_cells_then_patches() {
+        assert_eq!(reference_latent_grid(1024, 1536, (2, 2)), (96, 64));
+        // 100 px -> 6 latent cells -> 6; 90 px -> 5 -> 4.
+        assert_eq!(reference_latent_grid(90, 100, (2, 2)), (6, 4));
+        assert_eq!(REFERENCE_NOISE_AUG, 0.999);
     }
 }

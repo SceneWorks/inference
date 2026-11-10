@@ -111,7 +111,7 @@ pub const MAX_STEPS: u32 = 200;
 
 /// Quantization group size the shared vision tower is built with — the same value every other
 /// consumer of `mlx-gen-boogu`'s tower passes.
-const VISION_GROUP_SIZE: i32 = 64;
+pub(crate) const VISION_GROUP_SIZE: i32 = 64;
 
 /// Which MiniMax-H3 **task** a request is, and therefore which DiT partition it loads.
 ///

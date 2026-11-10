@@ -1,4 +1,16 @@
-//! The **`minimax_h3_image` generator**: prompt → image, `MiniMaxAI/MiniMax-H3-Image` on MLX.
+//! The **`minimax_h3_image` generator**: prompt (and up to 16 reference images) → image,
+//! `MiniMaxAI/MiniMax-H3-Image` on MLX.
+//!
+//! # Tasks
+//!
+//! * **`text2image`** — no reference: the phases below.
+//! * **`edit`** — 1 to 16 `Conditioning::Reference` / `Conditioning::MultiReference` images,
+//!   in request order (`<Picture 1>` is the first). Each reference takes two paths, as upstream:
+//!   resized to a 1024 short edge, it goes through H3's Qwen3-VL vision tower and is spliced into the
+//!   `Picture i: ` + vision-block presentation ([`MiniMaxH3Tokenizer::image_edit_ids`]);
+//!   resized into a `[1024, 2048]` short edge, it is VAE-encoded on its own latent grid
+//!   ([`MiniMaxH3ImageVaeEncoder`]), noised to `t = 0.999` and packed in front of the generated
+//!   rows ([`ImageLayout::edit`]), held there for every step. The output size is the request's.
 //!
 //! # Phases (staged; nothing is co-resident)
 //!
@@ -27,12 +39,14 @@ use mlx_rs::ops::{add, clip, multiply};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::gen_core::h3_image::{
-    generation_canvas, latent_grid, t2i_prompt_ids, validate_request as validate_h3_image,
-    FIXED_GUIDANCE, FIXED_STEPS, MIN_GENERATION_AREA_DEFAULT,
+    edit_reference_images, generation_canvas, latent_grid, reference_vae_size,
+    reference_vision_size, t2i_prompt_ids, validate_request as validate_h3_image, FIXED_GUIDANCE,
+    FIXED_STEPS, MIN_GENERATION_AREA_DEFAULT, REFERENCE_NOISE_AUG, VAE_SPATIAL_RATIO,
 };
 use mlx_gen::gen_core::{
-    reject_unknown_components, Capabilities, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, Precision, Progress, StepSupport, WeightsSource,
+    reject_unknown_components, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, Modality, ModelDescriptor, Precision, Progress, StepSupport,
+    WeightsSource,
 };
 use mlx_gen::{default_seed, Error, Result};
 
@@ -40,11 +54,13 @@ use crate::config::LATENT_CHANNELS;
 use crate::denoise::schedule::SigmaSchedule;
 use crate::h3_image::dit::{ImageDenoiser, MiniMaxH3ImageDit, IMAGE_DIT_COMPONENT};
 use crate::h3_image::layout::ImageLayout;
-use crate::image_vae::{MiniMaxH3ImageVae, IMAGE_VAE_COMPONENT};
+use crate::image_vae::{MiniMaxH3ImageVae, MiniMaxH3ImageVaeEncoder, IMAGE_VAE_COMPONENT};
 use crate::model::TEXT_ENCODER_COMPONENT;
 use crate::pipeline::{patchify_video_latents, unpatchify_video_rows, PIXEL_MEAN, PIXEL_STD};
 use crate::spatial_tiling::SpatialTiling;
-use crate::text_encoder::{MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, LM_PREFIX};
+use crate::text_encoder::{
+    MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, LM_PREFIX, VISION_PREFIX,
+};
 
 /// The published provider id.
 pub const IMAGE_MODEL_ID: &str = "minimax_h3_image";
@@ -85,8 +101,12 @@ pub fn descriptor() -> ModelDescriptor {
             // documented no-op (`validate` clears it before the shared floor).
             supports_negative_prompt: false,
             supports_guidance: false,
-            // text2image only in this item; edit (reference images) is a separate route.
-            conditioning: vec![],
+            // `edit`: 1..=16 reference images, as single references and/or one multi-reference
+            // list, in request order. No reference is `text2image`.
+            conditioning: vec![
+                ConditioningKind::Reference,
+                ConditioningKind::MultiReference,
+            ],
             supports_lora: false,
             supports_lokr: false,
             supported_quants: &[],
@@ -182,6 +202,8 @@ pub fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<
             "{IMAGE_MODEL_ID}: prompt must not be empty"
         )));
     }
+    let references = edit_reference_images(&req.conditioning)
+        .map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
     validate_h3_image(
         req.width,
         req.height,
@@ -191,7 +213,7 @@ pub fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<
         req.negative_prompt
             .as_deref()
             .is_some_and(|n| !n.trim().is_empty()),
-        req.conditioning.len(),
+        references.len(),
     )
     .map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
     // Guidance 1.0 is the family's documented no-op, admitted above; the shared floor refuses any
@@ -296,6 +318,81 @@ pub fn resize_to_request(
     })
 }
 
+/// One reference resized for one of its consumers, PIL-Lanczos as `VaeImageProcessor.resize`
+/// does; a reference already at `(width, height)` keeps its pixels.
+pub fn resize_reference(
+    image: &mlx_gen::media::Image,
+    (width, height): (u32, u32),
+) -> Result<mlx_gen::media::Image> {
+    resize_to_request(image.clone(), width, height)
+}
+
+/// The VAE copy's pixels: cropped at the top left to whole [`VAE_SPATIAL_RATIO`] cells, then
+/// ImageNet-normalized to `[1, 3, H, W]` (`MiniMaxH3ImageEditVaeEncoderStep`).
+pub fn reference_vae_pixels(image: &mlx_gen::media::Image) -> Result<Array> {
+    let r = VAE_SPATIAL_RATIO;
+    let (w, h) = (image.width / r * r, image.height / r * r);
+    if w == 0 || h == 0 {
+        return Err(Error::Msg(format!(
+            "{IMAGE_MODEL_ID}: a {}x{} reference holds no whole {r}px VAE cell",
+            image.width, image.height
+        )));
+    }
+    let mut pixels = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h as usize {
+        let row = y * image.width as usize * 3;
+        pixels.extend_from_slice(&image.pixels[row..row + w as usize * 3]);
+    }
+    let cropped = mlx_gen::media::Image {
+        width: w,
+        height: h,
+        pixels,
+    };
+    Ok(crate::keyframe::keyframe_to_vae_pixels(&cropped)?.reshape(&[1, 3, h as i32, w as i32])?)
+}
+
+/// Seeded `[shape]` standard-normal noise for an edit's per-reference draws: the posterior
+/// sample (`stream` 0) and the conditioning augmentation (`stream` 1) of reference `index`, each
+/// its own key so no two draws share a stream and none disturbs the generated image's noise.
+pub fn reference_noise(seed: u64, stream: u64, index: usize, shape: &[i32]) -> Result<Array> {
+    let key = mlx_rs::random::key(
+        seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(stream.wrapping_mul(1 << 32))
+            .wrapping_add(index as u64 + 1),
+    )?;
+    Ok(mlx_rs::random::normal::<f32>(
+        shape,
+        None,
+        None,
+        Some(&key),
+    )?)
+}
+
+/// An edit's conditioning rows: every reference latent `[1, 24, h, w]` noised to
+/// [`REFERENCE_NOISE_AUG`] with its `noise` (`scale_noise`, `t · x + (1 - t) · n` in float32),
+/// patchified as one latent frame, and concatenated in packed order —
+/// `MiniMaxH3ImageEditPrepareLatentsStep`. Returns `[1, num_reference_rows, 96]`.
+pub fn reference_condition_rows(
+    latents: &[Array],
+    noise: &[Array],
+    patch: [i32; 3],
+) -> Result<Array> {
+    if latents.len() != noise.len() || latents.is_empty() {
+        return Err(Error::Msg(format!(
+            "{IMAGE_MODEL_ID}: {} reference latents for {} noise tensors",
+            latents.len(),
+            noise.len()
+        )));
+    }
+    let mut rows = Vec::with_capacity(latents.len());
+    for (latent, n) in latents.iter().zip(noise) {
+        let latent = latent.as_dtype(Dtype::Float32)?;
+        let noised = crate::conditioning::scale_noise(&latent, REFERENCE_NOISE_AUG, n)?;
+        rows.push(patchify_video_latents(&noised.expand_dims(2)?, patch)?);
+    }
+    Ok(mlx_rs::ops::concatenate_axis(&rows, 1)?)
+}
+
 /// Drop a component and drain MLX's allocator cache (H3's retried drain).
 fn release<T>(component: T) {
     drop(component);
@@ -335,6 +432,93 @@ impl MiniMaxH3Image {
         Ok(context)
     }
 
+    /// The `edit` presentation (`MiniMaxH3ImageEditTextEncoderStep`): H3's Qwen3-VL vision tower
+    /// over every vision-resized reference, spliced into the `Picture i: ` + vision-block
+    /// presentation, then the layer-50 context. Returns the context and its per-row tags.
+    pub fn encode_edit_prompt(
+        &self,
+        prompt: &str,
+        vision_images: &[mlx_gen::media::Image],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(Array, Vec<i32>)> {
+        let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
+        let shard = self.text_encoder_dir.join(format!(
+            "model-{:05}-of-00014.safetensors",
+            crate::text_encoder::VISION_SHARD
+        ));
+        if !shard.is_file() {
+            return Err(Error::Msg(format!(
+                "{IMAGE_MODEL_ID}: an edit reads the vision tower from {} (MiniMax-H3's \
+                 text_encoder/ shard {}), which is missing",
+                shard.display(),
+                crate::text_encoder::VISION_SHARD
+            )));
+        }
+        let mut w = crate::text_encoder::map_shards(&self.text_encoder_dir, true)?;
+        let vision = mlx_gen_boogu::vision::VisionTower::from_weights(
+            &w,
+            crate::text_encoder::minimax_h3_vision_config(),
+            VISION_PREFIX,
+            crate::model::VISION_GROUP_SIZE,
+        )?;
+        w.materialize_accessed()?;
+        let refs: Vec<&mlx_gen::media::Image> = vision_images.iter().collect();
+        let grounded = crate::text_encoder::run_vision(&vision, &refs)?;
+        let mut forced: Vec<&Array> = grounded.embeds.iter().collect();
+        forced.extend(grounded.deepstack.iter().flatten());
+        mlx_rs::transforms::eval(forced)?;
+        release(vision);
+        w.remove_prefix(VISION_PREFIX);
+
+        let (ids, tags) = tok.image_edit_ids(prompt, &grounded.counts)?;
+        let len = ids.len() as i32;
+        let input_ids = Array::from_slice(&ids, &[1, len]);
+        let mask = Array::from_slice(&vec![1i32; ids.len()], &[1, len]);
+        let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
+        let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg)?;
+        let context = mlx_gen::gen_core::with_prompt_encoding(on_progress, || {
+            te.forward_with_images(
+                &input_ids,
+                &mask,
+                &grounded.embeds,
+                &grounded.deepstack,
+                &grounded.grids,
+            )
+        })?;
+        mlx_rs::transforms::eval([&context])?;
+        release((te, w, grounded));
+        if context.shape()[1] != tags.len() as i32 {
+            return Err(Error::Msg(format!(
+                "{IMAGE_MODEL_ID}: the edit context has {} rows but {} modality tags",
+                context.shape()[1],
+                tags.len()
+            )));
+        }
+        Ok((context, tags))
+    }
+
+    /// Every VAE-resized reference's conditioning latent `[1, 24, h, w]` on its own grid
+    /// (`MiniMaxH3ImageEditVaeEncoderStep`), the posterior sampled with [`reference_noise`]
+    /// stream 0. The encoder is loaded, used and released here.
+    pub fn encode_reference_latents(
+        &self,
+        vae_images: &[mlx_gen::media::Image],
+        seed: u64,
+        patch: [i32; 3],
+    ) -> Result<Vec<Array>> {
+        let encoder = MiniMaxH3ImageVaeEncoder::load(&self.root)?;
+        let mut latents = Vec::with_capacity(vae_images.len());
+        for (i, image) in vae_images.iter().enumerate() {
+            let posterior = encoder.encode(&reference_vae_pixels(image)?)?;
+            let noise = reference_noise(seed, 0, i, posterior.mean().shape())?;
+            let latent = encoder.reference_latent(&posterior, &noise, (patch[1], patch[2]))?;
+            mlx_rs::transforms::eval([&latent])?;
+            latents.push(latent);
+        }
+        release(encoder);
+        Ok(latents)
+    }
+
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -352,9 +536,42 @@ impl MiniMaxH3Image {
         let seed = req.seed.unwrap_or_else(default_seed);
         let count = req.count.max(1);
 
+        let references = edit_reference_images(&req.conditioning)
+            .map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
+        let patch = crate::dit::config::MiniMaxH3ImageDitConfig::default()
+            .base
+            .patch_size;
+
         // --- 1. conditioning ---------------------------------------------------------------
+        // An edit's references are resized once per consumer; neither copy is resized to the
+        // generated image's size.
         on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::TextEncoder));
-        let context = self.encode_prompt(&req.prompt, on_progress)?;
+        let (context, text_tags, reference_latents) = if references.is_empty() {
+            let context = self.encode_prompt(&req.prompt, on_progress)?;
+            let n = context.shape()[1];
+            (
+                context,
+                vec![mlx_gen::gen_core::h3_image::TEXT_TAG; n as usize],
+                Vec::new(),
+            )
+        } else {
+            let vision_images = references
+                .iter()
+                .map(|r| resize_reference(r, reference_vision_size(r.width, r.height)))
+                .collect::<Result<Vec<_>>>()?;
+            let (context, tags) =
+                self.encode_edit_prompt(&req.prompt, &vision_images, on_progress)?;
+            drop(vision_images);
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            let vae_images = references
+                .iter()
+                .map(|r| resize_reference(r, reference_vae_size(r.width, r.height)))
+                .collect::<Result<Vec<_>>>()?;
+            let latents = self.encode_reference_latents(&vae_images, seed, patch)?;
+            (context, tags, latents)
+        };
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
@@ -362,12 +579,27 @@ impl MiniMaxH3Image {
         // --- 2. denoise --------------------------------------------------------------------
         on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::Renderer));
         let dit = MiniMaxH3ImageDit::load(&self.root, self.dtype)?;
-        let layout = ImageLayout::t2i(
-            context.shape()[1],
-            latent_h as i32,
-            latent_w as i32,
-            dit.config().base.patch_size,
-        )?;
+        debug_assert_eq!(patch, dit.config().base.patch_size);
+        let layout = if reference_latents.is_empty() {
+            ImageLayout::t2i(
+                context.shape()[1],
+                latent_h as i32,
+                latent_w as i32,
+                dit.config().base.patch_size,
+            )?
+        } else {
+            let grids: Vec<(i32, i32)> = reference_latents
+                .iter()
+                .map(|l| (l.shape()[2], l.shape()[3]))
+                .collect();
+            ImageLayout::edit(
+                &text_tags,
+                &grids,
+                latent_h as i32,
+                latent_w as i32,
+                dit.config().base.patch_size,
+            )?
+        };
         let denoiser = ImageDenoiser::new(
             dit,
             layout.clone(),
@@ -379,14 +611,29 @@ impl MiniMaxH3Image {
         let total = steps * count;
         let mut latents = Vec::with_capacity(count as usize);
         for n in 0..count {
-            let noise = initial_rows(&layout, seed.wrapping_add(u64::from(n)))?;
+            let image_seed = seed.wrapping_add(u64::from(n));
+            let noise = initial_rows(&layout, image_seed)?;
+            // An edit's reference rows lead the packed image stream, noised to 0.999 with one draw
+            // per reference after the generated image's own.
+            let packed = if reference_latents.is_empty() {
+                noise
+            } else {
+                let aug = reference_latents
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| reference_noise(image_seed, 1, i, l.shape()))
+                    .collect::<Result<Vec<_>>>()?;
+                let condition = reference_condition_rows(&reference_latents, &aug, patch)?;
+                mlx_rs::ops::concatenate_axis(&[condition, noise], 1)?
+            };
             let done = n * steps;
-            let rows = denoiser.denoise(&noise, &req.cancel, &mut |s| {
+            let rows = denoiser.denoise(&packed, &req.cancel, &mut |s| {
                 on_progress(Progress::Step {
                     current: done + s as u32,
                     total,
                 })
             })?;
+            let rows = denoiser.generated_rows(&rows)?;
             let latent = unpatchify_video_rows(
                 &rows,
                 LATENT_CHANNELS as i32,
@@ -404,7 +651,7 @@ impl MiniMaxH3Image {
             mlx_rs::transforms::eval([&latent])?;
             latents.push(latent);
         }
-        release(denoiser);
+        release((denoiser, reference_latents));
 
         // --- 3. decode ---------------------------------------------------------------------
         on_progress(Progress::Decoding);
@@ -599,5 +846,90 @@ mod tests {
         let down = resize_to_request(image(px), 2, 3).unwrap();
         assert_eq!((down.width, down.height), (2, 3));
         assert_eq!(down.pixels, vec![10u8; 2 * 3 * 3]);
+    }
+
+    fn image(w: u32, h: u32) -> mlx_gen::media::Image {
+        mlx_gen::media::Image {
+            width: w,
+            height: h,
+            pixels: (0..w * h * 3).map(|v| (v % 251) as u8).collect(),
+        }
+    }
+
+    fn with_refs(n: usize, w: u32, h: u32) -> GenerationRequest {
+        GenerationRequest {
+            conditioning: vec![mlx_gen::gen_core::Conditioning::MultiReference {
+                images: (0..n).map(|_| image(w, h)).collect(),
+            }],
+            ..req(1024, 1024)
+        }
+    }
+
+    /// `edit` is advertised as reference images, and the validator admits 1..=16 references of
+    /// at least 32 px a side and refuses 17 or a 31 px one.
+    #[test]
+    fn edit_admits_one_to_sixteen_references_of_at_least_32_px() {
+        let caps = descriptor().capabilities;
+        assert!(caps.conditioning.contains(&ConditioningKind::Reference));
+        assert!(caps
+            .conditioning
+            .contains(&ConditioningKind::MultiReference));
+        validate_request(&caps, &with_refs(1, 32, 32)).unwrap();
+        validate_request(&caps, &with_refs(16, 64, 40)).unwrap();
+        let e = validate_request(&caps, &with_refs(17, 64, 64))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("17"), "{e}");
+        let e = validate_request(&caps, &with_refs(2, 31, 64))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("32"), "{e}");
+    }
+
+    /// The VAE copy is cropped at the top left to whole 16 px cells before normalization.
+    #[test]
+    fn reference_vae_pixels_crop_to_whole_cells() {
+        let img = image(40, 35);
+        let px = reference_vae_pixels(&img).unwrap();
+        assert_eq!(px.shape(), &[1, 3, 32, 32]);
+        // Pixel (y=1, x=2) red channel survives the crop at the same place.
+        let want = (f32::from(img.pixels[(40 + 2) * 3]) / 255.0 - PIXEL_MEAN[0]) / PIXEL_STD[0];
+        let got: Vec<f32> = px
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        assert!((got[32 + 2] - want).abs() < 1e-6);
+        assert!(reference_vae_pixels(&image(15, 64)).is_err());
+    }
+
+    /// Reference rows: `0.999 · x + 0.001 · n`, one latent frame each, concatenated in order.
+    #[test]
+    fn reference_condition_rows_noise_then_pack_in_order() {
+        let a = Array::from_slice(&vec![1.0f32; 24 * 2 * 4], &[1, 24, 2, 4]);
+        let b = Array::from_slice(&vec![2.0f32; 24 * 4 * 2], &[1, 24, 4, 2]);
+        let za = Array::from_slice(&vec![0.0f32; 24 * 8], &[1, 24, 2, 4]);
+        let zb = Array::from_slice(&vec![1000.0f32; 24 * 8], &[1, 24, 4, 2]);
+        let rows = reference_condition_rows(&[a, b], &[za, zb], [1, 2, 2]).unwrap();
+        assert_eq!(rows.shape(), &[1, 2 + 2, 96]);
+        let v: Vec<f32> = rows.as_slice::<f32>().to_vec();
+        assert!((v[0] - 0.999).abs() < 1e-6);
+        assert!((v[2 * 96] - (2.0 * 0.999 + 1000.0 * (1.0 - 0.999f32))).abs() < 1e-3);
+        assert!(reference_condition_rows(&[], &[], [1, 2, 2]).is_err());
+    }
+
+    /// Distinct references and streams draw distinct noise; the same key draws the same noise.
+    #[test]
+    fn reference_noise_streams_are_distinct_and_deterministic() {
+        let draw = |seed, stream, i| -> Vec<f32> {
+            reference_noise(seed, stream, i, &[1, 4])
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec()
+        };
+        assert_eq!(draw(7, 0, 0), draw(7, 0, 0));
+        assert_ne!(draw(7, 0, 0), draw(7, 1, 0));
+        assert_ne!(draw(7, 0, 0), draw(7, 0, 1));
+        assert_ne!(draw(7, 0, 0), draw(8, 0, 0));
     }
 }

@@ -16,9 +16,9 @@
 //! * **One output head per step.** Step `i` projects with `pdd_proj_out.{i}`
 //!   ([`crate::dit::heads::PddHeads::select`]); the step index is an argument of [`ImageDenoiser::velocity`]
 //!   rather than a property of the model, so it reaches the head application on every call.
-//! * **One row class.** Every row of a `text2image` sequence sits at the step's timestep (upstream
-//!   `row_timestep_plan` with no reference rows), so the AdaLN schedule has a single row class and
-//!   the gather index is `global_timestep · 3 + tag`. The six timesteps are enumerated up front,
+//! * **At most two row classes.** Every text and generated row sits at the step's timestep
+//!   (upstream `row_timestep_plan`); an edit's reference rows sit at `0.999` for every step. The
+//!   gather index is `global_timestep · 3 + tag`. The six timesteps are enumerated up front,
 //!   which lets the whole run's modulation be projected once and `adaln_proj` evicted — H3's own
 //!   [`AdaLnCache::precompute_and_evict`].
 //!
@@ -30,6 +30,7 @@ use std::path::Path;
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::gen_core::h3_image::REFERENCE_NOISE_AUG;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -175,6 +176,16 @@ pub fn velocity_euler_delta(timesteps: &[f32], step: usize) -> Result<f32> {
     Ok(sigma(step) - sigma(step + 1))
 }
 
+/// Per sequence row, its AdaLN row class: `1` for an edit's reference rows (held at
+/// [`REFERENCE_NOISE_AUG`]), `0` for every text and generated row (the step's timestep).
+pub fn image_row_classes(layout: &ImageLayout) -> Vec<i32> {
+    let mut classes = vec![0i32; layout.seq_len() as usize];
+    let start = layout.num_text_tokens() as usize;
+    let end = start + layout.num_reference_rows() as usize;
+    classes[start..end].fill(1);
+    classes
+}
+
 /// The image DiT as the fixed 6-step sampler's velocity model: everything constant across a
 /// request (refined text rows, rotary tables, the whole run's modulation and the per-step gather
 /// indices) built once, so a step is "project, concat, 50 blocks, norm, head `i`".
@@ -234,11 +245,24 @@ impl ImageDenoiser {
         }
         let tables = dit.rope.tables(layout.position_ids())?;
 
-        // One row class: every row of a text2image sequence is at the step's timestep.
+        // Row class 0 is the step's timestep, which every text and generated row sits at; an
+        // edit's reference rows are class 1, held at `REFERENCE_NOISE_AUG` for every step
+        // (`MiniMaxH3ImageSetTimestepsStep.row_timestep_plan`).
         let timesteps = schedule.timesteps().to_vec();
-        let adaln_schedule = TimestepSchedule::new(timesteps.iter().map(|&t| vec![t]).collect())?;
-        let seq_len = layout.seq_len();
-        let row_classes = Array::from_slice(&vec![0i32; seq_len as usize], &[seq_len]);
+        let has_references = layout.num_reference_rows() > 0;
+        let adaln_schedule = TimestepSchedule::new(
+            timesteps
+                .iter()
+                .map(|&t| {
+                    if has_references {
+                        vec![t, REFERENCE_NOISE_AUG]
+                    } else {
+                        vec![t]
+                    }
+                })
+                .collect(),
+        )?;
+        let row_classes = Array::from_slice(&image_row_classes(&layout), &[layout.seq_len()]);
         let mut adaln_indices = Vec::with_capacity(steps);
         let mut timestep_indices = Vec::with_capacity(steps);
         for step in 0..steps {
@@ -307,8 +331,9 @@ impl ImageDenoiser {
 
     /// The DiT velocity of every image row at sampling step `step`, through head `step`.
     ///
-    /// `image_rows` is `[1, num_image_rows, in_channels · prod(patch)]`; the result has the same
-    /// shape, float32 (the heads are float32).
+    /// `image_rows` is `[1, num_packed_image_rows, in_channels · prod(patch)]` — an edit's
+    /// reference rows first, then the generated rows; the result has the same shape, float32 (the
+    /// heads are float32), exactly what the reference transformer returns.
     pub fn velocity(&self, step: usize, image_rows: &Array) -> Result<Array> {
         let head = self.dit.projections.pdd_heads.select(step)?;
         let adaln = self.adaln_indices.get(step).ok_or_else(|| {
@@ -317,7 +342,7 @@ impl ImageDenoiser {
                 self.adaln_indices.len()
             ))
         })?;
-        let rows = self.layout.num_image_rows();
+        let rows = self.layout.num_packed_image_rows();
         let want = [1, rows, self.dit.cfg.base.video_patch_dim()];
         if image_rows.shape() != want {
             return Err(Error::Msg(format!(
@@ -356,17 +381,43 @@ impl ImageDenoiser {
     /// One sampler step: the velocity at step `step` through head `step`, then the checkpoint's
     /// `euler_update_form = "velocity"` update `x_next = x_t + (sigma - sigma_next) · v`, in float32
     /// (`scheduler/scheduler_config.json`; `MiniMaxH3Scheduler.step`).
+    ///
+    /// Only the generated rows are written: an edit's reference rows ride through every step
+    /// unchanged (`MiniMaxH3ImageLoopSchedulerStep`).
     pub fn step(&self, step: usize, image_rows: &Array) -> Result<Array> {
         let v = self.velocity(step, image_rows)?;
         let delta = velocity_euler_delta(self.schedule.timesteps(), step)?;
         let x = image_rows.as_dtype(Dtype::Float32)?;
-        Ok(mlx_rs::ops::add(
-            &x,
-            &mlx_rs::ops::multiply(&v.as_dtype(Dtype::Float32)?, Array::from_f32(delta))?,
+        let refs = self.layout.num_reference_rows();
+        let all = self.layout.num_packed_image_rows();
+        let generated = mlx_rs::ops::add(
+            &slice_axis(&x, 1, refs, all)?,
+            &mlx_rs::ops::multiply(
+                &slice_axis(&v.as_dtype(Dtype::Float32)?, 1, refs, all)?,
+                Array::from_f32(delta),
+            )?,
+        )?;
+        if refs == 0 {
+            return Ok(generated);
+        }
+        Ok(concatenate_axis(
+            &[slice_axis(&x, 1, 0, refs)?, generated],
+            1,
         )?)
     }
 
-    /// The whole fixed-step loop, forcing each step and checking `cancel` between steps.
+    /// The generated rows of a packed `[1, num_packed_image_rows, ·]` image stream.
+    pub fn generated_rows(&self, packed: &Array) -> Result<Array> {
+        slice_axis(
+            packed,
+            1,
+            self.layout.num_reference_rows(),
+            self.layout.num_packed_image_rows(),
+        )
+    }
+
+    /// The whole fixed-step loop over the packed image rows (an edit's reference rows first),
+    /// forcing each step and checking `cancel` between steps. Returns the packed rows.
     pub fn denoise(
         &self,
         noise_rows: &Array,
@@ -429,5 +480,14 @@ mod tests {
         let names = crate::dit::MiniMaxH3Dit::names(&crate::dit::MiniMaxH3DitConfig::default());
         assert_eq!(names.len(), crate::dit::PUBLISHED_DIT_TENSORS);
         assert!(names.iter().any(|n| n == "audio_proj_out.weight"));
+    }
+
+    /// An edit's reference rows are the only class-1 rows.
+    #[test]
+    fn reference_rows_are_the_held_row_class() {
+        let layout = ImageLayout::edit(&[1, 0, 1], &[(2, 4)], 2, 2, [1, 2, 2]).unwrap();
+        assert_eq!(image_row_classes(&layout), vec![0, 0, 0, 1, 1, 0]);
+        let t2i = ImageLayout::t2i(2, 2, 2, [1, 2, 2]).unwrap();
+        assert_eq!(image_row_classes(&t2i), vec![0, 0, 0]);
     }
 }

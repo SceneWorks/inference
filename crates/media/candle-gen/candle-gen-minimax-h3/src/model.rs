@@ -679,10 +679,15 @@ fn terminal_device_sample(_device: &Device) -> serde_json::Value {
 /// The prefix trim is what keeps this to the 50 layers the tap runs: `lm_prefixes` names
 /// `embed_tokens` and layers `0..50`, so the header-only mmap never materializes layers 50-63,
 /// the final norm or `lm_head`.
+///
+/// With `grounded`, the pass is the vision-grounded one MiniMax-H3-Image `edit` (SW-7092) runs:
+/// the tower's merged embeds spliced over the `<|image_pad|>` runs and its deepstack features
+/// injected (`forward_with_images`). The tower itself was run, and released, before this.
 pub(crate) fn run_conditioner(
     te_dir: &Path,
     ids: &candle_gen::candle_core::Tensor,
     mask: &candle_gen::candle_core::Tensor,
+    grounded: Option<&crate::text_encoder::GroundedVision>,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<candle_gen::candle_core::Tensor> {
@@ -710,8 +715,10 @@ pub(crate) fn run_conditioner(
         }
         te.prepare_streamed(&cfg, device)?;
     }
-    let context =
-        candle_gen::gen_core::with_prompt_encoding(on_progress, || te.forward(ids, mask))?;
+    let context = candle_gen::gen_core::with_prompt_encoding(on_progress, || match grounded {
+        None => te.forward(ids, mask),
+        Some(g) => te.forward_with_images(ids, mask, &g.embeds, &g.deepstack, &g.grids),
+    })?;
     // candle is eager, so `context` is already materialized here and dropping the encoder
     // genuinely frees its weights — there is no lazy graph holding them alive.
     drop(te);
@@ -1027,6 +1034,7 @@ impl MiniMaxH3 {
             &self.tiers.text_encoder_dir,
             &ids,
             &mask,
+            None,
             &self.device,
             on_progress,
         )?;

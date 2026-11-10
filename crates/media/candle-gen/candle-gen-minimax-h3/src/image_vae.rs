@@ -261,6 +261,132 @@ impl MiniMaxH3ImageVae {
     }
 }
 
+/// The **encode** half of the MiniMax-H3-Image VAE (`AutoencoderKLMiniMaxH3Image.encode`): H3's
+/// causal-CNN encoder and `quant_conv` (the video VAE's encode half, the same 118 published tensor
+/// names) run over ONE frame, tiled at the shipped 256 / 64 with the tiles blended in latent space,
+/// and the last (only) latent frame kept. Float32, as upstream pins it (`_keep_in_fp32_modules`).
+/// Separate from [`MiniMaxH3ImageVae`] because only an edit reads it, and the two are never
+/// resident together.
+#[derive(Debug, Clone)]
+pub struct MiniMaxH3ImageVaeEncoder {
+    half: crate::vae::EncodeHalf,
+    latents_mean: Tensor,
+    latents_std: Tensor,
+    cfg: MiniMaxH3VaeConfig,
+    tiling: SpatialTiling,
+}
+
+impl MiniMaxH3ImageVaeEncoder {
+    /// Build from an already-populated [`Weights`] map holding `encoder.*` and `quant_conv.*`.
+    pub fn from_weights(w: &Weights, cfg: &MiniMaxH3VaeConfig, device: &Device) -> Result<Self> {
+        if cfg.decoder_layout != DecoderLayout::Image2d {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3-image vae encoder: needs the Image2d config, got {:?}",
+                cfg.decoder_layout
+            )));
+        }
+        cfg.validate()?;
+        let c = cfg.latent_channels;
+        let stat = |v: &[f32]| -> Result<Tensor> {
+            Ok(Tensor::from_vec(v.to_vec(), (1, c, 1, 1), device)?)
+        };
+        Ok(Self {
+            half: crate::vae::EncodeHalf::from_weights(w, cfg, DType::F32)?,
+            latents_mean: stat(&cfg.latents_mean)?,
+            latents_std: stat(&cfg.latents_std)?,
+            cfg: cfg.clone(),
+            tiling: SpatialTiling::default(),
+        })
+    }
+
+    /// Load `vae_diffusers/`'s encode half — only its `encoder.*` / `quant_conv.*` tensors.
+    pub fn load(root: impl AsRef<Path>, device: &Device) -> Result<Self> {
+        let dir = root.as_ref().join(IMAGE_VAE_COMPONENT);
+        let config_path = dir.join("config.json");
+        let text = std::fs::read_to_string(&config_path).map_err(|e| {
+            CandleError::Msg(format!(
+                "minimax-h3-image vae encoder: reading {}: {e}",
+                config_path.display()
+            ))
+        })?;
+        let cfg = MiniMaxH3VaeConfig::from_image_diffusers_json(&text)?;
+        let files = sorted_safetensors(&dir, "minimax-h3-image vae encoder")?;
+        let w =
+            Weights::from_files_filtered(&files, device, DType::F32, &["encoder.", "quant_conv."])?;
+        Self::from_weights(&w, &cfg, device)
+    }
+
+    /// Every tensor the encode half reads: `quant_conv` plus the 116 `encoder.*`.
+    pub fn tensor_names(cfg: &MiniMaxH3VaeConfig) -> Vec<String> {
+        crate::vae::MiniMaxH3VideoVae::encode_tensor_names(cfg)
+    }
+
+    /// Override the tiling (the shipped 256 / 64 by default).
+    pub fn with_tiling(mut self, tiling: SpatialTiling) -> Self {
+        self.tiling = tiling;
+        self
+    }
+
+    /// `vae.encode(pixels)`: ImageNet-normalized `[1, 3, H, W]` pixels (`H`, `W` multiples of 16)
+    /// to the posterior over `[1, 24, 1, H/16, W/16]`.
+    pub fn encode(&self, pixels: &Tensor) -> Result<crate::vae_encoder::DiagonalGaussian> {
+        let s = pixels.dims();
+        let ratio = self.cfg.patch_size;
+        if s.len() != 4
+            || s[1] != self.cfg.in_channels
+            || !s[2].is_multiple_of(ratio)
+            || !s[3].is_multiple_of(ratio)
+        {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3-image vae encode: expected [B, {}, H, W] with H and W multiples of \
+                 {ratio}, got {s:?}",
+                self.cfg.in_channels
+            )));
+        }
+        // An image is a single frame of the causal video encoder, which maps to one latent frame.
+        let x = pixels.to_dtype(DType::F32)?.unsqueeze(2)?;
+        let moments = if self.tiling.enabled {
+            self.half.encode_tiled(
+                &x,
+                ratio,
+                self.tiling.tile_height,
+                self.tiling.tile_width,
+                self.tiling.overlap_height,
+                self.tiling.overlap_width,
+            )?
+        } else {
+            self.half.encode_untiled(&x)?
+        };
+        let t = moments.dims()[2];
+        crate::vae_encoder::DiagonalGaussian::from_parameters(&moments.narrow(2, t - 1, 1)?)
+    }
+
+    /// One reference's conditioning latent, the released recipe (`MiniMaxH3ImageEditVaeEncoderStep`):
+    /// a posterior sample `mean + std · noise` rounded to float16, cropped at the top left to whole
+    /// `patch` cells, then normalized by the per-channel latent statistics. `noise` matches the
+    /// posterior's `[1, 24, 1, h, w]`. Returns `[1, 24, h', w']`.
+    pub fn reference_latent(
+        &self,
+        posterior: &crate::vae_encoder::DiagonalGaussian,
+        noise: &Tensor,
+        patch: (usize, usize),
+    ) -> Result<Tensor> {
+        let sampled = crate::conditioning::fp16_round_trip(&posterior.sample_with(noise)?)?;
+        let sampled = sampled.squeeze(2)?;
+        let (_, _, lh, lw) = sampled.dims4()?;
+        let (h, w) = (lh / patch.0 * patch.0, lw / patch.1 * patch.1);
+        if h == 0 || w == 0 {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3-image vae encode: a {lh}x{lw} latent holds no whole {patch:?} patch"
+            )));
+        }
+        let cropped = sampled.narrow(2, 0, h)?.narrow(3, 0, w)?.contiguous()?;
+        Ok(cropped
+            .broadcast_sub(&self.latents_mean)?
+            .broadcast_div(&self.latents_std)?)
+    }
+}
+
 /// `(rows, cols)` of the decode tile grid for a `height × width` **pixel** canvas at the shipped
 /// geometry — the tile count a bounded decode runs, without a VAE.
 pub fn decode_tile_grid(height: usize, width: usize, ratio: usize) -> Result<(usize, usize)> {
@@ -276,6 +402,16 @@ pub fn decode_tile_grid(height: usize, width: usize, ratio: usize) -> Result<(us
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// The encode half reads the 118 published `encoder.*` / `quant_conv.*` tensors.
+    #[test]
+    fn encode_tensor_names_are_the_published_118() {
+        let names = MiniMaxH3ImageVaeEncoder::tensor_names(&MiniMaxH3VaeConfig::image());
+        assert_eq!(names.len(), 118);
+        assert!(names
+            .iter()
+            .all(|n| n.starts_with("encoder.") || n.starts_with("quant_conv.")));
+    }
 
     #[test]
     fn decode_tensor_names_are_post_quant_plus_the_391_decoder_tensors() {

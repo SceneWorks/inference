@@ -2843,6 +2843,22 @@ expected_files = [
   "text_encoder/model-00012-of-00014.safetensors",
 ]
 
+# SW-7092 — MiniMax-H3's Qwen3-VL vision tower: all 351 `model.visual.*` tensors live in text-encoder
+# shard 14 and nowhere else (`mlx-gen-minimax-h3` `text_encoder::VISION_SHARD`). MiniMax-H3-Image's
+# `edit` runs every reference through it, so the `minimax-h3-image` profile's edit renders fetch it
+# into the same pinned MiniMax-H3 snapshot as the `minimax-h3-text-encoder` row; the `t2va` lanes
+# that read only shards 1-12 keep not fetching it.
+[[models]]
+key = "minimax-h3-vision-tower"
+repository = "MiniMaxAI/MiniMax-H3"
+revision = "939557dc319dd91227e30195a763f272ba7f8765"
+license = "MiniMax H3 Community License Agreement"
+size_class = "large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_SNAPSHOT"]
+download_files = ["text_encoder/model-00014-of-00014.safetensors"]
+expected_files = ["text_encoder/model-00014-of-00014.safetensors"]
+
 # ── MiniMax-H3 DiT component (sc-19558) ──────────────────────────────────────────────────────────
 #
 # THE GAP THIS CLOSES. Two `#[ignore]`d candle gates read HEADERS ONLY and were nevertheless

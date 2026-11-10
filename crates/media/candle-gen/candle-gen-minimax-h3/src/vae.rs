@@ -67,12 +67,99 @@ pub fn split_fused_qkv(fused: &Tensor, heads: usize, head_dim: usize) -> Result<
     ])
 }
 
-/// The encode half — `quant_conv` and the CNN encoder, loaded together or not at all.
+/// The encode half — `quant_conv` and the CNN encoder, loaded together or not at all. Shared with
+/// the MiniMax-H3-Image VAE ([`crate::image_vae::MiniMaxH3ImageVaeEncoder`]), whose encoder is this
+/// one run over a single frame.
 #[derive(Debug, Clone)]
-struct EncodeHalf {
+pub(crate) struct EncodeHalf {
     quant_w: Tensor,
     quant_b: Tensor,
     encoder: VideoEncoder3d,
+    dtype: DType,
+}
+
+impl EncodeHalf {
+    /// `quant_conv` + `encoder.*` out of `w`.
+    pub(crate) fn from_weights(
+        w: &Weights,
+        cfg: &MiniMaxH3VaeConfig,
+        dtype: DType,
+    ) -> Result<Self> {
+        // `quant_conv` is the mirror of `post_quant_conv`: `nn.Conv3d(2·z, 2·z, 1)` over the
+        // POSTERIOR PARAMETERS, so it is twice as wide — it maps mean and logvar together.
+        let raw_q = w.require("quant_conv.weight")?.to_dtype(dtype)?;
+        let sq = raw_q.dims();
+        let c2 = 2 * cfg.latent_channels;
+        if sq != [c2, c2, 1, 1, 1] {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 vae: quant_conv.weight is {sq:?}, expected [{c2}, {c2}, 1, 1, 1] \
+                 — it maps the posterior's mean AND logvar, so it is twice the latent width"
+            )));
+        }
+        Ok(Self {
+            quant_w: raw_q.reshape((c2, c2))?,
+            quant_b: w.require("quant_conv.bias")?.to_dtype(dtype)?,
+            encoder: VideoEncoder3d::from_weights(w, "encoder", cfg, dtype)?,
+            dtype,
+        })
+    }
+
+    /// The pointwise `quant_conv` channel map over the posterior parameters.
+    fn quant_conv(&self, x: &Tensor) -> Result<Tensor> {
+        let nhwc = x.permute((0, 2, 3, 4, 1))?.contiguous()?;
+        let mapped = linear(&nhwc, &self.quant_w, &self.quant_b)?;
+        Ok(mapped.permute((0, 4, 1, 2, 3))?.contiguous()?)
+    }
+
+    /// The encoder and `quant_conv` in ONE pass over `[B, C, T, H, W]`.
+    pub(crate) fn encode_untiled(&self, pixels: &Tensor) -> Result<Tensor> {
+        let pixels = pixels.to_dtype(self.dtype)?;
+        self.quant_conv(&self.encoder.forward(&pixels)?)
+    }
+
+    /// The encoder and `quant_conv` over `[B, C, T, H, W]` in spatial tiles laid out in pixel
+    /// space and blended in LATENT space (`_encode_clip` / `_encode` with tiling on).
+    pub(crate) fn encode_tiled(
+        &self,
+        pixels: &Tensor,
+        ratio: usize,
+        tile_height: usize,
+        tile_width: usize,
+        overlap_height: usize,
+        overlap_width: usize,
+    ) -> Result<Tensor> {
+        let s = pixels.dims().to_vec();
+        if s.len() != 5 {
+            return Err(CandleError::Msg(format!(
+                "minimax-h3 vae encode: expected [B, C, T, H, W], got {s:?}"
+            )));
+        }
+        let (height, width) = (s[3], s[4]);
+        let rows = TilePlan::split(height, tile_height, overlap_height, ratio)?;
+        let cols = TilePlan::split(width, tile_width, overlap_width, ratio)?;
+        let pixels = pixels.to_dtype(self.dtype)?;
+
+        // The overlaps blend in LATENT units — the pixel overlaps are exact multiples of the
+        // spatial compression ratio precisely so this division is exact.
+        let latent = |o: &[usize]| o.iter().map(|v| v / ratio).collect::<Vec<usize>>();
+        // Streamed through the same [`BoundedStitch`] the decode half uses, so the two halves of
+        // this pair do not drift apart — the failure sc-19008 already found on exactly this pair,
+        // where `encode_clip` hardcoded its tile constants while `decode_clip` read `self.tiling`.
+        let mut stitch = BoundedStitch::new(
+            rows.len(),
+            cols.len(),
+            &latent(&rows.overlaps),
+            &latent(&cols.overlaps),
+        )?;
+        for (i, &y) in rows.starts.iter().enumerate() {
+            for (j, &x) in cols.starts.iter().enumerate() {
+                let tile = pixels.narrow(3, y, rows.lengths[i])?;
+                let tile = tile.narrow(4, x, cols.lengths[j])?.contiguous()?;
+                stitch.push(self.quant_conv(&self.encoder.forward(&tile)?)?)?;
+            }
+        }
+        stitch.finish()
+    }
 }
 
 /// The video VAE — both halves: the ViT decoder (sc-17154) and the causal-CNN encoder (sc-19008).
@@ -125,22 +212,7 @@ impl MiniMaxH3VideoVae {
         // would break both crates' cross-backend digests. `encode` then reports a typed error
         // naming the missing half rather than panicking or silently returning noise.
         let encode = if w.contains("encoder.conv_in.weight") {
-            // `quant_conv` is the mirror of `post_quant_conv`: `nn.Conv3d(2·z, 2·z, 1)` over the
-            // POSTERIOR PARAMETERS, so it is twice as wide — it maps mean and logvar together.
-            let raw_q = w.require("quant_conv.weight")?.to_dtype(dtype)?;
-            let sq = raw_q.dims();
-            let c2 = 2 * c;
-            if sq != [c2, c2, 1, 1, 1] {
-                return Err(CandleError::Msg(format!(
-                    "minimax-h3 vae: quant_conv.weight is {sq:?}, expected [{c2}, {c2}, 1, 1, 1] \
-                     — it maps the posterior's mean AND logvar, so it is twice the latent width"
-                )));
-            }
-            Some(Box::new(EncodeHalf {
-                quant_w: raw_q.reshape((c2, c2))?,
-                quant_b: w.require("quant_conv.bias")?.to_dtype(dtype)?,
-                encoder: VideoEncoder3d::from_weights(w, "encoder", cfg, dtype)?,
-            }))
+            Some(Box::new(EncodeHalf::from_weights(w, cfg, dtype)?))
         } else {
             None
         };
@@ -351,13 +423,6 @@ impl MiniMaxH3VideoVae {
         })
     }
 
-    /// The pointwise `quant_conv` channel map over the posterior parameters.
-    fn quant_conv(&self, half: &EncodeHalf, x: &Tensor) -> Result<Tensor> {
-        let nhwc = x.permute((0, 2, 3, 4, 1))?.contiguous()?;
-        let mapped = linear(&nhwc, &half.quant_w, &half.quant_b)?;
-        Ok(mapped.permute((0, 4, 1, 2, 3))?.contiguous()?)
-    }
-
     /// `encoder` then `quant_conv` on ONE temporal clip, **spatially tiled** — the reference's
     /// `_encode_clip`.
     ///
@@ -385,9 +450,7 @@ impl MiniMaxH3VideoVae {
 
     /// The encoder and `quant_conv` in ONE pass — the reference's `use_tiling = False` branch.
     pub fn encode_clip_untiled(&self, pixels: &Tensor) -> Result<Tensor> {
-        let half = self.encode_half()?;
-        let pixels = pixels.to_dtype(self.dtype)?;
-        self.quant_conv(half, &half.encoder.forward(&pixels)?)
+        self.encode_half()?.encode_untiled(pixels)
     }
 
     /// [`Self::encode_clip`] at an explicit tile geometry.
@@ -415,39 +478,14 @@ impl MiniMaxH3VideoVae {
         overlap_height: usize,
         overlap_width: usize,
     ) -> Result<Tensor> {
-        let half = self.encode_half()?;
-        let s = pixels.dims().to_vec();
-        if s.len() != 5 {
-            return Err(CandleError::Msg(format!(
-                "minimax-h3 vae encode: expected [B, C, T, H, W], got {s:?}"
-            )));
-        }
-        let (height, width) = (s[3], s[4]);
-        let ratio = self.cfg.patch_size;
-        let rows = TilePlan::split(height, tile_height, overlap_height, ratio)?;
-        let cols = TilePlan::split(width, tile_width, overlap_width, ratio)?;
-        let pixels = pixels.to_dtype(self.dtype)?;
-
-        // The overlaps blend in LATENT units — the pixel overlaps are exact multiples of the
-        // spatial compression ratio precisely so this division is exact.
-        let latent = |o: &[usize]| o.iter().map(|v| v / ratio).collect::<Vec<usize>>();
-        // Streamed through the same [`BoundedStitch`] the decode half uses, so the two halves of
-        // this pair do not drift apart — the failure sc-19008 already found on exactly this pair,
-        // where `encode_clip` hardcoded its tile constants while `decode_clip` read `self.tiling`.
-        let mut stitch = BoundedStitch::new(
-            rows.len(),
-            cols.len(),
-            &latent(&rows.overlaps),
-            &latent(&cols.overlaps),
-        )?;
-        for (i, &y) in rows.starts.iter().enumerate() {
-            for (j, &x) in cols.starts.iter().enumerate() {
-                let tile = pixels.narrow(3, y, rows.lengths[i])?;
-                let tile = tile.narrow(4, x, cols.lengths[j])?.contiguous()?;
-                stitch.push(self.quant_conv(half, &half.encoder.forward(&tile)?)?)?;
-            }
-        }
-        stitch.finish()
+        self.encode_half()?.encode_tiled(
+            pixels,
+            self.cfg.patch_size,
+            tile_height,
+            tile_width,
+            overlap_height,
+            overlap_width,
+        )
     }
 
     /// Encode normalized pixels `[B, 3, T, H, W]` into a posterior — the reference's `encode`.

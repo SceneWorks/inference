@@ -1,5 +1,5 @@
-//! The `text2image` packed sequence: `[text | generated image]` (`build_image_packed_sequence`,
-//! before_denoise.py, with no reference grids).
+//! The packed sequences: `text2image` `[text | generated image]` and `edit`
+//! `[text | reference images | generated image]` (`build_image_packed_sequence`, before_denoise.py).
 //!
 //! * text rows carry `(k, 0, 0)` for `k` in `0..num_text_tokens` — H3's own
 //!   [`text_position_ids`];
@@ -7,6 +7,12 @@
 //!   aspect-normalized `(h, w)` grid ([`frame_grid`]);
 //! * tags are [`TEXT_TAG`] then [`IMAGE_TAG`] (gen-core's checkpoint constants; image rows reuse
 //!   H3's video slot of the three-modality AdaLN table).
+//!
+//! An edit's references sit between the text and the generated image. Each is one rotary frame on
+//! its OWN latent grid, at one integer time slot from `num_text_tokens` on — H3's `ref2va` image
+//! reference block ([`reference_block_position_ids`], `advance = 1.0`) — and the generated image
+//! takes the slot after the last reference. Every reference row is tagged [`IMAGE_TAG`]; the text
+//! rows keep the presentation's own tags (a vision block's rows are image-tagged).
 //!
 //! The geometry is a single latent frame (`T = 1`). That is legal for **this** family only: H3's
 //! video `JointGeometry` keeps refusing it, and nothing here goes through that type.
@@ -16,12 +22,17 @@ use mlx_rs::Array;
 use mlx_gen::gen_core::h3_image::{IMAGE_TAG, TEXT_TAG};
 use mlx_gen::{Error, Result};
 
-use crate::dit::positions::{frame_grid, text_position_ids, to_array};
+use crate::dit::positions::{
+    frame_grid, reference_block_position_ids, text_position_ids, to_array, ReferenceLatentGeometry,
+};
+use crate::reference::ReferenceKind;
 
-/// One `text2image` request's packed layout.
+/// One request's packed layout.
 #[derive(Debug, Clone)]
 pub struct ImageLayout {
     num_text_tokens: i32,
+    /// `(latent_height, latent_width)` of every reference, in packed order. Empty for `text2image`.
+    reference_grids: Vec<(i32, i32)>,
     latent_height: i32,
     latent_width: i32,
     patch: [i32; 3],
@@ -55,6 +66,47 @@ pub fn t2i_position_rows(
     Ok(rows)
 }
 
+/// The `edit` coordinates: text `(k, 0, 0)`, then every reference as one frame at
+/// `t = num_text_tokens + i` on its own aspect-normalized grid, then the generated image at
+/// `t = num_text_tokens + num_references`. f64 host math, as the reference builds it.
+pub fn edit_position_rows(
+    num_text_tokens: i32,
+    reference_grids: &[(i32, i32)],
+    latent_height: i32,
+    latent_width: i32,
+    patch: [i32; 3],
+) -> Result<Vec<[f64; 3]>> {
+    if reference_grids.is_empty() {
+        return Err(Error::Msg(
+            "minimax-h3-image layout: an edit needs at least one reference".into(),
+        ));
+    }
+    let mut rows = t2i_position_rows(num_text_tokens, latent_height, latent_width, patch)?;
+    let target = rows.split_off(num_text_tokens as usize);
+    let (_, target_w) = frame_grid(latent_height, latent_width, patch[1], patch[2])?;
+    let mut clock = f64::from(num_text_tokens);
+    for &(h, w) in reference_grids {
+        if h % patch[1] != 0 || w % patch[2] != 0 {
+            return Err(Error::Msg(format!(
+                "minimax-h3-image layout: a {h}x{w} reference latent is not whole {patch:?} patches"
+            )));
+        }
+        let geometry = ReferenceLatentGeometry {
+            kind: ReferenceKind::Image,
+            num_latent_frames: 1,
+            latent_height: h,
+            latent_width: w,
+            num_audio_latents: 0,
+        };
+        let (_, video, advance) =
+            reference_block_position_ids(&geometry, clock, patch[1], patch[2], 0, &target_w)?;
+        rows.extend(video);
+        clock += advance;
+    }
+    rows.extend(target.into_iter().map(|[_, h, w]| [clock, h, w]));
+    Ok(rows)
+}
+
 /// Per-row modality tags: [`TEXT_TAG`] for the text rows, [`IMAGE_TAG`] for the image rows.
 pub fn t2i_token_tags(num_text_tokens: i32, num_image_rows: i32) -> Vec<i32> {
     let mut tags = vec![TEXT_TAG; num_text_tokens.max(0) as usize];
@@ -85,6 +137,7 @@ impl ImageLayout {
         }
         Ok(Self {
             num_text_tokens,
+            reference_grids: Vec::new(),
             latent_height,
             latent_width,
             patch,
@@ -93,19 +146,75 @@ impl ImageLayout {
         })
     }
 
+    /// The `edit` layout: `text_tags` is the presentation's per-row tag (vision-block rows
+    /// [`IMAGE_TAG`]), `reference_grids` every reference's own `(latent_height, latent_width)` in
+    /// packed order (1..=16 of them), then the generated `latent_height x latent_width` image.
+    pub fn edit(
+        text_tags: &[i32],
+        reference_grids: &[(i32, i32)],
+        latent_height: i32,
+        latent_width: i32,
+        patch: [i32; 3],
+    ) -> Result<Self> {
+        if reference_grids.len() > mlx_gen::gen_core::h3_image::MAX_REFERENCES {
+            return Err(Error::Msg(format!(
+                "minimax-h3-image layout: {} references, at most {}",
+                reference_grids.len(),
+                mlx_gen::gen_core::h3_image::MAX_REFERENCES
+            )));
+        }
+        let num_text_tokens = text_tags.len() as i32;
+        let rows = edit_position_rows(
+            num_text_tokens,
+            reference_grids,
+            latent_height,
+            latent_width,
+            patch,
+        )?;
+        let mut tags = text_tags.to_vec();
+        tags.resize(rows.len(), IMAGE_TAG);
+        Ok(Self {
+            num_text_tokens,
+            reference_grids: reference_grids.to_vec(),
+            latent_height,
+            latent_width,
+            patch,
+            position_ids: to_array(&rows)?,
+            token_tags: Array::from_slice(&tags, &[tags.len() as i32]),
+        })
+    }
+
+    /// The references' latent grids, in packed order (empty for `text2image`).
+    pub fn reference_grids(&self) -> &[(i32, i32)] {
+        &self.reference_grids
+    }
+
+    /// Leading image rows that are reference rows rather than generated ones.
+    pub fn num_reference_rows(&self) -> i32 {
+        self.reference_grids
+            .iter()
+            .map(|&(h, w)| (h / self.patch[1]) * (w / self.patch[2]))
+            .sum()
+    }
+
+    /// Image rows the DiT reads: the reference rows then the generated rows.
+    pub fn num_packed_image_rows(&self) -> i32 {
+        self.num_reference_rows() + self.num_image_rows()
+    }
+
     /// Rows the text condition occupies — the leading `0..num_text_tokens`.
     pub fn num_text_tokens(&self) -> i32 {
         self.num_text_tokens
     }
 
-    /// Rows of the generated image — the trailing `num_text_tokens..seq_len`.
+    /// Rows of the generated image — the trailing ones.
     pub fn num_image_rows(&self) -> i32 {
         (self.latent_height / self.patch[1]) * (self.latent_width / self.patch[2])
     }
 
     /// Whole sequence length.
     pub fn seq_len(&self) -> i32 {
-        self.num_text_tokens + self.num_image_rows()
+        self.num_text_tokens + self.num_packed_image_rows()
     }
 
     /// Latent height of the generated image.
@@ -178,5 +287,40 @@ mod tests {
         assert!(ImageLayout::t2i(0, 4, 4, [1, 2, 2]).is_err());
         assert!(ImageLayout::t2i(2, 4, 4, [2, 2, 2]).is_err());
         assert!(ImageLayout::t2i(2, 5, 4, [1, 2, 2]).is_err());
+    }
+
+    /// The reference's edit layout: references at consecutive integer slots after the text, each
+    /// on its own grid, then the target one slot later; reference rows image-tagged.
+    #[test]
+    fn edit_layout_matches_the_reference_convention() {
+        // 2 text rows, a 2x2-patch reference (4x4 latent) and a 1x2-patch one (2x4), target 4x4.
+        let rows = edit_position_rows(2, &[(4, 4), (2, 4)], 4, 4, [1, 2, 2]).unwrap();
+        assert_eq!(rows.len(), 2 + 4 + 2 + 4);
+        assert_eq!(rows[1], [1.0, 0.0, 0.0]);
+        assert_eq!(rows[2], [2.0, 0.0, 0.0]);
+        assert_eq!(rows[5], [2.0, 16.0, 16.0]);
+        // 2x4 latent: sqrt_area = sqrt(8); h axis ratio 2/sqrt8 centred, one patch row.
+        let ratio_h = 2.0 / 8f64.sqrt();
+        let left_h = (1.0 - ratio_h) / 2.0 * 32.0;
+        assert_eq!(rows[6][0], 3.0);
+        assert!((rows[6][1] - left_h).abs() < 1e-12);
+        assert_eq!(rows[8], [4.0, 0.0, 0.0]);
+        assert_eq!(rows[11], [4.0, 16.0, 16.0]);
+
+        let layout = ImageLayout::edit(&[1, 0, 0, 1], &[(4, 4), (2, 4)], 4, 4, [1, 2, 2]).unwrap();
+        assert_eq!(layout.num_reference_rows(), 6);
+        assert_eq!(layout.num_image_rows(), 4);
+        assert_eq!(layout.seq_len(), 4 + 6 + 4);
+        let tags: Vec<i32> = layout.token_tags().as_slice::<i32>().to_vec();
+        assert_eq!(tags, vec![1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(ImageLayout::edit(&[1], &[], 4, 4, [1, 2, 2]).is_err());
+        assert!(ImageLayout::edit(&[1], &[(3, 4)], 4, 4, [1, 2, 2]).is_err());
+        assert!(ImageLayout::edit(&[1], &[(2, 2); 17], 4, 4, [1, 2, 2]).is_err());
+        assert_eq!(
+            ImageLayout::edit(&[1], &[(2, 2); 16], 4, 4, [1, 2, 2])
+                .unwrap()
+                .num_reference_rows(),
+            16
+        );
     }
 }
