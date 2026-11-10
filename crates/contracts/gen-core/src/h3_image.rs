@@ -49,6 +49,32 @@ pub const SIGMAS: [f32; 7] = [
     0.0,
 ];
 
+/// [`SIGMAS`] exactly as `pdd_config.json` / diffusers' `sample_sigmas` publish them (float64).
+/// The sampler derives its float32 grid from these, not from the rounded [`SIGMAS`]; see
+/// [`sampler_sigmas`].
+pub const SIGMAS_F64: [f64; 7] = [
+    1.0,
+    0.967_523_694_038_391_1,
+    0.887_548_506_259_918_2,
+    0.75,
+    0.532_773_911_952_972_4,
+    0.232_008_874_416_351_32,
+    0.0,
+];
+
+/// The float32 sigma grid the released sampler steps on (`MiniMaxH3ImageSetTimestepsStep`,
+/// before_denoise.py): every published sigma is rounded through its float32 timestep
+/// `t = f32(1 - sigma)` and back, `sigma' = 1 - t` in float32, with the terminal `0.0` kept. Below
+/// `sigma = 0.5` that round trip moves a sigma by an ulp, so this is not [`SIGMAS`].
+pub fn sampler_sigmas() -> [f32; 7] {
+    let mut out = [0.0f32; 7];
+    for (slot, &s) in out.iter_mut().zip(SIGMAS_F64.iter()).take(6) {
+        let t = (1.0f64 - s) as f32;
+        *slot = 1.0f32 - t;
+    }
+    out
+}
+
 /// One published size: label and exact pixel dimensions (about 16 MP each).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AspectEntry {
@@ -339,6 +365,26 @@ mod tests {
             Error::from(errs[0].clone()),
             Error::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn the_sampler_grid_is_the_float32_round_trip_of_the_published_sigmas() {
+        let g = sampler_sigmas();
+        for (i, (&f, &d)) in SIGMAS.iter().zip(SIGMAS_F64.iter()).enumerate() {
+            assert_eq!(
+                f, d as f32,
+                "SIGMAS[{i}] is the float32 rounding of SIGMAS_F64[{i}]"
+            );
+        }
+        assert_eq!(g[0], 1.0);
+        assert_eq!(g[3], 0.75);
+        assert_eq!(g[6], 0.0);
+        assert!(g.windows(2).all(|w| w[0] > w[1]));
+        // The round trip moves a sigma by at most one float32 ulp of its timestep.
+        for i in 0..6 {
+            let d = (g[i] - SIGMAS[i]).abs();
+            assert!(d <= f32::EPSILON, "{i}: {} vs {}", g[i], SIGMAS[i]);
+        }
     }
 
     #[test]

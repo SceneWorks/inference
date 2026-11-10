@@ -353,6 +353,28 @@ impl MiniMaxH3Tokenizer {
         Self::to_arrays(self.ids(prompt)?, device)
     }
 
+    /// Encode a MiniMax-H3-Image `text2image` prompt (SW-7091) → `(input_ids, attention_mask)`:
+    /// the prompt **verbatim** with no chat template and no special tokens, exactly as
+    /// [`Self::encode_prompt`], then truncated to its first `max_tokens` ids
+    /// (`tokenizer(prompt, add_special_tokens=False)["input_ids"][:max_sequence_length]`,
+    /// `MiniMaxH3ImageTextEncoderStep`). An empty result is refused.
+    pub fn encode_prompt_truncated(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        let mut ids = self.ids(prompt)?;
+        ids.truncate(max_tokens);
+        // The shared presentation rule (`gen_core::h3_image::t2i_prompt_ids`) refuses an empty
+        // presentation and caps it at the contract's 4096; `max_tokens` can only tighten that.
+        let ids = candle_gen::gen_core::h3_image::t2i_prompt_ids(
+            ids.into_iter().map(|i| i as i32).collect(),
+        )
+        .map_err(|e| CandleError::Msg(e.to_string()))?;
+        Self::to_arrays(ids.into_iter().map(|i| i as u32).collect(), device)
+    }
+
     /// Encode the visual presentation → `(input_ids, attention_mask)` `[1, L]` u32 on `device`.
     /// `num_image_tokens[k]` is reference `k`'s merged vision-token count.
     pub fn encode_with_images(

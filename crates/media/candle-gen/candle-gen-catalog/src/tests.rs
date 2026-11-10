@@ -503,6 +503,10 @@ fn every_registered_generator_advertises_its_exact_latent_space() {
             // external decoder can consume it, so the descriptor deliberately advertises
             // nothing and fails closed against every decoder swap.
             "minimax_h3" => None,
+            // MiniMax-H3-Image (SW-7091) denoises in a 24-channel latent its OWN 2-D ViT decoder
+            // (`vae_diffusers/`) upsamples 16x in its output projection; no published latent
+            // space names it and no external decoder consumes it, so it fails closed too.
+            "minimax_h3_image" => None,
             family => panic!(
                 "{} has unclassified latent lineage for registered family {family}",
                 descriptor.id
@@ -1207,6 +1211,7 @@ fn complete_catalog_has_stable_conforming_surface() {
             "mage_flow_edit_base",
             "mage_flow_edit_turbo",
             "minimax_h3",
+            "minimax_h3_image",
             "mochi_1",
             "moss_image_base",
             "moss_image_sft",

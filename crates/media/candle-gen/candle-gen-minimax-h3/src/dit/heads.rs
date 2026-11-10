@@ -57,7 +57,7 @@
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::{CandleError, Result, Weights};
 
-use crate::dit::config::{MiniMaxH3DitConfig, MODALITY_NUM};
+use crate::dit::config::{DitVariant, MiniMaxH3DitConfig, MODALITY_NUM};
 use crate::dit::layers::RmsNorm;
 use crate::nn::{linear, silu};
 
@@ -500,12 +500,17 @@ impl AdaLayerNormOut {
 
 /// **The 17 input/output tensors of `transformer/`**, loaded together so the set is one auditable
 /// unit rather than seven scattered fields.
+///
+/// On MiniMax-H3-Image ([`DitVariant::Image`], SW-7091) the set is **23**: there is no audio
+/// stream (`audio_proj_in` / `audio_proj_out` are `None`) and no `proj_out` — the output
+/// projection is one of the `pdd_proj_out.{i}` heads, selected by the sampling step through
+/// [`Self::output_head`].
 #[derive(Debug, Clone)]
 pub struct DitProjections {
     /// Patchified video rows → the residual stream. **float32** in the published checkpoint.
     pub proj_in: LinearBias,
-    /// Audio latent rows → the residual stream. **float32**.
-    pub audio_proj_in: LinearBias,
+    /// Audio latent rows → the residual stream. **float32**. `None` on the image transformer.
+    pub audio_proj_in: Option<LinearBias>,
     /// The text encoder's 5120-wide context → the residual stream. bfloat16, and it runs **before**
     /// the token refiner.
     pub context_embedder: LinearBias,
@@ -515,17 +520,22 @@ pub struct DitProjections {
     pub time_embedder: Option<TimestepEmbedder>,
     /// The packed sequence's final modulated norm. bfloat16.
     pub norm_out: AdaLayerNormOut,
-    /// The residual stream → the video patch dim. **float32**.
-    pub proj_out: LinearBias,
-    /// The residual stream → `audio_in_channels`. **float32**.
-    pub audio_proj_out: LinearBias,
+    /// The residual stream → the video patch dim. **float32**. `None` on the image transformer,
+    /// whose output projection is a per-step head in [`Self::pdd_proj_out`].
+    pub proj_out: Option<LinearBias>,
+    /// The residual stream → `audio_in_channels`. **float32**. `None` on the image transformer.
+    pub audio_proj_out: Option<LinearBias>,
+    /// MiniMax-H3-Image's per-step output heads, `pdd_proj_out.{i}`: the residual stream → the
+    /// image patch dim, **float32**. Empty on the H3 video transformer.
+    pub pdd_proj_out: Vec<LinearBias>,
 }
 
 impl DitProjections {
     pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
+        let opt = |p: &Option<LinearBias>| p.as_ref().map(|p| p.copy_to_device(device)).transpose();
         let mut copy = self.clone();
         copy.proj_in = copy.proj_in.copy_to_device(device)?;
-        copy.audio_proj_in = copy.audio_proj_in.copy_to_device(device)?;
+        copy.audio_proj_in = opt(&self.audio_proj_in)?;
         copy.context_embedder = copy.context_embedder.copy_to_device(device)?;
         copy.time_embedder = copy
             .time_embedder
@@ -533,8 +543,13 @@ impl DitProjections {
             .map(|p| p.copy_to_device(device))
             .transpose()?;
         copy.norm_out = copy.norm_out.copy_to_device(device)?;
-        copy.proj_out = copy.proj_out.copy_to_device(device)?;
-        copy.audio_proj_out = copy.audio_proj_out.copy_to_device(device)?;
+        copy.proj_out = opt(&self.proj_out)?;
+        copy.audio_proj_out = opt(&self.audio_proj_out)?;
+        copy.pdd_proj_out = self
+            .pdd_proj_out
+            .iter()
+            .map(|p| p.copy_to_device(device))
+            .collect::<Result<_>>()?;
         Ok(copy)
     }
 
@@ -544,9 +559,21 @@ impl DitProjections {
     /// Tensors this module owns on the pruned (sc-26684) path.
     pub const CURVE_TENSOR_COUNT: usize = 14;
 
+    /// Tensors this module owns on the image transformer with `num_pdd_heads` heads:
+    /// `proj_in`, `context_embedder`, `time_embedder`, `norm_out` and two per head — 23 shipped.
+    pub fn image_tensor_count(num_pdd_heads: usize) -> usize {
+        2 + 2 + 4 + 3 + 2 * num_pdd_heads
+    }
+
     /// Load all 17, at their stored dtypes.
+    ///
+    /// Dispatches on [`MiniMaxH3DitConfig::variant`]: the image transformer loads through
+    /// [`Self::from_weights_image`].
     pub fn from_weights(w: &Weights, cfg: &MiniMaxH3DitConfig) -> Result<Self> {
         cfg.validate()?;
+        if let DitVariant::Image { .. } = cfg.variant {
+            return Self::from_weights_image(w, cfg);
+        }
         Ok(Self {
             proj_in: LinearBias::from_weights(
                 w,
@@ -554,12 +581,12 @@ impl DitProjections {
                 cfg.video_patch_dim(),
                 cfg.hidden_size,
             )?,
-            audio_proj_in: LinearBias::from_weights(
+            audio_proj_in: Some(LinearBias::from_weights(
                 w,
                 "audio_proj_in",
                 cfg.audio_in_channels,
                 cfg.hidden_size,
-            )?,
+            )?),
             context_embedder: LinearBias::from_weights(
                 w,
                 "context_embedder",
@@ -568,25 +595,34 @@ impl DitProjections {
             )?,
             time_embedder: Some(TimestepEmbedder::from_weights(w, "time_embedder", cfg)?),
             norm_out: AdaLayerNormOut::from_weights(w, "norm_out", cfg)?,
-            proj_out: LinearBias::from_weights(
+            proj_out: Some(LinearBias::from_weights(
                 w,
                 "proj_out",
                 cfg.hidden_size,
                 cfg.video_patch_dim(),
-            )?,
-            audio_proj_out: LinearBias::from_weights(
+            )?),
+            audio_proj_out: Some(LinearBias::from_weights(
                 w,
                 "audio_proj_out",
                 cfg.hidden_size,
                 cfg.audio_in_channels,
-            )?,
+            )?),
+            pdd_proj_out: Vec::new(),
         })
     }
 
-    /// Load the pruned (sc-26684) set: no `time_embedder`, and `norm_out.linear` is the reduced
-    /// curve projection held by [`crate::dit::curve::CurveAdaLn`].
-    pub fn from_weights_curve(w: &Weights, cfg: &MiniMaxH3DitConfig) -> Result<Self> {
+    /// Load the MiniMax-H3-Image set (SW-7091): no audio tensor is read — the checkpoint carries
+    /// none — and `pdd_proj_out.{0..num_pdd_heads}` replace `proj_out`, each `[patch_dim,
+    /// hidden_size]` + `[patch_dim]` at its stored (float32) dtype.
+    pub fn from_weights_image(w: &Weights, cfg: &MiniMaxH3DitConfig) -> Result<Self> {
         cfg.validate()?;
+        let heads = cfg.num_pdd_heads().ok_or_else(|| {
+            CandleError::Msg(
+                "minimax-h3 dit: the per-step output heads belong to the image transformer; this \
+                 config is the audio+video one"
+                    .into(),
+            )
+        })?;
         Ok(Self {
             proj_in: LinearBias::from_weights(
                 w,
@@ -594,12 +630,54 @@ impl DitProjections {
                 cfg.video_patch_dim(),
                 cfg.hidden_size,
             )?,
-            audio_proj_in: LinearBias::from_weights(
+            audio_proj_in: None,
+            context_embedder: LinearBias::from_weights(
+                w,
+                "context_embedder",
+                cfg.text_dim,
+                cfg.hidden_size,
+            )?,
+            time_embedder: Some(TimestepEmbedder::from_weights(w, "time_embedder", cfg)?),
+            norm_out: AdaLayerNormOut::from_weights(w, "norm_out", cfg)?,
+            proj_out: None,
+            audio_proj_out: None,
+            pdd_proj_out: (0..heads)
+                .map(|i| {
+                    LinearBias::from_weights(
+                        w,
+                        &format!("pdd_proj_out.{i}"),
+                        cfg.hidden_size,
+                        cfg.video_patch_dim(),
+                    )
+                })
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    /// Load the pruned (sc-26684) set: no `time_embedder`, and `norm_out.linear` is the reduced
+    /// curve projection held by [`crate::dit::curve::CurveAdaLn`].
+    pub fn from_weights_curve(w: &Weights, cfg: &MiniMaxH3DitConfig) -> Result<Self> {
+        cfg.validate()?;
+        if !cfg.has_audio() {
+            return Err(CandleError::Msg(
+                "minimax-h3-image dit: no modulation-pruned image checkpoint is published; the \
+                 direct-curve AdaLN loads only the audio+video transformer"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            proj_in: LinearBias::from_weights(
+                w,
+                "proj_in",
+                cfg.video_patch_dim(),
+                cfg.hidden_size,
+            )?,
+            audio_proj_in: Some(LinearBias::from_weights(
                 w,
                 "audio_proj_in",
                 cfg.audio_in_channels,
                 cfg.hidden_size,
-            )?,
+            )?),
             context_embedder: LinearBias::from_weights(
                 w,
                 "context_embedder",
@@ -608,19 +686,42 @@ impl DitProjections {
             )?,
             time_embedder: None,
             norm_out: AdaLayerNormOut::from_weights_curve(w, "norm_out", cfg)?,
-            proj_out: LinearBias::from_weights(
+            proj_out: Some(LinearBias::from_weights(
                 w,
                 "proj_out",
                 cfg.hidden_size,
                 cfg.video_patch_dim(),
-            )?,
-            audio_proj_out: LinearBias::from_weights(
+            )?),
+            audio_proj_out: Some(LinearBias::from_weights(
                 w,
                 "audio_proj_out",
                 cfg.hidden_size,
                 cfg.audio_in_channels,
-            )?,
+            )?),
+            pdd_proj_out: Vec::new(),
         })
+    }
+
+    /// The video-stream output projection for a forward: H3 video's single `proj_out` when
+    /// `pdd_step` is `None`, MiniMax-H3-Image's head `pdd_step` otherwise. Asking the image
+    /// transformer for `proj_out`, the video transformer for a head, or for a head past the last
+    /// is a typed error rather than a silently reused head.
+    pub fn output_head(&self, pdd_step: Option<usize>) -> Result<&LinearBias> {
+        match (pdd_step, &self.proj_out) {
+            (None, Some(head)) => Ok(head),
+            (None, None) => Err(CandleError::Msg(
+                "minimax-h3-image dit: the image transformer has no `proj_out`; every forward \
+                 names its sampling step, which selects `pdd_proj_out.{step}`"
+                    .into(),
+            )),
+            (Some(step), _) => self.pdd_proj_out.get(step).ok_or_else(|| {
+                CandleError::Msg(format!(
+                    "minimax-h3 dit: sampling step {step} has no output head; this checkpoint \
+                     carries {} per-step heads",
+                    self.pdd_proj_out.len()
+                ))
+            }),
+        }
     }
 
     /// Every tensor name these projections consume — the 17.
@@ -632,6 +733,18 @@ impl DitProjections {
         v.extend(AdaLayerNormOut::names("norm_out"));
         v.extend(LinearBias::names("proj_out"));
         v.extend(LinearBias::names("audio_proj_out"));
+        v
+    }
+
+    /// Every top-level tensor name the image transformer consumes — 23 at six heads.
+    pub fn names_image(num_pdd_heads: usize) -> Vec<String> {
+        let mut v = LinearBias::names("proj_in").to_vec();
+        v.extend(LinearBias::names("context_embedder"));
+        v.extend(TimestepEmbedder::names("time_embedder"));
+        v.extend(AdaLayerNormOut::names("norm_out"));
+        for i in 0..num_pdd_heads {
+            v.extend(LinearBias::names(&format!("pdd_proj_out.{i}")));
+        }
         v
     }
 
@@ -651,8 +764,9 @@ impl DitProjections {
 
     /// Device bytes the 17 hold — small next to the stack, and the only float32 weights in the DiT.
     pub fn nbytes(&self) -> usize {
+        let opt = |p: &Option<LinearBias>| p.as_ref().map(LinearBias::nbytes).unwrap_or(0);
         self.proj_in.nbytes()
-            + self.audio_proj_in.nbytes()
+            + opt(&self.audio_proj_in)
             + self.context_embedder.nbytes()
             + self
                 .time_embedder
@@ -660,8 +774,13 @@ impl DitProjections {
                 .map(TimestepEmbedder::nbytes)
                 .unwrap_or(0)
             + self.norm_out.nbytes()
-            + self.proj_out.nbytes()
-            + self.audio_proj_out.nbytes()
+            + opt(&self.proj_out)
+            + opt(&self.audio_proj_out)
+            + self
+                .pdd_proj_out
+                .iter()
+                .map(LinearBias::nbytes)
+                .sum::<usize>()
     }
 }
 
@@ -716,6 +835,89 @@ mod tests {
         ] {
             assert!(names.contains(&expect.to_string()), "missing {expect}");
         }
+    }
+
+    /// SW-7091 AC2 (load side): the image transformer loads with NO audio tensor in the map, its
+    /// top-level set is the 23 names (`proj_in`, `context_embedder`, `time_embedder`, `norm_out`,
+    /// two per head), and step `i` resolves to `pdd_proj_out.{i}` — not to head 0, not to a
+    /// `proj_out` — with an out-of-range step refused. Each head's bias is its index, so the
+    /// selection is read back off the loaded tensors, not assumed. Load and lookup only; no
+    /// forward runs.
+    #[test]
+    fn the_image_transformer_loads_without_audio_and_selects_the_head_of_each_step() {
+        let dev = Device::Cpu;
+        let heads = 3usize;
+        let cfg = MiniMaxH3DitConfig {
+            hidden_size: 2,
+            in_channels: 1,
+            text_dim: 3,
+            freq_dim: 2,
+            time_embed_hidden_dim: 2,
+            time_embed_dim: 2,
+            ..MiniMaxH3DitConfig::image()
+        };
+        let cfg = MiniMaxH3DitConfig {
+            variant: DitVariant::Image {
+                num_pdd_heads: heads,
+            },
+            ..cfg
+        };
+        let patch = cfg.video_patch_dim();
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        let mut put = |name: &str, dims: &[usize], fill: f32| {
+            let n: usize = dims.iter().product();
+            map.insert(
+                name.to_string(),
+                Tensor::from_vec(vec![fill; n], dims, &dev).unwrap(),
+            );
+        };
+        put("proj_in.weight", &[2, patch], 0.1);
+        put("proj_in.bias", &[2], 0.0);
+        put("context_embedder.weight", &[2, 3], 0.1);
+        put("context_embedder.bias", &[2], 0.0);
+        put("time_embedder.linear_1.weight", &[2, 2], 0.1);
+        put("time_embedder.linear_1.bias", &[2], 0.0);
+        put("time_embedder.linear_2.weight", &[2, 2], 0.1);
+        put("time_embedder.linear_2.bias", &[2], 0.0);
+        put("norm_out.norm.weight", &[2], 1.0);
+        put("norm_out.linear.weight", &[4, 2], 0.1);
+        put("norm_out.linear.bias", &[4], 0.0);
+        for i in 0..heads {
+            put(&format!("pdd_proj_out.{i}.weight"), &[patch, 2], 0.1);
+            put(&format!("pdd_proj_out.{i}.bias"), &[patch], i as f32);
+        }
+        let names = DitProjections::names_image(heads);
+        assert_eq!(names.len(), DitProjections::image_tensor_count(heads));
+        assert_eq!(DitProjections::image_tensor_count(6), 23);
+        assert_eq!(names.len(), map.len(), "every tensor in the map is named");
+        assert!(names.iter().all(|n| map.contains_key(n)));
+        assert!(!names
+            .iter()
+            .any(|n| n.contains("audio") || n == "proj_out.weight"));
+
+        let w = Weights::from_map(map);
+        let p = DitProjections::from_weights(&w, &cfg).unwrap();
+        assert!(p.audio_proj_in.is_none() && p.audio_proj_out.is_none() && p.proj_out.is_none());
+        assert_eq!(p.pdd_proj_out.len(), heads);
+        for step in 0..heads {
+            let bias = flat(p.output_head(Some(step)).unwrap().bias());
+            assert!(
+                bias.iter().all(|&b| b == step as f32),
+                "step {step} must project through pdd_proj_out.{step}, got bias {bias:?}"
+            );
+        }
+        assert!(p.output_head(Some(heads)).is_err(), "past the last head");
+        assert!(
+            p.output_head(None).is_err(),
+            "the image transformer has no proj_out"
+        );
+        // The audio+video loader cannot read this map: it requires the audio stream.
+        let video = MiniMaxH3DitConfig {
+            variant: DitVariant::AudioVideo,
+            audio_in_channels: 32,
+            ..cfg.clone()
+        };
+        assert!(DitProjections::from_weights(&w, &video).is_err());
     }
 
     /// **The flip.** `flip_sin_to_cos = True` puts COSINE first. The unflipped order is the

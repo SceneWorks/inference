@@ -132,6 +132,9 @@ pub mod config;
 pub mod decoder;
 pub mod denoise;
 pub mod dit;
+pub mod image_memory_strategy;
+pub mod image_model;
+pub mod image_pipeline;
 pub mod image_vae;
 pub mod keyframe;
 pub mod layout;
@@ -196,6 +199,10 @@ pub use dit::{
     MiniMaxH3Dit, MiniMaxH3DitConfig, MmRope, ReferenceLatentGeometry, TimestepSchedule,
     TokenRefiner, MODALITY_NUM, PUBLISHED_DIT_TENSORS,
 };
+pub use image_model::{
+    image_descriptor, MiniMaxH3Image, IMAGE_DIT_PARTITION, IMAGE_MODEL_ID, IMAGE_REGISTRATION,
+};
+pub use image_pipeline::{ImageLayout, ImageVelocity};
 pub use image_vae::{
     bounded_decode_parameters as image_bounded_decode_parameters, MiniMaxH3ImageVae,
     IMAGE_DECODE_OVERLAP, IMAGE_DECODE_TILE_EDGE, IMAGE_VAE_COMPONENT,
@@ -283,7 +290,10 @@ pub const SIZE_MULTIPLE: u32 = VAE_RATIO as u32 * 2;
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry.register_generator(model::REGISTRATION);
+    let registry = registry
+        .register_generator(model::REGISTRATION)
+        // SW-7091: MiniMax-H3-Image text-to-image, its own engine id and image descriptor.
+        .register_generator(image_model::IMAGE_REGISTRATION);
     // The fleet shape (see candle-gen-flux): the memory route rides `register_providers` only on
     // the build that can execute it; every other platform appends the same weights-free surfaces
     // through `register_memory_contract_surfaces` from the catalog, and registering both would be
@@ -301,6 +311,9 @@ pub fn register_memory_contract_surfaces(
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
+        .register_memory_strategy(image_memory_strategy::IMAGE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(image_memory_strategy::IMAGE_MEMORY_CONTRACT_FIXTURE)
+        .register_memory_behavior(image_memory_strategy::IMAGE_MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit Candle MiniMax-H3 provider catalog.

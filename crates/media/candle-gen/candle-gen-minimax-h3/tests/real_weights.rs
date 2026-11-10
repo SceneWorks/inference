@@ -1674,3 +1674,236 @@ fn image_vae_tiled_decode_lowers_the_16mp_peak() {
         );
     }
 }
+
+// ── SW-7091: MiniMax-H3-Image DiT and text-to-image ──────────────────────────────────────────────
+
+/// Peak-relative max-abs-diff bound for one bf16 DiT evaluation against the diffusers bf16
+/// `MiniMaxH3ImageTransformer2DModel` (50 blocks, float32 heads). Both sides run bf16 blocks with
+/// their own attention kernels, so this is a cross-implementation bound, not an f32 one.
+const IMAGE_DIT_PEAK_TOL: f32 = 6e-2;
+/// Mean-relative bound for the same comparison — the stricter, aggregate half of the gate.
+const IMAGE_DIT_MEAN_TOL: f32 = 2e-2;
+
+/// The committed producer whose output the DiT gate accepts.
+const IMAGE_DIT_PRODUCER: &[u8] =
+    include_bytes!("../../../mlx-gen/tools/dump_minimax_h3_image_dit_real.py");
+
+/// The snapshot root holding `transformer_diffusers/` (the `minimax-h3-image-t2i` row).
+fn image_dit_snapshot() -> std::path::PathBuf {
+    let raw = std::env::var("MINIMAX_H3_IMAGE_SNAPSHOT").unwrap_or_default();
+    assert!(
+        !raw.is_empty(),
+        "MINIMAX_H3_IMAGE_SNAPSHOT must point at a MiniMaxAI/MiniMax-H3-Image snapshot root; this \
+         test is #[ignore]d and asserts rather than skips."
+    );
+    let path = std::path::PathBuf::from(raw);
+    assert!(
+        path.join("transformer_diffusers")
+            .join("config.json")
+            .is_file(),
+        "MINIMAX_H3_IMAGE_SNAPSHOT={} has no transformer_diffusers/config.json",
+        path.display()
+    );
+    path
+}
+
+/// AC1 + AC2 (candle): the image DiT loads from `transformer_diffusers/` with exactly the 644
+/// declared tensors and no audio tensor, and its step-0 output (head 0) and step-3 output (head 3)
+/// match diffusers' `MiniMaxH3ImageTransformer2DModel` on the published weights, over the exact
+/// inputs of the reference SW-7090's macOS job produces (`dit-reference.safetensors`, shared by
+/// both backends). The timesteps this crate derives are held to the producer's.
+#[test]
+#[ignore = "needs a real MiniMax-H3-Image snapshot (transformer_diffusers/) + a reference (MINIMAX_H3_IMAGE_DIT_REFERENCE); 66 GB bf16 DiT"]
+fn image_dit_first_step_matches_the_official_diffusers_transformer() {
+    use candle_gen_minimax_h3::dit::{ImageDit, MiniMaxH3Dit, MiniMaxH3DitConfig};
+    use candle_gen_minimax_h3::{ImageLayout, ImageVelocity, IMAGE_DIT_PARTITION};
+    use gen_core_h3::h3_schedule::SigmaSchedule;
+    use sha2::{Digest, Sha256};
+
+    let root = image_dit_snapshot();
+    let raw = std::env::var("MINIMAX_H3_IMAGE_DIT_REFERENCE").unwrap_or_default();
+    assert!(
+        !raw.is_empty(),
+        "MINIMAX_H3_IMAGE_DIT_REFERENCE must point at the output of \
+         tools/dump_minimax_h3_image_dit_real.py; this test asserts rather than skips."
+    );
+    let reference = common::Golden::load(&raw);
+    assert_eq!(
+        reference.meta("reference").unwrap_or_default(),
+        "diffusers.MiniMaxH3ImageTransformer2DModel"
+    );
+    assert_eq!(
+        reference.meta("producer_sha256").unwrap_or_default(),
+        format!("{:x}", Sha256::digest(IMAGE_DIT_PRODUCER)),
+        "the reference was produced by a different dump_minimax_h3_image_dit_real.py; re-produce it"
+    );
+
+    // Exhaustive mapping: the partition carries exactly the declared names — no audio tensor.
+    let dir = root.join(IMAGE_DIT_PARTITION);
+    let cfg = MiniMaxH3DitConfig::from_image_diffusers_json(
+        &std::fs::read_to_string(dir.join("config.json")).expect("config"),
+    )
+    .expect("image config");
+    let declared: BTreeSet<String> = MiniMaxH3Dit::names(&cfg).into_iter().collect();
+    assert_eq!(shard_keys(&dir, "transformer_diffusers"), declared);
+    assert!(!declared.iter().any(|n| n.contains("audio")));
+
+    assert_eq!(reference.meta("steps").unwrap_or_default(), "0,3");
+    let num_text: usize = reference.meta("num_text").expect("meta").parse().unwrap();
+    let hw = reference.meta("latent_hw").expect("meta").to_string();
+    let (lh, lw) = hw.split_once('x').expect("HxW");
+    let (lh, lw): (usize, usize) = (lh.parse().unwrap(), lw.parse().unwrap());
+    let layout = ImageLayout::text_to_image(num_text, lh, lw, cfg.patch_size).expect("layout");
+
+    let schedule = SigmaSchedule::h3_image_distilled().expect("schedule");
+    let want_t: Vec<f32> = reference
+        .meta("timesteps")
+        .expect("meta")
+        .split(',')
+        .map(|t| t.parse().unwrap())
+        .collect();
+    assert_eq!(
+        want_t,
+        vec![schedule.timesteps()[0], schedule.timesteps()[3]],
+        "the timesteps must be the released sampler's float32 values"
+    );
+
+    let dev = device();
+    let dit = MiniMaxH3Dit::load_from_dir(&dir, &dev, DType::BF16).expect("load the image DiT");
+    assert!(!dit.config().has_audio());
+    let context = reference
+        .tensor("in.context")
+        .to_dtype(DType::BF16)
+        .and_then(|t| t.to_device(&dev))
+        .expect("context");
+    let rows = reference.tensor("in.rows").to_device(&dev).expect("rows");
+    let mut model = ImageDit::new(dit, &layout, &context, schedule.timesteps()).expect("ImageDit");
+    assert!(model.released_bytes() > 0, "adaln_proj was evicted");
+    let run = |model: &mut ImageDit, step: usize| -> Tensor {
+        model
+            .forward(step, &rows)
+            .expect("forward")
+            .to_dtype(DType::F32)
+            .and_then(|t| t.to_device(&Device::Cpu))
+            .expect("to host")
+    };
+    let got0 = run(&mut model, 0);
+    let got3 = run(&mut model, 3);
+    let want0 = reference.tensor("out.step0");
+    let want3 = reference.tensor("out.step3");
+    assert_eq!(got0.dims(), want0.dims());
+    let (p0, m0) = rel(&got0, &want0);
+    let (p3, m3) = rel(&got3, &want3);
+    let (between, _) = rel(&want0, &want3);
+    let (cross, _) = rel(&got3, &want0);
+    println!(
+        "image DiT vs diffusers (bounds peak {IMAGE_DIT_PEAK_TOL:.0e} / mean {IMAGE_DIT_MEAN_TOL:.0e}): \
+         step0 peak {p0:.3e} mean {m0:.3e}; step3 peak {p3:.3e} mean {m3:.3e}; reference step0 vs \
+         step3 {between:.3e}; candle step3 vs reference step0 {cross:.3e}"
+    );
+    assert!(
+        p0 < IMAGE_DIT_PEAK_TOL && m0 < IMAGE_DIT_MEAN_TOL,
+        "step 0 diverges"
+    );
+    assert!(
+        p3 < IMAGE_DIT_PEAK_TOL && m3 < IMAGE_DIT_MEAN_TOL,
+        "step 3 diverges"
+    );
+    assert!(
+        between > IMAGE_DIT_PEAK_TOL && cross > IMAGE_DIT_PEAK_TOL,
+        "steps 0 and 3 must be distinguishable for the head check to mean anything"
+    );
+    assert_eq!(model.forwards(), 2);
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_dit_first_step_matches_the_official_diffusers_transformer"
+    );
+}
+
+/// AC1 (candle/CUDA): the registered `minimax_h3_image` generator renders a 2048 x 2048 bf16
+/// image end to end — conditioner, six-step DiT, tiled 2-D VAE decode — through the registry's own
+/// load path. The image is written to `MINIMAX_H3_IMAGE_RENDER_OUT` when set.
+#[test]
+#[ignore = "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT), MiniMax-H3's text encoder (MINIMAX_H3_SNAPSHOT) and CUDA; full 2048x2048 render"]
+fn image_text_to_image_renders_2048_on_cuda() {
+    #[cfg(not(feature = "cuda"))]
+    panic!("the 2048x2048 render runs the 66 GB DiT on the GPU; build with --features cuda");
+    #[cfg(feature = "cuda")]
+    {
+        use candle_gen::gen_core::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
+
+        let root = image_dit_snapshot();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        // The conditioner: this snapshot's own `text_encoder/` when present, else MiniMax-H3's
+        // byte-identical copy staged as the `text_encoder` component.
+        if !root.join("text_encoder").is_dir() {
+            let h3 = std::env::var("MINIMAX_H3_SNAPSHOT").unwrap_or_default();
+            assert!(
+                !h3.is_empty(),
+                "the image snapshot has no text_encoder/; MINIMAX_H3_SNAPSHOT must point at a \
+                 MiniMax-H3 snapshot holding text_encoder/ shards 1-12"
+            );
+            spec.components.insert(
+                "text_encoder".into(),
+                WeightsSource::Dir(std::path::PathBuf::from(h3).join("text_encoder")),
+            );
+        }
+        let generator = candle_gen_minimax_h3::image_model::load_image(&spec)
+            .expect("load the minimax_h3_image generator");
+        assert_eq!(generator.descriptor().id, "minimax_h3_image");
+        let req = GenerationRequest {
+            prompt: "A red lighthouse on a rocky coast at dusk, waves breaking, warm light in the \
+                     lantern room, photographed with a 35mm lens"
+                .into(),
+            width: 2048,
+            height: 2048,
+            seed: Some(7091),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let mut steps = Vec::new();
+        let output = generator
+            .generate(&req, &mut |p| {
+                if let candle_gen::gen_core::Progress::Step { current, .. } = p {
+                    steps.push(current)
+                }
+            })
+            .expect("render");
+        assert_eq!(steps, vec![1, 2, 3, 4, 5, 6], "one forward per fixed step");
+        let GenerationOutput::Images(images) = output else {
+            panic!("an image generator must return images")
+        };
+        assert_eq!(images.len(), 1);
+        let img = &images[0];
+        assert_eq!((img.width, img.height), (2048, 2048));
+        let n = img.pixels.len() as f64;
+        let mean = img.pixels.iter().map(|&p| f64::from(p)).sum::<f64>() / n;
+        let var = img
+            .pixels
+            .iter()
+            .map(|&p| (f64::from(p) - mean).powi(2))
+            .sum::<f64>()
+            / n;
+        println!(
+            "2048x2048 render in {:.1} s: mean {mean:.1}, std {:.1}",
+            started.elapsed().as_secs_f64(),
+            var.sqrt()
+        );
+        assert!(
+            var.sqrt() > 10.0 && (5.0..250.0).contains(&mean),
+            "degenerate render: mean {mean:.1}, std {:.1}",
+            var.sqrt()
+        );
+        if let Ok(out) = std::env::var("MINIMAX_H3_IMAGE_RENDER_OUT") {
+            image::RgbImage::from_raw(img.width, img.height, img.pixels.clone())
+                .expect("rgb")
+                .save(&out)
+                .expect("write the render");
+            println!("wrote {out}");
+        }
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_text_to_image_renders_2048_on_cuda"
+        );
+    }
+}
