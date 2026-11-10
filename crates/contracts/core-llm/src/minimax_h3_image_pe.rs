@@ -9,10 +9,13 @@
 //! # Prompts are read from the model's own files, never copied
 //!
 //! The system and task prompts are MiniMax Materials under the MiniMax-H3-Image Community License.
-//! They are read at run time from the snapshot's `prompt/` directory and each is checked against
-//! the SHA-256 the snapshot's `prompt/manifest.json` lists, and the manifest itself against
-//! [`MANIFEST_SHA256`] (the pinned revision's copy). Nothing licensed is vendored here, tests
-//! included: the tests build synthetic prompt trees.
+//! They are read at run time from the **upstream** `MiniMaxAI/MiniMax-H3-Image-PE` snapshot at
+//! [`REVISION`] — its `prompt/` directory — and each is checked against the SHA-256 the snapshot's
+//! `prompt/manifest.json` lists, and the manifest itself against [`MANIFEST_SHA256`]. A converted
+//! tier (bf16 / Q8 / Q4, local or published) never carries `prompt/`: the weights load from the
+//! tier, the prompts from the upstream snapshot, as the Qwen-Image rewriter never redistributes
+//! Qwen's prompts. Nothing licensed is vendored here, tests included: the tests build synthetic
+//! prompt trees.
 //!
 //! # The two workflows (model card, revision [`REVISION`])
 //!

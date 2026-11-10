@@ -100,6 +100,9 @@ pub(crate) fn modelopt_projection(
     Ok(Some(Projection::Nvfp4(std::sync::Arc::new(weight))))
 }
 
+/// The licensed prompt directory a converted tier never carries (see [`convert_snapshot_to_bf16`]).
+pub const PROMPT_DIR: &str = "prompt";
+
 /// What [`convert_snapshot_to_bf16`] wrote.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConvertReport {
@@ -134,9 +137,13 @@ fn copy_tree(src: &Path, out: &Path, skip: &dyn Fn(&Path) -> bool) -> Result<()>
 /// Every ModelOpt projection becomes a bf16 `<stem>.weight`; its `.weight_scale`,
 /// `.weight_scale_2` and `.input_scale` are dropped. Every other tensor is copied byte for byte
 /// (bf16 stays bf16). `config.json` loses its `quantization_config`; `hf_quant_config.json` and the
-/// source index are not copied (a new index is written); every other file and directory — the
-/// tokenizer, chat template, `generation_config.json`, `processor_config.json` and the model's
-/// own `prompt/` files — is copied unchanged.
+/// source index are not copied (a new index is written). The model's `prompt/` directory is **not**
+/// copied either: the prompts are licensed MiniMax prose, so a converted (and possibly published)
+/// tier never carries them, and the runtime reads them from the upstream
+/// `MiniMaxAI/MiniMax-H3-Image-PE` snapshot at the pinned revision
+/// ([`core_llm::minimax_h3_image_pe::PromptFiles::load_verified`]), exactly as the Qwen-Image
+/// rewriter never redistributes Qwen's prompts. Every other file and directory — the tokenizer,
+/// chat template, `generation_config.json`, `processor_config.json` — is copied unchanged.
 pub fn convert_snapshot_to_bf16(source: &Path, out_dir: &Path) -> Result<ConvertReport> {
     let config: Value = serde_json::from_str(&std::fs::read_to_string(source.join("config.json"))?)
         .map_err(|e| Error::Config(format!("config.json: {e}")))?;
@@ -271,6 +278,7 @@ pub fn convert_snapshot_to_bf16(source: &Path, out_dir: &Path) -> Result<Convert
             || name == "model.safetensors.index.json"
             || name.ends_with(".safetensors")
             || name.starts_with('.')
+            || (name == PROMPT_DIR && p.is_dir())
     };
     copy_tree(source, out_dir, &skip)?;
     std::fs::write(
@@ -333,7 +341,8 @@ mod tests {
         std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
         std::fs::write(dir.join("hf_quant_config.json"), "{}").unwrap();
         std::fs::create_dir_all(dir.join("prompt/t2i")).unwrap();
-        std::fs::write(dir.join("prompt/t2i/x.txt"), "kept").unwrap();
+        std::fs::write(dir.join("prompt/t2i/x.txt"), "licensed").unwrap();
+        std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
     }
 
     #[test]
@@ -370,10 +379,11 @@ mod tests {
                 .unwrap();
         assert!(config.get("quantization_config").is_none());
         assert!(!out.path().join("hf_quant_config.json").exists());
-        assert_eq!(
-            std::fs::read_to_string(out.path().join("prompt/t2i/x.txt")).unwrap(),
-            "kept"
+        assert!(
+            !out.path().join("prompt").exists(),
+            "a converted tier never carries the licensed prompt files"
         );
+        assert!(out.path().join("tokenizer.json").exists());
         let index: Value = serde_json::from_str(
             &std::fs::read_to_string(out.path().join("model.safetensors.index.json")).unwrap(),
         )

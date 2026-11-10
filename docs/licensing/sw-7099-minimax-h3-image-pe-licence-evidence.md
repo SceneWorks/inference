@@ -26,7 +26,10 @@ Unchanged and transcribed as for H3: §III.1 licence copy, §III.4 NOTICE file, 
 "MiniMax-H3-Image" display, §V.2 downstream restrictions, §V.4 Excluded Territories (EU, UK,
 Republic of Korea, USA), §V.5 safeguards, Exhibit A acceptable use (inside the LICENSE).
 
-No MiniMax prompt text or weight is committed. The adapter (`core_llm::minimax_h3_image_pe`) reads
-the prompts from the installed snapshot and checks them against `prompt/manifest.json`, whose
+No MiniMax prompt text or weight is committed, and no converted tier (bf16 / Q8 / Q4, local or
+published) bundles the `prompt/` files: `modelopt_nvfp4_to_bf16` drops the directory. The adapter
+(`core_llm::minimax_h3_image_pe`) reads the prompts from the upstream
+`MiniMaxAI/MiniMax-H3-Image-PE` snapshot at the pinned revision and checks them against
+`prompt/manifest.json`, whose
 SHA-256 at the pinned revision is `6b0969322669d9713e33148d36c401f73b18939337ea2384d90dc457430b6a5b`.
 Its tests and quality prompt set use this repository's own text.
