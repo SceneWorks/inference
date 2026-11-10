@@ -311983,6 +311983,71 @@
     }
   },
   {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_lora_real::h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image transformer_diffusers/ bf16 on CUDA plus seeded synthetic LoRAs in the diffusers/PEFT, kohya lora_unet_ and ComfyUI layouts (SW-7096); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
     "package": "mlx-gen-minimax-h3",
     "target": "integration",
     "target_kind": "test",
@@ -312082,6 +312147,72 @@
       ]
     },
     "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_lora_real::h3_image_lora_layouts_fold_identically_on_the_real_dit",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 (first three blocks) plus seeded synthetic LoRAs written to RUNNER_TEMP in the diffusers/PEFT, kohya lora_unet_ and ComfyUI layouts (SW-7096)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT); three resident blocks",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_lora_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_lora_real::h3_image_streamed_blocks_carry_the_lora_like_resident_ones",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real bf16 transformer_diffusers/ of MiniMaxAI/MiniMax-H3-Image@492fd8c4 (first three blocks, resident and rebuilt through DitBlockStream) plus seeded synthetic PEFT and kohya LoRAs written to RUNNER_TEMP (SW-7096)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT); three resident blocks",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_lora_real.rs"
   },
   {
     "package": "mlx-gen-minimax-h3",

@@ -1434,6 +1434,131 @@ pub fn validate_minimax_h3_trainer_layout(
     })
 }
 
+/// How a MiniMax-H3 / MiniMax-H3-Image LoRA file's keys are spelled, decided once per file so
+/// both backends' installs and the adapter-memory pricing route it identically (SW-7096).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MiniMaxH3LoraKeySpace {
+    /// The exact `networks.lora_minimax_h3` trainer export: stamped with that module, so it is
+    /// held to [`validate_minimax_h3_trainer_layout`]'s complete 50 × 4 census.
+    Trainer,
+    /// A generic kohya file: `lora_unet_` keys without the trainer's module stamp. Every key is
+    /// rewritten through [`minimax_h3_kohya_key_to_dotted`]; one that does not resolve refuses the
+    /// file.
+    Kohya,
+    /// Dotted keys: diffusers/PEFT, ComfyUI, or LoKr — routed by the caller's existing checks.
+    Dotted,
+}
+
+/// Classify a MiniMax-H3 LoRA file's key space (SW-7096).
+///
+/// A file whose metadata claims [`MINIMAX_H3_TRAINER_NETWORK_MODULE`] is the exact trainer export
+/// and keeps its strict census. Any other `lora_unet_` file is generic kohya — community trainers
+/// (kohya sd-scripts, musubi-tuner) write `ss_network_module = "networks.lora"` and train subsets
+/// of the blocks, which the trainer census would refuse although every key maps to a real module.
+/// The kohya route applies the same raw-module conversion the trainer route does (fused QKV split,
+/// SwiGLU half swap), so the two routes cannot fold the same tensors differently.
+///
+/// [`classify_minimax_h3_trainer_namespace`]'s LoKr-mixing refusal runs first, unchanged.
+pub fn classify_minimax_h3_lora_key_space<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    network_module: Option<&str>,
+    network_type: Option<&str>,
+) -> std::result::Result<MiniMaxH3LoraKeySpace, String> {
+    let keys = keys.into_iter().collect::<Vec<_>>();
+    let trainer =
+        classify_minimax_h3_trainer_namespace(keys.iter().copied(), network_module, network_type)?;
+    let stamped =
+        network_module.is_some_and(|module| module.trim() == MINIMAX_H3_TRAINER_NETWORK_MODULE);
+    Ok(if trainer && stamped {
+        MiniMaxH3LoraKeySpace::Trainer
+    } else if keys_are_kohya(keys.iter().copied()) {
+        MiniMaxH3LoraKeySpace::Kohya
+    } else {
+        MiniMaxH3LoraKeySpace::Dotted
+    })
+}
+
+/// Rewrite one generic kohya `lora_unet_` key on the MiniMax-H3 DiT surface to its dotted form
+/// (SW-7096), or `None` when it names no known module or role.
+///
+/// kohya flattens the module path with `_`, which is lossy because module names carry `_`
+/// themselves (`qkv_proj`, `to_out`, `refiner_blocks`), so the path is matched against the known
+/// containers and leaves rather than split on `_`:
+///
+/// | container | leaves |
+/// | --- | --- |
+/// | `transformer_blocks_{i}_`, `blocks_{i}_` | `attn_to_{q,k,v}`, `attn_to_out_0`, `ff_net_0_proj`, `ff_net_2`, `attn_qkv_proj`, `attn_out_proj`, `mlp_fc1`, `mlp_fc2`, `adaln_proj_linear` |
+/// | `token_refiner_refiner_blocks_{i}_`, `token_refiner_blocks_{i}_` | the same |
+///
+/// The roles are `.lora_down.weight`, `.lora_up.weight` and `.alpha`. The block index is not range
+/// checked here; the model decides whether block `i` exists, and an absent one is an unmatched
+/// target. `adaln_proj_linear` resolves so the install can name it as the deliberately
+/// non-addressable AdaLN surface instead of as an unknown key.
+pub fn minimax_h3_kohya_key_to_dotted(key: &str) -> Option<String> {
+    let rest = key.strip_prefix(KOHYA_PREFIX)?;
+    let (stem, suffix) = [".lora_down.weight", ".lora_up.weight", ".alpha"]
+        .into_iter()
+        .find_map(|suffix| rest.strip_suffix(suffix).map(|stem| (stem, suffix)))?;
+    let (container, tail) = [
+        (
+            "token_refiner_refiner_blocks_",
+            "token_refiner.refiner_blocks.",
+        ),
+        ("token_refiner_blocks_", "token_refiner.blocks."),
+        ("transformer_blocks_", "transformer_blocks."),
+        ("blocks_", "blocks."),
+    ]
+    .into_iter()
+    .find_map(|(flat, dotted)| {
+        let after = stem.strip_prefix(flat)?;
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 || after.as_bytes().get(digits) != Some(&b'_') {
+            return None;
+        }
+        Some((
+            format!("{dotted}{}", &after[..digits]),
+            &after[digits + 1..],
+        ))
+    })?;
+    let leaf = match tail {
+        "attn_to_q" => "attn.to_q",
+        "attn_to_k" => "attn.to_k",
+        "attn_to_v" => "attn.to_v",
+        "attn_to_out_0" => "attn.to_out.0",
+        "ff_net_0_proj" => "ff.net.0.proj",
+        "ff_net_2" => "ff.net.2",
+        "attn_qkv_proj" => "attn.qkv_proj",
+        "attn_out_proj" => "attn.out_proj",
+        "mlp_fc1" => "mlp.fc1",
+        "mlp_fc2" => "mlp.fc2",
+        "adaln_proj_linear" => "adaln_proj.linear",
+        _ => return None,
+    };
+    Some(format!("{container}.{leaf}{suffix}"))
+}
+
+/// Rewrite every key of a generic kohya MiniMax-H3 file (SW-7096): `Ok` pairs each source key with
+/// its dotted form, `Err` lists **every** key that does not resolve, sorted, so the refusal names
+/// them all and nothing is partially applied.
+pub fn rewrite_minimax_h3_kohya_keys<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+) -> std::result::Result<Vec<(String, String)>, Vec<String>> {
+    let mut rewritten = Vec::new();
+    let mut unmatched = Vec::new();
+    for key in keys {
+        match minimax_h3_kohya_key_to_dotted(key) {
+            Some(dotted) => rewritten.push((key.to_owned(), dotted)),
+            None => unmatched.push(key.to_owned()),
+        }
+    }
+    if unmatched.is_empty() {
+        Ok(rewritten)
+    } else {
+        unmatched.sort();
+        Err(unmatched)
+    }
+}
+
 /// Common LoRA namespace prefixes a PEFT/diffusers file may carry on its keys (LoKr keys are bare).
 pub const COMMON_LORA_PREFIXES: [&str; 2] = ["transformer.", "diffusion_model."];
 
@@ -2146,6 +2271,109 @@ mod tests {
         assert_eq!(layout.source_targets, 200);
         assert_eq!(layout.ranks, vec![16]);
         assert!(layout.trunk_only);
+    }
+
+    /// SW-7096: generic kohya keys on both the diffusers and the native (ComfyUI-style) module
+    /// names resolve to their dotted form; anything else is named, never dropped.
+    #[test]
+    fn minimax_h3_kohya_keys_resolve_on_both_module_spellings() {
+        for (key, want) in [
+            (
+                "lora_unet_transformer_blocks_3_attn_to_q.lora_down.weight",
+                "transformer_blocks.3.attn.to_q.lora_down.weight",
+            ),
+            (
+                "lora_unet_transformer_blocks_49_attn_to_out_0.lora_up.weight",
+                "transformer_blocks.49.attn.to_out.0.lora_up.weight",
+            ),
+            (
+                "lora_unet_transformer_blocks_0_ff_net_0_proj.alpha",
+                "transformer_blocks.0.ff.net.0.proj.alpha",
+            ),
+            (
+                "lora_unet_blocks_12_attn_qkv_proj.lora_down.weight",
+                "blocks.12.attn.qkv_proj.lora_down.weight",
+            ),
+            (
+                "lora_unet_blocks_7_mlp_fc1.lora_up.weight",
+                "blocks.7.mlp.fc1.lora_up.weight",
+            ),
+            (
+                "lora_unet_token_refiner_refiner_blocks_1_ff_net_2.alpha",
+                "token_refiner.refiner_blocks.1.ff.net.2.alpha",
+            ),
+            (
+                "lora_unet_token_refiner_blocks_0_attn_out_proj.lora_down.weight",
+                "token_refiner.blocks.0.attn.out_proj.lora_down.weight",
+            ),
+            (
+                "lora_unet_blocks_4_adaln_proj_linear.lora_up.weight",
+                "blocks.4.adaln_proj.linear.lora_up.weight",
+            ),
+        ] {
+            assert_eq!(
+                minimax_h3_kohya_key_to_dotted(key).as_deref(),
+                Some(want),
+                "{key}"
+            );
+        }
+        for unknown in [
+            "lora_unet_blocks_0_attn_q_proj.lora_down.weight",
+            "lora_unet_final_layer_linear.lora_down.weight",
+            "lora_unet_blocks_x_mlp_fc2.alpha",
+            "lora_unet_blocks_0_mlp_fc1.lora_mid.weight",
+            "transformer_blocks.0.attn.to_q.lora_A.weight",
+        ] {
+            assert_eq!(minimax_h3_kohya_key_to_dotted(unknown), None, "{unknown}");
+        }
+        let err = rewrite_minimax_h3_kohya_keys([
+            "lora_unet_blocks_0_mlp_fc1.lora_down.weight",
+            "lora_unet_video_patch_proj.lora_down.weight",
+            "lora_unet_condition_proj.lora_up.weight",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            err,
+            vec![
+                "lora_unet_condition_proj.lora_up.weight".to_owned(),
+                "lora_unet_video_patch_proj.lora_down.weight".to_owned(),
+            ]
+        );
+    }
+
+    /// SW-7096: only the trainer's own module stamp selects the strict census; a community kohya
+    /// file with the same raw keys is generic kohya, and dotted files stay dotted.
+    #[test]
+    fn minimax_h3_lora_key_space_is_trainer_only_when_stamped() {
+        let raw = ["lora_unet_blocks_0_attn_qkv_proj.lora_down.weight"];
+        assert_eq!(
+            classify_minimax_h3_lora_key_space(raw, Some(MINIMAX_H3_TRAINER_NETWORK_MODULE), None),
+            Ok(MiniMaxH3LoraKeySpace::Trainer)
+        );
+        for module in [None, Some("networks.lora")] {
+            assert_eq!(
+                classify_minimax_h3_lora_key_space(raw, module, None),
+                Ok(MiniMaxH3LoraKeySpace::Kohya)
+            );
+        }
+        assert_eq!(
+            classify_minimax_h3_lora_key_space(
+                ["lora_unet_transformer_blocks_0_attn_to_q.lora_down.weight"],
+                Some("networks.lora"),
+                None
+            ),
+            Ok(MiniMaxH3LoraKeySpace::Kohya)
+        );
+        assert_eq!(
+            classify_minimax_h3_lora_key_space(
+                ["transformer.transformer_blocks.0.attn.to_q.lora_A.weight"],
+                None,
+                None
+            ),
+            Ok(MiniMaxH3LoraKeySpace::Dotted)
+        );
+        // The trainer/LoKr mixing refusal still runs first.
+        assert!(classify_minimax_h3_lora_key_space(raw, None, Some("lokr")).is_err());
     }
 
     #[test]

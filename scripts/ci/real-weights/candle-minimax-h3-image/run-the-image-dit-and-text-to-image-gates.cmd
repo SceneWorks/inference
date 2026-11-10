@@ -23,11 +23,20 @@ set "PYTHONPATH="
 call "%VCVARS%"
 call :run_one image_dit_first_step_matches_the_official_diffusers_transformer || exit /b 1
 call :run_one image_text_to_image_renders_2048_on_cuda || exit /b 1
+rem SW-7096: the three LoRA layouts fold identically on the real image DiT; ten stack with their scales.
+call :run_lora h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda || exit /b 1
 exit /b 0
 
 :run_one
 set "log=%RUNNER_TEMP%\minimax-h3-image-evidence\%~1.log"
 cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration real_weights::%~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+type "%log%"
+findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+exit /b 0
+
+:run_lora
+set "log=%RUNNER_TEMP%\minimax-h3-image-evidence\%~1.log"
+cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration h3_image_lora_real::%~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
 type "%log%"
 findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
 exit /b 0

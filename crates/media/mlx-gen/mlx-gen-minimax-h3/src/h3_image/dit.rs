@@ -30,6 +30,7 @@ use std::path::Path;
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -125,6 +126,11 @@ impl MiniMaxH3ImageDit {
         v
     }
 
+    /// The 50 resident blocks, in order.
+    pub fn blocks(&self) -> &[DitBlock] {
+        &self.blocks
+    }
+
     /// The geometry in force.
     pub fn config(&self) -> &MiniMaxH3ImageDitConfig {
         &self.cfg
@@ -173,6 +179,31 @@ pub fn velocity_euler_delta(timesteps: &[f32], step: usize) -> Result<f32> {
     }
     let sigma = |i: usize| timesteps.get(i).map_or(0.0, |&t| 1.0 - t);
     Ok(sigma(step) - sigma(step + 1))
+}
+
+/// The image DiT's LoRA target surface (SW-7096): `transformer_blocks.{i}.…` and
+/// `token_refiner.…`, the same diffusers module names H3 video's DiT exposes, because the image
+/// DiT runs H3's own [`DitBlock`] and [`TokenRefiner`]. The input/output projections are raw
+/// weight/bias pairs and are not adapter-addressable, as on H3 video.
+impl AdaptableHost for MiniMaxH3ImageDit {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["transformer_blocks", i, rest @ ..] => {
+                let idx: usize = i.parse().ok()?;
+                self.blocks.get_mut(idx)?.adaptable_mut(rest)
+            }
+            ["token_refiner", rest @ ..] => self.refiner.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+}
+
+/// The image checkpoint is the full timestep-MLP topology: `adaln_proj` exists as weights and is
+/// not adapter-addressable, exactly as on H3 video's full path.
+impl crate::adapters::MiniMaxH3AdapterHost for MiniMaxH3ImageDit {
+    fn adapter_surface(&self) -> crate::adapters::AdaLnSurface {
+        crate::adapters::AdaLnSurface::FullTimestepMlp
+    }
 }
 
 /// The image DiT as the fixed 6-step sampler's velocity model: everything constant across a

@@ -58,6 +58,16 @@
 //! and computes the wrong thing, which is the sc-18740 defect class a fully green parity suite did
 //! not see. See [`convert_comfyui_key_space`] for the three transforms and what each one is worth.
 //!
+//! # Generic kohya and unknown layouts (SW-7096)
+//!
+//! A `lora_unet_` file **without** the trainer's `networks.lora_minimax_h3` stamp is generic
+//! kohya. Every key is rewritten to its dotted module path by the shared `gen_core` mapping
+//! ([`convert_kohya_key_space`]) — the same one the MLX install and the adapter-memory pricing
+//! read — on either module spelling; a native-named result then takes the ComfyUI conversion. A key
+//! that names no module refuses the whole file, listing every such key, and so does a dotted file
+//! carrying anything but LoRA factors and alphas ([`unknown_lora_keys`]). The image generator
+//! installs through this same seam onto its `transformer_diffusers/` DiT.
+//!
 //! # The alpha trap — why neither shared path can load these files
 //!
 //! The effective fold is `scale · alpha / rank`, and lightx2v's diffusers exports carry the alpha as
@@ -102,9 +112,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::weightsmeta::{
-    classify_minimax_h3_trainer_namespace, parse_minimax_h3_trainer_key,
-    validate_minimax_h3_trainer_layout, MiniMaxH3TrainerLayout, MiniMaxH3TrainerRole,
-    MINIMAX_H3_TOKEN_REFINER_METADATA_KEY,
+    classify_minimax_h3_lora_key_space, parse_minimax_h3_trainer_key,
+    rewrite_minimax_h3_kohya_keys, validate_minimax_h3_trainer_layout, MiniMaxH3LoraKeySpace,
+    MiniMaxH3TrainerLayout, MiniMaxH3TrainerRole, MINIMAX_H3_TOKEN_REFINER_METADATA_KEY,
 };
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::quant::LokrFactors;
@@ -352,6 +362,9 @@ pub struct MiniMaxH3LoraReport {
     pub converted_from_comfyui: usize,
     /// How many specs arrived in the exact `networks.lora_minimax_h3` trainer namespace.
     pub converted_from_trainer: usize,
+    /// How many specs arrived as generic kohya `lora_unet_` files and were rewritten to dotted
+    /// keys (SW-7096).
+    pub converted_from_kohya: usize,
     /// Source trainer targets applied before fused QKV expands into q/k/v runtime modules.
     pub trainer_source_targets_applied: usize,
     /// Distinct source factor ranks observed across trainer adapters, sorted for stable receipts.
@@ -655,9 +668,9 @@ fn is_block_diagonal(up: &Tensor, out: usize, r: usize) -> Result<bool> {
 ///
 /// **What this does not do.** It does not claim any *other* key space. The exact
 /// `networks.lora_minimax_h3` / `lora_unet_blocks_*` trainer namespace is converted by
-/// [`convert_minimax_h3_trainer_key_space`]; any other kohya (`lora_unet_`) or BFL export still
-/// reaches the strict install and fails there, loudly, naming paths that matched no module — never
-/// a partial fold.
+/// [`convert_minimax_h3_trainer_key_space`]; a generic kohya (`lora_unet_`) file is first rewritten
+/// to dotted keys by [`convert_kohya_key_space`] (SW-7096) and reaches this only when it uses the
+/// native module names.
 pub fn convert_comfyui_key_space(
     tensors: &HashMap<String, Tensor>,
     meta: &HashMap<String, String>,
@@ -1118,6 +1131,75 @@ fn apply_one_lokr(
     Ok(())
 }
 
+/// Rewrite a generic kohya `lora_unet_` file to the dotted key space (SW-7096) — the Candle twin
+/// of `mlx_gen_minimax_h3::adapters::convert_kohya_key_space`, over the same shared
+/// [`rewrite_minimax_h3_kohya_keys`] mapping.
+///
+/// A key that names no MiniMax-H3 module refuses the **whole** file, listing every such key. The
+/// result keeps the file's own module spelling (diffusers or native), so a native-named file still
+/// goes through [`convert_comfyui_key_space`]'s qkv split and SwiGLU half swap. Every target gets an
+/// explicit `.alpha` — its own in-band one, else the one [`resolve_target_alpha`] resolves from
+/// `meta` — so no later stage depends on reading the original header.
+pub fn convert_kohya_key_space(
+    tensors: &HashMap<String, Tensor>,
+    meta: &HashMap<String, String>,
+) -> Result<HashMap<String, Tensor>> {
+    let pairs =
+        rewrite_minimax_h3_kohya_keys(tensors.keys().map(String::as_str)).map_err(|unmatched| {
+            CandleError::Msg(format!(
+                "minimax_h3 adapter: {} kohya key(s) name no MiniMax-H3 / MiniMax-H3-Image module, \
+                 so the layout is unknown; refusing the whole file rather than applying part of \
+                 it: {unmatched:?}",
+                unmatched.len()
+            ))
+        })?;
+    let file_alpha = resolve_alpha(meta)?;
+    let blob = LoraAdapterMeta::from_file_metadata(meta);
+    let mut out = HashMap::with_capacity(pairs.len());
+    let mut stems: BTreeMap<String, bool> = BTreeMap::new();
+    let mut device = Device::Cpu;
+    for (source, dotted) in pairs {
+        let (stem, has_alpha) = match dotted.strip_suffix(".alpha") {
+            Some(stem) => (stem.to_owned(), true),
+            None => (
+                dotted
+                    .strip_suffix(".lora_down.weight")
+                    .or_else(|| dotted.strip_suffix(".lora_up.weight"))
+                    .unwrap_or(&dotted)
+                    .to_owned(),
+                false,
+            ),
+        };
+        *stems.entry(stem).or_default() |= has_alpha;
+        let tensor = tensors[&source].clone();
+        device = tensor.device().clone();
+        out.insert(dotted, tensor);
+    }
+    for (stem, has_alpha) in stems {
+        if !has_alpha {
+            let path = normalize_minimax_h3_key(&stem);
+            let blob_alpha = blob.as_ref().and_then(|c| c.effective(&path).0);
+            let alpha = resolve_target_alpha(None, blob_alpha, file_alpha);
+            out.insert(format!("{stem}.alpha"), Tensor::new(&[alpha], &device)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Keys of a dotted (diffusers/PEFT or ComfyUI) file that are not a LoRA factor or alpha, sorted
+/// (SW-7096). The install refuses a file carrying any: such a key (a DoRA magnitude, a full `.diff`,
+/// a `lora_mid`) is part of the adapter's arithmetic, and skipping it would apply the file only
+/// partially.
+pub fn unknown_lora_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut unknown: Vec<String> = keys
+        .into_iter()
+        .filter(|key| classify_key(key).is_none())
+        .map(str::to_owned)
+        .collect();
+    unknown.sort();
+    unknown
+}
+
 /// Install one diffusers-key-space LoRA file's residuals onto `host` at `scale`.
 fn apply_one_lora(
     host: &mut MiniMaxH3Dit,
@@ -1235,7 +1317,7 @@ pub fn apply_minimax_h3_adapters(
         let before = report.applied;
         let before_unmatched = report.unmatched_paths.len();
         let af = read_adapter(&spec.path)?;
-        let trainer = classify_minimax_h3_trainer_namespace(
+        let space = classify_minimax_h3_lora_key_space(
             af.tensors.keys().map(String::as_str),
             af.meta.get("ss_network_module").map(String::as_str),
             af.meta.get("networkType").map(String::as_str),
@@ -1246,6 +1328,7 @@ pub fn apply_minimax_h3_adapters(
                 spec.path.display()
             ))
         })?;
+        let trainer = space == MiniMaxH3LoraKeySpace::Trainer;
         let lokr = af.declares_lokr() || has_lokr_keys(&af.tensors);
         if lokr {
             apply_one_lokr(host, &af.tensors, &af.meta, spec.scale, &mut report)?;
@@ -1267,7 +1350,33 @@ pub fn apply_minimax_h3_adapters(
                 spec.path.display()
             )));
         }
-        let comfy = !trainer && is_comfyui_key_space(af.tensors.keys().map(String::as_str));
+        // SW-7096: a generic kohya file is rewritten to dotted keys first (refusing any key that
+        // names no module); a dotted file must carry nothing but LoRA factors and alphas.
+        let kohya = if space == MiniMaxH3LoraKeySpace::Kohya {
+            report.converted_from_kohya += 1;
+            Some(
+                convert_kohya_key_space(&af.tensors, &af.meta).map_err(|error| {
+                    CandleError::Msg(format!("{error} (file {})", spec.path.display()))
+                })?,
+            )
+        } else {
+            if !trainer {
+                let unknown = unknown_lora_keys(af.tensors.keys().map(String::as_str));
+                if !unknown.is_empty() {
+                    return Err(CandleError::Msg(format!(
+                        "minimax_h3 adapter {}: {} key(s) are not LoRA factors of a known layout \
+                         (diffusers/PEFT `.lora_A/.lora_B`, kohya `lora_unet_`, ComfyUI \
+                         `.lora_down/.lora_up`, `.alpha`); refusing the whole file rather than \
+                         applying part of it: {unknown:?}",
+                        spec.path.display(),
+                        unknown.len()
+                    )));
+                }
+            }
+            None
+        };
+        let source = kohya.as_ref().unwrap_or(&af.tensors);
+        let comfy = !trainer && is_comfyui_key_space(source.keys().map(String::as_str));
         let tensors = if trainer {
             let (converted, layout, alphas) =
                 convert_minimax_h3_trainer_key_space(&af.tensors, &af.meta)?;
@@ -1286,7 +1395,7 @@ pub fn apply_minimax_h3_adapters(
             // `af.meta` is the ORIGINAL file's header: the converted map is rebuilt key by key and
             // carries no metadata of its own, so the alpha the conversion divides has to come from
             // the file the user supplied.
-            let converted = convert_comfyui_key_space(&af.tensors, &af.meta)?;
+            let converted = convert_comfyui_key_space(source, &af.meta)?;
             if is_comfyui_key_space(converted.keys().map(String::as_str)) {
                 return Err(CandleError::Msg(format!(
                     "minimax_h3 adapter {}: the ComfyUI conversion left a fused or unrenamed \
@@ -1297,7 +1406,7 @@ pub fn apply_minimax_h3_adapters(
             report.converted_from_comfyui += 1;
             converted
         } else {
-            af.tensors.clone()
+            source.clone()
         };
         apply_one_lora(host, &tensors, &af.meta, spec.scale, &mut report)?;
         // Per-spec, NOT aggregate: this file, on its own, must have folded onto something.
@@ -1310,8 +1419,8 @@ pub fn apply_minimax_h3_adapters(
                 "minimax_h3 adapter {}: no target modules matched in this file — expected the \
                  diffusers key space (`transformer_blocks.{{i}}.…` / `token_refiner.…` with \
                  `.lora_A.default.weight` / `.lora_B.default.weight`), a PEFT-stamped LoKr, a \
-                 ComfyUI export this lane can convert, or the exact `networks.lora_minimax_h3` \
-                 trainer namespace",
+                 ComfyUI export this lane can convert, a kohya `lora_unet_` file, or the exact \
+                 `networks.lora_minimax_h3` trainer namespace",
                 spec.path.display()
             )));
         }
@@ -1340,6 +1449,87 @@ fn has_lokr_keys(tensors: &HashMap<String, Tensor>) -> bool {
 #[cfg(test)]
 mod alias_tests {
     use super::*;
+
+    /// SW-7096: a generic kohya file is rewritten on both module spellings, every target leaves
+    /// with an explicit alpha, and an unknown layout is refused naming each unmatched key.
+    #[test]
+    fn a_generic_kohya_file_is_rewritten_and_an_unknown_layout_is_named() {
+        let dev = Device::Cpu;
+        let t = |shape: &[usize]| Tensor::ones(shape, DType::F32, &dev).unwrap();
+        let mut tensors = HashMap::from([
+            (
+                "lora_unet_blocks_0_attn_qkv_proj.lora_down.weight".to_string(),
+                t(&[6, 8]),
+            ),
+            (
+                "lora_unet_blocks_0_attn_qkv_proj.lora_up.weight".to_string(),
+                t(&[36, 6]),
+            ),
+            (
+                "lora_unet_blocks_0_attn_qkv_proj.alpha".to_string(),
+                Tensor::new(&[3.0f32], &dev).unwrap(),
+            ),
+            (
+                "lora_unet_transformer_blocks_1_ff_net_2.lora_down.weight".to_string(),
+                t(&[2, 32]),
+            ),
+            (
+                "lora_unet_transformer_blocks_1_ff_net_2.lora_up.weight".to_string(),
+                t(&[8, 2]),
+            ),
+        ]);
+        let meta = HashMap::new();
+        let out = convert_kohya_key_space(&tensors, &meta).unwrap();
+        let mut keys: Vec<&str> = out.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "blocks.0.attn.qkv_proj.alpha",
+                "blocks.0.attn.qkv_proj.lora_down.weight",
+                "blocks.0.attn.qkv_proj.lora_up.weight",
+                "transformer_blocks.1.ff.net.2.alpha",
+                "transformer_blocks.1.ff.net.2.lora_down.weight",
+                "transformer_blocks.1.ff.net.2.lora_up.weight",
+            ]
+        );
+        let alpha = |k: &str| out[k].flatten_all().unwrap().to_vec1::<f32>().unwrap()[0];
+        assert_eq!(alpha("blocks.0.attn.qkv_proj.alpha"), 3.0);
+        assert_eq!(
+            alpha("transformer_blocks.1.ff.net.2.alpha"),
+            DEFAULT_LORA_ALPHA
+        );
+        // A converted native file is still a ComfyUI-space map, so the qkv split runs on it.
+        assert!(is_comfyui_key_space(out.keys().map(String::as_str)));
+
+        tensors.insert(
+            "lora_unet_final_layer_linear.lora_down.weight".into(),
+            t(&[2, 8]),
+        );
+        let error = convert_kohya_key_space(&tensors, &meta)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("lora_unet_final_layer_linear.lora_down.weight"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("lora_unet_blocks_0_attn_qkv_proj"),
+            "{error}"
+        );
+
+        assert_eq!(
+            unknown_lora_keys([
+                "transformer_blocks.0.attn.to_q.lora_A.weight",
+                "transformer_blocks.0.attn.to_q.lora_magnitude_vector",
+                "diffusion_model.blocks.0.attn.out_proj.diff",
+            ]),
+            [
+                "diffusion_model.blocks.0.attn.out_proj.diff",
+                "transformer_blocks.0.attn.to_q.lora_magnitude_vector",
+            ]
+        );
+    }
 
     #[test]
     fn clay_raw_refiner_header_maps_to_exact_native_targets() {

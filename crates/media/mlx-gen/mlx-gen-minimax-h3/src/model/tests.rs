@@ -510,16 +510,11 @@ fn the_published_admission_refuses_selections_this_provider_cannot_serve() {
         "{reason}"
     );
 
-    // --- refused: rung 4 on an ADAPTER-CARRYING deferred load (sc-18650) ----------------------
+    // --- admitted: rung 4 on an ADAPTER-CARRYING deferred load (SW-7096) ----------------------
     //
-    // The blocker this arm exists for. `requested_transformer_window` has always refused a
-    // windowed render with adapters, but until this story the contract did not know: `streamable`
-    // read the load shape alone, so this exact spec published rung 4 `Implemented`, accepted the
-    // selection, opened a scope, and only then hit a hard `Unsupported` inside `generate`.
-    //
-    // `MemoryRunContext` carries no adapter axis, so this cannot be a route-gate refusal — the
-    // declaration is the only seam that can see it, which is why the assertion is on `support`
-    // as well as on the two admission seams.
+    // sc-18650 declared this `Missing` because a window rebuilt each block from the staged tier
+    // and dropped the residuals. The block stream now re-applies them to every rebuilt block, so
+    // the same spec must publish the rung `Implemented`, admit the selection and open a scope.
     let lora = root.path().join("turbo.safetensors");
     std::fs::write(&lora, b"\x00").expect("adapter file");
     let adapted_spec =
@@ -537,19 +532,20 @@ fn the_published_admission_refuses_selections_this_provider_cannot_serve() {
             .capability(MemoryStrategy::BoundedTransformerResidency)
             .expect("rung 4 must appear in the strategy table")
             .support,
-        mlx_gen::gen_core::MemoryStrategySupport::Missing,
-        "an adapter load must declare rung 4 Missing — the window would drop the factors"
+        mlx_gen::gen_core::MemoryStrategySupport::Implemented,
+        "an adapter load keeps rung 4 — the stream re-applies the residuals to each block"
+    );
+    assert_eq!(
+        adapted.memory_strategy_safety_check(&streamed),
+        MemorySafetyDecision::Accept,
+        "an adapter load must admit block streaming at the safety check"
     );
     assert!(
-        matches!(
-            adapted.memory_strategy_safety_check(&streamed),
-            MemorySafetyDecision::Reject { .. }
-        ),
-        "an adapter load must refuse block streaming at the safety check"
-    );
-    assert!(
-        adapted.begin_memory_strategy_request(&streamed).is_err(),
-        "an adapter load must not open a streaming scope"
+        adapted
+            .begin_memory_strategy_request(&streamed)
+            .expect("an adapter load must open a streaming scope")
+            .is_some(),
+        "an adapter load must hand back a live streaming scope"
     );
     // ...and the adapter's resident bytes are charged rather than declared away (sc-18650).
     assert_eq!(
@@ -619,7 +615,7 @@ fn transformer_streaming_is_admitted_and_refused_exactly_as_declared() {
         .to_string();
     assert!(refusal.contains("DeferredMaterialization"), "{refusal}");
 
-    // Adapters would be silently dropped from every windowed block — typed refusal.
+    // Adapters are admitted (SW-7096): the stream re-applies them to every rebuilt block.
     let adapted = MiniMaxH3 {
         adapters: vec![AdapterSpec {
             path: PathBuf::from("/nonexistent.safetensors"),
@@ -630,11 +626,12 @@ fn transformer_streaming_is_admitted_and_refused_exactly_as_declared() {
         }],
         ..generator_at("/snap/transformer")
     };
-    let refusal = adapted
-        .requested_transformer_window(&streamed(stream_request))
-        .expect_err("a streamed render with adapters must be refused")
-        .to_string();
-    assert!(refusal.contains("adapter"), "{refusal}");
+    assert_eq!(
+        adapted
+            .requested_transformer_window(&streamed(stream_request))
+            .expect("a streamed render with adapters must be admitted"),
+        Some(crate::memory_strategy::TRANSFORMER_WINDOW_SIZE)
+    );
 
     // The component defaults to `Dit` (SC-15794), which is deliberately outside this
     // provider's published domain — so both the explicit and the defaulted forms refuse.
