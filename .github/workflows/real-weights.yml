@@ -1764,17 +1764,7 @@ jobs:
       # An unset repo variable would otherwise reach `ensure_model_snapshot.py` as an empty path and
       # fail as a confusing "revision mismatch" rather than "you did not configure this lane".
       - name: Require the operator-provisioned snapshot paths
-        run: |
-          for v in MLX_LLM_JOYCAPTION_SNAPSHOT; do
-            if [[ -z "${!v}" ]]; then
-              echo "Repository variable $v is unset; this lane cannot resolve its snapshot path" >&2
-              exit 1
-            fi
-            if [[ "${!v}" != /* ]]; then
-              echo "$v must be an absolute path, got: ${!v}" >&2
-              exit 1
-            fi
-          done
+        run: source scripts/ci/real-weights/mlx-llm-joycaption/require-the-operator-provisioned-snapshot-paths.sh
       # Report-only: what this box had free, and which of these snapshots it already holds,
       # BEFORE anything transfers. Also names the runner -- `rw-*` labels live in org settings
       # and are invisible from the runners themselves, so a run log is the only record of
@@ -4050,9 +4040,7 @@ jobs:
         # forwards on the CPU of a CUDA runner and certified nothing about the GPU. Its ±0.02
         # absolute cosine band is far above accelerator reduced-precision noise, so no bound in it
         # was CPU-calibrated.
-        run: |
-          call "%VCVARS%"
-          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test variant_divergence -- --ignored --nocapture || exit /b 1
+        run: call scripts\ci\real-weights\sa3-small-sfx-cuda\prove-music-and-sfx-actually-diverge-on-cuda.cmd
       - name: Run registered SFX provider conformance and concurrent RNG isolation on CUDA
         shell: cmd
         run: call scripts\ci\real-weights\sa3-small-sfx-cuda\run-registered-sfx-provider-conformance-and-concurrent-rng-i.cmd
@@ -4089,8 +4077,7 @@ jobs:
         run: call scripts\ci\real-weights\sa3-medium-cuda\install-reviewed-cpython-3-12.cmd
       - name: Configure immutable medium and small snapshot paths
         shell: cmd
-        run: |
-          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model stable-audio-3-medium --model stable-audio-3-medium-base --model stable-audio-3-small-music --model stable-audio-3-small-sfx --model same-l
+        run: call scripts\ci\real-weights\sa3-medium-cuda\configure-immutable-medium-and-small-snapshot-paths.cmd
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4174,8 +4161,7 @@ jobs:
         run: call scripts\ci\real-weights\sa3-base-identity-cuda\install-reviewed-cpython-3-12.cmd
       - name: Configure all six immutable Stable Audio 3 snapshot paths
         shell: cmd
-        run: |
-          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music --model stable-audio-3-small-sfx --model stable-audio-3-medium --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base --model stable-audio-3-medium-base --model same-l
+        run: call scripts\ci\real-weights\sa3-base-identity-cuda\configure-all-six-immutable-stable-audio-3-snapshot-paths.cmd
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4199,9 +4185,7 @@ jobs:
         run: call scripts\ci\real-weights\sa3-base-identity-cuda\reject-every-cross-variant-weight-path-and-match-the-frozen.cmd
       - name: Prove real CFG and the negative prompt on a base checkpoint
         shell: cmd
-        run: |
-          call "%VCVARS%"
-          cargo test --locked --release -p candle-audio-stable-audio-3 --features cuda --test base_guidance -- --ignored --nocapture || exit /b 1
+        run: call scripts\ci\real-weights\sa3-base-identity-cuda\prove-real-cfg-and-the-negative-prompt-on-a-base-checkpoint.cmd
       - name: Certify the explicit-negative conditioning path itself
         shell: cmd
         run: call scripts\ci\real-weights\sa3-base-identity-cuda\certify-the-explicit-negative-conditioning-path-itself.cmd
@@ -4238,8 +4222,7 @@ jobs:
         run: call scripts\ci\real-weights\sa3-small-base-cuda\install-reviewed-cpython-3-12.cmd
       - name: Configure both immutable small-base snapshot paths
         shell: cmd
-        run: |
-          "%REVIEWED_PYTHON%" scripts/release/export_model_snapshot_paths.py --model stable-audio-3-small-music-base --model stable-audio-3-small-sfx-base
+        run: call scripts\ci\real-weights\sa3-small-base-cuda\configure-both-immutable-small-base-snapshot-paths.cmd
       - name: Select Git Bash
         shell: cmd
         run: |
@@ -4519,19 +4502,13 @@ jobs:
           components: rustfmt, clippy
       - name: Configure runner-local SDXL validation paths
         shell: cmd
-        run: |
-          echo EDIT_SRC=%RUNNER_TEMP%\sdxl-edit-src.ppm>>"%GITHUB_ENV%"
-          echo EDIT_OUT=%RUNNER_TEMP%\sdxl-edit-out>>"%GITHUB_ENV%"
-          echo IP_REF=%RUNNER_TEMP%\sdxl-ip-ref.ppm>>"%GITHUB_ENV%"
-          echo IP_OUT=%RUNNER_TEMP%\sdxl-ip-out>>"%GITHUB_ENV%"
+        run: call scripts\ci\real-weights\candle-sdxl\configure-runner-local-sdxl-validation-paths.cmd
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: call scripts\ci\real-weights\candle-sdxl\materialize-and-verify-immutable-snapshots.cmd
       - name: Stage synthetic source images
         shell: cmd
-        run: |
-          "%REVIEWED_PYTHON%" scripts/ci/make_test_image.py "%EDIT_SRC%" 768 768 || exit /b 1
-          "%REVIEWED_PYTHON%" scripts/ci/make_test_image.py "%IP_REF%" 768 768 || exit /b 1
+        run: call scripts\ci\real-weights\candle-sdxl\stage-synthetic-source-images.cmd
       - name: Run SDXL real-weight renders
         shell: cmd
         run: call scripts\ci\real-weights\candle-sdxl\run-sdxl-real-weight-renders.cmd
@@ -4598,9 +4575,7 @@ jobs:
           components: rustfmt, clippy
       - name: Configure runner-local MMAudio output paths
         shell: cmd
-        run: |
-          echo MMAUDIO_WAV_OUT=%RUNNER_TEMP%\mmaudio_foley_16k.wav>>"%GITHUB_ENV%"
-          echo MMAUDIO_WAV_OUT_44K=%RUNNER_TEMP%\mmaudio_foley_44k.wav>>"%GITHUB_ENV%"
+        run: call scripts\ci\real-weights\candle-mmaudio\configure-runner-local-mmaudio-output-paths.cmd
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: call scripts\ci\real-weights\candle-mmaudio\materialize-and-verify-immutable-snapshots.cmd
@@ -4954,29 +4929,34 @@ jobs:
     name: MLX H3-Image VAE
     if: inputs.profile == 'minimax-h3-image'
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
-      MINIMAX_H3_IMAGE_SNAPSHOT: ${{ vars.MINIMAX_H3_IMAGE_SNAPSHOT }}
-      MINIMAX_H3_IMAGE_VAE_REFERENCE: ${{ vars.MINIMAX_H3_IMAGE_VAE_REFERENCE }}
+      MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Resolve runner-local snapshot paths
-        run: python3.12 scripts/release/resolve_snapshot_paths.py MINIMAX_H3_IMAGE_SNAPSHOT MINIMAX_H3_IMAGE_VAE_REFERENCE
+        run: python3.12 scripts/release/resolve_snapshot_paths.py MLX_GEN_MODELS_ROOT
       - name: Report runner disk headroom
         continue-on-error: true
-        run: scripts/ci/report_runner_disk_headroom.sh MINIMAX_H3_IMAGE_SNAPSHOT MINIMAX_H3_IMAGE_VAE_REFERENCE
-      - name: Run image VAE gates
-        run: source scripts/ci/real-weights/mlx-minimax-h3-image/run-minimax-h3-image-vae-gates.sh
+        run: scripts/ci/report_runner_disk_headroom.sh MLX_GEN_MODELS_ROOT
+      - name: Materialize and produce the image VAE reference
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image/materialize-and-produce-the-image-vae-reference.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: minimax-h3-image-vae-reference
+          path: ${{ runner.temp }}/minimax-h3-image-vae-reference
+          if-no-files-found: error
+      - name: Run the image VAE gates
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image/run-the-image-vae-gates.sh
 
   candle-minimax-h3-image:
-    needs: validate-selection
+    needs: [validate-selection, mlx-minimax-h3-image]
     name: Candle H3-Image VAE (CUDA)
-    if: inputs.profile == 'minimax-h3-image'
+    if: ${{ !cancelled() && needs.validate-selection.result == 'success' && inputs.profile == 'minimax-h3-image' }}
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 180
     env:
-      MINIMAX_H3_IMAGE_SNAPSHOT: ${{ vars.CANDLE_MINIMAX_H3_IMAGE_SNAPSHOT }}
-      MINIMAX_H3_IMAGE_VAE_REFERENCE: ${{ vars.CANDLE_MINIMAX_H3_IMAGE_VAE_REFERENCE }}
+      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
       CUDA_COMPUTE_CAP: "80"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -4988,9 +4968,13 @@ jobs:
         shell: cmd
         run: call scripts\ci\real-weights\candle-minimax-h3-image\install-reviewed-cpython-3-12.cmd
       - uses: ./.github/actions/setup-rust
-      - name: Run image VAE gates
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: minimax-h3-image-vae-reference
+          path: ${{ runner.temp }}/minimax-h3-image-vae-reference
+      - name: Run the image VAE gates
         shell: cmd
-        run: call scripts\ci\real-weights\candle-minimax-h3-image\run-minimax-h3-image-vae-gates.cmd
+        run: call scripts\ci\real-weights\candle-minimax-h3-image\run-the-image-vae-gates.cmd
 
   # sc-24114 — Qwen-Image 2.1 real-weight evidence on candle/CUDA. DISPATCH-ONLY (`qwen-image-2-1`
   # profile; never `all`, never the schedule): it renders at the upstream 2048² / 40-step default and
@@ -5430,10 +5414,7 @@ jobs:
       - name: Record the CUDA device inventory
         continue-on-error: true
         shell: cmd
-        run: |
-          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH; exit /b 0)
-          nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv > "%IRIS_OUT%\cuda-device-inventory.csv"
-          type "%IRIS_OUT%\cuda-device-inventory.csv"
+        run: call scripts\ci\real-weights\candle-iris\record-the-cuda-device-inventory.cmd
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: call scripts\ci\real-weights\candle-iris\materialize-and-verify-immutable-snapshots.cmd
@@ -5516,10 +5497,7 @@ jobs:
       - name: Record the CUDA device inventory
         continue-on-error: true
         shell: cmd
-        run: |
-          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH; exit /b 0)
-          nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv > "%SUPRA2_OUT%\cuda-device-inventory.csv"
-          type "%SUPRA2_OUT%\cuda-device-inventory.csv"
+        run: call scripts\ci\real-weights\candle-supra2\record-the-cuda-device-inventory.cmd
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: call scripts\ci\real-weights\candle-supra2\materialize-and-verify-immutable-snapshots.cmd
@@ -5685,10 +5663,7 @@ jobs:
       - name: Record the CUDA device inventory
         continue-on-error: true
         shell: cmd
-        run: |
-          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH; exit /b 0)
-          nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv > "%DECODE_BENCH_OUT%\cuda-device-inventory.csv"
-          type "%DECODE_BENCH_OUT%\cuda-device-inventory.csv"
+        run: call scripts\ci\real-weights\candle-decode-speedups-bench\record-the-cuda-device-inventory.cmd
       # The runner builds both checkouts first (stamped: `SPECULATIVE_BENCH_BUILD_GIT_SHA`), then
       # alternates the epic and baseline processes per row.
       - name: Build both checkouts and run every matrix row (epic and baseline alternating)
@@ -6334,10 +6309,7 @@ jobs:
       - name: Record the CUDA device inventory
         continue-on-error: true
         shell: cmd
-        run: |
-          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH; exit /b 0)
-          nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv > "%FLUX3_OUT%\cuda-device-inventory.csv"
-          type "%FLUX3_OUT%\cuda-device-inventory.csv"
+        run: call scripts\ci\real-weights\candle-flux3-klein\record-the-cuda-device-inventory.cmd
       - name: Materialize and verify the immutable package snapshot
         shell: cmd
         run: call scripts\ci\real-weights\candle-flux3-klein\materialize-and-verify-immutable-snapshot.cmd
@@ -6491,10 +6463,7 @@ jobs:
       - name: Record the CUDA device inventory
         continue-on-error: true
         shell: cmd
-        run: |
-          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH; exit /b 0)
-          nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv > "%IRIS_OUT%\cuda-device-inventory.csv"
-          type "%IRIS_OUT%\cuda-device-inventory.csv"
+        run: call scripts\ci\real-weights\candle-iris-curricula\record-the-cuda-device-inventory.cmd
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: call scripts\ci\real-weights\candle-iris-curricula\materialize-and-verify-immutable-snapshots.cmd
@@ -6531,17 +6500,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Prepare normalized evidence paths and require admitted CUDA listener
         shell: cmd
-        run: |
-          for %%I in ("%RUNNER_TEMP%\veda-s3-cuda-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%") do set "S3_OUTPUT_DIR=%%~fI"
-          for %%I in ("%RUNNER_TEMP%\veda-s3-cuda-target-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%") do set "CARGO_TARGET_DIR=%%~fI"
-          mkdir "%S3_OUTPUT_DIR%" || exit /b 1
-          echo S3_OUTPUT_DIR=%S3_OUTPUT_DIR%>>"%GITHUB_ENV%"
-          echo CARGO_TARGET_DIR=%CARGO_TARGET_DIR%>>"%GITHUB_ENV%"
-          >"%S3_OUTPUT_DIR%\preflight.json" echo {"instrument":"veda_s3_cuda","complete":false,"status":"tooling_not_yet_checked","runner":"%RUNNER_NAME%","host":"%COMPUTERNAME%","source_commit":"%GITHUB_SHA%","gpu_started":false,"device_test_started":false}
-          if not "%RUNNER_NAME%"=="cuda-windows" if not "%RUNNER_NAME%"=="cuda-windows-2" (
-            echo Unexpected CUDA listener %RUNNER_NAME%
-            exit /b 1
-          )
+        run: call scripts\ci\real-weights\veda-s3-cuda\prepare-normalized-evidence-paths-and-require-admitted-cuda.cmd
       - name: Install pinned uv
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:

@@ -20,31 +20,73 @@ Hash-pinned: the output carries ``producer_sha256``, the SHA-256 of THIS file's 
 gates compare it to the SHA-256 of the committed copy of this file. A reference made by any other
 version of this producer is refused, so editing this file requires re-producing the reference.
 
-The output is a few MB and is deliberately **not** committed (real-weight bytes). Produce it on a
-box holding the snapshot, from a torch + diffusers (>= 0.42.0.dev0, with
-``AutoencoderKLMiniMaxH3Image``) environment:
+The output is a few MB and is deliberately **not** committed (real-weight bytes). The
+``minimax-h3-image`` real-weights profile produces it in the job itself, in the reviewed
+hash-locked Mage reference environment (torch + diffusers 0.38.0); run it the same way by hand:
 
     MINIMAX_H3_IMAGE_SNAPSHOT=<snapshot-root> python3 tools/dump_minimax_h3_image_vae_real.py \
-        --out ~/minimax-h3-image-real-vae-reference.safetensors
+        --out <dir>/minimax-h3-image-vae-reference.safetensors
 
-and point ``MINIMAX_H3_IMAGE_VAE_REFERENCE`` at it.
+The reference class
+-------------------
+
+``AutoencoderKLMiniMaxH3Image`` landed on diffusers ``main`` at ``REFERENCE_COMMIT`` and is in no
+released wheel yet. When the installed diffusers does not ship the module, this producer loads that
+exact upstream file — downloaded from the pinned commit and refused unless its SHA-256 is
+``REFERENCE_MODULE_SHA256`` — as ``diffusers.models.autoencoders.autoencoder_kl_minimax_h3_image``
+on top of the installed package. Everything it imports (``AutoencoderMixin``, ``FeedForward``'s
+``swiglu``, ``dispatch_attention_fn``, ``AttentionModuleMixin``) exists unchanged in diffusers
+0.38.0. The module's identity is recorded in the output metadata.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
+import importlib.util
 import os
+import sys
+import tempfile
+import urllib.request
 from pathlib import Path
 
 import torch
 from safetensors.numpy import save_file
 
-from _paths import hf_hub_cache
-
 SEED = 7089
+MODULE = "diffusers.models.autoencoders.autoencoder_kl_minimax_h3_image"
+REFERENCE_COMMIT = "875373ac7f5856071e345a3e394c74efccc6b9e6"
+REFERENCE_MODULE_SHA256 = "82da645ee07b0c0443aacd64f160c14c3fe928d61d64023e0102ecbe99557ce1"
+REFERENCE_MODULE_URL = (
+    f"https://raw.githubusercontent.com/huggingface/diffusers/{REFERENCE_COMMIT}/"
+    "src/diffusers/models/autoencoders/autoencoder_kl_minimax_h3_image.py"
+)
 SMALL_HW = (4, 4)
 TILED_HW = (24, 40)
+
+
+def reference_class():
+    """Return ``(AutoencoderKLMiniMaxH3Image, source)`` — installed, or the pinned upstream file."""
+    try:
+        module = importlib.import_module(MODULE)
+        return module.AutoencoderKLMiniMaxH3Image, "installed"
+    except ModuleNotFoundError:
+        pass
+    with urllib.request.urlopen(REFERENCE_MODULE_URL, timeout=60) as response:
+        body = response.read()
+    digest = hashlib.sha256(body).hexdigest()
+    if digest != REFERENCE_MODULE_SHA256:
+        raise SystemExit(f"{REFERENCE_MODULE_URL} has sha256 {digest}, expected {REFERENCE_MODULE_SHA256}")
+    path = Path(tempfile.mkdtemp()) / "autoencoder_kl_minimax_h3_image.py"
+    path.write_bytes(body)
+    import diffusers.models.autoencoders  # noqa: F401 — the parent package the module's relative imports resolve against
+
+    spec = importlib.util.spec_from_file_location(MODULE, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[MODULE] = module
+    spec.loader.exec_module(module)
+    return module.AutoencoderKLMiniMaxH3Image, f"diffusers@{REFERENCE_COMMIT}:{digest}"
 
 
 def main() -> None:
@@ -53,14 +95,10 @@ def main() -> None:
     args = ap.parse_args()
 
     import diffusers
-    from diffusers import AutoencoderKLMiniMaxH3Image
 
-    snapshot = Path(
-        os.environ.get("MINIMAX_H3_IMAGE_SNAPSHOT")
-        or next(
-            iter(sorted((hf_hub_cache() / "models--MiniMaxAI--MiniMax-H3-Image" / "snapshots").glob("*")))
-        )
-    )
+    AutoencoderKLMiniMaxH3Image, module_source = reference_class()
+
+    snapshot = Path(os.environ["MINIMAX_H3_IMAGE_SNAPSHOT"])
     producer_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
     vae = AutoencoderKLMiniMaxH3Image.from_pretrained(snapshot / "vae_diffusers", torch_dtype=torch.float32)
@@ -103,6 +141,7 @@ def main() -> None:
         "provenance": "converted-checkpoint",
         "reference": "diffusers.AutoencoderKLMiniMaxH3Image",
         "reference_version": diffusers.__version__,
+        "reference_module": module_source,
         "snapshot": snapshot.name,
         "seed": str(SEED),
         "tile": f"{tile[0]}/{tile[1]}",

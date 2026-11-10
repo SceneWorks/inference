@@ -897,7 +897,9 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
-        MACOS_MAGE_LOCK: 1,
+        # 2 since SW-7089's `mlx-minimax-h3-image` produces its diffusers reference in the same
+        # reviewed Mage reference environment.
+        MACOS_MAGE_LOCK: 2,
     }
     actual_lock_counts = {lock: locks_seen.count(lock) for lock in set(locks_seen)}
     if actual_lock_counts != expected_lock_counts:
