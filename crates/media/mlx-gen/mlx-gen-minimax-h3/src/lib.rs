@@ -195,6 +195,7 @@ pub mod cost;
 pub mod decoder;
 pub mod denoise;
 pub mod dit;
+pub mod image_vae;
 pub mod keyframe;
 pub mod layout;
 pub mod memory_strategy;
@@ -231,8 +232,9 @@ pub use conditioning::{
     KEYFRAME_NOISE_AUG_T,
 };
 pub use config::{
-    MiniMaxH3VaeConfig, CLIP_LENGTH, DECODER_HEAD_DIM, DECODER_NUM_HEADS, DECODER_NUM_LAYERS,
-    DECODER_NUM_REGISTER_TOKENS, DECODER_ROPE_DIM_RATIO, DECODER_ROPE_THETA, LATENTS_MEAN,
+    DecoderLayout, MiniMaxH3VaeConfig, CLIP_LENGTH, DECODER_HEAD_DIM, DECODER_NUM_HEADS,
+    DECODER_NUM_LAYERS, DECODER_NUM_REGISTER_TOKENS, DECODER_ROPE_DIM_RATIO, DECODER_ROPE_THETA,
+    IMAGE_DECODER_NUM_HEADS, IMAGE_DECODER_NUM_LAYERS, IMAGE_DECODER_ROPE_DIM_RATIO, LATENTS_MEAN,
     LATENTS_STD, LATENT_CHANNELS, TOKEN_DROP, VAE_RATIO, VAE_RATIO_T,
 };
 pub use cost::{
@@ -256,6 +258,10 @@ pub use dit::{
     TimestepEmbedder, TimestepSchedule, TokenRefiner, TokenRefinerBlock, MODALITY_NUM,
     PUBLISHED_DIT_TENSORS,
 };
+pub use image_vae::{
+    bounded_decode_parameters as image_bounded_decode_parameters, MiniMaxH3ImageVae,
+    IMAGE_DECODE_OVERLAP, IMAGE_DECODE_TILE_EDGE, IMAGE_VAE_COMPONENT,
+};
 pub use keyframe::{
     anchors_for, fit_keyframe, fit_keyframes, keyframe_to_vae_pixels, resolve_canvas_size,
     resolve_keyframe_canvas, round_half_to_even, KeyframeFit, MAX_ASPECT_RATIO, MIN_ASPECT_RATIO,
@@ -276,7 +282,7 @@ pub use reference::{
     ReferencePresentation, VideoReference, MAX_AUDIO_REFERENCES, MAX_IMAGE_REFERENCES,
     MAX_TOTAL_REFERENCES, MAX_VIDEO_REFERENCES, REFERENCE_IMAGE_SHORT_EDGE,
 };
-pub use rope::{create_token_ids, Rope3d, RopeTables};
+pub use rope::{create_token_ids, create_token_ids_2d, Rope3d, RopeTables};
 pub use text_encoder::{
     encode_grounded, encode_grounded_from_vision, inspect_conditioning, minimax_h3_vision_config,
     run_vision, ConditioningDefect, DegenerateConditioning, GroundedVision, MiniMaxH3TeConfig,
