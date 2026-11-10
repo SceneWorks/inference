@@ -1497,3 +1497,180 @@ fn real_weight_tiling_is_inert_below_one_tile() {
         "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::real_weight_tiling_is_inert_below_one_tile"
     );
 }
+
+// ── SW-7089: MiniMax-H3-Image 2-D VAE decoder ────────────────────────────────────────────────────
+
+/// Peak-relative max-abs-diff bound for the image VAE against diffusers, at f32 — the bar the
+/// video decode gate uses for the same comparison.
+const IMAGE_VAE_TOL: f32 = 2e-2;
+
+/// The committed producer whose output the image gate accepts (it lives with the MLX tools).
+const IMAGE_VAE_PRODUCER: &[u8] =
+    include_bytes!("../../../mlx-gen/tools/dump_minimax_h3_image_vae_real.py");
+
+fn image_snapshot() -> std::path::PathBuf {
+    let raw = std::env::var("MINIMAX_H3_IMAGE_SNAPSHOT").unwrap_or_default();
+    assert!(
+        !raw.is_empty(),
+        "MINIMAX_H3_IMAGE_SNAPSHOT must point at a MiniMaxAI/MiniMax-H3-Image snapshot root (the \
+         dir holding `vae_diffusers/`). This test is #[ignore]d and asserts rather than skips."
+    );
+    let path = std::path::PathBuf::from(raw);
+    assert!(
+        path.join("vae_diffusers").join("config.json").is_file(),
+        "MINIMAX_H3_IMAGE_SNAPSHOT={} has no vae_diffusers/config.json",
+        path.display()
+    );
+    path
+}
+
+/// AC1 (candle): the 2-D decoder, tiled and untiled, against the official diffusers
+/// `AutoencoderKLMiniMaxH3Image` on the published `vae_diffusers/` bytes. The reference must carry
+/// the committed producer's SHA-256.
+#[test]
+#[ignore = "needs a real MiniMax-H3-Image snapshot + a reference decode (MINIMAX_H3_IMAGE_VAE_REFERENCE)"]
+fn image_vae_decode_matches_the_official_diffusers_vae() {
+    use candle_gen_minimax_h3::spatial_tiling::SpatialTiling;
+    use candle_gen_minimax_h3::MiniMaxH3ImageVae;
+    use sha2::{Digest, Sha256};
+
+    let root = image_snapshot();
+    let raw = std::env::var("MINIMAX_H3_IMAGE_VAE_REFERENCE").unwrap_or_default();
+    assert!(
+        !raw.is_empty(),
+        "MINIMAX_H3_IMAGE_VAE_REFERENCE must point at the output of \
+         tools/dump_minimax_h3_image_vae_real.py; this test asserts rather than skips."
+    );
+    let reference = common::Golden::load(&raw);
+    assert_eq!(
+        reference.meta("reference").unwrap_or_default(),
+        "diffusers.AutoencoderKLMiniMaxH3Image",
+        "the reference must come from the official image VAE class"
+    );
+    let pinned = format!("{:x}", Sha256::digest(IMAGE_VAE_PRODUCER));
+    assert_eq!(
+        reference.meta("producer_sha256").unwrap_or_default(),
+        pinned,
+        "the reference was produced by a different dump_minimax_h3_image_vae_real.py than the \
+         committed one; re-produce it"
+    );
+
+    let dev = device();
+    let vae = MiniMaxH3ImageVae::load(&root, &dev, DType::F32).expect("load the image VAE");
+    assert!(
+        vae.tiling().enabled,
+        "the shipped image VAE tiles by default"
+    );
+    let decode = |vae: &MiniMaxH3ImageVae, key: &str| -> Tensor {
+        let latent = reference.tensor(key).to_device(&dev).expect("latent");
+        vae.decode(&latent)
+            .expect("decode")
+            .to_device(&Device::Cpu)
+            .expect("to cpu")
+    };
+
+    let got = decode(&vae, "in.small");
+    let want = reference.tensor("out.small");
+    assert_eq!(got.dims(), want.dims(), "small decode shape");
+    let (small_rel, _) = rel(&got, &want);
+
+    let got_tiled = decode(&vae, "in.tiled");
+    let want_tiled = reference.tensor("out.tiled");
+    assert_eq!(got_tiled.dims(), &[1, 3, 384, 640], "tiled decode shape");
+    let (tiled_rel, _) = rel(&got_tiled, &want_tiled);
+
+    let untiled = vae.clone().with_tiling(SpatialTiling::disabled());
+    let got_untiled = decode(&untiled, "in.tiled");
+    let want_untiled = reference.tensor("out.untiled");
+    let (untiled_rel, _) = rel(&got_untiled, &want_untiled);
+    let (branch_gap, _) = rel(&want_tiled, &want_untiled);
+
+    println!(
+        "image VAE vs diffusers AutoencoderKLMiniMaxH3Image (bound {IMAGE_VAE_TOL:.0e}): small \
+         {small_rel:.3e}, tiled {tiled_rel:.3e}, untiled {untiled_rel:.3e}; reference tiled-vs-untiled \
+         gap {branch_gap:.3e}"
+    );
+    assert!(
+        small_rel < IMAGE_VAE_TOL,
+        "small decode diverges by {small_rel:.3e}"
+    );
+    assert!(
+        tiled_rel < IMAGE_VAE_TOL,
+        "tiled decode diverges by {tiled_rel:.3e}"
+    );
+    assert!(
+        untiled_rel < IMAGE_VAE_TOL,
+        "untiled decode diverges by {untiled_rel:.3e}"
+    );
+    assert!(
+        branch_gap > IMAGE_VAE_TOL,
+        "the reference's tiled and untiled decodes differ by only {branch_gap:.3e}, so this \
+         canvas does not distinguish the branches"
+    );
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_vae_decode_matches_the_official_diffusers_vae"
+    );
+}
+
+/// AC2 (candle/CUDA): at 16 MP (a 256x256 latent -> 4096x4096 px) the shipped 256 / 64 tiled
+/// decode — the family's BoundedDecode — peaks below the untiled decode, measured as the CUDA
+/// pool's concurrent-live high-water reset before each run. Off CUDA there is no device peak to
+/// read, so the test refuses rather than passing on nothing.
+#[test]
+#[ignore = "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT) and CUDA; 16 MP decode twice"]
+fn image_vae_tiled_decode_lowers_the_16mp_peak() {
+    #[cfg(not(feature = "cuda"))]
+    panic!("the 16 MP peak comparison reads the CUDA pool high-water; build with --features cuda");
+    #[cfg(feature = "cuda")]
+    {
+        use candle_gen_minimax_h3::spatial_tiling::SpatialTiling;
+        use candle_gen_minimax_h3::MiniMaxH3ImageVae;
+
+        let root = image_snapshot();
+        let dev = device();
+        assert!(dev.is_cuda(), "the peak comparison needs the CUDA device");
+        let vae = MiniMaxH3ImageVae::load(&root, &dev, DType::F32).expect("load the image VAE");
+        let n = 24 * 256 * 256;
+        let vals: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
+        let latents = Tensor::from_vec(vals, (1, 24, 256, 256), &dev).expect("latents");
+        let measure = |label: &str, vae: &MiniMaxH3ImageVae| -> u64 {
+            dev.synchronize().expect("sync");
+            let pool = candle_gen::cuda_mempool::MemPool::device_current(0)
+                .expect("a CUDA memory pool on device 0");
+            pool.reset_high_water();
+            let started = std::time::Instant::now();
+            let out = vae.decode(&latents).expect("decode");
+            dev.synchronize().expect("sync");
+            let peak = pool.used_high().expect("pool high-water");
+            assert_eq!(out.dims(), &[1, 3, 4096, 4096], "{label} decode shape");
+            let mean = out
+                .abs()
+                .and_then(|t| t.mean_all())
+                .and_then(|t| t.to_scalar::<f32>())
+                .expect("mean");
+            assert!(
+                mean.is_finite() && mean > 0.0,
+                "{label} decode is degenerate: {mean}"
+            );
+            println!(
+                "16 MP {label} decode: peak {:.3} GiB in {:.1} s",
+                peak as f64 / (1u64 << 30) as f64,
+                started.elapsed().as_secs_f64()
+            );
+            peak
+        };
+        let tiled_peak = measure("tiled 256/64", &vae);
+        let untiled_vae = vae.clone().with_tiling(SpatialTiling::disabled());
+        let untiled_peak = measure("untiled", &untiled_vae);
+        assert!(
+            tiled_peak < untiled_peak,
+            "the bounded (tiled) decode peaked at {tiled_peak} B, not below the untiled \
+             {untiled_peak} B"
+        );
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_vae_tiled_decode_lowers_the_16mp_peak"
+        );
+    }
+}

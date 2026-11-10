@@ -20,6 +20,19 @@
 //!
 //! After the blocks, `proj_out` is applied to the whole sequence and only then truncated back to
 //! the patch tokens — the suffix rows are computed and discarded, exactly as upstream.
+//!
+//! # The 2-D mode (MiniMax-H3-Image)
+//!
+//! `MiniMaxH3ImageViTDecoder2d` is the same decoder with three differences, selected by
+//! [`DecoderLayout::Image2d`] rather than by a second copy of the layers:
+//!
+//! - the input is an NCHW latent and tokens are `(h, w)` row-major ([`pack_tokens_2d`]);
+//! - the rotary carries 2 axes `(h, w)` — 32 rotated dims = 8 frequencies per axis at the shipped
+//!   ratio 0.5 — and the suffix tokens again sit at the origin;
+//! - `proj_out` emits a spatial-only `out_channels · patch_size²` patch ([`unpack_tokens_2d`]).
+//!
+//! [`ViT3dDecoder::forward`] (video) and [`ViT3dDecoder::forward_image`] share the token core, and
+//! each refuses the other layout, so a video decoder can never run with 2 rotary axes.
 
 use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::concatenate_axis;
@@ -30,11 +43,12 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use crate::blocks::TransformerBlock;
-use crate::config::MiniMaxH3VaeConfig;
-use crate::rope::{create_token_ids, Rope3d};
-use crate::tensor::{pack_tokens, slice_axis, unpack_tokens};
+use crate::config::{DecoderLayout, MiniMaxH3VaeConfig};
+use crate::rope::{create_token_ids, create_token_ids_2d, Rope3d};
+use crate::tensor::{pack_tokens, pack_tokens_2d, slice_axis, unpack_tokens, unpack_tokens_2d};
 
-/// The transformer video decoder.
+/// The transformer VAE decoder — the 3-D video layout or, with [`DecoderLayout::Image2d`], the
+/// MiniMax-H3-Image 2-D layout.
 #[derive(Debug, Clone)]
 pub struct ViT3dDecoder {
     proj_in_w: Array,
@@ -104,7 +118,7 @@ impl ViT3dDecoder {
         if proj_out_w.shape() != [cfg.patch_dim(), cfg.dim()] {
             return Err(Error::Msg(format!(
                 "minimax-h3 decoder: {prefix}.proj_out.weight is {:?}, expected [{}, {}] \
-                 (out_channels · patch_size_t · patch_size²)",
+                 (out_channels · decoder patch_size_t · patch_size²)",
                 proj_out_w.shape(),
                 cfg.patch_dim(),
                 cfg.dim()
@@ -126,7 +140,11 @@ impl ViT3dDecoder {
             proj_out_b: w
                 .require(&format!("{prefix}.proj_out.bias"))?
                 .as_dtype(dtype)?,
-            rope: Rope3d::new(cfg.rope_apply_dim(), cfg.rope_theta)?,
+            rope: Rope3d::with_axes(
+                cfg.rope_apply_dim(),
+                cfg.rope_theta,
+                cfg.decoder_layout.rope_axes(),
+            )?,
             cfg: cfg.clone(),
             dtype,
         })
@@ -159,6 +177,8 @@ impl ViT3dDecoder {
     }
 
     /// Decode a `[B, latent_channels, T, H, W]` latent into `[B, out_channels, T·4, H·16, W·16]`.
+    ///
+    /// Video layout only; an image decoder takes [`Self::forward_image`].
     pub fn forward(&self, latent: &Array) -> Result<Array> {
         let s = latent.shape();
         if s.len() != 5 {
@@ -166,18 +186,70 @@ impl ViT3dDecoder {
                 "minimax-h3 decoder: expected [B, C, T, H, W], got {s:?}"
             )));
         }
-        let (b, c, t, h, w) = (s[0], s[1], s[2], s[3], s[4]);
+        self.require_layout(DecoderLayout::Video3d)?;
+        let (t, h, w) = (s[2], s[3], s[4]);
+        self.check_channels(s[1])?;
+        let latent = latent.as_dtype(self.dtype)?;
+        let tokens = pack_tokens(&latent)?;
+        // Patch ids from the latent grid; every suffix token sits at the rotary origin.
+        let ids = create_token_ids(t, h, w, Dtype::Float32)?;
+        let out = self.decode_tokens(&tokens, s[0], ids)?;
+        unpack_tokens(
+            &out,
+            self.cfg.out_channels,
+            self.cfg.patch_size,
+            self.cfg.patch_size_t,
+            t,
+            h,
+            w,
+        )
+    }
+
+    /// Decode a `[B, latent_channels, H, W]` latent image into `[B, out_channels, H·16, W·16]` —
+    /// `MiniMaxH3ImageViTDecoder2d.forward`, untiled. [`DecoderLayout::Image2d`] only.
+    pub fn forward_image(&self, latent: &Array) -> Result<Array> {
+        let s = latent.shape();
+        if s.len() != 4 {
+            return Err(Error::Msg(format!(
+                "minimax-h3 image decoder: expected [B, C, H, W], got {s:?}"
+            )));
+        }
+        self.require_layout(DecoderLayout::Image2d)?;
+        let (h, w) = (s[2], s[3]);
+        self.check_channels(s[1])?;
+        let latent = latent.as_dtype(self.dtype)?;
+        let tokens = pack_tokens_2d(&latent)?;
+        let ids = create_token_ids_2d(h, w, Dtype::Float32)?;
+        let out = self.decode_tokens(&tokens, s[0], ids)?;
+        unpack_tokens_2d(&out, self.cfg.out_channels, self.cfg.patch_size, h, w)
+    }
+
+    fn require_layout(&self, want: DecoderLayout) -> Result<()> {
+        if self.cfg.decoder_layout != want {
+            return Err(Error::Msg(format!(
+                "minimax-h3 decoder: this decoder is {:?}, the call needs {want:?}",
+                self.cfg.decoder_layout
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_channels(&self, c: i32) -> Result<()> {
         if c != self.cfg.latent_channels {
             return Err(Error::Msg(format!(
                 "minimax-h3 decoder: expected {} latent channels, got {c}",
                 self.cfg.latent_channels
             )));
         }
-        let latent = latent.as_dtype(self.dtype)?;
-        let num_patches = t * h * w;
+        Ok(())
+    }
 
-        let tokens = pack_tokens(&latent)?;
-        let hidden = linear(&tokens, &self.proj_in_w, &self.proj_in_b)?;
+    /// The layout-independent core: `proj_in`, the register + zero-CLS suffix, the blocks under
+    /// the rotary built from `patch_ids` (`[1, N, axes]`, suffix ids appended here at the origin),
+    /// `norm_out` and `proj_out`, truncated back to the `N` patch tokens.
+    fn decode_tokens(&self, tokens: &Array, b: i32, patch_ids: Array) -> Result<Array> {
+        let num_patches = tokens.shape()[1];
+        let hidden = linear(tokens, &self.proj_in_w, &self.proj_in_b)?;
 
         // registers, then a ZERO cls token (`torch.zeros_like`, not a learned parameter).
         let registers = mlx_rs::ops::broadcast_to(
@@ -187,10 +259,8 @@ impl ViT3dDecoder {
         let cls = Array::zeros::<f32>(&[b, 1, self.cfg.dim()])?.as_dtype(self.dtype)?;
         let hidden = concatenate_axis(&[hidden, registers, cls], 1)?;
 
-        // Patch ids from the latent grid; every suffix token sits at the rotary origin.
-        let ids = create_token_ids(t, h, w, Dtype::Float32)?;
-        let suffix = Array::zeros::<f32>(&[1, self.cfg.num_suffix_tokens(), 3])?;
-        let ids = concatenate_axis(&[ids, suffix], 1)?;
+        let suffix = Array::zeros::<f32>(&[1, self.cfg.num_suffix_tokens(), self.rope.num_axes()])?;
+        let ids = concatenate_axis(&[patch_ids, suffix], 1)?;
         let tables = self.rope.tables(&ids)?;
 
         let mut hidden = hidden;
@@ -206,17 +276,7 @@ impl ViT3dDecoder {
         )?;
         let out = linear(&hidden, &self.proj_out_w, &self.proj_out_b)?;
         // Suffix rows are projected and then discarded, matching upstream.
-        let out = slice_axis(&out, 1, 0, num_patches)?;
-
-        unpack_tokens(
-            &out,
-            self.cfg.out_channels,
-            self.cfg.patch_size,
-            self.cfg.patch_size_t,
-            t,
-            h,
-            w,
-        )
+        slice_axis(&out, 1, 0, num_patches)
     }
 }
 
@@ -233,6 +293,17 @@ mod tests {
         assert_eq!(names.len(), 583);
         let unique: std::collections::BTreeSet<_> = names.iter().collect();
         assert_eq!(unique.len(), names.len(), "duplicate tensor name");
+    }
+
+    /// The published `MiniMax-H3-Image` `vae_diffusers` safetensors header carries 391 `decoder.*`
+    /// tensors: 24 blocks × 16 + the same 7 top-level ones. The block layout is shared, so the
+    /// image decoder needs no names of its own.
+    #[test]
+    fn names_cover_the_published_image_decoder_tensor_count() {
+        let names = ViT3dDecoder::names("decoder", &MiniMaxH3VaeConfig::image());
+        assert_eq!(names.len(), 391);
+        assert!(names.contains(&"decoder.transformer_blocks.23.ff.net.0.proj.weight".to_string()));
+        assert!(!names.iter().any(|n| n.contains("transformer_blocks.24.")));
     }
 
     #[test]

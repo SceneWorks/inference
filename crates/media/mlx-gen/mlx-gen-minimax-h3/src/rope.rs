@@ -82,39 +82,91 @@ pub fn create_token_ids(t: i32, h: i32, w: i32, dtype: Dtype) -> Result<Array> {
     Ok(Array::from_slice(&ids, &[1, t * h * w, 3]).as_dtype(dtype)?)
 }
 
-/// The 3-D rotary embedding.
+/// Length-normalized token ids for an `(H, W)` latent image — the 2-D decoder's grid.
+///
+/// The same cell-centre mapping as [`create_token_ids`], meshed `ij` over two axes, so token
+/// `h·W + w` carries `(h_coord, w_coord)` (`MiniMaxH3ImageViTDecoder2d.forward`). Returns
+/// `[1, H·W, 2]`.
+pub fn create_token_ids_2d(h: i32, w: i32, dtype: Dtype) -> Result<Array> {
+    if h <= 0 || w <= 0 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 rope: latent grid must be positive, got ({h}, {w})"
+        )));
+    }
+    let axis = |n: i32| -> Vec<f32> {
+        (0..n)
+            .map(|i| 2.0 * ((i as f32 + 0.5) / n as f32) - 1.0)
+            .collect()
+    };
+    let (hc, wc) = (axis(h), axis(w));
+    let mut ids = Vec::with_capacity((h * w * 2) as usize);
+    for &hv in &hc {
+        for &wv in &wc {
+            ids.push(hv);
+            ids.push(wv);
+        }
+    }
+    Ok(Array::from_slice(&ids, &[1, h * w, 2]).as_dtype(dtype)?)
+}
+
+/// The N-axis rotary embedding: 3 axes `(t, h, w)` for the video decoder, 2 axes `(h, w)` for the
+/// image decoder (`MiniMaxH3*RotaryPosEmbed(dim, theta, num_axes)`). The name predates the 2-axis
+/// mode; the arithmetic is the same module with `num_axes` as a parameter.
 #[derive(Debug, Clone)]
 pub struct Rope3d {
     inv_freq: Vec<f32>,
     /// Rotated head dims.
     pub apply_dim: i32,
+    num_axes: i32,
 }
 
 impl Rope3d {
-    /// `apply_dim` must be a positive multiple of `2 · 3` — the reference raises otherwise.
+    /// The 3-axis video rotary. `apply_dim` must be a positive multiple of `2 · 3` — the reference
+    /// raises otherwise.
     pub fn new(apply_dim: i32, theta: f32) -> Result<Self> {
-        if apply_dim <= 0 || apply_dim % 6 != 0 {
+        Self::with_axes(apply_dim, theta, 3)
+    }
+
+    /// A rotary over `num_axes` position axes. `apply_dim` must be a positive multiple of
+    /// `2 · num_axes`.
+    pub fn with_axes(apply_dim: i32, theta: f32, num_axes: i32) -> Result<Self> {
+        if num_axes <= 0 {
             return Err(Error::Msg(format!(
-                "minimax-h3 rope: apply_dim {apply_dim} must be a positive multiple of 6"
+                "minimax-h3 rope: num_axes {num_axes} must be positive"
             )));
         }
-        // `1 / theta ** arange(0, 1, 2·n_dim/dim)` — `apply_dim/6` frequencies per position axis.
-        let step = 6.0f32 / apply_dim as f32;
-        let inv_freq = (0..apply_dim / 6)
+        let per = 2 * num_axes;
+        if apply_dim <= 0 || apply_dim % per != 0 {
+            return Err(Error::Msg(format!(
+                "minimax-h3 rope: apply_dim {apply_dim} must be a positive multiple of {per}"
+            )));
+        }
+        // `1 / theta ** arange(0, 1, 2·n_dim/dim)` — `apply_dim / (2·n_dim)` frequencies per
+        // position axis. At 3 axes `step` is `6.0 / apply_dim`, the exact f32 the 3-D-only
+        // constructor computed, so the video tables are unchanged bit for bit.
+        let step = per as f32 / apply_dim as f32;
+        let inv_freq = (0..apply_dim / per)
             .map(|i| theta.powf(-(i as f32 * step)))
             .collect();
         Ok(Self {
             inv_freq,
             apply_dim,
+            num_axes,
         })
     }
 
-    /// Frequencies per position axis — `apply_dim / 6`.
+    /// Frequencies per position axis — `apply_dim / (2 · num_axes)`.
     pub fn freqs_per_axis(&self) -> usize {
         self.inv_freq.len()
     }
 
-    /// Build `(cos, sin)` for `ids` of shape `[1, N, 3]`, returning `[1, N, 1, apply_dim]` each.
+    /// Position axes the ids carry.
+    pub fn num_axes(&self) -> i32 {
+        self.num_axes
+    }
+
+    /// Build `(cos, sin)` for `ids` of shape `[1, N, num_axes]`, returning
+    /// `[1, N, 1, apply_dim]` each.
     ///
     /// Always **f32**, whatever `ids` carries: the reference's position grid is built
     /// `dtype=torch.float32` and `inv_freq` is a float32 buffer
@@ -123,9 +175,10 @@ impl Rope3d {
     /// The candle twin has always done this; see the module doc.
     pub fn tables(&self, ids: &Array) -> Result<RopeTables> {
         let shape = ids.shape();
-        if shape.len() != 3 || shape[2] != 3 {
+        let axes = self.num_axes;
+        if shape.len() != 3 || shape[2] != axes {
             return Err(Error::Msg(format!(
-                "minimax-h3 rope: expected ids as [B, N, 3], got {shape:?}"
+                "minimax-h3 rope: expected ids as [B, N, {axes}], got {shape:?}"
             )));
         }
         let (b, n) = (shape[0], shape[1]);
@@ -134,10 +187,10 @@ impl Rope3d {
         // angles[b, n, axis, f] = 2π · ids[b, n, axis] · inv_freq[f]
         let inv = Array::from_slice(&self.inv_freq, &[1, 1, 1, f]).as_dtype(Dtype::Float32)?;
         let scaled = multiply(
-            &ids.as_dtype(Dtype::Float32)?.reshape(&[b, n, 3, 1])?,
+            &ids.as_dtype(Dtype::Float32)?.reshape(&[b, n, axes, 1])?,
             Array::from_f32(2.0 * std::f32::consts::PI),
         )?;
-        let angles = multiply(&scaled, &inv)?.reshape(&[b, n, 3 * f])?;
+        let angles = multiply(&scaled, &inv)?.reshape(&[b, n, axes * f])?;
         // `.tile(2)` on the last axis: the half-split rotary consumes [θ, θ].
         let angles =
             concatenate_axis(&[angles.clone(), angles], -1)?.reshape(&[b, n, 1, self.apply_dim])?;
@@ -233,6 +286,81 @@ mod tests {
         assert_eq!(rope.freqs_per_axis(), 2);
         assert!(Rope3d::new(32, 100.0).is_err());
         assert!(Rope3d::new(0, 100.0).is_err());
+    }
+
+    /// The image decoder's rotary: 32 rotated dims over 2 axes -> 8 frequencies per axis, the
+    /// count `MiniMaxH3ImageRotaryPosEmbed(32, num_axes=2)` builds.
+    #[test]
+    fn two_axis_rotary_has_apply_dim_over_four_frequencies() {
+        let rope = Rope3d::with_axes(32, 100.0, 2).unwrap();
+        assert_eq!(rope.freqs_per_axis(), 8);
+        assert_eq!(rope.num_axes(), 2);
+        assert!(Rope3d::with_axes(6, 100.0, 2).is_err());
+        assert!(Rope3d::with_axes(32, 100.0, 0).is_err());
+    }
+
+    /// `new` is the 3-axis case of `with_axes`, table for table — the video decoder's rotary is
+    /// unchanged by the 2-axis generalization.
+    #[test]
+    fn the_three_axis_constructor_is_unchanged() {
+        let a = Rope3d::new(48, 100.0).unwrap();
+        let b = Rope3d::with_axes(48, 100.0, 3).unwrap();
+        assert_eq!(a.inv_freq, b.inv_freq);
+        // The pre-generalization formula, written out: `theta^-(i · 6/48)`.
+        let legacy: Vec<f32> = (0..8)
+            .map(|i| 100.0f32.powf(-(i as f32 * (6.0f32 / 48.0))))
+            .collect();
+        assert_eq!(a.inv_freq, legacy);
+        let ids = create_token_ids(2, 3, 4, Dtype::Float32).unwrap();
+        let (ta, tb) = (a.tables(&ids).unwrap(), b.tables(&ids).unwrap());
+        assert_eq!(ta.cos.as_slice::<f32>(), tb.cos.as_slice::<f32>());
+        assert_eq!(ta.sin.as_slice::<f32>(), tb.sin.as_slice::<f32>());
+    }
+
+    /// 2-D ids mesh `(h, w)` in `ij` order at cell centres.
+    #[test]
+    fn two_d_token_ids_are_row_major_cell_centres() {
+        let ids = create_token_ids_2d(2, 3, Dtype::Float32).unwrap();
+        assert_eq!(ids.shape(), &[1, 6, 2]);
+        let v: Vec<f32> = ids.as_slice::<f32>().to_vec();
+        let expect = [
+            (-0.5, -2.0 / 3.0),
+            (-0.5, 0.0),
+            (-0.5, 2.0 / 3.0),
+            (0.5, -2.0 / 3.0),
+            (0.5, 0.0),
+            (0.5, 2.0 / 3.0),
+        ];
+        for (k, (h, w)) in expect.iter().enumerate() {
+            assert!(
+                (v[2 * k] - h).abs() < 1e-6 && (v[2 * k + 1] - w).abs() < 1e-6,
+                "token {k}"
+            );
+        }
+        assert!(create_token_ids_2d(0, 3, Dtype::Float32).is_err());
+    }
+
+    /// Table layout over 2 axes: `[h-freqs | w-freqs]` tiled twice, angle `2π · coord · f`.
+    #[test]
+    fn two_axis_tables_follow_the_reference_layout() {
+        let rope = Rope3d::with_axes(8, 100.0, 2).unwrap();
+        let ids = Array::from_slice(&[0.25f32, -0.5], &[1, 1, 2]);
+        let t = rope.tables(&ids).unwrap();
+        assert_eq!(t.cos.shape(), &[1, 1, 1, 8]);
+        let inv = [1.0f32, 100.0f32.powf(-0.5)];
+        let mut want = Vec::new();
+        for coord in [0.25f32, -0.5] {
+            for f in inv {
+                want.push((2.0 * std::f32::consts::PI * coord * f).cos());
+            }
+        }
+        let want: Vec<f32> = want.iter().chain(want.iter()).copied().collect();
+        for (g, w) in t.cos.as_slice::<f32>().iter().zip(&want) {
+            assert!((g - w).abs() < 1e-5, "{g} vs {w}");
+        }
+        // 3-axis ids into a 2-axis rotary is a shape error, not a silent reinterpretation.
+        let wrong = create_token_ids(1, 1, 1, Dtype::Float32).unwrap();
+        assert!(rope.tables(&wrong).is_err());
     }
 
     /// The pass-through tail must be returned BYTE-identical — this is what makes the rotary

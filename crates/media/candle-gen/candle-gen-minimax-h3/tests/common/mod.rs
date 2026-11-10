@@ -529,6 +529,7 @@ pub fn fixture_config(token_drop: i32) -> MiniMaxH3VaeConfig {
         temporal_downsample_factors: SHARED_FIXTURE_VAE_TEMPORAL_DOWNSAMPLE_FACTORS.to_vec(),
         norm_num_groups: SHARED_FIXTURE_VAE_NORM_NUM_GROUPS,
         encoder_norm_eps: SHARED_FIXTURE_VAE_ENCODER_NORM_EPS,
+        decoder_layout: candle_gen_minimax_h3::DecoderLayout::Video3d,
     }
 }
 
