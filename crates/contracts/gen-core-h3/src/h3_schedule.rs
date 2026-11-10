@@ -241,6 +241,17 @@ impl SigmaSchedule {
         })
     }
 
+    /// The fixed MiniMax-H3-Image distilled grid, [`gen_core::h3_image::SIGMAS`], adopted with no
+    /// shift and no collapse. Image rows carry the video token tag, so this is a `Video` grid;
+    /// `shift` is recorded as `1.0` (identity) because the checkpoint's grid is used as published.
+    pub fn h3_image_distilled() -> Result<Self> {
+        Self::from_sigmas(
+            DenoiseModality::Video,
+            1.0,
+            gen_core::h3_image::SIGMAS.to_vec(),
+        )
+    }
+
     /// The modality this grid was built for.
     pub fn modality(&self) -> DenoiseModality {
         self.modality
@@ -383,6 +394,14 @@ impl JointSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn h3_image_distilled_is_the_published_six_step_grid() {
+        let sch = SigmaSchedule::h3_image_distilled().unwrap();
+        assert_eq!(sch.sigmas(), &gen_core::h3_image::SIGMAS[..]);
+        assert_eq!(sch.timesteps().len(), 6);
+        assert_eq!(sch.timesteps()[0], 0.0);
+    }
 
     /// The published shifts, and that they are reachable only through their own modality.
     #[test]

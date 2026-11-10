@@ -1,19 +1,22 @@
-//! MiniMax-H3-Image request contract: size rules, published aspect table, the fixed 6-step sigma
-//! list, and the refusals a request must pass before any backend runs. Tensor-free: MLX, Candle and
-//! the shared-generation runner all read these as data.
+//! MiniMax-H3-Image request contract: size and canvas rules, the published aspect table, the fixed
+//! 6-step sigma list, and the refusals a request must pass before any backend runs. Tensor-free:
+//! MLX, Candle and the shared-generation runner all read these as data.
 //!
-//! Source: the MiniMaxAI/MiniMax-H3-Image model card and `pdd_config.json` (read 2026-11-10). The
-//! diffusers pipeline source was not reachable, so the upstream size ceiling is taken from the card:
-//! it states a working range of "about 4 MP to 20 MP" and no hard maximum. We refuse above 20 MP
-//! (`20 * 2^20` px, the same megapixel unit as the card's 4 MP default `2048x2048` and 16 MP
-//! `4096x4096`). This is stricter than upstream, which is not documented to refuse.
+//! Sources (read 2026-11-10): `huggingface/diffusers` main,
+//! `src/diffusers/modular_pipelines/minimax_h3_image/` (`before_denoise.py` canvas and validation,
+//! `modular_pipeline.py` multiple/max sequence length, `decoders.py` resize back), plus the
+//! MiniMaxAI/MiniMax-H3-Image model card and `pdd_config.json`.
 //!
-//! This family is NOT bound by H3 video's `CANVAS_MAX_PIXELS` (1.03 MP) or `MAX_CANVAS_EDGE` (2016).
+//! Upstream enforces NO maximum output area or edge: the requested size only has to be positive.
+//! The 32 px stride applies to the derived generation canvas, not to the requested size, which is
+//! resized back from the canvas. The card's "about 4 MP to 20 MP" range is advisory only. This
+//! family is NOT bound by H3 video's `CANVAS_MAX_PIXELS` (1.03 MP) or `MAX_CANVAS_EDGE` (2016).
 
 use crate::Error;
 use thiserror::Error as ThisError;
 
-/// Pixels per generated token edge: VAE 16x spatial times DiT patch 2x2.
+/// Canvas multiple, pixels per token edge: VAE 16x spatial times DiT patch 2x2
+/// (`canvas_multiple`, modular_pipeline.py:69).
 pub const SIZE_STRIDE: u32 = 32;
 /// Smallest accepted `min_generation_area` (upstream parameter range, pixels).
 pub const MIN_GENERATION_AREA_MIN: u64 = 1024;
@@ -21,9 +24,11 @@ pub const MIN_GENERATION_AREA_MIN: u64 = 1024;
 pub const MIN_GENERATION_AREA_MAX: u64 = 16_777_216;
 /// Upstream default `min_generation_area` (2048x2048).
 pub const MIN_GENERATION_AREA_DEFAULT: u64 = 4_194_304;
-/// Largest output area we accept (20 MP, `20 * 2^20`).
-pub const MAX_OUTPUT_AREA: u64 = 20 * 1_048_576;
-/// Maximum reference images for edit.
+/// Advisory working range (not enforced; upstream has no maximum): about 4 MP to 20 MP.
+pub const WORKING_AREA_MIN: u64 = 4 * 1_048_576;
+/// Upper end of the advisory working range.
+pub const WORKING_AREA_MAX: u64 = 20 * 1_048_576;
+/// Maximum reference images for edit (model card; diffusers does not enforce a count).
 pub const MAX_REFERENCES: usize = 16;
 /// Prompt is truncated upstream to this many tokens.
 pub const MAX_PROMPT_TOKENS: usize = 4096;
@@ -99,10 +104,8 @@ pub const ASPECT_TABLE: [AspectEntry; 8] = [
 /// Why a H3-Image request was refused. Each variant names the limit it broke.
 #[derive(Debug, Clone, PartialEq, ThisError)]
 pub enum H3ImageRefusal {
-    #[error("size {width}x{height} must be non-zero multiples of {SIZE_STRIDE}")]
-    SizeStride { width: u32, height: u32 },
-    #[error("size {width}x{height} is {area} px, above the {MAX_OUTPUT_AREA} px (20 MP) limit")]
-    AreaAboveMax { width: u32, height: u32, area: u64 },
+    #[error("size {width}x{height} must be positive on both sides")]
+    SizeNotPositive { width: u32, height: u32 },
     #[error("min_generation_area {value} is outside {MIN_GENERATION_AREA_MIN}..={MIN_GENERATION_AREA_MAX}")]
     MinGenerationAreaRange { value: u64 },
     #[error("steps {steps} refused: H3-Image is fixed at {FIXED_STEPS} steps")]
@@ -121,27 +124,32 @@ impl From<H3ImageRefusal> for Error {
     }
 }
 
-/// Check an output size. Sizes below 4 MP are valid: upstream renders them on a larger canvas.
+/// Python `round` (half to even) to the nearest multiple, floored at one multiple.
+fn round_to_multiple(value: f64) -> u32 {
+    let m = f64::from(SIZE_STRIDE);
+    ((value / m).round_ties_even() * m).max(m) as u32
+}
+
+/// The `(width, height)` canvas upstream generates a `width x height` output on
+/// (`get_image_canvas_size`, before_denoise.py:94). An image below `min_generation_area` is scaled
+/// up by `sqrt(min_generation_area / area)` at the same aspect; either way both sides round to the
+/// nearest multiple of [`SIZE_STRIDE`]. The output is resized back from this canvas to the
+/// requested size when they differ (decoders.py:165).
+pub fn generation_canvas(width: u32, height: u32, min_generation_area: u64) -> (u32, u32) {
+    let (w, h) = (f64::from(width), f64::from(height));
+    let scale = (min_generation_area as f64 / (w * h)).sqrt().max(1.0);
+    (round_to_multiple(w * scale), round_to_multiple(h * scale))
+}
+
+/// Check an output size: upstream only requires it to be positive (before_denoise.py:212).
 pub fn validate_size(width: u32, height: u32) -> Result<(), H3ImageRefusal> {
-    if width == 0
-        || height == 0
-        || !width.is_multiple_of(SIZE_STRIDE)
-        || !height.is_multiple_of(SIZE_STRIDE)
-    {
-        return Err(H3ImageRefusal::SizeStride { width, height });
-    }
-    let area = u64::from(width) * u64::from(height);
-    if area > MAX_OUTPUT_AREA {
-        return Err(H3ImageRefusal::AreaAboveMax {
-            width,
-            height,
-            area,
-        });
+    if width == 0 || height == 0 {
+        return Err(H3ImageRefusal::SizeNotPositive { width, height });
     }
     Ok(())
 }
 
-/// Check an optional `min_generation_area` against the published range.
+/// Check an optional `min_generation_area` against upstream's range (before_denoise.py:214).
 pub fn validate_min_generation_area(value: Option<u64>) -> Result<(), H3ImageRefusal> {
     match value {
         Some(v) if !(MIN_GENERATION_AREA_MIN..=MIN_GENERATION_AREA_MAX).contains(&v) => {
@@ -187,34 +195,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_entries_are_valid_sizes_near_16mp() {
+    fn table_entries_are_stride_aligned_near_16mp() {
         for e in ASPECT_TABLE {
             validate_size(e.width, e.height).unwrap();
+            assert_eq!((e.width % SIZE_STRIDE, e.height % SIZE_STRIDE), (0, 0));
             let a = u64::from(e.width) * u64::from(e.height);
             assert!((15_000_000..=17_000_000).contains(&a), "{}", e.label);
         }
     }
 
     #[test]
-    fn size_range() {
-        validate_size(32, 32).unwrap();
-        validate_size(6272, 2688).unwrap();
-        // Above H3 video's 1.03 MP cap and 2016 edge: allowed here.
-        validate_size(4096, 4096).unwrap();
+    fn size_only_needs_to_be_positive() {
+        validate_size(1, 1).unwrap();
+        validate_size(1000, 1001).unwrap();
+        // No maximum area or edge upstream, and not H3 video's 1.03 MP / 2016 caps.
+        validate_size(8192, 8192).unwrap();
         assert_eq!(
             validate_size(0, 32),
-            Err(H3ImageRefusal::SizeStride {
+            Err(H3ImageRefusal::SizeNotPositive {
                 width: 0,
                 height: 32
             })
         );
-        assert!(matches!(
-            validate_size(1000, 1024),
-            Err(H3ImageRefusal::SizeStride { .. })
-        ));
-        let e = validate_size(6400, 3360).unwrap_err();
-        assert!(matches!(e, H3ImageRefusal::AreaAboveMax { .. }));
-        assert!(e.to_string().contains("20 MP"));
+    }
+
+    #[test]
+    fn canvas_scales_small_images_and_rounds() {
+        // At or above the minimum area: only rounding to the stride.
+        assert_eq!(
+            generation_canvas(4096, 4096, MIN_GENERATION_AREA_DEFAULT),
+            (4096, 4096)
+        );
+        assert_eq!(generation_canvas(1000, 1001, 1024), (992, 992));
+        // 1024x1024 with the 4 MP default scales 2x.
+        assert_eq!(
+            generation_canvas(1024, 1024, MIN_GENERATION_AREA_DEFAULT),
+            (2048, 2048)
+        );
+        // min_generation_area 1024 never enlarges; tiny sizes floor at one stride.
+        assert_eq!(generation_canvas(8, 8, 1024), (32, 32));
+        // 512x768 (0.39 MP) at 4 MP: scale sqrt(4194304/393216)=3.266 -> 1672.5, 2508.8
+        assert_eq!(
+            generation_canvas(512, 768, MIN_GENERATION_AREA_DEFAULT),
+            (1664, 2496)
+        );
     }
 
     #[test]
@@ -223,7 +247,8 @@ mod tests {
         validate_min_generation_area(Some(1024)).unwrap();
         validate_min_generation_area(Some(16_777_216)).unwrap();
         assert!(validate_min_generation_area(Some(1023)).is_err());
-        assert!(validate_min_generation_area(Some(16_777_217)).is_err());
+        let e = validate_min_generation_area(Some(16_777_217)).unwrap_err();
+        assert!(e.to_string().contains("16777216"));
     }
 
     #[test]
