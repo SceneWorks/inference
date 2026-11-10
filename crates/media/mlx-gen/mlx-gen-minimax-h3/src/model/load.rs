@@ -35,7 +35,7 @@ pub(super) fn resolve_text_encoder_dir(root: &Path, spec: &LoadSpec) -> PathBuf 
 /// therefore does not fail cleanly — Mage's q8 vision tower (packed at 32, read at 64) derived
 /// "bits 16" from a perfectly good artifact and was diagnosed as a bad upload (sc-15154). Reading
 /// the declared group size and rejecting a mismatch by name turns that into one actionable line.
-pub(super) fn reconcile_text_encoder(te_dir: &Path) -> Result<()> {
+pub(crate) fn reconcile_text_encoder(te_dir: &Path) -> Result<()> {
     let Some(declared) = mlx_gen::quant::packed_quant_group_size_at(te_dir)? else {
         // Dense, or packed without a declared group size — the loaders auto-detect on `.scales`
         // and `packed_bits` will reject anything that does not divide cleanly at our own width.

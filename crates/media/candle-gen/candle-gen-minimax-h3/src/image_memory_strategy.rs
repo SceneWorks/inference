@@ -23,7 +23,7 @@ use candle_gen::gen_core::{
     MemoryWindowMaterialization, ProviderMemoryProfile, ResidentRequestMemory, WeightsSource,
 };
 
-use crate::image_model::{IMAGE_DIT_PARTITION, IMAGE_MODEL_ID};
+use crate::image_model::IMAGE_MODEL_ID;
 use crate::image_vae::{IMAGE_DECODE_OVERLAP, IMAGE_DECODE_TILE_EDGE, IMAGE_VAE_COMPONENT};
 
 /// Content fingerprint of this contract.
@@ -58,14 +58,14 @@ fn component_bytes(
 /// The load-exact inventory: the conditioner's layer-50 tap (the `lm_prefixes` the render maps)
 /// at bf16, the DiT at its stored mixed bf16/f32 widths, and the VAE's decode half at its stored
 /// f32.
-fn asset_facts(root: &Path, te_dir: &Path) -> gen_core::Result<MemoryAssetFacts> {
+fn asset_facts(dit_dir: &Path, root: &Path, te_dir: &Path) -> gen_core::Result<MemoryAssetFacts> {
     let te_cfg = crate::text_encoder::MiniMaxH3TeConfig::from_component_dir(te_dir)
         .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
     let prefixes = crate::text_encoder::lm_prefixes(crate::text_encoder::LM_PREFIX, &te_cfg);
     let conditioning = component_bytes(te_dir, Some(BF16_WIDTH), &|name: &str| {
         prefixes.iter().any(|p| name.starts_with(p.as_str()))
     })?;
-    let transformer = component_bytes(&root.join(IMAGE_DIT_PARTITION), None, &|_| true)?;
+    let transformer = component_bytes(dit_dir, None, &|_| true)?;
     let decoder = component_bytes(&root.join(IMAGE_VAE_COMPONENT), None, &|name: &str| {
         name.starts_with("decoder.") || name.starts_with("post_quant_conv.")
     })?;
@@ -85,11 +85,12 @@ fn asset_facts(root: &Path, te_dir: &Path) -> gen_core::Result<MemoryAssetFacts>
 fn architecture_facts_from_snapshot(
     _provider_id: &str,
     root: &Path,
-    _spec: &LoadSpec,
+    spec: &LoadSpec,
 ) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    let dit = af::component_config(root, IMAGE_DIT_PARTITION);
+    // The staged tier's directory when one is staged, else the snapshot's own.
+    let dit = af::config_file(&crate::image_model::resolve_dit_dir(root, spec).join("config.json"));
     let vae = af::component_config(root, IMAGE_VAE_COMPONENT);
     gen_core::MemoryArchitectureFacts {
         attention_heads: af::axis_of(dit.as_ref(), &["num_attention_heads"]),
@@ -106,11 +107,6 @@ fn architecture_facts_from_snapshot(
 
 /// The weights-free contract — the registry conformance surface.
 pub fn weights_free_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{IMAGE_MODEL_ID}: no quantized tier is published for this family yet"
-        )));
-    }
     let mut contract = MemoryProviderContract::compatibility_default(
         IMAGE_MODEL_ID,
         MemoryBackendRealization::CandleCuda {
@@ -177,7 +173,8 @@ pub fn contract_for(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract>
         )));
     };
     let te_dir = crate::image_model::resolve_text_encoder_dir(root, spec);
-    contract.asset_facts = asset_facts(root, &te_dir)?;
+    let dit_dir = crate::image_model::resolve_dit_dir(root, spec);
+    contract.asset_facts = asset_facts(&dit_dir, root, &te_dir)?;
     Ok(contract)
 }
 
@@ -295,7 +292,8 @@ pub const IMAGE_MEMORY_REGISTRATION: candle_gen::gen_core::MemoryRegistration = 
     contract_for
 );
 
-/// The weights-free contract fixture, dense tier only (no quantized tier is published).
+/// The weights-free contract fixture, dense tier only: the quantized tiers add no strategy or
+/// formula, only smaller asset bytes read from the staged directories.
 pub const IMAGE_MEMORY_CONTRACT_FIXTURE: candle_gen::gen_core::MemoryContractFixtureRegistration =
     candle_gen::gen_core::MemoryContractFixtureRegistration {
         provider_id: IMAGE_MODEL_ID,
@@ -364,9 +362,12 @@ mod tests {
         assert!(c.lifecycle.synchronized_phase_release && c.lifecycle.decode_tiling);
         assert!(validate_decode(Some(256), Some(64)).is_ok());
         assert!(validate_decode(Some(512), Some(64)).is_err());
-        let mut q = spec();
-        q.quantize = Some(gen_core::Quant::Q4);
-        assert!(weights_free_contract(&q).is_err());
+        // The packed tiers use the same contract; only the asset bytes differ.
+        for tier in [gen_core::Quant::Q4, gen_core::Quant::Q8] {
+            let mut q = spec();
+            q.quantize = Some(tier);
+            assert!(weights_free_contract(&q).is_ok(), "{tier:?}");
+        }
         assert!(!memory_contract_surface_specs().is_empty());
     }
 

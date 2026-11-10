@@ -1907,3 +1907,189 @@ fn image_text_to_image_renders_2048_on_cuda() {
         );
     }
 }
+
+// ---- SW-7093: the q8 / q4 DiT tiers (candle/CUDA) ---------------------------------------------
+
+/// The converter's output: `<root>/{q8,q4}/transformer_diffusers/` and
+/// `<root>/{q8,q4}/pdd_fused_heads.safetensors` (`MINIMAX_H3_IMAGE_TIERS_ROOT`), written by the
+/// `minimax_h3_image_prequant` example.
+#[cfg(feature = "cuda")]
+fn image_tiers_root() -> std::path::PathBuf {
+    let raw = std::env::var("MINIMAX_H3_IMAGE_TIERS_ROOT").unwrap_or_default();
+    assert!(
+        !raw.is_empty(),
+        "MINIMAX_H3_IMAGE_TIERS_ROOT must point at the converter's output; this test is #[ignore]d \
+         and asserts rather than skips."
+    );
+    std::path::PathBuf::from(raw)
+}
+
+/// Audit one converted tier by its safetensors index and headers: exactly the published 644 tensor
+/// names plus a `.scales`/`.biases` pair per packed one, the six `pdd_proj_out.{i}` heads and the
+/// I/O projections dense, the blocks and AdaLN packed, and the heads file a byte copy.
+#[cfg(feature = "cuda")]
+fn audit_image_tier(label: &str, bits: i64) {
+    let tier = image_tiers_root().join(label);
+    let dir = tier.join("transformer_diffusers");
+    let config = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    let cfg: serde_json::Value = serde_json::from_str(&config).unwrap();
+    assert_eq!(cfg["quantization"]["bits"], bits, "{label} marker bits");
+    assert_eq!(cfg["quantization"]["group_size"], 64);
+    let index: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("diffusion_pytorch_model.safetensors.index.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let keys: BTreeSet<String> = index["weight_map"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    let unpacked: BTreeSet<String> = keys
+        .iter()
+        .filter(|k| !k.ends_with(".scales") && !k.ends_with(".biases"))
+        .cloned()
+        .collect();
+    assert_eq!(unpacked.len(), 644, "{label}: the published tensor count");
+    assert!(!unpacked.iter().any(|n| n.contains("audio")));
+    for i in 0..6 {
+        assert!(
+            unpacked.contains(&format!("pdd_proj_out.{i}.weight")),
+            "{label}: head {i} missing"
+        );
+        assert!(
+            !keys.contains(&format!("pdd_proj_out.{i}.scales")),
+            "{label}: pdd_proj_out.{i} was packed"
+        );
+    }
+    for dense in [
+        "proj_in",
+        "context_embedder",
+        "norm_out.linear",
+        "time_embedder.linear_1",
+    ] {
+        assert!(
+            !keys.contains(&format!("{dense}.scales")),
+            "{label}: {dense} was packed"
+        );
+    }
+    assert!(keys.contains("transformer_blocks.0.attn.to_q.scales"));
+    assert!(keys.contains("transformer_blocks.49.adaln_proj.linear.scales"));
+    let heads = image_dit_snapshot().join("pdd_fused_heads.safetensors");
+    if heads.is_file() {
+        assert_eq!(
+            std::fs::read(tier.join("pdd_fused_heads.safetensors")).unwrap(),
+            std::fs::read(&heads).unwrap(),
+            "{label}: pdd_fused_heads.safetensors must be a byte copy"
+        );
+    }
+}
+
+/// Audit the converted tier, then render 2048 x 2048 through the registry's load path at it. The text encoder is
+/// MiniMax-H3's own tier artifact (`MINIMAX_H3_TIER_SNAPSHOT/{tier}/text_encoder`), never a copy
+/// under the image repository. A CUDA out-of-memory error fails the test loudly (the card may be
+/// shared); the packed render needs less than bf16.
+#[cfg(feature = "cuda")]
+fn render_image_tier(label: &str, quant: candle_gen::gen_core::Quant) {
+    use candle_gen::gen_core::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
+
+    let te =
+        std::path::PathBuf::from(std::env::var("MINIMAX_H3_TIER_SNAPSHOT").unwrap_or_default())
+            .join(label)
+            .join("text_encoder");
+    assert!(
+        te.join("config.json").is_file(),
+        "MINIMAX_H3_TIER_SNAPSHOT must hold MiniMax-H3's {label}/text_encoder/ (no {})",
+        te.join("config.json").display()
+    );
+    let mut spec = LoadSpec::new(WeightsSource::Dir(image_dit_snapshot()));
+    spec.quantize = Some(quant);
+    spec.components.insert(
+        "transformer_diffusers".into(),
+        WeightsSource::Dir(image_tiers_root().join(label).join("transformer_diffusers")),
+    );
+    spec.components
+        .insert("text_encoder".into(), WeightsSource::Dir(te));
+    let generator = candle_gen_minimax_h3::image_model::load_image(&spec)
+        .expect("load the minimax_h3_image generator at the packed tier");
+    let req = GenerationRequest {
+        prompt: "A red lighthouse on a rocky coast at dusk, waves breaking, warm light in the \
+                 lantern room, photographed with a 35mm lens"
+            .into(),
+        width: 2048,
+        height: 2048,
+        seed: Some(7093),
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let mut steps = Vec::new();
+    let output = generator
+        .generate(&req, &mut |p| {
+            if let candle_gen::gen_core::Progress::Step { current, .. } = p {
+                steps.push(current)
+            }
+        })
+        .unwrap_or_else(|e| panic!("{label} render failed (a CUDA OOM lands here): {e}"));
+    assert_eq!(steps, vec![1, 2, 3, 4, 5, 6], "one forward per fixed step");
+    let GenerationOutput::Images(images) = output else {
+        panic!("an image generator must return images")
+    };
+    let img = &images[0];
+    assert_eq!((img.width, img.height), (2048, 2048));
+    let n = img.pixels.len() as f64;
+    let mean = img.pixels.iter().map(|&p| f64::from(p)).sum::<f64>() / n;
+    let std = (img
+        .pixels
+        .iter()
+        .map(|&p| (f64::from(p) - mean).powi(2))
+        .sum::<f64>()
+        / n)
+        .sqrt();
+    println!(
+        "2048x2048 {label} render in {:.1} s: mean {mean:.1}, std {std:.1}",
+        started.elapsed().as_secs_f64()
+    );
+    assert!(
+        std > 10.0 && (5.0..250.0).contains(&mean),
+        "degenerate {label} render: mean {mean:.1}, std {std:.1}"
+    );
+    if let Ok(out) = std::env::var("MINIMAX_H3_IMAGE_RENDER_OUT") {
+        image::RgbImage::from_raw(img.width, img.height, img.pixels.clone())
+            .expect("rgb")
+            .save(format!("{out}-{label}.png"))
+            .expect("write the render");
+    }
+}
+
+/// AC1 (candle/CUDA): a 2048 x 2048 render at the q8 tier.
+#[test]
+#[ignore = "needs the converted q8 tier, MINIMAX_H3_IMAGE_SNAPSHOT, MiniMax-H3's q8 text encoder (MINIMAX_H3_TIER_SNAPSHOT) and CUDA; full 2048x2048 render"]
+fn image_t2i_renders_2048_q8_on_cuda() {
+    #[cfg(not(feature = "cuda"))]
+    panic!("the 2048x2048 render runs the DiT on the GPU; build with --features cuda");
+    #[cfg(feature = "cuda")]
+    {
+        render_image_tier("q8", candle_gen::gen_core::Quant::Q8);
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_t2i_renders_2048_q8_on_cuda"
+        );
+    }
+}
+
+/// AC1 (candle/CUDA): a 2048 x 2048 render at the q4 tier.
+#[test]
+#[ignore = "needs the converted q4 tier, MINIMAX_H3_IMAGE_SNAPSHOT, MiniMax-H3's q4 text encoder (MINIMAX_H3_TIER_SNAPSHOT) and CUDA; full 2048x2048 render"]
+fn image_t2i_renders_2048_q4_on_cuda() {
+    #[cfg(not(feature = "cuda"))]
+    panic!("the 2048x2048 render runs the DiT on the GPU; build with --features cuda");
+    #[cfg(feature = "cuda")]
+    {
+        render_image_tier("q4", candle_gen::gen_core::Quant::Q4);
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_t2i_renders_2048_q4_on_cuda"
+        );
+    }
+}

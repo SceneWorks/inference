@@ -23,6 +23,8 @@ set "PYTHONPATH="
 call "%VCVARS%"
 call :run_one image_dit_first_step_matches_the_official_diffusers_transformer || exit /b 1
 call :run_one image_text_to_image_renders_2048_on_cuda || exit /b 1
+rem SW-7093 - then the q8 / q4 tiers: convert, audit and render each.
+call :tiers || exit /b 1
 exit /b 0
 
 :run_one
@@ -30,4 +32,36 @@ set "log=%RUNNER_TEMP%\minimax-h3-image-evidence\%~1.log"
 cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration real_weights::%~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
 type "%log%"
 findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+exit /b 0
+
+:tiers
+rem SW-7093 - MiniMax-H3-Image q8 / q4 DiT tiers on candle/CUDA: convert from the dense snapshot with the
+rem candle converter (the same MLX-affine artifact the MLX lane writes), audit it, and render 2048x2048
+rem through the registered generator at each tier. Called at the end of this script, which has set
+rem the snapshot variables, the hub lock, the CUDA/MSVC environment and REVIEWED_PYTHON. The converted tiers go under the runner's models root
+rem (never to Hugging Face) and are removed after each tier's render. The text encoder at each tier is
+rem MiniMax-H3's existing SceneWorks/minimax-h3-mlx artifact. The card is shared: a render that runs out
+rem of CUDA memory fails loudly here.
+set "MINIMAX_H3_TIER_SNAPSHOT=%CANDLE_GEN_MODELS_ROOT%\models--SceneWorks--minimax-h3-mlx\snapshots\137ce668c55a20bc0935fd1cf2a3de8448abb7f4"
+set "MINIMAX_H3_IMAGE_TIERS_ROOT=%CANDLE_GEN_MODELS_ROOT%\sceneworks-minimax-h3-image-tiers"
+set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+for %%T in (q8 q4) do "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3-mlx-te-%%T --snapshot "%MINIMAX_H3_TIER_SNAPSHOT%" || exit /b 1
+set "PYTHONPATH="
+if exist "%MINIMAX_H3_IMAGE_TIERS_ROOT%" rmdir /s /q "%MINIMAX_H3_IMAGE_TIERS_ROOT%"
+mkdir "%MINIMAX_H3_IMAGE_TIERS_ROOT%" || exit /b 1
+set "MINIMAX_H3_IMAGE_RENDER_OUT=%RUNNER_TEMP%\minimax-h3-image-evidence\t2i-2048"
+for %%T in (q8 q4) do (
+  call :tier %%T || exit /b 1
+)
+exit /b 0
+
+:tier
+set "MINIMAX_H3_IMAGE_SRC=%MINIMAX_H3_IMAGE_SNAPSHOT%"
+set "MINIMAX_H3_IMAGE_OUT=%MINIMAX_H3_IMAGE_TIERS_ROOT%\%~1"
+set "MINIMAX_H3_TIER=%~1"
+set "log=%RUNNER_TEMP%\minimax-h3-image-evidence\convert-%~1.log"
+cargo run --locked --release -p candle-gen-minimax-h3 --example minimax_h3_image_prequant > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+type "%log%"
+call :run_one image_t2i_renders_2048_%~1_on_cuda || exit /b 1
+rmdir /s /q "%MINIMAX_H3_IMAGE_OUT%"
 exit /b 0

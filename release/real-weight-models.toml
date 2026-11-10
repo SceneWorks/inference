@@ -2967,6 +2967,71 @@ expected_files = [
   "q4/transformer_ref/diffusion_pytorch_model.safetensors.index.json",
 ]
 
+# SW-7093 -- MiniMax-H3's **existing** packed text encoder, one row per tier (~31.1 GB q8, ~16.5 GB q4;
+# language-model shards 1-12, the layer-50 tap the image generator reads). Every MiniMax-H3-Image tier
+# resolves its text encoder here, never to a copy in the image repository: the `minimax-h3-image`
+# profile stages `{tier}/text_encoder` of this snapshot as the `text_encoder` component beside the
+# tier's converted DiT.
+[[models]]
+key = "minimax-h3-mlx-te-q8"
+repository = "SceneWorks/minimax-h3-mlx"
+revision = "137ce668c55a20bc0935fd1cf2a3de8448abb7f4"
+license = "MiniMax H3 Community License Agreement"
+size_class = "large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_TIER_SNAPSHOT"]
+download_files = [
+  "q8/text_encoder/config.json",
+  "q8/text_encoder/model.safetensors.index.json",
+  "q8/text_encoder/model-00001-of-00014.safetensors",
+  "q8/text_encoder/model-00002-of-00014.safetensors",
+  "q8/text_encoder/model-00003-of-00014.safetensors",
+  "q8/text_encoder/model-00004-of-00014.safetensors",
+  "q8/text_encoder/model-00005-of-00014.safetensors",
+  "q8/text_encoder/model-00006-of-00014.safetensors",
+  "q8/text_encoder/model-00007-of-00014.safetensors",
+  "q8/text_encoder/model-00008-of-00014.safetensors",
+  "q8/text_encoder/model-00009-of-00014.safetensors",
+  "q8/text_encoder/model-00010-of-00014.safetensors",
+  "q8/text_encoder/model-00011-of-00014.safetensors",
+  "q8/text_encoder/model-00012-of-00014.safetensors",
+]
+expected_files = [
+  "q8/text_encoder/config.json",
+  "q8/text_encoder/model-00001-of-00014.safetensors",
+  "q8/text_encoder/model-00012-of-00014.safetensors",
+]
+
+[[models]]
+key = "minimax-h3-mlx-te-q4"
+repository = "SceneWorks/minimax-h3-mlx"
+revision = "137ce668c55a20bc0935fd1cf2a3de8448abb7f4"
+license = "MiniMax H3 Community License Agreement"
+size_class = "large"
+profiles = ["media-macos", "media-cuda"]
+environment = ["MINIMAX_H3_TIER_SNAPSHOT"]
+download_files = [
+  "q4/text_encoder/config.json",
+  "q4/text_encoder/model.safetensors.index.json",
+  "q4/text_encoder/model-00001-of-00014.safetensors",
+  "q4/text_encoder/model-00002-of-00014.safetensors",
+  "q4/text_encoder/model-00003-of-00014.safetensors",
+  "q4/text_encoder/model-00004-of-00014.safetensors",
+  "q4/text_encoder/model-00005-of-00014.safetensors",
+  "q4/text_encoder/model-00006-of-00014.safetensors",
+  "q4/text_encoder/model-00007-of-00014.safetensors",
+  "q4/text_encoder/model-00008-of-00014.safetensors",
+  "q4/text_encoder/model-00009-of-00014.safetensors",
+  "q4/text_encoder/model-00010-of-00014.safetensors",
+  "q4/text_encoder/model-00011-of-00014.safetensors",
+  "q4/text_encoder/model-00012-of-00014.safetensors",
+]
+expected_files = [
+  "q4/text_encoder/config.json",
+  "q4/text_encoder/model-00001-of-00014.safetensors",
+  "q4/text_encoder/model-00012-of-00014.safetensors",
+]
+
 # ── MiniMax-H3 Veda dense-vs-sparse A/B inputs (epic sc-25140, sc-25777) ─────────────────────────
 #
 # Dispatch-only `.github/workflows/veda-ab-cuda.yml` materializes these as plain directories (real

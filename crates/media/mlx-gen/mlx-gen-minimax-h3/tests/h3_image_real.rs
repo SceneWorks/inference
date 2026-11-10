@@ -294,3 +294,207 @@ fn h3_image_t2i_renders_2048_bf16() {
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED h3_image_real::h3_image_t2i_renders_2048_bf16");
 }
+
+// ---- SW-7093: the q8 / q4 DiT tiers ---------------------------------------------------------
+
+/// Where the converter wrote the tiers: `<root>/{q8,q4}/transformer_diffusers/` plus
+/// `<root>/{q8,q4}/pdd_fused_heads.safetensors` (`MINIMAX_H3_IMAGE_TIERS_ROOT`).
+fn tiers_root() -> PathBuf {
+    let raw = std::env::var("MINIMAX_H3_IMAGE_TIERS_ROOT").unwrap_or_default();
+    assert!(
+        !raw.is_empty(),
+        "MINIMAX_H3_IMAGE_TIERS_ROOT must point at the converter's output (the \
+         `minimax_h3_prequant` example with MINIMAX_H3_COMPONENT=image_dit). This test is \
+         #[ignore]d and asserts rather than skips."
+    );
+    PathBuf::from(raw)
+}
+
+/// Audit a converted tier's index: the tier carries exactly the published 644 tensor names plus a
+/// `.scales` / `.biases` pair for every packed one; the six `pdd_proj_out.{i}` heads and the I/O
+/// projections are dense float32 / unpacked; the blocks are packed; the heads file is copied
+/// byte for byte.
+fn audit_tier(label: &str, bits: i32) {
+    let tier = tiers_root().join(label);
+    let dir = tier.join(IMAGE_DIT_COMPONENT);
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(cfg["quantization"]["bits"], bits, "{label} marker bits");
+    assert_eq!(cfg["quantization"]["group_size"], 64);
+    let index: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("diffusion_pytorch_model.safetensors.index.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let keys: std::collections::BTreeSet<String> = index["weight_map"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    let published: std::collections::BTreeSet<String> = MiniMaxH3ImageDit::names(
+        &MiniMaxH3ImageDitConfig::from_diffusers_json(
+            &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        )
+        .unwrap(),
+    )
+    .into_iter()
+    .collect();
+    assert_eq!(published.len(), PUBLISHED_IMAGE_DIT_TENSORS);
+    let unpacked: std::collections::BTreeSet<String> = keys
+        .iter()
+        .filter(|k| !k.ends_with(".scales") && !k.ends_with(".biases"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        unpacked, published,
+        "{label}: tensor names vs the published set"
+    );
+    for i in 0..6 {
+        assert!(
+            !keys.contains(&format!("pdd_proj_out.{i}.scales")),
+            "{label}: pdd_proj_out.{i} was packed"
+        );
+    }
+    for dense in [
+        "proj_in",
+        "context_embedder",
+        "norm_out.linear",
+        "time_embedder.linear_1",
+    ] {
+        assert!(
+            !keys.contains(&format!("{dense}.scales")),
+            "{label}: {dense} was packed"
+        );
+    }
+    assert!(
+        keys.contains("transformer_blocks.0.attn.to_q.scales"),
+        "{label}: blocks not packed"
+    );
+    assert!(keys.contains("transformer_blocks.49.adaln_proj.linear.scales"));
+    let w = Weights::from_dir(&dir).unwrap();
+    for i in 0..6 {
+        assert_eq!(
+            w.require(&format!("pdd_proj_out.{i}.weight"))
+                .unwrap()
+                .dtype(),
+            Dtype::Float32,
+            "{label}: head {i} is dense float32"
+        );
+    }
+    let heads = image_snapshot().join("pdd_fused_heads.safetensors");
+    if heads.is_file() {
+        assert_eq!(
+            std::fs::read(tier.join("pdd_fused_heads.safetensors")).unwrap(),
+            std::fs::read(&heads).unwrap(),
+            "{label}: pdd_fused_heads.safetensors must be a byte copy"
+        );
+    }
+}
+
+/// Audit the converted tier, then render 2048² through the registered generator at it. The text encoder is MiniMax-H3's
+/// own tier artifact from `SceneWorks/minimax-h3-mlx` (`MINIMAX_H3_TIER_SNAPSHOT/{tier}/text_encoder`,
+/// AC2) -- never a copy under the image repository.
+fn render_tier(label: &str, quant: mlx_gen::gen_core::Quant) {
+    // AC1 (converter): the tier keeps the heads dense and packs the blocks.
+    audit_tier(label, quant.bits());
+    let root = image_snapshot();
+    let te = PathBuf::from(std::env::var("MINIMAX_H3_TIER_SNAPSHOT").unwrap_or_default())
+        .join(label)
+        .join("text_encoder");
+    assert!(
+        te.join("config.json").is_file(),
+        "MINIMAX_H3_TIER_SNAPSHOT must hold MiniMax-H3's {label}/text_encoder/ (found no {})",
+        te.join("config.json").display()
+    );
+    let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+    spec.quantize = Some(quant);
+    spec.components.insert(
+        IMAGE_DIT_COMPONENT.to_owned(),
+        WeightsSource::Dir(tiers_root().join(label).join(IMAGE_DIT_COMPONENT)),
+    );
+    spec.components
+        .insert(TEXT_ENCODER_COMPONENT.to_owned(), WeightsSource::Dir(te));
+    let registry = mlx_gen_minimax_h3::h3_image::register_providers(
+        mlx_gen::gen_core::ProviderRegistryBuilder::new(),
+    )
+    .build()
+    .unwrap();
+    let registration = registry
+        .generators()
+        .find(|g| (g.descriptor)().id == "minimax_h3_image")
+        .expect("minimax_h3_image is registered");
+    let generator = (registration.load)(&spec).unwrap();
+    let req = GenerationRequest {
+        prompt: "A lighthouse on a rocky coast at dusk, warm light in the lamp room, waves \
+                 breaking on the rocks, detailed photograph"
+            .into(),
+        width: 2048,
+        height: 2048,
+        count: 1,
+        seed: Some(7093),
+        ..Default::default()
+    };
+    generator.validate(&req).unwrap();
+    let started = std::time::Instant::now();
+    let mut steps = 0u32;
+    let out = generator
+        .generate(&req, &mut |p| {
+            if let mlx_gen::gen_core::Progress::Step { current, .. } = p {
+                steps = current;
+            }
+        })
+        .unwrap();
+    let GenerationOutput::Images(images) = out else {
+        panic!("minimax_h3_image must return images");
+    };
+    let image = &images[0];
+    assert_eq!((image.width, image.height), (2048, 2048));
+    assert_eq!(steps, 6);
+    let n = image.pixels.len() as f64;
+    let mean = image.pixels.iter().map(|&p| p as f64).sum::<f64>() / n;
+    let std = (image
+        .pixels
+        .iter()
+        .map(|&p| (p as f64 - mean).powi(2))
+        .sum::<f64>()
+        / n)
+        .sqrt();
+    println!(
+        "minimax_h3_image 2048² {label} render in {:.1} s: pixel mean {mean:.2}, std {std:.2}",
+        started.elapsed().as_secs_f64()
+    );
+    assert!(
+        std > 10.0,
+        "the {label} render is near-constant (std {std:.2})"
+    );
+    if let Ok(out) = std::env::var("MINIMAX_H3_IMAGE_RENDER_OUT") {
+        if !out.is_empty() {
+            image::save_buffer(
+                format!("{out}-{label}.png"),
+                &image.pixels,
+                image.width,
+                image.height,
+                image::ColorType::Rgb8,
+            )
+            .unwrap();
+        }
+    }
+    crate::model_inference_device::record_model_inference_device();
+}
+
+/// AC1: a 2048² render at the q8 tier.
+#[test]
+#[ignore = "needs the converted q8 tier, MINIMAX_H3_IMAGE_SNAPSHOT and MiniMax-H3's q8 text encoder (MINIMAX_H3_TIER_SNAPSHOT); full 2048² render"]
+fn h3_image_t2i_renders_2048_q8() {
+    render_tier("q8", mlx_gen::gen_core::Quant::Q8);
+    println!("MODEL_INFERENCE_BODY_COMPLETED h3_image_real::h3_image_t2i_renders_2048_q8");
+}
+
+/// AC1: a 2048² render at the q4 tier.
+#[test]
+#[ignore = "needs the converted q4 tier, MINIMAX_H3_IMAGE_SNAPSHOT and MiniMax-H3's q4 text encoder (MINIMAX_H3_TIER_SNAPSHOT); full 2048² render"]
+fn h3_image_t2i_renders_2048_q4() {
+    render_tier("q4", mlx_gen::gen_core::Quant::Q4);
+    println!("MODEL_INFERENCE_BODY_COMPLETED h3_image_real::h3_image_t2i_renders_2048_q4");
+}

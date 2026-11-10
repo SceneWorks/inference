@@ -348,7 +348,7 @@ ArtifactInput,
 /// here — because that is the shape `mlx_gen_minimax_h3::model::reconcile_tier` takes: the reconcile
 /// is what the third state switches off, while the directory probe and the group-size validation run
 /// either way.
-fn require_partition(dir: &Path, tier: Option<Tier>, component: &str) -> Result<()> {
+pub(crate) fn require_partition(dir: &Path, tier: Option<Tier>, component: &str) -> Result<()> {
     require_component_dir(dir, tier, component)?;
     if let Some(tier) = tier {
         reconcile_tier(dir, tier, component)?;
