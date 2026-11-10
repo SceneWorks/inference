@@ -156,6 +156,9 @@ impl AdaptableHost for DitBlockStream {
     }
 }
 
+/// The AdaLN projection's leaf path inside a block.
+pub const ADALN_LEAF: &str = "adaln_proj.linear";
+
 /// The logical `[out, in]` shape of one adaptable block leaf, or `None` for a path that is not one
 /// of [`crate::adapters::BLOCK_TARGETS`].
 fn block_leaf_shape(cfg: &MiniMaxH3DitConfig, leaf: &str) -> Option<(&'static str, [i32; 2])> {
@@ -169,6 +172,9 @@ fn block_leaf_shape(cfg: &MiniMaxH3DitConfig, leaf: &str) -> Option<(&'static st
         "attn.to_out.0" => ("attn.to_out.0", [hidden, inner]),
         "ff.net.0.proj" => ("ff.net.0.proj", [2 * ffn, hidden]),
         "ff.net.2" => ("ff.net.2", [hidden, ffn]),
+        // SW-7096: the AdaLN projection — re-applied by `materialize_adaln`, not by the body
+        // rebuild. Only a host that admits AdaLN adapters (the image DiT) routes here.
+        ADALN_LEAF => (ADALN_LEAF, [cfg.adaln_out_features(), cfg.time_embed_dim]),
         _ => return None,
     };
     Some((name, shape))
@@ -224,7 +230,7 @@ impl DitBlockStream {
     /// Push block `index`'s held residuals onto its freshly rebuilt `block`.
     fn install_adapters(&self, block: &mut DitBlock, index: usize) -> Result<()> {
         for ((_, leaf), slot) in self.adapters.slots.range((index, "")..(index + 1, "")) {
-            if slot.adapters().is_empty() {
+            if slot.adapters().is_empty() || *leaf == ADALN_LEAF {
                 continue;
             }
             let segs: Vec<&str> = leaf.split('.').collect();
@@ -289,7 +295,14 @@ impl DitBlockStream {
     /// call this — see the module docs.
     pub fn materialize_adaln(&self, view: &mut Weights, index: usize) -> Result<AdaLnProjection> {
         let prefix = format!("transformer_blocks.{index}.adaln_proj.linear");
-        let projection = AdaLnProjection::from_weights(view, &prefix, &self.cfg, self.dtype)?;
+        let mut projection = AdaLnProjection::from_weights(view, &prefix, &self.cfg, self.dtype)?;
+        // SW-7096: an AdaLN residual is re-applied here, so the windowed precompute's tables
+        // carry it exactly as the resident precompute's do.
+        if let Some(slot) = self.adapters.slots.get(&(index, ADALN_LEAF)) {
+            for adapter in slot.adapters() {
+                projection.linear_mut().push(adapter.clone());
+            }
+        }
         // sc-23402: the projection's two source tensors, forced and GPU-verified (sc-22414) before
         // the precompute consumes them and the prefix is drained.
         view.materialize_accessed()?;
@@ -441,7 +454,6 @@ mod tests {
         }
         for unmatched in [
             "transformer_blocks.50.attn.to_q",
-            "transformer_blocks.0.adaln_proj.linear",
             "transformer_blocks.0.attn.qkv_proj",
             "token_refiner.refiner_blocks.0.attn.to_q",
             "proj_in",
@@ -449,6 +461,12 @@ mod tests {
             let segs: Vec<&str> = unmatched.split('.').collect();
             assert!(stream.adaptable_mut(&segs).is_none(), "{unmatched}");
         }
+        // SW-7096: the AdaLN projection has a slot too, re-applied by `materialize_adaln`; the video
+        // host keeps it unreachable, the image host routes to it.
+        let adaln = stream
+            .adaptable_mut(&["transformer_blocks", "7", "adaln_proj", "linear"])
+            .expect("adaln slot");
+        assert_eq!(adaln.base_shape(), vec![96768, 2688]);
         assert!(
             stream.adapters().is_empty(),
             "creating slots holds no residual"

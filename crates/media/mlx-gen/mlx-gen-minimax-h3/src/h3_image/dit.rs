@@ -181,29 +181,82 @@ pub fn velocity_euler_delta(timesteps: &[f32], step: usize) -> Result<f32> {
     Ok(sigma(step) - sigma(step + 1))
 }
 
-/// The image DiT's LoRA target surface (SW-7096): `transformer_blocks.{i}.…` and
-/// `token_refiner.…`, the same diffusers module names H3 video's DiT exposes, because the image
-/// DiT runs H3's own [`DitBlock`] and [`TokenRefiner`]. The input/output projections are raw
-/// weight/bias pairs and are not adapter-addressable, as on H3 video.
+/// The image DiT's LoRA target surface (SW-7096): **every linear layer it has**, under the
+/// `MiniMaxH3ImageTransformer2DModel` (diffusers) module names a PEFT/diffusers LoRA uses:
+///
+/// | path | module |
+/// | --- | --- |
+/// | `transformer_blocks.{i}.attn.{to_q,to_k,to_v,to_out.0}`, `….ff.net.{0.proj,2}` | block leaves |
+/// | `transformer_blocks.{i}.adaln_proj.linear` | the block's AdaLN projection |
+/// | `token_refiner.refiner_blocks.{i}.…` | refiner leaves (its only linears) |
+/// | `proj_in`, `context_embedder` | input projections |
+/// | `time_embedder.linear_1`, `time_embedder.linear_2` | the timestep MLP |
+/// | `norm_out.linear` | the final AdaLN projection |
+/// | `pdd_proj_out.{i}` | per-step output head `i` |
+///
+/// `pdd_proj_out` is an `nn.ModuleList` in the reference, so PEFT addresses each head on its own
+/// and a LoRA on head `i` changes only step `i`'s output; there is no `proj_out` module, so a
+/// `proj_out` target names no module and is refused, as PEFT would fail to inject it.
+///
+/// **The AdaLN cache stays exact.** The image denoiser enumerates its six timesteps up front and
+/// precomputes every block's modulation (and `norm_out`'s) from `time_embedder` once, then evicts
+/// `adaln_proj`. Adapters are installed when the DiT is mapped for a render, before
+/// [`ImageDenoiser::new`] runs that precompute, so the tables are computed **with** every
+/// `time_embedder` / `adaln_proj` / `norm_out` residual applied; a new adapter set means a new
+/// load and therefore a new precompute.
 impl AdaptableHost for MiniMaxH3ImageDit {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
+            ["transformer_blocks", i, "adaln_proj", "linear"] => {
+                let idx: usize = i.parse().ok()?;
+                self.blocks.get_mut(idx)?.adaln_linear_mut()
+            }
             ["transformer_blocks", i, rest @ ..] => {
                 let idx: usize = i.parse().ok()?;
                 self.blocks.get_mut(idx)?.adaptable_mut(rest)
             }
             ["token_refiner", rest @ ..] => self.refiner.adaptable_mut(rest),
+            ["proj_in"] => self.projections.proj_in.adaptable_mut(),
+            ["context_embedder"] => self.projections.context_embedder.adaptable_mut(),
+            ["time_embedder", linear] => self
+                .projections
+                .time_embedder
+                .linear_mut(linear)?
+                .adaptable_mut(),
+            ["norm_out", "linear"] => self.projections.norm_out.linear_mut()?.adaptable_mut(),
+            ["pdd_proj_out", i] => {
+                let idx: usize = i.parse().ok()?;
+                self.projections.pdd_heads.head_mut(idx)?.adaptable_mut()
+            }
             _ => None,
         }
     }
 }
 
-/// The image checkpoint is the full timestep-MLP topology: `adaln_proj` exists as weights and is
-/// not adapter-addressable, exactly as on H3 video's full path.
+/// Every linear of the image DiT is addressable, so an unmatched target is reported as naming no
+/// module (see [`crate::adapters::AdaLnSurface::ImageAllLinears`]).
 impl crate::adapters::MiniMaxH3AdapterHost for MiniMaxH3ImageDit {
     fn adapter_surface(&self) -> crate::adapters::AdaLnSurface {
-        crate::adapters::AdaLnSurface::FullTimestepMlp
+        crate::adapters::AdaLnSurface::ImageAllLinears
     }
+}
+
+/// Every module path an adapter can address on the image DiT at `cfg` (SW-7096).
+pub fn image_adapter_target_paths(cfg: &MiniMaxH3ImageDitConfig) -> Vec<String> {
+    let mut v = crate::adapters::adapter_target_paths(&cfg.base);
+    v.extend((0..cfg.base.num_layers).map(|i| format!("transformer_blocks.{i}.adaln_proj.linear")));
+    v.extend(
+        [
+            "proj_in",
+            "context_embedder",
+            "time_embedder.linear_1",
+            "time_embedder.linear_2",
+            "norm_out.linear",
+        ]
+        .map(String::from),
+    );
+    v.extend((0..cfg.num_pdd_heads).map(|i| format!("pdd_proj_out.{i}")));
+    v
 }
 
 /// The image DiT as the fixed 6-step sampler's velocity model: everything constant across a

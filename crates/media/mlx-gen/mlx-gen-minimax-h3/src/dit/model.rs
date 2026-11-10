@@ -726,6 +726,12 @@ impl AdaptableHost for MiniMaxH3Dit {
                 // SW-7096: a deferred load holds no blocks; its residuals go to the stream, which
                 // re-applies them to each block a window rebuilds.
                 if let Some(stream) = self.stream.as_mut() {
+                    // The video surface keeps `adaln_proj` non-addressable (sc-26688), on both
+                    // residency modes, so a deferred load must not admit what a resident one
+                    // refuses.
+                    if rest.first() == Some(&"adaln_proj") {
+                        return None;
+                    }
                     return stream.adaptable_mut(path);
                 }
                 let idx: usize = i.parse().ok()?;

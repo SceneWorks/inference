@@ -182,6 +182,11 @@ pub enum AdaLnSurface {
     /// Curve topology: the timestep MLP is absent and the reduced projections live in the curve
     /// runtime. Body leaves (attention/FFN) are unchanged.
     PrunedCurve,
+    /// MiniMax-H3-Image (SW-7096): every linear layer of the image DiT is adapter-addressable —
+    /// the block and refiner leaves, each block's `adaln_proj.linear`, `proj_in`,
+    /// `context_embedder`, `time_embedder.linear_{1,2}`, `norm_out.linear` and every
+    /// `pdd_proj_out.{i}` head — so an unmatched target names no module at all.
+    ImageAllLinears,
 }
 
 /// The AdaLN stems a full-topology adapter may name that are never adapter-addressable, paired
@@ -248,10 +253,15 @@ pub enum UnmatchedTargetClass {
 
 /// Classify one normalized, matched-nothing module stem against the checkpoint's surface.
 pub fn classify_unmatched_target(path: &str, surface: AdaLnSurface) -> UnmatchedTargetClass {
+    if surface == AdaLnSurface::ImageAllLinears {
+        return UnmatchedTargetClass::NoSuchModule;
+    }
     if is_adaln_surface_target(path) {
         return match surface {
             AdaLnSurface::PrunedCurve => UnmatchedTargetClass::PrunedCurveTopologyMismatch,
-            AdaLnSurface::FullTimestepMlp => UnmatchedTargetClass::DeliberatelyExcluded,
+            AdaLnSurface::FullTimestepMlp | AdaLnSurface::ImageAllLinears => {
+                UnmatchedTargetClass::DeliberatelyExcluded
+            }
         };
     }
     if is_known_non_adapter_module(path) {
@@ -396,6 +406,26 @@ pub fn adapter_target_paths(cfg: &MiniMaxH3DitConfig) -> Vec<String> {
                 .map(|t| format!("token_refiner.refiner_blocks.{i}.{t}")),
         );
     }
+    v
+}
+
+/// Every module path an adapter can address on the **image** DiT (SW-7096): the body surface of
+/// [`adapter_target_paths`] plus each block's `adaln_proj.linear`, `proj_in`, `context_embedder`,
+/// `time_embedder.linear_{1,2}`, `norm_out.linear` and every `pdd_proj_out.{i}` head.
+pub fn image_adapter_target_paths(cfg: &MiniMaxH3DitConfig) -> Vec<String> {
+    let mut v = adapter_target_paths(cfg);
+    v.extend((0..cfg.num_layers).map(|i| format!("transformer_blocks.{i}.adaln_proj.linear")));
+    v.extend(
+        [
+            "proj_in",
+            "context_embedder",
+            "time_embedder.linear_1",
+            "time_embedder.linear_2",
+            "norm_out.linear",
+        ]
+        .map(String::from),
+    );
+    v.extend((0..cfg.num_pdd_heads().unwrap_or(0)).map(|i| format!("pdd_proj_out.{i}")));
     v
 }
 
@@ -1069,7 +1099,11 @@ fn apply_one_lokr(
     }
 
     let device = host.device().clone();
-    let paths = adapter_target_paths(&host.config().clone());
+    let paths = if host.adapter_surface() == AdaLnSurface::ImageAllLinears {
+        image_adapter_target_paths(&host.config().clone())
+    } else {
+        adapter_target_paths(&host.config().clone())
+    };
     let mut matched = BTreeSet::new();
     for path in paths {
         let segments = path.split('.').collect::<Vec<_>>();

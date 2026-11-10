@@ -316,3 +316,172 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda() {
         "\nMODEL_INFERENCE_BODY_COMPLETED h3_image_lora_real::h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda"
     );
 }
+
+/// One PEFT file of rank-[`RANK`] factors on `targets` (`(module path, out, in)`), alpha = rank.
+fn write_targets(dir: &Path, name: &str, targets: &[(&str, usize, usize)], seed: u32) -> PathBuf {
+    let mut t = Vec::new();
+    for (k, (path, out, inp)) in targets.iter().enumerate() {
+        let s = seed + 10 * k as u32;
+        t.push((
+            format!("transformer.{path}.lora_A.weight"),
+            seeded(&[RANK, *inp], s),
+        ));
+        t.push((
+            format!("transformer.{path}.lora_B.weight"),
+            seeded(&[*out, RANK], s + 1),
+        ));
+    }
+    let path = dir.join(name);
+    write(&path, &t, &[("alpha", &RANK.to_string())]);
+    path
+}
+
+/// Velocities at `steps` from a freshly loaded image DiT carrying `specs` — load, install,
+/// precompute (with the adapters applied), forward, release.
+fn velocities(
+    root: &Path,
+    device: &Device,
+    specs: &[AdapterSpec],
+    steps: &[usize],
+) -> Vec<Vec<f32>> {
+    use candle_gen_minimax_h3::dit::ImageDit;
+    use candle_gen_minimax_h3::{ImageLayout, ImageVelocity};
+    let mut dit =
+        MiniMaxH3Dit::load_from_dir(root.join("transformer_diffusers"), device, DType::BF16)
+            .expect("load the image DiT");
+    if !specs.is_empty() {
+        apply_minimax_h3_adapters(&mut dit, specs).expect("install");
+    }
+    let cfg = dit.config().clone();
+    let layout = ImageLayout::text_to_image(8, 16, 16, cfg.patch_size).expect("layout");
+    let context = seeded(&[1, 8, cfg.text_dim], 21)
+        .affine(50.0, 0.0)
+        .and_then(|t| t.to_dtype(DType::BF16))
+        .and_then(|t| t.to_device(device))
+        .unwrap();
+    let schedule = gen_core_h3::h3_schedule::SigmaSchedule::h3_image_distilled().unwrap();
+    let rows_n = layout.num_image_rows();
+    let patch_dim = cfg.in_channels * cfg.patch_size.iter().product::<usize>();
+    let rows = seeded(&[1, rows_n, patch_dim], 23)
+        .affine(50.0, 0.0)
+        .and_then(|t| t.to_device(device))
+        .unwrap();
+    let mut model = ImageDit::new(dit, &layout, &context, schedule.timesteps()).expect("ImageDit");
+    let out = steps
+        .iter()
+        .map(|&step| {
+            let v = model.forward(step, &rows).expect("forward");
+            v.to_dtype(DType::F32)
+                .and_then(|v| v.flatten_all())
+                .and_then(|v| v.to_vec1::<f32>())
+                .unwrap()
+        })
+        .collect();
+    drop(model);
+    candle_gen_minimax_h3::release_device_memory(device).unwrap();
+    out
+}
+
+fn rel1(a: &[f32], b: &[f32]) -> f32 {
+    rel(&[a.to_vec()], &[b.to_vec()])
+}
+
+/// SW-7096, the non-body linears on candle/CUDA: a LoRA on `pdd_proj_out.2` moves step 2 and not
+/// step 0; LoRAs on block 0's `adaln_proj.linear`, `time_embedder.linear_2`, `norm_out.linear`
+/// (kohya-spelled) plus `proj_in` / `context_embedder` move step 0, so the AdaLN precompute carried
+/// them; a `proj_out` target names no module and is refused by name.
+#[test]
+#[ignore = "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT) and CUDA; three 66 GB bf16 DiT loads"]
+fn h3_image_adaln_and_output_head_loras_reach_the_denoiser_cuda() {
+    let root = image_snapshot();
+    let dir = scratch();
+    let device = candle_gen::default_device().expect("a candle device");
+    let cfg = MiniMaxH3DitConfig::from_image_diffusers_json(
+        &std::fs::read_to_string(root.join("transformer_diffusers").join("config.json")).unwrap(),
+    )
+    .unwrap();
+    let hidden = cfg.hidden_size;
+    let patch_dim = cfg.in_channels * cfg.patch_size.iter().product::<usize>();
+    let bare = velocities(&root, &device, &[], &[0, 2]);
+
+    let head = write_targets(
+        dir.path(),
+        "head.safetensors",
+        &[("pdd_proj_out.2", patch_dim, hidden)],
+        31,
+    );
+    let with_head = velocities(&root, &device, &[spec(head, 20.0)], &[0, 2]);
+    let (moved_2, moved_0) = (rel1(&with_head[1], &bare[1]), rel1(&with_head[0], &bare[0]));
+    println!("[sw-7096 candle] pdd_proj_out.2 LoRA moves step 2 by {moved_2:.3e}, step 0 by {moved_0:.3e}");
+    assert!(
+        moved_2 > 1e-3,
+        "the head LoRA must move step 2, got {moved_2:.3e}"
+    );
+    assert!(
+        moved_0 <= moved_2 / 100.0,
+        "a LoRA on head 2 must not touch step 0 ({moved_0:.3e})"
+    );
+
+    let io = write_targets(
+        dir.path(),
+        "io.safetensors",
+        &[
+            (
+                "time_embedder.linear_2",
+                cfg.time_embed_dim,
+                cfg.time_embed_hidden_dim,
+            ),
+            ("proj_in", hidden, patch_dim),
+            ("context_embedder", hidden, cfg.text_dim),
+        ],
+        41,
+    );
+    let mut t = Vec::new();
+    for (k, (stem, out, inp)) in [
+        (
+            "lora_unet_transformer_blocks_0_adaln_proj_linear",
+            cfg.adaln_out_features(),
+            cfg.time_embed_dim,
+        ),
+        ("lora_unet_norm_out_linear", 2 * hidden, cfg.time_embed_dim),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let s = 51 + 10 * k as u32;
+        t.push((format!("{stem}.lora_down.weight"), seeded(&[RANK, inp], s)));
+        t.push((
+            format!("{stem}.lora_up.weight"),
+            seeded(&[out, RANK], s + 1),
+        ));
+        t.push((format!("{stem}.alpha"), scalar(RANK as f32)));
+    }
+    let adaln = dir.path().join("adaln-kohya.safetensors");
+    write(&adaln, &t, &[("ss_network_module", "networks.lora")]);
+    let with_adaln = velocities(&root, &device, &[spec(io, 20.0), spec(adaln, 20.0)], &[0]);
+    let moved = rel1(&with_adaln[0], &bare[0]);
+    println!("[sw-7096 candle] AdaLN + I/O LoRAs move step 0 by {moved:.3e}");
+    assert!(
+        moved > 1e-3,
+        "the AdaLN/I-O LoRAs must move step 0, got {moved:.3e}"
+    );
+
+    let missing = write_targets(
+        dir.path(),
+        "proj-out.safetensors",
+        &[("proj_out", patch_dim, hidden)],
+        61,
+    );
+    let mut dit =
+        MiniMaxH3Dit::load_from_dir(root.join("transformer_diffusers"), &device, DType::BF16)
+            .expect("load the image DiT");
+    let error = apply_minimax_h3_adapters(&mut dit, &[spec(missing, 1.0)])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("proj_out"), "{error}");
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED h3_image_lora_real::h3_image_adaln_and_output_head_loras_reach_the_denoiser_cuda"
+    );
+}

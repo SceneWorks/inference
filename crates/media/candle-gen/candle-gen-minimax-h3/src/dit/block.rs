@@ -126,13 +126,40 @@ pub struct AdaLnProjection {
     /// load-bearing (see [`Self::forward`]).
     compute_dtype: DType,
     hidden_size: usize,
+    /// Forward-time LoRA/LoKr residuals (SW-7096), in a residual-only slot. Only the image DiT
+    /// routes an install here; installed before the precompute, they are part of every table.
+    adapters: Option<Box<LinearNoBias>>,
 }
 
 impl AdaLnProjection {
     pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
         let mut copy = self.clone();
         copy.inner = copy.inner.copy_to_device(device)?;
+        copy.adapters = self
+            .adapters
+            .as_ref()
+            .map(|slot| slot.copy_to_device(device).map(Box::new))
+            .transpose()?;
         Ok(copy)
+    }
+
+    /// The adapter slot (SW-7096), created on first use at `[out, time_embed_dim]` on `device`
+    /// — the device this projection's base lives on.
+    pub fn adaptable_mut(
+        &mut self,
+        device: &candle_gen::candle_core::Device,
+    ) -> Option<&mut LinearNoBias> {
+        if self.adapters.is_none() {
+            let slot = LinearNoBias::residual_slot(
+                self.time_embed_dim(),
+                self.out_features(),
+                self.compute_dtype,
+                device,
+            )
+            .ok()?;
+            self.adapters = Some(Box::new(slot));
+        }
+        self.adapters.as_deref_mut()
     }
 
     /// The width of the timestep embedding this projection consumes — `time_embed_dim`, 2688
@@ -185,6 +212,7 @@ impl AdaLnProjection {
             base_bytes: loaded.base_bytes,
             compute_dtype: dtype,
             hidden_size: cfg.hidden_size,
+            adapters: None,
         })
     }
 
@@ -214,6 +242,10 @@ impl AdaLnProjection {
         }
         let activated = silu(temb)?.to_dtype(self.compute_dtype)?;
         let projected = self.inner.forward_upcast(&activated)?;
+        let projected = match &self.adapters {
+            Some(slot) => slot.add_residuals(&activated, projected)?,
+            None => projected,
+        };
 
         // `view(-1, 6·hidden)` BEFORE the chunk: modality becomes a row axis, not a column one.
         let rows = steps * MODALITY_NUM;
@@ -445,6 +477,18 @@ impl DitBlock {
     pub fn clear_adapters(&mut self) {
         self.attn.clear_adapters();
         self.ff.clear_adapters();
+        if let Some(p) = self.adaln_proj.as_mut() {
+            p.adapters = None;
+        }
+    }
+
+    /// This block's AdaLN projection slot for an adapter install (SW-7096); `None` once evicted
+    /// or on a pruned block. Only the image DiT's host routes here.
+    pub fn adaln_adaptable_mut(
+        &mut self,
+        device: &candle_gen::candle_core::Device,
+    ) -> Option<&mut LinearNoBias> {
+        self.adaln_proj.as_mut()?.adaptable_mut(device)
     }
 
     /// Take the AdaLN projection out of the block, **returning** it so the caller controls the drop
@@ -586,6 +630,99 @@ impl DitBlock {
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
+
+    /// SW-7096: an AdaLN projection carrying a LoRA projects the tables its MERGED weight would, so
+    /// the image precompute (run after the install) caches the adapted tables.
+    #[test]
+    fn an_adaln_lora_projects_the_tables_its_merged_weight_would() {
+        let cfg = MiniMaxH3DitConfig {
+            hidden_size: 8,
+            time_embed_dim: 6,
+            ..MiniMaxH3DitConfig::default()
+        };
+        let (out, inp, r) = (cfg.adaln_out_features(), cfg.time_embed_dim, 2);
+        let seeded = |shape: &[usize], seed: u32| {
+            let n: usize = shape.iter().product();
+            let v: Vec<f32> = (0..n as u32)
+                .map(|i| {
+                    ((i.wrapping_mul(2_654_435_761) ^ seed.wrapping_mul(40_503)) % 997) as f32
+                        / 997.0
+                        - 0.5
+                })
+                .collect();
+            Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
+        };
+        let (w, b) = (seeded(&[out, inp], 1), seeded(&[out], 2));
+        let (down, up) = (seeded(&[r, inp], 3), seeded(&[out, r], 4));
+        let load = |weight: Tensor| {
+            let map = std::collections::HashMap::from([
+                ("p.weight".to_string(), weight),
+                ("p.bias".to_string(), b.clone()),
+            ]);
+            AdaLnProjection::from_weights(&Weights::from_map(map), "p", &cfg, DType::F32).unwrap()
+        };
+        let temb = seeded(&[3, inp], 5);
+        let mut adapted = load(w.clone());
+        adapted
+            .adaptable_mut(&Device::Cpu)
+            .unwrap()
+            .push_lora(
+                down.t().unwrap().contiguous().unwrap(),
+                up.t().unwrap().contiguous().unwrap(),
+                0.5,
+            )
+            .unwrap();
+        let merged = load((&w + up.matmul(&down).unwrap().affine(0.5, 0.0).unwrap()).unwrap());
+        let bare = load(w);
+        let diff = |a: &Tensor, b: &Tensor| {
+            (a - b)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+        };
+        let (g, m, z) = (
+            adapted.forward(&temb).unwrap(),
+            merged.forward(&temb).unwrap(),
+            bare.forward(&temb).unwrap(),
+        );
+        for (got, (want, base)) in [
+            &g.shift_msa,
+            &g.scale_msa,
+            &g.gate_msa,
+            &g.shift_mlp,
+            &g.scale_mlp,
+            &g.gate_mlp,
+        ]
+        .into_iter()
+        .zip(
+            [
+                &m.shift_msa,
+                &m.scale_msa,
+                &m.gate_msa,
+                &m.shift_mlp,
+                &m.scale_mlp,
+                &m.gate_mlp,
+            ]
+            .into_iter()
+            .zip([
+                &z.shift_msa,
+                &z.scale_msa,
+                &z.gate_msa,
+                &z.shift_mlp,
+                &z.scale_mlp,
+                &z.gate_mlp,
+            ]),
+        ) {
+            assert!(diff(got, want) < 1e-5);
+            assert!(diff(got, base) > 1e-4);
+        }
+    }
 
     /// The published block ships exactly 12 tensors, and none of the attention or feed-forward
     /// ones is a bias.

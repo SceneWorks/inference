@@ -1489,6 +1489,7 @@ pub fn classify_minimax_h3_lora_key_space<'a>(
 /// | --- | --- |
 /// | `transformer_blocks_{i}_`, `blocks_{i}_` | `attn_to_{q,k,v}`, `attn_to_out_0`, `ff_net_0_proj`, `ff_net_2`, `attn_qkv_proj`, `attn_out_proj`, `mlp_fc1`, `mlp_fc2`, `adaln_proj_linear` |
 /// | `token_refiner_refiner_blocks_{i}_`, `token_refiner_blocks_{i}_` | the same |
+/// | *(top level)* | `proj_in`, `context_embedder`, `time_embedder_linear_{1,2}`, `norm_out_linear`, `pdd_proj_out_{i}` |
 ///
 /// The roles are `.lora_down.weight`, `.lora_up.weight` and `.alpha`. The block index is not range
 /// checked here; the model decides whether block `i` exists, and an absent one is an unmatched
@@ -1499,6 +1500,21 @@ pub fn minimax_h3_kohya_key_to_dotted(key: &str) -> Option<String> {
     let (stem, suffix) = [".lora_down.weight", ".lora_up.weight", ".alpha"]
         .into_iter()
         .find_map(|suffix| rest.strip_suffix(suffix).map(|stem| (stem, suffix)))?;
+    // The image DiT's top-level linears (SW-7096): addressed on the image surface only; the video
+    // surface reports them as deliberately non-addressable.
+    let top = match stem {
+        "proj_in" | "context_embedder" => Some(stem.to_owned()),
+        "time_embedder_linear_1" => Some("time_embedder.linear_1".to_owned()),
+        "time_embedder_linear_2" => Some("time_embedder.linear_2".to_owned()),
+        "norm_out_linear" => Some("norm_out.linear".to_owned()),
+        _ => stem
+            .strip_prefix("pdd_proj_out_")
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .map(|n| format!("pdd_proj_out.{n}")),
+    };
+    if let Some(top) = top {
+        return Some(format!("{top}{suffix}"));
+    }
     let (container, tail) = [
         (
             "token_refiner_refiner_blocks_",
@@ -2310,6 +2326,30 @@ mod tests {
                 "lora_unet_blocks_4_adaln_proj_linear.lora_up.weight",
                 "blocks.4.adaln_proj.linear.lora_up.weight",
             ),
+            (
+                "lora_unet_transformer_blocks_4_adaln_proj_linear.alpha",
+                "transformer_blocks.4.adaln_proj.linear.alpha",
+            ),
+            (
+                "lora_unet_proj_in.lora_down.weight",
+                "proj_in.lora_down.weight",
+            ),
+            (
+                "lora_unet_context_embedder.lora_up.weight",
+                "context_embedder.lora_up.weight",
+            ),
+            (
+                "lora_unet_time_embedder_linear_2.alpha",
+                "time_embedder.linear_2.alpha",
+            ),
+            (
+                "lora_unet_norm_out_linear.lora_down.weight",
+                "norm_out.linear.lora_down.weight",
+            ),
+            (
+                "lora_unet_pdd_proj_out_5.lora_up.weight",
+                "pdd_proj_out.5.lora_up.weight",
+            ),
         ] {
             assert_eq!(
                 minimax_h3_kohya_key_to_dotted(key).as_deref(),
@@ -2322,6 +2362,9 @@ mod tests {
             "lora_unet_final_layer_linear.lora_down.weight",
             "lora_unet_blocks_x_mlp_fc2.alpha",
             "lora_unet_blocks_0_mlp_fc1.lora_mid.weight",
+            "lora_unet_proj_out.lora_down.weight",
+            "lora_unet_pdd_proj_out_x.lora_down.weight",
+            "lora_unet_time_embedder_linear_3.alpha",
             "transformer_blocks.0.attn.to_q.lora_A.weight",
         ] {
             assert_eq!(minimax_h3_kohya_key_to_dotted(unknown), None, "{unknown}");

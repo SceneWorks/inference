@@ -82,6 +82,9 @@ pub const TIME_PROJ_DOWNSCALE_FREQ_SHIFT: f64 = 0.0;
 pub struct LinearBias {
     weight: Tensor,
     bias: Tensor,
+    /// Forward-time LoRA/LoKr residuals (SW-7096), in a residual-only slot. `None` unless an
+    /// install routes here — only the image DiT does.
+    adapters: Option<Box<crate::dit::layers::LinearNoBias>>,
 }
 
 impl LinearBias {
@@ -89,7 +92,34 @@ impl LinearBias {
         let mut copy = self.clone();
         copy.weight = copy.weight.to_device(device)?;
         copy.bias = copy.bias.to_device(device)?;
+        copy.adapters = self
+            .adapters
+            .as_ref()
+            .map(|slot| slot.copy_to_device(device).map(Box::new))
+            .transpose()?;
         Ok(copy)
+    }
+
+    /// This projection's adapter slot (SW-7096), created on first use at its `[out, in]` shape
+    /// and stored dtype.
+    pub fn adaptable_mut(&mut self) -> Option<&mut crate::dit::layers::LinearNoBias> {
+        if self.adapters.is_none() {
+            let (out, inp) = (self.weight.dims()[0], self.weight.dims()[1]);
+            let slot = crate::dit::layers::LinearNoBias::residual_slot(
+                inp,
+                out,
+                self.weight.dtype(),
+                self.weight.device(),
+            )
+            .ok()?;
+            self.adapters = Some(Box::new(slot));
+        }
+        self.adapters.as_deref_mut()
+    }
+
+    /// Drop every residual on this projection.
+    pub fn clear_adapters(&mut self) {
+        self.adapters = None;
     }
 
     /// Load `{prefix}.weight` / `{prefix}.bias` **at their stored dtype**, checking the shape.
@@ -133,7 +163,11 @@ impl LinearBias {
                 bias.dims()
             )));
         }
-        Ok(Self { weight, bias })
+        Ok(Self {
+            weight,
+            bias,
+            adapters: None,
+        })
     }
 
     /// The two tensor names this projection consumes.
@@ -169,7 +203,12 @@ impl LinearBias {
     /// keeps a float32 head from silently running its matmul at the block stack's bfloat16.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = x.to_dtype(self.weight.dtype())?;
-        __model_proof_output!(linear(&x, &self.weight, &self.bias))
+        let y = __model_proof_output!(linear(&x, &self.weight, &self.bias))?;
+        // SW-7096: the residuals read the same cast input the base does.
+        match &self.adapters {
+            Some(slot) => slot.add_residuals(&x, y),
+            None => Ok(y),
+        }
     }
 }
 
@@ -243,6 +282,20 @@ pub struct TimestepEmbedder {
 }
 
 impl TimestepEmbedder {
+    /// `linear_1` / `linear_2` for an adapter install (SW-7096).
+    pub fn linear_mut(&mut self, name: &str) -> Option<&mut LinearBias> {
+        match name {
+            "linear_1" => Some(&mut self.linear_1),
+            "linear_2" => Some(&mut self.linear_2),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn clear_adapters(&mut self) {
+        self.linear_1.clear_adapters();
+        self.linear_2.clear_adapters();
+    }
+
     pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
         let mut copy = self.clone();
         copy.linear_1 = copy.linear_1.copy_to_device(device)?;
@@ -334,6 +387,11 @@ pub struct AdaLayerNormOut {
 }
 
 impl AdaLayerNormOut {
+    /// `linear` for an adapter install (SW-7096); `None` on the pruned path.
+    pub fn linear_mut(&mut self) -> Option<&mut LinearBias> {
+        self.linear.as_mut()
+    }
+
     pub(crate) fn copy_to_device(&self, device: &candle_gen::candle_core::Device) -> Result<Self> {
         let mut copy = self.clone();
         copy.norm = copy.norm.copy_to_device(device)?;
@@ -789,6 +847,72 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
     use std::collections::HashMap;
+
+    fn seeded(shape: &[usize], seed: u32) -> Tensor {
+        let n: usize = shape.iter().product();
+        let v: Vec<f32> = (0..n as u32)
+            .map(|i| {
+                ((i.wrapping_mul(2_654_435_761) ^ seed.wrapping_mul(40_503)) % 997) as f32 / 997.0
+                    - 0.5
+            })
+            .collect();
+        Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
+    }
+
+    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    /// SW-7096: a LoRA on a bias-Linear head (the image DiT's I/O heads) folds to the same output as
+    /// the delta MERGED into its weight, and a zero-scale LoRA leaves the head byte-identical.
+    #[test]
+    fn a_lora_on_a_bias_linear_head_matches_its_merged_weight() {
+        let (inp, out, r) = (6, 5, 2);
+        let (w, b) = (seeded(&[out, inp], 1), seeded(&[out], 2));
+        let (down, up) = (seeded(&[r, inp], 3), seeded(&[out, r], 4));
+        let load = |weight: Tensor| {
+            let map = HashMap::from([
+                ("h.weight".to_string(), weight),
+                ("h.bias".to_string(), b.clone()),
+            ]);
+            LinearBias::from_weights(&Weights::from_map(map), "h", inp, out).unwrap()
+        };
+        let x = seeded(&[1, 3, inp], 5);
+        let mut head = load(w.clone());
+        let bare = head.forward(&x).unwrap();
+        head.adaptable_mut()
+            .unwrap()
+            .push_lora(
+                down.t().unwrap().contiguous().unwrap(),
+                up.t().unwrap().contiguous().unwrap(),
+                0.75,
+            )
+            .unwrap();
+        let got = head.forward(&x).unwrap();
+        let merged = load((&w + up.matmul(&down).unwrap().affine(0.75, 0.0).unwrap()).unwrap());
+        assert!(max_abs(&got, &merged.forward(&x).unwrap()) < 1e-5);
+        assert!(max_abs(&got, &bare) > 1e-3);
+        head.clear_adapters();
+        assert_eq!(max_abs(&head.forward(&x).unwrap(), &bare), 0.0);
+        head.adaptable_mut()
+            .unwrap()
+            .push_lora(
+                down.t().unwrap().contiguous().unwrap(),
+                up.t().unwrap().contiguous().unwrap(),
+                0.0,
+            )
+            .unwrap();
+        assert_eq!(max_abs(&head.forward(&x).unwrap(), &bare), 0.0);
+    }
 
     fn flat(t: &Tensor) -> Vec<f32> {
         t.to_dtype(DType::F32)

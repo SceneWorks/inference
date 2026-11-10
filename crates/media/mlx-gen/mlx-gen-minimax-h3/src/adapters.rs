@@ -211,6 +211,11 @@ pub enum AdaLnSurface {
     /// Curve topology: the timestep MLP is absent and the reduced projections live in the curve
     /// runtime. Body leaves (attention/FFN) are unchanged.
     PrunedCurve,
+    /// MiniMax-H3-Image (SW-7096): every linear layer of the image DiT is adapter-addressable —
+    /// the block and refiner leaves, each block's `adaln_proj.linear`, `proj_in`,
+    /// `context_embedder`, `time_embedder.linear_{1,2}`, `norm_out.linear` and every
+    /// `pdd_proj_out.{i}` head — so an unmatched target names no module at all.
+    ImageAllLinears,
 }
 
 /// The AdaLN stems a full-topology adapter may name that are never adapter-addressable, paired
@@ -276,10 +281,15 @@ pub enum UnmatchedTargetClass {
 
 /// Classify one normalized, matched-nothing module stem against the checkpoint's surface.
 pub fn classify_unmatched_target(path: &str, surface: AdaLnSurface) -> UnmatchedTargetClass {
+    if surface == AdaLnSurface::ImageAllLinears {
+        return UnmatchedTargetClass::NoSuchModule;
+    }
     if is_adaln_surface_target(path) {
         return match surface {
             AdaLnSurface::PrunedCurve => UnmatchedTargetClass::PrunedCurveTopologyMismatch,
-            AdaLnSurface::FullTimestepMlp => UnmatchedTargetClass::DeliberatelyExcluded,
+            AdaLnSurface::FullTimestepMlp | AdaLnSurface::ImageAllLinears => {
+                UnmatchedTargetClass::DeliberatelyExcluded
+            }
         };
     }
     if is_known_non_adapter_module(path) {

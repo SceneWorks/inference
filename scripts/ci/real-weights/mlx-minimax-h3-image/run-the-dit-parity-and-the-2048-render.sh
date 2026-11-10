@@ -14,7 +14,7 @@ for name in h3_image_dit_names_match_the_published_index h3_image_dit_first_step
     exit 1
   fi
 done
-for name in h3_image_lora_layouts_fold_identically_on_the_real_dit h3_image_streamed_blocks_carry_the_lora_like_resident_ones; do
+for name in h3_image_lora_layouts_fold_identically_on_the_real_dit h3_image_streamed_blocks_carry_the_lora_like_resident_ones h3_image_adaln_and_output_head_loras_reach_the_denoiser; do
   out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
     h3_image_lora_real::"$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
   if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then

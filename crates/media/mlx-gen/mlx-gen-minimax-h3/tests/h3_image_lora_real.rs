@@ -18,9 +18,12 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::adapters::{AdaptableHost, Adapter};
 use mlx_gen::gen_core::{AdapterKind, AdapterSpec};
 use mlx_gen_minimax_h3::adapters::{apply_minimax_h3_adapters, BLOCK_TARGETS};
+use mlx_gen_minimax_h3::denoise::schedule::SigmaSchedule;
 use mlx_gen_minimax_h3::dit::config::MiniMaxH3ImageDitConfig;
 use mlx_gen_minimax_h3::dit::{MmRope, MmRopeTables};
-use mlx_gen_minimax_h3::h3_image::{ImageLayout, MiniMaxH3ImageDit, IMAGE_DIT_COMPONENT};
+use mlx_gen_minimax_h3::h3_image::{
+    ImageDenoiser, ImageLayout, MiniMaxH3ImageDit, IMAGE_DIT_COMPONENT,
+};
 use mlx_gen_minimax_h3::tensor::slice_axis;
 use mlx_gen_minimax_h3::DitBlockStream;
 
@@ -412,5 +415,169 @@ fn h3_image_streamed_blocks_carry_the_lora_like_resident_ones() {
     crate::model_inference_device::record_model_inference_device();
     println!(
         "MODEL_INFERENCE_BODY_COMPLETED h3_image_lora_real::h3_image_streamed_blocks_carry_the_lora_like_resident_ones"
+    );
+}
+
+/// One PEFT file of rank-[`RANK`] factors on `targets` (`(module path, out, in)`), alpha = rank.
+fn write_targets(dir: &Path, name: &str, targets: &[(&str, i32, i32)], seed: u32) -> PathBuf {
+    let mut t = Vec::new();
+    for (k, (path, out, inp)) in targets.iter().enumerate() {
+        let s = seed + 10 * k as u32;
+        t.push((
+            format!("transformer.{path}.lora_A.weight"),
+            seeded(&[RANK, *inp], s),
+        ));
+        t.push((
+            format!("transformer.{path}.lora_B.weight"),
+            seeded(&[*out, RANK], s + 1),
+        ));
+    }
+    let path = dir.join(name);
+    write(&path, t, &[("alpha", &RANK.to_string())]);
+    path
+}
+
+/// The step-`step` velocity of a freshly loaded image DiT carrying `specs`, on a small packed
+/// sequence. Each call loads, installs, precomputes (with the adapters applied) and releases.
+fn velocities(root: &Path, specs: &[AdapterSpec], steps: &[usize]) -> Vec<Array> {
+    let mut dit = MiniMaxH3ImageDit::load(root, Dtype::Bfloat16).expect("image DiT");
+    if !specs.is_empty() {
+        apply_minimax_h3_adapters(&mut dit, specs).expect("install");
+    }
+    let cfg = dit.config().clone();
+    let layout = ImageLayout::t2i(8, 16, 16, cfg.base.patch_size).unwrap();
+    let context = seeded(&[1, 8, cfg.base.text_dim], 21)
+        .multiply(Array::from_f32(50.0))
+        .unwrap();
+    let rows = seeded(
+        &[1, layout.num_image_rows(), cfg.base.video_patch_dim()],
+        23,
+    )
+    .multiply(Array::from_f32(50.0))
+    .unwrap()
+    .as_dtype(Dtype::Float32)
+    .unwrap();
+    let denoiser = ImageDenoiser::new(
+        dit,
+        layout,
+        &context,
+        SigmaSchedule::h3_image_distilled().unwrap(),
+    )
+    .expect("denoiser");
+    let out = steps
+        .iter()
+        .map(|&step| {
+            let v = denoiser.velocity(step, &rows).unwrap();
+            mlx_rs::transforms::eval([&v]).unwrap();
+            v
+        })
+        .collect();
+    drop(denoiser);
+    mlx_gen::residency::drain_allocator_cache();
+    out
+}
+
+/// SW-7096, the non-body linears on MLX: a LoRA on `pdd_proj_out.2` changes step 2's velocity and
+/// leaves step 0's **bit-identical** (each head is its own PEFT module); a LoRA on block 0's
+/// `adaln_proj.linear`, `time_embedder.linear_2` and `norm_out.linear` (kohya-spelled) plus
+/// `proj_in` / `context_embedder` changes step 0 — so the AdaLN precompute ran with the residuals
+/// applied — and a `proj_out` target, a module the image DiT does not have, is refused by name.
+#[test]
+#[ignore = "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT); three full image-DiT loads"]
+fn h3_image_adaln_and_output_head_loras_reach_the_denoiser() {
+    let root = image_snapshot();
+    let dir = scratch();
+    let probe = MiniMaxH3ImageDit::load(&root, Dtype::Bfloat16).expect("image DiT");
+    let cfg = probe.config().clone();
+    drop(probe);
+    let b = &cfg.base;
+
+    let bare = velocities(&root, &[], &[0, 2]);
+
+    let head = write_targets(
+        dir.path(),
+        "head.safetensors",
+        &[("pdd_proj_out.2", b.video_patch_dim(), b.hidden_size)],
+        31,
+    );
+    let with_head = velocities(&root, &[spec(head, 20.0)], &[0, 2]);
+    let moved_2 = rel(&with_head[1], &bare[1]);
+    let moved_0 = rel(&with_head[0], &bare[0]);
+    println!(
+        "[sw-7096 mlx] pdd_proj_out.2 LoRA moves step 2 by rel-max-abs {moved_2:.3e}, step 0 by {moved_0:.3e}"
+    );
+    assert!(
+        moved_2 > 1e-3,
+        "the head LoRA must move step 2, got {moved_2:.3e}"
+    );
+    // Expected exactly 0; the bound only tolerates run-to-run noise far below the head's effect.
+    assert!(
+        moved_0 <= moved_2 / 100.0,
+        "a LoRA on head 2 must not touch step 0 (moved {moved_0:.3e})"
+    );
+
+    let io = write_targets(
+        dir.path(),
+        "io.safetensors",
+        &[
+            (
+                "time_embedder.linear_2",
+                b.time_embed_dim,
+                b.time_embed_hidden_dim,
+            ),
+            ("proj_in", b.hidden_size, b.video_patch_dim()),
+            ("context_embedder", b.hidden_size, b.text_dim),
+        ],
+        41,
+    );
+    // kohya top-level and block spellings for the two AdaLN projections.
+    let mut t = Vec::new();
+    for (k, (stem, out, inp)) in [
+        (
+            "lora_unet_transformer_blocks_0_adaln_proj_linear",
+            b.adaln_out_features(),
+            b.time_embed_dim,
+        ),
+        (
+            "lora_unet_norm_out_linear",
+            2 * b.hidden_size,
+            b.time_embed_dim,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let s = 51 + 10 * k as u32;
+        t.push((format!("{stem}.lora_down.weight"), seeded(&[RANK, inp], s)));
+        t.push((
+            format!("{stem}.lora_up.weight"),
+            seeded(&[out, RANK], s + 1),
+        ));
+        t.push((format!("{stem}.alpha"), alpha(RANK as f32)));
+    }
+    let adaln = dir.path().join("adaln-kohya.safetensors");
+    write(&adaln, t, &[("ss_network_module", "networks.lora")]);
+    let with_adaln = velocities(&root, &[spec(io, 20.0), spec(adaln, 20.0)], &[0]);
+    let moved = rel(&with_adaln[0], &bare[0]);
+    println!("[sw-7096 mlx] AdaLN + I/O LoRAs move step 0 by rel-max-abs {moved:.3e}");
+    assert!(
+        moved > 1e-3,
+        "the AdaLN/I-O LoRAs must move step 0, got {moved:.3e}"
+    );
+
+    let missing = write_targets(
+        dir.path(),
+        "proj-out.safetensors",
+        &[("proj_out", b.video_patch_dim(), b.hidden_size)],
+        61,
+    );
+    let mut dit = MiniMaxH3ImageDit::load(&root, Dtype::Bfloat16).expect("image DiT");
+    let error = apply_minimax_h3_adapters(&mut dit, &[spec(missing, 1.0)])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("proj_out"), "{error}");
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED h3_image_lora_real::h3_image_adaln_and_output_head_loras_reach_the_denoiser"
     );
 }

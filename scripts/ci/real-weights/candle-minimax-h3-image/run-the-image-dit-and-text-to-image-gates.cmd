@@ -25,6 +25,7 @@ call :run_one image_dit_first_step_matches_the_official_diffusers_transformer ||
 call :run_one image_text_to_image_renders_2048_on_cuda || exit /b 1
 rem SW-7096: the three LoRA layouts fold identically on the real image DiT; ten stack with their scales.
 call :run_lora h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda || exit /b 1
+call :run_lora h3_image_adaln_and_output_head_loras_reach_the_denoiser_cuda || exit /b 1
 exit /b 0
 
 :run_one
