@@ -2,7 +2,7 @@
 //!
 //! Two consumers of one byte-level import ([`Nvfp4Tensor::from_modelopt_parts`]):
 //!
-//! - **Native load** ([`modelopt_projection`]): on a device that serves NVFP4 (CUDA sm_120), a
+//! - **Native load** (`modelopt_projection`): on a device that serves NVFP4 (CUDA sm_120), a
 //!   ModelOpt projection is staged as the resident NVFP4 operand exactly as published — never
 //!   dequantized and requantized. Any other format request over a ModelOpt projection is refused
 //!   by name ([`core_llm::modelopt::dense_runtime_refusal`]): its U8 codes are not dense weights.
