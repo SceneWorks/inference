@@ -23,6 +23,12 @@
 //! 2. **Denoise.** `transformer_diffusers/` ([`MiniMaxH3ImageDit`]) over the `[text | image]`
 //!    sequence, six fixed steps on [`SigmaSchedule::h3_image_distilled`], step `i` through head `i`,
 //!    velocity Euler. Released.
+//!
+//! Under rung 4 (a [`mlx_gen::gen_core::LoadShape::DeferredMaterialization`] load and a request
+//! whose memory block streams, SW-7094) phases 1 and 2 run H3's deferred text encoder and
+//! [`MiniMaxH3ImageDit::load_dir_deferred`] one layer / block at a time
+//! ([`MiniMaxH3Image::requested_transformer_window`]).
+//!
 //! 3. **Decode.** `vae_diffusers/` ([`MiniMaxH3ImageVae`]), tiled at the shipped 256 / 64; pixel
 //!    normalization reverted; 8-bit by truncation (decoders.py); resized back to the requested size
 //!    with Lanczos when the canvas differs.
@@ -84,6 +90,10 @@ pub struct MiniMaxH3Image {
     /// LoRA / LoKr adapters (SW-7096), installed on the DiT each time it is mapped for a render
     /// and released with it.
     adapters: Vec<mlx_gen::gen_core::AdapterSpec>,
+    /// The load shape this generator was loaded at — the one field rung 4's declaration and its
+    /// runtime admission ([`MiniMaxH3Image::requested_transformer_window`]) both read, so the two
+    /// cannot disagree about whether the rung exists (SW-7094).
+    load_shape: mlx_gen::gen_core::LoadShape,
 }
 
 /// The identity, modality and capability surface.
@@ -197,6 +207,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory_strategy,
         memory_tier: mlx_gen::request_scope::loaded_tier(spec),
         adapters: spec.adapters.clone(),
+        load_shape: spec.load_shape,
     }))
 }
 
@@ -416,10 +427,42 @@ impl MiniMaxH3Image {
         &self.text_encoder_dir
     }
 
-    /// Encode the prompt (layer-50 hidden state) and release the text encoder.
+    /// Build the request's text encoder at the residency [`Self::requested_transformer_window`]
+    /// admitted: resident over the mapped shards, or H3's deferred encoder with a per-window
+    /// layer rebuild (rung 4, SW-7094). One constructor for both presentations, so `text2image`
+    /// cannot stream while `edit` silently stays resident.
+    fn build_te(
+        &self,
+        w: Option<&mlx_gen::weights::Weights>,
+        cfg: &MiniMaxH3TeConfig,
+        window: Option<u32>,
+        cancel: &mlx_gen::CancelFlag,
+    ) -> Result<MiniMaxH3TextEncoder> {
+        match (window, w) {
+            (None, Some(w)) => MiniMaxH3TextEncoder::from_weights(w, LM_PREFIX, cfg),
+            (Some(window), None) => {
+                let mut te = MiniMaxH3TextEncoder::from_dir_deferred(
+                    &self.text_encoder_dir,
+                    LM_PREFIX,
+                    cfg,
+                )?;
+                te.set_block_window(window as usize, cancel.clone())?;
+                Ok(te)
+            }
+            _ => Err(Error::Msg(format!(
+                "{IMAGE_MODEL_ID}: a resident text encoder builds from mapped shards and a \
+                 windowed one from none"
+            ))),
+        }
+    }
+
+    /// Encode the prompt (layer-50 hidden state) and release the text encoder. `window` is the
+    /// rung-4 layer window, `None` for the resident encoder.
     pub fn encode_prompt(
         &self,
         prompt: &str,
+        window: Option<u32>,
+        cancel: &mlx_gen::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
@@ -427,9 +470,17 @@ impl MiniMaxH3Image {
         let len = ids.len() as i32;
         let input_ids = Array::from_slice(&ids, &[1, len]);
         let mask = Array::from_slice(&vec![1i32; ids.len()], &[1, len]);
-        let w = crate::text_encoder::map_shards(&self.text_encoder_dir, false)?;
+        // Under a window the shard map is skipped: `from_dir_deferred` reads only `embed_tokens`,
+        // and a retained map would keep every layer tensor reachable across the windowed walk.
+        let w = match window {
+            None => Some(crate::text_encoder::map_shards(
+                &self.text_encoder_dir,
+                false,
+            )?),
+            Some(_) => None,
+        };
         let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
-        let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg)?;
+        let te = self.build_te(w.as_ref(), &cfg, window, cancel)?;
         let context =
             mlx_gen::gen_core::with_prompt_encoding(on_progress, || te.forward(&input_ids, &mask))?;
         // Force before the encoder is dropped: a lazy context still references every weight.
@@ -445,6 +496,8 @@ impl MiniMaxH3Image {
         &self,
         prompt: &str,
         vision_images: &[mlx_gen::media::Image],
+        window: Option<u32>,
+        cancel: &mlx_gen::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(Array, Vec<i32>)> {
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
@@ -481,7 +534,16 @@ impl MiniMaxH3Image {
         let input_ids = Array::from_slice(&ids, &[1, len]);
         let mask = Array::from_slice(&vec![1i32; ids.len()], &[1, len]);
         let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
-        let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg)?;
+        // Under a window the mapped shards are released before the encoder is built: the deferred
+        // loader reopens the staged directory per window (H3's `encode_prompt_grounded`).
+        let w = match window {
+            None => Some(w),
+            Some(_) => {
+                release(w);
+                None
+            }
+        };
+        let te = self.build_te(w.as_ref(), &cfg, window, cancel)?;
         let context = mlx_gen::gen_core::with_prompt_encoding(on_progress, || {
             te.forward_with_images(
                 &input_ids,
@@ -525,6 +587,55 @@ impl MiniMaxH3Image {
         Ok(latents)
     }
 
+    /// The rung-4 admission for one request (SW-7094): `Some(window)` routes the render through
+    /// the deferred loaders ([`MiniMaxH3ImageDit::load_dir_deferred`],
+    /// [`MiniMaxH3TextEncoder::from_dir_deferred`]), `None` is the resident staged path.
+    ///
+    /// Each guard mirrors a declaration clause of [`crate::h3_image::memory`], because a request
+    /// the contract refuses must be refused here even without a request scope, and one it admits
+    /// must not be silently downgraded:
+    ///
+    /// * the load shape must be [`mlx_gen::gen_core::LoadShape::DeferredMaterialization`] — rung
+    ///   4's prerequisite, and what `memory::streamable` resolves `Implemented` on;
+    /// * the component must be [`mlx_gen::gen_core::TransformerComponent::Both`] — the only
+    ///   declared arm (the conditioning phase is the taller one at every tier);
+    /// * the window must be the published singleton
+    ///   [`crate::h3_image::memory::IMAGE_TRANSFORMER_WINDOW_SIZE`].
+    ///
+    /// Adapters are admitted: the block stream re-applies them to every rebuilt block (SW-7096).
+    pub fn requested_transformer_window(&self, req: &GenerationRequest) -> Result<Option<u32>> {
+        use mlx_gen::gen_core::{LoadShape, TransformerComponent};
+        let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
+            return Ok(None);
+        };
+        if self.load_shape != LoadShape::DeferredMaterialization {
+            return Err(Error::Unsupported(format!(
+                "{IMAGE_MODEL_ID}: transformer streaming (rung 4) requires a \
+                 LoadShape::DeferredMaterialization load; this generator was loaded resident, \
+                 where the rung is declared Missing"
+            )));
+        }
+        let component = memory
+            .transformer_window_component
+            .unwrap_or(TransformerComponent::Dit);
+        if component != TransformerComponent::Both {
+            return Err(Error::Unsupported(format!(
+                "{IMAGE_MODEL_ID}: transformer streaming is declared for TransformerComponent::Both \
+                 only — got {component:?}"
+            )));
+        }
+        let size = memory
+            .transformer_window_size
+            .unwrap_or(crate::h3_image::memory::IMAGE_TRANSFORMER_WINDOW_SIZE);
+        if size != crate::h3_image::memory::IMAGE_TRANSFORMER_WINDOW_SIZE {
+            return Err(Error::Unsupported(format!(
+                "{IMAGE_MODEL_ID}: transformer window {size} is outside the published domain [{}]",
+                crate::h3_image::memory::IMAGE_TRANSFORMER_WINDOW_SIZE
+            )));
+        }
+        Ok(Some(size))
+    }
+
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -534,8 +645,9 @@ impl MiniMaxH3Image {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        // Resolved before any weight maps, so an unadmitted geometry is a request error.
+        // Resolved before any weight maps, so an unadmitted geometry or window is a request error.
         let tiling = decode_tiling_for(req)?;
+        let window = self.requested_transformer_window(req)?;
         let (canvas_w, canvas_h) =
             generation_canvas(req.width, req.height, MIN_GENERATION_AREA_DEFAULT);
         let (latent_h, latent_w) = latent_grid(canvas_w, canvas_h)?;
@@ -553,7 +665,7 @@ impl MiniMaxH3Image {
         // generated image's size.
         on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::TextEncoder));
         let (context, text_tags, reference_latents) = if references.is_empty() {
-            let context = self.encode_prompt(&req.prompt, on_progress)?;
+            let context = self.encode_prompt(&req.prompt, window, &req.cancel, on_progress)?;
             let n = context.shape()[1];
             (
                 context,
@@ -565,8 +677,13 @@ impl MiniMaxH3Image {
                 .iter()
                 .map(|r| resize_reference(r, reference_vision_size(r.width, r.height)))
                 .collect::<Result<Vec<_>>>()?;
-            let (context, tags) =
-                self.encode_edit_prompt(&req.prompt, &vision_images, on_progress)?;
+            let (context, tags) = self.encode_edit_prompt(
+                &req.prompt,
+                &vision_images,
+                window,
+                &req.cancel,
+                on_progress,
+            )?;
             drop(vision_images);
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
@@ -584,11 +701,16 @@ impl MiniMaxH3Image {
 
         // --- 2. denoise --------------------------------------------------------------------
         on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::Renderer));
-        let mut dit = MiniMaxH3ImageDit::load_dir(&self.dit_dir, self.dtype)?;
+        let mut dit = match window {
+            None => MiniMaxH3ImageDit::load_dir(&self.dit_dir, self.dtype)?,
+            Some(_) => MiniMaxH3ImageDit::load_dir_deferred(&self.dit_dir, self.dtype)?,
+        };
         if !self.adapters.is_empty() {
             // Strict, like H3 video: an unmatched target or a file that matched nothing fails the
-            // render here rather than producing an image the LoRA barely touched.
+            // render here rather than producing an image the LoRA barely touched. Under rung 4 the
+            // block residuals land in the stream's overlay and are forced once here.
             crate::adapters::apply_minimax_h3_adapters(&mut dit, &self.adapters)?;
+            dit.materialize_streamed_adapters()?;
         }
         debug_assert_eq!(patch, dit.config().base.patch_size);
         let layout = if reference_latents.is_empty() {
@@ -611,12 +733,22 @@ impl MiniMaxH3Image {
                 dit.config().base.patch_size,
             )?
         };
-        let denoiser = ImageDenoiser::new(
-            dit,
-            layout.clone(),
-            &context,
-            SigmaSchedule::h3_image_distilled()?,
-        )?;
+        let denoiser = match window {
+            None => ImageDenoiser::new(
+                dit,
+                layout.clone(),
+                &context,
+                SigmaSchedule::h3_image_distilled()?,
+            )?,
+            Some(window) => ImageDenoiser::new_windowed(
+                dit,
+                layout.clone(),
+                &context,
+                SigmaSchedule::h3_image_distilled()?,
+                window as usize,
+                req.cancel.clone(),
+            )?,
+        };
         release(context);
         let steps = denoiser.num_steps() as u32;
         let total = steps * count;
@@ -826,6 +958,102 @@ mod tests {
             ..Default::default()
         });
         assert!(decode_tiling_for(&r).is_err());
+    }
+
+    fn generator(shape: mlx_gen::gen_core::LoadShape) -> MiniMaxH3Image {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-minimax-h3-image".into()));
+        spec.load_shape = shape;
+        MiniMaxH3Image {
+            descriptor: descriptor(),
+            root: "/nonexistent-minimax-h3-image".into(),
+            dit_dir: "/nonexistent-minimax-h3-image/transformer_diffusers".into(),
+            text_encoder_dir: "/nonexistent-minimax-h3-image/text_encoder".into(),
+            dtype: Dtype::Bfloat16,
+            memory_strategy: crate::h3_image::memory::weights_free_contract(&spec).unwrap(),
+            memory_tier: mlx_gen::request_scope::loaded_tier(&spec),
+            adapters: Vec::new(),
+            load_shape: shape,
+        }
+    }
+
+    /// SW-7094: rung 4's runtime admission mirrors the declaration — the generation memory the
+    /// contract derives for its own rung-4 selection is admitted with window 1; a resident load,
+    /// a DiT-only scope or another window is refused rather than silently run resident.
+    #[test]
+    fn transformer_streaming_is_admitted_exactly_as_declared() {
+        use mlx_gen::gen_core::{
+            GenerationMemory, LoadShape, MemorySelection, MemoryStrategy, MemoryStrategyParameters,
+            TransformerComponent,
+        };
+        let deferred = generator(LoadShape::DeferredMaterialization);
+        let selection = MemorySelection {
+            strategy: MemoryStrategy::BoundedTransformerResidency,
+            parameters: MemoryStrategyParameters {
+                decode_tile_edge: Some(256),
+                decode_overlap: Some(64),
+                transformer_window_size: Some(1),
+                transformer_window_component: Some(TransformerComponent::Both),
+                ..Default::default()
+            },
+            tier: deferred.memory_tier,
+        };
+        let declared = deferred.memory_strategy.generation_memory(&selection);
+        let streamed = GenerationRequest {
+            memory: declared,
+            ..req(4096, 4096)
+        };
+        assert_eq!(
+            deferred.requested_transformer_window(&streamed).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            deferred
+                .requested_transformer_window(&req(4096, 4096))
+                .unwrap(),
+            None
+        );
+        let with = |memory: GenerationMemory| GenerationRequest {
+            memory: Some(memory),
+            ..req(4096, 4096)
+        };
+        let both = GenerationMemory {
+            stream_transformer_blocks: true,
+            transformer_window_component: Some(TransformerComponent::Both),
+            ..Default::default()
+        };
+        assert_eq!(
+            deferred.requested_transformer_window(&with(both)).unwrap(),
+            Some(1)
+        );
+        for refused in [
+            GenerationMemory {
+                transformer_window_component: Some(TransformerComponent::Dit),
+                ..both
+            },
+            GenerationMemory {
+                transformer_window_component: None,
+                ..both
+            },
+            GenerationMemory {
+                transformer_window_size: Some(2),
+                ..both
+            },
+        ] {
+            assert!(deferred
+                .requested_transformer_window(&with(refused))
+                .is_err());
+        }
+        let resident = generator(LoadShape::EagerMaterialization);
+        let e = resident
+            .requested_transformer_window(&with(both))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("DeferredMaterialization"), "{e}");
+        // Declaration and admission agree: the resident contract does not admit the selection.
+        assert!(resident
+            .memory_strategy
+            .validate_selection(&selection)
+            .is_err());
     }
 
     /// A missing component is a load-time error naming the path, and only the text-encoder

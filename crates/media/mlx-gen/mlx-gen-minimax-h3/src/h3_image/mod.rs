@@ -14,8 +14,10 @@
 //! | [`dit`] | [`dit::MiniMaxH3ImageDit`] (644 tensors) and the per-step [`dit::ImageDenoiser`] |
 //! | [`model`] | the generator: descriptor, load, validate, staged generate |
 //! | [`tier`] | q8 / q4 DiT tier resolution; the text encoder is H3's own tier artifact |
-//! | [`memory`] | the shared-ladder contract: staged residency + bounded decode |
+//! | [`memory`] | the shared-ladder contract: rungs 0-2 and 4; rung 3 not applicable on MLX |
+//! | [`admission`] | per-phase host / GPU estimates and the ladder walk (derived, unmeasured) |
 
+pub mod admission;
 pub mod dit;
 pub mod layout;
 pub mod memory;

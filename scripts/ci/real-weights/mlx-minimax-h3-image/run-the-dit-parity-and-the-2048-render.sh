@@ -52,6 +52,20 @@ for tier in q8 q4; do
     echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
     exit 1
   fi
+  # SW-7094 (q4 only, before the tier is removed): the windowed DiT matches the resident one, the
+  # rung-3 verdict re-taken at image geometry, and a 16 MP request admitted and rendered streamed.
+  if [[ $tier == q4 ]]; then
+    for name in h3_image_real::h3_image_streamed_dit_matches_resident_q4 \
+      h3_image_bounded_attention_real::h3_image_rung3_verdict_holds_at_image_geometry \
+      h3_image_real::h3_image_t2i_renders_16mp_streamed_q4; do
+      out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
+        "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)"
+      if ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+        echo "::error::'$name' did not run exactly one passing test — a rename would make this step vacuously green" >&2
+        exit 1
+      fi
+    done
+  fi
   rm -rf "${MINIMAX_H3_IMAGE_TIERS_ROOT:?}/$tier"
 done
 # SW-7096 LoRA gates (run after the tiers; they need only the dense image snapshot).

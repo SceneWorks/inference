@@ -1122,11 +1122,11 @@ mod tests {
         // sc-24213's `supra2_img` publishes exactly one surface: the dense tier, resident, eager
         // (its loader refuses quantization, sequential offload and deferred materialization) — +1.
         // MOSS Base and SFT each witness bf16 + resident + eager — one surface apiece.
-        // SW-7090's `minimax_h3_image` publishes one surface: the dense tier, resident, eager (its
-        // loader refuses quantization and has no deferred shape) — +1.
+        // SW-7090's `minimax_h3_image` publishes the dense tier, resident, at both materialization
+        // shapes — eager, and SW-7094's deferred (rung 4) load — +2.
         assert_eq!(
             surfaces.len(),
-            53 * 12 + 6 + 3 + 2 * 3 + 12 + 4 + 4 + 6 + 6 + 2 + 1 + 1
+            53 * 12 + 6 + 3 + 2 * 3 + 12 + 4 + 4 + 6 + 6 + 2 + 1 + 2
         );
         // The MLX catalog's only composed memory routes are Iris depth (a provider-specific API)
         // and Iris restoration (a transform): real routes with no gen-core generator registration.
