@@ -1314,10 +1314,10 @@ impl ImageDit {
                 timesteps.len()
             )));
         }
-        if dit.stream_window.is_some() || dit.curve.is_some() {
+        if dit.curve.is_some() {
             return Err(CandleError::Msg(
-                "minimax-h3-image dit: the streamed and modulation-pruned DiT paths are not wired \
-                 for the image transformer"
+                "minimax-h3-image dit: the modulation-pruned DiT path is not wired for the image \
+                 transformer"
                     .into(),
             ));
         }
@@ -1348,31 +1348,68 @@ impl ImageDit {
                 })
                 .collect(),
         )?;
-        let mut captured: Option<Tensor> = None;
-        let embedder = dit.projections.time_embedder.clone().ok_or_else(|| {
-            CandleError::Msg("minimax-h3-image dit: the checkpoint has no timestep MLP".into())
-        })?;
-        let (cache, released_bytes) = AdaLnCache::precompute_and_evict(
-            &mut dit.blocks,
-            schedule,
-            AdaLnResidency::PrecomputeAndEvict,
-            &device,
-            |ts| {
-                let temb = embedder.forward(ts, &device)?;
-                captured = Some(temb.clone());
-                Ok(temb)
-            },
-        )?;
-        let temb = captured.ok_or_else(|| {
-            CandleError::Msg(
-                "minimax-h3-image dit: the AdaLN precompute did not evaluate the timestep \
-                 embedding"
-                    .into(),
-            )
-        })?;
-        // `norm_out`'s table from the SAME `temb` the block stack's was projected from.
-        let norm_out = dit.projections.norm_out.modulation(&temb)?;
-        drop(temb);
+        let (cache, released_bytes, norm_out) = if let Some(window) = dit.stream_window {
+            // SW-7095, rung 4: the blocks stay on the host in runtime format. Each block's
+            // `adaln_proj` is copied to the device, projected over the whole schedule and dropped
+            // — one block at a time, exactly as H3 video's `JointDit` streamed precompute — then
+            // every host projection is released. The device never held the 26 GB, so no device
+            // eviction saving is claimed.
+            let policy = crate::block_stream::current().ok_or_else(|| {
+                CandleError::Msg(
+                    "minimax-h3-image dit: streamed AdaLN requires an active request".into(),
+                )
+            })?;
+            let temb = dit.embed_timesteps(schedule.distinct_timesteps())?;
+            let norm_out = dit.projections.norm_out.modulation(&temb)?;
+            let plan = candle_gen::block_window::BlockPlan::new(dit.blocks.len(), window)?;
+            let layers = candle_gen::block_window::run_windowed(
+                &device,
+                &plan,
+                &policy.cancel,
+                Vec::with_capacity(dit.blocks.len()),
+                || Ok(()),
+                |mut layers, _, range| {
+                    for layer in range {
+                        if policy.cancel.is_cancelled() {
+                            return Err(CandleError::Canceled);
+                        }
+                        layers.push(dit.blocks[layer].modulation_for_window(&temb, &device)?);
+                    }
+                    Ok(layers)
+                },
+            )?;
+            let cache = AdaLnCache::assemble(schedule, layers, dit.pruning_identity())?;
+            for block in &mut dit.blocks {
+                block.evict_adaln();
+            }
+            (cache, 0, norm_out)
+        } else {
+            let mut captured: Option<Tensor> = None;
+            let embedder = dit.projections.time_embedder.clone().ok_or_else(|| {
+                CandleError::Msg("minimax-h3-image dit: the checkpoint has no timestep MLP".into())
+            })?;
+            let (cache, released_bytes) = AdaLnCache::precompute_and_evict(
+                &mut dit.blocks,
+                schedule,
+                AdaLnResidency::PrecomputeAndEvict,
+                &device,
+                |ts| {
+                    let temb = embedder.forward(ts, &device)?;
+                    captured = Some(temb.clone());
+                    Ok(temb)
+                },
+            )?;
+            let temb = captured.ok_or_else(|| {
+                CandleError::Msg(
+                    "minimax-h3-image dit: the AdaLN precompute did not evaluate the timestep \
+                     embedding"
+                        .into(),
+                )
+            })?;
+            // `norm_out`'s table from the SAME `temb` the block stack's was projected from.
+            let norm_out = dit.projections.norm_out.modulation(&temb)?;
+            (cache, released_bytes, norm_out)
+        };
         Ok(Self {
             dit,
             tables,

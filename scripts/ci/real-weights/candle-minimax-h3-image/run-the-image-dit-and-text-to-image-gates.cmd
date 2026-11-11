@@ -13,6 +13,7 @@ set "MINIMAX_H3_IMAGE_DIT_REFERENCE=%RUNNER_TEMP%\minimax-h3-image-vae-reference
 set "MINIMAX_H3_IMAGE_RENDER_OUT=%RUNNER_TEMP%\minimax-h3-image-evidence\t2i-2048.png"
 set "MINIMAX_H3_IMAGE_EDIT_REFERENCE=%RUNNER_TEMP%\minimax-h3-image-vae-reference\edit-reference.safetensors"
 set "MINIMAX_H3_IMAGE_EDIT_RENDER_OUT=%RUNNER_TEMP%\minimax-h3-image-evidence\edit-1024x768.png"
+set "MINIMAX_H3_IMAGE_STREAMED_RENDER_OUT=%RUNNER_TEMP%\minimax-h3-image-evidence\t2i-4096-streamed.png"
 set "MINIMAX_H3_SNAPSHOT=%CANDLE_GEN_MODELS_ROOT%\models--MiniMaxAI--MiniMax-H3\snapshots\939557dc319dd91227e30195a763f272ba7f8765"
 set "MINIMAX_H3_IMAGE_SNAPSHOT=%CANDLE_GEN_MODELS_ROOT%\models--MiniMaxAI--MiniMax-H3-Image\snapshots\492fd8c4eca666f1085f57e30738c1e0d86b3439"
 if not exist "%MINIMAX_H3_IMAGE_DIT_REFERENCE%" (
@@ -37,6 +38,9 @@ call :run_one image_edit_presentation_matches_the_processor_template || exit /b 
 call :run_one image_edit_reference_latents_match_the_official_diffusers_vae || exit /b 1
 call :run_one image_edit_first_step_matches_the_official_diffusers_transformer || exit /b 1
 call :run_one image_edit_renders_three_references_on_cuda || exit /b 1
+rem SW-7095 - a 16 MP bf16 render admitted against the card's free memory and run through the
+rem streamed route (the one-block window over the text encoder and the DiT).
+call :run_one image_t2i_renders_16mp_streamed_on_cuda || exit /b 1
 rem SW-7093 - then the q8 / q4 tiers: convert, audit and render each.
 call :tiers || exit /b 1
 rem SW-7096: the three LoRA layouts fold identically on the real image DiT; ten stack with their scales.

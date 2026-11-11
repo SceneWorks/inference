@@ -17,11 +17,29 @@ pub(super) fn profile(
     let text = std::fs::read_to_string(directory.join("config.json"))?;
     let config = crate::dit::MiniMaxH3DitConfig::from_diffusers_json(&text)
         .map_err(|error| Error::Unsupported(error.to_string()))?;
-    let paths = crate::adapters::adapter_target_paths(&config);
+    profile_for(
+        directory,
+        &crate::adapters::adapter_target_paths(&config),
+        specs,
+        native,
+    )
+}
+
+/// [`profile`] over an explicit adapter target surface — the MiniMax-H3-Image transformer's
+/// `crate::adapters::image_adapter_target_paths` (SW-7095).
+pub(crate) fn profile_for(
+    directory: &Path,
+    paths: &[String],
+    specs: &[AdapterSpec],
+    native: &[NativeProjection],
+) -> Result<H3AdapterMemoryProfile> {
+    if specs.is_empty() {
+        return Ok(H3AdapterMemoryProfile::default());
+    }
     let headers = weightsmeta::safetensors_path_tensor_headers(directory)?;
     // H3's Candle DiT loader requests BF16 for the body/refiner, independently
     // of whether a source leaf is dense, affine, ConvRot or native W4A8.
-    let targets = h3_adapter_memory::targets_from_headers(&headers, native, &paths, 2)?;
+    let targets = h3_adapter_memory::targets_from_headers(&headers, native, paths, 2)?;
     h3_adapter_memory::profile_stack(super::native_backend(), specs, &targets)
 }
 
