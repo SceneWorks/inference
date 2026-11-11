@@ -127337,6 +127337,100 @@
   },
   {
     "package": "candle-llm",
+    "target": "minimax_h3_image_pe",
+    "target_kind": "test",
+    "fqn": "minimax_h3_image_pe_quality_against_nvfp4",
+    "source": "crates/llm/candle-llm/tests/minimax_h3_image_pe.rs",
+    "cargo_target_metadata": {
+      "name": "minimax_h3_image_pe",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "crates/llm/candle-llm/tests/minimax_h3_image_pe.rs::minimax_h3_image_pe_quality_against_nvfp4; source setup helpers=var; source-bound asset/control facts below",
+    "configuration_source": "crates/llm/candle-llm/tests/minimax_h3_image_pe.rs::minimax_h3_image_pe_quality_against_nvfp4",
+    "required_environment": [
+      "MINIMAX_PE_LABEL",
+      "MINIMAX_PE_OUTPUT",
+      "MINIMAX_PE_PROMPTS",
+      "MINIMAX_PE_TIER"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [
+      "CANDLE_LLM_DEVICE"
+    ],
+    "default_configuration": null,
+    "configurations": {
+      "source-fixed-candle-cuda": {
+        "source_identity": "crates/llm/candle-llm/tests/minimax_h3_image_pe.rs::minimax_h3_image_pe_quality_against_nvfp4/source-fixed-candle-cuda",
+        "environment": {
+          "CANDLE_LLM_DEVICE": null
+        },
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting.",
+        "required_work": [
+          "Entire selected source test body including all source assertions/controls and expected refusal/cancel branches; no matrix/body rewriting."
+        ]
+      }
+    },
+    "configuration_kind": "source-controls",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/llm/candle-llm/tests/minimax_h3_image_pe.rs::minimax_h3_image_pe_quality_against_nvfp4",
+      "requirements": [
+        {
+          "slot": "source-observable-142c1c42b74f74e6291dd39e969f5449da3a7c71e1c2925267067d00da8c6059",
+          "role": "model-weights",
+          "readers": [
+            "candle-llm::primitives::Weights::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "source-observable-eaaba8bc2b67e8d1ad447042f90b6b356b33578d8a4b06c09cbf8df711747412",
+          "role": "tokenizer",
+          "readers": [
+            "core-llm::tokenizer::Tokenizer::from_file"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "minimax-pe-provider-configs",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/candle-llm/src/provider.rs::read_json::std::fs::read_to_string@267613"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-llm",
     "target": "nvfp4_gemv",
     "target_kind": "test",
     "fqn": "dispatch_takes_the_gemv_for_decode_rows_and_cublaslt_otherwise_visibly",
@@ -281405,6 +281499,81 @@
     "expected_devices": [
       "mlx-cpu"
     ]
+  },
+  {
+    "package": "mlx-llm",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "minimax_h3_image_pe::minimax_h3_image_pe_quality_against_nvfp4",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "MiniMax-H3-Image-PE prompt set + the tier at MINIMAX_PE_TIER",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; explicit model-proof workflow",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs MiniMax-H3-Image-PE weights: see the module docs for the MINIMAX_PE_* variables",
+      "env_gates": [
+        "MINIMAX_PE_LABEL",
+        "MINIMAX_PE_OUTPUT",
+        "MINIMAX_PE_PROMPTS",
+        "MINIMAX_PE_TIER"
+      ],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run with --ignored --nocapture per the crate's documented command"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/llm/mlx-llm/tests/minimax_h3_image_pe.rs",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/llm/mlx-llm/tests/minimax_h3_image_pe.rs::minimax_h3_image_pe::minimax_h3_image_pe_quality_against_nvfp4@c1b788b99b1489517629a802e840d756a5e71cd96cc4117c9101a4be6d6d598c",
+      "requirements": [
+        {
+          "slot": "model-weight-collections",
+          "role": "model-weights",
+          "readers": [
+            "mlx-llm::primitives::Weights::from_dir"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "model-configurations",
+          "role": "artifact-input",
+          "readers": [
+            "crates/llm/mlx-llm/src/provider.rs::read_config_value::std::fs::read_to_string@232605"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "model-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "core-llm::tokenizer::Tokenizer::from_file",
+            "crates/llm/mlx-llm/src/provider.rs::load_admitted::Tokenizer::from_file@87862"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
   },
   {
     "package": "candle-gen-moss-image",

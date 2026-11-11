@@ -130,8 +130,8 @@ pub use prefix::{
     PREFIX_PAGED_NOT_SNAPSHOTTED,
 };
 pub use prepare::{
-    detect_format, ModelFormat, PrepareReport, PrepareSpec, SnapshotPreparerRegistration,
-    SnapshotPreparerRegistry, SnapshotPreparerRegistryBuilder,
+    check_prepare_output, detect_format, ModelFormat, PrepareReport, PrepareSpec,
+    SnapshotPreparerRegistration, SnapshotPreparerRegistry, SnapshotPreparerRegistryBuilder,
 };
 pub use prism::{
     apply_hadamard_forward_in_place, apply_hadamard_inverse_in_place, decode_block_into,

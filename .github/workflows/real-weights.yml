@@ -728,6 +728,7 @@ jobs:
       - name: Run production-latent quality admission
         env:
           DECODE_QUALITY_SOURCE_REVISION: ${{ env.QUALITY_SOURCE_REVISION }}
+          QUALITY_GEOMETRY: ${{ matrix.candidate.geometry }}
         run: source scripts/ci/real-weights/mlx-decode-quality-kolors/run-production-latent-quality-admission.sh
       - name: Upload semantic quality receipts
         if: always()
@@ -812,6 +813,7 @@ jobs:
         env:
           SDXL_QUALITY_ENTRY: ${{ env.QUALITY_MODEL }}
           DECODE_QUALITY_SOURCE_REVISION: ${{ env.QUALITY_SOURCE_REVISION }}
+          QUALITY_GEOMETRY: ${{ matrix.candidate.geometry }}
         run: source scripts/ci/real-weights/mlx-decode-quality-sdxl/run-production-latent-quality-admission.sh
       - name: Upload semantic quality receipts
         if: always()
@@ -881,6 +883,7 @@ jobs:
         env:
           CHROMA_QUALITY_ENTRY: ${{ env.QUALITY_MODEL }}
           DECODE_QUALITY_SOURCE_REVISION: ${{ env.QUALITY_SOURCE_REVISION }}
+          QUALITY_GEOMETRY: ${{ matrix.candidate.geometry }}
         run: source scripts/ci/real-weights/mlx-decode-quality-chroma/run-production-latent-quality-admission.sh
       - name: Upload semantic quality receipts
         if: always() && (inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model.id)
@@ -5620,6 +5623,7 @@ jobs:
       - name: Materialize and verify immutable snapshots
         run: source scripts/ci/real-weights/mlx-minimax-h3-image-pe/materialize-and-verify-immutable-snapshots.sh
       - name: Convert and score the MLX tiers
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
         run: source scripts/ci/real-weights/mlx-minimax-h3-image-pe/convert-and-score-the-mlx-tiers.sh
       - name: Keep the evidence
         if: ${{ !cancelled() }}

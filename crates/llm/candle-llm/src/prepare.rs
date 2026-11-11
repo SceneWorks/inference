@@ -169,6 +169,7 @@ fn prepare_hf(spec: &PrepareSpec) -> Result<PrepareReport> {
     keys.remove("__metadata__");
     let selection = QuantizedTensors::from_config(&config, |key| keys.contains(key))?;
 
+    check_output(spec)?;
     std::fs::create_dir_all(&spec.out_dir)?;
     let mut stored = 0;
     let mut num_tensors = 0;
@@ -210,6 +211,13 @@ fn prepare_hf(spec: &PrepareSpec) -> Result<PrepareReport> {
         num_tensors,
         passthrough: false,
     })
+}
+
+/// [`core_llm::check_prepare_output`] for a preparation that writes: a re-prepare into a directory
+/// holding an earlier tier would leave its shards for the loader to read beside (and over) the new.
+fn check_output(spec: &PrepareSpec) -> Result<()> {
+    core_llm::check_prepare_output(&spec.source, &spec.out_dir)
+        .map_err(|e| Error::Msg(format!("prepare: {e}")))
 }
 
 /// Files besides `config.json`, `tokenizer.json` and the weights that a prepared HF tier carries
@@ -263,6 +271,7 @@ fn prepare_gguf(spec: &PrepareSpec) -> Result<PrepareReport> {
         }
     }
 
+    check_output(spec)?;
     std::fs::create_dir_all(&spec.out_dir)?;
     write_json(&spec.out_dir.join("config.json"), &config)?;
     save_safetensors(&tensors, &spec.out_dir.join("model.safetensors"))?;
@@ -584,6 +593,50 @@ mod tests {
         bytes.extend_from_slice(&[0; 4]);
         std::fs::write(&shard, &bytes).unwrap();
         assert_eq!(count_safetensors_tensors(dir.path()).unwrap(), 1);
+    }
+
+    /// SW-7099 review: a quantized prepare refuses an output that already holds files — the
+    /// loader reads every `*.safetensors`, so an earlier tier's shard would load beside the new one
+    /// — or that is the source or inside it, before writing anything.
+    #[test]
+    fn a_quantized_prepare_refuses_a_stale_or_nested_output() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let config = serde_json::json!({
+            "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+            "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 1,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "vocab_size": 8,
+            "rms_norm_eps": 1e-5, "rope_theta": 10000.0
+        });
+        std::fs::write(src.join("config.json"), config.to_string()).unwrap();
+        std::fs::write(src.join("tokenizer.json"), "{}").unwrap();
+        let json =
+            br#"{"model.embed_tokens.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut shard = (json.len() as u64).to_le_bytes().to_vec();
+        shard.extend_from_slice(json);
+        shard.extend_from_slice(&[0; 4]);
+        std::fs::write(src.join("model.safetensors"), &shard).unwrap();
+
+        let stale = root.path().join("stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("model.safetensors"), b"old tier").unwrap();
+        let err = prepare(&PrepareSpec::quantized(&src, &stale, Quantize::Q4)).unwrap_err();
+        assert!(err.to_string().contains("not empty"), "{err}");
+        assert_eq!(
+            std::fs::read(stale.join("model.safetensors")).unwrap(),
+            b"old tier"
+        );
+
+        for out in [src.clone(), src.join("q4")] {
+            let err = prepare(&PrepareSpec::quantized(&src, &out, Quantize::Q4)).unwrap_err();
+            assert!(
+                err.to_string().contains("inside it"),
+                "{}: {err}",
+                out.display()
+            );
+        }
+        assert!(!src.join("q4").exists());
     }
 
     /// sc-19375: the preparer stores blocks for exactly the tensors the loader quantizes and load
