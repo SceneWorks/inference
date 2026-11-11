@@ -63,6 +63,7 @@ pub mod constraint;
 pub mod defaults;
 pub mod detok;
 pub mod error;
+pub mod json_schema;
 pub mod kv_compression;
 pub mod message;
 pub mod minimax_h3_image_pe;
@@ -103,6 +104,7 @@ pub use constraint::{
 pub use defaults::{speculative_default, DecodeBackend, DecodeDefaults, RecommendedDepths};
 pub use detok::IncrementalDetok;
 pub use error::{Error, RequestResourceExhausted, Result};
+pub use json_schema::{JsonSchema, SchemaState};
 pub use kv_compression::{
     compressed_kv_cache_bytes, kv_model_family, plan_kv_cache, plan_kv_cache_without_reader,
     qualified_kv_model_family, qualify_kv_compression, CompressedKvAllocation, KvAttentionGeometry,

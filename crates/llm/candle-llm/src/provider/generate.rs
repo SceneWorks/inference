@@ -372,12 +372,13 @@ impl TextLlm for LlamaProvider {
         // Structured-output constraint: build a JSON mask over the cached decode table.
         let constraint_starts_in_reasoning =
             self.descriptor.capabilities.supports_thinking && prompt_opens_thinking(&prompt);
-        let mut json_mask = match req.constraint {
-            Some(Constraint::Json) => {
+        let mut json_mask = match &req.constraint {
+            Some(constraint) => {
                 let table = self
                     .constraint_table
                     .get_or_init(|| self.tokenizer.constraint_decode_table());
-                Some(JsonMask::new(
+                Some(JsonMask::for_constraint(
+                    constraint,
                     table,
                     self.stop_tokens.iter().map(|&i| i as u32),
                     constraint_starts_in_reasoning,

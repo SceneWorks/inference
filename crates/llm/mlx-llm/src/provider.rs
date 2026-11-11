@@ -2628,6 +2628,7 @@ fn campaign_cancellation_probe_request() -> TextLlmRequest {
 /// Adapts a `core_llm::JsonConstraint` to the engine's [`ConstraintMask`] decode seam.
 struct JsonMask<'a> {
     inner: JsonConstraint<'a>,
+    constraint: Constraint,
     table: &'a ConstraintDecodeTable,
     stop_ids: Vec<u32>,
     accepted: Vec<i32>,
@@ -2638,14 +2639,26 @@ struct JsonMask<'a> {
 }
 
 impl<'a> JsonMask<'a> {
+    #[cfg(test)]
     fn new(
+        table: &'a ConstraintDecodeTable,
+        stop_ids: impl IntoIterator<Item = u32>,
+        reasoning: bool,
+    ) -> Self {
+        Self::for_constraint(&Constraint::Json, table, stop_ids, reasoning)
+    }
+
+    /// Enforce `constraint` (any [`Constraint`] kind) once the reasoning block, if open, closes.
+    fn for_constraint(
+        constraint: &Constraint,
         table: &'a ConstraintDecodeTable,
         stop_ids: impl IntoIterator<Item = u32>,
         reasoning: bool,
     ) -> Self {
         let stop_ids = stop_ids.into_iter().collect::<Vec<_>>();
         Self {
-            inner: JsonConstraint::new(table, stop_ids.iter().copied()),
+            inner: JsonConstraint::for_constraint(constraint, table, stop_ids.iter().copied()),
+            constraint: constraint.clone(),
             table,
             stop_ids,
             accepted: Vec::new(),
@@ -2723,7 +2736,11 @@ impl RewindableConstraintMask for JsonMask<'_> {
             return;
         }
         self.accepted.truncate(checkpoint);
-        self.inner = JsonConstraint::new(self.table, self.stop_ids.iter().copied());
+        self.inner = JsonConstraint::for_constraint(
+            &self.constraint,
+            self.table,
+            self.stop_ids.iter().copied(),
+        );
         self.reasoning_tail.clear();
         self.reasoning = self.initial_reasoning;
         let accepted = self.accepted.clone();
@@ -4145,12 +4162,13 @@ impl LlamaProvider {
         // Structured-output constraint (story 7166): build a JSON mask over the cached decode table.
         let constraint_starts_in_reasoning =
             self.descriptor.capabilities.supports_thinking && prompt_opens_thinking(&prompt);
-        let mut json_mask = match req.constraint {
-            Some(Constraint::Json) => {
+        let mut json_mask = match &req.constraint {
+            Some(constraint) => {
                 let table = self
                     .constraint_table
                     .get_or_init(|| self.tokenizer.constraint_decode_table());
-                Some(JsonMask::new(
+                Some(JsonMask::for_constraint(
+                    constraint,
                     table,
                     self.stop_tokens.iter().map(|&i| i as u32),
                     constraint_starts_in_reasoning,
@@ -5198,7 +5216,7 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // legacy `mtp` field by the load path.
             speculative: vec![prompt_lookup_capabilities(SPECULATIVE_MAX_DEPTH)],
             // JSON-constrained decoding (sc-7166).
-            supported_constraints: vec![ConstraintKind::Json],
+            supported_constraints: vec![ConstraintKind::Json, ConstraintKind::JsonSchema],
         },
     }
 }
