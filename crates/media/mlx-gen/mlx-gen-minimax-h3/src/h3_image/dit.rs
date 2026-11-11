@@ -328,6 +328,30 @@ impl AdaptableHost for MiniMaxH3ImageDit {
     }
 }
 
+/// The intermediate stages one [`ImageDenoiser::velocity_traced`] records: the residual stream after
+/// each of [`Self::layers`] (`[1, seq_len, hidden_size]`, in layer order) and `norm_out`'s output
+/// over the whole packed sequence. Diagnostic only — the real-weight parity gate compares each
+/// against the reference's own tensors so a miss names the stage it enters at.
+#[derive(Debug, Default)]
+pub struct ImageDitTrace {
+    /// Layers whose output to record.
+    pub layers: Vec<usize>,
+    /// `(layer, residual stream after it)` for every recorded layer.
+    pub hidden: Vec<(usize, Array)>,
+    /// `norm_out`'s output — the step head's input — once the forward has run.
+    pub pre_head: Option<Array>,
+}
+
+impl ImageDitTrace {
+    /// A trace recording the residual stream after each of `layers`.
+    pub fn new(layers: &[usize]) -> Self {
+        Self {
+            layers: layers.to_vec(),
+            ..Self::default()
+        }
+    }
+}
+
 /// Every linear of the image DiT is addressable, so an unmatched target is reported as naming no
 /// module (see [`crate::adapters::AdaLnSurface::ImageAllLinears`]).
 impl crate::adapters::MiniMaxH3AdapterHost for MiniMaxH3ImageDit {
@@ -364,6 +388,8 @@ pub struct ImageDenoiser {
     text_rows: Array,
     cache: AdaLnCache,
     norm_out: NormOutModulation,
+    /// `[num_distinct_timesteps, time_embed_dim]` — what `cache` and `norm_out` were projected from.
+    temb: Array,
     schedule: SigmaSchedule,
     /// Per step: `[seq_len]` `global_timestep · 3 + tag`, what the blocks gather with.
     adaln_indices: Vec<Array>,
@@ -502,7 +528,7 @@ impl ImageDenoiser {
             )
         })?;
         let norm_out = dit.projections.norm_out.modulation(&temb)?;
-        mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale])?;
+        mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale, &temb])?;
         UnverifiedSources::verify(&mut dit.unverified.body)?;
 
         Ok(Self {
@@ -512,6 +538,7 @@ impl ImageDenoiser {
             text_rows: parts.text_rows,
             cache,
             norm_out,
+            temb,
             schedule,
             adaln_indices: parts.adaln_indices,
             timestep_indices: parts.timestep_indices,
@@ -573,6 +600,7 @@ impl ImageDenoiser {
             text_rows: parts.text_rows,
             cache,
             norm_out,
+            temb,
             schedule,
             adaln_indices: parts.adaln_indices,
             timestep_indices: parts.timestep_indices,
@@ -629,12 +657,49 @@ impl ImageDenoiser {
         self.released_bytes
     }
 
+    /// The timestep embedding the whole run's modulation was projected from —
+    /// `[num_distinct_timesteps, time_embed_dim]`, rows in the AdaLN schedule's distinct-timestep
+    /// order.
+    pub fn temb(&self) -> &Array {
+        &self.temb
+    }
+
+    /// The block stack's precomputed modulation (and the schedule it is keyed on).
+    pub fn adaln_cache(&self) -> &AdaLnCache {
+        &self.cache
+    }
+
+    /// `norm_out`'s per-timestep `(shift, scale)` table.
+    pub fn norm_out_modulation(&self) -> &NormOutModulation {
+        &self.norm_out
+    }
+
     /// The DiT velocity of every image row at sampling step `step`, through head `step`.
     ///
     /// `image_rows` is `[1, num_packed_image_rows, in_channels · prod(patch)]` — an edit's
     /// reference rows first, then the generated rows; the result has the same shape, float32 (the
     /// heads are float32), exactly what the reference transformer returns.
     pub fn velocity(&self, step: usize, image_rows: &Array) -> Result<Array> {
+        self.velocity_inner(step, image_rows, None)
+    }
+
+    /// [`Self::velocity`], also recording the stages `trace` asks for — the diagnostic twin the
+    /// real-weight parity gate reports with.
+    pub fn velocity_traced(
+        &self,
+        step: usize,
+        image_rows: &Array,
+        trace: &mut ImageDitTrace,
+    ) -> Result<Array> {
+        self.velocity_inner(step, image_rows, Some(trace))
+    }
+
+    fn velocity_inner(
+        &self,
+        step: usize,
+        image_rows: &Array,
+        mut trace: Option<&mut ImageDitTrace>,
+    ) -> Result<Array> {
         let head = self.dit.projections.pdd_heads.select(step)?;
         let adaln = self.adaln_indices.get(step).ok_or_else(|| {
             Error::Msg(format!(
@@ -672,6 +737,11 @@ impl ImageDenoiser {
                             &self.tables,
                             self.bounded_attention(),
                         )?;
+                        if let Some(trace) = trace.as_deref_mut() {
+                            if trace.layers.contains(&layer) {
+                                trace.hidden.push((layer, x.clone()));
+                            }
+                        }
                     }
                     x
                 }
@@ -692,6 +762,11 @@ impl ImageDenoiser {
                                 self.bounded_attention(),
                             )?;
                             // The block drops per iteration, not per window.
+                            if let Some(trace) = trace.as_deref_mut() {
+                                if trace.layers.contains(&layer) {
+                                    trace.hidden.push((layer, hidden.clone()));
+                                }
+                            }
                         }
                         Ok(hidden)
                     },
@@ -711,6 +786,9 @@ impl ImageDenoiser {
             &self.norm_out,
             &self.timestep_indices[step],
         )?;
+        if let Some(trace) = trace {
+            trace.pre_head = Some(x.clone());
+        }
         let text = self.layout.num_text_tokens();
         let image = slice_axis(&x, 1, text, text + rows)?;
         head.forward(&image)

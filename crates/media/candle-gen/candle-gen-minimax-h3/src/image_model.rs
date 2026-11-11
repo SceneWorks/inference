@@ -161,6 +161,7 @@ impl MiniMaxH3Image {
     /// Validate the snapshot and record the paths a render reads: `transformer_diffusers/`,
     /// `text_encoder/` and `vae_diffusers/` with shards, plus `tokenizer/`.
     pub fn load(spec: &LoadSpec) -> Result<Self> {
+        refuse_precision_override(spec)?;
         let root = match &spec.weights {
             WeightsSource::Dir(p) => p.clone(),
             WeightsSource::File(p) => p
@@ -312,8 +313,8 @@ impl MiniMaxH3Image {
             return Err(CandleError::Canceled);
         }
         let (width, height) = Self::output_size(req);
-        let (canvas_w, canvas_h) =
-            contract::generation_canvas(width, height, contract::MIN_GENERATION_AREA_DEFAULT);
+        // The same canvas admission sized this request's resources from.
+        let (canvas_w, canvas_h) = crate::image_memory_strategy::admission_canvas(width, height)?;
         let (latent_h, latent_w) = latent_grid(canvas_w, canvas_h)?;
         let schedule =
             SigmaSchedule::h3_image_distilled().map_err(|e| CandleError::Msg(e.to_string()))?;
@@ -581,8 +582,29 @@ pub fn load_image(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Gener
         IMAGE_MODEL_ID,
     )?;
     crate::model::reject_unread_slots_for(spec, IMAGE_MODEL_ID)?;
-    debug_assert_eq!(spec.precision, Precision::Bf16);
     Ok(Box::new(MiniMaxH3Image::load(spec)?))
+}
+
+/// Refuse a `precision` override: this route does not wire one.
+///
+/// [`Precision::Bf16`] is gen-core's "provider default, no override" sentinel (see
+/// [`candle_gen::gen_core::Precision`]); only [`Precision::Fp32`] is an ask. The candle route
+/// loads the DiT at the checkpoint's bf16 block store (float32 heads), the conditioner at bf16 and
+/// the VAE at f32 whatever the spec says, and its block stream, q8/q4 tiers and memory contract are
+/// all sized for that. Honoring the ask would mean an f32 DiT through every one of those paths,
+/// so, as gen-core's contract prescribes for an unwired override, it is refused with a typed
+/// [`candle_gen::gen_core::Error::Unsupported`] rather than rendered (and priced) as bf16. The MLX
+/// twin does wire it: its loaders take the requested dtype.
+pub(crate) fn refuse_precision_override(spec: &LoadSpec) -> candle_gen::gen_core::Result<()> {
+    if spec.precision == Precision::Bf16 {
+        return Ok(());
+    }
+    Err(candle_gen::gen_core::Error::Unsupported(format!(
+        "{IMAGE_MODEL_ID}: the candle route does not wire a precision override; it loads the \
+         checkpoint's bf16 DiT block store (float32 heads) and an f32 VAE. Got {:?}; drop the \
+         override (or use the MLX backend, which honors Fp32)",
+        spec.precision
+    )))
 }
 
 candle_gen::register_generators! {
@@ -674,6 +696,36 @@ mod tests {
         assert_eq!(latent_grid(canvas.0, canvas.1).unwrap(), (128, 128));
         let canvas = contract::generation_canvas(1024, 1024, contract::MIN_GENERATION_AREA_DEFAULT);
         assert_eq!(canvas, (2048, 2048));
+    }
+
+    /// An `Fp32` precision override is refused with a typed `Unsupported` on every entry point
+    /// before any path is touched — the registry load, the generator's own loader and the memory
+    /// contract — instead of loading and pricing the route's bf16 DiT as though it were honored.
+    /// The `Bf16` sentinel passes the precision check (and then fails on the missing snapshot).
+    #[test]
+    fn an_fp32_precision_override_is_refused_not_ignored() {
+        use candle_gen::gen_core::Error as GenError;
+        let bf16 = LoadSpec::new(WeightsSource::Dir("/nonexistent-h3-image".into()));
+        let mut fp32 = bf16.clone();
+        fp32.precision = Precision::Fp32;
+        assert!(refuse_precision_override(&bf16).is_ok());
+        assert!(matches!(
+            refuse_precision_override(&fp32),
+            Err(GenError::Unsupported(m)) if m.contains("precision")
+        ));
+        assert!(matches!(load_image(&fp32), Err(GenError::Unsupported(_))));
+        assert!(matches!(
+            MiniMaxH3Image::load(&fp32),
+            Err(CandleError::Unsupported(m)) if m.contains("precision")
+        ));
+        assert!(matches!(
+            crate::image_memory_strategy::contract_for(&fp32),
+            Err(GenError::Unsupported(m)) if m.contains("precision")
+        ));
+        assert!(!matches!(
+            MiniMaxH3Image::load(&bf16),
+            Err(CandleError::Unsupported(m)) if m.contains("precision")
+        ));
     }
 
     /// Every slot the provider does not read is refused before any path is touched.

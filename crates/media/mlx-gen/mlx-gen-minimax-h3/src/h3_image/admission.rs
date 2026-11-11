@@ -185,10 +185,14 @@ fn headers(path: &std::path::Path) -> Result<Vec<SafetensorsTensorHeader>> {
 }
 
 /// Bytes a header occupies once the loader has built it: stored width, except a dense float
-/// that follows an Fp32 load's cast.
+/// that follows an Fp32 load's cast. A cast tensor is priced at the wider of its stored and its
+/// cast width: MLX casts lazily over the evaluated source, so the stored-width source is never
+/// less than what the load holds.
 fn loaded_bytes(header: &SafetensorsTensorHeader, float_width: Option<u64>) -> Result<u64> {
     match float_width {
-        Some(width) if header.is_float() => header.materialized_bytes(width),
+        Some(width) if header.is_float() => {
+            Ok(header.materialized_bytes(width)?.max(header.data_bytes))
+        }
         _ => Ok(header.data_bytes),
     }
 }
@@ -282,7 +286,9 @@ impl ImageMemoryFacts {
             if h.name.starts_with("encoder.") || h.name.starts_with("quant_conv.") {
                 encoder = encoder.saturating_add(h.data_bytes);
             } else {
-                decoder = decoder.saturating_add(h.data_bytes);
+                // `MiniMaxH3ImageVae::load` casts the decode half to `spec.precision`'s dtype; the
+                // encode half (`MiniMaxH3ImageVaeEncoder::load`) keeps its stored widths.
+                decoder = decoder.saturating_add(loaded_bytes(&h, float_width)?);
             }
         }
 

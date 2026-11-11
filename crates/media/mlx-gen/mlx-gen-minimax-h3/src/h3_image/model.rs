@@ -35,7 +35,8 @@
 //!
 //! # Size
 //!
-//! Any positive size. The generation canvas is [`generation_canvas`] at upstream's default 4 MP
+//! Any positive size. The generation canvas is
+//! [`mlx_gen::gen_core::h3_image::generation_canvas`] at upstream's default 4 MP
 //! minimum area: a smaller request is generated larger at the same aspect and resized back. None
 //! of H3 video's caps (1.03 MP canvas, 2016 px edge, 17n+5 frames) apply.
 
@@ -45,9 +46,9 @@ use mlx_rs::ops::{add, clip, multiply};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::gen_core::h3_image::{
-    edit_reference_images, generation_canvas, latent_grid, reference_vae_size,
-    reference_vision_size, t2i_prompt_ids, validate_request as validate_h3_image, FIXED_GUIDANCE,
-    FIXED_STEPS, MIN_GENERATION_AREA_DEFAULT, REFERENCE_NOISE_AUG, VAE_SPATIAL_RATIO,
+    edit_reference_images, latent_grid, reference_vae_size, reference_vision_size, t2i_prompt_ids,
+    validate_request as validate_h3_image, FIXED_GUIDANCE, FIXED_STEPS, REFERENCE_NOISE_AUG,
+    VAE_SPATIAL_RATIO,
 };
 use mlx_gen::gen_core::{
     reject_unknown_components, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
@@ -648,8 +649,9 @@ impl MiniMaxH3Image {
         // Resolved before any weight maps, so an unadmitted geometry or window is a request error.
         let tiling = decode_tiling_for(req)?;
         let window = self.requested_transformer_window(req)?;
-        let (canvas_w, canvas_h) =
-            generation_canvas(req.width, req.height, MIN_GENERATION_AREA_DEFAULT);
+        // The same canvas admission sized this request's resources from.
+        let (canvas_w, canvas_h) = crate::h3_image::memory::admission_canvas(req.width, req.height)
+            .map_err(Error::from)?;
         let (latent_h, latent_w) = latent_grid(canvas_w, canvas_h)?;
         let seed = req.seed.unwrap_or_else(default_seed);
         let count = req.count.max(1);

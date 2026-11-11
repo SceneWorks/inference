@@ -80,7 +80,7 @@ pub use heads::{
 };
 pub use layers::{DitAttention, DitFeedForward, LinearNoBias, RmsNorm};
 pub use model::{
-    BlockModulation, ImageDit, ImageForward, JointDit, MiniMaxH3Dit, PackedForward,
+    BlockModulation, ImageDit, ImageDitTrace, ImageForward, JointDit, MiniMaxH3Dit, PackedForward,
     PUBLISHED_DIT_TENSORS, PUBLISHED_IMAGE_DIT_TENSORS,
 };
 pub use positions::{

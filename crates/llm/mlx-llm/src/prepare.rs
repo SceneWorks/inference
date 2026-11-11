@@ -42,6 +42,9 @@ pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
     match format {
         ModelFormat::Gguf => {
             let gguf_path = resolve_gguf_path(&spec.source)?;
+            // A write into a directory holding an earlier tier would leave its shards for the
+            // loader to read beside (and over) the new ones.
+            core_llm::check_prepare_output(&spec.source, &spec.out_dir)?;
             let report = convert_file(
                 &gguf_path,
                 &spec.out_dir,
@@ -69,6 +72,7 @@ pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
             }
             Some(_) => {
                 validate_supported_hf_architecture(&spec.source)?;
+                core_llm::check_prepare_output(&spec.source, &spec.out_dir)?;
                 let report =
                     write_hf_snapshot(&spec.source, &spec.out_dir, quant).map_err(to_core)?;
                 Ok(PrepareReport {
@@ -215,6 +219,47 @@ mod tests {
         assert_eq!(report.quantized, None);
         assert!(report.num_tensors > 0);
         assert!(!out.exists(), "passthrough must not write the out_dir");
+    }
+
+    /// SW-7099 review: a quantized prepare refuses an output that already holds files (a stale
+    /// shard would load beside the new tier) or sits inside the source, before writing anything.
+    #[test]
+    fn a_quantized_prepare_refuses_a_stale_or_nested_output() {
+        let src = unique_dir("refuse-src");
+        let config = json!({
+            "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+            "hidden_size": 8, "intermediate_size": 16, "num_hidden_layers": 1,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "vocab_size": 8,
+            "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "tie_word_embeddings": false
+        });
+        std::fs::write(src.join("config.json"), config.to_string()).unwrap();
+        std::fs::write(src.join("tokenizer.json"), "{}").unwrap();
+        let header =
+            br#"{"model.embed_tokens.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut shard = (header.len() as u64).to_le_bytes().to_vec();
+        shard.extend_from_slice(header);
+        shard.extend_from_slice(&[0; 4]);
+        std::fs::write(src.join("model.safetensors"), &shard).unwrap();
+
+        let stale = unique_out("refuse-stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("model.safetensors"), b"old tier").unwrap();
+        let err = prepare(&PrepareSpec::quantized(&*src, &*stale, Quantize::Q4)).unwrap_err();
+        assert!(err.to_string().contains("not empty"), "{err}");
+        assert_eq!(
+            std::fs::read(stale.join("model.safetensors")).unwrap(),
+            b"old tier"
+        );
+
+        for out in [src.to_path_buf(), src.join("q4")] {
+            let err = prepare(&PrepareSpec::quantized(&*src, &out, Quantize::Q4)).unwrap_err();
+            assert!(
+                err.to_string().contains("inside it"),
+                "{}: {err}",
+                out.display()
+            );
+        }
+        assert!(!src.join("q4").exists());
     }
 
     #[test]

@@ -561,8 +561,16 @@ fn block_working_bytes(
     let score_row = mul(heads, rows)?.max(1);
     let query_rows = (score_budget / score_row).clamp(1, rows.max(1));
     let scores = mul(query_rows, score_row)?;
-    // q, k, v, the repeated k/v at every head, their contiguous copies and the output.
-    let attention = add_all([mul(6, inner)?, mul(2, kv)?, mul(16, scores)?])?;
+    // q, k, v, the repeated k/v at every head, their contiguous copies and the output, plus the
+    // materializing fallback's float32 `kᵀ` (`crate::nn::sdpa_materialized` computes half-dtype
+    // scores in f32): twice a half-dtype key copy, one of which the cast replaces.
+    let f32_keys_extra = if element_bytes < 4 { inner } else { 0 };
+    let attention = add_all([
+        mul(6, inner)?,
+        f32_keys_extra,
+        mul(2, kv)?,
+        mul(16, scores)?,
+    ])?;
     let ffn_elements = mul(mul(rows, 2)?, intermediate)?.min(score_budget.max(1));
     let ffn = add_all([mul(3 * element_bytes, ffn_elements)?, mul(2, hidden_buf)?])?;
     add_all([mul(4, hidden_buf)?, attention.max(ffn)])

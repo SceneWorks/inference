@@ -559,14 +559,23 @@ pub(super) fn snapshot_quantized_copy_bytes<'a>(
             let Ok(prefix) = qwen35_dense_prefix(|key| tensors.contains_key(key)) else {
                 return Some((0, consumed));
             };
+            // In a ModelOpt checkpoint a weight without `.weight_scale` loads dense, as its
+            // source's cast (`keyed_projection`), never in the load's format.
+            let modelopt = tensors
+                .keys()
+                .any(|key| key.ends_with(core_llm::modelopt::WEIGHT_SCALE));
             for (key, tensor) in tensors {
                 // The loader's own selection — the rule the preparer stores blocks by, too.
                 if !qwen35::loads_quantized(cfg, prefix, key) {
                     continue;
                 }
+                let staged = modelopt_dims(key, tensor, tensors);
+                if modelopt && staged.is_none() {
+                    continue;
+                }
                 consumed.insert(key.as_str());
                 // A ModelOpt NVFP4 projection (SW-7099) is staged at its logical shape.
-                if let Some((rows, cols)) = modelopt_dims(key, tensor, tensors) {
+                if let Some((rows, cols)) = staged {
                     add(format.projection_bytes(rows, cols)?)?;
                     continue;
                 }
@@ -627,9 +636,9 @@ pub(super) fn snapshot_quantized_copy_bytes<'a>(
             } else {
                 "lm_head.weight".to_string()
             };
-            let head_dims = tensors
-                .get(&head)
-                .and_then(|t| modelopt_dims(&head, t, tensors).or_else(|| t.dims2()));
+            let head_dims = tensors.get(&head).and_then(|t| {
+                modelopt_dims(&head, t, tensors).or_else(|| t.dims2().filter(|_| !modelopt))
+            });
             if let Some((rows, cols)) = head_dims {
                 if !cfg.tie_word_embeddings {
                     consumed.insert("lm_head.weight");

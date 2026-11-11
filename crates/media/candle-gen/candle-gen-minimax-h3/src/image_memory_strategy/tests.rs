@@ -253,3 +253,104 @@ fn every_implemented_rung_has_a_behavior_fixture() {
         drop(scope);
     }
 }
+
+/// Write a header-plus-zeros safetensors file of `(name, dtype, shape)` tensors.
+fn write_safetensors(path: &Path, tensors: &[(&str, &str, &[usize])]) {
+    let width = |dtype: &str| if dtype == "F32" { 4 } else { 2 };
+    let mut header = serde_json::Map::new();
+    let mut offset = 0_usize;
+    for (name, dtype, shape) in tensors {
+        let len = shape.iter().product::<usize>() * width(dtype);
+        header.insert(
+            (*name).into(),
+            serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + len]}),
+        );
+        offset += len;
+    }
+    let json = serde_json::Value::Object(header).to_string().into_bytes();
+    let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(json);
+    bytes.resize(bytes.len() + offset, 0);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// The VAE decode half is loaded with `DType::F32`, so a bf16-stored decode tensor is priced at
+/// 4 bytes per element (the encoder half is not read); the DiT keeps its stored widths.
+#[test]
+fn asset_facts_price_the_vae_at_the_f32_it_is_loaded_at() {
+    let root = tempfile::tempdir().unwrap();
+    let te = root.path().join(crate::image_model::IMAGE_TEXT_ENCODER);
+    std::fs::create_dir_all(&te).unwrap();
+    std::fs::write(te.join("config.json"), "{}").unwrap();
+    write_safetensors(
+        &te.join("model.safetensors"),
+        &[("unread.weight", "BF16", &[4])],
+    );
+    let dit = root.path().join(crate::image_model::IMAGE_DIT_PARTITION);
+    write_safetensors(
+        &dit.join("model.safetensors"),
+        &[
+            ("transformer_blocks.0.attn.to_q.weight", "BF16", &[8, 8]),
+            ("pdd_proj_out.0.weight", "F32", &[4, 4]),
+        ],
+    );
+    write_safetensors(
+        &root
+            .path()
+            .join(IMAGE_VAE_COMPONENT)
+            .join("model.safetensors"),
+        &[
+            ("decoder.proj_in.weight", "BF16", &[4, 8]),
+            ("post_quant_conv.bias", "F32", &[4]),
+            ("encoder.proj_in.weight", "BF16", &[1000]),
+        ],
+    );
+    let facts = asset_facts(&dit, root.path(), &te).unwrap();
+    assert_eq!(facts.decoder_bytes, (32 + 4) * VAE_F32_WIDTH);
+    assert_eq!(facts.transformer_bytes, 64 * 2 + 16 * 4);
+    assert_eq!(facts.conditioning_bytes, 0);
+}
+
+/// A non-32-aligned request the generator accepts is admitted at its requested size, and its
+/// resources follow the canvas the generator renders on. The request scope still binds the
+/// requested size: the canvas itself is not the admitted request.
+#[test]
+fn a_non_aligned_request_is_admitted_and_sized_at_its_canvas() {
+    use gen_core::h3_image::{generation_canvas, MIN_GENERATION_AREA_DEFAULT};
+
+    let canvas = admission_canvas(1000, 1001).unwrap();
+    assert_eq!(
+        canvas,
+        generation_canvas(1000, 1001, MIN_GENERATION_AREA_DEFAULT)
+    );
+    assert_ne!(canvas, (1000, 1001));
+    assert!(admission_canvas(1000, 0).is_err());
+
+    let load = spec(LoadShape::DeferredMaterialization);
+    let c = weights_free_contract(&load).unwrap();
+    let mut context = fixture_context(&c, &load, MemoryStrategy::StagedResidency);
+    context.geometry.width = 1000;
+    context.geometry.height = 1001;
+    assert_eq!(
+        safety_check_with(None, &load, &c, &context),
+        MemorySafetyDecision::Accept
+    );
+    let request = |width, height| gen_core::GenerationRequest {
+        prompt: "a lighthouse at dusk".into(),
+        width,
+        height,
+        ..Default::default()
+    };
+    let mut scope = registered_begin_request(None, &load, &c, &context)
+        .unwrap()
+        .unwrap();
+    scope.configure_request(&mut request(1000, 1001)).unwrap();
+    drop(scope);
+    let mut scope = registered_begin_request(None, &load, &c, &context)
+        .unwrap()
+        .unwrap();
+    assert!(scope
+        .configure_request(&mut request(canvas.0, canvas.1))
+        .is_err());
+}

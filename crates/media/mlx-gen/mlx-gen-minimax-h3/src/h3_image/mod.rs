@@ -25,8 +25,8 @@ pub mod model;
 pub mod tier;
 
 pub use dit::{
-    image_row_classes, velocity_euler_delta, ImageDenoiser, MiniMaxH3ImageDit, IMAGE_DIT_COMPONENT,
-    PUBLISHED_IMAGE_DIT_TENSORS,
+    image_row_classes, velocity_euler_delta, ImageDenoiser, ImageDitTrace, MiniMaxH3ImageDit,
+    IMAGE_DIT_COMPONENT, PUBLISHED_IMAGE_DIT_TENSORS,
 };
 pub use layout::ImageLayout;
 pub use model::{

@@ -16,19 +16,20 @@ use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::denoise::schedule::SigmaSchedule;
 use mlx_gen_minimax_h3::dit::config::MiniMaxH3ImageDitConfig;
 use mlx_gen_minimax_h3::h3_image::{
-    ImageDenoiser, ImageLayout, MiniMaxH3ImageDit, IMAGE_DIT_COMPONENT, PUBLISHED_IMAGE_DIT_TENSORS,
+    ImageDenoiser, ImageDitTrace, ImageLayout, MiniMaxH3ImageDit, IMAGE_DIT_COMPONENT,
+    PUBLISHED_IMAGE_DIT_TENSORS,
 };
 use mlx_gen_minimax_h3::model::TEXT_ENCODER_COMPONENT;
+use mlx_gen_minimax_h3::tensor::slice_axis;
 
 /// The committed producer whose output the parity gate accepts.
 const DIT_PRODUCER: &[u8] = include_bytes!("../../tools/dump_minimax_h3_image_dit_real.py");
 
-/// Relative L2 bound for a bf16 50-block DiT against the diffusers bf16 forward (CPU torch). The
-/// two run the same mixed precision but accumulate in different orders across 50 residual
-/// blocks; the cosine bound below is the shape check, this one the magnitude check.
-const DIT_REL_L2_TOL: f32 = 5e-2;
-/// Minimum cosine similarity of each step's velocity against diffusers.
-const DIT_MIN_COSINE: f32 = 0.995;
+/// The family DiT parity bounds (requirement E9), shared with the Candle gate: a bf16 50-block DiT
+/// against the diffusers forward (CPU torch, float32 activations over the same bf16-stored weights).
+use mlx_gen::gen_core::h3_image::{
+    DIT_PARITY_MAX_REL_L2 as DIT_REL_L2_TOL, DIT_PARITY_MIN_COSINE as DIT_MIN_COSINE,
+};
 
 fn image_snapshot() -> PathBuf {
     let raw = std::env::var("MINIMAX_H3_IMAGE_SNAPSHOT").unwrap_or_default();
@@ -59,6 +60,28 @@ fn rel_l2(got: &Array, want: &Array) -> f32 {
             .item()
     };
     n(&diff) / n(want)
+}
+
+/// `max|got - want| / max|want|` — the peak-relative error, reported next to rel-L2 per stage.
+fn rel_peak(got: &Array, want: &Array) -> f32 {
+    let got = got.as_dtype(Dtype::Float32).unwrap();
+    let diff = mlx_rs::ops::abs(mlx_rs::ops::subtract(&got, want).unwrap()).unwrap();
+    let peak: f32 = mlx_rs::ops::abs(want).unwrap().max(None).unwrap().item();
+    let d: f32 = diff.max(None).unwrap().item();
+    d / peak.max(1e-12)
+}
+
+/// One diagnostic line: a named stage's rel-L2, peak-relative error and cosine against the
+/// reference's own tensor. Printed, never asserted — the bounds stay on the velocity alone.
+fn stage_line(step: usize, stage: &str, got: &Array, want: &Array) -> String {
+    let got = got.as_dtype(Dtype::Float32).unwrap();
+    assert_eq!(got.shape(), want.shape(), "step {step} {stage} shape");
+    format!(
+        "h3-image DiT step {step} stage {stage:<16} rel-L2 {:.3e} peak-rel {:.3e} cosine {:.6}",
+        rel_l2(&got, want),
+        rel_peak(&got, want),
+        cosine(&got, want)
+    )
 }
 
 fn cosine(got: &Array, want: &Array) -> f32 {
@@ -113,10 +136,17 @@ fn h3_image_dit_names_match_the_published_index() {
 }
 
 /// AC1 / AC2: the MLX DiT's step-0 and step-3 velocities against diffusers'
-/// `MiniMaxH3ImageTransformer2DModel` on the same inputs (`tools/dump_minimax_h3_image_dit_real.py`,
-/// hash-pinned). Step 3 runs through head 3 at `t = 0.25`, so a head or timestep mis-binding fails
-/// it even when step 0 passes; the two heads are also shown to give different outputs on the
-/// same rows.
+/// `MiniMaxH3ImageTransformer2DModel` (`tools/dump_minimax_h3_image_dit_real.py`, hash-pinned,
+/// float32 activations over the bf16 weights). Step 0 is asserted on the noise rows. Step 3 is
+/// asserted on the sampler's own `x_3` (`diag.traj.rows3`, reached by the reference from those
+/// noise rows), through head 3 at `t = 0.25`, so a head or timestep mis-binding fails it even when
+/// step 0 passes; the two heads are also shown to give different outputs on the same rows.
+///
+/// Before asserting, every step prints its error at each stage the reference recorded (`temb`,
+/// `norm_out` shift/scale, block 0's AdaLN tables, the residual stream after the `diag_layers`,
+/// `norm_out`'s output). Also printed, never asserted: step 3 on the step-0 noise rows (an input
+/// no sampler shows the model at `t = 0.25`), and both asserted velocities against the
+/// reference's own bf16-compute forward (`diag.bf16.*`).
 #[test]
 #[ignore = "needs a real MiniMax-H3-Image snapshot + a DiT reference (MINIMAX_H3_IMAGE_DIT_REFERENCE); ~40 GB resident"]
 fn h3_image_dit_first_step_matches_diffusers() {
@@ -140,6 +170,11 @@ fn h3_image_dit_first_step_matches_diffusers() {
         format!("{:x}", Sha256::digest(DIT_PRODUCER)),
         "the reference was produced by a different dump_minimax_h3_image_dit_real.py than the \
          committed one; re-produce it"
+    );
+    assert_eq!(
+        r.metadata("compute_dtype").unwrap_or_default(),
+        "float32",
+        "the asserted reference must be computed with float32 activations"
     );
     let num_text: i32 = r.metadata("num_text").unwrap().parse().unwrap();
     let (lh, lw) = {
@@ -167,31 +202,143 @@ fn h3_image_dit_first_step_matches_diffusers() {
         denoiser.released_adaln_bytes() > 0,
         "the AdaLN projections were evicted"
     );
+    let want_t: Vec<f32> = r
+        .metadata("timesteps")
+        .unwrap()
+        .split(',')
+        .map(|t| t.parse().unwrap())
+        .collect();
+    let sched_t = denoiser.schedule().timesteps();
+    assert_eq!(
+        want_t,
+        vec![sched_t[0], sched_t[3]],
+        "the timesteps must be the released sampler's float32 values"
+    );
+    let diag_layers: Vec<usize> = r
+        .metadata("diag_layers")
+        .expect("the reference records its diag_layers")
+        .split(',')
+        .map(|k| k.parse().unwrap())
+        .collect();
+    let row_block = |table: &Array, g: i32, rows: i32| -> Array {
+        slice_axis(table, 0, g * rows, (g + 1) * rows).unwrap()
+    };
     let mut results = Vec::new();
     for step in [0usize, 3] {
-        let got = denoiser.velocity(step, &rows).unwrap();
+        let mut trace = ImageDitTrace::new(&diag_layers);
+        let got = denoiser.velocity_traced(step, &rows, &mut trace).unwrap();
         mlx_rs::transforms::eval([&got]).unwrap();
         let want = r.require(&format!("out.step{step}")).unwrap();
         assert_eq!(got.shape(), want.shape(), "step {step} shape");
+
+        let d = |name: &str| r.require(&format!("diag.step{step}.{name}")).unwrap();
+        let g = denoiser
+            .adaln_cache()
+            .schedule()
+            .global_timestep_index(step, 0)
+            .unwrap();
+        let mods = denoiser.adaln_cache().modulation(0).unwrap();
+        let block0 = mlx_rs::ops::stack_axis(
+            &mods
+                .tables()
+                .map(|t| row_block(t, g, 3))
+                .collect::<Vec<_>>(),
+            0,
+        )
+        .unwrap();
+        let norm_out = denoiser.norm_out_modulation();
+        let mut lines = vec![
+            stage_line(step, "temb", &row_block(denoiser.temb(), g, 1), d("temb")),
+            stage_line(
+                step,
+                "norm_out.shift",
+                &row_block(&norm_out.shift, g, 1),
+                d("norm_out.shift"),
+            ),
+            stage_line(
+                step,
+                "norm_out.scale",
+                &row_block(&norm_out.scale, g, 1),
+                d("norm_out.scale"),
+            ),
+            stage_line(step, "block0.adaln", &block0, d("block0.adaln")),
+        ];
+        for (layer, hidden) in &trace.hidden {
+            lines.push(stage_line(
+                step,
+                &format!("hidden.block{layer}"),
+                hidden,
+                d(&format!("hidden.block{layer}")),
+            ));
+        }
+        lines.push(stage_line(
+            step,
+            "pre_head",
+            trace.pre_head.as_ref().expect("the trace records norm_out"),
+            d("pre_head"),
+        ));
+        lines.push(stage_line(step, "velocity", &got, want));
+        for line in lines {
+            println!("{line}");
+        }
         results.push((step, rel_l2(&got, want), cosine(&got, want), got));
     }
+    // Asserted step 3: the sampler's own x_3, reached by the reference from the same noise rows.
+    let traj_rows = r.require("diag.traj.rows3").unwrap().clone();
+    let traj = denoiser.velocity(3, &traj_rows).unwrap();
+    mlx_rs::transforms::eval([&traj]).unwrap();
+    let traj_want = r.require("diag.traj.out3").unwrap();
+    assert_eq!(
+        traj.shape(),
+        traj_want.shape(),
+        "on-trajectory step 3 shape"
+    );
+    println!("{}", stage_line(3, "on-trajectory", &traj, traj_want));
+    // The reference's own rounding: the same two asserted inputs at bf16 compute.
+    let bf16_step0 = r.require("diag.bf16.step0").unwrap();
+    let bf16_traj = r.require("diag.bf16.traj.out3").unwrap();
+    println!(
+        "{}",
+        stage_line(
+            0,
+            "ref bf16 vs f32",
+            bf16_step0,
+            r.require("out.step0").unwrap()
+        )
+    );
+    println!("{}", stage_line(3, "ref bf16 vs f32", bf16_traj, traj_want));
+    println!(
+        "{}",
+        stage_line(0, "vs ref bf16", &results[0].3, bf16_step0)
+    );
+    println!("{}", stage_line(3, "traj vs ref bf16", &traj, bf16_traj));
     let head_gap = rel_l2(
         &results[0].3,
         &results[1].3.as_dtype(Dtype::Float32).unwrap(),
     );
-    for (step, rel, cos, _) in &results {
+    let (off_rel, off_cos) = (results[1].1, results[1].2);
+    let asserted = [
+        ("step 0", results[0].1, results[0].2),
+        (
+            "step 3 on-trajectory",
+            rel_l2(&traj, traj_want),
+            cosine(&traj, traj_want),
+        ),
+    ];
+    for (what, rel, cos) in &asserted {
         println!(
-            "h3-image DiT step {step} vs diffusers: rel-L2 {rel:.3e} (bound {DIT_REL_L2_TOL:.0e}), \
+            "h3-image DiT {what} vs diffusers: rel-L2 {rel:.3e} (bound {DIT_REL_L2_TOL:.0e}), \
              cosine {cos:.6} (floor {DIT_MIN_COSINE})"
         );
     }
+    println!(
+        "h3-image DiT step 3 off-trajectory (step-0 noise rows at t = 0.25; diagnostic, not \
+         asserted): rel-L2 {off_rel:.3e}, cosine {off_cos:.6}"
+    );
     println!("step-0 vs step-3 velocity rel-L2 gap {head_gap:.3e}");
-    for (step, rel, cos, _) in &results {
-        assert!(
-            *rel < DIT_REL_L2_TOL,
-            "step {step} diverges: rel-L2 {rel:.3e}"
-        );
-        assert!(*cos > DIT_MIN_COSINE, "step {step} cosine {cos:.6}");
+    for (what, rel, cos) in &asserted {
+        assert!(*rel < DIT_REL_L2_TOL, "{what} diverges: rel-L2 {rel:.3e}");
+        assert!(*cos > DIT_MIN_COSINE, "{what} cosine {cos:.6}");
     }
     assert!(
         head_gap > DIT_REL_L2_TOL,
