@@ -30,7 +30,8 @@ use mlx_gen::gen_core::h3_image::dit_sweep::{self, RowRegions, SweepRow};
 /// The family DiT parity bounds (requirement E9), shared with the Candle gate: a bf16 50-block DiT
 /// against the diffusers forward (CPU torch, float32 activations over the same bf16-stored weights).
 use mlx_gen::gen_core::h3_image::{
-    DIT_PARITY_MAX_REL_L2 as DIT_REL_L2_TOL, DIT_PARITY_MIN_COSINE as DIT_MIN_COSINE,
+    edit_parity_limit, DIT_PARITY_MAX_REL_L2 as DIT_REL_L2_TOL,
+    DIT_PARITY_MIN_COSINE as DIT_MIN_COSINE,
 };
 
 fn image_snapshot() -> PathBuf {
@@ -1040,9 +1041,24 @@ fn h3_image_edit_first_step_matches_diffusers() {
          asserted): rel-L2 {off_rel:.3e}, cosine {off_cos:.6}"
     );
     println!("step-0 vs step-3 velocity rel-L2 gap {head_gap:.3e}");
-    for (what, rel, cos) in &asserted {
-        assert!(*rel < DIT_REL_L2_TOL, "{what} diverges: rel-L2 {rel:.3e}");
-        assert!(*cos > DIT_MIN_COSINE, "{what} cosine {cos:.6}");
+    // The edit bound is relative to the reference's own bf16 rounding (see
+    // `EDIT_DIT_PARITY_MAX_RATIO_TO_REFERENCE_BF16`); `require` fails if the reference lacks it.
+    let drifts = [
+        rel_l2(bf16_step0, want0) as f64,
+        rel_l2(bf16_traj, traj_want) as f64,
+    ];
+    for ((what, rel, cos), drift) in asserted.iter().zip(drifts) {
+        let limit = edit_parity_limit(drift).unwrap_or_else(|e| panic!("{what}: {e}"));
+        println!(
+            "h3-image edit DiT {what} gate: limit {limit:.3e}, reference bf16 drift {drift:.3e}, \
+             ours/drift ratio {:.3}",
+            *rel as f64 / drift
+        );
+        assert!(
+            (*rel as f64) <= limit,
+            "{what} diverges: rel-L2 {rel:.3e} > limit {limit:.3e}"
+        );
+        assert!(*cos >= DIT_MIN_COSINE, "{what} cosine {cos:.6}");
     }
     assert!(
         head_gap > DIT_REL_L2_TOL,

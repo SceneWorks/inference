@@ -1681,7 +1681,9 @@ fn image_vae_tiled_decode_lowers_the_16mp_peak() {
 // values as the MLX gate: rel-L2 and cosine of the velocity against diffusers' float32-activation
 // forward over the same bf16 weights. Peak and mean errors are printed as diagnostics only.
 use candle_gen::gen_core::h3_image::dit_sweep::{self, RowRegions, SweepRow};
-use candle_gen::gen_core::h3_image::{DIT_PARITY_MAX_REL_L2, DIT_PARITY_MIN_COSINE};
+use candle_gen::gen_core::h3_image::{
+    edit_parity_limit, DIT_PARITY_MAX_REL_L2, DIT_PARITY_MIN_COSINE,
+};
 
 /// `(||got - want|| / ||want||, cosine)` over the flattened tensors, in f32.
 fn image_dit_rel_l2_cosine(got: &Tensor, want: &Tensor) -> (f32, f32) {
@@ -2655,7 +2657,7 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
     let (l3, c3) = image_dit_rel_l2_cosine(&got3, &want3);
     let (between, _) = image_dit_rel_l2_cosine(&want3, &want0);
     println!(
-        "image edit DiT vs diffusers (family bounds rel-L2 {DIT_PARITY_MAX_REL_L2:.0e}, cosine \
+        "image edit DiT vs diffusers (t2i rel-L2 bound {DIT_PARITY_MAX_REL_L2:.0e}; edit limit is 2x reference bf16 drift; cosine \
          {DIT_PARITY_MIN_COSINE}): step0 rel-L2 {l0:.3e} cosine {c0:.6}; step3 on-trajectory \
          rel-L2 {lt:.3e} cosine {ct:.6}; reference step0 vs step3 rel-L2 {between:.3e}"
     );
@@ -2667,10 +2669,23 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
         "image edit DiT step 3 off-trajectory (step-0 rows at t = 0.25; diagnostic, not \
          asserted): rel-L2 {l3:.3e} cosine {c3:.6} peak {p3:.3e} mean {m3:.3e}"
     );
-    for (what, l2, cos) in [("step 0", l0, c0), ("step 3 on-trajectory", lt, ct)] {
+    // The edit bound is relative to the reference's own bf16 rounding (see
+    // `EDIT_DIT_PARITY_MAX_RATIO_TO_REFERENCE_BF16`); `tensor` fails if the reference lacks it.
+    let (d0, _) = image_dit_rel_l2_cosine(&bf16_step0, &want0);
+    let (dt, _) = image_dit_rel_l2_cosine(&bf16_traj, &traj_want);
+    for ((what, l2, cos), drift) in [("step 0", l0, c0), ("step 3 on-trajectory", lt, ct)]
+        .into_iter()
+        .zip([d0 as f64, dt as f64])
+    {
+        let limit = edit_parity_limit(drift).unwrap_or_else(|e| panic!("{what}: {e}"));
+        println!(
+            "image edit DiT {what} gate: limit {limit:.3e}, reference bf16 drift {drift:.3e}, \
+             ours/drift ratio {:.3}",
+            l2 as f64 / drift
+        );
         assert!(
-            l2 <= DIT_PARITY_MAX_REL_L2,
-            "{what} diverges: rel-L2 {l2:.3e}"
+            (l2 as f64) <= limit,
+            "{what} diverges: rel-L2 {l2:.3e} > limit {limit:.3e}"
         );
         assert!(
             cos >= DIT_PARITY_MIN_COSINE,

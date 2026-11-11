@@ -244,6 +244,38 @@ pub const DIT_PARITY_MAX_REL_L2: f32 = 5e-2;
 /// Family DiT parity bound: the flattened velocity's cosine similarity against diffusers is at
 /// least this. Asserted next to [`DIT_PARITY_MAX_REL_L2`] by both backends.
 pub const DIT_PARITY_MIN_COSINE: f32 = 0.995;
+/// Edit-path DiT parity bound, relative to the reference's own bf16 rounding: a backend's edit
+/// velocity passes when `rel-L2(ours, f32 reference)` is at most this times
+/// `rel-L2(reference bf16, reference f32)`, computed per step from the same reference file.
+///
+/// Why: on edit inputs the deep-stack blocks amplify bf16 rounding, so upstream's own bf16 forward
+/// misses the fixed [`DIT_PARITY_MAX_REL_L2`] (5.33e-2 at step 0, 4.98e-2 at step 3). Michael
+/// approved this bound on 2026-11-11. The text-to-image gates keep the fixed
+/// [`DIT_PARITY_MAX_REL_L2`]. Use [`edit_parity_limit`] to apply it.
+pub const EDIT_DIT_PARITY_MAX_RATIO_TO_REFERENCE_BF16: f64 = 2.0;
+/// A reference bf16 drift below this is not a genuine bf16 forward (bf16 rounding through a deep
+/// stack is never this small), so [`edit_parity_limit`] refuses it.
+pub const EDIT_DIT_MIN_PLAUSIBLE_REFERENCE_BF16_DRIFT: f64 = 1e-4;
+
+/// The edit-path rel-L2 limit for one step: [`EDIT_DIT_PARITY_MAX_RATIO_TO_REFERENCE_BF16`] times
+/// the reference's bf16-vs-f32 rel-L2 drift at that step. Refuses a non-finite drift and one below
+/// [`EDIT_DIT_MIN_PLAUSIBLE_REFERENCE_BF16_DRIFT`], so the gate can never pass vacuously.
+pub fn edit_parity_limit(reference_bf16_drift: f64) -> Result<f64, Error> {
+    if !reference_bf16_drift.is_finite() {
+        return Err(Error::Msg(format!(
+            "the edit reference's bf16-vs-f32 drift is {reference_bf16_drift}; the reference must \
+             contain a finite bf16 forward (diag.bf16.*)"
+        )));
+    }
+    if reference_bf16_drift < EDIT_DIT_MIN_PLAUSIBLE_REFERENCE_BF16_DRIFT {
+        return Err(Error::Msg(format!(
+            "the edit reference's bf16-vs-f32 drift {reference_bf16_drift:.3e} is below \
+             {EDIT_DIT_MIN_PLAUSIBLE_REFERENCE_BF16_DRIFT:.0e}: the bf16 reference is not a \
+             genuine bf16 forward"
+        )));
+    }
+    Ok(EDIT_DIT_PARITY_MAX_RATIO_TO_REFERENCE_BF16 * reference_bf16_drift)
+}
 /// VAE spatial compression: one latent cell per 16x16 pixels.
 pub const VAE_SPATIAL_RATIO: u32 = 16;
 
@@ -987,6 +1019,26 @@ pub mod dit_sweep {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_parity_limit_scales_the_reference_bf16_drift() {
+        let limit = edit_parity_limit(5.33e-2).unwrap();
+        assert!((limit - 2.0 * 5.33e-2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn edit_parity_limit_refuses_a_missing_or_nan_drift() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(edit_parity_limit(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn edit_parity_limit_refuses_a_tiny_drift() {
+        assert!(edit_parity_limit(0.0).is_err());
+        assert!(edit_parity_limit(9e-5).is_err());
+        assert!(edit_parity_limit(1e-4).is_ok());
+    }
 
     #[test]
     fn prompt_ids_truncate_at_4096_and_refuse_empty() {
