@@ -79,4 +79,7 @@ fn minimax_h3_image_pe_quality_against_nvfp4() {
         failed.is_empty(),
         "{label}: replies that broke the schema: {failed:?}"
     );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED minimax_h3_image_pe_quality_against_nvfp4");
 }

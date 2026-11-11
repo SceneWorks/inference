@@ -10,11 +10,21 @@
 //!
 //! # What it writes
 //! A prepared snapshot is the HF shape [`TextLlmRegistry::load_for_model`](core_llm::TextLlmRegistry::load_for_model) already consumes:
-//! `config.json` + `model.safetensors` (via [`candle_core::safetensors::save`]) + `tokenizer.json`
-//! (and `tokenizer_config.json` when there is a chat template). Reading the dense tensors reuses the
-//! loaders candle already has — HF via [`Weights::from_dir`], GGUF via [`GgufCheckpoint::open`]
-//! (Candle's native reader dequantizes every GGML block type for free), so the writer is uniform
-//! across both inputs.
+//! `config.json` + the safetensors weights (via [`candle_core::safetensors::save`]) + `tokenizer.json`
+//! and the [`SNAPSHOT_SIDECARS`] the loader reads (tokenizer config, chat template, generation EOS
+//! set, processor config). An HF source is read and written **one shard at a time**
+//! ([`Weights::from_file_host_raw`]): each output shard keeps its source shard's file name, and a
+//! sharded source gets a fresh `model.safetensors.index.json`, so peak host memory is one shard, not
+//! the model (SW-7099: a 27B bf16 snapshot is ~54 GB). A GGUF is read whole through
+//! [`GgufCheckpoint::open`] (Candle's native reader dequantizes every GGML block type for free) and
+//! written as one `model.safetensors`.
+//!
+//! A qwen3_5 VLM snapshot (a `text_config` decoder plus a Qwen3-VL `vision_config` tower, e.g.
+//! MiniMax-H3-Image-PE) is prepared like its text decoder: the selection below never names a
+//! `model.visual.*` tensor, so the vision tower is written dense at every tier — the policy the
+//! Qwen-Image 2.1 text-encoder tiers use (`mlx_gen_qwen_image_2_1::convert`) and the MLX preparer
+//! applies. Any other `vision_config` snapshot (LLaVA) is declined: it belongs to the vision
+//! provider.
 //!
 //! # How quantization is persisted
 //! A Q4 / Q8 snapshot stores its layer projections **already quantized** (sc-19375), so a tier
@@ -46,7 +56,7 @@
 //! (32-weight blocks). A projection aligned to neither is a clear error, not a silent dense
 //! fallback, matching quantize-on-load.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use candle_core::quantized::QTensor;
@@ -74,8 +84,9 @@ fn backend() -> &'static str {
 }
 
 /// Weightless probe: can the candle backend prepare `spec.source`? A `*.gguf` container is accepted;
-/// an HF source must be a directory holding `config.json` and must not be a multimodal snapshot (a
-/// `vision_config` block belongs to the vision provider's preparer). Reads only `config.json`, never a
+/// an HF source must be a directory holding `config.json` and must not be a multimodal snapshot the
+/// text decoder does not own (a non-qwen3_5 `vision_config` block belongs to the vision provider's
+/// preparer; a qwen3_5 VLM is the text provider's, as at load). Reads only `config.json`, never a
 /// weight shard — mirrors [`provider::can_load`](crate::provider::can_load).
 pub fn can_prepare(spec: &PrepareSpec) -> bool {
     match detect_format(&spec.source) {
@@ -83,7 +94,7 @@ pub fn can_prepare(spec: &PrepareSpec) -> bool {
         Ok(ModelFormat::Safetensors) => {
             spec.source.is_dir()
                 && spec.source.join("config.json").is_file()
-                && !has_vision_config(&spec.source.join("config.json"))
+                && !has_foreign_vision_config(&spec.source.join("config.json"))
         }
         Err(_) => false,
     }
@@ -101,7 +112,8 @@ pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
 }
 
 /// Prepare from an HF-safetensors snapshot directory. Dense + already-loadable ⇒ passthrough;
-/// quantized ⇒ load the dense weights, round the projections, and write a fresh snapshot.
+/// quantized ⇒ per source shard, read it, store the selected projections as GGML blocks, and write
+/// it out under the same file name; then the config, index and sidecars.
 fn prepare_hf(spec: &PrepareSpec) -> Result<PrepareReport> {
     let src = &spec.source;
     let config_path = src.join("config.json");
@@ -137,28 +149,90 @@ fn prepare_hf(spec: &PrepareSpec) -> Result<PrepareReport> {
         });
     };
 
-    // Quantized: load dense weights, round the projections to the requested scheme, write the
-    // snapshot. The source dtype is preserved (the loader casts to its compute dtype anyway).
+    // Quantized. The selection's decoder-root probe needs every key of the snapshot, read from the
+    // shard headers only; then each shard is read, rounded and written on its own, so peak host
+    // memory is one shard. The source dtype is preserved (the loader casts to its compute dtype).
     let mut config = read_json(&config_path)?;
-    let mut tensors = Weights::from_dir(src, &Device::Cpu)?.into_map();
-    let stored = quantize_projections(&mut tensors, q, &config)?;
+    let shards = safetensors_shards(src)?;
+    if shards.is_empty() {
+        return Err(Error::Msg(format!(
+            "prepare: HF source {} has no safetensors tensors",
+            src.display()
+        )));
+    }
+    let mut keys = HashSet::new();
+    for shard in &shards {
+        let header = crate::provider::read_safetensors_header(shard)
+            .map_err(|e| Error::Msg(format!("prepare: {e}")))?;
+        keys.extend(header.into_iter().map(|(k, _)| k));
+    }
+    keys.remove("__metadata__");
+    let selection = QuantizedTensors::from_config(&config, |key| keys.contains(key))?;
 
+    check_output(spec)?;
     std::fs::create_dir_all(&spec.out_dir)?;
+    let mut stored = 0;
+    let mut num_tensors = 0;
+    let mut total_bytes = 0;
+    let mut weight_map = Map::new();
+    for shard in &shards {
+        let name = shard
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| Error::Msg(format!("prepare: shard name {}", shard.display())))?;
+        let mut tensors = Weights::from_file_host_raw(shard)?.into_map();
+        stored += quantize_selected(&mut tensors, q, &selection)?;
+        save_safetensors(&tensors, &spec.out_dir.join(name))?;
+        for (key, t) in &tensors {
+            weight_map.insert(key.clone(), Json::from(name));
+            total_bytes += t.elem_count() * t.dtype().size_in_bytes();
+        }
+        num_tensors += tensors.len();
+    }
+
     stamp_quantization(&mut config, q, stored);
     write_json(&spec.out_dir.join("config.json"), &config)?;
-    save_safetensors(&tensors, &spec.out_dir.join("model.safetensors"))?;
+    if shards.len() > 1 {
+        let index = serde_json::json!({
+            "metadata": {"total_size": total_bytes},
+            "weight_map": weight_map,
+        });
+        write_json(&spec.out_dir.join("model.safetensors.index.json"), &index)?;
+    }
     std::fs::copy(&tokenizer_path, spec.out_dir.join("tokenizer.json"))?;
-    copy_optional(src, &spec.out_dir, "tokenizer_config.json")?;
-    copy_optional(src, &spec.out_dir, "special_tokens_map.json")?;
+    for name in SNAPSHOT_SIDECARS {
+        copy_optional(src, &spec.out_dir, name)?;
+    }
 
     Ok(PrepareReport {
         input_format: ModelFormat::Safetensors,
         quantized: spec.quantize,
         out_dir: spec.out_dir.clone(),
-        num_tensors: tensors.len(),
+        num_tensors,
         passthrough: false,
     })
 }
+
+/// [`core_llm::check_prepare_output`] for a preparation that writes: a re-prepare into a directory
+/// holding an earlier tier would leave its shards for the loader to read beside (and over) the new.
+fn check_output(spec: &PrepareSpec) -> Result<()> {
+    core_llm::check_prepare_output(&spec.source, &spec.out_dir)
+        .map_err(|e| Error::Msg(format!("prepare: {e}")))
+}
+
+/// Files besides `config.json`, `tokenizer.json` and the weights that a prepared HF tier carries
+/// over byte for byte, because the loader reads them: the tokenizer config and special-token map,
+/// the sidecar `chat_template.jinja` (which wins over the tokenizer config's template),
+/// `generation_config.json` (the generation EOS set) and `processor_config.json` (the multimodal
+/// front-end's geometry). Nothing else is copied — in particular never a model's licensed
+/// `prompt/` directory (SW-7099).
+pub const SNAPSHOT_SIDECARS: [&str; 5] = [
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "chat_template.jinja",
+    "generation_config.json",
+    "processor_config.json",
+];
 
 /// Prepare from a `*.gguf` container: Candle's native reader dequantizes every block type, then this
 /// writes an HF-shaped snapshot (reconstructed `config.json`, a `tokenizer.json` rebuilt from the
@@ -197,6 +271,7 @@ fn prepare_gguf(spec: &PrepareSpec) -> Result<PrepareReport> {
         }
     }
 
+    check_output(spec)?;
     std::fs::create_dir_all(&spec.out_dir)?;
     write_json(&spec.out_dir.join("config.json"), &config)?;
     save_safetensors(&tensors, &spec.out_dir.join("model.safetensors"))?;
@@ -300,6 +375,16 @@ fn quantize_projections(
     config: &Json,
 ) -> Result<usize> {
     let selection = QuantizedTensors::from_config(config, |key| tensors.contains_key(key))?;
+    quantize_selected(tensors, q, &selection)
+}
+
+/// [`quantize_projections`] over a `selection` resolved once for the whole snapshot, applied to the
+/// tensors of one shard (an HF source is prepared shard by shard).
+fn quantize_selected(
+    tensors: &mut HashMap<String, Tensor>,
+    q: QuantSpec,
+    selection: &QuantizedTensors,
+) -> Result<usize> {
     let mut keys: Vec<String> = tensors
         .keys()
         .filter(|k| selection.contains(k))
@@ -388,25 +473,39 @@ fn resolve_gguf_path(source: &Path) -> Result<PathBuf> {
         .ok_or_else(|| Error::Unsupported(format!("prepare: no *.gguf in {}", source.display())))
 }
 
-/// Whether a `config.json` declares a `vision_config` (a multimodal snapshot the text preparer
-/// declines). Any read/parse failure ⇒ `false` (the format probe handles non-snapshots).
-fn has_vision_config(config_json: &Path) -> bool {
+/// Whether a `config.json` declares a `vision_config` the text preparer declines: any multimodal
+/// snapshot except a qwen3_5 VLM, whose `text_config` decoder this backend's text provider loads
+/// (the LLaVA probe declines it the same way, [`crate::llava::can_load`]). Any read/parse failure ⇒
+/// `false` (the format probe handles non-snapshots).
+fn has_foreign_vision_config(config_json: &Path) -> bool {
     std::fs::read_to_string(config_json)
         .ok()
         .and_then(|t| serde_json::from_str::<Json>(&t).ok())
-        .map(|v| v.get("vision_config").is_some())
-        .unwrap_or(false)
+        .is_some_and(|v| {
+            v.get("vision_config").is_some()
+                && !matches!(Architecture::from_config(&v), Ok(Architecture::Qwen35))
+        })
+}
+
+/// Every `*.safetensors` shard in `dir`, sorted (the loader's merge order).
+fn safetensors_shards(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut shards = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+            shards.push(path);
+        }
+    }
+    shards.sort();
+    Ok(shards)
 }
 
 /// Count weight tensors across every `*.safetensors` shard in `dir` by reading only the headers (no
 /// tensor data) — cheap enough for the dense passthrough's `num_tensors`.
 fn count_safetensors_tensors(dir: &Path) -> Result<usize> {
     let mut total = 0;
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
-            total += count_header_tensors(&path)?;
-        }
+    for path in safetensors_shards(dir)? {
+        total += count_header_tensors(&path)?;
     }
     Ok(total)
 }
@@ -496,6 +595,50 @@ mod tests {
         assert_eq!(count_safetensors_tensors(dir.path()).unwrap(), 1);
     }
 
+    /// SW-7099 review: a quantized prepare refuses an output that already holds files — the
+    /// loader reads every `*.safetensors`, so an earlier tier's shard would load beside the new one
+    /// — or that is the source or inside it, before writing anything.
+    #[test]
+    fn a_quantized_prepare_refuses_a_stale_or_nested_output() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let config = serde_json::json!({
+            "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+            "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 1,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "vocab_size": 8,
+            "rms_norm_eps": 1e-5, "rope_theta": 10000.0
+        });
+        std::fs::write(src.join("config.json"), config.to_string()).unwrap();
+        std::fs::write(src.join("tokenizer.json"), "{}").unwrap();
+        let json =
+            br#"{"model.embed_tokens.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut shard = (json.len() as u64).to_le_bytes().to_vec();
+        shard.extend_from_slice(json);
+        shard.extend_from_slice(&[0; 4]);
+        std::fs::write(src.join("model.safetensors"), &shard).unwrap();
+
+        let stale = root.path().join("stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("model.safetensors"), b"old tier").unwrap();
+        let err = prepare(&PrepareSpec::quantized(&src, &stale, Quantize::Q4)).unwrap_err();
+        assert!(err.to_string().contains("not empty"), "{err}");
+        assert_eq!(
+            std::fs::read(stale.join("model.safetensors")).unwrap(),
+            b"old tier"
+        );
+
+        for out in [src.clone(), src.join("q4")] {
+            let err = prepare(&PrepareSpec::quantized(&src, &out, Quantize::Q4)).unwrap_err();
+            assert!(
+                err.to_string().contains("inside it"),
+                "{}: {err}",
+                out.display()
+            );
+        }
+        assert!(!src.join("q4").exists());
+    }
+
     /// sc-19375: the preparer stores blocks for exactly the tensors the loader quantizes and load
     /// admission prices — the shared `loads_quantized` rule — so a projection-named tensor outside
     /// the decoder the loader builds (a layer past `num_hidden_layers`, another root) and every
@@ -568,6 +711,161 @@ mod tests {
             persisted_ggml_blocks(&with(serde_json::json!({"bits": 3, "storage": "ggml"}))),
             None
         );
+    }
+
+    /// A tiny qwen3_5 VLM `config.json`: a `text_config` decoder plus a Qwen3-VL `vision_config`
+    /// tower, the MiniMax-H3-Image-PE shape (SW-7099).
+    fn qwen35_vlm_config() -> Json {
+        serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"], "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text", "hidden_size": 32, "num_hidden_layers": 1,
+                "intermediate_size": 64, "num_attention_heads": 2, "num_key_value_heads": 1,
+                "head_dim": 16, "vocab_size": 8, "linear_num_value_heads": 2,
+                "linear_num_key_heads": 1, "linear_key_head_dim": 16, "linear_value_head_dim": 16
+            },
+            "vision_config": { "model_type": "qwen3_vl", "depth": 1, "hidden_size": 32 }
+        })
+    }
+
+    fn write_config(dir: &Path, config: &Json) {
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    }
+
+    /// SW-7099: a qwen3_5 VLM snapshot is the text preparer's (as it is the text provider's at
+    /// load); any other `vision_config` snapshot (LLaVA) is still declined.
+    #[test]
+    fn a_qwen35_vlm_is_preparable_and_llava_is_not() {
+        let vlm = tempfile::tempdir().unwrap();
+        write_config(vlm.path(), &qwen35_vlm_config());
+        std::fs::write(vlm.path().join("model.safetensors"), b"\x00").unwrap();
+        let out = vlm.path().join("out");
+        assert!(can_prepare(&PrepareSpec::quantized(
+            vlm.path(),
+            &out,
+            Quantize::Q8
+        )));
+
+        let llava = tempfile::tempdir().unwrap();
+        write_config(
+            llava.path(),
+            &serde_json::json!({
+                "architectures": ["LlavaForConditionalGeneration"], "model_type": "llava",
+                "text_config": {"architectures": ["LlamaForCausalLM"]},
+                "vision_config": {"hidden_size": 16}
+            }),
+        );
+        std::fs::write(llava.path().join("model.safetensors"), b"\x00").unwrap();
+        assert!(!can_prepare(&PrepareSpec::quantized(
+            llava.path(),
+            llava.path().join("out"),
+            Quantize::Q8
+        )));
+    }
+
+    /// SW-7099: a sharded qwen3_5 VLM source is prepared shard by shard — each output shard keeps
+    /// its source name, a fresh index maps every tensor to its shard, the decoder projections are
+    /// stored as GGML blocks while the vision tower, embeddings and head stay dense, the runtime
+    /// sidecars are copied, and the licensed `prompt/` directory and stale index are not.
+    #[test]
+    fn a_sharded_qwen35_vlm_tier_is_written_per_shard_with_a_dense_vision_tower() {
+        let src = tempfile::tempdir().unwrap();
+        write_config(src.path(), &qwen35_vlm_config());
+        let t = |rows: usize, cols: usize| Tensor::ones((rows, cols), DType::BF16, &Device::Cpu);
+        let shard1: HashMap<String, Tensor> = [
+            ("model.language_model.embed_tokens.weight", t(8, 32)),
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                t(64, 32),
+            ),
+            ("model.visual.blocks.0.attn.qkv.weight", t(96, 32)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.unwrap()))
+        .collect();
+        let shard2: HashMap<String, Tensor> = [
+            (
+                "model.language_model.layers.0.mlp.down_proj.weight",
+                t(32, 64),
+            ),
+            ("model.visual.merger.linear_fc1.weight", t(32, 32)),
+            ("lm_head.weight", t(8, 32)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.unwrap()))
+        .collect();
+        let names = [
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ];
+        candle_core::safetensors::save(&shard1, src.path().join(names[0])).unwrap();
+        candle_core::safetensors::save(&shard2, src.path().join(names[1])).unwrap();
+        std::fs::write(src.path().join("model.safetensors.index.json"), "{}").unwrap();
+        for name in std::iter::once("tokenizer.json").chain(SNAPSHOT_SIDECARS) {
+            std::fs::write(src.path().join(name), name).unwrap();
+        }
+        std::fs::create_dir_all(src.path().join("prompt/t2i")).unwrap();
+        std::fs::write(src.path().join("prompt/t2i/system_prompt.txt"), "licensed").unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        let out = out.path().join("q8");
+        let report = prepare(&PrepareSpec::quantized(src.path(), &out, Quantize::Q8)).unwrap();
+        assert!(!report.passthrough);
+        assert_eq!(report.num_tensors, 6);
+
+        let dtype_shape = |shard: &str, key: &str| {
+            let header = crate::provider::read_safetensors_header(&out.join(shard)).unwrap();
+            let entry = &header[key];
+            (
+                entry["dtype"].as_str().unwrap().to_string(),
+                serde_json::from_value::<Vec<usize>>(entry["shape"].clone()).unwrap(),
+            )
+        };
+        let blocks = |rows: usize, blocks: usize| ("U8".to_string(), vec![rows, blocks, 34]);
+        let dense = |rows: usize, cols: usize| ("BF16".to_string(), vec![rows, cols]);
+        let expected = [
+            (
+                names[0],
+                "model.language_model.embed_tokens.weight",
+                dense(8, 32),
+            ),
+            (
+                names[0],
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                blocks(64, 1),
+            ),
+            (
+                names[0],
+                "model.visual.blocks.0.attn.qkv.weight",
+                dense(96, 32),
+            ),
+            (
+                names[1],
+                "model.language_model.layers.0.mlp.down_proj.weight",
+                blocks(32, 2),
+            ),
+            (
+                names[1],
+                "model.visual.merger.linear_fc1.weight",
+                dense(32, 32),
+            ),
+            (names[1], "lm_head.weight", dense(8, 32)),
+        ];
+        let index = read_json(&out.join("model.safetensors.index.json")).unwrap();
+        let weight_map = index["weight_map"].as_object().unwrap();
+        assert_eq!(weight_map.len(), expected.len());
+        for (shard, key, want) in expected {
+            assert_eq!(dtype_shape(shard, key), want, "{key}");
+            assert_eq!(weight_map[key], shard, "{key}");
+        }
+
+        let config = read_json(&out.join("config.json")).unwrap();
+        assert_eq!(persisted_ggml_blocks(&config), Some(QuantSpec::q8()));
+        assert!(config.get("vision_config").is_some());
+        for name in std::iter::once("tokenizer.json").chain(SNAPSHOT_SIDECARS) {
+            assert_eq!(std::fs::read_to_string(out.join(name)).unwrap(), name);
+        }
+        assert!(!out.join("prompt").exists(), "a tier never carries prompt/");
     }
 
     #[test]

@@ -5644,22 +5644,27 @@ mod prefix_cache {
     }
 }
 
-/// SW-7099: a ModelOpt NVFP4 qwen3_5 snapshot is priced as the load builds it — every published
-/// triple staged at its logical shape as the resident NVFP4 operand, the triples themselves held
-/// on the host and never cast — and a device that cannot serve NVFP4 refuses it by name instead
-/// of reading the packed codes as dense weights.
-#[test]
-fn a_modelopt_nvfp4_snapshot_is_priced_as_staged_nvfp4_and_refused_off_blackwell() {
+/// The synthetic qwen3_5 snapshot as a ModelOpt NVFP4 checkpoint: every NVFP4-eligible
+/// projection (and the untied head when `convert_head`) a published triple. `eligible_head` widens
+/// the synthetic head (50 rows, which NVFP4 keeps dense) to 64 rows; only admission reads it.
+/// Returns the snapshot and the staged NVFP4 bytes of its triples.
+fn modelopt_qwen35_snapshot(convert_head: bool, eligible_head: bool) -> (tempfile::TempDir, u64) {
     use crate::primitives::projection::nvfp4_device_bytes;
     use candle_core::{DType, Device};
     let dense = qwen35_snapshot(false, false, true);
     let mut tensors =
         candle_core::safetensors::load(dense.path().join("model.safetensors"), &Device::Cpu)
             .unwrap();
+    if eligible_head {
+        let cols = tensors["lm_head.weight"].dims2().unwrap().1;
+        let head = Tensor::zeros((64, cols), DType::BF16, &Device::Cpu).unwrap();
+        tensors.insert("lm_head.weight".into(), head);
+    }
     let keys: Vec<String> = tensors.keys().cloned().collect();
     let (mut expected, mut converted) = (0u64, 0usize);
     for key in keys {
-        let quantized = crate::models::qwen35::quantizes_tensor(&key) || key == "lm_head.weight";
+        let quantized = crate::models::qwen35::quantizes_tensor(&key)
+            || (convert_head && key == "lm_head.weight");
         let (rows, cols) = match tensors[&key].dims2() {
             Ok(dims) if quantized => dims,
             _ => continue,
@@ -5700,6 +5705,36 @@ fn a_modelopt_nvfp4_snapshot_is_priced_as_staged_nvfp4_and_refused_off_blackwell
     let dir = dense.path();
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
     candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
+    (dense, expected)
+}
+
+/// SW-7099 review: a ModelOpt checkpoint's head without `.weight_scale` loads dense, so it is
+/// never priced as an NVFP4 copy — where the same head published as a triple is.
+#[test]
+fn a_modelopt_snapshots_dense_head_is_not_priced_as_nvfp4() {
+    let (with_head, staged_with_head) = modelopt_qwen35_snapshot(true, true);
+    let (snapshot, staged) = modelopt_qwen35_snapshot(false, true);
+    assert!(
+        staged_with_head > staged,
+        "the synthetic head is NVFP4-eligible"
+    );
+    let copy = |dir: &std::path::Path| {
+        super::LlamaProvider::load_memory_estimate(&spec_at(dir, None), true)
+            .unwrap()
+            .quantized_copy_bytes
+    };
+    assert_eq!(copy(snapshot.path()), staged);
+    assert_eq!(copy(with_head.path()), staged_with_head);
+}
+
+/// SW-7099: a ModelOpt NVFP4 qwen3_5 snapshot is priced as the load builds it — every published
+/// triple staged at its logical shape as the resident NVFP4 operand, the triples themselves held
+/// on the host and never cast — and a device that cannot serve NVFP4 refuses it by name instead
+/// of reading the packed codes as dense weights.
+#[test]
+fn a_modelopt_nvfp4_snapshot_is_priced_as_staged_nvfp4_and_refused_off_blackwell() {
+    let (dense, expected) = modelopt_qwen35_snapshot(true, false);
+    let dir = dense.path();
 
     let estimate = super::LlamaProvider::load_memory_estimate(&spec_at(dir, None), true).unwrap();
     assert_eq!(estimate.quantized_copy_bytes, expected);

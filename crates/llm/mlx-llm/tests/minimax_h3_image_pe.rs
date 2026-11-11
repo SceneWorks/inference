@@ -70,4 +70,6 @@ fn minimax_h3_image_pe_quality_against_nvfp4() {
         failed.is_empty(),
         "{label}: replies that broke the schema: {failed:?}"
     );
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED minimax_h3_image_pe::minimax_h3_image_pe_quality_against_nvfp4");
 }

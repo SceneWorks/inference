@@ -100,6 +100,12 @@ pub(crate) fn modelopt_projection(
     Ok(Some(Projection::Nvfp4(std::sync::Arc::new(weight))))
 }
 
+/// Whether `w` is a ModelOpt NVFP4 checkpoint: any projection carries a `.weight_scale` sibling.
+/// Its weights without one were left unquantized by the publisher and load dense.
+pub(crate) fn is_modelopt_checkpoint(w: &Weights) -> bool {
+    w.keys().any(|key| key.ends_with(WEIGHT_SCALE))
+}
+
 /// The licensed prompt directory a converted tier never carries (see [`convert_snapshot_to_bf16`]).
 pub const PROMPT_DIR: &str = "prompt";
 
@@ -132,7 +138,7 @@ fn copy_tree(src: &Path, out: &Path, skip: &dyn Fn(&Path) -> bool) -> Result<()>
 }
 
 /// Dequantize a ModelOpt NVFP4 snapshot at `source` into a dense bf16 snapshot at `out_dir`
-/// (created; must be empty or absent), on the CPU, one shard at a time.
+/// (created; must be empty or absent, and outside `source`), on the CPU, one shard at a time.
 ///
 /// Every ModelOpt projection becomes a bf16 `<stem>.weight`; its `.weight_scale`,
 /// `.weight_scale_2` and `.input_scale` are dropped. Every other tensor is copied byte for byte
@@ -156,12 +162,7 @@ pub fn convert_snapshot_to_bf16(source: &Path, out_dir: &Path) -> Result<Convert
             source.display()
         )));
     }
-    if out_dir.exists() && std::fs::read_dir(out_dir)?.next().is_some() {
-        return Err(Error::Config(format!(
-            "output directory {} is not empty",
-            out_dir.display()
-        )));
-    }
+    core_llm::check_prepare_output(source, out_dir).map_err(|e| Error::Config(e.to_string()))?;
     std::fs::create_dir_all(out_dir)?;
 
     let mut shards: Vec<_> = std::fs::read_dir(source)?
@@ -392,6 +393,23 @@ mod tests {
             index["weight_map"]["layer.proj.weight"],
             "model-00001-of-00001.safetensors"
         );
+    }
+
+    /// SW-7099 review: the bf16 tier is never written into its own source (the shard copy would
+    /// recurse into it, and the loader would read it back as part of the source).
+    #[test]
+    fn an_output_inside_the_source_is_refused() {
+        let src = tempfile::tempdir().unwrap();
+        tiny_snapshot(src.path());
+        for out in [src.path().join("bf16"), src.path().to_path_buf()] {
+            let err = convert_snapshot_to_bf16(src.path(), &out).unwrap_err();
+            assert!(
+                err.to_string().contains("inside it"),
+                "{}: {err}",
+                out.display()
+            );
+        }
+        assert!(!src.path().join("bf16").exists());
     }
 
     #[test]
