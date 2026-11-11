@@ -570,6 +570,7 @@ mod tests {
     /// weight would — so the image precompute, which runs after the install, caches the adapted
     /// tables — and the delta reaches every one of the six tables.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn an_adaln_lora_projects_the_tables_its_merged_weight_would() {
         let cfg = MiniMaxH3DitConfig {
             num_attention_heads: 4,
@@ -623,6 +624,8 @@ mod tests {
             assert!(mlx_gen::testing::max_abs_diff_f32(g, m) < 1e-3);
             assert!(mlx_gen::testing::max_abs_diff_f32(g, b) > 1e-2);
         }
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED dit::block::tests::an_adaln_lora_projects_the_tables_its_merged_weight_would");
     }
 
     /// The published block ships exactly 12 tensors, and none of the attention or feed-forward

@@ -79,11 +79,39 @@ const PREFIXES: [&str; 4] = [
     "transformer.",
     "model.",
 ];
+/// The native (`transformer/`, ComfyUI) names of MiniMax-H3's top-level linears and their
+/// diffusers names (SW-7096). Each pair is a pure rename: the published H3-Image `transformer/`
+/// and `transformer_diffusers/` tensors are byte-identical under it. Both backends' installers
+/// (`normalize_minimax_h3_key`) and this pricer apply the same table. `final_layer.video_out` is
+/// not here: it is the base single output head, which a PDD release replaces per step — see
+/// [`NATIVE_OUTPUT_HEAD`].
+pub const NATIVE_TOP_LEVEL: [(&str, &str); 5] = [
+    ("condition_proj", "context_embedder"),
+    ("video_patch_proj", "proj_in"),
+    ("time_embedder.proj_in", "time_embedder.linear_1"),
+    ("time_embedder.proj_out", "time_embedder.linear_2"),
+    ("final_layer.adaln_proj.linear", "norm_out.linear"),
+];
+
+/// The native single output head (SW-7096). A LoRA on it applies to **every** per-step head
+/// `pdd_proj_out.{i}` the host carries (ComfyUI patches a single-head `video_out` LoRA onto the
+/// base every step's head is built from); a host with no per-step heads leaves it unmatched.
+pub const NATIVE_OUTPUT_HEAD: &str = "final_layer.video_out";
+
+/// The per-step heads [`NATIVE_OUTPUT_HEAD`] fans out to.
+const PER_STEP_HEAD_PREFIX: &str = "pdd_proj_out.";
+
+/// Strip a known namespace prefix, then map a native top-level name to its diffusers module —
+/// the installers' `normalize_minimax_h3_key`.
 fn normalize(path: &str) -> String {
-    PREFIXES
+    let stem = PREFIXES
         .iter()
         .find_map(|prefix| path.strip_prefix(prefix))
-        .unwrap_or(path)
+        .unwrap_or(path);
+    NATIVE_TOP_LEVEL
+        .iter()
+        .find_map(|(native, diffusers)| (stem == *native).then_some(*diffusers))
+        .unwrap_or(stem)
         .to_string()
 }
 fn raw_container(path: &str) -> String {
@@ -350,12 +378,33 @@ fn price_lora(
             return Err(invalid(format!("rank mismatch {path}")));
         }
         let (dw, uw) = (width(down)?, width(up)?);
-        let routes = lora_routes(&path);
-        let fused = routes.len() == 3;
+        let fan_out = path == NATIVE_OUTPUT_HEAD;
+        let routes = if fan_out {
+            // The installers push the same factors onto every per-step head; each head is priced
+            // as its own target (its own prepared pair and forward scratch).
+            let heads: Vec<String> = targets
+                .iter()
+                .filter(|t| t.path.starts_with(PER_STEP_HEAD_PREFIX))
+                .map(|t| t.path.clone())
+                .collect();
+            if heads.is_empty() {
+                return Err(invalid(format!(
+                    "target {path} has no per-step head to fan out to"
+                )));
+            }
+            heads
+        } else {
+            lora_routes(&path)
+        };
+        let fused = !fan_out && routes.len() == 3;
         if fused && source_output % 3 != 0 {
             return Err(invalid("unequal fused QKV outputs"));
         }
-        let output = source_output / routes.len() as u64;
+        let output = if fused {
+            source_output / 3
+        } else {
+            source_output
+        };
         // Swapped FFN up factors and fused split conversions can independently own
         // their source-shaped copy, before final orientation/fold/device transfer.
         if fused || path.ends_with(".mlp.fc1") {
@@ -696,6 +745,74 @@ mod tests {
             visual_elements: 0,
             global: 0,
         }
+    }
+
+    /// SW-7096: a LoRA on the native top-level names prices against the diffusers module the
+    /// installers adapt — `condition_proj` is `context_embedder` — and the native single output
+    /// head `final_layer.video_out` fans out to every per-step head at its full width.
+    #[test]
+    fn native_top_level_names_price_on_the_modules_the_installers_adapt() {
+        let targets = [
+            target("context_embedder", 8, 12, false),
+            target("pdd_proj_out.0", 8, 6, false),
+            target("pdd_proj_out.1", 8, 6, false),
+        ];
+        for backend in [CANDLE, MLX] {
+            let f = file(vec![
+                h(
+                    "diffusion_model.condition_proj.lora_down.weight",
+                    Dtype::BF16,
+                    &[3, 8],
+                ),
+                h(
+                    "diffusion_model.condition_proj.lora_up.weight",
+                    Dtype::BF16,
+                    &[12, 3],
+                ),
+                h(
+                    "diffusion_model.final_layer.video_out.lora_down.weight",
+                    Dtype::BF16,
+                    &[2, 8],
+                ),
+                h(
+                    "diffusion_model.final_layer.video_out.lora_up.weight",
+                    Dtype::BF16,
+                    &[6, 2],
+                ),
+            ]);
+            let p = profile_from_headers(backend, &[f], &targets).unwrap();
+            let mut priced: Vec<_> = p
+                .projections
+                .iter()
+                .map(|m| (m.target.path.as_str(), m.installed_bytes))
+                .collect();
+            priced.sort();
+            assert_eq!(
+                priced,
+                [
+                    ("context_embedder", (8 + 12) * 3 * 2),
+                    ("pdd_proj_out.0", (8 + 6) * 2 * 2),
+                    ("pdd_proj_out.1", (8 + 6) * 2 * 2),
+                ]
+            );
+        }
+        // A host with no per-step heads has nothing for the output head to land on.
+        let f = file(vec![
+            h(
+                "diffusion_model.final_layer.video_out.lora_down.weight",
+                Dtype::BF16,
+                &[2, 8],
+            ),
+            h(
+                "diffusion_model.final_layer.video_out.lora_up.weight",
+                Dtype::BF16,
+                &[6, 2],
+            ),
+        ]);
+        let e = profile_from_headers(CANDLE, &[f], &targets[..1])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("per-step head"), "{e}");
     }
 
     #[test]

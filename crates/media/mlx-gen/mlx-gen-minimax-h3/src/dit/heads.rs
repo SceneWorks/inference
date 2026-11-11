@@ -947,6 +947,7 @@ mod tests {
     /// `addmm`) matches an f64 host projection to F32 accuracy. TF32 keeps 10 fraction bits, so a
     /// TF32 product misses this by well over 1e-5 of the peak.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_float32_head_projects_at_full_float32_precision() {
         let (rows, inp, out) = (64, 256, 96);
         let w = seeded(&[out, inp], 11);
@@ -983,12 +984,15 @@ mod tests {
             "float32 head error {:.3e} of peak",
             worst / peak
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED dit::heads::tests::a_float32_head_projects_at_full_float32_precision");
     }
 
     /// SW-7096: a LoRA on a bias-Linear head is `x·Wᵀ + b + scale·(alpha/rank)·x·Aᵀ·Bᵀ` — checked
     /// against the same projection with the delta MERGED into its weight, an independent route —
     /// and a zero-scale LoRA is byte-identical to the bare head.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_lora_on_a_bias_linear_head_matches_its_merged_weight() {
         let (inp, out, r) = (6, 5, 2);
         let w = seeded(&[out, inp], 1);
@@ -1038,6 +1042,8 @@ mod tests {
             mlx_gen::testing::max_abs_diff_f32(&off.forward(&x).unwrap(), &before),
             0.0
         );
+        crate::model_inference_device::record_model_inference_device();
+        println!("MODEL_INFERENCE_BODY_COMPLETED dit::heads::tests::a_lora_on_a_bias_linear_head_matches_its_merged_weight");
     }
 
     /// The set is exactly 17 names, all distinct, and none of them belongs to a block or the

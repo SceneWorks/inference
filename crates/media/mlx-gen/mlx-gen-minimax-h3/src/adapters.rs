@@ -468,19 +468,16 @@ pub fn normalize_minimax_h3_key(key: &str) -> String {
 /// renames diffusers' `convert_minimax_h3_to_diffusers.py` applies). `final_layer.video_out` is
 /// not here: it is the base single output head, which a PDD release replaces per step — see
 /// [`NATIVE_OUTPUT_HEAD`].
-pub const NATIVE_TOP_LEVEL: [(&str, &str); 5] = [
-    ("condition_proj", "context_embedder"),
-    ("video_patch_proj", "proj_in"),
-    ("time_embedder.proj_in", "time_embedder.linear_1"),
-    ("time_embedder.proj_out", "time_embedder.linear_2"),
-    ("final_layer.adaln_proj.linear", "norm_out.linear"),
-];
+///
+/// One table, shared with the header-only adapter pricer (`gen_core_h3::h3_adapter_memory`), so
+/// memory admission routes a native-named LoRA to the module this install adapts.
+pub const NATIVE_TOP_LEVEL: [(&str, &str); 5] = gen_core_h3::h3_adapter_memory::NATIVE_TOP_LEVEL;
 
 /// The native single output head (SW-7096). On MiniMax-H3-Image it applies to **every** per-step
 /// head `pdd_proj_out.{i}`: the PDD heads replace this head step by step, and ComfyUI — the loader
 /// that consumes native-named LoRAs — patches a single-head `video_out` LoRA onto the base row
 /// block every step's head is built from. A host with no per-step heads leaves it unmatched.
-pub const NATIVE_OUTPUT_HEAD: &str = "final_layer.video_out";
+pub const NATIVE_OUTPUT_HEAD: &str = gen_core_h3::h3_adapter_memory::NATIVE_OUTPUT_HEAD;
 
 /// `true` if `w` is a lightx2v **`_comfyui_`** export rather than the diffusers one.
 ///

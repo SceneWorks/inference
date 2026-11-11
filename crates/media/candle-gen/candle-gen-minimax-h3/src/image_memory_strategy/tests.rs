@@ -155,6 +155,77 @@ fn the_route_gate_admits_edit_and_any_size_and_refuses_an_unsplittable_chunk() {
     assert!(route_gate(&c, &largest, tier).is_ok());
 }
 
+/// SW-7092: admission prices each edit reference as a 2048² VAE copy because the geometry carries
+/// only their count, but the VAE copy caps the short edge alone — a 4096x2048 reference keeps
+/// 8192 rows. The generator re-prices the admitted selection at the references' actual sizes: a
+/// budget that holds the square bound exactly admits a 2048² reference and refuses the wide one.
+#[test]
+fn the_exact_reference_geometry_is_repriced_against_the_admitted_budget() {
+    let load = spec(LoadShape::DeferredMaterialization);
+    let c = weights_free_contract(&load).unwrap();
+    let facts = admission::shipped_scale_facts(0);
+    let mut context = fixture_context(&c, &load, MemoryStrategy::BoundedTransformerResidency);
+    context.mode = MemoryMode::Edit;
+    context.has_reference = true;
+    context.geometry.width = 2048;
+    context.geometry.height = 2048;
+    context.geometry.reference_count = 1;
+    context.predicted_peak_bytes = 0;
+    let bound = admission::estimate(
+        &c,
+        &facts,
+        &admission::ImageRequestShape::with_reference_count(2048, 2048, 1),
+        &context.selection,
+    )
+    .unwrap()
+    .peak_device_bytes();
+    context.budget = MemoryBudget {
+        total_bytes: bound,
+        committed_bytes: 0,
+        reclaimable_bytes: 0,
+        reserved_headroom_bytes: 0,
+    };
+    assert!(estimate_gate(Some(&facts), &c, &context).is_ok());
+    let request = |w: u32, h: u32| gen_core::GenerationRequest {
+        prompt: "edit".into(),
+        width: 2048,
+        height: 2048,
+        conditioning: vec![gen_core::Conditioning::MultiReference {
+            images: vec![gen_core::Image {
+                width: w,
+                height: h,
+                pixels: vec![0; (w * h * 3) as usize],
+            }],
+        }],
+        ..Default::default()
+    };
+    assert!(admit_exact_request(Some(&facts), &c, &context, &request(2048, 2048)).is_ok());
+    let wide = request(4096, 2048);
+    let rows = admission::ImageRequestRows::of(
+        &admission::ImageRequestShape::from_request(&wide).unwrap(),
+    );
+    assert_eq!(rows.reference_rows, vec![8192]);
+    let e = admit_exact_request(Some(&facts), &c, &context, &wide)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("GPU budget"), "{e}");
+    // The same wide reference against a chunk that holds one row of the square bound but not of
+    // its real sequence is refused by the chunk check.
+    let square_keys = admission::ImageRequestRows::of(
+        &admission::ImageRequestShape::with_reference_count(2048, 2048, 1),
+    )
+    .sequence_rows();
+    let heads = crate::dit::MiniMaxH3DitConfig::image().num_attention_heads as u64;
+    let mut chunked = context.clone();
+    chunked.budget.total_bytes = u64::MAX / 2;
+    chunked.selection.parameters.attention_chunk_size = Some((square_keys * heads) as u32);
+    assert!(admit_exact_request(Some(&facts), &c, &chunked, &request(2048, 2048)).is_ok());
+    let e = admit_exact_request(Some(&facts), &c, &chunked, &wide)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("materializing attention row"), "{e}");
+}
+
 /// AC2's admission: given a simulated 40 GB of free device memory, the 16 MP request is refused at
 /// the staged rung — its estimate holds the whole DiT — and admitted at the streamed one, so the
 /// ladder lands on rung 4 instead of rejecting the request at the resident peak.

@@ -634,6 +634,7 @@ mod tests {
     /// SW-7096: an AdaLN projection carrying a LoRA projects the tables its MERGED weight would, so
     /// the image precompute (run after the install) caches the adapted tables.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn an_adaln_lora_projects_the_tables_its_merged_weight_would() {
         let cfg = MiniMaxH3DitConfig {
             hidden_size: 8,
@@ -722,6 +723,8 @@ mod tests {
             assert!(diff(got, want) < 1e-5);
             assert!(diff(got, base) > 1e-4);
         }
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::block::tests::an_adaln_lora_projects_the_tables_its_merged_weight_would");
     }
 
     /// The published block ships exactly 12 tensors, and none of the attention or feed-forward

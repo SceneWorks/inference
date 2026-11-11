@@ -875,6 +875,7 @@ mod tests {
     /// SW-7096: a LoRA on a bias-Linear head (the image DiT's I/O heads) folds to the same output as
     /// the delta MERGED into its weight, and a zero-scale LoRA leaves the head byte-identical.
     #[test]
+    #[ignore = "model inference; explicit model-proof workflow"]
     fn a_lora_on_a_bias_linear_head_matches_its_merged_weight() {
         let (inp, out, r) = (6, 5, 2);
         let (w, b) = (seeded(&[out, inp], 1), seeded(&[out], 2));
@@ -912,6 +913,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(max_abs(&head.forward(&x).unwrap(), &bare), 0.0);
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::heads::tests::a_lora_on_a_bias_linear_head_matches_its_merged_weight");
     }
 
     fn flat(t: &Tensor) -> Vec<f32> {
