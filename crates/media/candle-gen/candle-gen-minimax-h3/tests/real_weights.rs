@@ -30,7 +30,7 @@ use crate::common;
 
 use std::collections::BTreeSet;
 
-use common::{flat, read_snapshot_file, rel, safetensors_keys, snapshot, std_dev};
+use common::{flat, l2_norm, read_snapshot_file, rel, safetensors_keys, snapshot, std_dev};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::loader::sorted_safetensors;
@@ -1671,6 +1671,387 @@ fn image_vae_tiled_decode_lowers_the_16mp_peak() {
         #[cfg(feature = "model-inference-proof")]
         println!(
             "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_vae_tiled_decode_lowers_the_16mp_peak"
+        );
+    }
+}
+
+// ── SW-7091: MiniMax-H3-Image DiT and text-to-image ──────────────────────────────────────────────
+
+// The DiT gate asserts the family bounds (requirement E9, `gen_core::h3_image`), the same metric and
+// values as the MLX gate: rel-L2 and cosine of the velocity against diffusers' float32-activation
+// forward over the same bf16 weights. Peak and mean errors are printed as diagnostics only.
+use candle_gen::gen_core::h3_image::{DIT_PARITY_MAX_REL_L2, DIT_PARITY_MIN_COSINE};
+
+/// `(||got - want|| / ||want||, cosine)` over the flattened tensors, in f32.
+fn image_dit_rel_l2_cosine(got: &Tensor, want: &Tensor) -> (f32, f32) {
+    let (g, w) = (flat(got), flat(want));
+    assert_eq!(g.len(), w.len(), "length mismatch");
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let diff: Vec<f32> = g.iter().zip(&w).map(|(a, b)| a - b).collect();
+    let dot: f32 = g.iter().zip(&w).map(|(a, b)| a * b).sum();
+    (norm(&diff) / norm(&w), dot / (norm(&g) * norm(&w)))
+}
+
+/// The committed producer whose output the DiT gate accepts.
+const IMAGE_DIT_PRODUCER: &[u8] =
+    include_bytes!("../../../mlx-gen/tools/dump_minimax_h3_image_dit_real.py");
+
+/// One diagnostic line for the image DiT gate: a named stage's peak- and mean-relative error and
+/// rel-L2 against the reference's own tensor. Printed, never asserted — the bounds stay on the
+/// velocity alone.
+fn image_dit_stage_line(step: usize, stage: &str, got: &Tensor, want: &Tensor) -> String {
+    let got = got
+        .to_dtype(DType::F32)
+        .and_then(|t| t.to_device(&Device::Cpu))
+        .expect("stage to host");
+    assert_eq!(got.dims(), want.dims(), "step {step} {stage} shape");
+    let (peak, mean) = rel(&got, want);
+    let l2 = l2_norm(&(&got - want).expect("diff")) / l2_norm(want).max(1e-12);
+    format!(
+        "image DiT step {step} stage {stage:<16} peak {peak:.3e} mean {mean:.3e} rel-L2 {l2:.3e}"
+    )
+}
+
+/// The snapshot root holding `transformer_diffusers/` (the `minimax-h3-image-t2i` row).
+fn image_dit_snapshot() -> std::path::PathBuf {
+    let raw = std::env::var("MINIMAX_H3_IMAGE_SNAPSHOT").unwrap_or_default();
+    assert!(
+        !raw.is_empty(),
+        "MINIMAX_H3_IMAGE_SNAPSHOT must point at a MiniMaxAI/MiniMax-H3-Image snapshot root; this \
+         test is #[ignore]d and asserts rather than skips."
+    );
+    let path = std::path::PathBuf::from(raw);
+    assert!(
+        path.join("transformer_diffusers")
+            .join("config.json")
+            .is_file(),
+        "MINIMAX_H3_IMAGE_SNAPSHOT={} has no transformer_diffusers/config.json",
+        path.display()
+    );
+    path
+}
+
+/// AC1 + AC2 (candle): the image DiT loads from `transformer_diffusers/` with exactly the 644
+/// declared tensors and no audio tensor, and its step-0 output (head 0) and step-3 output (head 3)
+/// match diffusers' `MiniMaxH3ImageTransformer2DModel` on the published weights, over the exact
+/// inputs of the reference SW-7090's macOS job produces (`dit-reference.safetensors`, shared by
+/// both backends; float32 activations over the bf16 weights). Step 0 is asserted on the noise
+/// rows; step 3 on the sampler's own `x_3` (`diag.traj.rows3`, reached by the reference from those
+/// noise rows). The timesteps this crate derives are held to the producer's.
+///
+/// Before asserting, every step prints its error at each stage the reference recorded (`temb`,
+/// `norm_out` shift/scale, block 0's AdaLN tables, the residual stream after the `diag_layers`,
+/// `norm_out`'s output). Also printed, never asserted: step 3 on the step-0 noise rows (an input
+/// no sampler shows the model at `t = 0.25`), and both asserted velocities against the
+/// reference's own bf16-compute forward (`diag.bf16.*`).
+#[test]
+#[ignore = "needs a real MiniMax-H3-Image snapshot (transformer_diffusers/) + a reference (MINIMAX_H3_IMAGE_DIT_REFERENCE); 66 GB bf16 DiT"]
+fn image_dit_first_step_matches_the_official_diffusers_transformer() {
+    use candle_gen_minimax_h3::dit::{ImageDit, ImageDitTrace, MiniMaxH3Dit, MiniMaxH3DitConfig};
+    use candle_gen_minimax_h3::{ImageLayout, ImageVelocity, IMAGE_DIT_PARTITION};
+    use gen_core_h3::h3_schedule::SigmaSchedule;
+    use sha2::{Digest, Sha256};
+
+    let root = image_dit_snapshot();
+    let raw = std::env::var("MINIMAX_H3_IMAGE_DIT_REFERENCE").unwrap_or_default();
+    assert!(
+        !raw.is_empty(),
+        "MINIMAX_H3_IMAGE_DIT_REFERENCE must point at the output of \
+         tools/dump_minimax_h3_image_dit_real.py; this test asserts rather than skips."
+    );
+    let reference = common::Golden::load(&raw);
+    assert_eq!(
+        reference.meta("reference").unwrap_or_default(),
+        "diffusers.MiniMaxH3ImageTransformer2DModel"
+    );
+    assert_eq!(
+        reference.meta("producer_sha256").unwrap_or_default(),
+        format!("{:x}", Sha256::digest(IMAGE_DIT_PRODUCER)),
+        "the reference was produced by a different dump_minimax_h3_image_dit_real.py; re-produce it"
+    );
+    assert_eq!(
+        reference.meta("compute_dtype").unwrap_or_default(),
+        "float32",
+        "the asserted reference must be computed with float32 activations"
+    );
+
+    // Exhaustive mapping: the partition carries exactly the declared names — no audio tensor.
+    let dir = root.join(IMAGE_DIT_PARTITION);
+    let cfg = MiniMaxH3DitConfig::from_image_diffusers_json(
+        &std::fs::read_to_string(dir.join("config.json")).expect("config"),
+    )
+    .expect("image config");
+    let declared: BTreeSet<String> = MiniMaxH3Dit::names(&cfg).into_iter().collect();
+    assert_eq!(shard_keys(&dir, "transformer_diffusers"), declared);
+    assert!(!declared.iter().any(|n| n.contains("audio")));
+
+    assert_eq!(reference.meta("steps").unwrap_or_default(), "0,3");
+    let num_text: usize = reference.meta("num_text").expect("meta").parse().unwrap();
+    let hw = reference.meta("latent_hw").expect("meta").to_string();
+    let (lh, lw) = hw.split_once('x').expect("HxW");
+    let (lh, lw): (usize, usize) = (lh.parse().unwrap(), lw.parse().unwrap());
+    let layout = ImageLayout::text_to_image(num_text, lh, lw, cfg.patch_size).expect("layout");
+
+    let schedule = SigmaSchedule::h3_image_distilled().expect("schedule");
+    let want_t: Vec<f32> = reference
+        .meta("timesteps")
+        .expect("meta")
+        .split(',')
+        .map(|t| t.parse().unwrap())
+        .collect();
+    assert_eq!(
+        want_t,
+        vec![schedule.timesteps()[0], schedule.timesteps()[3]],
+        "the timesteps must be the released sampler's float32 values"
+    );
+
+    let dev = device();
+    let dit = MiniMaxH3Dit::load_from_dir(&dir, &dev, DType::BF16).expect("load the image DiT");
+    assert!(!dit.config().has_audio());
+    let context = reference
+        .tensor("in.context")
+        .to_dtype(DType::BF16)
+        .and_then(|t| t.to_device(&dev))
+        .expect("context");
+    let rows = reference.tensor("in.rows").to_device(&dev).expect("rows");
+    let mut model = ImageDit::new(dit, &layout, &context, schedule.timesteps()).expect("ImageDit");
+    assert!(model.released_bytes() > 0, "adaln_proj was evicted");
+    let diag_layers: Vec<usize> = reference
+        .meta("diag_layers")
+        .expect("the reference records its diag_layers")
+        .split(',')
+        .map(|k| k.parse().unwrap())
+        .collect();
+    let host = |t: &Tensor| -> Tensor {
+        t.to_dtype(DType::F32)
+            .and_then(|t| t.to_device(&Device::Cpu))
+            .expect("to host")
+    };
+    let run = |model: &mut ImageDit, step: usize| -> Tensor {
+        let mut trace = ImageDitTrace::new(&diag_layers);
+        let got = host(
+            &model
+                .forward_traced(step, &rows, &mut trace)
+                .expect("forward"),
+        );
+        let d = |name: &str| reference.tensor(&format!("diag.step{step}.{name}"));
+        let g = model
+            .adaln_cache()
+            .schedule()
+            .global_timestep_index(step, 0)
+            .expect("timestep row") as usize;
+        let mods = model
+            .adaln_cache()
+            .modulation(0)
+            .expect("block 0 modulation");
+        let block0 = Tensor::stack(
+            &mods
+                .tables()
+                .map(|t| t.narrow(0, g * 3, 3).expect("rows"))
+                .collect::<Vec<_>>(),
+            0,
+        )
+        .expect("stack");
+        let norm_out = model.norm_out_modulation();
+        let mut lines = vec![
+            image_dit_stage_line(
+                step,
+                "temb",
+                &model.temb().narrow(0, g, 1).expect("row"),
+                &d("temb"),
+            ),
+            image_dit_stage_line(
+                step,
+                "norm_out.shift",
+                &norm_out.shift.narrow(0, g, 1).expect("row"),
+                &d("norm_out.shift"),
+            ),
+            image_dit_stage_line(
+                step,
+                "norm_out.scale",
+                &norm_out.scale.narrow(0, g, 1).expect("row"),
+                &d("norm_out.scale"),
+            ),
+            image_dit_stage_line(step, "block0.adaln", &block0, &d("block0.adaln")),
+        ];
+        for (layer, hidden) in &trace.hidden {
+            lines.push(image_dit_stage_line(
+                step,
+                &format!("hidden.block{layer}"),
+                hidden,
+                &d(&format!("hidden.block{layer}")),
+            ));
+        }
+        lines.push(image_dit_stage_line(
+            step,
+            "pre_head",
+            trace.pre_head.as_ref().expect("the trace records norm_out"),
+            &d("pre_head"),
+        ));
+        lines.push(image_dit_stage_line(
+            step,
+            "velocity",
+            &got,
+            &reference.tensor(&format!("out.step{step}")),
+        ));
+        for line in lines {
+            println!("{line}");
+        }
+        got
+    };
+    let got0 = run(&mut model, 0);
+    let got3 = run(&mut model, 3);
+    // Asserted step 3: the sampler's own x_3, reached by the reference from the same noise rows.
+    let traj_rows = reference
+        .tensor("diag.traj.rows3")
+        .to_device(&dev)
+        .expect("trajectory rows");
+    let traj = host(&model.forward(3, &traj_rows).expect("on-trajectory forward"));
+    let traj_want = reference.tensor("diag.traj.out3");
+    println!(
+        "{}",
+        image_dit_stage_line(3, "on-trajectory", &traj, &traj_want)
+    );
+    // The reference's own rounding: the same two asserted inputs at bf16 compute.
+    let want0 = reference.tensor("out.step0");
+    let bf16_step0 = reference.tensor("diag.bf16.step0");
+    let bf16_traj = reference.tensor("diag.bf16.traj.out3");
+    for (step, stage, got, want) in [
+        (0, "ref bf16 vs f32", &bf16_step0, &want0),
+        (3, "ref bf16 vs f32", &bf16_traj, &traj_want),
+        (0, "vs ref bf16", &got0, &bf16_step0),
+        (3, "traj vs ref bf16", &traj, &bf16_traj),
+    ] {
+        println!("{}", image_dit_stage_line(step, stage, got, want));
+    }
+    let want3 = reference.tensor("out.step3");
+    assert_eq!(got0.dims(), want0.dims());
+    let (p0, m0) = rel(&got0, &want0);
+    let (pt, mt) = rel(&traj, &traj_want);
+    let (p3, m3) = rel(&got3, &want3);
+    let (l0, c0) = image_dit_rel_l2_cosine(&got0, &want0);
+    let (lt, ct) = image_dit_rel_l2_cosine(&traj, &traj_want);
+    let (l3, c3) = image_dit_rel_l2_cosine(&got3, &want3);
+    let (between, _) = image_dit_rel_l2_cosine(&want3, &want0);
+    let (cross, _) = image_dit_rel_l2_cosine(&got3, &want0);
+    println!(
+        "image DiT vs diffusers (family bounds rel-L2 {DIT_PARITY_MAX_REL_L2:.0e}, cosine {DIT_PARITY_MIN_COSINE}): \
+         step0 rel-L2 {l0:.3e} cosine {c0:.6}; step3 on-trajectory rel-L2 {lt:.3e} cosine {ct:.6}; \
+         reference step0 vs step3 rel-L2 {between:.3e}; candle step3 vs reference step0 {cross:.3e}"
+    );
+    println!(
+        "image DiT peak/mean diagnostics (not asserted): step0 peak {p0:.3e} mean {m0:.3e}; step3 \
+         on-trajectory peak {pt:.3e} mean {mt:.3e}"
+    );
+    println!(
+        "image DiT step 3 off-trajectory (step-0 noise rows at t = 0.25; diagnostic, not \
+         asserted): rel-L2 {l3:.3e} cosine {c3:.6} peak {p3:.3e} mean {m3:.3e}"
+    );
+    for (what, l2, cos) in [("step 0", l0, c0), ("step 3 on-trajectory", lt, ct)] {
+        assert!(
+            l2 <= DIT_PARITY_MAX_REL_L2,
+            "{what} diverges: rel-L2 {l2:.3e}"
+        );
+        assert!(
+            cos >= DIT_PARITY_MIN_COSINE,
+            "{what} cosine {cos:.6} below {DIT_PARITY_MIN_COSINE}"
+        );
+    }
+    assert!(
+        between > DIT_PARITY_MAX_REL_L2 && cross > DIT_PARITY_MAX_REL_L2,
+        "steps 0 and 3 must be distinguishable for the head check to mean anything"
+    );
+    assert_eq!(model.forwards(), 3);
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_dit_first_step_matches_the_official_diffusers_transformer"
+    );
+}
+
+/// AC1 (candle/CUDA): the registered `minimax_h3_image` generator renders a 2048 x 2048 bf16
+/// image end to end — conditioner, six-step DiT, tiled 2-D VAE decode — through the registry's own
+/// load path. The image is written to `MINIMAX_H3_IMAGE_RENDER_OUT` when set.
+#[test]
+#[ignore = "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT), MiniMax-H3's text encoder (MINIMAX_H3_SNAPSHOT) and CUDA; full 2048x2048 render"]
+fn image_text_to_image_renders_2048_on_cuda() {
+    #[cfg(not(feature = "cuda"))]
+    panic!("the 2048x2048 render runs the 66 GB DiT on the GPU; build with --features cuda");
+    #[cfg(feature = "cuda")]
+    {
+        use candle_gen::gen_core::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
+
+        let root = image_dit_snapshot();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        // The conditioner: this snapshot's own `text_encoder/` when present, else MiniMax-H3's
+        // byte-identical copy staged as the `text_encoder` component.
+        if !root.join("text_encoder").is_dir() {
+            let h3 = std::env::var("MINIMAX_H3_SNAPSHOT").unwrap_or_default();
+            assert!(
+                !h3.is_empty(),
+                "the image snapshot has no text_encoder/; MINIMAX_H3_SNAPSHOT must point at a \
+                 MiniMax-H3 snapshot holding text_encoder/ shards 1-12"
+            );
+            spec.components.insert(
+                "text_encoder".into(),
+                WeightsSource::Dir(std::path::PathBuf::from(h3).join("text_encoder")),
+            );
+        }
+        let generator = candle_gen_minimax_h3::image_model::load_image(&spec)
+            .expect("load the minimax_h3_image generator");
+        assert_eq!(generator.descriptor().id, "minimax_h3_image");
+        let req = GenerationRequest {
+            prompt: "A red lighthouse on a rocky coast at dusk, waves breaking, warm light in the \
+                     lantern room, photographed with a 35mm lens"
+                .into(),
+            width: 2048,
+            height: 2048,
+            seed: Some(7091),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let mut steps = Vec::new();
+        let output = generator
+            .generate(&req, &mut |p| {
+                if let candle_gen::gen_core::Progress::Step { current, .. } = p {
+                    steps.push(current)
+                }
+            })
+            .expect("render");
+        assert_eq!(steps, vec![1, 2, 3, 4, 5, 6], "one forward per fixed step");
+        let GenerationOutput::Images(images) = output else {
+            panic!("an image generator must return images")
+        };
+        assert_eq!(images.len(), 1);
+        let img = &images[0];
+        assert_eq!((img.width, img.height), (2048, 2048));
+        let n = img.pixels.len() as f64;
+        let mean = img.pixels.iter().map(|&p| f64::from(p)).sum::<f64>() / n;
+        let var = img
+            .pixels
+            .iter()
+            .map(|&p| (f64::from(p) - mean).powi(2))
+            .sum::<f64>()
+            / n;
+        println!(
+            "2048x2048 render in {:.1} s: mean {mean:.1}, std {:.1}",
+            started.elapsed().as_secs_f64(),
+            var.sqrt()
+        );
+        assert!(
+            var.sqrt() > 10.0 && (5.0..250.0).contains(&mean),
+            "degenerate render: mean {mean:.1}, std {:.1}",
+            var.sqrt()
+        );
+        if let Ok(out) = std::env::var("MINIMAX_H3_IMAGE_RENDER_OUT") {
+            image::RgbImage::from_raw(img.width, img.height, img.pixels.clone())
+                .expect("rgb")
+                .save(&out)
+                .expect("write the render");
+            println!("wrote {out}");
+        }
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_text_to_image_renders_2048_on_cuda"
         );
     }
 }

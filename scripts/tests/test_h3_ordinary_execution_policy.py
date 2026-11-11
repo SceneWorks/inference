@@ -443,6 +443,7 @@ REAL_WEIGHT_MODULES = {
     ("mlx", "duration_sweep_real"),
     ("mlx", "first_light"),
     ("mlx", "fl2va_first_light"),
+    ("mlx", "h3_image_real"),
     ("mlx", "quant_tiers_real"),
     ("mlx", "real_weights"),
     ("mlx", "ref2va_checkpoint"),

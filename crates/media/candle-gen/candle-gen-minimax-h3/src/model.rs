@@ -163,13 +163,13 @@ use crate::MODEL_ID;
 /// One render phase's start/finish log pair at `info` (sc-26691): the campaign's only window into
 /// where a multi-minute render is spending its time. Dropped without [`Self::done`] (an early `?`
 /// return) it logs nothing further — the error carries the story from there.
-struct PhaseLog {
+pub(crate) struct PhaseLog {
     phase: &'static str,
     started: std::time::Instant,
 }
 
 impl PhaseLog {
-    fn start(phase: &'static str) -> Self {
+    pub(crate) fn start(phase: &'static str) -> Self {
         tracing::info!(phase, "minimax-h3: phase start");
         Self {
             phase,
@@ -177,7 +177,7 @@ impl PhaseLog {
         }
     }
 
-    fn done(self) {
+    pub(crate) fn done(self) {
         tracing::info!(
             phase = self.phase,
             elapsed_ms = self.started.elapsed().as_millis() as u64,
@@ -254,7 +254,7 @@ pub const MAX_STEPS: u32 = 200;
 /// An omitted seed uses gen-core's shared time-derived policy rather than a provider-local
 /// constant. The resolved value is then handed to either partition's initial latent draw, so all
 /// request paths preserve explicit-seed reproducibility.
-fn resolve_seed(req: &GenerationRequest) -> u64 {
+pub(crate) fn resolve_seed(req: &GenerationRequest) -> u64 {
     req.seed.unwrap_or_else(candle_gen::gen_core::default_seed)
 }
 
@@ -402,7 +402,7 @@ fn require_component(root: &Path, component: &str) -> Result<()> {
 /// The tiered components are staged outside the snapshot root, so the check cannot be expressed as
 /// `root.join(component)` for them. Identical check, identical messages — only the path arithmetic
 /// moves to the caller.
-fn require_component_shards(dir: &Path, component: &str) -> Result<()> {
+pub(crate) fn require_component_shards(dir: &Path, component: &str) -> Result<()> {
     if !dir.is_dir() {
         return Err(CandleError::Msg(format!(
             "{MODEL_ID}: the snapshot has no `{component}/` component at {}",
@@ -670,6 +670,53 @@ fn terminal_device_sample(device: &Device) -> serde_json::Value {
 #[cfg(not(feature = "cuda"))]
 fn terminal_device_sample(_device: &Device) -> serde_json::Value {
     serde_json::json!({"method": "unavailable_without_cuda", "poolAvailable": false})
+}
+
+/// **The text-only conditioner pass**: map the Qwen3-VL-32B layer-50 tap from `te_dir`, run it
+/// over `(ids, mask)`, release it and synchronize — the phase H3 `t2va` and MiniMax-H3-Image
+/// `text2image` (SW-7091) both run, over the byte-identical `text_encoder/`.
+///
+/// The prefix trim is what keeps this to the 50 layers the tap runs: `lm_prefixes` names
+/// `embed_tokens` and layers `0..50`, so the header-only mmap never materializes layers 50-63,
+/// the final norm or `lm_head`.
+pub(crate) fn run_conditioner(
+    te_dir: &Path,
+    ids: &candle_gen::candle_core::Tensor,
+    mask: &candle_gen::candle_core::Tensor,
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<candle_gen::candle_core::Tensor> {
+    let cfg = MiniMaxH3TeConfig::from_component_dir(te_dir)?;
+    let shards = candle_gen::loader::sorted_safetensors(te_dir, "minimax-h3 te")?;
+    let prefixes = lm_prefixes(LM_PREFIX, &cfg);
+    let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+    let policy = crate::block_stream::current();
+    let load_device = if policy.is_some() {
+        &Device::Cpu
+    } else {
+        device
+    };
+    let w = candle_gen::Weights::from_files_filtered_host_packed(
+        &shards,
+        load_device,
+        TE_STORE_DTYPE,
+        &refs,
+    )?;
+    let mut te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
+    drop(w);
+    if let Some(policy) = policy {
+        if policy.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        te.prepare_streamed(&cfg, device)?;
+    }
+    let context =
+        candle_gen::gen_core::with_prompt_encoding(on_progress, || te.forward(ids, mask))?;
+    // candle is eager, so `context` is already materialized here and dropping the encoder
+    // genuinely frees its weights — there is no lazy graph holding them alive.
+    drop(te);
+    crate::dit::release_device_memory(device)?;
+    Ok(context)
 }
 
 /// Whether the resolved source supports byte-preserving host-to-device block migration.
@@ -976,37 +1023,13 @@ impl MiniMaxH3 {
         let phase = PhaseLog::start("text_encoder");
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let (ids, mask) = tok.encode_prompt(prompt, &self.device)?;
-        let cfg = MiniMaxH3TeConfig::from_component_dir(&self.tiers.text_encoder_dir)?;
-        let shards =
-            candle_gen::loader::sorted_safetensors(&self.tiers.text_encoder_dir, "minimax-h3 te")?;
-        let prefixes = lm_prefixes(LM_PREFIX, &cfg);
-        let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-        let policy = crate::block_stream::current();
-        let load_device = if policy.is_some() {
-            &Device::Cpu
-        } else {
-            &self.device
-        };
-        let w = candle_gen::Weights::from_files_filtered_host_packed(
-            &shards,
-            load_device,
-            TE_STORE_DTYPE,
-            &refs,
+        let context = run_conditioner(
+            &self.tiers.text_encoder_dir,
+            &ids,
+            &mask,
+            &self.device,
+            on_progress,
         )?;
-        let mut te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg, TE_STORE_DTYPE)?;
-        drop(w);
-        if let Some(policy) = policy {
-            if policy.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            te.prepare_streamed(&cfg, &self.device)?;
-        }
-        let context =
-            candle_gen::gen_core::with_prompt_encoding(on_progress, || te.forward(&ids, &mask))?;
-        // candle is eager, so `context` is already materialized here and dropping the encoder
-        // genuinely frees its weights — there is no lazy graph holding them alive.
-        drop(te);
-        crate::dit::release_device_memory(&self.device)?;
         phase.done();
         Ok(context)
     }
@@ -2346,6 +2369,15 @@ pub fn load(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Generator>>
 ///   streaming. Deferred loads validate source migration support before materialization;
 ///   the request chooses whether the prepared host stack executes under a window.
 fn reject_unread_slots(spec: &LoadSpec) -> candle_gen::gen_core::Result<()> {
+    reject_unread_slots_for(spec, MODEL_ID)
+}
+
+/// [`reject_unread_slots`] under another engine id of this crate — MiniMax-H3-Image (SW-7091)
+/// reads none of these slots either.
+pub(crate) fn reject_unread_slots_for(
+    spec: &LoadSpec,
+    model_id: &str,
+) -> candle_gen::gen_core::Result<()> {
     let mut unread: Vec<&str> = Vec::new();
     if spec.control.is_some() {
         unread.push("control");
@@ -2376,7 +2408,7 @@ fn reject_unread_slots(spec: &LoadSpec) -> candle_gen::gen_core::Result<()> {
         return Ok(());
     }
     Err(candle_gen::gen_core::Error::Unsupported(format!(
-        "{MODEL_ID}: the candle lane reads none of these LoadSpec slots — {}. No code in this \
+        "{model_id}: the candle lane reads none of these LoadSpec slots — {}. No code in this \
          crate opens them, so honoring the load would render as though they were never set. \
          `control`/`extra_controls`/`ip_adapter` need the conditioning branches this lane has not \
          ported; `pid` and `identity` have no seam in this latent space; `text_encoder` is \
@@ -3108,8 +3140,11 @@ mod tests {
     /// size: deliberately blunt, in exchange for being exact about the regression that was live.
     fn staged_phases() -> [(&'static str, &'static [Phase]); 5] {
         [
+            // `encode_prompt` delegates its one phase to `run_conditioner` (SW-7091), the text-only
+            // conditioner pass MiniMax-H3-Image's `text2image` shares, so the phase is pinned where
+            // the map and the release now live.
             (
-                "fn encode_prompt(",
+                "fn run_conditioner(",
                 &[(
                     "the 66.7 GB Qwen3-VL-32B text encoder",
                     TE_MAPS,

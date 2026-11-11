@@ -49,6 +49,32 @@ pub const SIGMAS: [f32; 7] = [
     0.0,
 ];
 
+/// [`SIGMAS`] exactly as `pdd_config.json` / diffusers' `sample_sigmas` publish them (float64).
+/// The sampler derives its float32 grid from these, not from the rounded [`SIGMAS`]; see
+/// [`sampler_sigmas`].
+pub const SIGMAS_F64: [f64; 7] = [
+    1.0,
+    0.967_523_694_038_391_1,
+    0.887_548_506_259_918_2,
+    0.75,
+    0.532_773_911_952_972_4,
+    0.232_008_874_416_351_32,
+    0.0,
+];
+
+/// The float32 sigma grid the released sampler steps on (`MiniMaxH3ImageSetTimestepsStep`,
+/// before_denoise.py): every published sigma is rounded through its float32 timestep
+/// `t = f32(1 - sigma)` and back, `sigma' = 1 - t` in float32, with the terminal `0.0` kept. Below
+/// `sigma = 0.5` that round trip moves a sigma by an ulp, so this is not [`SIGMAS`].
+pub fn sampler_sigmas() -> [f32; 7] {
+    let mut out = [0.0f32; 7];
+    for (slot, &s) in out.iter_mut().zip(SIGMAS_F64.iter()).take(6) {
+        let t = (1.0f64 - s) as f32;
+        *slot = 1.0f32 - t;
+    }
+    out
+}
+
 /// One published size: label and exact pixel dimensions (about 16 MP each).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AspectEntry {
@@ -190,9 +216,82 @@ pub fn validate_request(
     Ok(())
 }
 
+/// Per-row modality tag of an image row (`MINIMAX_H3_IMAGE_TAG`, modular_pipeline.py). Tags index
+/// the transformer's AdaLN table, so the values are a checkpoint contract: image rows reuse H3's
+/// video slot.
+pub const IMAGE_TAG: i32 = 0;
+/// Per-row modality tag of a text row (`MINIMAX_H3_TEXT_TAG`).
+pub const TEXT_TAG: i32 = 1;
+/// Family DiT parity bound (requirement E9): a backend's velocity matches the diffusers
+/// `MiniMaxH3ImageTransformer2DModel` (float32 activations over the same bf16 weights) when
+/// `||got - want|| / ||want||` is at most this, at step 0 and at the on-trajectory step 3. Both the
+/// MLX and the Candle real-weight gates assert it.
+pub const DIT_PARITY_MAX_REL_L2: f32 = 5e-2;
+/// Family DiT parity bound: the flattened velocity's cosine similarity against diffusers is at
+/// least this. Asserted next to [`DIT_PARITY_MAX_REL_L2`] by both backends.
+pub const DIT_PARITY_MIN_COSINE: f32 = 0.995;
+/// VAE spatial compression: one latent cell per 16x16 pixels.
+pub const VAE_SPATIAL_RATIO: u32 = 16;
+
+/// The `text2image` presentation's token ids: the prompt tokenized verbatim (no chat template, no
+/// special tokens) and truncated to [`MAX_PROMPT_TOKENS`] (encoders.py,
+/// `MiniMaxH3ImageTextEncoderStep`). An empty presentation is refused, as upstream refuses an empty
+/// prompt.
+pub fn t2i_prompt_ids(mut ids: Vec<i32>) -> Result<Vec<i32>, Error> {
+    if ids.is_empty() {
+        return Err(Error::Unsupported(
+            "MiniMax-H3-Image needs a non-empty prompt: the packed sequence has no text rows \
+             without one"
+                .into(),
+        ));
+    }
+    ids.truncate(MAX_PROMPT_TOKENS);
+    Ok(ids)
+}
+
+/// The `(latent_height, latent_width)` a `width x height` canvas packs to. The canvas must be a
+/// [`SIZE_STRIDE`] multiple, which [`generation_canvas`] guarantees.
+pub fn latent_grid(canvas_width: u32, canvas_height: u32) -> Result<(u32, u32), Error> {
+    if canvas_width == 0
+        || canvas_height == 0
+        || !canvas_width.is_multiple_of(SIZE_STRIDE)
+        || !canvas_height.is_multiple_of(SIZE_STRIDE)
+    {
+        return Err(Error::Msg(format!(
+            "MiniMax-H3-Image canvas {canvas_width}x{canvas_height} must be a positive multiple of \
+             {SIZE_STRIDE}"
+        )));
+    }
+    Ok((
+        canvas_height / VAE_SPATIAL_RATIO,
+        canvas_width / VAE_SPATIAL_RATIO,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_ids_truncate_at_4096_and_refuse_empty() {
+        assert_eq!(t2i_prompt_ids(vec![5, 6]).unwrap(), vec![5, 6]);
+        let long: Vec<i32> = (0..5000).collect();
+        let kept = t2i_prompt_ids(long).unwrap();
+        assert_eq!(kept.len(), MAX_PROMPT_TOKENS);
+        assert_eq!(kept[4095], 4095);
+        assert!(matches!(
+            t2i_prompt_ids(Vec::new()),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn latent_grid_is_the_canvas_over_16() {
+        assert_eq!(latent_grid(2048, 2048).unwrap(), (128, 128));
+        assert_eq!(latent_grid(1664, 2496).unwrap(), (156, 104));
+        assert!(latent_grid(1000, 1000).is_err());
+        assert_eq!((IMAGE_TAG, TEXT_TAG), (0, 1));
+    }
 
     #[test]
     fn table_entries_are_stride_aligned_near_16mp() {
@@ -274,6 +373,26 @@ mod tests {
             Error::from(errs[0].clone()),
             Error::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn the_sampler_grid_is_the_float32_round_trip_of_the_published_sigmas() {
+        let g = sampler_sigmas();
+        for (i, (&f, &d)) in SIGMAS.iter().zip(SIGMAS_F64.iter()).enumerate() {
+            assert_eq!(
+                f, d as f32,
+                "SIGMAS[{i}] is the float32 rounding of SIGMAS_F64[{i}]"
+            );
+        }
+        assert_eq!(g[0], 1.0);
+        assert_eq!(g[3], 0.75);
+        assert_eq!(g[6], 0.0);
+        assert!(g.windows(2).all(|w| w[0] > w[1]));
+        // The round trip moves a sigma by at most one float32 ulp of its timestep.
+        for i in 0..6 {
+            let d = (g[i] - SIGMAS[i]).abs();
+            assert!(d <= f32::EPSILON, "{i}: {} vs {}", g[i], SIGMAS[i]);
+        }
     }
 
     #[test]

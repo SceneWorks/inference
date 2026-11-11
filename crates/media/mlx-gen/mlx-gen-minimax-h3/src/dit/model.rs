@@ -69,19 +69,19 @@ pub const PUBLISHED_DIT_TENSORS: usize = 638;
 /// The handles are refcounted copies of the arrays the built modules hold, so keeping them costs
 /// nothing; each group is dropped once verified.
 #[derive(Debug, Clone, Default)]
-struct UnverifiedSources {
+pub(crate) struct UnverifiedSources {
     /// The 17 projections and the 21 refiner tensors: resident for the whole request, first
     /// consumed by [`MiniMaxH3Dit::embed_context`].
-    head: Vec<(String, Array)>,
+    pub(crate) head: Vec<(String, Array)>,
     /// `transformer_blocks.{i}.adaln_proj.*`: first consumed by the AdaLN precompute (or, under
     /// [`AdaLnResidency::Resident`], per step), and evicted right after the precompute.
-    adaln: Vec<(String, Array)>,
+    pub(crate) adaln: Vec<(String, Array)>,
     /// The ten body tensors of every block: first consumed by denoise step 1.
-    body: Vec<(String, Array)>,
+    pub(crate) body: Vec<(String, Array)>,
 }
 
 impl UnverifiedSources {
-    fn partition(entries: Vec<(String, Array)>) -> Self {
+    pub(crate) fn partition(entries: Vec<(String, Array)>) -> Self {
         let mut groups = Self::default();
         for (key, array) in entries {
             let group = if key.contains(".adaln_proj.") {
@@ -97,7 +97,7 @@ impl UnverifiedSources {
     }
 
     /// Evaluate + verify one group and release its handles.
-    fn verify(group: &mut Vec<(String, Array)>) -> Result<()> {
+    pub(crate) fn verify(group: &mut Vec<(String, Array)>) -> Result<()> {
         {
             let mut named: Vec<(&str, &Array)> = group
                 .iter()

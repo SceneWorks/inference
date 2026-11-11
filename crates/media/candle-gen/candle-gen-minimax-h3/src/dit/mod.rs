@@ -70,14 +70,19 @@ pub mod rope;
 
 pub use adaln::{release_device_memory, AdaLnCache, AdaLnResidency, ScheduleKey, TimestepSchedule};
 pub use block::{AdaLnModulation, AdaLnProjection, DitBlock};
-pub use config::{MiniMaxH3DitConfig, MODALITY_NUM, MODULATION_PARAMS};
+pub use config::{
+    DitVariant, MiniMaxH3DitConfig, IMAGE_DIT_CLASS, MODALITY_NUM, MODULATION_PARAMS,
+};
 pub use curve::{CurveAdaLn, CurveProjection};
 pub use heads::{
     timestep_sincos, AdaLayerNormOut, DitProjections, LinearBias, NormOutModulation,
     TimestepEmbedder,
 };
 pub use layers::{DitAttention, DitFeedForward, LinearNoBias, RmsNorm};
-pub use model::{BlockModulation, JointDit, MiniMaxH3Dit, PackedForward, PUBLISHED_DIT_TENSORS};
+pub use model::{
+    BlockModulation, ImageDit, ImageDitTrace, ImageForward, JointDit, MiniMaxH3Dit, PackedForward,
+    PUBLISHED_DIT_TENSORS, PUBLISHED_IMAGE_DIT_TENSORS,
+};
 pub use positions::{
     audio_position_ids, frame_grid, keyframe_anchor_time, keyframe_position_ids,
     reference_block_position_ids, spatial_axis_grid, temporal_grid, text_position_ids,

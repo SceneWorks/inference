@@ -323,6 +323,12 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "minimax_h3",
         components: &["minimax_h3", "qwen3_vl_32b_instruct"],
     },
+    // SW-7091: MiniMax-H3-Image — its own repository and licence (the DiT, the 2-D VAE, the
+    // tokenizer); its `text_encoder/` is the same Qwen3-VL-32B shards MiniMax-H3 ships.
+    ProviderComponents {
+        provider_id: "minimax_h3_image",
+        components: &["minimax_h3_image", "qwen3_vl_32b_instruct"],
+    },
     // --- mochi ------------------------------------------------------------------------------
     // The AsymmVAE ships inside the Mochi snapshot and rides its row; the T5-XXL encoder is the
     // same `google/t5-v1_1-xxl` FLUX and Chroma condition on, which is what the crate names
@@ -628,7 +634,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 60);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 61);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -660,10 +666,10 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            70,
-            "70 distinct Candle provider ids: 63 generators (qwen_image_2_1_turbo joined in \
+            72,
+            "72 distinct Candle provider ids: 65 generators (qwen_image_2_1_turbo joined in \
              sc-25901, flux3_klein in sc-26235, flux3_klein_base in sc-26239, MOSS Base/SFT in sc-26323, \
-             supra2_img in sc-24214) + 20 trainers (16 of them also \
+             supra2_img in sc-24214, krea_2_turbo_control, minimax_h3_image in SW-7091) + 20 trainers (16 of them also \
              generator ids — iris_3b joined in sc-25686, flux3_klein_base in sc-26240; iris_3b_restore, sc-25688, is the \
              transform's id; iris_3b_depth, sc-25687, is its own) + 1 captioner + 2 embedders + \
              1 transform (iris_3b_restore, sc-25683)"
@@ -825,6 +831,7 @@ mod tests {
                 "ltx_2_3",
                 "ltx_2_3_distilled",
                 "minimax_h3",
+                "minimax_h3_image",
                 "mochi_1",
                 "moss_image_base",
                 "moss_image_sft",

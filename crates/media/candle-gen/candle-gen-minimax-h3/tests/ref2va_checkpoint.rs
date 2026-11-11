@@ -263,12 +263,68 @@ fn production_sources() -> Vec<(String, String)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut out = Vec::new();
     walk(&dir, &mut out);
+    // A `#[cfg(test)] mod x;` lives in its own file, so `production_text`'s in-file `#[cfg(test)]`
+    // cut cannot see that the whole file is test-only. Those files are not production load sites
+    // (the manual real-weight residency witnesses load a DiT directly, by design), so drop them —
+    // by what the declaring file says, not by a hand-kept list of names.
+    let test_only = test_only_module_files(&dir);
+    out.retain(|(p, _)| !test_only.contains(Path::new(p)));
     assert!(
         out.len() > 10,
         "{} yielded only {} .rs file(s); the scan would pass vacuously",
         dir.display(),
         out.len()
     );
+    out
+}
+
+/// Files under `dir` that exist only as `#[cfg(test)] mod name;` declarations (other `#[cfg(..)]`
+/// attributes may sit between the two lines).
+fn test_only_module_files(dir: &Path) -> BTreeSet<std::path::PathBuf> {
+    fn walk(dir: &Path, out: &mut BTreeSet<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap().map(|e| e.unwrap()) {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_symlink() {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, out);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            // Children of `layers.rs` live in `layers/`; children of `lib.rs`/`mod.rs` beside it.
+            let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+            let parent = path.parent().unwrap();
+            let child_dir = if matches!(stem.as_str(), "lib" | "main" | "mod") {
+                parent.to_path_buf()
+            } else {
+                parent.join(&stem)
+            };
+            let text = std::fs::read_to_string(&path).unwrap();
+            let mut test_gated = false;
+            for line in text.lines().map(str::trim) {
+                if line == "#[cfg(test)]" {
+                    test_gated = true;
+                } else if line.starts_with("#[") {
+                    // another attribute: keep the pending gate
+                } else if let Some(name) = line
+                    .strip_prefix("mod ")
+                    .and_then(|r| r.strip_suffix(';'))
+                    .filter(|_| test_gated)
+                {
+                    out.insert(child_dir.join(format!("{name}.rs")));
+                    out.insert(child_dir.join(name).join("mod.rs"));
+                    test_gated = false;
+                } else {
+                    test_gated = false;
+                }
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(dir, &mut out);
     out
 }
 
@@ -374,11 +430,19 @@ fn every_dit_load_site_in_the_crate_is_driven_by_the_task() {
         resolve_calls += src.matches("MiniMaxH3Task::resolve(").count();
     }
 
-    // ── one map, and it is the seam's own.
+    // ── the video DiT is mapped at one site, and it is the seam's own. The image model
+    // (`image_model.rs`, sw-7091) is a separate registered family with its own single-partition
+    // DiT (`IMAGE_DIT_PARTITION`) and no task: it can never select a ref2va partition, and it is
+    // never loaded in the same render as a video DiT. It is recognised by file, and pinned to
+    // exactly one site that takes its own constant.
+    let image_file = Path::new("src").join("image_model.rs");
+    let (image_sites, sites): (Vec<_>, Vec<_>) = sites
+        .into_iter()
+        .partition(|(path, _)| Path::new(path).ends_with(&image_file));
     assert_eq!(
         sites.len(),
         1,
-        "the crate has {} `{ANCHOR}` call site(s); there must be exactly one — inside \
+        "the video render path has {} `{ANCHOR}` call site(s); there must be exactly one — inside \
          `load_task_dit`, the seam that folds the staged LoRA — because a render arm that maps its \
          own DiT renders with the caller's adapter silently dropped: {sites:?}",
         sites.len()
@@ -389,6 +453,32 @@ fn every_dit_load_site_in_the_crate_is_driven_by_the_task() {
          — a literal path, or `root` + partition, ignores the staged tier: {:?}",
         sites[0]
     );
+    assert_eq!(
+        image_sites.len(),
+        1,
+        "`src/image_model.rs` must map its image DiT at exactly one site: {image_sites:?}"
+    );
+    assert!(
+        image_sites[0].1.contains("IMAGE_DIT_PARTITION"),
+        "the image DiT load must take `IMAGE_DIT_PARTITION`, the image family's own partition: {:?}",
+        image_sites[0]
+    );
+    let image_src = &sources
+        .iter()
+        .find(|(p, _)| Path::new(p).ends_with(&image_file))
+        .expect("src/image_model.rs is scanned")
+        .1;
+    for video_partition in [
+        "BASE_DIT_PARTITION",
+        "REFERENCE_DIT_PARTITION",
+        "task.partition()",
+    ] {
+        assert!(
+            !image_src.contains(video_partition),
+            "src/image_model.rs names `{video_partition}`; the image family must stay independent \
+             of the video partitions, or it is no longer exempt from the task-driven rule"
+        );
+    }
     // ...and the flat `root`-joining wrapper is off the render path entirely.
     assert!(
         flat_sites.is_empty(),

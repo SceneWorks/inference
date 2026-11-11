@@ -241,15 +241,36 @@ impl SigmaSchedule {
         })
     }
 
-    /// The fixed MiniMax-H3-Image distilled grid, [`gen_core::h3_image::SIGMAS`], adopted with no
-    /// shift and no collapse. Image rows carry the video token tag, so this is a `Video` grid;
-    /// `shift` is recorded as `1.0` (identity) because the checkpoint's grid is used as published.
+    /// The fixed MiniMax-H3-Image distilled grid, adopted with no shift and no collapse. Image rows
+    /// carry the video token tag, so this is a `Video` grid; `shift` is recorded as `1.0`
+    /// (identity) because the checkpoint's grid is used as published.
+    ///
+    /// The grid is [`gen_core::h3_image::sampler_sigmas`] — the published sigmas rounded through
+    /// their float32 timesteps the way the released sampler does — so [`Self::timesteps`] are the
+    /// exact `1 - sigma` values diffusers conditions the transformer on.
     pub fn h3_image_distilled() -> Result<Self> {
         Self::from_sigmas(
             DenoiseModality::Video,
             1.0,
-            gen_core::h3_image::SIGMAS.to_vec(),
+            gen_core::h3_image::sampler_sigmas().to_vec(),
         )
+    }
+
+    /// The velocity-form Euler coefficient at `index`: `sigma[i] - sigma[i+1]`, in float32.
+    ///
+    /// MiniMax-H3-Image's scheduler runs `euler_update_form = "velocity"`
+    /// (`scheduler/scheduler_config.json`): `x_next = x_t + (sigma - sigma_next) * v`, on the grid
+    /// sigmas — not the two-source denoised form [`Self::euler_coefficients`] reproduces for H3
+    /// video.
+    pub fn velocity_delta(&self, index: usize) -> Result<f32> {
+        if index >= self.num_evals() {
+            return Err(Error::Msg(format!(
+                "minimax-h3 scheduler: {} step {index} is outside the schedule's {} evaluations",
+                self.modality.name(),
+                self.num_evals()
+            )));
+        }
+        Ok(self.sigmas[index] - self.sigmas[index + 1])
     }
 
     /// The modality this grid was built for.
@@ -398,9 +419,18 @@ mod tests {
     #[test]
     fn h3_image_distilled_is_the_published_six_step_grid() {
         let sch = SigmaSchedule::h3_image_distilled().unwrap();
-        assert_eq!(sch.sigmas(), &gen_core::h3_image::SIGMAS[..]);
+        assert_eq!(sch.sigmas(), &gen_core::h3_image::sampler_sigmas()[..]);
         assert_eq!(sch.timesteps().len(), 6);
         assert_eq!(sch.timesteps()[0], 0.0);
+        // t = 1 - sigma over the round-tripped grid: the float32 timesteps diffusers feeds the DiT.
+        for (i, &t) in sch.timesteps().iter().enumerate() {
+            assert_eq!(t, 1.0 - sch.sigmas()[i]);
+        }
+        // The velocity form steps by sigma[i] - sigma[i+1]; the deltas sum to the whole grid.
+        let total: f32 = (0..6).map(|i| sch.velocity_delta(i).unwrap()).sum();
+        assert!((total - 1.0).abs() < 1e-6, "{total}");
+        assert_eq!(sch.velocity_delta(3).unwrap(), 0.75 - sch.sigmas()[4]);
+        assert!(sch.velocity_delta(6).is_err());
     }
 
     /// The published shifts, and that they are reachable only through their own modality.
