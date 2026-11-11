@@ -1685,9 +1685,7 @@ jobs:
       - name: Materialize and verify immutable snapshots
         run: source scripts/ci/real-weights/mlx-llm/materialize-and-verify-immutable-snapshots.sh
       - name: Run representative conformance
-        run: |
-          cargo test --locked -p mlx-llm --test integration conformance::real_model_passes_core_llm_conformance -- --ignored --nocapture
-          cargo test --locked -p mlx-llm --test integration conformance::real_qwen3_passes_core_llm_conformance -- --ignored --nocapture
+        run: source scripts/ci/real-weights/mlx-llm/run-representative-conformance.sh
 
   # sc-17250: the 16 GB JoyCaption snapshot was maintained on a runner for a year while NO workflow
   # ran the four `#[ignore]` tests it backs — golden-token VLM parity that was protecting nothing.
@@ -1859,29 +1857,9 @@ jobs:
         run: source scripts/ci/real-weights/mlx-media/prove-the-sdxl-native-decode-seam-on-real-weights.sh
       - name: Derive immutable Mage oracle cache key
         id: mage-oracle-key
-        run: |
-          snapshot_revision() {
-            local snapshot="$1"
-            local marker="$snapshot/.sceneworks-model-revision"
-            local revision
-            if [[ -f "$marker" ]]; then
-              revision="$(tr -d '\r\n' < "$marker")"
-            else
-              revision="$(basename "$(cd "$snapshot" && pwd -P)")"
-            fi
-            if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "Snapshot does not resolve to an immutable 40-hex revision: $snapshot" >&2
-              return 1
-            fi
-            printf '%s' "$revision"
-          }
-          producer="${{ hashFiles('.github/workflows/real-weights.yml', 'scripts/ci/real-weights/mlx-media/**', 'crates/media/mlx-gen/_vendor/mage_flow/**', 'crates/media/mlx-gen/_vendor/mage_flow/assets/dog.jpg', 'crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt', 'crates/media/mlx-gen/tools/_paths.py', 'crates/media/mlx-gen/tools/dump_mage_flow_golden.py', 'crates/media/mlx-gen/tools/dump_mage_vae_sizes.py', 'scripts/release/mage_reference_environment.py', 'scripts/release/provision_mage_oracles.py', 'scripts/release/provision_mage_edit_variants.py', 'scripts/release/promote_mage_oracle_seed.py', 'scripts/release/verify_mage_candle_oracles.py', 'scripts/release/verify_mage_candle_transfer.py') }}"
-          if [[ ! "$producer" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "Oracle producer fingerprint is missing or malformed: $producer" >&2
-            exit 1
-          fi
-          key="mage-oracles-v1-$(snapshot_revision "$MAGE_SNAPSHOT")-$(snapshot_revision "$MAGE_EDIT_SNAPSHOT")-$(snapshot_revision "$MAGE_EDIT_BASE_SNAPSHOT")-$(snapshot_revision "$MAGE_EDIT_TURBO_SNAPSHOT")-$producer"
-          echo "key=$key" >> "$GITHUB_OUTPUT"
+        env:
+          MAGE_ORACLE_PRODUCER: ${{ hashFiles('.github/workflows/real-weights.yml', 'scripts/ci/real-weights/mlx-media/**', 'crates/media/mlx-gen/_vendor/mage_flow/**', 'crates/media/mlx-gen/_vendor/mage_flow/assets/dog.jpg', 'crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt', 'crates/media/mlx-gen/tools/_paths.py', 'crates/media/mlx-gen/tools/dump_mage_flow_golden.py', 'crates/media/mlx-gen/tools/dump_mage_vae_sizes.py', 'scripts/release/mage_reference_environment.py', 'scripts/release/provision_mage_oracles.py', 'scripts/release/provision_mage_edit_variants.py', 'scripts/release/promote_mage_oracle_seed.py', 'scripts/release/verify_mage_candle_oracles.py', 'scripts/release/verify_mage_candle_transfer.py') }}
+        run: source scripts/ci/real-weights/mlx-media/derive-immutable-mage-oracle-cache-key.sh
       - name: Restore verified Mage oracle cache
         id: mage-oracle-cache
         # Certification must inspect the persistent seed on the runner that actually claimed each
@@ -2810,10 +2788,7 @@ jobs:
       # the case worth knowing about here, so do not read its presence as coverage for this hole.
       - name: Extract the S18 cell evidence
         if: always()
-        run: |
-          touch "$RUNNER_TEMP/s18-sweep.log"
-          grep -E "^(S18CELL|  VERDICT:)" "$RUNNER_TEMP/s18-sweep.log" > "$RUNNER_TEMP/s18-cells.tsv" || true
-          echo "captured $(grep -c '^S18CELL' "$RUNNER_TEMP/s18-cells.tsv" || true) S18CELL rows"
+        run: source scripts/ci/real-weights/mlx-krea-realtime-s18-sweep/extract-the-s18-cell-evidence.sh
       - name: Upload the S18 cell evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -3580,12 +3555,7 @@ jobs:
       - name: Configure immutable SAME-L snapshot path
         run: python3.12 scripts/release/export_model_snapshot_paths.py --model same-l
       - name: Toolchain and hardware versions
-        run: |
-          sw_vers
-          system_profiler SPHardwareDataType SPDisplaysDataType |
-            grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
-          rustc --version
-          cargo --version
+        run: source scripts/ci/real-weights/same-l-metal/toolchain-and-hardware-versions.sh
       - name: Materialize and verify immutable SAME-L snapshot
         run: source scripts/ci/real-weights/same-l-metal/materialize-and-verify-immutable-same-l-snapshot.sh
       - name: Verify SAME-L short and long band boundaries on Metal
@@ -3611,12 +3581,7 @@ jobs:
           python3.12 scripts/release/export_model_snapshot_paths.py \
             --model same-s --model same-l
       - name: Toolchain and hardware versions
-        run: |
-          sw_vers
-          system_profiler SPHardwareDataType SPDisplaysDataType |
-            grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
-          rustc --version
-          cargo --version
+        run: source scripts/ci/real-weights/same-chunked-metal/toolchain-and-hardware-versions.sh
       - name: Materialize and verify immutable SAME snapshots
         run: source scripts/ci/real-weights/same-chunked-metal/materialize-and-verify-immutable-same-snapshots.sh
       - name: Verify frozen SAME-S and SAME-L chunk ownership on Metal
@@ -3671,18 +3636,9 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Configure immutable small-sfx and small-music snapshot paths
-        run: |
-          # sc-14544's identity and divergence gates compare the two checkpoints against each other,
-          # so both snapshots are required on this runner.
-          python3.12 scripts/release/export_model_snapshot_paths.py \
-            --model stable-audio-3-small-sfx --model stable-audio-3-small-music
+        run: source scripts/ci/real-weights/sa3-small-sfx-metal/configure-immutable-small-sfx-and-small-music-snapshot-paths.sh
       - name: Toolchain and hardware versions
-        run: |
-          sw_vers
-          system_profiler SPHardwareDataType SPDisplaysDataType |
-            grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory|Chipset Model|Metal Support'
-          rustc --version
-          cargo --version
+        run: source scripts/ci/real-weights/sa3-small-sfx-metal/toolchain-and-hardware-versions.sh
       - name: Materialize and verify both immutable small snapshots
         run: source scripts/ci/real-weights/sa3-small-sfx-metal/materialize-and-verify-both-immutable-small-snapshots.sh
       # sc-14546 moved `--test variant_binding` to the `sa3-base-identity-metal` job. Every gate in
@@ -4885,8 +4841,48 @@ jobs:
             ${{ runner.temp }}/minimax-h3-vram-bf16.json
           if-no-files-found: error
 
-  mlx-minimax-h3-image:
+  minimax-h3-image-reference:
     needs: validate-selection
+    name: H3-Image diffusers reference
+    if: inputs.profile == 'minimax-h3-image'
+    runs-on: [self-hosted, macOS, ARM64, rw-mage]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - id: key
+        name: Compute the reference cache key
+        run: source scripts/ci/real-weights/minimax-h3-image-reference/compute-the-reference-cache-key.sh
+      - id: cache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: minimax-h3-image-vae-reference
+          key: ${{ steps.key.outputs.key }}
+      - name: Materialize and produce the image VAE reference
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: source scripts/ci/real-weights/minimax-h3-image-reference/materialize-and-produce-the-image-vae-reference.sh
+      - name: Materialize the DiT and produce its reference
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: source scripts/ci/real-weights/minimax-h3-image-reference/materialize-the-dit-and-produce-its-reference.sh
+      - name: Report the reference
+        env:
+          H3I_REFERENCE_KEY: ${{ steps.key.outputs.key }}
+          H3I_REFERENCE_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: source scripts/ci/real-weights/minimax-h3-image-reference/report-the-reference.sh
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: minimax-h3-image-vae-reference
+          key: ${{ steps.key.outputs.key }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: minimax-h3-image-vae-reference
+          path: minimax-h3-image-vae-reference
+          if-no-files-found: error
+      - if: always()
+        run: rm -rf minimax-h3-image-vae-reference
+
+  mlx-minimax-h3-image:
+    needs: [validate-selection, minimax-h3-image-reference]
     defaults:
       run:
         shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 9000 -- /bin/bash -e {0}
@@ -4903,15 +4899,12 @@ jobs:
       - name: Report runner disk headroom
         continue-on-error: true
         run: scripts/ci/report_runner_disk_headroom.sh MLX_GEN_MODELS_ROOT
-      - name: Materialize and produce the image VAE reference
-        run: source scripts/ci/real-weights/mlx-minimax-h3-image/materialize-and-produce-the-image-vae-reference.sh
-      - name: Materialize the DiT and produce its reference
-        run: source scripts/ci/real-weights/mlx-minimax-h3-image/materialize-the-dit-and-produce-its-reference.sh
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: minimax-h3-image-vae-reference
           path: ${{ runner.temp }}/minimax-h3-image-vae-reference
-          if-no-files-found: error
+      - name: Materialize the image weights
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image/materialize-the-image-weights.sh
       - name: Set up the MLX build environment
         run: source scripts/ci/real-weights/mlx-minimax-h3-image/set-up-the-mlx-build-environment.sh
       - name: Run the image VAE gates
@@ -4920,7 +4913,7 @@ jobs:
         run: source scripts/ci/real-weights/mlx-minimax-h3-image/run-the-dit-parity-and-the-2048-render.sh
 
   candle-minimax-h3-image:
-    needs: [validate-selection, mlx-minimax-h3-image]
+    needs: [validate-selection, minimax-h3-image-reference]
     name: Candle H3-Image VAE + t2i (CUDA)
     if: ${{ !cancelled() && needs.validate-selection.result == 'success' && inputs.profile == 'minimax-h3-image' }}
     runs-on: [self-hosted, windows, cuda, real-weights]
