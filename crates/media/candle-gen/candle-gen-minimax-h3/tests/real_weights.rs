@@ -1680,6 +1680,7 @@ fn image_vae_tiled_decode_lowers_the_16mp_peak() {
 // The DiT gate asserts the family bounds (requirement E9, `gen_core::h3_image`), the same metric and
 // values as the MLX gate: rel-L2 and cosine of the velocity against diffusers' float32-activation
 // forward over the same bf16 weights. Peak and mean errors are printed as diagnostics only.
+use candle_gen::gen_core::h3_image::dit_sweep::{self, RowRegions, SweepRow};
 use candle_gen::gen_core::h3_image::{DIT_PARITY_MAX_REL_L2, DIT_PARITY_MIN_COSINE};
 
 /// `(||got - want|| / ||want||, cosine)` over the flattened tensors, in f32.
@@ -2086,6 +2087,57 @@ fn image_edit_reference() -> common::Golden {
     reference
 }
 
+/// Print the per-block sweep of one traced step-0 forward against the reference's
+/// `diag.sweep.{f32,bf16}.block{k}` (see `gen_core::h3_image::dit_sweep`). Diagnostic only.
+fn image_edit_block_sweep(
+    reference: &common::Golden,
+    trace: &candle_gen_minimax_h3::dit::ImageDitTrace,
+    layers: &[usize],
+    regions: RowRegions,
+) {
+    println!(
+        "sweep (step 0): per block, rel-L2 vs the f32 reference, vs the bf16 reference, and the \
+         reference's own bf16-vs-f32 drift — all rows, then text / reference / generated rows"
+    );
+    let mut rows = Vec::with_capacity(layers.len());
+    for &layer in layers {
+        let (_, hidden) = trace
+            .hidden
+            .iter()
+            .find(|(l, _)| *l == layer)
+            .unwrap_or_else(|| panic!("the trace recorded block {layer}"));
+        let (f32_key, bf16_key) = (
+            format!("diag.sweep.f32.block{layer}"),
+            format!("diag.sweep.bf16.block{layer}"),
+        );
+        assert_eq!(
+            hidden.dims(),
+            reference.shape(&f32_key),
+            "sweep block {layer} shape"
+        );
+        assert_eq!(
+            reference.dtype(&bf16_key),
+            "BF16",
+            "sweep block {layer} bf16 dtype"
+        );
+        let width = *hidden.dims().last().expect("hidden width");
+        let row = SweepRow::new(
+            layer,
+            &flat(hidden),
+            &reference.f32(&f32_key),
+            &reference.f32(&bf16_key),
+            width,
+            regions,
+        )
+        .expect("sweep row");
+        println!("{row}");
+        rows.push(row);
+    }
+    for line in dit_sweep::summary(&rows) {
+        println!("{line}");
+    }
+}
+
 /// AC2 (candle): the `edit` presentation built with the snapshot's own tokenizer is the processor
 /// template's (`Picture i: ` + vision block per reference, then the prompt, no chat template), id
 /// for id and tag for tag, as diffusers' `MiniMaxH3ImageEditTextEncoderStep` builds it.
@@ -2218,6 +2270,12 @@ fn image_edit_reference_latents_match_the_official_diffusers_vae() {
 /// block 0's AdaLN tables, the residual stream after the `diag_layers`, `norm_out`'s output), the
 /// velocity error over the reference rows and the generated rows separately, step 3 on the step-0
 /// rows, and both asserted velocities against the reference's own bf16-compute forward.
+///
+/// Also printed at step 0: the per-block sweep (`diag.sweep.*`, `gen_core::h3_image::dit_sweep`)
+/// — after every block in `sweep_layers`, the error against the f32 and the bf16 reference and the
+/// reference's own bf16-vs-f32 drift, over all rows and per row class, with the largest reference
+/// activation and the largest error located — then the first block where this backend departs
+/// from diffusers' bf16 compute.
 #[test]
 #[ignore = "needs MINIMAX_H3_IMAGE_SNAPSHOT (transformer_diffusers/) + MINIMAX_H3_IMAGE_EDIT_REFERENCE; 66 GB bf16 DiT"]
 fn image_edit_first_step_matches_the_official_diffusers_transformer() {
@@ -2268,6 +2326,11 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
     );
     let num_ref = layout.num_reference_rows();
     let num_packed = layout.num_packed_image_rows();
+    let sweep_regions = RowRegions {
+        text: layout.num_text_tokens(),
+        reference: num_ref,
+        generated: num_packed - num_ref,
+    };
 
     let schedule = SigmaSchedule::h3_image_distilled().expect("schedule");
     let want_t: Vec<f32> = reference
@@ -2284,6 +2347,13 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
     let diag_layers: Vec<usize> = reference
         .meta("diag_layers")
         .expect("the reference records its diag_layers")
+        .split(',')
+        .map(|k| k.parse().unwrap())
+        .collect();
+    assert_eq!(reference.meta("sweep_step").unwrap_or_default(), "0");
+    let sweep_layers: Vec<usize> = reference
+        .meta("sweep_layers")
+        .expect("the reference records its sweep_layers")
         .split(',')
         .map(|k| k.parse().unwrap())
         .collect();
@@ -2333,7 +2403,11 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
         }
     };
     let run = |model: &mut ImageDit, step: usize| -> Tensor {
-        let mut trace = ImageDitTrace::new(&diag_layers);
+        let mut layers = diag_layers.clone();
+        if step == 0 {
+            layers.extend(&sweep_layers);
+        }
+        let mut trace = ImageDitTrace::new(&layers);
         let got = host(
             &model
                 .forward_traced(step, &rows, &mut trace)
@@ -2374,7 +2448,7 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
             ),
             image_dit_stage_line(step, "block0.adaln", &block0, &d("block0.adaln")),
         ];
-        for (layer, hidden) in &trace.hidden {
+        for (layer, hidden) in trace.hidden.iter().filter(|(l, _)| diag_layers.contains(l)) {
             lines.push(image_dit_stage_line(
                 step,
                 &format!("hidden.block{layer}"),
@@ -2394,6 +2468,9 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
             println!("{line}");
         }
         regions(step, "velocity", &got, &want);
+        if step == 0 {
+            image_edit_block_sweep(&reference, &trace, &sweep_layers, sweep_regions);
+        }
         got
     };
     let got0 = run(&mut model, 0);

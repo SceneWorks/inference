@@ -25,6 +25,8 @@ use mlx_gen_minimax_h3::tensor::slice_axis;
 /// The committed producer whose output the parity gate accepts.
 const DIT_PRODUCER: &[u8] = include_bytes!("../../tools/dump_minimax_h3_image_dit_real.py");
 
+use mlx_gen::gen_core::h3_image::dit_sweep::{self, RowRegions, SweepRow};
+
 /// The family DiT parity bounds (requirement E9), shared with the Candle gate: a bf16 50-block DiT
 /// against the diffusers forward (CPU torch, float32 activations over the same bf16-stored weights).
 use mlx_gen::gen_core::h3_image::{
@@ -488,6 +490,46 @@ fn peak_rel(got: &Array, want: &Array) -> f32 {
         / peak
 }
 
+/// Print the per-block sweep of one traced step-0 forward against the reference's
+/// `diag.sweep.{f32,bf16}.block{k}` (see `gen_core::h3_image::dit_sweep`). Diagnostic only.
+fn edit_block_sweep(r: &Weights, trace: &ImageDitTrace, layers: &[usize], regions: RowRegions) {
+    println!(
+        "sweep (step 0): per block, rel-L2 vs the f32 reference, vs the bf16 reference, and the \
+         reference's own bf16-vs-f32 drift — all rows, then text / reference / generated rows"
+    );
+    let mut rows = Vec::with_capacity(layers.len());
+    for &layer in layers {
+        let (_, hidden) = trace
+            .hidden
+            .iter()
+            .find(|(l, _)| *l == layer)
+            .unwrap_or_else(|| panic!("the trace recorded block {layer}"));
+        let f32_ref = r.require(&format!("diag.sweep.f32.block{layer}")).unwrap();
+        let bf16_ref = r.require(&format!("diag.sweep.bf16.block{layer}")).unwrap();
+        assert_eq!(hidden.shape(), f32_ref.shape(), "sweep block {layer} shape");
+        assert_eq!(
+            bf16_ref.dtype(),
+            Dtype::Bfloat16,
+            "sweep block {layer} bf16 dtype"
+        );
+        let width = *hidden.shape().last().unwrap() as usize;
+        let row = SweepRow::new(
+            layer,
+            &host_f32(hidden),
+            &host_f32(f32_ref),
+            &host_f32(bf16_ref),
+            width,
+            regions,
+        )
+        .unwrap();
+        println!("{row}");
+        rows.push(row);
+    }
+    for line in dit_sweep::summary(&rows) {
+        println!("{line}");
+    }
+}
+
 /// AC2: the `edit` presentation this crate builds with the snapshot's own tokenizer — a
 /// `Picture i: ` label and a vision block per reference, then the prompt, no chat template — is
 /// the processor template's, id for id and tag for tag, as diffusers'
@@ -613,6 +655,12 @@ fn h3_image_edit_reference_latents_match_diffusers() {
 /// residual stream after the `diag_layers`, `norm_out`'s output), the velocity error over the
 /// reference rows and over the generated rows separately, step 3 on the step-0 rows, and both
 /// asserted velocities against the reference's own bf16-compute forward (`diag.bf16.*`).
+///
+/// Also printed at step 0: the per-block sweep (`diag.sweep.*`, `gen_core::h3_image::dit_sweep`)
+/// — after every block in `sweep_layers`, the error against the f32 and the bf16 reference and the
+/// reference's own bf16-vs-f32 drift, over all rows and per row class, with the largest reference
+/// activation and the largest error located — then the first block where this backend departs
+/// from diffusers' bf16 compute.
 #[test]
 #[ignore = "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_IMAGE_EDIT_REFERENCE; ~40 GB resident"]
 fn h3_image_edit_first_step_matches_diffusers() {
@@ -670,6 +718,11 @@ fn h3_image_edit_first_step_matches_diffusers() {
     );
     let num_ref = layout.num_reference_rows();
     let num_packed = layout.num_packed_image_rows();
+    let sweep_regions = RowRegions {
+        text: layout.num_text_tokens() as usize,
+        reference: num_ref as usize,
+        generated: (num_packed - num_ref) as usize,
+    };
     let denoiser = ImageDenoiser::new(
         dit,
         layout,
@@ -692,6 +745,13 @@ fn h3_image_edit_first_step_matches_diffusers() {
     let diag_layers: Vec<usize> = r
         .metadata("diag_layers")
         .expect("the reference records its diag_layers")
+        .split(',')
+        .map(|k| k.parse().unwrap())
+        .collect();
+    assert_eq!(r.metadata("sweep_step").unwrap_or_default(), "0");
+    let sweep_layers: Vec<usize> = r
+        .metadata("sweep_layers")
+        .expect("the reference records its sweep_layers")
         .split(',')
         .map(|k| k.parse().unwrap())
         .collect();
@@ -725,7 +785,11 @@ fn h3_image_edit_first_step_matches_diffusers() {
     };
     let mut results = Vec::new();
     for step in [0usize, 3] {
-        let mut trace = ImageDitTrace::new(&diag_layers);
+        let mut layers = diag_layers.clone();
+        if step == 0 {
+            layers.extend(&sweep_layers);
+        }
+        let mut trace = ImageDitTrace::new(&layers);
         let got = denoiser.velocity_traced(step, &rows, &mut trace).unwrap();
         mlx_rs::transforms::eval([&got]).unwrap();
         let want = r.require(&format!("out.step{step}")).unwrap();
@@ -758,7 +822,7 @@ fn h3_image_edit_first_step_matches_diffusers() {
             ),
             stage_line(step, "block0.adaln", &block0, d("block0.adaln")),
         ];
-        for (layer, hidden) in &trace.hidden {
+        for (layer, hidden) in trace.hidden.iter().filter(|(l, _)| diag_layers.contains(l)) {
             lines.push(stage_line(
                 step,
                 &format!("hidden.block{layer}"),
@@ -777,6 +841,9 @@ fn h3_image_edit_first_step_matches_diffusers() {
             println!("{line}");
         }
         regions(step, "velocity", &got, want);
+        if step == 0 {
+            edit_block_sweep(&r, &trace, &sweep_layers, sweep_regions);
+        }
         results.push((step, rel_l2(&got, want), cosine(&got, want), got));
     }
     // Asserted step 3: the sampler's own x_3, reached by the reference from the same rows.
