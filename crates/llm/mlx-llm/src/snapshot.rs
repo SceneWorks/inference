@@ -704,6 +704,15 @@ ArtifactInput,
     .map_err(|e| Error::Config(format!("read {}: {e}", config_path.display())))?;
     let mut config: Value = serde_json::from_str(&config_text)
         .map_err(|e| Error::Config(format!("parse {}: {e}", config_path.display())))?;
+    // A ModelOpt NVFP4 source stores packed U8 projections plus scale companions; re-quantizing
+    // those bytes as ordinary weights writes a snapshot that cannot load. Refuse before any write.
+    if quantize.is_some() && core_llm::modelopt::modelopt_nvfp4(&config) != Ok(None) {
+        return Err(Error::Unsupported(format!(
+            "{} is a ModelOpt-quantized checkpoint and cannot be re-quantized to Q4/Q8; run \
+             convert_snapshot_to_bf16 (candle-llm) on it first, then prepare the bf16 output",
+            source.display()
+        )));
+    }
     if drop_native_mtp {
         fn no_mtp_layers(map: &mut serde_json::Map<String, Value>) {
             if map.contains_key("mtp_num_hidden_layers") {
@@ -783,6 +792,32 @@ path,
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A quantized write of a ModelOpt-quantized source is refused before anything is written, and
+    /// the refusal names `convert_snapshot_to_bf16`. Config-only: no tensor is read.
+    #[test]
+    fn write_hf_snapshot_refuses_a_modelopt_source_without_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("config.json"),
+            serde_json::json!({
+                "model_type": "llama",
+                "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4",
+                                        "group_size": 16}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let out = root.path().join("out");
+        let err = write_hf_snapshot(&src, &out, Some(QuantSpec::q4())).unwrap_err();
+        assert!(
+            err.to_string().contains("convert_snapshot_to_bf16"),
+            "{err}"
+        );
+        assert!(!out.exists(), "nothing is written on refusal");
+    }
     use crate::config::ModelConfig;
     use crate::models::{CausalLm, Qwen35Config, Qwen35Model};
     use crate::primitives::sampler::{SplitMix64, TokenRng};
