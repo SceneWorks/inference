@@ -1677,9 +1677,11 @@ fn image_vae_tiled_decode_lowers_the_16mp_peak() {
 
 // ── SW-7091: MiniMax-H3-Image DiT and text-to-image ──────────────────────────────────────────────
 
-/// Peak-relative max-abs-diff bound for one bf16 DiT evaluation against the diffusers bf16
-/// `MiniMaxH3ImageTransformer2DModel` (50 blocks, float32 heads). Both sides run bf16 blocks with
-/// their own attention kernels, so this is a cross-implementation bound, not an f32 one.
+/// Peak-relative max-abs-diff bound for one bf16 DiT evaluation against the diffusers
+/// `MiniMaxH3ImageTransformer2DModel` (50 blocks, float32 heads), computed with float32
+/// activations over the same bf16-stored weights (the reference's `compute_dtype`). This side runs
+/// bf16 blocks with its own attention kernels, so this is a cross-implementation bound, not an f32
+/// one.
 const IMAGE_DIT_PEAK_TOL: f32 = 6e-2;
 /// Mean-relative bound for the same comparison — the stricter, aggregate half of the gate.
 const IMAGE_DIT_MEAN_TOL: f32 = 2e-2;
@@ -1727,11 +1729,15 @@ fn image_dit_snapshot() -> std::path::PathBuf {
 /// declared tensors and no audio tensor, and its step-0 output (head 0) and step-3 output (head 3)
 /// match diffusers' `MiniMaxH3ImageTransformer2DModel` on the published weights, over the exact
 /// inputs of the reference SW-7090's macOS job produces (`dit-reference.safetensors`, shared by
-/// both backends). The timesteps this crate derives are held to the producer's.
+/// both backends; float32 activations over the bf16 weights). Step 0 is asserted on the noise
+/// rows; step 3 on the sampler's own `x_3` (`diag.traj.rows3`, reached by the reference from those
+/// noise rows). The timesteps this crate derives are held to the producer's.
 ///
 /// Before asserting, every step prints its error at each stage the reference recorded (`temb`,
 /// `norm_out` shift/scale, block 0's AdaLN tables, the residual stream after the `diag_layers`,
-/// `norm_out`'s output) and the on-trajectory step-3 velocity, so a miss says where it enters.
+/// `norm_out`'s output). Also printed, never asserted: step 3 on the step-0 noise rows (an input
+/// no sampler shows the model at `t = 0.25`), and both asserted velocities against the
+/// reference's own bf16-compute forward (`diag.bf16.*`).
 #[test]
 #[ignore = "needs a real MiniMax-H3-Image snapshot (transformer_diffusers/) + a reference (MINIMAX_H3_IMAGE_DIT_REFERENCE); 66 GB bf16 DiT"]
 fn image_dit_first_step_matches_the_official_diffusers_transformer() {
@@ -1756,6 +1762,11 @@ fn image_dit_first_step_matches_the_official_diffusers_transformer() {
         reference.meta("producer_sha256").unwrap_or_default(),
         format!("{:x}", Sha256::digest(IMAGE_DIT_PRODUCER)),
         "the reference was produced by a different dump_minimax_h3_image_dit_real.py; re-produce it"
+    );
+    assert_eq!(
+        reference.meta("compute_dtype").unwrap_or_default(),
+        "float32",
+        "the asserted reference must be computed with float32 activations"
     );
 
     // Exhaustive mapping: the partition carries exactly the declared names — no audio tensor.
@@ -1884,41 +1895,52 @@ fn image_dit_first_step_matches_the_official_diffusers_transformer() {
     };
     let got0 = run(&mut model, 0);
     let got3 = run(&mut model, 3);
-    // Diagnostic: step 3 on the sampler's own x_3 (reached by the reference from the same noise
-    // rows), next to the asserted off-trajectory step 3.
+    // Asserted step 3: the sampler's own x_3, reached by the reference from the same noise rows.
     let traj_rows = reference
         .tensor("diag.traj.rows3")
         .to_device(&dev)
         .expect("trajectory rows");
     let traj = host(&model.forward(3, &traj_rows).expect("on-trajectory forward"));
+    let traj_want = reference.tensor("diag.traj.out3");
     println!(
         "{}",
-        image_dit_stage_line(
-            3,
-            "on-trajectory",
-            &traj,
-            &reference.tensor("diag.traj.out3")
-        )
+        image_dit_stage_line(3, "on-trajectory", &traj, &traj_want)
     );
+    // The reference's own rounding: the same two asserted inputs at bf16 compute.
     let want0 = reference.tensor("out.step0");
+    let bf16_step0 = reference.tensor("diag.bf16.step0");
+    let bf16_traj = reference.tensor("diag.bf16.traj.out3");
+    for (step, stage, got, want) in [
+        (0, "ref bf16 vs f32", &bf16_step0, &want0),
+        (3, "ref bf16 vs f32", &bf16_traj, &traj_want),
+        (0, "vs ref bf16", &got0, &bf16_step0),
+        (3, "traj vs ref bf16", &traj, &bf16_traj),
+    ] {
+        println!("{}", image_dit_stage_line(step, stage, got, want));
+    }
     let want3 = reference.tensor("out.step3");
     assert_eq!(got0.dims(), want0.dims());
     let (p0, m0) = rel(&got0, &want0);
+    let (pt, mt) = rel(&traj, &traj_want);
     let (p3, m3) = rel(&got3, &want3);
     let (between, _) = rel(&want0, &want3);
     let (cross, _) = rel(&got3, &want0);
     println!(
         "image DiT vs diffusers (bounds peak {IMAGE_DIT_PEAK_TOL:.0e} / mean {IMAGE_DIT_MEAN_TOL:.0e}): \
-         step0 peak {p0:.3e} mean {m0:.3e}; step3 peak {p3:.3e} mean {m3:.3e}; reference step0 vs \
-         step3 {between:.3e}; candle step3 vs reference step0 {cross:.3e}"
+         step0 peak {p0:.3e} mean {m0:.3e}; step3 on-trajectory peak {pt:.3e} mean {mt:.3e}; \
+         reference step0 vs step3 {between:.3e}; candle step3 vs reference step0 {cross:.3e}"
+    );
+    println!(
+        "image DiT step 3 off-trajectory (step-0 noise rows at t = 0.25; diagnostic, not \
+         asserted): peak {p3:.3e} mean {m3:.3e}"
     );
     assert!(
         p0 < IMAGE_DIT_PEAK_TOL && m0 < IMAGE_DIT_MEAN_TOL,
         "step 0 diverges"
     );
     assert!(
-        p3 < IMAGE_DIT_PEAK_TOL && m3 < IMAGE_DIT_MEAN_TOL,
-        "step 3 diverges"
+        pt < IMAGE_DIT_PEAK_TOL && mt < IMAGE_DIT_MEAN_TOL,
+        "step 3 on-trajectory diverges"
     );
     assert!(
         between > IMAGE_DIT_PEAK_TOL && cross > IMAGE_DIT_PEAK_TOL,

@@ -25,9 +25,10 @@ use mlx_gen_minimax_h3::tensor::slice_axis;
 /// The committed producer whose output the parity gate accepts.
 const DIT_PRODUCER: &[u8] = include_bytes!("../../tools/dump_minimax_h3_image_dit_real.py");
 
-/// Relative L2 bound for a bf16 50-block DiT against the diffusers bf16 forward (CPU torch). The
-/// two run the same mixed precision but accumulate in different orders across 50 residual
-/// blocks; the cosine bound below is the shape check, this one the magnitude check.
+/// Relative L2 bound for a bf16 50-block DiT against the diffusers forward (CPU torch, float32
+/// activations over the same bf16-stored weights — the reference's `compute_dtype`). The MLX side
+/// rounds its residual stream to bf16 across 50 blocks; the cosine bound below is the shape check,
+/// this one the magnitude check.
 const DIT_REL_L2_TOL: f32 = 5e-2;
 /// Minimum cosine similarity of each step's velocity against diffusers.
 const DIT_MIN_COSINE: f32 = 0.995;
@@ -137,14 +138,17 @@ fn h3_image_dit_names_match_the_published_index() {
 }
 
 /// AC1 / AC2: the MLX DiT's step-0 and step-3 velocities against diffusers'
-/// `MiniMaxH3ImageTransformer2DModel` on the same inputs (`tools/dump_minimax_h3_image_dit_real.py`,
-/// hash-pinned). Step 3 runs through head 3 at `t = 0.25`, so a head or timestep mis-binding fails
-/// it even when step 0 passes; the two heads are also shown to give different outputs on the
-/// same rows.
+/// `MiniMaxH3ImageTransformer2DModel` (`tools/dump_minimax_h3_image_dit_real.py`, hash-pinned,
+/// float32 activations over the bf16 weights). Step 0 is asserted on the noise rows. Step 3 is
+/// asserted on the sampler's own `x_3` (`diag.traj.rows3`, reached by the reference from those
+/// noise rows), through head 3 at `t = 0.25`, so a head or timestep mis-binding fails it even when
+/// step 0 passes; the two heads are also shown to give different outputs on the same rows.
 ///
 /// Before asserting, every step prints its error at each stage the reference recorded (`temb`,
 /// `norm_out` shift/scale, block 0's AdaLN tables, the residual stream after the `diag_layers`,
-/// `norm_out`'s output) and the on-trajectory step-3 velocity, so a miss says where it enters.
+/// `norm_out`'s output). Also printed, never asserted: step 3 on the step-0 noise rows (an input
+/// no sampler shows the model at `t = 0.25`), and both asserted velocities against the
+/// reference's own bf16-compute forward (`diag.bf16.*`).
 #[test]
 #[ignore = "needs a real MiniMax-H3-Image snapshot + a DiT reference (MINIMAX_H3_IMAGE_DIT_REFERENCE); ~40 GB resident"]
 fn h3_image_dit_first_step_matches_diffusers() {
@@ -168,6 +172,11 @@ fn h3_image_dit_first_step_matches_diffusers() {
         format!("{:x}", Sha256::digest(DIT_PRODUCER)),
         "the reference was produced by a different dump_minimax_h3_image_dit_real.py than the \
          committed one; re-produce it"
+    );
+    assert_eq!(
+        r.metadata("compute_dtype").unwrap_or_default(),
+        "float32",
+        "the asserted reference must be computed with float32 activations"
     );
     let num_text: i32 = r.metadata("num_text").unwrap().parse().unwrap();
     let (lh, lw) = {
@@ -276,37 +285,62 @@ fn h3_image_dit_first_step_matches_diffusers() {
         }
         results.push((step, rel_l2(&got, want), cosine(&got, want), got));
     }
-    // Diagnostic: step 3 on the sampler's own x_3 (reached by the reference from the same noise
-    // rows), next to the asserted off-trajectory step 3 above.
+    // Asserted step 3: the sampler's own x_3, reached by the reference from the same noise rows.
     let traj_rows = r.require("diag.traj.rows3").unwrap().clone();
     let traj = denoiser.velocity(3, &traj_rows).unwrap();
     mlx_rs::transforms::eval([&traj]).unwrap();
+    let traj_want = r.require("diag.traj.out3").unwrap();
+    assert_eq!(
+        traj.shape(),
+        traj_want.shape(),
+        "on-trajectory step 3 shape"
+    );
+    println!("{}", stage_line(3, "on-trajectory", &traj, traj_want));
+    // The reference's own rounding: the same two asserted inputs at bf16 compute.
+    let bf16_step0 = r.require("diag.bf16.step0").unwrap();
+    let bf16_traj = r.require("diag.bf16.traj.out3").unwrap();
     println!(
         "{}",
         stage_line(
-            3,
-            "on-trajectory",
-            &traj,
-            r.require("diag.traj.out3").unwrap()
+            0,
+            "ref bf16 vs f32",
+            bf16_step0,
+            r.require("out.step0").unwrap()
         )
     );
+    println!("{}", stage_line(3, "ref bf16 vs f32", bf16_traj, traj_want));
+    println!(
+        "{}",
+        stage_line(0, "vs ref bf16", &results[0].3, bf16_step0)
+    );
+    println!("{}", stage_line(3, "traj vs ref bf16", &traj, bf16_traj));
     let head_gap = rel_l2(
         &results[0].3,
         &results[1].3.as_dtype(Dtype::Float32).unwrap(),
     );
-    for (step, rel, cos, _) in &results {
+    let (off_rel, off_cos) = (results[1].1, results[1].2);
+    let asserted = [
+        ("step 0", results[0].1, results[0].2),
+        (
+            "step 3 on-trajectory",
+            rel_l2(&traj, traj_want),
+            cosine(&traj, traj_want),
+        ),
+    ];
+    for (what, rel, cos) in &asserted {
         println!(
-            "h3-image DiT step {step} vs diffusers: rel-L2 {rel:.3e} (bound {DIT_REL_L2_TOL:.0e}), \
+            "h3-image DiT {what} vs diffusers: rel-L2 {rel:.3e} (bound {DIT_REL_L2_TOL:.0e}), \
              cosine {cos:.6} (floor {DIT_MIN_COSINE})"
         );
     }
+    println!(
+        "h3-image DiT step 3 off-trajectory (step-0 noise rows at t = 0.25; diagnostic, not \
+         asserted): rel-L2 {off_rel:.3e}, cosine {off_cos:.6}"
+    );
     println!("step-0 vs step-3 velocity rel-L2 gap {head_gap:.3e}");
-    for (step, rel, cos, _) in &results {
-        assert!(
-            *rel < DIT_REL_L2_TOL,
-            "step {step} diverges: rel-L2 {rel:.3e}"
-        );
-        assert!(*cos > DIT_MIN_COSINE, "step {step} cosine {cos:.6}");
+    for (what, rel, cos) in &asserted {
+        assert!(*rel < DIT_REL_L2_TOL, "{what} diverges: rel-L2 {rel:.3e}");
+        assert!(*cos > DIT_MIN_COSINE, "{what} cosine {cos:.6}");
     }
     assert!(
         head_gap > DIT_REL_L2_TOL,
