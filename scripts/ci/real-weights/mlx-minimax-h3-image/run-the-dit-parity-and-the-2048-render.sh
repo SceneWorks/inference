@@ -59,10 +59,11 @@ for tier in q8 q4; do
   fi
   run_gate h3_image_real::"h3_image_t2i_renders_2048_$tier"
   # SW-7094 (q4 only, before the tier is removed): the windowed DiT matches the resident one, the
-  # rung-3 verdict re-taken at image geometry, and a 16 MP request admitted and rendered streamed.
+  # implemented rung 3 lowering the denoise peak at image geometry, and a 16 MP request admitted
+  # and rendered streamed.
   if [[ $tier == q4 ]]; then
     for name in h3_image_real::h3_image_streamed_dit_matches_resident_q4 \
-      h3_image_bounded_attention_real::h3_image_rung3_verdict_holds_at_image_geometry \
+      h3_image_bounded_attention_real::h3_image_rung3_lowers_the_denoise_peak_at_image_geometry \
       h3_image_real::h3_image_t2i_renders_16mp_streamed_q4; do
       run_gate "$name"
     done

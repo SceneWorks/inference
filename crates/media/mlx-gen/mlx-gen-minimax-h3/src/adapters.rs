@@ -1736,6 +1736,79 @@ mod tests {
         );
     }
 
+    /// SW-7096: every block-leaf key the MLX real-weight LoRA gate writes names an image-DiT
+    /// module — PEFT through the prefix strip, kohya through the shared rewrite (native spellings
+    /// then through the ComfyUI conversion) — so the gate's adapters cannot miss silently.
+    #[test]
+    fn the_real_weight_gate_keys_name_image_dit_modules() {
+        let cfg = crate::dit::config::MiniMaxH3ImageDitConfig::default();
+        let targets: BTreeSet<String> = crate::h3_image::dit::image_adapter_target_paths(&cfg)
+            .into_iter()
+            .collect();
+        let native = ["attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"];
+        for block in 0..3 {
+            for leaf in BLOCK_TARGETS {
+                let key = format!("transformer.transformer_blocks.{block}.{leaf}");
+                let path = normalize_minimax_h3_key(&key);
+                assert!(targets.contains(&path), "{key} -> {path}");
+            }
+            let kohya: Vec<String> = native
+                .iter()
+                .map(|leaf| {
+                    format!(
+                        "lora_unet_blocks_{block}_{}.lora_down.weight",
+                        leaf.replace('.', "_")
+                    )
+                })
+                .collect();
+            let rewritten = rewrite_minimax_h3_kohya_keys(kohya.iter().map(String::as_str))
+                .expect("every native kohya block key names a module");
+            let dotted: BTreeSet<String> = rewritten.into_iter().map(|(_, d)| d).collect();
+            for leaf in native {
+                assert!(
+                    dotted.contains(&format!("blocks.{block}.{leaf}.lora_down.weight")),
+                    "{dotted:?}"
+                );
+            }
+        }
+    }
+
+    /// SW-7096: a file that matches no module is refused rather than installed as zero residuals —
+    /// whether its factors name a module the DiT does not have, or it carries no LoRA factor at
+    /// all — and nothing of it reaches the host.
+    #[test]
+    fn a_file_that_matches_nothing_is_refused_not_applied_as_zero_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = stream_host(dir.path());
+        let missing = save(
+            dir.path(),
+            "missing.safetensors",
+            &[
+                (
+                    "transformer.transformer_blocks.0.attn.to_qq.lora_A.weight",
+                    seeded(&[1, 8], 1),
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_qq.lora_B.weight",
+                    seeded(&[8, 1], 2),
+                ),
+            ],
+            &[("alpha", "1")],
+        );
+        let error = apply_minimax_h3_adapters(&mut host, &[missing])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("transformer_blocks.0.attn.to_qq"), "{error}");
+        let no_factors = save(
+            dir.path(),
+            "no-factors.safetensors",
+            &[("transformer.proj_in.weight", seeded(&[8, 8], 3))],
+            &[],
+        );
+        assert!(apply_minimax_h3_adapters(&mut host, &[no_factors]).is_err());
+        assert_eq!(host.adapters().residual_count(), 0);
+    }
+
     #[test]
     fn clay_raw_refiner_header_maps_to_exact_native_targets() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(

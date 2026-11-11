@@ -313360,13 +313360,13 @@
     "package": "mlx-gen-minimax-h3",
     "target": "integration",
     "target_kind": "test",
-    "fqn": "h3_image_bounded_attention_real::h3_image_rung3_verdict_holds_at_image_geometry",
+    "fqn": "h3_image_bounded_attention_real::h3_image_rung3_lowers_the_denoise_peak_at_image_geometry",
     "execution_role": "direct",
     "backend": "mlx",
     "device_binding": "runtime-stream",
     "fixture_identity": "real q4 DiT tier converted from MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/, pdd_fused_heads); synthetic 512-token text rows and latents at 2048 and 4096 px (SW-7094)",
     "configuration_source": "body-local construction (preserved verbatim)",
-    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile, rung-3 image-geometry verdict (mlx-minimax-h3-image job)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile, rung 3 lowers the image-geometry denoise peak bit-exactly (mlx-minimax-h3-image job)",
     "cargo_features": [
       "model-inference-proof"
     ],

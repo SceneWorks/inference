@@ -21,9 +21,11 @@
 //!
 //! # The ladder
 //!
-//! [`admit`] walks rungs 0, 1, 2 and 4 in order and returns the first selection whose peak fits the
-//! budget. Rung 3 is declared not applicable on MLX ([`crate::h3_image::memory`]) and is never a
-//! candidate. Rung 0's estimate charges every component co-resident — the "resident peak" a
+//! [`admit`] walks rungs 0 to 4 in order and returns the first selection whose peak fits the
+//! budget (rung 4 only on a load that can stream). Rung 3 lowers the denoise phase only: it
+//! chunks each block's attention on whole heads ([`crate::h3_image::memory`]), so the head-major
+//! attention operands are held for one chunk's heads instead of all of them. Rung 0's estimate
+//! charges every component co-resident — the "resident peak" a
 //! request is rejected at when nothing streams — although the generator always stages; that is
 //! the over-provisioning direction.
 
@@ -545,6 +547,8 @@ struct Engaged {
     stream_te: bool,
     stream_dit: bool,
     window: u64,
+    /// Rung 3's declared score budget, when the selection engages it.
+    attention_chunk: Option<u32>,
 }
 
 fn engaged(contract: &MemoryProviderContract, selection: &MemorySelection) -> Engaged {
@@ -555,7 +559,16 @@ fn engaged(contract: &MemoryProviderContract, selection: &MemorySelection) -> En
         || contract.engages_selection(selection, MemoryStrategy::StagedResidency);
     let rung4 = contract.engages_selection(selection, MemoryStrategy::BoundedTransformerResidency);
     let component = selection.parameters.window_component();
+    let attention_chunk = contract
+        .engages_selection(selection, MemoryStrategy::BoundedAttention)
+        .then(|| {
+            selection
+                .parameters
+                .attention_chunk_size
+                .unwrap_or(crate::h3_image::memory::IMAGE_ATTENTION_CHUNK_SIZE)
+        });
     Engaged {
+        attention_chunk,
         staged,
         stream_te: rung4 && component.includes_text_encoder(),
         stream_dit: rung4 && component.includes_dit(),
@@ -576,6 +589,22 @@ fn window_peak(bytes: &[u64], window: u64) -> u64 {
         .map(|c| sum(c.iter().copied()))
         .max()
         .unwrap_or(0)
+}
+
+/// The head-major attention operands one block's attention holds at once over `s` rows: two
+/// `[S, heads · head_dim]` copies at width `a`, for every head unbounded and for one chunk's whole
+/// heads under rung 3 ([`crate::h3_image::memory::image_attention_budget`]). Two copies, not
+/// three: run 43042251357 measured rung 3 saving 137 MB of the q4 denoise peak at 2048², and
+/// `2 · s · (inner − 3 · head_dim) · a` is 125 MB of it, so the term never prices the rung below
+/// what it was measured to hold.
+fn attention_operand_bytes(chunk: Option<u32>, s: u64, a: u64) -> u64 {
+    let b = MiniMaxH3ImageDitConfig::default().base;
+    let heads = b.num_attention_heads as u64;
+    let held = chunk.map_or(heads, |chunk| {
+        let budget = crate::h3_image::memory::image_attention_budget(chunk, s);
+        crate::h3_image::memory::image_attention_heads_per_chunk(budget, heads, s)
+    });
+    2 * s * held * b.attention_head_dim as u64 * a
 }
 
 /// The per-phase estimate of `shape` at `selection` on `contract` — see the module docs for what
@@ -701,7 +730,8 @@ pub fn estimate(
     let block_elements = 6 * hidden + 5 * inner + 2 * ffn + ffn;
     let step_work = s * block_elements * a
         + (rows.reference + rows.image) * b.video_patch_dim() as u64 * 4 * 4
-        + s * b.attention_head_dim as u64 * 4 * 2;
+        + s * b.attention_head_dim as u64 * 4 * 2
+        + attention_operand_bytes(e.attention_chunk, s, a);
     // The LoRA overlay is resident in full at every rung — rung 4's streamed blocks keep their
     // factors as an overlay for the whole render (`DitBlockStream::adapters`) — plus one block's
     // residual working set (every target's per-row bytes over all `s` rows, an upper bound for the
@@ -779,12 +809,17 @@ pub fn estimate(
 }
 
 /// The ladder candidates this contract declares, cheapest-to-run first: rung 0, rung 1, rung 2 at
-/// the shipped tile, and rung 4 (window 1 over both transformers) when the load can stream.
+/// the shipped tile, rung 3 at the declared attention budget, and rung 4 (window 1 over both
+/// transformers, attention chunked by cost order) when the load can stream.
 pub fn ladder(contract: &MemoryProviderContract, tier: MemoryNumericTier) -> Vec<MemorySelection> {
     let decode = MemoryStrategyParameters {
         decode_tile_edge: Some(IMAGE_DECODE_TILE_EDGE),
         decode_overlap: Some(IMAGE_DECODE_OVERLAP),
         ..Default::default()
+    };
+    let attention = MemoryStrategyParameters {
+        attention_chunk_size: Some(crate::h3_image::memory::IMAGE_ATTENTION_CHUNK_SIZE),
+        ..decode
     };
     let candidates = [
         (
@@ -796,6 +831,7 @@ pub fn ladder(contract: &MemoryProviderContract, tier: MemoryNumericTier) -> Vec
             MemoryStrategyParameters::default(),
         ),
         (MemoryStrategy::BoundedDecode, decode),
+        (MemoryStrategy::BoundedAttention, attention),
         (
             MemoryStrategy::BoundedTransformerResidency,
             MemoryStrategyParameters {
@@ -803,7 +839,7 @@ pub fn ladder(contract: &MemoryProviderContract, tier: MemoryNumericTier) -> Vec
                     crate::h3_image::memory::IMAGE_TRANSFORMER_WINDOW_SIZE,
                 ),
                 transformer_window_component: Some(TransformerComponent::Both),
-                ..decode
+                ..attention
             },
         ),
     ];
@@ -1036,11 +1072,13 @@ mod tests {
             vec![
                 MemoryStrategy::Resident,
                 MemoryStrategy::StagedResidency,
-                MemoryStrategy::BoundedDecode
+                MemoryStrategy::BoundedDecode,
+                MemoryStrategy::BoundedAttention
             ]
         );
         let generation = c.generation_memory(&admission.estimate.selection).unwrap();
         assert!(generation.stream_transformer_blocks && generation.tile_vae_decode);
+        assert!(generation.chunk_attention);
         assert_eq!(generation.transformer_window_size, Some(1));
 
         // The loaded generator's safety check at that budget: the streamed estimate is accepted,
@@ -1093,6 +1131,95 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("GPU") && error.contains("host"), "{error}");
+    }
+
+    /// Rung 3 (SW-7094): on the ladder of every load, between rung 2 and rung 4. It lowers the
+    /// per-step working set by exactly the attention operands of the heads outside one chunk —
+    /// 1 head per chunk at the 8,192- and 20,480-row sequences, 3 at a 512-token 4 MP request's
+    /// 4,608 — and changes neither conditioning nor decode.
+    ///
+    /// On an eager load the AdaLN precompute (the whole DiT plus the table) still binds the
+    /// denoise phase of these text-to-image requests, so the derived facts show rung 3 at most
+    /// equal to rung 2 there. Zeroing the AdaLN stack isolates the per-step term rung 3 changes:
+    /// then the difference is exact, and a budget that fits rung 3 but not rung 2 admits rung 3.
+    #[test]
+    fn rung_3_lowers_the_denoise_step_by_the_unchunked_heads() {
+        let q4 = tier(Some(mlx_gen::gen_core::Quant::Q4));
+        let resident = contract(LoadShape::EagerMaterialization);
+        let strategies: Vec<MemoryStrategy> =
+            ladder(&resident, q4).iter().map(|s| s.strategy).collect();
+        assert_eq!(
+            strategies,
+            vec![
+                MemoryStrategy::Resident,
+                MemoryStrategy::StagedResidency,
+                MemoryStrategy::BoundedDecode,
+                MemoryStrategy::BoundedAttention
+            ]
+        );
+        let deferred = contract(LoadShape::DeferredMaterialization);
+        assert_eq!(
+            ladder(&deferred, q4).last().unwrap().strategy,
+            MemoryStrategy::BoundedTransformerResidency
+        );
+
+        let derived = ImageMemoryFacts::derived(Some(4));
+        let mut step_bound = derived.clone();
+        step_bound.dit_adaln_bytes = vec![0; step_bound.dit_adaln_bytes.len()];
+        let (heads, head_dim) = (56u64, 128u64);
+        let short = |edge| ImageRequestShape {
+            prompt_tokens: Some(512),
+            ..ImageRequestShape::text_to_image(edge, edge)
+        };
+        let pair = |facts: &ImageMemoryFacts, shape: &ImageRequestShape| {
+            let at_rung = |strategy| estimate(&resident, facts, shape, &at(&resident, strategy));
+            (
+                at_rung(MemoryStrategy::BoundedDecode).unwrap(),
+                at_rung(MemoryStrategy::BoundedAttention).unwrap(),
+            )
+        };
+        for (shape, s, per_chunk) in [
+            (ImageRequestShape::text_to_image(2048, 2048), 8192u64, 1u64),
+            (ImageRequestShape::text_to_image(4096, 4096), 20_480, 1),
+            (short(2048), 4608, 3),
+        ] {
+            assert_eq!(Rows::of(&shape).unwrap().sequence(), s);
+            let (rung2, rung3) = pair(&step_bound, &shape);
+            assert_eq!(
+                rung2.phases[1].device_bytes - rung3.phases[1].device_bytes,
+                2 * s * (heads - per_chunk) * head_dim * 2,
+                "{s} rows"
+            );
+            assert_eq!(rung2.phases[0], rung3.phases[0]);
+            assert_eq!(rung2.phases[2], rung3.phases[2]);
+            let (rung2, rung3) = pair(&derived, &shape);
+            assert!(rung3.phases[1].device_bytes <= rung2.phases[1].device_bytes);
+        }
+
+        let shape = ImageRequestShape::text_to_image(4096, 4096);
+        let (rung2, rung3) = pair(&step_bound, &shape);
+        assert!(rung3.peak_bytes() < rung2.peak_bytes());
+        let admission = admit(
+            &resident,
+            &step_bound,
+            &shape,
+            q4,
+            budget(rung3.peak_bytes()),
+        )
+        .unwrap();
+        assert_eq!(
+            admission.estimate.selection.strategy,
+            MemoryStrategy::BoundedAttention
+        );
+        assert_eq!(admission.rejected.len(), 3);
+        let generation = resident
+            .generation_memory(&admission.estimate.selection)
+            .unwrap();
+        assert!(generation.chunk_attention && generation.tile_vae_decode);
+        assert_eq!(
+            generation.attention_chunk_size,
+            Some(crate::h3_image::memory::IMAGE_ATTENTION_CHUNK_SIZE)
+        );
     }
 
     /// LoRA: the overlay is charged in full at every rung — never window-bounded — plus one

@@ -5,7 +5,7 @@
 //! | 0 | [`MemoryStrategy::Resident`] | implemented — the baseline; the generator always stages, so a resident admission over-provisions |
 //! | 1 | [`MemoryStrategy::StagedResidency`] | implemented, structural — the text encoder is built, encodes, is forced and released before the DiT maps; the DiT denoises and is released before the VAE maps. `unconditionally_engages_staged_residency` |
 //! | 2 | [`MemoryStrategy::BoundedDecode`] | implemented — SW-7089's 256 px / 64 px tiled decode ([`crate::image_vae::bounded_decode_parameters`]), a singleton domain because the tile edge changes the picture |
-//! | 3 | [`MemoryStrategy::BoundedAttention`] | **structurally not applicable** — see below |
+//! | 3 | [`MemoryStrategy::BoundedAttention`] | implemented (SW-7094) — every DiT block's attention runs as whole-head chunks at the shared 64 Mi score budget ([`IMAGE_ATTENTION_CHUNK_SIZE`]), floored at one whole head ([`image_attention_budget`]); see below |
 //! | 4 | [`MemoryStrategy::BoundedTransformerResidency`] | implemented on a [`LoadShape::DeferredMaterialization`] load for **both** transformers, window 1 (SW-7094) |
 //!
 //! # Rung 4 (SW-7094)
@@ -26,18 +26,25 @@
 //! (`crate::memory_strategy::TRANSFORMER_WINDOW_SIZE`). No image-family measurement is recorded
 //! here; the family's anchors are measured once at the end of the feature.
 //!
-//! # Rung 3 is not applicable on MLX, and that verdict is re-taken at image geometry
+//! # Rung 3 (SW-7094)
 //!
-//! MLX's fused `scaled_dot_product_attention` never materializes the `[B, H, S, S]` score tensor
-//! rung 3 bounds — a property of the kernel, not of the sequence length. H3 measured it at
-//! `S = 104_030` (sc-18661, [`crate::memory_strategy::RUNG3_MEASURED_PEAK_DELTAS`]): every chunked
-//! arm costs denoise peak. This family's sequences are shorter (16,384 image rows at 16 MP plus at
-//! most 4,096 prompt tokens, plus up to 16 references' rows), so they sit inside the range H3
-//! measured. The verdict is held to an image-geometry measurement by
-//! `tests/h3_image_bounded_attention_real.rs`, which runs the real q4 image DiT at 2048² and 4096²
-//! on both chunk axes and fails if any chunked arm saves more than 0.5 % of peak — the condition
-//! under which this
-//! declaration must become an implementation.
+//! MLX's fused `scaled_dot_product_attention` never materializes the `[B, H, S, S]` score tensor,
+//! so the rung does not bound scores here: it bounds the head-major `q`/`k`/`v` operands and the
+//! attention output, which a chunk holds for its own heads only. H3 video measured every chunked
+//! arm costing denoise peak at `S = 104_030` (sc-18661), and this family declared the rung not
+//! applicable on that ground; the image-geometry measurement then found the head axis at 64 Mi
+//! **saving** 1.05 % of the q4 denoise peak at 2048² (run 43042251357), with a bit-identical
+//! velocity, so the rung is implemented. Each block's attention runs through
+//! [`crate::h3_image::ImageDenoiser::set_bounded_attention`] on [`AttentionChunkAxis::Heads`],
+//! resident and windowed alike, so rung 4 (which engages rung 3 by cost order) chunks too.
+//!
+//! The budget is the shared [`IMAGE_ATTENTION_CHUNK_SIZE`] (64 Mi score elements), floored at one
+//! whole head of the request's sequence ([`image_attention_budget`]). Without the floor a sequence
+//! above 8,192 rows (any 16 MP request) falls back to query-row chunks inside a head, the axis H3
+//! measured costing peak and the one whose reconstruction is only tolerance-equivalent. With it,
+//! every chunk is whole heads and the output is the unbounded one bit for bit.
+//! `tests/h3_image_bounded_attention_real.rs` asserts on the real q4 image DiT at 2048² and 4096²
+//! that the rung lowers the denoise peak and leaves the velocity bit-identical.
 //!
 //! # Admission
 //!
@@ -56,6 +63,8 @@ use mlx_gen::gen_core::{
     MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, StreamedWeightFacts,
     TransformerComponent,
 };
+
+use mlx_gen::attention::{AttentionBudget, AttentionChunkAxis};
 
 use crate::h3_image::admission::ImageMemoryFacts;
 use crate::h3_image::model::IMAGE_MODEL_ID;
@@ -84,29 +93,53 @@ const ADALN_TABLE_MAX_BYTES: u64 = 6 * (3 * 7) * 5376 * 50 * 2;
 /// (`50 · (96768 · 2688 + 96768)` bf16 elements, the same projections as H3's).
 const ADALN_BF16_BYTES: u64 = 50 * (96_768 * 2_688 + 96_768) * 2;
 
-/// The text rung 3's `StructurallyNotApplicable` carries.
-fn rung3_inapplicability_reason() -> String {
-    let cells = crate::memory_strategy::RUNG3_MEASURED_PEAK_DELTAS
-        .iter()
-        .map(|(tier, frames, seq, heads, rows, one_head)| {
-            format!(
-                "{tier} {frames}f/seq {seq}: {:+.2}% heads, {:+.2}% query rows, {:+.2}% one-head",
-                heads * 100.0,
-                rows * 100.0,
-                one_head * 100.0
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    format!(
-        "MLX's fused SDPA streams the attention scores, so the [B,H,S,S] tensor rung 3 bounds is \
-         never built at any sequence length. The H3 block stack this family runs was measured \
-         in-forward on both chunk axes at S=104030, above every image sequence (16384 image rows \
-         at 16 MP + up to 4096 prompt tokens + reference rows), and every chunked arm COSTS denoise \
-         peak ({cells}). tests/h3_image_bounded_attention_real.rs re-takes the verdict on the real \
-         image DiT at 2048 and 4096 px and fails if any arm saves more than 0.5% of peak. MLX-scoped: the candle \
-         backend materializes its scores."
+/// Rung 3's one declared parameter: the shared constrained score budget (64 Mi elements per
+/// attention call) — the arm `tests/h3_image_bounded_attention_real.rs` measured saving peak.
+pub const IMAGE_ATTENTION_CHUNK_SIZE: u32 =
+    mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
+
+/// The attention budget a rung-3 request runs at over a packed sequence of `seq_len` rows: the
+/// declared `chunk_size`, floored at one whole head (`seq_len²` scores, batch 1). The floor keeps
+/// the planner on whole heads at every admitted sequence, so a long sequence never falls back to
+/// query-row chunks (see the module docs). MLX never builds the scores either way.
+pub fn image_attention_budget(chunk_size: u32, seq_len: u64) -> AttentionBudget {
+    AttentionBudget::from_score_elements(
+        u64::from(chunk_size).max(seq_len.saturating_mul(seq_len)),
+        true,
     )
+}
+
+/// Whole heads per attention chunk at `budget` over `seq_len` rows of `heads` heads — the
+/// planner's own answer ([`AttentionBudget::head_chunks`]), for admission's pricing.
+pub fn image_attention_heads_per_chunk(budget: AttentionBudget, heads: u64, seq_len: u64) -> u64 {
+    budget
+        .head_chunks(1, heads, seq_len, seq_len)
+        .heads_per_chunk()
+}
+
+/// The rung-3 plan one request runs at: `None` when its memory block does not chunk attention,
+/// else the budget over `seq_len` rows on the head axis. A chunk size outside the declared domain
+/// is refused, not clamped.
+pub fn requested_bounded_attention(
+    memory: Option<mlx_gen::gen_core::GenerationMemory>,
+    seq_len: u64,
+) -> mlx_gen::gen_core::Result<Option<(AttentionBudget, AttentionChunkAxis)>> {
+    let Some(memory) = memory.filter(|memory| memory.chunk_attention) else {
+        return Ok(None);
+    };
+    let chunk = memory
+        .attention_chunk_size
+        .unwrap_or(IMAGE_ATTENTION_CHUNK_SIZE);
+    if chunk != IMAGE_ATTENTION_CHUNK_SIZE {
+        return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+            "{IMAGE_MODEL_ID}: attention chunk size {chunk} is outside the published domain \
+             [{IMAGE_ATTENTION_CHUNK_SIZE}]"
+        )));
+    }
+    Ok(Some((
+        image_attention_budget(chunk, seq_len),
+        AttentionChunkAxis::Heads,
+    )))
 }
 
 /// Rung 4 exists exactly on a deferred load — the rung's shared prerequisite.
@@ -211,10 +244,8 @@ fn build_contract(
         capability.support = match capability.strategy {
             MemoryStrategy::Resident
             | MemoryStrategy::StagedResidency
-            | MemoryStrategy::BoundedDecode => MemoryStrategySupport::Implemented,
-            MemoryStrategy::BoundedAttention => MemoryStrategySupport::StructurallyNotApplicable {
-                reason: rung3_inapplicability_reason(),
-            },
+            | MemoryStrategy::BoundedDecode
+            | MemoryStrategy::BoundedAttention => MemoryStrategySupport::Implemented,
             MemoryStrategy::BoundedTransformerResidency if streamable => {
                 MemoryStrategySupport::Implemented
             }
@@ -222,6 +253,10 @@ fn build_contract(
         };
         capability.parameters = match capability.strategy {
             MemoryStrategy::BoundedDecode => bounded_decode_parameters(),
+            MemoryStrategy::BoundedAttention => MemoryParameterRanges {
+                attention_chunk_sizes: vec![IMAGE_ATTENTION_CHUNK_SIZE],
+                ..Default::default()
+            },
             MemoryStrategy::BoundedTransformerResidency if streamable => MemoryParameterRanges {
                 transformer_window_sizes: vec![IMAGE_TRANSFORMER_WINDOW_SIZE],
                 transformer_window_components: vec![TransformerComponent::Both],
@@ -234,7 +269,7 @@ fn build_contract(
         phases: phases(),
         synchronized_phase_release: true,
         decode_tiling: true,
-        attention_chunking: false,
+        attention_chunking: true,
         transformer_window_materialization: streamable,
     };
     let mut phase_facts = mlx_gen::gen_core::MemoryPhaseFacts::staged(
@@ -268,6 +303,7 @@ fn build_contract(
         MemoryFormulaVariable::BatchCount,
         MemoryFormulaVariable::ConditioningTokenCount,
         MemoryFormulaVariable::DecodeTileArea,
+        MemoryFormulaVariable::AttentionChunkSize,
     ];
     if asset_facts.overlay_bytes > 0 {
         variables.push(MemoryFormulaVariable::OverlayBytes);
@@ -419,6 +455,17 @@ fn begin_request_with_cleanup(
                         .transformer_window_size
                         .unwrap_or(IMAGE_TRANSFORMER_WINDOW_SIZE)
                 });
+            // The same guard for rung 3: the scope admits the declared chunk size exactly when
+            // the selection engages the rung (selected directly, or by rung 4's cost order).
+            config.attention_chunk_size = contract
+                .engages(context.selection.strategy, MemoryStrategy::BoundedAttention)
+                .then(|| {
+                    context
+                        .selection
+                        .parameters
+                        .attention_chunk_size
+                        .unwrap_or(IMAGE_ATTENTION_CHUNK_SIZE)
+                });
             Ok(config)
         },
     )
@@ -503,16 +550,17 @@ mod tests {
         weights_free_contract(&spec).unwrap()
     }
 
-    /// Rungs 0-2 are implemented on every load; rung 3 is not applicable on MLX with a reason that
-    /// names the measurement it rests on; rung 4 is `Missing` on a resident load.
+    /// Rungs 0-3 are implemented on every load, rung 3 at the one shared 64 Mi budget; rung 4 is
+    /// `Missing` on a resident load.
     #[test]
-    fn a_resident_load_declares_rungs_0_to_2_and_rung_3_not_applicable() {
+    fn a_resident_load_declares_rungs_0_to_3() {
         let c = weights_free();
         let support = |s| c.capability(s).unwrap().support.clone();
         for rung in [
             MemoryStrategy::Resident,
             MemoryStrategy::StagedResidency,
             MemoryStrategy::BoundedDecode,
+            MemoryStrategy::BoundedAttention,
         ] {
             assert_eq!(
                 support(rung),
@@ -520,16 +568,14 @@ mod tests {
                 "{rung:?}"
             );
         }
-        let MemoryStrategySupport::StructurallyNotApplicable { reason } =
-            support(MemoryStrategy::BoundedAttention)
-        else {
-            panic!("rung 3 must be StructurallyNotApplicable on MLX");
-        };
-        assert!(
-            reason.contains("h3_image_bounded_attention_real"),
-            "{reason}"
+        assert_eq!(
+            c.capability(MemoryStrategy::BoundedAttention)
+                .unwrap()
+                .parameters
+                .attention_chunk_sizes,
+            vec![IMAGE_ATTENTION_CHUNK_SIZE]
         );
-        assert!(reason.contains("104030"), "{reason}");
+        assert_eq!(IMAGE_ATTENTION_CHUNK_SIZE, 64 << 20);
         assert_eq!(
             support(MemoryStrategy::BoundedTransformerResidency),
             MemoryStrategySupport::Missing
@@ -541,7 +587,7 @@ mod tests {
             bounded_decode_parameters()
         );
         assert!(c.lifecycle.decode_tiling);
-        assert!(!c.lifecycle.attention_chunking);
+        assert!(c.lifecycle.attention_chunking);
         assert!(!c.lifecycle.transformer_window_materialization);
         assert_eq!(c.load_shape, LoadShape::EagerMaterialization);
         assert_eq!(c.provider_id, IMAGE_MODEL_ID);
@@ -621,6 +667,8 @@ mod tests {
                 decode_overlap: Some(64),
                 transformer_window_size: Some(1),
                 transformer_window_component: Some(TransformerComponent::Both),
+                // Rung 4 engages rung 3 by cost order, so its chunk size is required too.
+                attention_chunk_size: Some(IMAGE_ATTENTION_CHUNK_SIZE),
                 ..Default::default()
             },
             tier: MemoryNumericTier {
@@ -634,6 +682,140 @@ mod tests {
         assert!(memory.stream_transformer_blocks);
         assert_eq!(memory.transformer_window_size, Some(1));
         assert!(weights_free().validate_selection(&selection).is_err());
+    }
+
+    /// Rung 3's runtime plan: a request whose memory block chunks attention runs whole heads at
+    /// the declared budget — 3 heads per chunk at the 4 MP canvas's 4,608 rows — floored at one
+    /// whole head on a sequence one head already overflows (a 16 MP request's 20,480 rows), so the
+    /// planner never falls back to query rows. Unselected is `None`; an undeclared size is refused.
+    #[test]
+    fn rung_3_runs_whole_heads_floored_at_one_head() {
+        use mlx_gen::gen_core::GenerationMemory;
+        let heads = 56u64;
+        let chunk = |memory, seq| requested_bounded_attention(memory, seq).unwrap();
+        let on = GenerationMemory {
+            chunk_attention: true,
+            attention_chunk_size: Some(IMAGE_ATTENTION_CHUNK_SIZE),
+            ..Default::default()
+        };
+        assert!(chunk(None, 4608).is_none());
+        assert!(chunk(Some(GenerationMemory::default()), 4608).is_none());
+
+        let (budget, axis) = chunk(Some(on), 4608).unwrap();
+        assert_eq!(axis, AttentionChunkAxis::Heads);
+        assert_eq!(budget.max_score_elements(), 64 << 20);
+        assert!(budget.eval_per_chunk());
+        let plan = budget.head_chunks(1, heads, 4608, 4608);
+        assert!(plan.chunks_heads());
+        assert_eq!(plan.heads_per_chunk(), 3);
+        // Each 3-head chunk fits, so the query axis is not split inside it.
+        assert_eq!(budget.query_block(1, 3, 4608, 4608), 4608);
+
+        let (budget, _) = chunk(Some(on), 20_480).unwrap();
+        assert_eq!(budget.max_score_elements(), 20_480 * 20_480);
+        assert_eq!(image_attention_heads_per_chunk(budget, heads, 20_480), 1);
+        assert_eq!(budget.query_block(1, 1, 20_480, 20_480), 20_480);
+
+        let named_default = GenerationMemory {
+            attention_chunk_size: None,
+            ..on
+        };
+        assert!(chunk(Some(named_default), 4608).is_some());
+        let other = GenerationMemory {
+            attention_chunk_size: Some(IMAGE_ATTENTION_CHUNK_SIZE / 2),
+            ..on
+        };
+        assert!(requested_bounded_attention(Some(other), 4608).is_err());
+    }
+
+    /// The contract's own rung-3 selection derives a generation memory that chunks attention at
+    /// the declared size, and rung 4 engages rung 3 by cost order on a deferred load; the request
+    /// scope admits exactly that chunk size.
+    #[test]
+    fn rung_3_selection_reaches_the_request_scope() {
+        use mlx_gen::gen_core::{MemorySelection, MemoryStrategyParameters};
+        let tier = MemoryNumericTier {
+            precision: mlx_gen::Precision::Bf16,
+            quant: None,
+            component_precision_floors: &[],
+        };
+        let decode = MemoryStrategyParameters {
+            decode_tile_edge: Some(256),
+            decode_overlap: Some(64),
+            attention_chunk_size: Some(IMAGE_ATTENTION_CHUNK_SIZE),
+            ..Default::default()
+        };
+        for (contract, strategy, parameters) in [
+            (weights_free(), MemoryStrategy::BoundedAttention, decode),
+            (
+                deferred(),
+                MemoryStrategy::BoundedTransformerResidency,
+                MemoryStrategyParameters {
+                    transformer_window_size: Some(1),
+                    transformer_window_component: Some(TransformerComponent::Both),
+                    ..decode
+                },
+            ),
+        ] {
+            let selection = MemorySelection {
+                strategy,
+                parameters,
+                tier,
+            };
+            contract.validate_selection(&selection).unwrap();
+            let memory = contract.generation_memory(&selection).unwrap();
+            assert!(memory.chunk_attention, "{strategy:?}");
+            assert_eq!(
+                memory.attention_chunk_size,
+                Some(IMAGE_ATTENTION_CHUNK_SIZE)
+            );
+            assert!(requested_bounded_attention(Some(memory), 4608)
+                .unwrap()
+                .is_some());
+        }
+        // Rung 2 alone does not chunk attention.
+        let rung2 = MemorySelection {
+            strategy: MemoryStrategy::BoundedDecode,
+            parameters: MemoryStrategyParameters {
+                attention_chunk_size: None,
+                ..decode
+            },
+            tier,
+        };
+        let c = weights_free();
+        assert!(!c.generation_memory(&rung2).unwrap().chunk_attention);
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-minimax-h3-image".into()));
+        let tier = mlx_gen::request_scope::loaded_tier(&spec);
+        let scope = |strategy| {
+            let context = mlx_gen::gen_core::standard_memory_behavior_context(
+                &c,
+                strategy,
+                tier,
+                mlx_gen::gen_core::MemoryBehaviorRoute {
+                    mode: mlx_gen::gen_core::MemoryMode::TextToImage,
+                    reference_count: 0,
+                    use_pid: false,
+                    has_phases: true,
+                    overlay: None,
+                },
+            )
+            .unwrap();
+            registered_scope(IMAGE_MODEL_ID, &spec, &c, &context, tier)
+                .unwrap()
+                .unwrap()
+        };
+        let mut rung3 = scope(MemoryStrategy::BoundedAttention);
+        rung3
+            .configure_attention(IMAGE_ATTENTION_CHUNK_SIZE)
+            .unwrap();
+        assert!(rung3
+            .configure_attention(IMAGE_ATTENTION_CHUNK_SIZE / 2)
+            .is_err());
+        let mut rung2 = scope(MemoryStrategy::BoundedDecode);
+        assert!(rung2
+            .configure_attention(IMAGE_ATTENTION_CHUNK_SIZE)
+            .is_err());
     }
 
     /// A production contract claims no calibration: nothing has been measured.
