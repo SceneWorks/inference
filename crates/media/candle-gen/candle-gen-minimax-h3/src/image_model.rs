@@ -20,6 +20,13 @@
 //! 3. **decode** — map `vae_diffusers/`'s decode half ([`MiniMaxH3ImageVae`]), decode with its
 //!    shipped 256 / 64 tiling, and resize back from the generation canvas to the requested size.
 //!
+//! # Streamed route (rung 4, SW-7095)
+//!
+//! On a [`LoadShape::DeferredMaterialization`] load, a request whose admitted selection streams
+//! the transformer blocks keeps the text encoder and the DiT on the host in runtime format and
+//! runs each through a one-block device window (`crate::block_stream`); the DiT's root modules
+//! and six heads stay on the device, and the AdaLN precompute projects one block at a time.
+//!
 //! # Size
 //!
 //! Any positive size: the image is generated on `gen_core::h3_image::generation_canvas` (a
@@ -142,6 +149,12 @@ pub struct MiniMaxH3Image {
     device: Device,
     contract: MemoryProviderContract,
     spec: LoadSpec,
+    /// [`LoadShape::DeferredMaterialization`] when the source supports rung 4 (SW-7095): a
+    /// request that selects it keeps the text encoder and DiT blocks on the host and runs them
+    /// through a one-block device window.
+    load_shape: LoadShape,
+    /// The header-only facts admission prices each request's phases from (SW-7095).
+    memory_facts: Option<crate::image_memory_strategy::admission::ImageMemoryFacts>,
 }
 
 impl MiniMaxH3Image {
@@ -185,6 +198,14 @@ impl MiniMaxH3Image {
                 contract::FIXED_STEPS
             )));
         }
+        if spec.load_shape == LoadShape::DeferredMaterialization
+            && !image_streaming_supported(spec)?
+        {
+            return Err(CandleError::Msg(format!(
+                "{IMAGE_MODEL_ID}: this source does not support runtime-format block migration; \
+                 use the resident load"
+            )));
+        }
         Ok(Self {
             descriptor: image_descriptor(),
             root,
@@ -194,6 +215,8 @@ impl MiniMaxH3Image {
             contract: crate::image_memory_strategy::contract_for(spec)
                 .map_err(|e| CandleError::Msg(e.to_string()))?,
             spec: spec.clone(),
+            load_shape: spec.load_shape,
+            memory_facts: crate::image_memory_strategy::facts_for(spec),
         })
     }
 
@@ -279,6 +302,11 @@ impl MiniMaxH3Image {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        // Rung 4 (SW-7095): a request whose admitted selection streams the transformer blocks
+        // installs the one-block window policy for this request only; the text encoder
+        // (`run_conditioner`) and the DiT load below read it.
+        let _stream_request =
+            crate::block_stream::RequestGuard::enter(req, self.load_shape, &self.device)?;
         Generator::validate(self, req)?;
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
@@ -332,11 +360,27 @@ impl MiniMaxH3Image {
 
         // --- 2. denoise --------------------------------------------------------------------
         let phase = PhaseLog::start("dit_load");
-        let mut dit = MiniMaxH3Dit::load_from_dir(&self.dit_dir, &self.device, DType::BF16)?;
+        // Streamed (rung 4): the stack is built on the host in runtime format and only the root
+        // modules (projections, refiner, the six heads) move to the device; each block is copied
+        // in for its window. The adapters are installed on the host copy first, so every window
+        // carries its block's factors.
+        let policy = crate::block_stream::current();
+        let load_device = if policy.is_some() {
+            &Device::Cpu
+        } else {
+            &self.device
+        };
+        let mut dit = MiniMaxH3Dit::load_from_dir(&self.dit_dir, load_device, DType::BF16)?;
         if !self.spec.adapters.is_empty() {
             // Strict, like H3 video: an unmatched target or a file that matched nothing fails the
             // render here rather than producing an image the LoRA barely touched.
             crate::adapters::apply_minimax_h3_adapters(&mut dit, &self.spec.adapters)?;
+        }
+        if let Some(policy) = policy {
+            if policy.cancel.is_cancelled() {
+                return Err(CandleError::Canceled);
+            }
+            dit.prepare_streamed(&self.device, policy.window)?;
         }
         phase.done();
         let patch = dit.config().patch_size;
@@ -416,6 +460,19 @@ impl MiniMaxH3Image {
     }
 }
 
+/// Whether the resolved DiT and text encoder sources support byte-preserving host-to-device block
+/// migration (rung 4) — header-only, shared by the contract declaration and the load boundary.
+pub(crate) fn image_streaming_supported(spec: &LoadSpec) -> Result<bool> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p.as_path(),
+        WeightsSource::File(p) => p.parent().unwrap_or(p),
+    };
+    Ok(
+        crate::block_stream::component_supported(&resolve_dit_dir(root, spec))?
+            && crate::block_stream::component_supported(&resolve_text_encoder_dir(root, spec))?,
+    )
+}
+
 /// Parse `transformer_diffusers/config.json` of a snapshot root and require it to be the image
 /// transformer.
 pub fn image_dit_config(root: &Path) -> Result<crate::dit::MiniMaxH3DitConfig> {
@@ -448,7 +505,12 @@ impl Generator for MiniMaxH3Image {
         &self,
         context: &candle_gen::gen_core::MemoryRunContext,
     ) -> candle_gen::gen_core::MemorySafetyDecision {
-        crate::image_memory_strategy::safety_check(&self.spec, &self.contract, context)
+        crate::image_memory_strategy::safety_check_with(
+            self.memory_facts.as_ref(),
+            &self.spec,
+            &self.contract,
+            context,
+        )
     }
 
     fn begin_memory_strategy_request(
@@ -456,7 +518,12 @@ impl Generator for MiniMaxH3Image {
         context: &candle_gen::gen_core::MemoryRunContext,
     ) -> candle_gen::gen_core::Result<Option<Box<dyn candle_gen::gen_core::MemoryRequestScope>>>
     {
-        crate::image_memory_strategy::registered_begin_request(&self.spec, &self.contract, context)
+        crate::image_memory_strategy::registered_begin_request(
+            self.memory_facts.as_ref(),
+            &self.spec,
+            &self.contract,
+            context,
+        )
     }
 
     fn generate(
@@ -508,12 +575,6 @@ pub fn load_image(spec: &LoadSpec) -> candle_gen::gen_core::Result<Box<dyn Gener
     // Q4 / Q8 are the published MLX-affine tiers; NVFP4 and FP8 are different formats and are
     // refused by name rather than reconciled against a q4/q8 marker.
     crate::model::requested_tier(spec)?;
-    if spec.load_shape == LoadShape::DeferredMaterialization {
-        return Err(candle_gen::gen_core::Error::Unsupported(format!(
-            "{IMAGE_MODEL_ID}: block-streamed (deferred) materialization is not wired for this \
-             family; use the resident load"
-        )));
-    }
     candle_gen::gen_core::reject_unknown_components(
         spec,
         &[IMAGE_TEXT_ENCODER, IMAGE_DIT_PARTITION],
@@ -636,9 +697,12 @@ mod tests {
         ));
         let e = load_image(&a).err().expect("missing snapshot");
         assert!(e.to_string().contains(IMAGE_DIT_PARTITION), "{e}");
+        // SW-7095: a deferred load is a read slot too — over a missing snapshot it fails at the
+        // component check, not as an unsupported slot.
         let mut d = spec.clone();
         d.load_shape = LoadShape::DeferredMaterialization;
-        assert!(load_image(&d).is_err());
+        let e = load_image(&d).err().expect("missing snapshot");
+        assert!(e.to_string().contains(IMAGE_DIT_PARTITION), "{e}");
         // A plain spec over a missing snapshot fails at the component check, naming the path.
         let e = load_image(&spec).err().expect("missing snapshot");
         assert!(e.to_string().contains(IMAGE_DIT_PARTITION), "{e}");

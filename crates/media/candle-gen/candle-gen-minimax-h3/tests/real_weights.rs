@@ -2454,3 +2454,273 @@ fn image_t2i_renders_2048_q4_on_cuda() {
         );
     }
 }
+
+// ---- SW-7095: the 16 MP streamed render (candle/CUDA rung 4) --------------------------------------
+
+/// AC2 (candle/CUDA): a 16 MP (4096 x 4096) bf16 text-to-image request that does not fit
+/// resident is admitted and completes through the streamed route.
+///
+/// The admission budget is the device's **actually-free** memory (`cuMemGetInfo` after a
+/// synchronize), not its total: the shared runner's cards carry other work. The per-phase host
+/// and GPU estimates of the staged and streamed rungs are printed in decimal GB and binary GiB.
+/// The test asserts the streamed estimate fits that free memory, that the selector lands on rung 4
+/// for any budget between the two estimates (on a busy card, the real one), that the loaded
+/// generator refuses the staged rung whenever its estimate exceeds the free memory and admits the
+/// streamed one, and then renders through the request scope that admission returns — the
+/// one-block window over the text encoder and the DiT. The image is written to
+/// `MINIMAX_H3_IMAGE_STREAMED_RENDER_OUT` when set.
+#[test]
+#[ignore = "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT), MiniMax-H3's text encoder (MINIMAX_H3_SNAPSHOT) and CUDA; full 4096x4096 streamed render"]
+fn image_t2i_renders_16mp_streamed_on_cuda() {
+    #[cfg(not(feature = "cuda"))]
+    panic!("the 16 MP streamed render runs on the GPU; build with --features cuda");
+    #[cfg(feature = "cuda")]
+    {
+        use candle_gen::gen_core::{
+            GenerationOutput, GenerationRequest, LoadShape, LoadSpec, MemoryBudget,
+            MemoryCacheState, MemoryGeometry, MemoryMode, MemoryNumericTier,
+            MemoryOptimizationAuthority, MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision,
+            MemoryStrategy, WeightsSource,
+        };
+        use candle_gen_minimax_h3::image_memory_strategy::admission::{
+            admit, binary_gib, decimal_gb, estimate, ladder, ImageRequestRows, ImageRequestShape,
+        };
+        use candle_gen_minimax_h3::image_memory_strategy::facts_for;
+
+        let root = image_dit_snapshot();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_load_shape(LoadShape::DeferredMaterialization);
+        if !root.join("text_encoder").is_dir() {
+            let h3 = std::env::var("MINIMAX_H3_SNAPSHOT").unwrap_or_default();
+            assert!(
+                !h3.is_empty(),
+                "the image snapshot has no text_encoder/; MINIMAX_H3_SNAPSHOT must point at a \
+                 MiniMax-H3 snapshot holding text_encoder/ shards 1-12"
+            );
+            spec.components.insert(
+                "text_encoder".into(),
+                WeightsSource::Dir(std::path::PathBuf::from(h3).join("text_encoder")),
+            );
+        }
+        let generator = candle_gen_minimax_h3::image_model::load_image(&spec)
+            .expect("load the minimax_h3_image generator for deferred materialization");
+        let contract = generator
+            .memory_strategy_contract()
+            .expect("the image generator publishes a memory contract")
+            .clone();
+        assert!(contract.conformance_errors().is_empty());
+
+        // The device's actually-free memory, after any pending frees complete.
+        let device = Device::new_cuda(0).expect("CUDA device 0");
+        device.synchronize().expect("synchronize");
+        let (free, total) = device
+            .as_cuda_device()
+            .expect("a CUDA device")
+            .cuda_stream()
+            .context()
+            .mem_get_info()
+            .expect("cuMemGetInfo");
+        let (free, total) = (free as u64, total as u64);
+        println!(
+            "GPU 0: {:.2} GB ({:.2} GiB) free of {:.2} GB ({:.2} GiB)",
+            decimal_gb(free),
+            binary_gib(free),
+            decimal_gb(total),
+            binary_gib(total)
+        );
+
+        let req = GenerationRequest {
+            prompt: "A red lighthouse on a rocky coast at dusk, waves breaking, warm light in the \
+                     lantern room, photographed with a 35mm lens"
+                .into(),
+            width: 4096,
+            height: 4096,
+            seed: Some(7095),
+            ..Default::default()
+        };
+        let facts = facts_for(&spec).expect("header-only facts of the real sources");
+        assert!(
+            facts.streamable,
+            "the dense source must support the streamed route"
+        );
+        let stream = contract
+            .phase_facts
+            .as_ref()
+            .and_then(|f| f.transformer_stream.as_ref())
+            .expect("the contract publishes the DiT's trunk and per-block bytes");
+        assert_eq!(stream, facts.transformer_stream());
+        assert_eq!(stream.stacks[0].len(), 50);
+        let shape = ImageRequestShape::from_request(&req).expect("shape");
+        assert_eq!(
+            ImageRequestRows::of(&shape).image_rows,
+            16_384,
+            "16 MP is 16,384 image tokens"
+        );
+        let tier = MemoryNumericTier {
+            precision: spec.precision,
+            quant: None,
+            component_precision_floors: &[],
+        };
+        let rungs = ladder(&contract, tier);
+        let at = |strategy| {
+            let selection = rungs
+                .iter()
+                .find(|s| s.strategy == strategy)
+                .expect("the deferred contract offers the rung");
+            estimate(&contract, &facts, &shape, selection).expect("estimate")
+        };
+        let staged = at(MemoryStrategy::StagedResidency);
+        let streamed = at(MemoryStrategy::BoundedTransformerResidency);
+        println!("staged:   {staged}");
+        println!("streamed: {streamed}");
+        assert!(
+            streamed.peak_device_bytes() < staged.peak_device_bytes(),
+            "streaming must lower the GPU peak"
+        );
+        assert!(
+            streamed.peak_device_bytes() <= free,
+            "the streamed 16 MP estimate ({streamed}) exceeds the {:.2} GB free on GPU 0",
+            decimal_gb(free)
+        );
+        let budget_of = |bytes| MemoryBudget {
+            total_bytes: bytes,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        let between = (staged.peak_device_bytes() + streamed.peak_device_bytes()) / 2;
+        assert_eq!(
+            admit(&contract, &facts, &shape, tier, budget_of(between))
+                .expect("a rung fits")
+                .estimate
+                .selection
+                .strategy,
+            MemoryStrategy::BoundedTransformerResidency
+        );
+        let resident_fits = staged.peak_device_bytes() <= free;
+        println!(
+            "resident {} on this card; admission picks {:?}",
+            if resident_fits {
+                "fits"
+            } else {
+                "does NOT fit"
+            },
+            admit(&contract, &facts, &shape, tier, budget_of(free))
+                .map(|a| a.estimate.selection.strategy)
+                .ok()
+        );
+
+        // Admission through the loaded generator, at the real free memory.
+        let calibration = contract.calibration.clone().expect("calibration identity");
+        let context_for = |strategy, predicted| MemoryRunContext {
+            reference_resources: None,
+            selection: contract
+                .representative_selection(strategy, tier, false)
+                .expect("selection"),
+            optimization_authority: MemoryOptimizationAuthority::Estimated,
+            calibration_abi: calibration.abi,
+            calibration_fingerprint: calibration.fingerprint.clone(),
+            load_shape: LoadShape::DeferredMaterialization,
+            mode: MemoryMode::TextToImage,
+            has_reference: false,
+            use_pid: false,
+            has_phases: true,
+            geometry: MemoryGeometry {
+                width: 4096,
+                height: 4096,
+                batch: 1,
+                frames: 1,
+                reference_count: 0,
+            },
+            overlay: None,
+            budget: MemoryBudget {
+                total_bytes: free,
+                committed_bytes: 0,
+                reclaimable_bytes: 0,
+                reserved_headroom_bytes: 0,
+            },
+            predicted_peak_bytes: predicted,
+            cache_state: MemoryCacheState::Cold,
+            evidence_revision: "sw-7095-16mp-streamed".into(),
+        };
+        let staged_context = context_for(
+            MemoryStrategy::StagedResidency,
+            streamed.peak_device_bytes(),
+        );
+        if !resident_fits {
+            assert!(
+                matches!(
+                    generator.memory_strategy_safety_check(&staged_context),
+                    MemorySafetyDecision::Reject { .. }
+                ),
+                "the staged rung must be refused where its estimate exceeds the free memory"
+            );
+        }
+        let context = context_for(
+            MemoryStrategy::BoundedTransformerResidency,
+            streamed.peak_device_bytes(),
+        );
+        assert_eq!(
+            generator.memory_strategy_safety_check(&context),
+            MemorySafetyDecision::Accept
+        );
+        let mut scope = generator
+            .begin_memory_strategy_request(&context)
+            .expect("admit the streamed route")
+            .expect("a request scope");
+        let mut request = req.clone();
+        scope.configure_request(&mut request).expect("configure");
+        let memory = request
+            .memory
+            .expect("the scope sets the request's memory policy");
+        assert!(memory.stream_transformer_blocks && memory.chunk_attention);
+        assert_eq!(memory.transformer_window_size, Some(1));
+
+        let started = std::time::Instant::now();
+        let mut steps = Vec::new();
+        let output = generator
+            .generate(&request, &mut |p| {
+                if let candle_gen::gen_core::Progress::Step { current, .. } = p {
+                    steps.push(current)
+                }
+            })
+            .unwrap_or_else(|e| panic!("the streamed 16 MP render failed: {e}"));
+        scope
+            .finish(MemoryRunOutcome::Complete)
+            .expect("finish the request scope");
+        assert_eq!(steps, vec![1, 2, 3, 4, 5, 6], "one forward per fixed step");
+        let GenerationOutput::Images(images) = output else {
+            panic!("an image generator must return images")
+        };
+        let img = &images[0];
+        assert_eq!((img.width, img.height), (4096, 4096));
+        let n = img.pixels.len() as f64;
+        let mean = img.pixels.iter().map(|&p| f64::from(p)).sum::<f64>() / n;
+        let std = (img
+            .pixels
+            .iter()
+            .map(|&p| (f64::from(p) - mean).powi(2))
+            .sum::<f64>()
+            / n)
+            .sqrt();
+        println!(
+            "4096x4096 streamed render in {:.1} s: mean {mean:.1}, std {std:.1}",
+            started.elapsed().as_secs_f64()
+        );
+        assert!(
+            std > 10.0 && (5.0..250.0).contains(&mean),
+            "degenerate streamed render: mean {mean:.1}, std {std:.1}"
+        );
+        if let Ok(out) = std::env::var("MINIMAX_H3_IMAGE_STREAMED_RENDER_OUT") {
+            image::RgbImage::from_raw(img.width, img.height, img.pixels.clone())
+                .expect("rgb")
+                .save(&out)
+                .expect("write the render");
+            println!("wrote {out}");
+        }
+        #[cfg(feature = "model-inference-proof")]
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED real_weights::image_t2i_renders_16mp_streamed_on_cuda"
+        );
+    }
+}

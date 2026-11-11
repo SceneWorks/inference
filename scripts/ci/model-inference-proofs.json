@@ -312586,6 +312586,83 @@
     "package": "candle-gen-minimax-h3",
     "target": "integration",
     "target_kind": "test",
+    "fqn": "real_weights::image_t2i_renders_16mp_streamed_on_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image conditioner + DiT + 2-D VAE, bf16 4096x4096 (16 MP) text-to-image render admitted against the card's free memory and run through the streamed one-block window on CUDA (SW-7095); crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_16mp_streamed_on_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_16mp_streamed_on_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_16mp_streamed_on_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs::real_weights::image_t2i_renders_16mp_streamed_on_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "h3-image-vae-decode-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files_filtered"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
     "fqn": "real_weights::image_edit_renders_three_references_on_cuda",
     "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/real_weights.rs",
     "cargo_target_metadata": {
