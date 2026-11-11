@@ -59,10 +59,70 @@ fn phases() -> Vec<MemoryPhase> {
     ]
 }
 
-/// The bytes each phase maps, from the files on disk (0 for a weights-free spec).
-fn asset_facts(spec: &LoadSpec) -> MemoryAssetFacts {
+/// Float width the loader opens the DiT block stack and the VAE decode half at:
+/// [`mlx_gen::Precision::Fp32`] casts them to float32 (`model.rs` maps it to `Dtype::Float32` and
+/// passes it to `MiniMaxH3ImageDit::load` and `MiniMaxH3ImageVae::load`); every other precision
+/// casts them to bfloat16.
+fn load_float_width(spec: &LoadSpec) -> u64 {
+    if spec.precision == mlx_gen::Precision::Fp32 {
+        4
+    } else {
+        2
+    }
+}
+
+/// Whether the image DiT loader casts tensor `name` to the requested dtype. The token refiner and
+/// the 50 blocks are cast; the top-level input/output tensors (`ImageDitProjections`: `proj_in`,
+/// `context_embedder`, `time_embedder`, `norm_out`, `pdd_proj_out.*`) keep their stored dtype.
+fn dit_tensor_is_cast(name: &str) -> bool {
+    name.starts_with("token_refiner.") || name.starts_with("transformer_blocks.")
+}
+
+/// Whether the image VAE loader reads tensor `name` (the decode half only; it casts every one).
+fn vae_tensor_is_read(name: &str) -> bool {
+    name.starts_with("decoder.") || name.starts_with("post_quant_conv.")
+}
+
+/// Bytes one component holds once its loader has opened it, from the safetensors headers alone.
+///
+/// `cast(name)` is `None` for a tensor the loader does not read, `Some(false)` for one held at its
+/// stored dtype, and `Some(true)` for a float tensor the loader casts to `float_width`. A cast
+/// tensor is priced at the wider of its stored and its cast width: MLX casts lazily over the
+/// evaluated source, so the stored-width source is never less than what the load holds. A missing
+/// component prices 0 (the loader refuses it later); a malformed one is an error.
+fn loaded_component_bytes(
+    path: &std::path::Path,
+    float_width: u64,
+    cast: &dyn Fn(&str) -> Option<bool>,
+) -> mlx_gen::gen_core::Result<u64> {
+    if safetensors_path_bytes(path) == 0 {
+        return Ok(0);
+    }
+    mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)?
+        .iter()
+        .try_fold(0_u64, |sum, header| {
+            let bytes = match cast(&header.name) {
+                None => 0,
+                Some(true) if header.is_float() => header
+                    .materialized_bytes(float_width)?
+                    .max(header.data_bytes),
+                Some(_) => header.data_bytes,
+            };
+            sum.checked_add(bytes).ok_or_else(|| {
+                mlx_gen::gen_core::Error::Msg(format!(
+                    "{IMAGE_MODEL_ID}: {} loaded byte sum overflow",
+                    path.display()
+                ))
+            })
+        })
+}
+
+/// The bytes each phase holds (0 for a weights-free spec). The text encoder is read at its stored
+/// dtype (on-disk shard lengths); the DiT and the VAE decode half are priced at the dtype
+/// `spec.precision` loads them at, from their tensor headers.
+fn asset_facts(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryAssetFacts> {
     let Some(root) = mlx_gen::gen_core::resolved_snapshot_root(spec) else {
-        return MemoryAssetFacts::default();
+        return Ok(MemoryAssetFacts::default());
     };
     let te_dir = match spec.components.get(TEXT_ENCODER_COMPONENT) {
         Some(WeightsSource::Dir(dir)) => dir.clone(),
@@ -72,9 +132,14 @@ fn asset_facts(spec: &LoadSpec) -> MemoryAssetFacts {
     let conditioning: u64 = crate::text_encoder::TE_SHARDS
         .map(|i| safetensors_path_bytes(te_dir.join(format!("model-{i:05}-of-00014.safetensors"))))
         .sum();
-    let transformer = safetensors_path_bytes(root.join(IMAGE_DIT_COMPONENT));
-    let decoder = safetensors_path_bytes(root.join(IMAGE_VAE_COMPONENT));
-    MemoryAssetFacts {
+    let width = load_float_width(spec);
+    let transformer = loaded_component_bytes(&root.join(IMAGE_DIT_COMPONENT), width, &|name| {
+        Some(dit_tensor_is_cast(name))
+    })?;
+    let decoder = loaded_component_bytes(&root.join(IMAGE_VAE_COMPONENT), width, &|name| {
+        vae_tensor_is_read(name).then_some(true)
+    })?;
+    Ok(MemoryAssetFacts {
         base_bytes: conditioning
             .saturating_add(transformer)
             .saturating_add(decoder),
@@ -82,7 +147,7 @@ fn asset_facts(spec: &LoadSpec) -> MemoryAssetFacts {
         transformer_bytes: transformer,
         decoder_bytes: decoder,
         overlay_bytes: 0,
-    }
+    })
 }
 
 fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
@@ -161,7 +226,7 @@ fn build_contract(
 
 /// The production contract: real file bytes, no calibration identity (unmeasured).
 pub fn contract_for(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    Ok(build_contract(spec, asset_facts(spec), None))
+    Ok(build_contract(spec, asset_facts(spec)?, None))
 }
 
 /// The weights-free contract catalog conformance resolves instead of [`contract_for`].
@@ -177,8 +242,8 @@ pub fn weights_free_contract(spec: &LoadSpec) -> mlx_gen::gen_core::Result<Memor
 }
 
 /// The family's admission predicates the shared pipeline cannot know: the decode geometry, no PiD
-/// route, one image per sequence (a batch renders sequentially), one latent frame, a stride-aligned
-/// canvas.
+/// route, one image per sequence (a batch renders sequentially), one latent frame, a positive
+/// requested size whose generation canvas has a latent grid.
 pub fn route_gate(context: &MemoryRunContext) -> mlx_gen::gen_core::Result<()> {
     if context.use_pid {
         return Err(mlx_gen::gen_core::Error::Unsupported(format!(
@@ -204,18 +269,26 @@ pub fn route_gate(context: &MemoryRunContext) -> mlx_gen::gen_core::Result<()> {
             g.frames
         )));
     }
-    let stride = mlx_gen::gen_core::h3_image::SIZE_STRIDE;
-    if g.width == 0
-        || g.height == 0
-        || !g.width.is_multiple_of(stride)
-        || !g.height.is_multiple_of(stride)
-    {
-        return Err(mlx_gen::gen_core::Error::Unsupported(format!(
-            "{IMAGE_MODEL_ID}: admission geometry {}x{} must be the {stride}px-aligned generation canvas",
-            g.width, g.height
-        )));
-    }
+    admission_canvas(g.width, g.height)?;
     Ok(())
+}
+
+/// The canvas a `width x height` request renders on, which is what its resources are sized from.
+///
+/// Admission takes the **requested** size, exactly as the generator does: any positive size
+/// ([`mlx_gen::gen_core::h3_image::validate_size`]). The generator renders on
+/// [`mlx_gen::gen_core::h3_image::generation_canvas`] at the default minimum area and resizes back,
+/// so the latent grid, the packed sequence and the decode all follow the canvas, not the request.
+/// The admitted geometry stays the requested size, so the request scope's equality check binds
+/// the request the caller actually sends.
+pub fn admission_canvas(width: u32, height: u32) -> mlx_gen::gen_core::Result<(u32, u32)> {
+    use mlx_gen::gen_core::h3_image::{
+        generation_canvas, latent_grid, validate_size, MIN_GENERATION_AREA_DEFAULT,
+    };
+    validate_size(width, height).map_err(mlx_gen::gen_core::Error::from)?;
+    let canvas = generation_canvas(width, height, MIN_GENERATION_AREA_DEFAULT);
+    latent_grid(canvas.0, canvas.1)?;
+    Ok(canvas)
 }
 
 fn profile_route_gate(
@@ -373,6 +446,142 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-minimax-h3-image".into()));
         assert!(contract_for(&spec).unwrap().calibration.is_none());
         assert!(weights_free().calibration.is_some());
+    }
+
+    /// Write a header-plus-zeros safetensors file of `(name, dtype, shape)` tensors.
+    fn write_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize])]) {
+        let width = |dtype: &str| if dtype == "F32" { 4 } else { 2 };
+        let mut header = serde_json::Map::new();
+        let mut offset = 0_usize;
+        for (name, dtype, shape) in tensors {
+            let len = shape.iter().product::<usize>() * width(dtype);
+            header.insert(
+                (*name).into(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + len]}),
+            );
+            offset += len;
+        }
+        let json = serde_json::Value::Object(header).to_string().into_bytes();
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(json);
+        bytes.resize(bytes.len() + offset, 0);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A snapshot whose DiT mixes a cast bf16 block tensor (64 elements) with a stored-f32 PDD
+    /// head (16) and a stored-bf16 `context_embedder` (8), and whose VAE carries a decode tensor
+    /// (32, bf16), a stored-f32 decode tensor (4) and an encoder tensor the loader never reads.
+    fn mixed_snapshot() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        write_safetensors(
+            &root
+                .path()
+                .join(IMAGE_DIT_COMPONENT)
+                .join("model.safetensors"),
+            &[
+                ("transformer_blocks.0.attn.to_q.weight", "BF16", &[8, 8]),
+                ("pdd_proj_out.0.weight", "F32", &[4, 4]),
+                ("context_embedder.weight", "BF16", &[2, 4]),
+            ],
+        );
+        write_safetensors(
+            &root
+                .path()
+                .join(IMAGE_VAE_COMPONENT)
+                .join("model.safetensors"),
+            &[
+                ("decoder.proj_in.weight", "BF16", &[4, 8]),
+                ("post_quant_conv.bias", "F32", &[4]),
+                ("encoder.proj_in.weight", "BF16", &[1000]),
+            ],
+        );
+        root
+    }
+
+    /// Fp32 casts the block stack and the VAE decode half to float32 at load, so they are priced
+    /// at 4 bytes per element; the top-level DiT tensors keep their stored widths, and the
+    /// encoder half of the VAE is not priced at all. Bf16 prices the same tensors at 2 bytes,
+    /// never below a stored-f32 tensor's own width.
+    #[test]
+    fn asset_facts_price_the_dtype_the_precision_loads() {
+        let root = mixed_snapshot();
+        let facts = |precision| {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()));
+            spec.precision = precision;
+            contract_for(&spec).unwrap().asset_facts
+        };
+        let fp32 = facts(mlx_gen::Precision::Fp32);
+        assert_eq!(fp32.transformer_bytes, 64 * 4 + 16 * 4 + 8 * 2);
+        assert_eq!(fp32.decoder_bytes, 32 * 4 + 4 * 4);
+        let bf16 = facts(mlx_gen::Precision::Bf16);
+        assert_eq!(bf16.transformer_bytes, 64 * 2 + 16 * 4 + 8 * 2);
+        assert_eq!(bf16.decoder_bytes, 32 * 2 + 4 * 4);
+        assert_eq!(fp32.conditioning_bytes, 0);
+        assert_eq!(fp32.base_bytes, fp32.transformer_bytes + fp32.decoder_bytes);
+    }
+
+    /// A non-32-aligned request the generator accepts is admitted at its requested size, and its
+    /// resources follow the canvas the generator renders on. The request scope still binds the
+    /// requested size: the canvas itself is not the admitted request.
+    #[test]
+    fn a_non_aligned_request_is_admitted_and_sized_at_its_canvas() {
+        use mlx_gen::gen_core::h3_image::{generation_canvas, MIN_GENERATION_AREA_DEFAULT};
+        use mlx_gen::gen_core::{
+            GenerationRequest, MemoryBehaviorRoute, MemoryGeometry, MemoryMode,
+        };
+
+        let canvas = admission_canvas(1000, 1001).unwrap();
+        assert_eq!(
+            canvas,
+            generation_canvas(1000, 1001, MIN_GENERATION_AREA_DEFAULT)
+        );
+        assert_ne!(canvas, (1000, 1001));
+        assert!(admission_canvas(0, 1001).is_err());
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-minimax-h3-image".into()));
+        let contract = weights_free_contract(&spec).unwrap();
+        let tier = mlx_gen::request_scope::loaded_tier(&spec);
+        let mut context = mlx_gen::gen_core::standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::StagedResidency,
+            tier,
+            MemoryBehaviorRoute {
+                mode: MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: true,
+                overlay: None,
+            },
+        )
+        .unwrap();
+        context.geometry = MemoryGeometry {
+            width: 1000,
+            height: 1001,
+            batch: 1,
+            frames: 1,
+            reference_count: 0,
+        };
+        assert_eq!(
+            safety_check_at_tier(&contract, tier, &context),
+            MemorySafetyDecision::Accept
+        );
+        let request = |width, height| GenerationRequest {
+            prompt: "a lighthouse at dusk".into(),
+            width,
+            height,
+            ..Default::default()
+        };
+        let mut scope = registered_scope(IMAGE_MODEL_ID, &spec, &contract, &context, tier)
+            .unwrap()
+            .unwrap();
+        scope.configure_request(&mut request(1000, 1001)).unwrap();
+        let mut scope = registered_scope(IMAGE_MODEL_ID, &spec, &contract, &context, tier)
+            .unwrap()
+            .unwrap();
+        assert!(scope
+            .configure_request(&mut request(canvas.0, canvas.1))
+            .is_err());
     }
 
     #[test]

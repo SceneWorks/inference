@@ -194,8 +194,8 @@ impl MiniMaxH3Image {
             return Err(CandleError::Canceled);
         }
         let (width, height) = Self::output_size(req);
-        let (canvas_w, canvas_h) =
-            contract::generation_canvas(width, height, contract::MIN_GENERATION_AREA_DEFAULT);
+        // The same canvas admission sized this request's resources from.
+        let (canvas_w, canvas_h) = crate::image_memory_strategy::admission_canvas(width, height)?;
         let (latent_h, latent_w) = latent_grid(canvas_w, canvas_h)?;
         let schedule =
             SigmaSchedule::h3_image_distilled().map_err(|e| CandleError::Msg(e.to_string()))?;

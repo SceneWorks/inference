@@ -30,9 +30,17 @@ use crate::image_vae::{IMAGE_DECODE_OVERLAP, IMAGE_DECODE_TILE_EDGE, IMAGE_VAE_C
 pub const IMAGE_MEMORY_CALIBRATION_FINGERPRINT: &str =
     "minimax-h3-image-candle-staged-bounded-decode-2026-11-10-v1";
 
-/// Width every float component is held at: bf16 for the conditioner and the DiT block store. The
-/// DiT's float32 top-level heads and the float32 VAE are priced at their stored width.
+/// Width the conditioner is held at (bf16). The DiT is loaded at its stored widths (bf16 block
+/// store, float32 top-level heads) and priced there.
 const BF16_WIDTH: u64 = 2;
+
+/// Width the VAE decode half is held at: `crate::image_model` loads it with `DType::F32`, which
+/// casts every float tensor to float32 whatever its stored dtype.
+///
+/// `LoadSpec::precision` does not reach either load on this route — the generator hardcodes the
+/// DiT's `DType::BF16` and the VAE's `DType::F32` — so an `Fp32` spec loads, and is priced,
+/// exactly as a `Bf16` one.
+const VAE_F32_WIDTH: u64 = 4;
 
 /// Bytes the resolved tensors of one component occupy once loaded. Float tensors price at
 /// `float_width` (or their stored width when `None`); `keep` selects the tensors the loader opens.
@@ -56,8 +64,8 @@ fn component_bytes(
 }
 
 /// The load-exact inventory: the conditioner's layer-50 tap (the `lm_prefixes` the render maps)
-/// at bf16, the DiT at its stored mixed bf16/f32 widths, and the VAE's decode half at its stored
-/// f32.
+/// at bf16, the DiT at its stored mixed bf16/f32 widths, and the VAE's decode half at the f32 it
+/// is cast to.
 fn asset_facts(root: &Path, te_dir: &Path) -> gen_core::Result<MemoryAssetFacts> {
     let te_cfg = crate::text_encoder::MiniMaxH3TeConfig::from_component_dir(te_dir)
         .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
@@ -66,9 +74,11 @@ fn asset_facts(root: &Path, te_dir: &Path) -> gen_core::Result<MemoryAssetFacts>
         prefixes.iter().any(|p| name.starts_with(p.as_str()))
     })?;
     let transformer = component_bytes(&root.join(IMAGE_DIT_PARTITION), None, &|_| true)?;
-    let decoder = component_bytes(&root.join(IMAGE_VAE_COMPONENT), None, &|name: &str| {
-        name.starts_with("decoder.") || name.starts_with("post_quant_conv.")
-    })?;
+    let decoder = component_bytes(
+        &root.join(IMAGE_VAE_COMPONENT),
+        Some(VAE_F32_WIDTH),
+        &|name: &str| name.starts_with("decoder.") || name.starts_with("post_quant_conv."),
+    )?;
     Ok(MemoryAssetFacts {
         base_bytes: conditioning
             .saturating_add(transformer)
@@ -231,7 +241,26 @@ fn route_gate(
             context.selection.parameters.decode_overlap,
         )?;
     }
+    admission_canvas(context.geometry.width, context.geometry.height)?;
     Ok(())
+}
+
+/// The canvas a `width x height` request renders on, which is what its resources are sized from.
+///
+/// Admission takes the **requested** size, exactly as the generator does: any positive size
+/// ([`gen_core::h3_image::validate_size`]). The generator renders on
+/// [`gen_core::h3_image::generation_canvas`] at the default minimum area and resizes back, so the
+/// latent grid, the packed sequence and the decode all follow the canvas, not the request. The
+/// admitted geometry stays the requested size, so the request scope's equality check binds the
+/// request the caller actually sends.
+pub fn admission_canvas(width: u32, height: u32) -> gen_core::Result<(u32, u32)> {
+    use gen_core::h3_image::{
+        generation_canvas, latent_grid, validate_size, MIN_GENERATION_AREA_DEFAULT,
+    };
+    validate_size(width, height).map_err(gen_core::Error::from)?;
+    let canvas = generation_canvas(width, height, MIN_GENERATION_AREA_DEFAULT);
+    latent_grid(canvas.0, canvas.1)?;
+    Ok(canvas)
 }
 
 /// The provider safety check: the shared handshake, then this route's gate.
@@ -368,6 +397,134 @@ mod tests {
         q.quantize = Some(gen_core::Quant::Q4);
         assert!(weights_free_contract(&q).is_err());
         assert!(!memory_contract_surface_specs().is_empty());
+    }
+
+    /// Write a header-plus-zeros safetensors file of `(name, dtype, shape)` tensors.
+    fn write_safetensors(path: &Path, tensors: &[(&str, &str, &[usize])]) {
+        let width = |dtype: &str| if dtype == "F32" { 4 } else { 2 };
+        let mut header = serde_json::Map::new();
+        let mut offset = 0_usize;
+        for (name, dtype, shape) in tensors {
+            let len = shape.iter().product::<usize>() * width(dtype);
+            header.insert(
+                (*name).into(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + len]}),
+            );
+            offset += len;
+        }
+        let json = serde_json::Value::Object(header).to_string().into_bytes();
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(json);
+        bytes.resize(bytes.len() + offset, 0);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// The VAE decode half is loaded with `DType::F32`, so a bf16-stored decode tensor is priced
+    /// at 4 bytes per element (the encoder half is not read); the DiT keeps its stored widths.
+    /// `spec.precision` reaches neither load, so an `Fp32` spec prices exactly as a `Bf16` one.
+    #[test]
+    fn asset_facts_price_the_vae_at_the_f32_it_is_loaded_at() {
+        let root = tempfile::tempdir().unwrap();
+        let te = root.path().join(crate::image_model::IMAGE_TEXT_ENCODER);
+        std::fs::create_dir_all(&te).unwrap();
+        std::fs::write(te.join("config.json"), "{}").unwrap();
+        write_safetensors(
+            &te.join("model.safetensors"),
+            &[("unread.weight", "BF16", &[4])],
+        );
+        write_safetensors(
+            &root
+                .path()
+                .join(IMAGE_DIT_PARTITION)
+                .join("model.safetensors"),
+            &[
+                ("transformer_blocks.0.attn.to_q.weight", "BF16", &[8, 8]),
+                ("pdd_proj_out.0.weight", "F32", &[4, 4]),
+            ],
+        );
+        write_safetensors(
+            &root
+                .path()
+                .join(IMAGE_VAE_COMPONENT)
+                .join("model.safetensors"),
+            &[
+                ("decoder.proj_in.weight", "BF16", &[4, 8]),
+                ("post_quant_conv.bias", "F32", &[4]),
+                ("encoder.proj_in.weight", "BF16", &[1000]),
+            ],
+        );
+        let facts = |precision| {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()));
+            spec.precision = precision;
+            contract_for(&spec).unwrap().asset_facts
+        };
+        let bf16 = facts(gen_core::Precision::Bf16);
+        assert_eq!(bf16.decoder_bytes, (32 + 4) * VAE_F32_WIDTH);
+        assert_eq!(bf16.transformer_bytes, 64 * 2 + 16 * 4);
+        assert_eq!(bf16.conditioning_bytes, 0);
+        assert_eq!(facts(gen_core::Precision::Fp32), bf16);
+    }
+
+    /// A non-32-aligned request the generator accepts is admitted at its requested size, and its
+    /// resources follow the canvas the generator renders on. The request scope still binds the
+    /// requested size: the canvas itself is not the admitted request.
+    #[test]
+    fn a_non_aligned_request_is_admitted_and_sized_at_its_canvas() {
+        use gen_core::h3_image::{generation_canvas, MIN_GENERATION_AREA_DEFAULT};
+        use gen_core::{GenerationRequest, MemoryBehaviorRoute, MemoryGeometry};
+
+        let canvas = admission_canvas(1000, 1001).unwrap();
+        assert_eq!(
+            canvas,
+            generation_canvas(1000, 1001, MIN_GENERATION_AREA_DEFAULT)
+        );
+        assert_ne!(canvas, (1000, 1001));
+        assert!(admission_canvas(1000, 0).is_err());
+
+        let spec = spec();
+        let contract = weights_free_contract(&spec).unwrap();
+        let tier = MEMORY_PROFILE.tier.resolve(&spec, &contract).unwrap();
+        let mut context = gen_core::standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::StagedResidency,
+            tier,
+            MemoryBehaviorRoute {
+                mode: MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: true,
+                overlay: None,
+            },
+        )
+        .unwrap();
+        context.geometry = MemoryGeometry {
+            width: 1000,
+            height: 1001,
+            batch: 1,
+            frames: 1,
+            reference_count: 0,
+        };
+        assert_eq!(
+            safety_check(&spec, &contract, &context),
+            MemorySafetyDecision::Accept
+        );
+        let request = |width, height| GenerationRequest {
+            prompt: "a lighthouse at dusk".into(),
+            width,
+            height,
+            ..Default::default()
+        };
+        let mut scope = registered_begin_request(&spec, &contract, &context)
+            .unwrap()
+            .unwrap();
+        scope.configure_request(&mut request(1000, 1001)).unwrap();
+        let mut scope = registered_begin_request(&spec, &contract, &context)
+            .unwrap()
+            .unwrap();
+        assert!(scope
+            .configure_request(&mut request(canvas.0, canvas.1))
+            .is_err());
     }
 
     /// The weights-free surface publishes no axis it could only have inferred from the id.
