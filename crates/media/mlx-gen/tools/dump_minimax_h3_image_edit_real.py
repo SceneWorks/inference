@@ -51,8 +51,10 @@ float32 activations for the same reason the ``text2image`` gates do.
 * ``diag.step{0,3}.*`` — the reference's intermediate stages, recorded by forward hooks as in the
   ``text2image`` producer: ``temb`` (``[2, time_embed_dim]``, one row per distinct timestep in
   ascending order — the step's timestep, then the reference rows' ``0.999``), ``norm_out.shift`` /
-  ``norm_out.scale`` (same rows), ``block0.adaln`` (``[6, 2 * MODALITY_NUM, hidden_size]``),
-  ``hidden.block{k}`` for every ``k`` in ``diag_layers`` and ``pre_head``;
+  ``norm_out.scale`` (same rows), ``block0.adaln`` and ``block39.adaln`` (each
+  ``[6, 2 * MODALITY_NUM, hidden_size]``; block 39 is ``ISOLATED_BLOCK``, which the gates re-run
+  alone from ``diag.sweep.f32.block38`` with these tables), ``hidden.block{k}`` for every ``k`` in
+  ``diag_layers`` and ``pre_head``;
 * ``diag.sweep.{f32,bf16}.block{k}`` — the per-block sweep: the residual stream after every block
   ``k`` in ``sweep_layers`` (every 5th block of the first half, block ``num_layers / 2 - 1``, then
   every block of the second half) at step 0, from BOTH step-0 forwards: the float32-activation one
@@ -115,6 +117,9 @@ REFERENCE_SIZES = ((160, 96), (330, 272), (128, 128))
 VISION_TOKENS = (16, 12, 20)
 PROMPT = "Put the striped object from <Picture 1> on the table in <Picture 2>, lit like <Picture 3>."
 TARGET_LATENT_HW = (32, 32)
+# The block the gates re-run alone from the float32 sweep's input (`gen_core::h3_image::dit_sweep`
+# `ISOLATED_BLOCK`); its AdaLN tables are recorded so the re-run can take the reference's own.
+ISOLATED_BLOCK = 39
 
 
 def load_pinned(module_name: str, relative: str, sha256: str, stub_tensor_parallel: bool):
@@ -281,6 +286,9 @@ class StageTaps:
         model.time_embedder.register_forward_hook(self._put("temb"))
         model.norm_out.linear.register_forward_hook(self._put("norm_out.linear"))
         model.transformer_blocks[0].adaln_proj.register_forward_hook(self._put("block0.adaln"))
+        model.transformer_blocks[ISOLATED_BLOCK].adaln_proj.register_forward_hook(
+            self._put(f"block{ISOLATED_BLOCK}.adaln")
+        )
         model.norm_out.register_forward_hook(self._put("pre_head"))
         for k in layers:
             model.transformer_blocks[k].register_forward_hook(self._put(f"hidden.block{k}"))
@@ -301,6 +309,7 @@ class StageTaps:
             f"diag.step{step}.norm_out.shift": f32(shift),
             f"diag.step{step}.norm_out.scale": f32(scale),
             f"diag.step{step}.block0.adaln": f32(torch.stack(seen["block0.adaln"])),
+            f"diag.step{step}.block{ISOLATED_BLOCK}.adaln": f32(torch.stack(seen[f"block{ISOLATED_BLOCK}.adaln"])),
             f"diag.step{step}.pre_head": f32(seen["pre_head"]),
         }
         for k in self.layers:
@@ -429,6 +438,7 @@ def main() -> None:
     diag_layers = (0, cfg.num_layers // 2 - 1, cfg.num_layers - 1)
     taps = StageTaps(model, diag_layers)
     sweep = BlockSweep(model, sweep_layers(cfg.num_layers))
+    assert {ISOLATED_BLOCK - 1, ISOLATED_BLOCK} <= set(sweep.layers), "the isolated block's input and output"
     # Every top-level module holding bf16 parameters; `proj_in`, `time_embedder` and the heads are
     # float32 in the checkpoint already. The coverage assert inside refuses a missed one.
     f32 = F32Compute(
@@ -522,6 +532,7 @@ def main() -> None:
         "diag_layers": ",".join(str(k) for k in diag_layers),
         "sweep_layers": ",".join(str(k) for k in sweep.layers),
         "sweep_step": "0",
+        "isolated_block": str(ISOLATED_BLOCK),
         "sweep_dtypes": "diag.sweep.f32.* float32, diag.sweep.bf16.* bfloat16",
         "producer": "crates/media/mlx-gen/tools/dump_minimax_h3_image_edit_real.py",
         "producer_sha256": producer_sha256,

@@ -980,6 +980,22 @@ pub fn linear(x: &Array, w: &Array, b: &Array) -> Result<Array> {
     Ok(addmm(b, x, w.t(), 1.0, 1.0)?)
 }
 
+/// `y = x · Wᵀ (+ b)` that keeps full FP32 accumulation for FP32 operands on every Metal family.
+///
+/// F32 storage alone is not a precision policy: on NAX hardware MLX may run an ordinary F32
+/// `addmm` / `matmul` as a TF32 GEMM (10 fraction bits). Projecting each row as an independent
+/// column vector (`W @ x[..., :, None]`) keeps the dispatcher at N=1, which selects the
+/// float-accumulating GEMV on both older Metal and NAX. `W` broadcasts over the leading axes as a
+/// view; it is not replicated per row, and the output has the same shape and bytes as [`linear`].
+/// The bias, when given, is a separate add after the projection.
+pub fn linear_precise(x: &Array, w: &Array, b: Option<&Array>) -> Result<Array> {
+    let y = w.matmul(&x.expand_dims(-1)?)?.squeeze_axes(&[-1])?;
+    Ok(match b {
+        Some(b) => add(&y, b)?,
+        None => y,
+    })
+}
+
 /// Affine Q4/Q8 matmul over an already-packed `[out, in]` weight, with an optional dense output
 /// bias. With P3 selected, the biased case first attempts the strict exact native epilogue. Any
 /// unsupported dtype, shape, group size, or Metal dispatcher executes the original

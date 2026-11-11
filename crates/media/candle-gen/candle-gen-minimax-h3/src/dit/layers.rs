@@ -66,7 +66,7 @@ use candle_gen::{CandleError, Result, Weights};
 use crate::dit::config::MiniMaxH3DitConfig;
 use crate::dit::rope::{MmRope, MmRopeTables};
 use crate::layout::split_gate_value;
-use crate::nn::{rms_weighted, sdpa_planned, silu};
+use crate::nn::{rms_weighted, sdpa_planned, silu_f32_rounded};
 
 #[cfg(all(feature = "cuda", feature = "model-inference-proof"))]
 #[cfg(test)]
@@ -879,7 +879,9 @@ impl DitFeedForward {
     fn forward_span(&self, x: &Tensor) -> Result<Tensor> {
         let h = self.proj.forward(x)?;
         let (gate, value) = split_gate_value(&h)?;
-        self.out.forward(&(silu(&gate)?.mul(&value)?))
+        // torch's `hidden_states * F.silu(gate)`: SiLU at float32, rounded once (SW-7092).
+        let activated = silu_f32_rounded(&gate)?;
+        self.out.forward(&activated.mul(&value)?)
     }
 }
 

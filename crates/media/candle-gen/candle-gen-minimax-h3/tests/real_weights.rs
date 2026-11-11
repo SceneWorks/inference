@@ -2138,6 +2138,149 @@ fn image_edit_block_sweep(
     }
 }
 
+/// SW-7092 diagnostic: block [`dit_sweep::ISOLATED_BLOCK`] run ALONE at step 0 from the reference's
+/// own input (`diag.sweep.{f32,bf16}.block{k-1}`), against `diag.sweep.{f32,bf16}.block{k}`, with
+/// per row class rel-L2 and the [`dit_sweep::PROBE`] massive activation. Three runs: the f32 input
+/// with the reference's own AdaLN tables (`diag.step0.block{k}.adaln`, spliced into the cache's
+/// step-0 rows), the f32 input with this backend's tables, and the bf16 input with this backend's
+/// tables (read against `vs-bf16`: diffusers' bf16 forward ran block k on exactly that input). A
+/// small error from the reference's input names the inherited error; a large one names block k's
+/// own compute. Printed, never asserted.
+fn image_edit_block_isolation(
+    reference: &common::Golden,
+    model: &candle_gen_minimax_h3::dit::ImageDit,
+    stream: DType,
+    regions: RowRegions,
+) {
+    use candle_gen_minimax_h3::dit::{AdaLnModulation, MODALITY_NUM};
+    let layer = dit_sweep::ISOLATED_BLOCK;
+    assert_eq!(
+        reference.meta("isolated_block").unwrap_or_default(),
+        layer.to_string(),
+        "the reference records the isolated block's AdaLN"
+    );
+    let dev = model.dit().device().clone();
+    let (in_f32_key, in_bf16_key) = (
+        format!("diag.sweep.f32.block{}", layer - 1),
+        format!("diag.sweep.bf16.block{}", layer - 1),
+    );
+    let input = |key: &str| {
+        reference
+            .tensor(key)
+            .to_dtype(stream)
+            .and_then(|t| t.to_device(&dev))
+            .expect("isolated block input")
+    };
+    let f32_out = reference.f32(&format!("diag.sweep.f32.block{layer}"));
+    let bf16_out = reference.f32(&format!("diag.sweep.bf16.block{layer}"));
+    let width = *reference
+        .shape(&format!("diag.sweep.f32.block{layer}"))
+        .last()
+        .expect("width");
+
+    let ours = model.adaln_cache().modulation(layer).expect("modulation");
+    let schedule = model.adaln_cache().schedule();
+    let want = reference.tensor(&format!("diag.step0.block{layer}.adaln"));
+    let rows_of = |table: &Tensor, class: usize| -> Tensor {
+        let g = schedule
+            .global_timestep_index(0, class)
+            .expect("timestep row") as usize;
+        table
+            .narrow(0, g * MODALITY_NUM, MODALITY_NUM)
+            .expect("rows")
+    };
+    let ours_step0: Vec<Tensor> = ours
+        .tables()
+        .map(|t| Tensor::cat(&[rows_of(t, 0), rows_of(t, 1)], 0).expect("cat"))
+        .collect();
+    println!(
+        "{}",
+        image_dit_stage_line(
+            0,
+            &format!("block{layer}.adaln"),
+            &Tensor::stack(&ours_step0, 0).expect("stack"),
+            &want
+        )
+    );
+    let spliced: Vec<Tensor> = ours
+        .tables()
+        .enumerate()
+        .map(|(i, table)| {
+            let reference_rows = want
+                .get(i)
+                .and_then(|t| t.to_dtype(table.dtype()))
+                .and_then(|t| t.to_device(&dev))
+                .expect("reference tables");
+            let total = table.dims()[0];
+            let mut table = table.clone();
+            for class in 0..2 {
+                let g = schedule
+                    .global_timestep_index(0, class)
+                    .expect("timestep row") as usize;
+                let block = reference_rows
+                    .narrow(0, class * MODALITY_NUM, MODALITY_NUM)
+                    .expect("block");
+                let mut parts = Vec::new();
+                if g > 0 {
+                    parts.push(table.narrow(0, 0, g * MODALITY_NUM).expect("head"));
+                }
+                parts.push(block);
+                let tail = (g + 1) * MODALITY_NUM;
+                if tail < total {
+                    parts.push(table.narrow(0, tail, total - tail).expect("tail"));
+                }
+                table = Tensor::cat(&parts, 0).expect("splice");
+            }
+            table
+        })
+        .collect();
+    let [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]: [Tensor; 6] =
+        spliced.try_into().expect("six tables");
+    let reference_adaln = AdaLnModulation {
+        shift_msa,
+        scale_msa,
+        gate_msa,
+        shift_mlp,
+        scale_mlp,
+        gate_mlp,
+    };
+    let (f32_in, bf16_in) = (input(&in_f32_key), input(&in_bf16_key));
+    let input_probe = dit_sweep::Located::at(
+        dit_sweep::PROBE,
+        &flat(&f32_in),
+        &reference.f32(&in_f32_key),
+        &reference.f32(&in_bf16_key),
+        width,
+        regions,
+    )
+    .expect("probe inside the sequence");
+    println!(
+        "isolated block {layer} input (block {} out, cast to {stream:?}): probe {input_probe}",
+        layer - 1
+    );
+    for (label, hidden, modulation) in [
+        (
+            "f32 input, reference AdaLN",
+            &f32_in,
+            Some(&reference_adaln),
+        ),
+        ("f32 input, own AdaLN", &f32_in, None),
+        ("bf16 input, own AdaLN", &bf16_in, None),
+    ] {
+        let got = flat(
+            &model
+                .block_forward(0, layer, hidden, modulation)
+                .expect("isolated block"),
+        );
+        let row =
+            SweepRow::new(layer, &got, &f32_out, &bf16_out, width, regions).expect("sweep row");
+        let probe =
+            dit_sweep::Located::at(dit_sweep::PROBE, &got, &f32_out, &bf16_out, width, regions)
+                .expect("probe inside the sequence");
+        println!("{}", dit_sweep::isolation_line(label, &row, &probe));
+    }
+}
+
 /// AC2 (candle): the `edit` presentation built with the snapshot's own tokenizer is the processor
 /// template's (`Picture i: ` + vision block per reference, then the prompt, no chat template), id
 /// for id and tag for tag, as diffusers' `MiniMaxH3ImageEditTextEncoderStep` builds it.
@@ -2470,6 +2613,8 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
         regions(step, "velocity", &got, &want);
         if step == 0 {
             image_edit_block_sweep(&reference, &trace, &sweep_layers, sweep_regions);
+            let stream = trace.hidden[0].1.dtype();
+            image_edit_block_isolation(&reference, model, stream, sweep_regions);
         }
         got
     };

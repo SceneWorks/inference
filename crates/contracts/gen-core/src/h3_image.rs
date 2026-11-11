@@ -766,6 +766,56 @@ pub mod dit_sweep {
         lines
     }
 
+    /// The block the edit gate re-runs alone, from the reference's own input (SW-7092): the block
+    /// where both backends under-build the reference's massive activation at [`PROBE`].
+    pub const ISOLATED_BLOCK: usize = 39;
+
+    /// `(row, channel)` of the massive activation the isolation line reads: text row 74, channel
+    /// 3474 — about `-2.2e6` after block 39 in the float32 edit reference.
+    pub const PROBE: (usize, usize) = (74, 3474);
+
+    impl Located {
+        /// The element at `(row, channel)` of three row-major `[seq_len, width]` buffers; `None`
+        /// when it lies outside any of them.
+        pub fn at(
+            (row, channel): (usize, usize),
+            got: &[f32],
+            f32_ref: &[f32],
+            bf16_ref: &[f32],
+            width: usize,
+            regions: RowRegions,
+        ) -> Option<Self> {
+            let i = row.checked_mul(width)?.checked_add(channel)?;
+            if channel >= width || row >= regions.seq_len() {
+                return None;
+            }
+            Some(Self {
+                row,
+                channel,
+                class: regions.class_of(row),
+                f32_ref: *f32_ref.get(i)?,
+                bf16_ref: *bf16_ref.get(i)?,
+                got: *got.get(i)?,
+            })
+        }
+    }
+
+    /// One block run in isolation: `isolated block {layer} [{label}]`, then per row class the
+    /// rel-L2 against the float32 and the bf16 reference after that block, then the [`PROBE`]
+    /// element. With the reference's own input, a large error here is the block's own compute;
+    /// a small one puts the full forward's error at that block on what it inherited.
+    pub fn isolation_line(label: &str, row: &SweepRow, probe: &Located) -> String {
+        let mut line = format!("isolated block {} [{label}]", row.layer);
+        for (name, e) in RowRegions::NAMES.iter().zip(&row.regions) {
+            line.push_str(&format!(
+                " | {name} vs-f32 {:.3e} vs-bf16 {:.3e}",
+                e.vs_f32, e.vs_bf16
+            ));
+        }
+        line.push_str(&format!(" | probe {probe} | worst |got-f32| {}", row.worst));
+        line
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -848,6 +898,30 @@ pub mod dit_sweep {
                 (5, 1, "generated", 4.0)
             );
             assert!(SweepRow::new(7, &got[..10], &f32_ref, &bf16_ref, 2, REGIONS).is_err());
+        }
+
+        #[test]
+        fn the_isolation_line_reads_the_probe_and_every_row_class() {
+            let f32_ref = [
+                1.0f32, 1.0, 1.0, 1.0, 50.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            ];
+            let bf16_ref = f32_ref;
+            let mut got = f32_ref;
+            got[4] = 25.0; // reference row 2, channel 0: half the massive activation
+            let probe = Located::at((2, 0), &got, &f32_ref, &bf16_ref, 2, REGIONS).unwrap();
+            assert_eq!(
+                (probe.class, probe.f32_ref, probe.got),
+                ("reference", 50.0, 25.0)
+            );
+            assert!(Located::at((6, 0), &got, &f32_ref, &bf16_ref, 2, REGIONS).is_none());
+            assert!(Located::at((0, 2), &got, &f32_ref, &bf16_ref, 2, REGIONS).is_none());
+            let row = SweepRow::new(39, &got, &f32_ref, &bf16_ref, 2, REGIONS).unwrap();
+            let line = isolation_line("ref input", &row, &probe);
+            assert!(line.starts_with("isolated block 39 [ref input]"), "{line}");
+            for name in RowRegions::NAMES {
+                assert!(line.contains(&format!("| {name} vs-f32")), "{line}");
+            }
+            assert!(line.contains("probe row 2 (reference) ch 0"), "{line}");
         }
 
         fn row(layer: usize, vs_f32: f32, vs_bf16: f32, drift: f32) -> SweepRow {

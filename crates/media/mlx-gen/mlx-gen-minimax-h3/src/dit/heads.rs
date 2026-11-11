@@ -233,13 +233,30 @@ impl LinearBias {
     ///
     /// The cast mirrors the reference's explicit `x.to(get_parameter_dtype(module))` and is what
     /// keeps a float32 head from silently running its matmul at the block stack's bfloat16.
+    ///
+    /// A float32 projection (the reference's `_keep_in_fp32_modules`: `proj_in`, `time_embedder`,
+    /// the output heads) runs through [`mlx_gen::nn::linear_precise`]: an ordinary F32 `addmm`
+    /// runs as TF32 on NAX, which rounded `time_embedder`'s output to 2.8e-3 rel-L2 (SW-7092) —
+    /// the tensor every AdaLN projection reads. See [`uses_precise_dispatch`].
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let x = x.as_dtype(self.weight.dtype())?;
-        let y = mlx_gen::nn::linear(&x, &self.weight, &self.bias)?;
+        let y = if uses_precise_dispatch(self.weight.dtype()) {
+            mlx_gen::nn::linear_precise(&x, &self.weight, Some(&self.bias))?
+        } else {
+            mlx_gen::nn::linear(&x, &self.weight, &self.bias)?
+        };
         // SW-7096: the residuals read the same cast input the base does — what a PEFT LoRA on
         // this module sees in the reference, which casts before calling the module.
         self.adapters.apply(&x, y)
     }
+}
+
+/// Whether a [`LinearBias`] over a weight of `weight_dtype` takes the full-precision N=1 dispatch
+/// ([`mlx_gen::nn::linear_precise`]) rather than the fused `addmm`: exactly the float32 weights,
+/// which are the modules the reference keeps in float32. A bfloat16 projection keeps the fused
+/// `addmm`, whose single rounding of the bias add is the bf16 contract.
+pub fn uses_precise_dispatch(weight_dtype: Dtype) -> bool {
+    weight_dtype == Dtype::Float32
 }
 
 /// `Timesteps(num_channels = freq_dim, flip_sin_to_cos = True, downscale_freq_shift = 0)` —
@@ -915,6 +932,57 @@ mod tests {
             })
             .collect();
         Array::from_slice(&v, shape)
+    }
+
+    /// SW-7092: exactly the float32 projections take the N=1 full-precision dispatch.
+    #[test]
+    fn only_float32_heads_take_the_precise_dispatch() {
+        assert!(uses_precise_dispatch(Dtype::Float32));
+        for dtype in [Dtype::Bfloat16, Dtype::Float16] {
+            assert!(!uses_precise_dispatch(dtype), "{dtype:?}");
+        }
+    }
+
+    /// SW-7092: a float32 head over many rows (the shape that NAX runs as a TF32 GEMM through
+    /// `addmm`) matches an f64 host projection to F32 accuracy. TF32 keeps 10 fraction bits, so a
+    /// TF32 product misses this by well over 1e-5 of the peak.
+    #[test]
+    fn a_float32_head_projects_at_full_float32_precision() {
+        let (rows, inp, out) = (64, 256, 96);
+        let w = seeded(&[out, inp], 11);
+        let b = seeded(&[out], 12);
+        let x = seeded(&[1, rows, inp], 13);
+        let mut map = Weights::empty();
+        map.insert("h.weight", w.clone());
+        map.insert("h.bias", b.clone());
+        let head = LinearBias::from_weights(&mut map, "h", inp, out).unwrap();
+        let got = head.forward(&x).unwrap();
+        assert_eq!(got.shape(), [1, rows, out]);
+        assert_eq!(got.dtype(), Dtype::Float32);
+        let (w, b, x, got) = (
+            w.as_slice::<f32>().to_vec(),
+            b.as_slice::<f32>().to_vec(),
+            x.as_slice::<f32>().to_vec(),
+            got.as_slice::<f32>().to_vec(),
+        );
+        let inp = inp as usize;
+        let out = out as usize;
+        let (mut peak, mut worst) = (0f64, 0f64);
+        for r in 0..rows as usize {
+            for o in 0..out {
+                let want = f64::from(b[o])
+                    + (0..inp)
+                        .map(|i| f64::from(x[r * inp + i]) * f64::from(w[o * inp + i]))
+                        .sum::<f64>();
+                peak = peak.max(want.abs());
+                worst = worst.max((f64::from(got[r * out + o]) - want).abs());
+            }
+        }
+        assert!(
+            worst / peak < 1e-5,
+            "float32 head error {:.3e} of peak",
+            worst / peak
+        );
     }
 
     /// SW-7096: a LoRA on a bias-Linear head is `x·Wᵀ + b + scale·(alpha/rank)·x·Aᵀ·Bᵀ` — checked

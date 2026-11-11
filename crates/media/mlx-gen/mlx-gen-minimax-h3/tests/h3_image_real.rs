@@ -530,6 +530,151 @@ fn edit_block_sweep(r: &Weights, trace: &ImageDitTrace, layers: &[usize], region
     }
 }
 
+/// `table` with row block `g` (`MODALITY_NUM` rows) replaced by `block`.
+fn splice_row_block(table: &Array, g: i32, block: &Array) -> Array {
+    let rows = mlx_gen_minimax_h3::dit::MODALITY_NUM;
+    let total = table.shape()[0];
+    let mut parts = Vec::new();
+    if g > 0 {
+        parts.push(slice_axis(table, 0, 0, g * rows).unwrap());
+    }
+    parts.push(block.as_dtype(table.dtype()).unwrap());
+    if (g + 1) * rows < total {
+        parts.push(slice_axis(table, 0, (g + 1) * rows, total).unwrap());
+    }
+    mlx_rs::ops::concatenate_axis(&parts, 0).unwrap()
+}
+
+/// SW-7092 diagnostic: block [`dit_sweep::ISOLATED_BLOCK`] run ALONE at step 0 from the reference's
+/// own input (`diag.sweep.{f32,bf16}.block{k-1}`), against `diag.sweep.{f32,bf16}.block{k}`, with
+/// per row class rel-L2 and the [`dit_sweep::PROBE`] massive activation. Three runs: the f32 input
+/// with the reference's own AdaLN tables (`diag.step0.block{k}.adaln`, spliced into the cache's
+/// step-0 rows), the f32 input with this backend's tables, and the bf16 input with this backend's
+/// tables (read against `vs-bf16`: diffusers' bf16 forward ran block k on exactly that input). A
+/// small error from the reference's input names the inherited error; a large one names block k's
+/// own compute. Printed, never asserted.
+fn edit_block_isolation(r: &Weights, denoiser: &ImageDenoiser, stream: Dtype, regions: RowRegions) {
+    use mlx_gen_minimax_h3::dit::{AdaLnModulation, MODALITY_NUM};
+    let layer = dit_sweep::ISOLATED_BLOCK;
+    assert_eq!(
+        r.metadata("isolated_block").unwrap_or_default(),
+        layer.to_string(),
+        "the reference records the isolated block's AdaLN"
+    );
+    let input = |dtype: &str| {
+        r.require(&format!("diag.sweep.{dtype}.block{}", layer - 1))
+            .unwrap()
+            .as_dtype(stream)
+            .unwrap()
+    };
+    let f32_out = host_f32(r.require(&format!("diag.sweep.f32.block{layer}")).unwrap());
+    let bf16_out = host_f32(r.require(&format!("diag.sweep.bf16.block{layer}")).unwrap());
+    let width = *r
+        .require(&format!("diag.sweep.f32.block{layer}"))
+        .unwrap()
+        .shape()
+        .last()
+        .unwrap() as usize;
+
+    let ours = denoiser.adaln_cache().modulation(layer).unwrap();
+    let schedule = denoiser.adaln_cache().schedule();
+    let want = r
+        .require(&format!("diag.step0.block{layer}.adaln"))
+        .unwrap();
+    let ours_step0: Vec<Array> = ours
+        .tables()
+        .map(|table| {
+            let parts: Vec<Array> = (0..2)
+                .map(|class| {
+                    let g = schedule.global_timestep_index(0, class).unwrap();
+                    slice_axis(table, 0, g * MODALITY_NUM, (g + 1) * MODALITY_NUM).unwrap()
+                })
+                .collect();
+            mlx_rs::ops::concatenate_axis(&parts, 0).unwrap()
+        })
+        .collect();
+    println!(
+        "{}",
+        stage_line(
+            0,
+            &format!("block{layer}.adaln"),
+            &mlx_rs::ops::stack_axis(&ours_step0, 0).unwrap(),
+            want
+        )
+    );
+    let spliced: Vec<Array> = ours
+        .tables()
+        .enumerate()
+        .map(|(i, table)| {
+            let reference = slice_axis(want, 0, i as i32, i as i32 + 1)
+                .unwrap()
+                .squeeze_axes(&[0])
+                .unwrap();
+            let mut table = table.clone();
+            for class in 0..2 {
+                let g = schedule.global_timestep_index(0, class).unwrap();
+                let block = slice_axis(
+                    &reference,
+                    0,
+                    class * MODALITY_NUM,
+                    (class + 1) * MODALITY_NUM,
+                )
+                .unwrap();
+                table = splice_row_block(&table, g, &block);
+            }
+            table
+        })
+        .collect();
+    let [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]: [Array; 6] =
+        spliced.try_into().unwrap();
+    let reference_adaln = AdaLnModulation {
+        shift_msa,
+        scale_msa,
+        gate_msa,
+        shift_mlp,
+        scale_mlp,
+        gate_mlp,
+    };
+    let f32_in = input("f32");
+    let bf16_in = input("bf16");
+    let input_probe = dit_sweep::Located::at(
+        dit_sweep::PROBE,
+        &host_f32(&f32_in),
+        &host_f32(
+            r.require(&format!("diag.sweep.f32.block{}", layer - 1))
+                .unwrap(),
+        ),
+        &host_f32(&bf16_in),
+        width,
+        regions,
+    )
+    .unwrap();
+    println!(
+        "isolated block {layer} input (block {} out, cast to {stream:?}): probe {input_probe}",
+        layer - 1
+    );
+    for (label, hidden, modulation) in [
+        (
+            "f32 input, reference AdaLN",
+            &f32_in,
+            Some(&reference_adaln),
+        ),
+        ("f32 input, own AdaLN", &f32_in, None),
+        ("bf16 input, own AdaLN", &bf16_in, None),
+    ] {
+        let got = denoiser
+            .block_forward(0, layer, hidden, modulation)
+            .unwrap();
+        mlx_rs::transforms::eval([&got]).unwrap();
+        let got = host_f32(&got);
+        let row = SweepRow::new(layer, &got, &f32_out, &bf16_out, width, regions).unwrap();
+        let probe =
+            dit_sweep::Located::at(dit_sweep::PROBE, &got, &f32_out, &bf16_out, width, regions)
+                .unwrap();
+        println!("{}", dit_sweep::isolation_line(label, &row, &probe));
+    }
+}
+
 /// AC2: the `edit` presentation this crate builds with the snapshot's own tokenizer — a
 /// `Picture i: ` label and a vision block per reference, then the prompt, no chat template — is
 /// the processor template's, id for id and tag for tag, as diffusers'
@@ -843,6 +988,8 @@ fn h3_image_edit_first_step_matches_diffusers() {
         regions(step, "velocity", &got, want);
         if step == 0 {
             edit_block_sweep(&r, &trace, &sweep_layers, sweep_regions);
+            let stream = trace.hidden[0].1.dtype();
+            edit_block_isolation(&r, &denoiser, stream, sweep_regions);
         }
         results.push((step, rel_l2(&got, want), cosine(&got, want), got));
     }
