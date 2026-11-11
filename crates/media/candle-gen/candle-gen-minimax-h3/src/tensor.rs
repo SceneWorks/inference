@@ -74,6 +74,55 @@ pub fn unpack_tokens(
         ))?)
 }
 
+/// Pack an NCHW latent image into ViT tokens `[B, H·W, C]` —
+/// `MiniMaxH3ImageViTDecoder2d.forward`'s `permute(0, 2, 3, 1).reshape(B, H·W, C)`, so token order
+/// is `(h, w)` row-major, matching [`crate::rope::create_token_ids_2d`].
+pub fn pack_tokens_2d(x: &Tensor) -> Result<Tensor> {
+    let s = x.dims();
+    if s.len() != 4 {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 pack_tokens_2d: expected [B, C, H, W], got {s:?}"
+        )));
+    }
+    let (b, c, h, w) = (s[0], s[1], s[2], s[3]);
+    Ok(x.permute((0, 2, 3, 1))?
+        .contiguous()?
+        .reshape((b, h * w, c))?)
+}
+
+/// Unpack 2-D ViT patch tokens back to an NCHW image.
+///
+/// `tokens` is `[B, H·W, out_channels · patch_size²]` with the channel axis laid out
+/// `(c, ph, pw)` row-major; the result is `[B, out_channels, H·patch_size, W·patch_size]` — the
+/// reference's `view(B, H, W, C, p, p).permute(0, 3, 1, 4, 2, 5)`.
+pub fn unpack_tokens_2d(
+    tokens: &Tensor,
+    out_channels: usize,
+    patch_size: usize,
+    lat_h: usize,
+    lat_w: usize,
+) -> Result<Tensor> {
+    let s = tokens.dims();
+    if s.len() != 3 {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 unpack_tokens_2d: expected [B, N, C], got {s:?}"
+        )));
+    }
+    let (b, n, c) = (s[0], s[1], s[2]);
+    let expected_c = out_channels * patch_size * patch_size;
+    if n != lat_h * lat_w || c != expected_c {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 unpack_tokens_2d: expected [B, {}, {expected_c}], got {s:?}",
+            lat_h * lat_w
+        )));
+    }
+    Ok(tokens
+        .reshape(&[b, lat_h, lat_w, out_channels, patch_size, patch_size][..])?
+        .permute((0, 3, 1, 4, 2, 5))?
+        .contiguous()?
+        .reshape((b, out_channels, lat_h * patch_size, lat_w * patch_size))?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +169,37 @@ mod tests {
         let tokens = pack_tokens(&x).unwrap();
         assert_eq!(tokens.dims(), &[1, 12, 1]);
         assert_eq!(flat(&tokens), vals);
+    }
+
+    #[test]
+    fn pack_2d_orders_tokens_h_then_w_and_round_trips() {
+        let vals: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let x = Tensor::from_vec(vals, (1, 2, 2, 3), &Device::Cpu).unwrap();
+        let tokens = pack_tokens_2d(&x).unwrap();
+        assert_eq!(tokens.dims(), &[1, 6, 2]);
+        // token (h=0, w=1) carries channel 0 = 1 and channel 1 = 7.
+        assert_eq!(&flat(&tokens)[2..4], &[1.0, 7.0]);
+        let back = unpack_tokens_2d(&tokens, 2, 1, 2, 3).unwrap();
+        assert_eq!(flat(&back), flat(&x));
+        assert!(pack_tokens_2d(&spread(&[1, 2, 1, 2, 3])).is_err());
+    }
+
+    /// A 2×2 latent with a 2×2 patch: each token's 4 features fill its own pixel block, so pixel
+    /// row 0 interleaves tokens (0,0) and (0,1). A wrong permute keeps the shape and moves pixels.
+    #[test]
+    fn unpack_2d_places_each_token_in_its_own_block() {
+        let vals: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let tokens = Tensor::from_vec(vals, (1, 4, 4), &Device::Cpu).unwrap();
+        let img = unpack_tokens_2d(&tokens, 1, 2, 2, 2).unwrap();
+        assert_eq!(img.dims(), &[1, 1, 4, 4]);
+        assert_eq!(
+            flat(&img),
+            vec![
+                0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0, 8.0, 9.0, 12.0, 13.0, 10.0, 11.0, 14.0,
+                15.0
+            ]
+        );
+        assert!(unpack_tokens_2d(&tokens, 1, 2, 2, 3).is_err());
     }
 
     #[test]

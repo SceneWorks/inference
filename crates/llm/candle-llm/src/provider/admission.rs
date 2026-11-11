@@ -226,6 +226,41 @@ pub(super) fn stored_block_bytes(tensors: &SnapshotTensors) -> Option<u64> {
         })
 }
 
+/// The payload bytes of a ModelOpt NVFP4 snapshot's projection triples (SW-7099) — the packed
+/// codes, block scales and scalar scales [`Weights::from_dir`] keeps on the **host** and stages
+/// into the resident NVFP4 operand. `None` on overflow.
+pub(super) fn modelopt_host_bytes(tensors: &SnapshotTensors) -> Option<u64> {
+    tensors
+        .iter()
+        .filter(|(name, t)| {
+            crate::primitives::weights::modelopt_host_tensor(name, t.dtype == "U8", &t.shape)
+                && (core_llm::modelopt::is_companion(name)
+                    || core_llm::modelopt::quantized_stem(name, |k| tensors.contains_key(k))
+                        .is_some())
+        })
+        .try_fold(0u64, |total, (_, t)| {
+            let elems = t
+                .shape
+                .iter()
+                .try_fold(1u64, |n, &d| n.checked_mul(d as u64))?;
+            // F32 scalars are 4 bytes; codes and E4M3 scales 1.
+            let width = if t.dtype == "F32" { 4 } else { 1 };
+            total.checked_add(elems.checked_mul(width)?)
+        })
+}
+
+/// The logical `[rows, cols]` of a ModelOpt NVFP4 projection `key` (its U8 codes hold two
+/// columns per byte), or `None` for a dense tensor.
+fn modelopt_dims(
+    key: &str,
+    tensor: &TensorHeader,
+    tensors: &SnapshotTensors,
+) -> Option<(usize, usize)> {
+    core_llm::modelopt::quantized_stem(key, |k| tensors.contains_key(k))?;
+    let (rows, half) = tensor.dims2()?;
+    Some((rows, half.checked_mul(2)?))
+}
+
 /// The projection format a load stores its quantized copy in, as admission prices it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CopyFormat {
@@ -524,12 +559,26 @@ pub(super) fn snapshot_quantized_copy_bytes<'a>(
             let Ok(prefix) = qwen35_dense_prefix(|key| tensors.contains_key(key)) else {
                 return Some((0, consumed));
             };
+            // In a ModelOpt checkpoint a weight without `.weight_scale` loads dense, as its
+            // source's cast (`keyed_projection`), never in the load's format.
+            let modelopt = tensors
+                .keys()
+                .any(|key| key.ends_with(core_llm::modelopt::WEIGHT_SCALE));
             for (key, tensor) in tensors {
                 // The loader's own selection — the rule the preparer stores blocks by, too.
                 if !qwen35::loads_quantized(cfg, prefix, key) {
                     continue;
                 }
+                let staged = modelopt_dims(key, tensor, tensors);
+                if modelopt && staged.is_none() {
+                    continue;
+                }
                 consumed.insert(key.as_str());
+                // A ModelOpt NVFP4 projection (SW-7099) is staged at its logical shape.
+                if let Some((rows, cols)) = staged {
+                    add(format.projection_bytes(rows, cols)?)?;
+                    continue;
+                }
                 // The stacked MoE experts are quantized one expert slice at a time: a
                 // `[mi, hidden]` gate and up from `gate_up_proj`, a `[hidden, mi]` down. A
                 // per-expert snapshot's `experts.{e}.*_proj.weight` (sc-24438) is an ordinary
@@ -587,7 +636,10 @@ pub(super) fn snapshot_quantized_copy_bytes<'a>(
             } else {
                 "lm_head.weight".to_string()
             };
-            if let Some((rows, cols)) = tensors.get(&head).and_then(TensorHeader::dims2) {
+            let head_dims = tensors.get(&head).and_then(|t| {
+                modelopt_dims(&head, t, tensors).or_else(|| t.dims2().filter(|_| !modelopt))
+            });
+            if let Some((rows, cols)) = head_dims {
                 if !cfg.tie_word_embeddings {
                     consumed.insert("lm_head.weight");
                 }
@@ -616,7 +668,10 @@ pub(super) fn snapshot_cast_copy_bytes(
     let mut total = 0u64;
     for (key, tensor) in tensors {
         // `F16`, `F32`, `F64`, `F8_*`: every safetensors float tag but `BF16`.
-        if !tensor.dtype.starts_with('F') || consumed.contains(key.as_str()) {
+        if !tensor.dtype.starts_with('F')
+            || consumed.contains(key.as_str())
+            || core_llm::modelopt::is_companion(key)
+        {
             continue;
         }
         let sidecar = [".scales", ".biases"].iter().any(|sidecar| {

@@ -63,9 +63,12 @@ pub mod constraint;
 pub mod defaults;
 pub mod detok;
 pub mod error;
+pub mod json_schema;
 pub mod kv_compression;
 pub mod message;
+pub mod minimax_h3_image_pe;
 pub mod model_config;
+pub mod modelopt;
 pub mod mtp_head;
 pub mod output;
 pub mod paging;
@@ -101,6 +104,7 @@ pub use constraint::{
 pub use defaults::{speculative_default, DecodeBackend, DecodeDefaults, RecommendedDepths};
 pub use detok::IncrementalDetok;
 pub use error::{Error, RequestResourceExhausted, Result};
+pub use json_schema::{JsonSchema, SchemaState};
 pub use kv_compression::{
     compressed_kv_cache_bytes, kv_model_family, plan_kv_cache, plan_kv_cache_without_reader,
     qualified_kv_model_family, qualify_kv_compression, CompressedKvAllocation, KvAttentionGeometry,
@@ -128,8 +132,8 @@ pub use prefix::{
     PREFIX_PAGED_NOT_SNAPSHOTTED,
 };
 pub use prepare::{
-    detect_format, ModelFormat, PrepareReport, PrepareSpec, SnapshotPreparerRegistration,
-    SnapshotPreparerRegistry, SnapshotPreparerRegistryBuilder,
+    check_prepare_output, detect_format, ModelFormat, PrepareReport, PrepareSpec,
+    SnapshotPreparerRegistration, SnapshotPreparerRegistry, SnapshotPreparerRegistryBuilder,
 };
 pub use prism::{
     apply_hadamard_forward_in_place, apply_hadamard_inverse_in_place, decode_block_into,

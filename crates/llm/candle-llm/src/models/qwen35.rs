@@ -117,18 +117,43 @@ fn dense_weight(w: &Weights, key: &str, dtype: DType) -> Result<Tensor> {
              quantized projection may be stored as GGML blocks"
         )));
     }
+    if core_llm::modelopt::quantized_stem(key, |k| w.contains(k)).is_some() {
+        return Err(Error::Config(format!(
+            "ModelOpt NVFP4 tensor `{key}` holds packed codes and cannot be read as a dense weight"
+        )));
+    }
     Ok(t.to_dtype(dtype)?)
 }
 
+/// The format a weight without its own quantization stores in: `format`, except in a ModelOpt
+/// checkpoint (`modelopt`), whose scale-less weights the publisher left unquantized and so load
+/// dense — re-quantizing them would add a lossy step the published checkpoint never took.
+fn scale_less_format(
+    modelopt: bool,
+    format: Option<&ProjectionFormat>,
+) -> Option<&ProjectionFormat> {
+    if modelopt {
+        None
+    } else {
+        format
+    }
+}
+
 /// The keyed projection `key` on `device`: a prepared tier's stored GGML blocks exactly as stored
-/// (sc-19375), else the dense weight stored in `format`.
+/// (sc-19375), else the dense weight stored in `format`. In a ModelOpt checkpoint (`modelopt`) a
+/// weight without `.weight_scale` is one the publisher left unquantized, so it loads dense.
 fn keyed_projection(
     w: &Weights,
     key: &str,
     dtype: DType,
     format: Option<&ProjectionFormat>,
+    modelopt: bool,
     device: &Device,
 ) -> Result<Projection> {
+    if let Some(p) = crate::modelopt::modelopt_projection(w, key, format, device)? {
+        return Ok(p);
+    }
+    let format = scale_less_format(modelopt, format);
     let t = w.require(key)?;
     if is_ggml_block_tensor(t) {
         let stem = key.strip_suffix(".weight").unwrap_or(key);
@@ -1866,9 +1891,10 @@ impl Qwen35Mtp {
             )));
         }
 
+        let modelopt = crate::modelopt::is_modelopt_checkpoint(w);
         let proj_q = |key: &str| -> Result<Projection> {
             debug_assert_priced(key, format);
-            keyed_projection(w, key, target.dtype, format, &target.device)
+            keyed_projection(w, key, target.dtype, format, modelopt, &target.device)
         };
         Self::assemble(w, target, format, &proj_q)
     }
@@ -2052,7 +2078,7 @@ impl Qwen35Mtp {
                         &target.device,
                     )
                 }
-                None => keyed_projection(&w, key, target.dtype, None, &target.device),
+                None => keyed_projection(&w, key, target.dtype, None, false, &target.device),
             }
         };
         Self::assemble(&w, target, None, &proj_q)
@@ -3247,6 +3273,8 @@ impl Qwen35Model {
             }
         };
         let req = |key: String| -> Result<Tensor> { dense_weight(w, &key, dtype) };
+        let modelopt = crate::modelopt::is_modelopt_checkpoint(w);
+        let dense_format = scale_less_format(modelopt, format);
         // Dense HF Qwen3.6 norms are zero-centered. Frozen Prism/Bonsai artifacts have already
         // converted every ordinary RMSNorm tensor to its direct multiplier and must remain raw.
         let norm_w = |key: String| -> Result<Tensor> {
@@ -3258,7 +3286,7 @@ impl Qwen35Model {
                 Some(weight) => Ok(Projection::load_prism(weight.clone())),
                 None => {
                     debug_assert_priced(&key, format);
-                    keyed_projection(w, &key, dtype, format, &device)
+                    keyed_projection(w, &key, dtype, format, modelopt, &device)
                 }
             }
         };
@@ -3296,9 +3324,13 @@ impl Qwen35Model {
                                 .into(),
                         ));
                     };
-                    Projection::load_as(weight.clone(), None, format)?
+                    Projection::load_as(weight.clone(), None, dense_format)?
+                } else if let Some(head) =
+                    crate::modelopt::modelopt_projection(w, &head_key, format, &device)?
+                {
+                    head
                 } else {
-                    Projection::load_as(req(head_key)?, None, format)?
+                    Projection::load_as(req(head_key)?, None, dense_format)?
                 },
             ))
         };
@@ -3654,6 +3686,51 @@ pub(crate) mod tests {
     use crate::primitives::moe::ExpertPart;
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// SW-7099 review: in a ModelOpt checkpoint a weight without `.weight_scale` (a dense
+    /// `lm_head`) loads dense under the load's quantized format, where a dense checkpoint's
+    /// weight is quantized in that format.
+    #[test]
+    fn a_modelopt_checkpoints_scale_less_weight_stays_dense() {
+        let head = |map: &mut HashMap<String, Tensor>| {
+            map.insert(
+                "lm_head.weight".into(),
+                Tensor::zeros((8, 256), DType::F32, &Device::Cpu).unwrap(),
+            );
+        };
+        let mut modelopt = HashMap::new();
+        head(&mut modelopt);
+        modelopt.insert(
+            "layers.0.mlp.down_proj.weight_scale".into(),
+            Tensor::zeros((8, 16), DType::U8, &Device::Cpu).unwrap(),
+        );
+        let modelopt = Weights::from_map(modelopt, Device::Cpu);
+        let mut dense = HashMap::new();
+        head(&mut dense);
+        let dense = Weights::from_map(dense, Device::Cpu);
+        assert!(crate::modelopt::is_modelopt_checkpoint(&modelopt));
+        assert!(!crate::modelopt::is_modelopt_checkpoint(&dense));
+
+        let q4 = ProjectionFormat::from(QuantSpec::q4());
+        let load = |w: &Weights| {
+            let flag = crate::modelopt::is_modelopt_checkpoint(w);
+            keyed_projection(
+                w,
+                "lm_head.weight",
+                DType::F32,
+                Some(&q4),
+                flag,
+                &Device::Cpu,
+            )
+            .unwrap()
+            .kind()
+        };
+        use crate::primitives::projection::ProjectionKind;
+        assert_eq!(load(&modelopt), ProjectionKind::Dense);
+        assert_eq!(load(&dense), ProjectionKind::Ggml);
+        assert!(scale_less_format(true, Some(&q4)).is_none());
+        assert!(scale_less_format(false, Some(&q4)).is_some());
+    }
 
     /// sc-24437: a prefix snapshot owns compact copies of exactly the positions it holds — never a
     /// view into the live cache's static KV buffer, which would pin that whole buffer beyond the

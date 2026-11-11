@@ -59,6 +59,7 @@ pub mod generator;
 pub mod guidance;
 pub mod h3_adapter_memory;
 pub mod h3_conditioning_memory;
+pub mod h3_image;
 pub mod h3_memory;
 pub mod h3_reference;
 pub mod hdr;
