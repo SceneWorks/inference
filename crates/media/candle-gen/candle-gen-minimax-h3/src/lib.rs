@@ -136,6 +136,7 @@ pub mod dit;
 pub mod image_memory_strategy;
 pub mod image_model;
 pub mod image_pipeline;
+pub mod image_sampler;
 pub mod image_vae;
 pub mod keyframe;
 pub mod layout;

@@ -46,9 +46,9 @@ use mlx_rs::ops::{add, clip, multiply};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::gen_core::h3_image::{
-    edit_reference_images, latent_grid, reference_vae_size, reference_vision_size, t2i_prompt_ids,
-    validate_request as validate_h3_image, FIXED_GUIDANCE, FIXED_STEPS, REFERENCE_NOISE_AUG,
-    VAE_SPATIAL_RATIO,
+    edit_reference_images, latent_grid, reference_vae_size, reference_vision_size, request_sampler,
+    t2i_prompt_ids, validate_request as validate_h3_image, FIXED_GUIDANCE, FIXED_STEPS,
+    REFERENCE_NOISE_AUG, VAE_SPATIAL_RATIO,
 };
 use mlx_gen::gen_core::{
     reject_unknown_components, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
@@ -139,6 +139,10 @@ pub fn descriptor() -> ModelDescriptor {
             // selection stages whatever residency it names.
             unconditionally_engages_staged_residency: true,
             max_prompt_tokens: Some(mlx_gen::gen_core::h3_image::MAX_PROMPT_TOKENS as u32),
+            // SW-7106: the released velocity Euler (the default) or ComfyUI's stochastic LCM on
+            // the same six-step grid, named by `sampler` and parameterized by `h3_image_sampler`.
+            samplers: mlx_gen::gen_core::h3_image::SAMPLER_NAMES.to_vec(),
+            supports_h3_image_sampler: true,
             ..Default::default()
         },
     }
@@ -234,6 +238,7 @@ pub fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<
         references.len(),
     )
     .map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
+    request_sampler(req).map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
     // Guidance 1.0 is the family's documented no-op, admitted above; the shared floor refuses any
     // guidance on a model without CFG, so it sees the request without it.
     if req.guidance == Some(FIXED_GUIDANCE) {
@@ -655,6 +660,8 @@ impl MiniMaxH3Image {
         let (latent_h, latent_w) = latent_grid(canvas_w, canvas_h)?;
         let seed = req.seed.unwrap_or_else(default_seed);
         let count = req.count.max(1);
+        let sampler =
+            request_sampler(req).map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
 
         let references = edit_reference_images(&req.conditioning)
             .map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
@@ -772,12 +779,14 @@ impl MiniMaxH3Image {
                 mlx_rs::ops::concatenate_axis(&[condition, noise], 1)?
             };
             let done = n * steps;
-            let rows = denoiser.denoise(&packed, &req.cancel, &mut |s| {
-                on_progress(Progress::Step {
-                    current: done + s as u32,
-                    total,
-                })
-            })?;
+            // Image `n`'s LCM noise is seeded from its own seed, like its initial latent.
+            let rows =
+                denoiser.denoise_with(&sampler, image_seed, &packed, &req.cancel, &mut |s| {
+                    on_progress(Progress::Step {
+                        current: done + s as u32,
+                        total,
+                    })
+                })?;
             let rows = denoiser.generated_rows(&rows)?;
             let latent = unpatchify_video_rows(
                 &rows,
@@ -931,9 +940,44 @@ mod tests {
                 ..req(2048, 2048)
             },
             req(0, 2048),
+            GenerationRequest {
+                sampler: Some("dpmpp_2m".into()),
+                ..req(2048, 2048)
+            },
+            GenerationRequest {
+                h3_image_sampler: Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm(0.0)),
+                ..req(2048, 2048)
+            },
+            GenerationRequest {
+                sampler: Some("euler".into()),
+                h3_image_sampler: Some(mlx_gen::gen_core::h3_image::H3ImageSampler::lcm_default()),
+                ..req(2048, 2048)
+            },
         ] {
             assert!(validate_request(&caps, &bad).is_err(), "{bad:?}");
         }
+        // SW-7106: both samplers are admitted, by name or by block.
+        for good in [
+            GenerationRequest {
+                sampler: Some("lcm".into()),
+                ..req(2048, 2048)
+            },
+            GenerationRequest {
+                sampler: Some("euler".into()),
+                ..req(2048, 2048)
+            },
+            GenerationRequest {
+                h3_image_sampler: Some(mlx_gen::gen_core::h3_image::H3ImageSampler::Lcm {
+                    s_noise: 1.1,
+                    s_noise_end: 0.9,
+                    noise_clip_std: 2.0,
+                }),
+                ..req(2048, 2048)
+            },
+        ] {
+            validate_request(&caps, &good).unwrap();
+        }
+        assert_eq!(caps.samplers, vec!["euler", "lcm"]);
         // Above H3 video's 1.03 MP canvas and 2016 px edge: admitted for this family.
         validate_request(&caps, &req(4736, 3552)).unwrap();
     }

@@ -156,6 +156,21 @@ pub enum H3ImageRefusal {
          strength; omit it"
     )]
     ReferenceStrength { index: usize, strength: f32 },
+    #[error("sampler {name:?} refused: H3-Image samples with one of {SAMPLER_NAMES:?}")]
+    UnknownSampler { name: String },
+    #[error(
+        "sampler {named:?} conflicts with the h3_image_sampler block, which selects {typed:?}; \
+         name one sampler"
+    )]
+    SamplerConflict { named: String, typed: &'static str },
+    #[error("lcm {field} {value} refused: it must be finite")]
+    SamplerNonFinite { field: &'static str, value: f32 },
+    #[error("lcm s_noise {value} refused: it must be greater than 0")]
+    SamplerNoiseScale { value: f32 },
+    #[error("lcm s_noise_end {value} refused: it must be 0 or greater")]
+    SamplerNoiseScaleEnd { value: f32 },
+    #[error("lcm noise_clip_std {value} refused: it must be 0 (off) or greater")]
+    SamplerNoiseClip { value: f32 },
 }
 
 impl From<H3ImageRefusal> for Error {
@@ -228,6 +243,259 @@ pub fn validate_request(
         });
     }
     Ok(())
+}
+
+// ── sampler ─────────────────────────────────────────────────────────────────────────────────────
+//
+// Both samplers step on the same fixed grid ([`sampler_sigmas`], six steps). ComfyUI's H3-Image
+// model sampling puts its `simple` scheduler at six steps exactly on that grid, so the LCM sampler
+// below is ComfyUI's `comfy/k_diffusion/sampling.py::sample_lcm` on the published sigmas.
+
+/// The sampler names a request may give in [`crate::GenerationRequest::sampler`], in the order the
+/// descriptor advertises them. `euler` is the released sampler and the default.
+pub const SAMPLER_NAMES: &[&str] = &["euler", "lcm"];
+/// ComfyUI's default LCM noise scale.
+pub const LCM_S_NOISE_DEFAULT: f32 = 1.0;
+/// LCM noise clipping is off unless asked for.
+pub const LCM_NOISE_CLIP_STD_DEFAULT: f32 = 0.0;
+
+/// How each of the six steps moves the generated rows.
+///
+/// The velocity `v` the H3-Image DiT returns points **toward the data**: the released Euler step
+/// is `x + (σᵢ − σᵢ₊₁)·v` with `σ` falling, so the clean estimate is `x0 = x + σᵢ·v`. ComfyUI's
+/// `CONST` model sampling writes the same estimate as `x - σ·v'` over its noise-ward velocity
+/// `v' = -v`; the two are the same arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum H3ImageSampler {
+    /// The released deterministic velocity Euler step, `x ← x + (σᵢ − σᵢ₊₁)·v`.
+    #[default]
+    Euler,
+    /// ComfyUI `sample_lcm`: jump to the clean estimate `x0 = x + σᵢ·v`, then, unless `σᵢ₊₁` is
+    /// the terminal 0, re-noise it to `σᵢ₊₁` with fresh seeded noise:
+    /// `x ← σᵢ₊₁·(s·ε) + (1 − σᵢ₊₁)·x0`. `s` ramps linearly from `s_noise` at step 0 to
+    /// `s_noise_end` at step `n − 1` ([`H3ImageSampler::noise_scale`]). When `noise_clip_std` is
+    /// above 0, `ε` is first clamped to `±noise_clip_std · std(ε)`.
+    Lcm {
+        s_noise: f32,
+        s_noise_end: f32,
+        noise_clip_std: f32,
+    },
+}
+
+impl H3ImageSampler {
+    /// LCM with ComfyUI's defaults: `s_noise = 1`, `s_noise_end = s_noise`, no clipping.
+    pub const fn lcm_default() -> Self {
+        Self::lcm(LCM_S_NOISE_DEFAULT)
+    }
+
+    /// LCM at a constant `s_noise` (`s_noise_end = s_noise`), no clipping.
+    pub const fn lcm(s_noise: f32) -> Self {
+        Self::Lcm {
+            s_noise,
+            s_noise_end: s_noise,
+            noise_clip_std: LCM_NOISE_CLIP_STD_DEFAULT,
+        }
+    }
+
+    /// The name [`SAMPLER_NAMES`] lists this sampler under.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Euler => "euler",
+            Self::Lcm { .. } => "lcm",
+        }
+    }
+
+    /// The first non-finite parameter as `(field, value)`, or `None`.
+    pub fn first_nonfinite_float(&self) -> Option<(&'static str, f32)> {
+        match *self {
+            Self::Euler => None,
+            Self::Lcm {
+                s_noise,
+                s_noise_end,
+                noise_clip_std,
+            } => [
+                ("s_noise", s_noise),
+                ("s_noise_end", s_noise_end),
+                ("noise_clip_std", noise_clip_std),
+            ]
+            .into_iter()
+            .find(|(_, v)| !v.is_finite()),
+        }
+    }
+
+    /// Refuse a parameter the step cannot use: a non-finite value, `s_noise <= 0`, a negative
+    /// `s_noise_end` (so every noised step's scale stays positive) or a negative clip.
+    pub fn validate(&self) -> Result<(), H3ImageRefusal> {
+        if let Some((field, value)) = self.first_nonfinite_float() {
+            return Err(H3ImageRefusal::SamplerNonFinite { field, value });
+        }
+        if let Self::Lcm {
+            s_noise,
+            s_noise_end,
+            noise_clip_std,
+        } = *self
+        {
+            if s_noise <= 0.0 {
+                return Err(H3ImageRefusal::SamplerNoiseScale { value: s_noise });
+            }
+            if s_noise_end < 0.0 {
+                return Err(H3ImageRefusal::SamplerNoiseScaleEnd { value: s_noise_end });
+            }
+            if noise_clip_std < 0.0 {
+                return Err(H3ImageRefusal::SamplerNoiseClip {
+                    value: noise_clip_std,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The noise scale `s` at step `step` of `num_steps`:
+    /// `s_noise + (s_noise_end − s_noise)·t` with `t = step / (num_steps − 1)`, and `t = 0` for a
+    /// single step. `0` under Euler, which adds no noise.
+    pub fn noise_scale(&self, step: usize, num_steps: usize) -> f32 {
+        match *self {
+            Self::Euler => 0.0,
+            Self::Lcm {
+                s_noise,
+                s_noise_end,
+                ..
+            } => {
+                let t = if num_steps > 1 {
+                    step as f32 / (num_steps - 1) as f32
+                } else {
+                    0.0
+                };
+                s_noise + (s_noise_end - s_noise) * t
+            }
+        }
+    }
+}
+
+/// The sampler a request runs: the typed `h3_image_sampler` block when present (validated), else
+/// the `sampler` name — `None` or `"euler"` is [`H3ImageSampler::Euler`], `"lcm"` is
+/// [`H3ImageSampler::lcm_default`]. A name that disagrees with the typed block is refused rather
+/// than either one winning.
+pub fn resolve_sampler(
+    name: Option<&str>,
+    typed: Option<H3ImageSampler>,
+) -> Result<H3ImageSampler, H3ImageRefusal> {
+    if let Some(name) = name.filter(|n| !SAMPLER_NAMES.contains(n)) {
+        return Err(H3ImageRefusal::UnknownSampler {
+            name: name.to_owned(),
+        });
+    }
+    let sampler = match (name, typed) {
+        (Some(named), Some(typed)) if named != typed.name() => {
+            return Err(H3ImageRefusal::SamplerConflict {
+                named: named.to_owned(),
+                typed: typed.name(),
+            })
+        }
+        (_, Some(typed)) => typed,
+        (Some("lcm"), None) => H3ImageSampler::lcm_default(),
+        _ => H3ImageSampler::Euler,
+    };
+    sampler.validate()?;
+    Ok(sampler)
+}
+
+/// [`resolve_sampler`] over a request's `sampler` and `h3_image_sampler` fields.
+pub fn request_sampler(req: &crate::GenerationRequest) -> Result<H3ImageSampler, H3ImageRefusal> {
+    resolve_sampler(req.sampler.as_deref(), req.h3_image_sampler)
+}
+
+/// The seed of the LCM noise one step draws, from the seed of the image being rendered.
+///
+/// `splitmix64((image_seed ⊕ "LCM_NOIS") + (step + 1)·φ)`, with `φ = 0x9E3779B97F4A7C15` and the
+/// domain word `0x4C434D5F4E4F4953` (ASCII `LCM_NOIS`). A pure function, so the same seed and
+/// sampler give the same image on a backend; the domain word and the finalizer keep these draws
+/// apart from the initial latent (seeded with `image_seed` itself) and the edit references' draws.
+/// Each backend turns the returned seed into standard-normal noise with its own generator, so the
+/// noise is the same across runs of one backend, not across backends.
+pub fn lcm_noise_seed(image_seed: u64, step: usize) -> u64 {
+    const DOMAIN: u64 = 0x4C43_4D5F_4E4F_4953;
+    let mut z =
+        (image_seed ^ DOMAIN).wrapping_add((step as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The tensor operations [`sampler_step`] needs. A backend implements these over its own float32
+/// tensors; the step arithmetic itself lives only in [`sampler_step`].
+pub trait H3ImageStepOps {
+    type Tensor;
+    type Error;
+    /// `x + b·y`, element-wise, float32.
+    fn add_scaled(
+        &mut self,
+        x: &Self::Tensor,
+        y: &Self::Tensor,
+        b: f32,
+    ) -> Result<Self::Tensor, Self::Error>;
+    /// `a·x`, element-wise, float32.
+    fn scale(&mut self, x: &Self::Tensor, a: f32) -> Result<Self::Tensor, Self::Error>;
+    /// Standard-normal float32 noise shaped like `like`, drawn deterministically from `seed`.
+    fn gaussian_like(
+        &mut self,
+        like: &Self::Tensor,
+        seed: u64,
+    ) -> Result<Self::Tensor, Self::Error>;
+    /// The sample standard deviation (divisor `n − 1`, `torch.std`'s default) over every element.
+    fn std(&mut self, x: &Self::Tensor) -> Result<f32, Self::Error>;
+    /// `x` clamped element-wise to `[lo, hi]`.
+    fn clamp(&mut self, x: &Self::Tensor, lo: f32, hi: f32) -> Result<Self::Tensor, Self::Error>;
+}
+
+/// Where one step sits: its index, the step count, and the two grid sigmas it moves between.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplerStep {
+    /// The step index, `0..num_steps`.
+    pub step: usize,
+    /// Steps in the run.
+    pub num_steps: usize,
+    /// `σᵢ`, the noise level the velocity was evaluated at.
+    pub sigma: f32,
+    /// `σᵢ₊₁`, the noise level the step moves to (`0` after the last).
+    pub sigma_next: f32,
+    /// The seed of the image being rendered (the request seed plus the image's index in a
+    /// multi-image request); [`lcm_noise_seed`] derives each step's noise seed from it.
+    pub image_seed: u64,
+}
+
+/// One sampler step over the generated rows `x` and their velocity `v`. An edit's reference rows
+/// never reach this function: the backend passes only the generated rows and keeps the reference
+/// rows as they are.
+///
+/// * [`H3ImageSampler::Euler`]: `x + (σᵢ − σᵢ₊₁)·v`, the released update.
+/// * [`H3ImageSampler::Lcm`]: `x0 = x + σᵢ·v`; returns `x0` when `σᵢ₊₁ = 0`, otherwise
+///   `(1 − σᵢ₊₁)·x0 + σᵢ₊₁·s·ε` with `ε` drawn from [`lcm_noise_seed`] and clamped to
+///   `±noise_clip_std·std(ε)` when the clip is on.
+pub fn sampler_step<O: H3ImageStepOps + ?Sized>(
+    ops: &mut O,
+    sampler: &H3ImageSampler,
+    at: SamplerStep,
+    x: &O::Tensor,
+    v: &O::Tensor,
+) -> Result<O::Tensor, O::Error> {
+    match *sampler {
+        H3ImageSampler::Euler => ops.add_scaled(x, v, at.sigma - at.sigma_next),
+        H3ImageSampler::Lcm { noise_clip_std, .. } => {
+            let x0 = ops.add_scaled(x, v, at.sigma)?;
+            if at.sigma_next <= 0.0 {
+                return Ok(x0);
+            }
+            let mut eps = ops.gaussian_like(&x0, lcm_noise_seed(at.image_seed, at.step))?;
+            if noise_clip_std > 0.0 {
+                let c = noise_clip_std * ops.std(&eps)?;
+                eps = ops.clamp(&eps, -c, c)?;
+            }
+            let s = sampler.noise_scale(at.step, at.num_steps);
+            let kept = ops.scale(&x0, 1.0 - at.sigma_next)?;
+            ops.add_scaled(&kept, &eps, at.sigma_next * s)
+        }
+    }
 }
 
 /// Per-row modality tag of an image row (`MINIMAX_H3_IMAGE_TAG`, modular_pipeline.py). Tags index
@@ -744,6 +1012,322 @@ mod tests {
         })
         .unwrap();
         assert_eq!(ids.len(), 1 + 3 + MAX_PROMPT_TOKENS);
+    }
+
+    /// A host `Vec<f32>` implementation of the step ops, with a scripted "gaussian" that returns
+    /// `noise` and records the seed it was asked for.
+    struct HostOps {
+        noise: Vec<f32>,
+        seeds: Vec<u64>,
+    }
+
+    impl H3ImageStepOps for HostOps {
+        type Tensor = Vec<f32>;
+        type Error = ();
+        fn add_scaled(&mut self, x: &Vec<f32>, y: &Vec<f32>, b: f32) -> Result<Vec<f32>, ()> {
+            Ok(x.iter().zip(y).map(|(x, y)| x + b * y).collect())
+        }
+        fn scale(&mut self, x: &Vec<f32>, a: f32) -> Result<Vec<f32>, ()> {
+            Ok(x.iter().map(|x| a * x).collect())
+        }
+        fn gaussian_like(&mut self, like: &Vec<f32>, seed: u64) -> Result<Vec<f32>, ()> {
+            assert_eq!(like.len(), self.noise.len());
+            self.seeds.push(seed);
+            Ok(self.noise.clone())
+        }
+        fn std(&mut self, x: &Vec<f32>) -> Result<f32, ()> {
+            let n = x.len() as f32;
+            let mean = x.iter().sum::<f32>() / n;
+            Ok((x.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / (n - 1.0)).sqrt())
+        }
+        fn clamp(&mut self, x: &Vec<f32>, lo: f32, hi: f32) -> Result<Vec<f32>, ()> {
+            Ok(x.iter().map(|v| v.clamp(lo, hi)).collect())
+        }
+    }
+
+    fn host(noise: &[f32]) -> HostOps {
+        HostOps {
+            noise: noise.to_vec(),
+            seeds: Vec::new(),
+        }
+    }
+
+    fn at(step: usize, sigma: f32, sigma_next: f32) -> SamplerStep {
+        SamplerStep {
+            step,
+            num_steps: 6,
+            sigma,
+            sigma_next,
+            image_seed: 42,
+        }
+    }
+
+    fn close(got: &[f32], want: &[f32]) {
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-6, "{got:?} vs {want:?}");
+        }
+    }
+
+    /// Euler is the released `x + (σᵢ − σᵢ₊₁)·v` and draws no noise.
+    #[test]
+    fn euler_steps_by_the_sigma_delta() {
+        let mut ops = host(&[9.0, 9.0]);
+        let out = sampler_step(
+            &mut ops,
+            &H3ImageSampler::Euler,
+            at(3, 0.75, 0.5),
+            &vec![1.0, 2.0],
+            &vec![0.5, -1.0],
+        )
+        .unwrap();
+        close(&out, &[1.125, 1.75]);
+        assert!(ops.seeds.is_empty());
+    }
+
+    /// LCM: `x0 = x + σ·v`, then `(1 − σ')·x0 + σ'·s·ε` with step 0's `s = s_noise`; the noise is
+    /// drawn from `lcm_noise_seed(image_seed, step)`.
+    #[test]
+    fn lcm_renoises_the_clean_estimate_to_the_next_sigma() {
+        let lcm = H3ImageSampler::Lcm {
+            s_noise: 1.1,
+            s_noise_end: 0.9,
+            noise_clip_std: 0.0,
+        };
+        let mut ops = host(&[1.0, -2.0]);
+        let out = sampler_step(
+            &mut ops,
+            &lcm,
+            at(0, 0.75, 0.5),
+            &vec![1.0, 2.0],
+            &vec![0.5, -1.0],
+        )
+        .unwrap();
+        // x0 = [1.375, 1.25]; 0.5·x0 + 0.5·1.1·[1, -2] = [1.2375, -0.475].
+        close(&out, &[1.2375, -0.475]);
+        assert_eq!(ops.seeds, vec![lcm_noise_seed(42, 0)]);
+
+        // Step 2 of 6: s = 1.1 − 0.2·0.4 = 1.02.
+        let mut ops = host(&[1.0, -2.0]);
+        let out = sampler_step(
+            &mut ops,
+            &lcm,
+            at(2, 0.75, 0.5),
+            &vec![0.0, 0.0],
+            &vec![0.0, 0.0],
+        )
+        .unwrap();
+        close(&out, &[0.51, -1.02]);
+        assert_eq!(ops.seeds, vec![lcm_noise_seed(42, 2)]);
+    }
+
+    /// The last step lands on the clean estimate and draws nothing.
+    #[test]
+    fn lcm_last_step_returns_the_clean_estimate() {
+        let mut ops = host(&[5.0, 5.0]);
+        let out = sampler_step(
+            &mut ops,
+            &H3ImageSampler::lcm_default(),
+            at(5, 0.25, 0.0),
+            &vec![1.0, 2.0],
+            &vec![0.5, -1.0],
+        )
+        .unwrap();
+        close(&out, &[1.125, 1.75]);
+        assert!(ops.seeds.is_empty());
+    }
+
+    /// The clip clamps ε to `±noise_clip_std·std(ε)`, with the sample (n − 1) standard deviation.
+    #[test]
+    fn lcm_clip_bounds_the_noise_by_its_std() {
+        let lcm = H3ImageSampler::Lcm {
+            s_noise: 1.0,
+            s_noise_end: 1.0,
+            noise_clip_std: 1.0,
+        };
+        // mean 0, sample variance (9 + 9 + 1 + 1) / 3 = 20/3, std 2.5819889.
+        let c = (20.0f32 / 3.0).sqrt();
+        let mut ops = host(&[3.0, -3.0, 1.0, -1.0]);
+        let zero = vec![0.0; 4];
+        let out = sampler_step(&mut ops, &lcm, at(1, 0.75, 0.5), &zero, &zero).unwrap();
+        close(&out, &[0.5 * c, -0.5 * c, 0.5, -0.5]);
+        // Clip 0 is off: the same draw passes through untouched.
+        let mut ops = host(&[3.0, -3.0, 1.0, -1.0]);
+        let out = sampler_step(
+            &mut ops,
+            &H3ImageSampler::lcm(1.0),
+            at(1, 0.75, 0.5),
+            &zero,
+            &zero,
+        )
+        .unwrap();
+        close(&out, &[1.5, -1.5, 0.5, -0.5]);
+    }
+
+    /// `s` ramps linearly over `step / (n − 1)`, and a single step uses `s_noise`.
+    #[test]
+    fn noise_scale_interpolates_from_start_to_end() {
+        let lcm = H3ImageSampler::Lcm {
+            s_noise: 1.1,
+            s_noise_end: 0.9,
+            noise_clip_std: 0.0,
+        };
+        let want = [1.1, 1.06, 1.02, 0.98, 0.94, 0.9];
+        for (i, w) in want.iter().enumerate() {
+            assert!((lcm.noise_scale(i, 6) - w).abs() < 1e-6, "step {i}");
+        }
+        assert_eq!(lcm.noise_scale(0, 1), 1.1);
+        assert_eq!(H3ImageSampler::lcm(0.7).noise_scale(3, 6), 0.7);
+        assert_eq!(H3ImageSampler::Euler.noise_scale(0, 6), 0.0);
+    }
+
+    /// No sampler named and no block is Euler — byte-identical to the released loop.
+    #[test]
+    fn the_default_sampler_is_euler() {
+        assert_eq!(H3ImageSampler::default(), H3ImageSampler::Euler);
+        assert_eq!(resolve_sampler(None, None).unwrap(), H3ImageSampler::Euler);
+        assert_eq!(
+            request_sampler(&crate::GenerationRequest::default()).unwrap(),
+            H3ImageSampler::Euler
+        );
+        assert_eq!(
+            resolve_sampler(Some("euler"), None).unwrap(),
+            H3ImageSampler::Euler
+        );
+        assert_eq!(
+            resolve_sampler(Some("lcm"), None).unwrap(),
+            H3ImageSampler::Lcm {
+                s_noise: 1.0,
+                s_noise_end: 1.0,
+                noise_clip_std: 0.0
+            }
+        );
+        let typed = H3ImageSampler::Lcm {
+            s_noise: 1.1,
+            s_noise_end: 0.9,
+            noise_clip_std: 2.5,
+        };
+        assert_eq!(resolve_sampler(Some("lcm"), Some(typed)).unwrap(), typed);
+        assert_eq!(resolve_sampler(None, Some(typed)).unwrap(), typed);
+        assert_eq!(SAMPLER_NAMES, &["euler", "lcm"]);
+    }
+
+    #[test]
+    fn sampler_refusals_are_typed() {
+        let lcm = |s_noise, s_noise_end, noise_clip_std| {
+            resolve_sampler(
+                None,
+                Some(H3ImageSampler::Lcm {
+                    s_noise,
+                    s_noise_end,
+                    noise_clip_std,
+                }),
+            )
+            .unwrap_err()
+        };
+        assert!(matches!(
+            lcm(f32::NAN, 1.0, 0.0),
+            H3ImageRefusal::SamplerNonFinite {
+                field: "s_noise",
+                ..
+            }
+        ));
+        assert!(matches!(
+            lcm(1.0, f32::INFINITY, 0.0),
+            H3ImageRefusal::SamplerNonFinite {
+                field: "s_noise_end",
+                ..
+            }
+        ));
+        assert!(matches!(
+            lcm(1.0, 1.0, f32::NEG_INFINITY),
+            H3ImageRefusal::SamplerNonFinite {
+                field: "noise_clip_std",
+                ..
+            }
+        ));
+        assert_eq!(
+            lcm(0.0, 1.0, 0.0),
+            H3ImageRefusal::SamplerNoiseScale { value: 0.0 }
+        );
+        assert_eq!(
+            lcm(-1.0, 1.0, 0.0),
+            H3ImageRefusal::SamplerNoiseScale { value: -1.0 }
+        );
+        assert_eq!(
+            lcm(1.0, -0.5, 0.0),
+            H3ImageRefusal::SamplerNoiseScaleEnd { value: -0.5 }
+        );
+        assert_eq!(
+            lcm(1.0, 1.0, -1.0),
+            H3ImageRefusal::SamplerNoiseClip { value: -1.0 }
+        );
+        // A ramp down to 0 is admitted: every noised step's scale stays positive.
+        resolve_sampler(
+            None,
+            Some(H3ImageSampler::Lcm {
+                s_noise: 1.0,
+                s_noise_end: 0.0,
+                noise_clip_std: 0.0,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_sampler(Some("dpmpp_2m"), None).unwrap_err(),
+            H3ImageRefusal::UnknownSampler {
+                name: "dpmpp_2m".into()
+            }
+        );
+        assert_eq!(
+            resolve_sampler(Some("euler"), Some(H3ImageSampler::lcm_default())).unwrap_err(),
+            H3ImageRefusal::SamplerConflict {
+                named: "euler".into(),
+                typed: "lcm"
+            }
+        );
+        assert!(matches!(
+            Error::from(lcm(0.0, 1.0, 0.0)),
+            Error::Unsupported(_)
+        ));
+    }
+
+    /// The block is refused on the shared floor by a model that does not advertise it, and its
+    /// floats join the request's finiteness floor.
+    #[test]
+    fn only_an_advertising_model_admits_the_sampler_block() {
+        let mut caps = crate::Capabilities {
+            min_size: 1,
+            max_size: 4096,
+            max_count: 1,
+            ..Default::default()
+        };
+        let mut req = crate::GenerationRequest {
+            h3_image_sampler: Some(H3ImageSampler::lcm_default()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            caps.validate_request("other_model", &req),
+            Err(Error::Unsupported(_))
+        ));
+        caps.supports_h3_image_sampler = true;
+        caps.validate_request("minimax_h3_image", &req).unwrap();
+        req.h3_image_sampler = Some(H3ImageSampler::lcm(f32::NAN));
+        assert_eq!(req.first_nonfinite_float().map(|(f, _)| f), Some("s_noise"));
+    }
+
+    /// The per-step noise seed is a pure function of (image seed, step), distinct per step and
+    /// per image, and never the image seed itself (the initial latent's).
+    #[test]
+    fn lcm_noise_seeds_are_deterministic_and_distinct() {
+        assert_eq!(lcm_noise_seed(7, 3), lcm_noise_seed(7, 3));
+        let mut seen = std::collections::HashSet::new();
+        for seed in [0u64, 1, 7, 7090, u64::MAX] {
+            for step in 0..6 {
+                let s = lcm_noise_seed(seed, step);
+                assert_ne!(s, seed);
+                assert!(seen.insert(s), "seed {seed} step {step} collides");
+            }
+        }
     }
 
     #[test]

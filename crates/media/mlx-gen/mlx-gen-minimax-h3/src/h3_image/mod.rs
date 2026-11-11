@@ -13,6 +13,7 @@
 //! | [`layout`] | the `text2image` / `edit` packed sequences: positions, tags |
 //! | [`dit`] | [`dit::MiniMaxH3ImageDit`] (644 tensors) and the per-step [`dit::ImageDenoiser`] |
 //! | [`model`] | the generator: descriptor, load, validate, staged generate |
+//! | [`sampler`] | the MLX ops behind gen-core's shared Euler / LCM sampler step |
 //! | [`tier`] | q8 / q4 DiT tier resolution; the text encoder is H3's own tier artifact |
 //! | [`memory`] | the shared-ladder contract: rungs 0-2 and 4; rung 3 not applicable on MLX |
 //! | [`admission`] | per-phase host / GPU estimates and the ladder walk (derived, unmeasured) |
@@ -22,6 +23,7 @@ pub mod dit;
 pub mod layout;
 pub mod memory;
 pub mod model;
+pub mod sampler;
 pub mod tier;
 
 pub use dit::{

@@ -52,6 +52,9 @@ mod dit_parity;
 #[path = "h3_image_lora_real.rs"]
 mod h3_image_lora_real;
 
+#[path = "h3_image_sampler_real.rs"]
+mod h3_image_sampler_real;
+
 #[path = "joint_denoise.rs"]
 mod joint_denoise;
 

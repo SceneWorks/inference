@@ -128,7 +128,10 @@ pub fn image_descriptor() -> ModelDescriptor {
             // PDD-distilled: one output head per step, so six is the only legal count.
             supported_steps: StepSupport::Exact(vec![contract::FIXED_STEPS]),
             component_precision_floors: &[],
-            samplers: Vec::new(),
+            // SW-7106: the released velocity Euler (the default) or ComfyUI's stochastic LCM on
+            // the same six-step grid, named by `sampler` and parameterized by `h3_image_sampler`.
+            samplers: contract::SAMPLER_NAMES.to_vec(),
+            supports_h3_image_sampler: true,
             schedulers: Vec::new(),
             min_size: 1,
             max_size: MAX_EDGE,
@@ -319,6 +322,8 @@ impl MiniMaxH3Image {
         let schedule =
             SigmaSchedule::h3_image_distilled().map_err(|e| CandleError::Msg(e.to_string()))?;
         let seed = resolve_seed(req);
+        let sampler =
+            contract::request_sampler(req).map_err(|r| CandleError::Msg(r.to_string()))?;
         tracing::info!(
             width,
             height,
@@ -426,6 +431,8 @@ impl MiniMaxH3Image {
         let rows = denoise_image(
             &mut model,
             &schedule,
+            &sampler,
+            seed,
             &initial,
             layout.num_reference_rows(),
             &self.device,
@@ -560,6 +567,7 @@ pub fn validate_image_request(
             .is_some_and(|n| !n.trim().is_empty()),
         contract::edit_reference_images(&req.conditioning)?.len(),
     )?;
+    contract::request_sampler(req)?;
     let mut sized = req.clone();
     sized.width = width;
     sized.height = height;
@@ -674,6 +682,26 @@ mod tests {
         r.prompt = "  ".into();
         assert!(validate_image_request(&d, &r).is_err());
         assert!(validate_image_request(&d, &request(0, 2048)).is_err());
+        // SW-7106: euler / lcm by name or block; a bad LCM parameter, an unknown name and a
+        // name that contradicts the block are refused.
+        assert_eq!(d.capabilities.samplers, vec!["euler", "lcm"]);
+        let mut r = request(2048, 2048);
+        r.sampler = Some("lcm".into());
+        validate_image_request(&d, &r).unwrap();
+        r.h3_image_sampler = Some(contract::H3ImageSampler::Lcm {
+            s_noise: 1.1,
+            s_noise_end: 0.9,
+            noise_clip_std: 2.0,
+        });
+        validate_image_request(&d, &r).unwrap();
+        r.sampler = Some("euler".into());
+        assert!(validate_image_request(&d, &r).is_err());
+        r.sampler = None;
+        r.h3_image_sampler = Some(contract::H3ImageSampler::lcm(-1.0));
+        assert!(validate_image_request(&d, &r).is_err());
+        let mut r = request(2048, 2048);
+        r.sampler = Some("dpmpp_2m".into());
+        assert!(validate_image_request(&d, &r).is_err());
         let mut r = request(2048, 2048);
         r.conditioning.push(Conditioning::Reference {
             image: candle_gen::gen_core::Image {
