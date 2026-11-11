@@ -33,15 +33,22 @@
 //! `preserve_thinking` on). The card ships no edit-specific parameters; the Diffusers blocks it
 //! recommends reuse the T2I ones for edit, and so does this adapter.
 //!
-//! The JSON schema the card enforces through XGrammar is enforced here by [`parse_t2i`] /
-//! [`parse_edit`] on the finished answer: a reply that is not exactly the schema is refused, never
-//! repaired.
+//! The card serves the expander with a reasoning parser and XGrammar (`--reasoning-parser qwen3
+//! --grammar-backend xgrammar`, `response_format` = the reply schema): the thinking trace is free,
+//! the answer after `</think>` is grammar-constrained, and the client (`scripts/expand_prompt.py`)
+//! `json.loads` the answer with no retry, fallback or extraction. This adapter mirrors that: every
+//! request carries [`Constraint::Json`], which both backends apply only after the reasoning block
+//! closes, so the answer is always well-formed JSON (an unconstrained run produced prose or fenced
+//! answers, SW-7099 run 42954971396, candle-bf16 `t2i-0` and mlx-q4 `t2i-3`). The schema itself
+//! (exact keys, ratio enum) is not a decode constraint here; [`parse_t2i`] / [`parse_edit`] check it
+//! on the finished answer, and a reply that is not exactly the schema is refused, never repaired.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::constraint::Constraint;
 use crate::message::{Content, ImageRef, Message, Role};
 use crate::request::{ReasoningEffort, Sampling, TextLlmRequest, ThinkingMode};
 
@@ -252,6 +259,9 @@ fn request(messages: Vec<Message>, params: &RequestParams) -> TextLlmRequest {
     };
     req.reasoning_effort = params.reasoning_effort;
     req.preserve_thinking = params.preserve_thinking;
+    // Upstream constrains the answer with XGrammar after the reasoning parser splits the thinking
+    // off (module docs); the backends apply this constraint only after `</think>`.
+    req.constraint = Some(Constraint::Json);
     req
 }
 
@@ -643,6 +653,9 @@ pub mod quality {
         /// The last [`THINKING_TAIL_CHARS`] characters of the reasoning trace, kept as evidence
         /// for a reply that broke the schema (a looping or unfinished trace shows here).
         pub thinking_tail: Option<String>,
+        /// The first [`ANSWER_HEAD_CHARS`] characters of the raw answer (the text after the
+        /// thinking block), kept as evidence for a reply that broke the schema.
+        pub answer_head: Option<String>,
     }
 
     /// Base seed of the quality set; case `i` of the run uses `QUALITY_SEED + i`, so a rerun on
@@ -651,6 +664,14 @@ pub mod quality {
 
     /// How much of a failed reply's reasoning trace the evidence keeps.
     pub const THINKING_TAIL_CHARS: usize = 800;
+
+    /// How much of a failed reply's raw answer the evidence keeps.
+    pub const ANSWER_HEAD_CHARS: usize = 800;
+
+    /// What every quality-set request constrains its answer to, as the evidence states it.
+    pub const ANSWER_CONSTRAINT: &str =
+        "json: well-formed JSON after </think> (upstream: XGrammar response_format); \
+         schema checked by parse_t2i/parse_edit";
 
     /// Judge a finished reply: the parsed expansion, or why it is refused. A reply that stopped on
     /// the token budget is named as a truncation — in the reasoning trace (no answer text at all)
@@ -704,6 +725,9 @@ pub mod quality {
                 }
                 _ => None,
             };
+            let answer_head = error
+                .as_ref()
+                .map(|_| out.text.chars().take(ANSWER_HEAD_CHARS).collect());
             runs.push(CaseRun {
                 id,
                 expansion,
@@ -711,6 +735,7 @@ pub mod quality {
                 generated_tokens: out.usage.generated_tokens,
                 finish_reason: out.finish_reason.map(|f| format!("{f:?}").to_lowercase()),
                 thinking_tail,
+                answer_head,
             });
             Ok(())
         };
@@ -740,10 +765,16 @@ pub mod quality {
                     "generated_tokens": r.generated_tokens,
                     "finish_reason": r.finish_reason,
                     "thinking_tail": r.thinking_tail,
+                    "answer_head": r.answer_head,
                 })
             })
             .collect();
-        serde_json::json!({"label": label, "revision": super::REVISION, "cases": cases})
+        serde_json::json!({
+            "label": label,
+            "revision": super::REVISION,
+            "answer_constraint": ANSWER_CONSTRAINT,
+            "cases": cases,
+        })
     }
 
     /// Read the reference expansions back out of [`runs_to_json`]'s document, by case id.
@@ -861,6 +892,7 @@ mod tests {
         assert_eq!(req.thinking, ThinkingMode::Enabled);
         assert_eq!(req.reasoning_effort, Some(ReasoningEffort::XHigh));
         assert_eq!(req.preserve_thinking, Some(true));
+        assert_eq!(req.constraint, Some(Constraint::Json));
         assert_eq!(files.params().aspect_ratios, ["1:1", "16:9"]);
     }
 
@@ -888,6 +920,7 @@ mod tests {
         let case = &cases[1];
         let req = edit_request(&files, case.instruction, &case.references, &case.aspect).unwrap();
         assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.constraint, Some(Constraint::Json));
         let parts = &req.messages[0].content;
         assert_eq!(parts.len(), 2 + 2 * 2 + 1);
         assert_eq!(parts[0], Content::text("EDIT TASK"));
@@ -1012,6 +1045,7 @@ mod tests {
                 generated_tokens: 9,
                 finish_reason: Some("stop".into()),
                 thinking_tail: None,
+                answer_head: None,
             },
             CaseRun {
                 id: "edit-0".into(),
@@ -1020,6 +1054,7 @@ mod tests {
                 generated_tokens: 7,
                 finish_reason: Some("stop".into()),
                 thinking_tail: None,
+                answer_head: None,
             },
         ];
         let doc = runs_to_json("nvfp4", &reference);
@@ -1073,6 +1108,63 @@ mod tests {
         assert!(stopped.contains("not JSON"), "{stopped}");
         let ok = r#"{"expanded_caption":"A cat.","aspect_ratio":"1:1"}"#;
         assert!(judge_reply(ok, Some(FinishReason::Length), 4096, &parse).is_ok());
+    }
+
+    #[test]
+    fn every_quality_request_is_json_constrained_and_a_refused_answer_is_kept() {
+        use crate::output::{StreamEvent, TextLlmOutput};
+        use crate::{TextLlm, TextLlmDescriptor};
+        // Answers every request with prose, as an unconstrained run did (run 42954971396).
+        struct Prose(std::cell::RefCell<Vec<Option<Constraint>>>);
+        impl TextLlm for Prose {
+            fn descriptor(&self) -> &TextLlmDescriptor {
+                unreachable!("run_set never reads the descriptor")
+            }
+            fn validate(&self, _: &TextLlmRequest) -> crate::Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                req: &TextLlmRequest,
+                _: &mut dyn FnMut(StreamEvent),
+            ) -> crate::Result<TextLlmOutput> {
+                self.0.borrow_mut().push(req.constraint);
+                Ok(TextLlmOutput {
+                    text: "Here is the caption: a red bicycle.".into(),
+                    thinking: Some("plan".into()),
+                    finish_reason: Some(crate::FinishReason::Stop),
+                    ..Default::default()
+                })
+            }
+        }
+        let (dir, digest) = synthetic_tree();
+        let files = PromptFiles::load_with_manifest_digest(dir.path(), &digest).unwrap();
+        let llm = Prose(Default::default());
+        let runs = quality::run_set(&llm, &files).unwrap();
+        let seen = llm.0.borrow();
+        assert_eq!(seen.len(), runs.len());
+        assert!(
+            seen.iter().all(|c| *c == Some(Constraint::Json)),
+            "{seen:?}"
+        );
+        for run in &runs {
+            assert!(run.expansion.is_none());
+            assert!(
+                run.error.as_deref().unwrap().contains("not JSON"),
+                "{run:?}"
+            );
+            assert_eq!(
+                run.answer_head.as_deref(),
+                Some("Here is the caption: a red bicycle.")
+            );
+            assert_eq!(run.thinking_tail.as_deref(), Some("plan"));
+        }
+        let doc = quality::runs_to_json("candle-bf16", &runs);
+        assert_eq!(doc["answer_constraint"], quality::ANSWER_CONSTRAINT);
+        assert_eq!(
+            doc["cases"][0]["answer_head"],
+            "Here is the caption: a red bicycle."
+        );
     }
 
     #[test]
