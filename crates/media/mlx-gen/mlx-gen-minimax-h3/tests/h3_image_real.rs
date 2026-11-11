@@ -872,3 +872,247 @@ fn h3_image_t2i_renders_2048_q4() {
     render_tier("q4", mlx_gen::gen_core::Quant::Q4);
     println!("MODEL_INFERENCE_BODY_COMPLETED h3_image_real::h3_image_t2i_renders_2048_q4");
 }
+
+/// The q4 tier's load spec: the converted DiT and MiniMax-H3's own q4 text encoder, at `shape`.
+fn q4_spec(shape: mlx_gen::gen_core::LoadShape) -> LoadSpec {
+    let te = PathBuf::from(std::env::var("MINIMAX_H3_TIER_SNAPSHOT").unwrap_or_default())
+        .join("q4")
+        .join("text_encoder");
+    assert!(
+        te.join("config.json").is_file(),
+        "MINIMAX_H3_TIER_SNAPSHOT must hold MiniMax-H3's q4/text_encoder/ (found no {})",
+        te.join("config.json").display()
+    );
+    let mut spec = LoadSpec::new(WeightsSource::Dir(image_snapshot()));
+    spec.quantize = Some(mlx_gen::gen_core::Quant::Q4);
+    spec.load_shape = shape;
+    spec.components.insert(
+        IMAGE_DIT_COMPONENT.to_owned(),
+        WeightsSource::Dir(tiers_root().join("q4").join(IMAGE_DIT_COMPONENT)),
+    );
+    spec.components
+        .insert(TEXT_ENCODER_COMPONENT.to_owned(), WeightsSource::Dir(te));
+    spec
+}
+
+/// SW-7094: a windowed (rung 4) image DiT reproduces the resident one. One step at 1024² through
+/// `ImageDenoiser::new` and through `ImageDenoiser::new_windowed` (window 1) on the real q4 tier,
+/// with identical synthetic inputs; H3's block stream is bit-identical on every tier, so the two
+/// velocities must be too.
+#[test]
+#[ignore = "needs the converted q4 tier (MINIMAX_H3_IMAGE_TIERS_ROOT); loads the q4 image DiT twice"]
+fn h3_image_streamed_dit_matches_resident_q4() {
+    let dir = tiers_root().join("q4").join(IMAGE_DIT_COMPONENT);
+    let cfg = MiniMaxH3ImageDitConfig::default();
+    let layout = ImageLayout::t2i(256, 64, 64, cfg.base.patch_size).unwrap();
+    let key = |seed| mlx_rs::random::key(seed).unwrap();
+    let context =
+        mlx_rs::random::normal::<f32>(&[1, 256, cfg.base.text_dim], None, None, Some(&key(5)))
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+    let rows = mlx_rs::random::normal::<f32>(
+        &[
+            1,
+            layout.num_packed_image_rows(),
+            cfg.base.video_patch_dim(),
+        ],
+        None,
+        None,
+        Some(&key(6)),
+    )
+    .unwrap();
+    mlx_rs::transforms::eval([&context, &rows]).unwrap();
+    let schedule = || SigmaSchedule::h3_image_distilled().unwrap();
+    let resident = {
+        let dit = MiniMaxH3ImageDit::load_dir(&dir, Dtype::Bfloat16).unwrap();
+        let d = ImageDenoiser::new(dit, layout.clone(), &context, schedule()).unwrap();
+        let v = d.velocity(0, &rows).unwrap();
+        mlx_rs::transforms::eval([&v]).unwrap();
+        v
+    };
+    mlx_rs::memory::clear_cache();
+    let streamed = {
+        let dit = MiniMaxH3ImageDit::load_dir_deferred(&dir, Dtype::Bfloat16).unwrap();
+        assert!(dit.is_deferred() && dit.blocks().is_empty());
+        let d = ImageDenoiser::new_windowed(
+            dit,
+            layout.clone(),
+            &context,
+            schedule(),
+            1,
+            mlx_gen::CancelFlag::default(),
+        )
+        .unwrap();
+        assert_eq!(d.block_window().unwrap().window_count(), 50);
+        assert_eq!(d.released_adaln_bytes(), 0);
+        let v = d.velocity(0, &rows).unwrap();
+        mlx_rs::transforms::eval([&v]).unwrap();
+        v
+    };
+    let diff = mlx_gen::testing::max_abs_diff_f32(&resident, &streamed);
+    println!("minimax_h3_image q4 streamed vs resident step 0: max|Δ| {diff:e}");
+    assert_eq!(
+        diff, 0.0,
+        "the windowed image DiT moved the velocity by {diff:e} — H3's block stream is bit-identical"
+    );
+    crate::model_inference_device::record_model_inference_device();
+    println!(
+        "MODEL_INFERENCE_BODY_COMPLETED h3_image_real::h3_image_streamed_dit_matches_resident_q4"
+    );
+}
+
+/// SW-7094 AC2: a 16 MP (4096²) q4 request that does NOT fit resident under the admitted budget is
+/// admitted on rung 4 by `h3_image::admission::admit` and completes through the streamed route.
+///
+/// The budget is set to 1.25x the streamed estimate, which the test asserts is below the staged
+/// estimate — so the resident and staged rungs are refused and the walk must stream. The render
+/// runs with the generation memory the contract derives for that selection, on a
+/// `DeferredMaterialization` load, and its MLX peak must stay inside the budget. The per-phase
+/// estimates are printed (derived, not recorded as anchors).
+#[test]
+#[ignore = "needs the converted q4 tier, MINIMAX_H3_IMAGE_SNAPSHOT and MiniMax-H3's q4 text encoder (MINIMAX_H3_TIER_SNAPSHOT); 16 MP streamed render"]
+fn h3_image_t2i_renders_16mp_streamed_q4() {
+    use mlx_gen::gen_core::{LoadShape, MemoryBudget, MemoryStrategy};
+    use mlx_gen_minimax_h3::h3_image::admission::{
+        admit, estimate, ladder, ImageMemoryFacts, ImageRequestShape,
+    };
+    let spec = q4_spec(LoadShape::DeferredMaterialization);
+    let registry = mlx_gen_minimax_h3::h3_image::register_providers(
+        mlx_gen::gen_core::ProviderRegistryBuilder::new(),
+    )
+    .build()
+    .unwrap();
+    let registration = registry
+        .generators()
+        .find(|g| (g.descriptor)().id == "minimax_h3_image")
+        .expect("minimax_h3_image is registered");
+    let generator = (registration.load)(&spec).unwrap();
+    let contract = generator.memory_strategy_contract().unwrap().clone();
+    let tier = mlx_gen::request_scope::loaded_tier(&spec);
+    let facts = ImageMemoryFacts::resolve(&spec).unwrap();
+    let shape = ImageRequestShape {
+        prompt_tokens: Some(64),
+        ..ImageRequestShape::text_to_image(4096, 4096)
+    };
+    let at = |strategy| {
+        let selection = ladder(&contract, tier)
+            .into_iter()
+            .find(|s| s.strategy == strategy)
+            .unwrap();
+        estimate(&contract, &facts, &shape, &selection).unwrap()
+    };
+    let staged = at(MemoryStrategy::StagedResidency);
+    let streamed = at(MemoryStrategy::BoundedTransformerResidency);
+    let total = streamed.peak_bytes() + streamed.peak_bytes() / 4;
+    assert!(
+        total < staged.peak_bytes(),
+        "the budget {total} must refuse the staged rung ({} B) for this to test streaming",
+        staged.peak_bytes()
+    );
+    let admission = admit(
+        &contract,
+        &facts,
+        &shape,
+        tier,
+        MemoryBudget {
+            total_bytes: total,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        admission.estimate.selection.strategy,
+        MemoryStrategy::BoundedTransformerResidency
+    );
+    for e in admission.rejected.iter().chain([&admission.estimate]) {
+        println!(
+            "estimate {:?}: peak {:.2} GB ({:?} binds) — {}",
+            e.selection.strategy,
+            e.peak_bytes() as f64 / 1e9,
+            e.binding_phase(),
+            e.phases
+                .iter()
+                .map(|p| format!(
+                    "{:?} {:.2} GB GPU + {:.3} GB host",
+                    p.phase,
+                    p.device_bytes as f64 / 1e9,
+                    p.host_bytes as f64 / 1e9
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let req = GenerationRequest {
+        prompt: "A lighthouse on a rocky coast at dusk, warm light in the lamp room, waves \
+                 breaking on the rocks, detailed photograph"
+            .into(),
+        width: 4096,
+        height: 4096,
+        count: 1,
+        seed: Some(7094),
+        memory: contract.generation_memory(&admission.estimate.selection),
+        ..Default::default()
+    };
+    assert!(req.memory.is_some_and(|m| m.stream_transformer_blocks));
+    generator.validate(&req).unwrap();
+    mlx_rs::memory::clear_cache();
+    mlx_rs::memory::reset_peak_memory();
+    let started = std::time::Instant::now();
+    let mut steps = 0u32;
+    let out = generator
+        .generate(&req, &mut |p| {
+            if let mlx_gen::gen_core::Progress::Step { current, .. } = p {
+                steps = current;
+            }
+        })
+        .unwrap();
+    let peak = mlx_rs::memory::get_peak_memory() as u64;
+    let GenerationOutput::Images(images) = out else {
+        panic!("minimax_h3_image must return images");
+    };
+    let image = &images[0];
+    assert_eq!((image.width, image.height), (4096, 4096));
+    assert_eq!(steps, 6);
+    let n = image.pixels.len() as f64;
+    let mean = image.pixels.iter().map(|&p| p as f64).sum::<f64>() / n;
+    let std = (image
+        .pixels
+        .iter()
+        .map(|&p| (p as f64 - mean).powi(2))
+        .sum::<f64>()
+        / n)
+        .sqrt();
+    println!(
+        "minimax_h3_image 4096² q4 streamed render in {:.1} s: MLX peak {:.2} GB against a {:.2} GB \
+         budget (streamed estimate {:.2} GB); pixel mean {mean:.2}, std {std:.2}",
+        started.elapsed().as_secs_f64(),
+        peak as f64 / 1e9,
+        total as f64 / 1e9,
+        streamed.peak_bytes() as f64 / 1e9
+    );
+    assert!(
+        std > 10.0,
+        "the 16 MP render is near-constant (std {std:.2})"
+    );
+    assert!(
+        peak <= total,
+        "the streamed render peaked at {peak} B, above the {total} B budget it was admitted under"
+    );
+    if let Ok(out) = std::env::var("MINIMAX_H3_IMAGE_RENDER_OUT") {
+        if !out.is_empty() {
+            image::save_buffer(
+                format!("{out}-16mp-streamed-q4.png"),
+                &image.pixels,
+                image.width,
+                image.height,
+                image::ColorType::Rgb8,
+            )
+            .unwrap();
+        }
+    }
+    crate::model_inference_device::record_model_inference_device();
+    println!("MODEL_INFERENCE_BODY_COMPLETED h3_image_real::h3_image_t2i_renders_16mp_streamed_q4");
+}

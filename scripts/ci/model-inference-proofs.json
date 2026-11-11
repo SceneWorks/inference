@@ -313046,6 +313046,107 @@
     "package": "mlx-gen-minimax-h3",
     "target": "integration",
     "target_kind": "test",
+    "fqn": "h3_image_real::h3_image_streamed_dit_matches_resident_q4",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real q4 DiT tier converted from MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/, pdd_fused_heads) loaded resident and deferred (rung 4, window 1); synthetic text rows and latents (SW-7094)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile, q4 tier step (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_TIERS_ROOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs the converted q4 tier (MINIMAX_H3_IMAGE_TIERS_ROOT); loads the q4 image DiT twice",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_real::h3_image_t2i_renders_16mp_streamed_q4",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real q4 DiT tier converted from MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/, pdd_fused_heads) plus its vae_diffusers/, tokenizer/ and MiniMax-H3's own SceneWorks/minimax-h3-mlx@137ce668 q4/text_encoder/ shards 1-12 ; DeferredMaterialization load, 4096x4096 admitted on rung 4 (SW-7094)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile, 16 MP streamed render (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT",
+      "MINIMAX_H3_IMAGE_TIERS_ROOT",
+      "MINIMAX_H3_TIER_SNAPSHOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "needs the converted q4 tier, MINIMAX_H3_IMAGE_SNAPSHOT and MiniMax-H3's q4 text encoder (MINIMAX_H3_TIER_SNAPSHOT); 16 MP streamed render",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_bounded_attention_real::h3_image_rung3_verdict_holds_at_image_geometry",
+    "execution_role": "direct",
+    "backend": "mlx",
+    "device_binding": "runtime-stream",
+    "fixture_identity": "real q4 DiT tier converted from MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/, pdd_fused_heads); synthetic 512-token text rows and latents at 2048 and 4096 px (SW-7094)",
+    "configuration_source": "body-local construction (preserved verbatim)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image real-weights profile, rung-3 image-geometry verdict (mlx-minimax-h3-image job)",
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_TIERS_ROOT"
+    ],
+    "route_metadata": {
+      "ignore_reason": "SW-7094: needs MINIMAX_H3_IMAGE_TIERS_ROOT (the converted q4 image DiT) + Metal; loads the 50-block DiT once per arm",
+      "env_gates": [],
+      "route": "preexisting #[ignore] manual workflow (env-gated); run by the minimax-h3-image real-weights profile with --ignored --exact --nocapture"
+    },
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "source": "crates/media/mlx-gen/mlx-gen-minimax-h3/tests/h3_image_bounded_attention_real.rs"
+  },
+  {
+    "package": "mlx-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
     "fqn": "h3_image_real::h3_image_edit_renders_three_references_bf16",
     "execution_role": "direct",
     "backend": "mlx",
