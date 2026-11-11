@@ -222,6 +222,14 @@ pub fn validate_request(
 pub const IMAGE_TAG: i32 = 0;
 /// Per-row modality tag of a text row (`MINIMAX_H3_TEXT_TAG`).
 pub const TEXT_TAG: i32 = 1;
+/// Family DiT parity bound (requirement E9): a backend's velocity matches the diffusers
+/// `MiniMaxH3ImageTransformer2DModel` (float32 activations over the same bf16 weights) when
+/// `||got - want|| / ||want||` is at most this, at step 0 and at the on-trajectory step 3. Both the
+/// MLX and the Candle real-weight gates assert it.
+pub const DIT_PARITY_MAX_REL_L2: f32 = 5e-2;
+/// Family DiT parity bound: the flattened velocity's cosine similarity against diffusers is at
+/// least this. Asserted next to [`DIT_PARITY_MAX_REL_L2`] by both backends.
+pub const DIT_PARITY_MIN_COSINE: f32 = 0.995;
 /// VAE spatial compression: one latent cell per 16x16 pixels.
 pub const VAE_SPATIAL_RATIO: u32 = 16;
 

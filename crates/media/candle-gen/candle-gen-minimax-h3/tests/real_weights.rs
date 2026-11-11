@@ -1677,14 +1677,20 @@ fn image_vae_tiled_decode_lowers_the_16mp_peak() {
 
 // ── SW-7091: MiniMax-H3-Image DiT and text-to-image ──────────────────────────────────────────────
 
-/// Peak-relative max-abs-diff bound for one bf16 DiT evaluation against the diffusers
-/// `MiniMaxH3ImageTransformer2DModel` (50 blocks, float32 heads), computed with float32
-/// activations over the same bf16-stored weights (the reference's `compute_dtype`). This side runs
-/// bf16 blocks with its own attention kernels, so this is a cross-implementation bound, not an f32
-/// one.
-const IMAGE_DIT_PEAK_TOL: f32 = 6e-2;
-/// Mean-relative bound for the same comparison — the stricter, aggregate half of the gate.
-const IMAGE_DIT_MEAN_TOL: f32 = 2e-2;
+// The DiT gate asserts the family bounds (requirement E9, `gen_core::h3_image`), the same metric and
+// values as the MLX gate: rel-L2 and cosine of the velocity against diffusers' float32-activation
+// forward over the same bf16 weights. Peak and mean errors are printed as diagnostics only.
+use candle_gen::gen_core::h3_image::{DIT_PARITY_MAX_REL_L2, DIT_PARITY_MIN_COSINE};
+
+/// `(||got - want|| / ||want||, cosine)` over the flattened tensors, in f32.
+fn image_dit_rel_l2_cosine(got: &Tensor, want: &Tensor) -> (f32, f32) {
+    let (g, w) = (flat(got), flat(want));
+    assert_eq!(g.len(), w.len(), "length mismatch");
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let diff: Vec<f32> = g.iter().zip(&w).map(|(a, b)| a - b).collect();
+    let dot: f32 = g.iter().zip(&w).map(|(a, b)| a * b).sum();
+    (norm(&diff) / norm(&w), dot / (norm(&g) * norm(&w)))
+}
 
 /// The committed producer whose output the DiT gate accepts.
 const IMAGE_DIT_PRODUCER: &[u8] =
@@ -1923,27 +1929,36 @@ fn image_dit_first_step_matches_the_official_diffusers_transformer() {
     let (p0, m0) = rel(&got0, &want0);
     let (pt, mt) = rel(&traj, &traj_want);
     let (p3, m3) = rel(&got3, &want3);
-    let (between, _) = rel(&want0, &want3);
-    let (cross, _) = rel(&got3, &want0);
+    let (l0, c0) = image_dit_rel_l2_cosine(&got0, &want0);
+    let (lt, ct) = image_dit_rel_l2_cosine(&traj, &traj_want);
+    let (l3, c3) = image_dit_rel_l2_cosine(&got3, &want3);
+    let (between, _) = image_dit_rel_l2_cosine(&want3, &want0);
+    let (cross, _) = image_dit_rel_l2_cosine(&got3, &want0);
     println!(
-        "image DiT vs diffusers (bounds peak {IMAGE_DIT_PEAK_TOL:.0e} / mean {IMAGE_DIT_MEAN_TOL:.0e}): \
-         step0 peak {p0:.3e} mean {m0:.3e}; step3 on-trajectory peak {pt:.3e} mean {mt:.3e}; \
-         reference step0 vs step3 {between:.3e}; candle step3 vs reference step0 {cross:.3e}"
+        "image DiT vs diffusers (family bounds rel-L2 {DIT_PARITY_MAX_REL_L2:.0e}, cosine {DIT_PARITY_MIN_COSINE}): \
+         step0 rel-L2 {l0:.3e} cosine {c0:.6}; step3 on-trajectory rel-L2 {lt:.3e} cosine {ct:.6}; \
+         reference step0 vs step3 rel-L2 {between:.3e}; candle step3 vs reference step0 {cross:.3e}"
+    );
+    println!(
+        "image DiT peak/mean diagnostics (not asserted): step0 peak {p0:.3e} mean {m0:.3e}; step3 \
+         on-trajectory peak {pt:.3e} mean {mt:.3e}"
     );
     println!(
         "image DiT step 3 off-trajectory (step-0 noise rows at t = 0.25; diagnostic, not \
-         asserted): peak {p3:.3e} mean {m3:.3e}"
+         asserted): rel-L2 {l3:.3e} cosine {c3:.6} peak {p3:.3e} mean {m3:.3e}"
     );
+    for (what, l2, cos) in [("step 0", l0, c0), ("step 3 on-trajectory", lt, ct)] {
+        assert!(
+            l2 <= DIT_PARITY_MAX_REL_L2,
+            "{what} diverges: rel-L2 {l2:.3e}"
+        );
+        assert!(
+            cos >= DIT_PARITY_MIN_COSINE,
+            "{what} cosine {cos:.6} below {DIT_PARITY_MIN_COSINE}"
+        );
+    }
     assert!(
-        p0 < IMAGE_DIT_PEAK_TOL && m0 < IMAGE_DIT_MEAN_TOL,
-        "step 0 diverges"
-    );
-    assert!(
-        pt < IMAGE_DIT_PEAK_TOL && mt < IMAGE_DIT_MEAN_TOL,
-        "step 3 on-trajectory diverges"
-    );
-    assert!(
-        between > IMAGE_DIT_PEAK_TOL && cross > IMAGE_DIT_PEAK_TOL,
+        between > DIT_PARITY_MAX_REL_L2 && cross > DIT_PARITY_MAX_REL_L2,
         "steps 0 and 3 must be distinguishable for the head check to mean anything"
     );
     assert_eq!(model.forwards(), 3);

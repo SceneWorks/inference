@@ -25,13 +25,11 @@ use mlx_gen_minimax_h3::tensor::slice_axis;
 /// The committed producer whose output the parity gate accepts.
 const DIT_PRODUCER: &[u8] = include_bytes!("../../tools/dump_minimax_h3_image_dit_real.py");
 
-/// Relative L2 bound for a bf16 50-block DiT against the diffusers forward (CPU torch, float32
-/// activations over the same bf16-stored weights — the reference's `compute_dtype`). The MLX side
-/// rounds its residual stream to bf16 across 50 blocks; the cosine bound below is the shape check,
-/// this one the magnitude check.
-const DIT_REL_L2_TOL: f32 = 5e-2;
-/// Minimum cosine similarity of each step's velocity against diffusers.
-const DIT_MIN_COSINE: f32 = 0.995;
+/// The family DiT parity bounds (requirement E9), shared with the Candle gate: a bf16 50-block DiT
+/// against the diffusers forward (CPU torch, float32 activations over the same bf16-stored weights).
+use mlx_gen::gen_core::h3_image::{
+    DIT_PARITY_MAX_REL_L2 as DIT_REL_L2_TOL, DIT_PARITY_MIN_COSINE as DIT_MIN_COSINE,
+};
 
 fn image_snapshot() -> PathBuf {
     let raw = std::env::var("MINIMAX_H3_IMAGE_SNAPSHOT").unwrap_or_default();
