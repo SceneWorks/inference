@@ -599,11 +599,20 @@ fn h3_image_edit_reference_latents_match_diffusers() {
 }
 
 /// AC1: a 3-reference edit's step-0 (head 0) and step-3 (head 3) DiT outputs match diffusers'
-/// `MiniMaxH3ImageTransformer2DModel` over `[text | 3 references | 512² image]`. The reference
-/// rows are built here — `0.999` noising, per-reference patchify, packed in front — from the
-/// reference's latents and draws, and must equal the producer's rows before the DiT runs; the
-/// layout (each reference on its own grid at its own rotary slot) and the held `0.999` row class
-/// are this crate's.
+/// `MiniMaxH3ImageTransformer2DModel` over `[text | 3 references | 512² image]`, computed by the
+/// reference with float32 activations over the bf16 weights (`compute_dtype`), as the `text2image`
+/// gate's reference is. The reference rows are built here — `0.999` noising, per-reference
+/// patchify, packed in front — from the reference's latents and draws, and must equal the
+/// producer's rows before the DiT runs; the layout (each reference on its own grid at its own
+/// rotary slot) and the held `0.999` row class are this crate's.
+///
+/// Step 0 is asserted on the packed rows. Step 3 is asserted on the sampler's own `x_3`
+/// (`diag.traj.rows3`: the generated rows walked through steps 0-2 by the reference, the reference
+/// rows unchanged), through head 3 at `t = 0.25`. Printed, never asserted: every stage the
+/// reference recorded (both timestep rows of `temb`, `norm_out`, block 0's AdaLN tables, the
+/// residual stream after the `diag_layers`, `norm_out`'s output), the velocity error over the
+/// reference rows and over the generated rows separately, step 3 on the step-0 rows, and both
+/// asserted velocities against the reference's own bf16-compute forward (`diag.bf16.*`).
 #[test]
 #[ignore = "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_IMAGE_EDIT_REFERENCE; ~40 GB resident"]
 fn h3_image_edit_first_step_matches_diffusers() {
@@ -611,6 +620,11 @@ fn h3_image_edit_first_step_matches_diffusers() {
 
     let root = image_snapshot();
     let r = edit_reference();
+    assert_eq!(
+        r.metadata("compute_dtype").unwrap_or_default(),
+        "float32",
+        "the asserted edit reference must be computed with float32 activations"
+    );
     let tags: Vec<i32> = host_f32(r.require("in.token_tags").unwrap())
         .into_iter()
         .map(|v| v as i32)
@@ -654,6 +668,8 @@ fn h3_image_edit_first_step_matches_diffusers() {
         layout.num_reference_rows().to_string(),
         r.metadata("num_reference_rows").unwrap()
     );
+    let num_ref = layout.num_reference_rows();
+    let num_packed = layout.num_packed_image_rows();
     let denoiser = ImageDenoiser::new(
         dit,
         layout,
@@ -661,31 +677,158 @@ fn h3_image_edit_first_step_matches_diffusers() {
         SigmaSchedule::h3_image_distilled().unwrap(),
     )
     .unwrap();
+    let want_t: Vec<f32> = r
+        .metadata("timesteps")
+        .unwrap()
+        .split(',')
+        .map(|t| t.parse().unwrap())
+        .collect();
+    let sched_t = denoiser.schedule().timesteps();
+    assert_eq!(
+        want_t,
+        vec![sched_t[0], sched_t[3]],
+        "the timesteps must be the released sampler's float32 values"
+    );
+    let diag_layers: Vec<usize> = r
+        .metadata("diag_layers")
+        .expect("the reference records its diag_layers")
+        .split(',')
+        .map(|k| k.parse().unwrap())
+        .collect();
+    // The reference's tables hold one row block per DISTINCT timestep of the step, ascending: the
+    // step's timestep (row class 0), then the reference rows' 0.999 (row class 1).
+    let blocks = |table: &Array, step: usize, rows: i32| -> Array {
+        let schedule = denoiser.adaln_cache().schedule();
+        let parts: Vec<Array> = (0..2)
+            .map(|class| {
+                let g = schedule.global_timestep_index(step, class).unwrap();
+                slice_axis(table, 0, g * rows, (g + 1) * rows).unwrap()
+            })
+            .collect();
+        mlx_rs::ops::concatenate_axis(&parts, 0).unwrap()
+    };
+    let regions = |step: usize, what: &str, got: &Array, want: &Array| {
+        for (name, lo, hi) in [
+            ("reference rows", 0, num_ref),
+            ("generated rows", num_ref, num_packed),
+        ] {
+            println!(
+                "{}",
+                stage_line(
+                    step,
+                    &format!("{what} {name}"),
+                    &slice_axis(got, 1, lo, hi).unwrap(),
+                    &slice_axis(want, 1, lo, hi).unwrap(),
+                )
+            );
+        }
+    };
     let mut results = Vec::new();
     for step in [0usize, 3] {
-        let got = denoiser.velocity(step, &rows).unwrap();
+        let mut trace = ImageDitTrace::new(&diag_layers);
+        let got = denoiser.velocity_traced(step, &rows, &mut trace).unwrap();
         mlx_rs::transforms::eval([&got]).unwrap();
         let want = r.require(&format!("out.step{step}")).unwrap();
         assert_eq!(got.shape(), want.shape(), "step {step} shape");
+
+        let d = |name: &str| r.require(&format!("diag.step{step}.{name}")).unwrap();
+        let mods = denoiser.adaln_cache().modulation(0).unwrap();
+        let block0 = mlx_rs::ops::stack_axis(
+            &mods
+                .tables()
+                .map(|t| blocks(t, step, 3))
+                .collect::<Vec<_>>(),
+            0,
+        )
+        .unwrap();
+        let norm_out = denoiser.norm_out_modulation();
+        let mut lines = vec![
+            stage_line(step, "temb", &blocks(denoiser.temb(), step, 1), d("temb")),
+            stage_line(
+                step,
+                "norm_out.shift",
+                &blocks(&norm_out.shift, step, 1),
+                d("norm_out.shift"),
+            ),
+            stage_line(
+                step,
+                "norm_out.scale",
+                &blocks(&norm_out.scale, step, 1),
+                d("norm_out.scale"),
+            ),
+            stage_line(step, "block0.adaln", &block0, d("block0.adaln")),
+        ];
+        for (layer, hidden) in &trace.hidden {
+            lines.push(stage_line(
+                step,
+                &format!("hidden.block{layer}"),
+                hidden,
+                d(&format!("hidden.block{layer}")),
+            ));
+        }
+        lines.push(stage_line(
+            step,
+            "pre_head",
+            trace.pre_head.as_ref().expect("the trace records norm_out"),
+            d("pre_head"),
+        ));
+        lines.push(stage_line(step, "velocity", &got, want));
+        for line in lines {
+            println!("{line}");
+        }
+        regions(step, "velocity", &got, want);
         results.push((step, rel_l2(&got, want), cosine(&got, want), got));
     }
+    // Asserted step 3: the sampler's own x_3, reached by the reference from the same rows.
+    let traj_rows = r.require("diag.traj.rows3").unwrap().clone();
+    let traj = denoiser.velocity(3, &traj_rows).unwrap();
+    mlx_rs::transforms::eval([&traj]).unwrap();
+    let traj_want = r.require("diag.traj.out3").unwrap();
+    assert_eq!(
+        traj.shape(),
+        traj_want.shape(),
+        "on-trajectory step 3 shape"
+    );
+    println!("{}", stage_line(3, "on-trajectory", &traj, traj_want));
+    regions(3, "on-trajectory", &traj, traj_want);
+    // The reference's own rounding: the same two asserted inputs at bf16 compute.
+    let want0 = r.require("out.step0").unwrap();
+    let bf16_step0 = r.require("diag.bf16.step0").unwrap();
+    let bf16_traj = r.require("diag.bf16.traj.out3").unwrap();
+    println!("{}", stage_line(0, "ref bf16 vs f32", bf16_step0, want0));
+    println!("{}", stage_line(3, "ref bf16 vs f32", bf16_traj, traj_want));
+    println!(
+        "{}",
+        stage_line(0, "vs ref bf16", &results[0].3, bf16_step0)
+    );
+    println!("{}", stage_line(3, "traj vs ref bf16", &traj, bf16_traj));
     let head_gap = rel_l2(
         &results[0].3,
         &results[1].3.as_dtype(Dtype::Float32).unwrap(),
     );
-    for (step, rel, cos, _) in &results {
+    let (off_rel, off_cos) = (results[1].1, results[1].2);
+    let asserted = [
+        ("step 0", results[0].1, results[0].2),
+        (
+            "step 3 on-trajectory",
+            rel_l2(&traj, traj_want),
+            cosine(&traj, traj_want),
+        ),
+    ];
+    for (what, rel, cos) in &asserted {
         println!(
-            "h3-image edit DiT step {step} vs diffusers: rel-L2 {rel:.3e} (bound \
+            "h3-image edit DiT {what} vs diffusers: rel-L2 {rel:.3e} (bound \
              {DIT_REL_L2_TOL:.0e}), cosine {cos:.6} (floor {DIT_MIN_COSINE})"
         );
     }
+    println!(
+        "h3-image edit DiT step 3 off-trajectory (step-0 rows at t = 0.25; diagnostic, not \
+         asserted): rel-L2 {off_rel:.3e}, cosine {off_cos:.6}"
+    );
     println!("step-0 vs step-3 velocity rel-L2 gap {head_gap:.3e}");
-    for (step, rel, cos, _) in &results {
-        assert!(
-            *rel < DIT_REL_L2_TOL,
-            "step {step} diverges: rel-L2 {rel:.3e}"
-        );
-        assert!(*cos > DIT_MIN_COSINE, "step {step} cosine {cos:.6}");
+    for (what, rel, cos) in &asserted {
+        assert!(*rel < DIT_REL_L2_TOL, "{what} diverges: rel-L2 {rel:.3e}");
+        assert!(*cos > DIT_MIN_COSINE, "{what} cosine {cos:.6}");
     }
     assert!(
         head_gap > DIT_REL_L2_TOL,

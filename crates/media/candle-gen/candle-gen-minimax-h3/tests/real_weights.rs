@@ -2206,13 +2206,22 @@ fn image_edit_reference_latents_match_the_official_diffusers_vae() {
 }
 
 /// AC1 (candle): a 3-reference edit's step-0 (head 0) and step-3 (head 3) DiT outputs match
-/// diffusers' `MiniMaxH3ImageTransformer2DModel` over `[text | 3 references | 512² image]`. The
-/// reference rows are built here from the reference's latents and draws and must equal the
-/// producer's before the DiT runs; the layout and the held `0.999` row class are this crate's.
+/// diffusers' `MiniMaxH3ImageTransformer2DModel` over `[text | 3 references | 512² image]`,
+/// computed by the reference with float32 activations over the bf16 weights (`compute_dtype`), as
+/// the `text2image` gate's reference is. The reference rows are built here from the reference's
+/// latents and draws and must equal the producer's before the DiT runs; the layout and the held
+/// `0.999` row class are this crate's.
+///
+/// Step 0 is asserted on the packed rows; step 3 on the sampler's own `x_3` (`diag.traj.rows3`: the
+/// generated rows walked through steps 0-2 by the reference, the reference rows unchanged). Printed,
+/// never asserted: every stage the reference recorded (both timestep rows of `temb`, `norm_out`,
+/// block 0's AdaLN tables, the residual stream after the `diag_layers`, `norm_out`'s output), the
+/// velocity error over the reference rows and the generated rows separately, step 3 on the step-0
+/// rows, and both asserted velocities against the reference's own bf16-compute forward.
 #[test]
 #[ignore = "needs MINIMAX_H3_IMAGE_SNAPSHOT (transformer_diffusers/) + MINIMAX_H3_IMAGE_EDIT_REFERENCE; 66 GB bf16 DiT"]
 fn image_edit_first_step_matches_the_official_diffusers_transformer() {
-    use candle_gen_minimax_h3::dit::{ImageDit, MiniMaxH3Dit, MiniMaxH3DitConfig};
+    use candle_gen_minimax_h3::dit::{ImageDit, ImageDitTrace, MiniMaxH3Dit, MiniMaxH3DitConfig};
     use candle_gen_minimax_h3::{
         reference_condition_rows, ImageLayout, ImageVelocity, IMAGE_DIT_PARTITION,
     };
@@ -2220,6 +2229,11 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
 
     let root = image_dit_snapshot();
     let reference = image_edit_reference();
+    assert_eq!(
+        reference.meta("compute_dtype").unwrap_or_default(),
+        "float32",
+        "the asserted edit reference must be computed with float32 activations"
+    );
     let dir = root.join(IMAGE_DIT_PARTITION);
     let cfg = MiniMaxH3DitConfig::from_image_diffusers_json(
         &std::fs::read_to_string(dir.join("config.json")).expect("config"),
@@ -2252,8 +2266,27 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
         layout.num_reference_rows().to_string(),
         reference.meta("num_reference_rows").expect("meta")
     );
+    let num_ref = layout.num_reference_rows();
+    let num_packed = layout.num_packed_image_rows();
 
     let schedule = SigmaSchedule::h3_image_distilled().expect("schedule");
+    let want_t: Vec<f32> = reference
+        .meta("timesteps")
+        .expect("meta")
+        .split(',')
+        .map(|t| t.parse().unwrap())
+        .collect();
+    assert_eq!(
+        want_t,
+        vec![schedule.timesteps()[0], schedule.timesteps()[3]],
+        "the timesteps must be the released sampler's float32 values"
+    );
+    let diag_layers: Vec<usize> = reference
+        .meta("diag_layers")
+        .expect("the reference records its diag_layers")
+        .split(',')
+        .map(|k| k.parse().unwrap())
+        .collect();
     let dev = device();
     let dit = MiniMaxH3Dit::load_from_dir(&dir, &dev, DType::BF16).expect("load the image DiT");
     let context = reference
@@ -2263,35 +2296,156 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
         .expect("context");
     let rows = rows.to_device(&dev).expect("rows");
     let mut model = ImageDit::new(dit, &layout, &context, schedule.timesteps()).expect("ImageDit");
-    let run = |model: &mut ImageDit, step: usize| -> Tensor {
-        model
-            .forward(step, &rows)
-            .expect("forward")
-            .to_dtype(DType::F32)
+    let host = |t: &Tensor| -> Tensor {
+        t.to_dtype(DType::F32)
             .and_then(|t| t.to_device(&Device::Cpu))
             .expect("to host")
     };
+    // The reference's tables hold one row block per DISTINCT timestep of the step, ascending: the
+    // step's timestep (row class 0), then the reference rows' 0.999 (row class 1).
+    let blocks = |model: &ImageDit, table: &Tensor, step: usize, rows: usize| -> Tensor {
+        let parts: Vec<Tensor> = (0..2)
+            .map(|class| {
+                let g = model
+                    .adaln_cache()
+                    .schedule()
+                    .global_timestep_index(step, class)
+                    .expect("timestep row") as usize;
+                table.narrow(0, g * rows, rows).expect("rows")
+            })
+            .collect();
+        Tensor::cat(&parts, 0).expect("cat")
+    };
+    let regions = |step: usize, what: &str, got: &Tensor, want: &Tensor| {
+        for (name, lo, hi) in [
+            ("reference rows", 0, num_ref),
+            ("generated rows", num_ref, num_packed),
+        ] {
+            println!(
+                "{}",
+                image_dit_stage_line(
+                    step,
+                    &format!("{what} {name}"),
+                    &got.narrow(1, lo, hi - lo).expect("region"),
+                    &want.narrow(1, lo, hi - lo).expect("region"),
+                )
+            );
+        }
+    };
+    let run = |model: &mut ImageDit, step: usize| -> Tensor {
+        let mut trace = ImageDitTrace::new(&diag_layers);
+        let got = host(
+            &model
+                .forward_traced(step, &rows, &mut trace)
+                .expect("forward"),
+        );
+        let d = |name: &str| reference.tensor(&format!("diag.step{step}.{name}"));
+        let mods = model
+            .adaln_cache()
+            .modulation(0)
+            .expect("block 0 modulation");
+        let block0 = Tensor::stack(
+            &mods
+                .tables()
+                .map(|t| blocks(model, t, step, 3))
+                .collect::<Vec<_>>(),
+            0,
+        )
+        .expect("stack");
+        let norm_out = model.norm_out_modulation();
+        let mut lines = vec![
+            image_dit_stage_line(
+                step,
+                "temb",
+                &blocks(model, model.temb(), step, 1),
+                &d("temb"),
+            ),
+            image_dit_stage_line(
+                step,
+                "norm_out.shift",
+                &blocks(model, &norm_out.shift, step, 1),
+                &d("norm_out.shift"),
+            ),
+            image_dit_stage_line(
+                step,
+                "norm_out.scale",
+                &blocks(model, &norm_out.scale, step, 1),
+                &d("norm_out.scale"),
+            ),
+            image_dit_stage_line(step, "block0.adaln", &block0, &d("block0.adaln")),
+        ];
+        for (layer, hidden) in &trace.hidden {
+            lines.push(image_dit_stage_line(
+                step,
+                &format!("hidden.block{layer}"),
+                hidden,
+                &d(&format!("hidden.block{layer}")),
+            ));
+        }
+        lines.push(image_dit_stage_line(
+            step,
+            "pre_head",
+            trace.pre_head.as_ref().expect("the trace records norm_out"),
+            &d("pre_head"),
+        ));
+        let want = reference.tensor(&format!("out.step{step}"));
+        lines.push(image_dit_stage_line(step, "velocity", &got, &want));
+        for line in lines {
+            println!("{line}");
+        }
+        regions(step, "velocity", &got, &want);
+        got
+    };
     let got0 = run(&mut model, 0);
     let got3 = run(&mut model, 3);
+    // Asserted step 3: the sampler's own x_3, reached by the reference from the same rows.
+    let traj_rows = reference
+        .tensor("diag.traj.rows3")
+        .to_device(&dev)
+        .expect("trajectory rows");
+    let traj = host(&model.forward(3, &traj_rows).expect("on-trajectory forward"));
+    let traj_want = reference.tensor("diag.traj.out3");
+    println!(
+        "{}",
+        image_dit_stage_line(3, "on-trajectory", &traj, &traj_want)
+    );
+    regions(3, "on-trajectory", &traj, &traj_want);
+    // The reference's own rounding: the same two asserted inputs at bf16 compute.
     let want0 = reference.tensor("out.step0");
+    let bf16_step0 = reference.tensor("diag.bf16.step0");
+    let bf16_traj = reference.tensor("diag.bf16.traj.out3");
+    for (step, stage, got, want) in [
+        (0, "ref bf16 vs f32", &bf16_step0, &want0),
+        (3, "ref bf16 vs f32", &bf16_traj, &traj_want),
+        (0, "vs ref bf16", &got0, &bf16_step0),
+        (3, "traj vs ref bf16", &traj, &bf16_traj),
+    ] {
+        println!("{}", image_dit_stage_line(step, stage, got, want));
+    }
     let want3 = reference.tensor("out.step3");
     assert_eq!(got0.dims(), want0.dims());
     // The family bound both backends assert (`gen_core::h3_image`), as the MLX edit gate does.
     let (p0, m0) = rel(&got0, &want0);
+    let (pt, mt) = rel(&traj, &traj_want);
     let (p3, m3) = rel(&got3, &want3);
     let (l0, c0) = image_dit_rel_l2_cosine(&got0, &want0);
+    let (lt, ct) = image_dit_rel_l2_cosine(&traj, &traj_want);
     let (l3, c3) = image_dit_rel_l2_cosine(&got3, &want3);
     let (between, _) = image_dit_rel_l2_cosine(&want3, &want0);
     println!(
         "image edit DiT vs diffusers (family bounds rel-L2 {DIT_PARITY_MAX_REL_L2:.0e}, cosine \
-         {DIT_PARITY_MIN_COSINE}): step0 rel-L2 {l0:.3e} cosine {c0:.6}; step3 rel-L2 {l3:.3e} \
-         cosine {c3:.6}; reference step0 vs step3 rel-L2 {between:.3e}"
+         {DIT_PARITY_MIN_COSINE}): step0 rel-L2 {l0:.3e} cosine {c0:.6}; step3 on-trajectory \
+         rel-L2 {lt:.3e} cosine {ct:.6}; reference step0 vs step3 rel-L2 {between:.3e}"
     );
     println!(
         "image edit DiT peak/mean diagnostics (not asserted): step0 peak {p0:.3e} mean {m0:.3e}; \
-         step3 peak {p3:.3e} mean {m3:.3e}"
+         step3 on-trajectory peak {pt:.3e} mean {mt:.3e}"
     );
-    for (what, l2, cos) in [("step 0", l0, c0), ("step 3", l3, c3)] {
+    println!(
+        "image edit DiT step 3 off-trajectory (step-0 rows at t = 0.25; diagnostic, not \
+         asserted): rel-L2 {l3:.3e} cosine {c3:.6} peak {p3:.3e} mean {m3:.3e}"
+    );
+    for (what, l2, cos) in [("step 0", l0, c0), ("step 3 on-trajectory", lt, ct)] {
         assert!(
             l2 <= DIT_PARITY_MAX_REL_L2,
             "{what} diverges: rel-L2 {l2:.3e}"
