@@ -31,10 +31,20 @@ use mlx_gen_minimax_h3::DitBlockStream;
 const BLOCKS: usize = 3;
 /// The synthetic LoRA's rank.
 const RANK: i32 = 4;
-/// Relative max-abs between two layouts of the same factors, or a streamed and a resident block.
-/// The arms run the same bf16 arithmetic; the bound only absorbs a different summation order of
-/// the split fused factors.
+/// Relative max-abs between two layouts of the same factors, or a streamed and a resident block,
+/// measured against **the LoRA's own effect** (`max |with − bare|`), not against the block output:
+/// a bound on the output alone passes a layout that folds nothing whenever the LoRA moves the
+/// output by less than the bound. The arms run the same bf16 arithmetic; the bound only absorbs a
+/// different summation order of the split fused factors.
 const REL_TOL: f32 = 2e-2;
+/// The strength every block-leaf LoRA is applied at (a power of two, so the scale is exact in
+/// bf16). SW-7096 run 43042251357 measured a strength-1 file of these factors moving the 3-block
+/// output by 1.709e-4 of its max-abs: the real blocks' residual stream carries activations far
+/// larger than a leaf's output, so the max-abs normalization hides an adapter that IS applied
+/// (the same factors move Candle's leaf outputs by 2.8e-3, and a strength-20 `pdd_proj_out` file
+/// moves the MLX velocity by 7.4e-3). The fold is linear in strength, so 64 puts the effect about
+/// an order of magnitude above the 1e-3 floor the assertions require.
+const STRENGTH: f32 = 64.0;
 
 fn image_snapshot() -> PathBuf {
     let raw = std::env::var("MINIMAX_H3_IMAGE_SNAPSHOT").unwrap_or_default();
@@ -255,6 +265,17 @@ fn rel(a: &Array, b: &Array) -> f32 {
     mlx_gen::testing::max_abs_diff_f32(a, b) / scale
 }
 
+/// `max |got − want|` over the LoRA's effect `max |want − bare|`: how far `got` is from `want`
+/// as a fraction of what the adapter changed. A `got` that folded nothing scores 1.
+fn rel_to_effect(got: &Array, want: &Array, bare: &Array) -> f32 {
+    let effect = mlx_gen::testing::max_abs_diff_f32(want, bare);
+    assert!(
+        effect > 0.0,
+        "the LoRA changed nothing, so no drift can be judged"
+    );
+    mlx_gen::testing::max_abs_diff_f32(got, want) / effect
+}
+
 fn clear(dit: &mut MiniMaxH3ImageDit) {
     for b in 0..BLOCKS {
         for leaf in BLOCK_TARGETS {
@@ -279,7 +300,7 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit() {
     let bare = run_resident(&dit, &inputs);
 
     let peft = write_peft(&cfg, dir.path(), 1);
-    apply_minimax_h3_adapters(&mut dit, &[spec(peft.clone(), 1.0)]).expect("PEFT install");
+    apply_minimax_h3_adapters(&mut dit, &[spec(peft.clone(), STRENGTH)]).expect("PEFT install");
     let with_peft = run_resident(&dit, &inputs);
     let moved = rel(&with_peft, &bare);
     println!("[sw-7096 mlx] LoRA moves the {BLOCKS}-block output by rel-max-abs {moved:.3e}");
@@ -291,19 +312,20 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit() {
     for kohya in [true, false] {
         clear(&mut dit);
         let native = write_native(&cfg, dir.path(), 1, kohya);
-        let report = apply_minimax_h3_adapters(&mut dit, &[spec(native, 1.0)]).expect("install");
+        let report =
+            apply_minimax_h3_adapters(&mut dit, &[spec(native, STRENGTH)]).expect("install");
         assert_eq!(report.applied, BLOCKS * BLOCK_TARGETS.len());
         let got = run_resident(&dit, &inputs);
-        let drift = rel(&got, &with_peft);
+        let drift = rel_to_effect(&got, &with_peft, &bare);
         let name = if kohya { "kohya" } else { "comfyui" };
-        println!("[sw-7096 mlx] {name} vs PEFT rel-max-abs {drift:.3e}");
+        println!("[sw-7096 mlx] {name} vs PEFT, relative to the LoRA's effect: {drift:.3e}");
         assert!(
             drift < REL_TOL,
-            "{name} must fold like PEFT, rel-max-abs {drift:.3e}"
+            "{name} must fold like PEFT, {drift:.3e} of the LoRA's effect"
         );
     }
 
-    // Ten stacked files, scales 0.1 … 1.0, three layouts interleaved: every leaf carries ten
+    // Ten stacked files, scales 0.1 … 1.0 (× STRENGTH), three layouts interleaved: every leaf carries ten
     // residuals in file order at the file's own scale.
     clear(&mut dit);
     let specs: Vec<AdapterSpec> = (0..10u32)
@@ -314,7 +336,7 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit() {
                 1 => write_native(&cfg, dir.path(), seed, true),
                 _ => write_native(&cfg, dir.path(), seed, false),
             };
-            spec(path, 0.1 * (i + 1) as f32)
+            spec(path, 0.1 * (i + 1) as f32 * STRENGTH)
         })
         .collect();
     apply_minimax_h3_adapters(&mut dit, &specs).expect("ten stacked LoRAs");
@@ -331,7 +353,7 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit() {
                 _ => panic!("{path}: a LoRA residual"),
             })
             .collect();
-        let want: Vec<f32> = (0..10).map(|i| 0.1 * (i + 1) as f32).collect();
+        let want: Vec<f32> = (0..10).map(|i| 0.1 * (i + 1) as f32 * STRENGTH).collect();
         assert_eq!(scales, want, "{path}");
     }
     let stacked = run_resident(&dit, &inputs);
@@ -347,8 +369,9 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit() {
 
 /// AC2 on MLX: a block rebuilt by the shared [`DitBlockStream`] from the real image checkpoint
 /// carries the LoRA — installed through the production install onto the stream — and matches the
-/// resident block with the same LoRA. Without the stream's re-application the streamed output
-/// equals the bare one, so the comparison cannot pass by accident.
+/// resident block with the same LoRA. Drift is measured against the LoRA's effect: without the
+/// stream's re-application the streamed output equals the bare one and scores 1, so the comparison
+/// cannot pass by accident.
 #[test]
 #[ignore = "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT); three resident blocks"]
 fn h3_image_streamed_blocks_carry_the_lora_like_resident_ones() {
@@ -360,7 +383,7 @@ fn h3_image_streamed_blocks_carry_the_lora_like_resident_ones() {
     let bare = run_resident(&dit, &inputs);
     let peft = write_peft(&cfg, dir.path(), 3);
     let kohya = write_native(&cfg, dir.path(), 4, true);
-    let specs = [spec(peft, 0.75), spec(kohya, 0.5)];
+    let specs = [spec(peft, 0.75 * STRENGTH), spec(kohya, 0.5 * STRENGTH)];
     apply_minimax_h3_adapters(&mut dit, &specs).expect("resident install");
     let resident = run_resident(&dit, &inputs);
 
@@ -399,18 +422,17 @@ fn h3_image_streamed_blocks_carry_the_lora_like_resident_ones() {
         mlx_rs::transforms::eval([&x]).unwrap();
         drop(view);
     }
-    let drift = rel(&x, &resident);
     let moved = rel(&resident, &bare);
-    println!(
-        "[sw-7096 mlx] streamed vs resident with LoRA rel-max-abs {drift:.3e}; LoRA moved {moved:.3e}"
-    );
+    println!("[sw-7096 mlx] LoRA moved the resident output by rel-max-abs {moved:.3e}");
     assert!(
         moved > 1e-3,
         "the LoRA must move the output, got {moved:.3e}"
     );
+    let drift = rel_to_effect(&x, &resident, &bare);
+    println!("[sw-7096 mlx] streamed vs resident, relative to the LoRA's effect: {drift:.3e}");
     assert!(
         drift < REL_TOL,
-        "streamed must match resident, rel-max-abs {drift:.3e}"
+        "streamed must match resident, {drift:.3e} of the LoRA's effect"
     );
     crate::model_inference_device::record_model_inference_device();
     println!(

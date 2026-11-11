@@ -15,7 +15,7 @@
 //! | [`model`] | the generator: descriptor, load, validate, staged generate |
 //! | [`sampler`] | the MLX ops behind gen-core's shared Euler / LCM sampler step |
 //! | [`tier`] | q8 / q4 DiT tier resolution; the text encoder is H3's own tier artifact |
-//! | [`memory`] | the shared-ladder contract: rungs 0-2 and 4; rung 3 not applicable on MLX |
+//! | [`memory`] | the shared-ladder contract: rungs 0-3, and 4 on a deferred load |
 //! | [`admission`] | per-phase host / GPU estimates and the ladder walk (derived, unmeasured) |
 
 pub mod admission;
@@ -61,5 +61,25 @@ mod registry_tests {
         let ids: Vec<&str> = registry.generators().map(|g| (g.descriptor)().id).collect();
         assert_eq!(ids, vec![super::IMAGE_MODEL_ID]);
         assert_eq!(registry.memory_strategy_registrations().len(), 1);
+    }
+
+    /// SW-7094: the shared weights-free conformance over the image registration at both load
+    /// shapes — every implemented rung, rung 3 included, is driven through the safety check and
+    /// the request scope, and every published contract surface conforms.
+    #[test]
+    fn the_image_registry_conforms_with_rung_3_implemented() {
+        use mlx_gen::gen_core::{LoadShape, LoadSpec, WeightsSource};
+        let registry = super::register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new())
+            .build()
+            .expect("registry");
+        for shape in [
+            LoadShape::EagerMaterialization,
+            LoadShape::DeferredMaterialization,
+        ] {
+            let spec =
+                LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_load_shape(shape);
+            gen_core_testkit::memory_strategy_registry_conformance(&registry, &spec);
+        }
+        gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
     }
 }

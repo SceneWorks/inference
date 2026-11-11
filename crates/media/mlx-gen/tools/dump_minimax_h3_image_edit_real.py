@@ -28,10 +28,37 @@ written so the real-weight gates on BOTH backends (``mlx-gen-minimax-h3``
    (``MiniMaxH3ImageSetTimestepsStep``), evaluated at step 0 (head 0) and step 3 (head 3). The
    context is seeded noise in place of the Qwen3-VL encode, as in the ``text2image`` producer.
 
+Compute precision and the asserted tensors
+------------------------------------------
+
+The DiT forwards are computed exactly as the ``text2image`` DiT producer
+(``dump_minimax_h3_image_dit_real.py``) computes its asserted tensors: **float32 activations over
+the bf16-stored weights** (``compute_dtype = float32``), through the same ``F32Compute`` hooks that
+upcast one top-level module's bf16 parameters at a time. A bf16-compute reference rounds its own
+residual stream after every one of the 50 blocks, which a comparison against a different bf16
+implementation cannot tell apart from that implementation's error; the edit gates assert against
+float32 activations for the same reason the ``text2image`` gates do.
+
+* ``out.step0`` — step 0 on the packed rows (``in.rows``);
+* ``out.step3`` — step 3 on the same rows, an input no sampler shows the model at ``t = 0.25``
+  (printed by the gates, not asserted);
+* ``diag.traj.rows3`` / ``diag.traj.out3`` — the released sampler walked from ``in.rows`` through
+  steps 0, 1, 2 (``x + (sigma_i - sigma_{i+1}) * v`` in float32 on the generated rows; the reference
+  rows ride through unchanged, ``MiniMaxH3ImageLoopSchedulerStep``) and the step-3 velocity there:
+  the asserted step 3;
+* ``diag.bf16.step0`` / ``diag.bf16.traj.out3`` — the same two asserted inputs at bf16 compute (the
+  checkpoint as published), the reference's own rounding, printed and never asserted;
+* ``diag.step{0,3}.*`` — the reference's intermediate stages, recorded by forward hooks as in the
+  ``text2image`` producer: ``temb`` (``[2, time_embed_dim]``, one row per distinct timestep in
+  ascending order — the step's timestep, then the reference rows' ``0.999``), ``norm_out.shift`` /
+  ``norm_out.scale`` (same rows), ``block0.adaln`` (``[6, 2 * MODALITY_NUM, hidden_size]``),
+  ``hidden.block{k}`` for every ``k`` in ``diag_layers`` and ``pre_head``.
+
 Hash-pinned: the output carries ``producer_sha256``, the SHA-256 of THIS file's bytes, and the Rust
 gates compare it to the committed copy. The output is a few MB and is not committed.
 
-Run (CPU torch, in the reviewed Mage reference environment; ~70 GB of host RAM for the bf16 DiT):
+Run (CPU torch, in the reviewed Mage reference environment; ~70 GB of host RAM: the bf16 DiT plus
+one module's float32 copy):
 
     MINIMAX_H3_IMAGE_SNAPSHOT=<snapshot-root> python3 tools/dump_minimax_h3_image_edit_real.py \
         --out <dir>/edit-reference.safetensors
@@ -199,6 +226,79 @@ def build_image_packed_sequence(text_token_tags, reference_grids, latent_h, late
     return position_ids, token_tags, image_indices, text_indices, num_reference_rows
 
 
+class F32Compute:
+    """Run each hooked module with its bf16 parameters upcast to float32, one module at a time.
+
+    The ``text2image`` DiT producer's own hooks: the pre-hook swaps every bf16 parameter's storage
+    for a float32 copy (and widens a bf16 positional input) and the forward hook puts the bf16
+    storage back, so the float32 copies live only while their module runs. ``enabled`` False is the
+    checkpoint as published (bf16 compute).
+    """
+
+    def __init__(self, model, modules):
+        self.enabled = False
+        self.saved: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
+        covered = set()
+        for module in modules:
+            module.register_forward_pre_hook(self._up)
+            module.register_forward_hook(self._down)
+            covered.update(id(p) for p in module.parameters())
+        missed = [n for n, p in model.named_parameters() if p.dtype != torch.float32 and id(p) not in covered]
+        assert not missed, f"bf16 parameters outside every float32-compute module: {missed[:8]}"
+
+    def _up(self, module, inputs):
+        if not self.enabled:
+            return None
+        assert not self.saved, "float32-compute modules must not nest"
+        for p in module.parameters():
+            if p.dtype == torch.bfloat16:
+                self.saved.append((p, p.data))
+                p.data = p.data.to(torch.float32)
+        return tuple(x.to(torch.float32) if torch.is_tensor(x) and x.dtype == torch.bfloat16 else x for x in inputs)
+
+    def _down(self, _module, _inputs, _output):
+        for p, data in self.saved:
+            p.data = data
+        self.saved.clear()
+
+
+class StageTaps:
+    """Forward hooks recording the reference's own intermediate tensors (see the module docs)."""
+
+    def __init__(self, model, layers: tuple[int, ...]):
+        self.layers = layers
+        self.armed = False
+        self.seen: dict[str, torch.Tensor] = {}
+        model.time_embedder.register_forward_hook(self._put("temb"))
+        model.norm_out.linear.register_forward_hook(self._put("norm_out.linear"))
+        model.transformer_blocks[0].adaln_proj.register_forward_hook(self._put("block0.adaln"))
+        model.norm_out.register_forward_hook(self._put("pre_head"))
+        for k in layers:
+            model.transformer_blocks[k].register_forward_hook(self._put(f"hidden.block{k}"))
+
+    def _put(self, key: str):
+        def hook(_module, _inputs, output):
+            if self.armed:
+                self.seen[key] = output
+
+        return hook
+
+    def take(self, step: int) -> dict[str, np.ndarray]:
+        seen, self.seen = self.seen, {}
+        f32 = lambda t: t.detach().to(torch.float32).numpy().copy()  # noqa: E731
+        shift, scale = seen["norm_out.linear"].chunk(2, dim=-1)
+        out = {
+            f"diag.step{step}.temb": f32(seen["temb"]),
+            f"diag.step{step}.norm_out.shift": f32(shift),
+            f"diag.step{step}.norm_out.scale": f32(scale),
+            f"diag.step{step}.block0.adaln": f32(torch.stack(seen["block0.adaln"])),
+            f"diag.step{step}.pre_head": f32(seen["pre_head"]),
+        }
+        for k in self.layers:
+            out[f"diag.step{step}.hidden.block{k}"] = f32(seen[f"hidden.block{k}"])
+        return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="output .safetensors path (keep it OUTSIDE the repo)")
@@ -264,6 +364,9 @@ def main() -> None:
     model.eval()
     cfg = model.config
     assert tuple(cfg.patch_size) == patch, cfg.patch_size
+    assert cfg.num_pdd_heads == len(SIGMAS) - 1, cfg.num_pdd_heads
+    assert model.proj_in.weight.dtype == torch.float32, "proj_in must keep its published float32"
+    assert model.pdd_proj_out[0].weight.dtype == torch.float32, "the heads must keep float32"
     context = torch.randn(1, len(token_ids), cfg.text_dim, generator=generator, dtype=torch.float32).to(torch.bfloat16)
     target = torch.randn(1, cfg.in_channels, 1, *TARGET_LATENT_HW, generator=generator, dtype=torch.float32)
     reference_noise = [torch.randn(lat.shape, generator=generator, dtype=torch.float32) for lat in reference_latents]
@@ -281,30 +384,65 @@ def main() -> None:
     )
     assert condition_rows.shape[0] == num_reference_rows
     timesteps = torch.tensor([1.0 - s for s in SIGMAS[:-1]], dtype=torch.float32)
+    # The released sampler's grid: sigma recovered from each float32 timestep, terminal 0.
+    sigmas = torch.cat([1.0 - timesteps, torch.zeros(1)])
     seq = position_ids.shape[0]
+    diag_layers = (0, cfg.num_layers // 2 - 1, cfg.num_layers - 1)
+    taps = StageTaps(model, diag_layers)
+    # Every top-level module holding bf16 parameters; `proj_in`, `time_embedder` and the heads are
+    # float32 in the checkpoint already. The coverage assert inside refuses a missed one.
+    f32 = F32Compute(
+        model,
+        [model.context_embedder, model.token_refiner, *model.transformer_blocks, model.norm_out],
+    )
+
+    def forward(rows: torch.Tensor, step: int) -> torch.Tensor:
+        row_timesteps = torch.full((seq,), float(timesteps[step]), dtype=torch.float32)
+        row_timesteps[image_indices[:num_reference_rows]] = REFERENCE_NOISE_AUG
+        unique, inverse = torch.unique(row_timesteps, sorted=True, return_inverse=True)
+        assert unique.numel() == 2 and unique[1].item() == torch.tensor(REFERENCE_NOISE_AUG).item()
+        out = model(
+            hidden_states=rows,
+            encoder_hidden_states=context,
+            timestep=unique,
+            timestep_indices=inverse,
+            token_tags=tags,
+            position_ids=position_ids.to(torch.float32),
+            image_indices=image_indices,
+            text_indices=text_indices,
+            pdd_step_index=step,
+            return_dict=False,
+        )[0]
+        print(
+            f"step {step} (t={timesteps[step].item():.6f}, head {step}, float32 compute {f32.enabled}): "
+            f"{tuple(out.shape)} std {out.float().std().item():.6f} L2 {out.float().flatten().norm().item():.6f}"
+        )
+        return out.to(torch.float32)
+
     outputs = {}
+    diag = {}
     with torch.no_grad():
+        f32.enabled = True
         for step in STEPS:
-            row_timesteps = torch.full((seq,), float(timesteps[step]), dtype=torch.float32)
-            row_timesteps[image_indices[:num_reference_rows]] = REFERENCE_NOISE_AUG
-            unique, inverse = torch.unique(row_timesteps, sorted=True, return_inverse=True)
-            out = model(
-                hidden_states=image_rows,
-                encoder_hidden_states=context,
-                timestep=unique,
-                timestep_indices=inverse,
-                token_tags=tags,
-                position_ids=position_ids.to(torch.float32),
-                image_indices=image_indices,
-                text_indices=text_indices,
-                pdd_step_index=step,
-                return_dict=False,
-            )[0]
-            outputs[step] = out.to(torch.float32)
-            print(
-                f"step {step} (t={timesteps[step].item():.6f}, head {step}): {tuple(out.shape)} "
-                f"std {out.float().std().item():.6f} L2 {out.float().flatten().norm().item():.6f}"
-            )
+            taps.armed = True
+            outputs[step] = forward(image_rows, step)
+            taps.armed = False
+            assert taps.seen["hidden.block0"].dtype == torch.float32, "the block stack must run in float32"
+            diag.update(taps.take(step))
+        # On-trajectory step 3: the sampler's own x_3, reached from the same rows. Only the generated
+        # rows move; the reference rows ride through every step unchanged.
+        rows = image_rows
+        velocity = outputs[0]
+        for step in range(1, 4):
+            generated = rows[:, num_reference_rows:] + (sigmas[step - 1] - sigmas[step]) * velocity[:, num_reference_rows:]
+            rows = torch.cat([image_rows[:, :num_reference_rows], generated], dim=1)
+            velocity = forward(rows, step)
+        diag["diag.traj.rows3"] = rows.numpy().copy()
+        diag["diag.traj.out3"] = velocity.numpy().copy()
+        # The reference's own rounding: the same two asserted inputs at bf16 compute.
+        f32.enabled = False
+        diag["diag.bf16.step0"] = forward(image_rows, 0).numpy().copy()
+        diag["diag.bf16.traj.out3"] = forward(rows, 3).numpy().copy()
 
     tensors["in.context"] = context.to(torch.float32).numpy().copy()
     tensors["in.target_rows"] = patchify(target, patch)[None].numpy().copy()
@@ -313,12 +451,17 @@ def main() -> None:
     tensors["in.rows"] = image_rows.numpy().copy()
     for step, out in outputs.items():
         tensors[f"out.step{step}"] = out.numpy().copy()
+    tensors.update(diag)
     meta = {
         "provenance": "converted-checkpoint",
         "reference": "diffusers.MiniMaxH3ImageTransformer2DModel+AutoencoderKLMiniMaxH3Image",
         "reference_version": diffusers.__version__,
         "reference_module": f"{dit_source} {vae_source}",
         "torch": torch.__version__,
+        "weight_dtype": "bfloat16 (proj_in, time_embedder, pdd_proj_out float32)",
+        "compute_dtype": "float32",
+        "compute_precision": "float32 activations over bf16-stored weights, upcast per top-level module on forward",
+        "bf16_diagnostics": "diag.bf16.step0, diag.bf16.traj.out3",
         "snapshot": snapshot.name,
         "seed": str(SEED),
         "prompt": PROMPT,
@@ -327,6 +470,8 @@ def main() -> None:
         "num_reference_rows": str(num_reference_rows),
         "latent_hw": f"{TARGET_LATENT_HW[0]}x{TARGET_LATENT_HW[1]}",
         "steps": ",".join(str(s) for s in STEPS),
+        "timesteps": ",".join(f"{timesteps[s].item():.9g}" for s in STEPS),
+        "diag_layers": ",".join(str(k) for k in diag_layers),
         "producer": "crates/media/mlx-gen/tools/dump_minimax_h3_image_edit_real.py",
         "producer_sha256": producer_sha256,
         "story": "SW-7092",
