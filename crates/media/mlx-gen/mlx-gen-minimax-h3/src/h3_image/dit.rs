@@ -400,9 +400,9 @@ pub struct ImageDenoiser {
     /// tier one window at a time on every step. Set by [`Self::new_windowed`] only.
     block_window: Option<BlockPlan>,
     window_cancel: CancelFlag,
-    /// Rung 3's measurement seam (SW-7094): `UNBOUNDED` on every shipped render, which is
-    /// byte-identical to the pre-rung forward. The image-geometry verdict is taken through it
-    /// (`tests/h3_image_bounded_attention_real.rs`).
+    /// Rung 3 (SW-7094): `UNBOUNDED` (byte-identical to the pre-rung forward) unless the request
+    /// engages the rung, when the generator sets the whole-head plan
+    /// ([`crate::h3_image::memory::requested_bounded_attention`]).
     attention_budget: AttentionBudget,
     attention_axis: AttentionChunkAxis,
 }
@@ -613,9 +613,9 @@ impl ImageDenoiser {
         })
     }
 
-    /// Rung 3's measurement seam: the attention plan every block runs under. Shipped renders never
-    /// call this — the family declares rung 3 not applicable on MLX — and the default `UNBOUNDED`
-    /// plan is the pre-rung forward byte for byte.
+    /// Rung 3: the attention plan every block runs under, resident and windowed. The generator
+    /// sets it when a request engages the rung; the default `UNBOUNDED` plan is the pre-rung
+    /// forward byte for byte.
     pub fn set_bounded_attention(&mut self, budget: AttentionBudget, axis: AttentionChunkAxis) {
         self.attention_budget = budget;
         self.attention_axis = axis;

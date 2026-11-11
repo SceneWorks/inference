@@ -649,6 +649,9 @@ impl MiniMaxH3Image {
         // Resolved before any weight maps, so an unadmitted geometry or window is a request error.
         let tiling = decode_tiling_for(req)?;
         let window = self.requested_transformer_window(req)?;
+        // Rung 3: an undeclared chunk size is refused here; the budget itself depends on the
+        // packed sequence and is resolved once the layout is known.
+        crate::h3_image::memory::requested_bounded_attention(req.memory, 0).map_err(Error::from)?;
         // The same canvas admission sized this request's resources from.
         let (canvas_w, canvas_h) = crate::h3_image::memory::admission_canvas(req.width, req.height)
             .map_err(Error::from)?;
@@ -735,7 +738,7 @@ impl MiniMaxH3Image {
                 dit.config().base.patch_size,
             )?
         };
-        let denoiser = match window {
+        let mut denoiser = match window {
             None => ImageDenoiser::new(
                 dit,
                 layout.clone(),
@@ -751,6 +754,15 @@ impl MiniMaxH3Image {
                 req.cancel.clone(),
             )?,
         };
+        // Rung 3 (SW-7094): every block's attention on whole heads, resident or windowed.
+        if let Some((budget, axis)) = crate::h3_image::memory::requested_bounded_attention(
+            req.memory,
+            layout.seq_len() as u64,
+        )
+        .map_err(Error::from)?
+        {
+            denoiser.set_bounded_attention(budget, axis);
+        }
         release(context);
         let steps = denoiser.num_steps() as u32;
         let total = steps * count;
@@ -995,6 +1007,7 @@ mod tests {
                 decode_overlap: Some(64),
                 transformer_window_size: Some(1),
                 transformer_window_component: Some(TransformerComponent::Both),
+                attention_chunk_size: Some(crate::h3_image::memory::IMAGE_ATTENTION_CHUNK_SIZE),
                 ..Default::default()
             },
             tier: deferred.memory_tier,
