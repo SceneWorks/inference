@@ -2355,6 +2355,9 @@ fn audit_image_tier(label: &str, bits: i64) {
 fn render_image_tier(label: &str, quant: candle_gen::gen_core::Quant) {
     use candle_gen::gen_core::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
 
+    // Audit the converted index and heads before spending a render on them.
+    audit_image_tier(label, if label == "q8" { 8 } else { 4 });
+
     let te =
         std::path::PathBuf::from(std::env::var("MINIMAX_H3_TIER_SNAPSHOT").unwrap_or_default())
             .join(label)
