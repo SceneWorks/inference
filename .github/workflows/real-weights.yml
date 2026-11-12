@@ -458,13 +458,7 @@ jobs:
     steps:
       - name: Require immutable source and non-dev-Mac placement before checkout/build
         shell: bash
-        run: |
-          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] && [[ "$SOURCE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]]
-          [[ "$COMPILE_HOST" == second-mac ]]
-          [[ "$COMPILE_PHASE" == compile-only || "$COMPILE_PHASE" == compile-host || "$COMPILE_PHASE" == prerequisite-probe ]]
-          [[ "$RUNNER_NAME" == nax-macos-2 ]]
-          command -v python3.12 >/dev/null || { echo "::error::Preinstalled Python3.12 required; no provisioning"; exit 1; }
+        run: source scripts/ci/real-weights/ios-pricing-compile-only/require-immutable-source-and-non-dev-mac-placement.sh
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ fromJSON(inputs.ios_pricing_compile_binding).source_sha }}
