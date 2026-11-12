@@ -1798,6 +1798,7 @@ mod veda_controls_tests {
     /// keep their own scales in file order. Nothing is executed: the residuals are read back as
     /// installed, so this holds without a forward.
     #[test]
+    #[ignore = "constructs complete synthetic DiTs to install adapters; dispatched only by the manual H3 native suite"]
     fn three_layouts_install_on_every_tier_with_their_own_scales() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         let dir = tempfile::tempdir().unwrap();
@@ -1976,6 +1977,9 @@ mod veda_controls_tests {
             let to_k = installed(&mut dit, &["transformer_blocks", "0", "attn", "to_k"]);
             assert_eq!(to_k.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![1.5]);
         }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::model::veda_controls_tests::three_layouts_install_on_every_tier_with_their_own_scales");
     }
 
     fn layout_on(mode: usize, channels: usize, dev: &Device) -> PackedLayout {

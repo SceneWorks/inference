@@ -233,6 +233,7 @@ LIB_GATED: dict[tuple[str, str], dict[str, object]] = {
         "names": [
             "native_controls_capture_every_mode_packed_tier_and_adapter_stack",
             "native_base_and_all_published_turbo_steps_reach_attention",
+            "three_layouts_install_on_every_tier_with_their_own_scales",
         ],
         "skip": [],
     },

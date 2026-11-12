@@ -67,7 +67,7 @@ class ReferenceStoreTests(unittest.TestCase):
 
     def test_publish_then_restore_round_trips_and_verifies(self) -> None:
         entry = self.quiet(store.publish, self.root, KEY, self.work)
-        manifest = json.loads((entry / store.MANIFEST).read_text())
+        manifest = json.loads((entry / store.MANIFEST).read_text(encoding="utf-8"))
         self.assertEqual(sorted(manifest["files"]), ["dit-reference.safetensors", "reference.safetensors"])
         self.assertEqual([p.name for p in self.root.iterdir()], [KEY])  # no partial left behind
         dest = self.tmp / "dest"
