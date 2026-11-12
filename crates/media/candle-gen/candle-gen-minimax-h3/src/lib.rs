@@ -129,6 +129,7 @@ pub mod blocks;
 pub mod chunking;
 pub mod conditioning;
 pub mod config;
+pub mod convert;
 pub mod decoder;
 pub mod denoise;
 pub mod dit;
@@ -202,10 +203,12 @@ pub use dit::{
 pub use image_model::{
     image_descriptor, MiniMaxH3Image, IMAGE_DIT_PARTITION, IMAGE_MODEL_ID, IMAGE_REGISTRATION,
 };
-pub use image_pipeline::{ImageLayout, ImageVelocity};
+pub use image_pipeline::{
+    reference_condition_rows, reference_vae_pixels, resize_reference, ImageLayout, ImageVelocity,
+};
 pub use image_vae::{
     bounded_decode_parameters as image_bounded_decode_parameters, MiniMaxH3ImageVae,
-    IMAGE_DECODE_OVERLAP, IMAGE_DECODE_TILE_EDGE, IMAGE_VAE_COMPONENT,
+    MiniMaxH3ImageVaeEncoder, IMAGE_DECODE_OVERLAP, IMAGE_DECODE_TILE_EDGE, IMAGE_VAE_COMPONENT,
 };
 pub use keyframe::{
     anchors_for, fit_keyframe, fit_keyframes, keyframe_to_vae_pixels, resolve_canvas_size,

@@ -848,7 +848,7 @@ fn observed_adaln(modulation: &AdaLnModulation, temb: &Tensor) -> Result<(Tensor
     let raw = Tensor::cat(&parts, 1)?.reshape((temb.dims()[0], 96768))?;
     // Stateless replay after the production call; this is not an exposed handle
     // to forward's internal activated tensor and cannot prewarm its GEMM.
-    let activated = silu(temb)?.to_dtype(DType::BF16)?;
+    let activated = crate::nn::silu(temb)?.to_dtype(DType::BF16)?;
     Ok((activated, raw))
 }
 
@@ -978,8 +978,8 @@ fn traced_ffn(
         let projection = metric(&a, &b)?;
         let (ag, av) = split_gate_value(&a)?;
         let (bg, bv) = split_gate_value(&b)?;
-        let aa = silu(&ag)?.mul(&av)?;
-        let ba = silu(&bg)?.mul(&bv)?;
+        let aa = silu_f32_rounded(&ag)?.mul(&av)?;
+        let ba = silu_f32_rounded(&bg)?.mul(&bv)?;
         let activation = metric(&aa, &ba)?;
         let ao = direct.out.forward(&aa)?;
         let bo = copied.out.forward(&ba)?;

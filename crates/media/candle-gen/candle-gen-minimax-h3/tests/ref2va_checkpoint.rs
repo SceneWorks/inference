@@ -458,16 +458,23 @@ fn every_dit_load_site_in_the_crate_is_driven_by_the_task() {
         1,
         "`src/image_model.rs` must map its image DiT at exactly one site: {image_sites:?}"
     );
-    assert!(
-        image_sites[0].1.contains("IMAGE_DIT_PARTITION"),
-        "the image DiT load must take `IMAGE_DIT_PARTITION`, the image family's own partition: {:?}",
-        image_sites[0]
-    );
     let image_src = &sources
         .iter()
         .find(|(p, _)| Path::new(p).ends_with(&image_file))
         .expect("src/image_model.rs is scanned")
         .1;
+    // SW-7093: the load site reads the resolved `dit_dir` (a staged tier component, else
+    // `root/IMAGE_DIT_PARTITION`), so the partition constant is pinned at the resolver instead.
+    assert!(
+        image_sites[0].1.contains("self.dit_dir"),
+        "the image DiT load must map the resolved `dit_dir`, never `root` + a literal: {:?}",
+        image_sites[0]
+    );
+    assert!(
+        image_src.contains("root.join(IMAGE_DIT_PARTITION)")
+            && image_src.contains("resolve_dit_dir(&root, spec)"),
+        "`dit_dir` must resolve from `IMAGE_DIT_PARTITION`, the image family's own partition"
+    );
     for video_partition in [
         "BASE_DIT_PARTITION",
         "REFERENCE_DIT_PARTITION",

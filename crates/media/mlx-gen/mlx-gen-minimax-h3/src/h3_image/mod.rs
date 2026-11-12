@@ -1,5 +1,5 @@
-//! **MiniMax-H3-Image** (`MiniMaxAI/MiniMax-H3-Image`) on MLX: the `minimax_h3_image` text-to-image
-//! generator, built from this crate's H3 layers.
+//! **MiniMax-H3-Image** (`MiniMaxAI/MiniMax-H3-Image`) on MLX: the `minimax_h3_image` generator —
+//! `text2image` and `edit` with 1-16 reference images — built from this crate's H3 layers.
 //!
 //! The image model is the MiniMax-H3 transformer without its audio stream, distilled to a fixed
 //! six-step sampler with one output head per step, over one packed `[text | image]` sequence whose
@@ -10,22 +10,29 @@
 //!
 //! | | |
 //! |---|---|
-//! | [`layout`] | the `text2image` packed sequence: positions, tags |
+//! | [`layout`] | the `text2image` / `edit` packed sequences: positions, tags |
 //! | [`dit`] | [`dit::MiniMaxH3ImageDit`] (644 tensors) and the per-step [`dit::ImageDenoiser`] |
 //! | [`model`] | the generator: descriptor, load, validate, staged generate |
-//! | [`memory`] | the shared-ladder contract: staged residency + bounded decode |
+//! | [`tier`] | q8 / q4 DiT tier resolution; the text encoder is H3's own tier artifact |
+//! | [`memory`] | the shared-ladder contract: rungs 0-3, and 4 on a deferred load |
+//! | [`admission`] | per-phase host / GPU estimates and the ladder walk (derived, unmeasured) |
 
+pub mod admission;
 pub mod dit;
 pub mod layout;
 pub mod memory;
 pub mod model;
+pub mod tier;
 
 pub use dit::{
-    velocity_euler_delta, ImageDenoiser, ImageDitTrace, MiniMaxH3ImageDit, IMAGE_DIT_COMPONENT,
-    PUBLISHED_IMAGE_DIT_TENSORS,
+    image_row_classes, velocity_euler_delta, ImageDenoiser, ImageDitTrace, MiniMaxH3ImageDit,
+    IMAGE_DIT_COMPONENT, PUBLISHED_IMAGE_DIT_TENSORS,
 };
 pub use layout::ImageLayout;
-pub use model::{MiniMaxH3Image, IMAGE_MODEL_ID};
+pub use model::{
+    reference_condition_rows, reference_noise, reference_vae_pixels, resize_reference,
+    MiniMaxH3Image, IMAGE_MODEL_ID,
+};
 
 /// Add the MLX MiniMax-H3-Image generator and its three memory registrations to an explicit media
 /// registry builder. Separate from [`crate::register_providers`] so H3 video's catalog surface is
@@ -52,5 +59,25 @@ mod registry_tests {
         let ids: Vec<&str> = registry.generators().map(|g| (g.descriptor)().id).collect();
         assert_eq!(ids, vec![super::IMAGE_MODEL_ID]);
         assert_eq!(registry.memory_strategy_registrations().len(), 1);
+    }
+
+    /// SW-7094: the shared weights-free conformance over the image registration at both load
+    /// shapes — every implemented rung, rung 3 included, is driven through the safety check and
+    /// the request scope, and every published contract surface conforms.
+    #[test]
+    fn the_image_registry_conforms_with_rung_3_implemented() {
+        use mlx_gen::gen_core::{LoadShape, LoadSpec, WeightsSource};
+        let registry = super::register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new())
+            .build()
+            .expect("registry");
+        for shape in [
+            LoadShape::EagerMaterialization,
+            LoadShape::DeferredMaterialization,
+        ] {
+            let spec =
+                LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_load_shape(shape);
+            gen_core_testkit::memory_strategy_registry_conformance(&registry, &spec);
+        }
+        gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
     }
 }

@@ -15,16 +15,32 @@ pub(super) fn dit_window(
     pruned: bool,
 ) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::h3_memory::window::WindowAllocation>>
 {
-    if !allocation.resolved
-        || !crate::block_stream::component_supported(path)
-            .map_err(|e| CoreError::Unsupported(e.to_string()))?
-    {
+    if !allocation.resolved {
         return Ok(None);
     }
     let cfg = crate::dit::MiniMaxH3DitConfig::from_diffusers_json(&std::fs::read_to_string(
         path.join("config.json"),
     )?)
     .map_err(|e| CoreError::Unsupported(e.to_string()))?;
+    dit_window_for(path, &cfg, allocation, bytes, pruned)
+}
+
+/// [`dit_window`] for an already-parsed DiT config — the H3 video `transformer/` or the
+/// MiniMax-H3-Image `transformer_diffusers/` (SW-7095), whose block stack is the same.
+pub(crate) fn dit_window_for(
+    path: &Path,
+    cfg: &crate::dit::MiniMaxH3DitConfig,
+    allocation: &gen_core_h3::h3_memory::NativeComponentAllocation,
+    bytes: u64,
+    pruned: bool,
+) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::h3_memory::window::WindowAllocation>>
+{
+    if !allocation.resolved
+        || !crate::block_stream::component_supported(path)
+            .map_err(|e| CoreError::Unsupported(e.to_string()))?
+    {
+        return Ok(None);
+    }
     let (_, _, decode) = runtime_payloads(path, false)?;
     let facts = candle_gen::gen_core::h3_memory::window::CudaWorkingSet {
         hidden: cfg.hidden_size as u64,
@@ -49,7 +65,7 @@ pub(super) fn dit_window(
         return Ok(None);
     }
     if !pruned {
-        window = window.with_cuda_adaln_working_sets(cuda_adaln_working_sets(path, &cfg)?)?;
+        window = window.with_cuda_adaln_working_sets(cuda_adaln_working_sets(path, cfg)?)?;
     }
     Ok(Some(window))
 }
@@ -132,7 +148,7 @@ fn cuda_adaln_working_sets(
 /// Runtime payloads collapse affine triples into the exact GGUF container used by CUDA.
 /// Returns payload-by-source-name, host constructor peak and the largest root/body decode peak.
 /// Full AdaLN decode is priced separately at its current precompute projection, not in denoise.
-fn runtime_payloads(
+pub(crate) fn runtime_payloads(
     path: &Path,
     text_encoder: bool,
 ) -> candle_gen::gen_core::Result<(BTreeMap<String, u64>, u64, u64)> {
@@ -264,7 +280,7 @@ pub(crate) fn proof_dit_inventory(
     runtime_payloads(path, false)
 }
 
-pub(super) fn text_encoder_stream(
+pub(crate) fn text_encoder_stream(
     path: &Path,
 ) -> candle_gen::gen_core::Result<Option<StreamedWeightFacts>> {
     if weightsmeta::safetensors_path_bytes(path) == 0 {

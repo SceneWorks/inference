@@ -1,4 +1,16 @@
-//! The **`minimax_h3_image` generator**: prompt → image, `MiniMaxAI/MiniMax-H3-Image` on MLX.
+//! The **`minimax_h3_image` generator**: prompt (and up to 16 reference images) → image,
+//! `MiniMaxAI/MiniMax-H3-Image` on MLX.
+//!
+//! # Tasks
+//!
+//! * **`text2image`** — no reference: the phases below.
+//! * **`edit`** — 1 to 16 `Conditioning::Reference` / `Conditioning::MultiReference` images,
+//!   in request order (`<Picture 1>` is the first). Each reference takes two paths, as upstream:
+//!   resized to a 1024 short edge, it goes through H3's Qwen3-VL vision tower and is spliced into the
+//!   `Picture i: ` + vision-block presentation ([`MiniMaxH3Tokenizer::image_edit_ids`]);
+//!   resized into a `[1024, 2048]` short edge, it is VAE-encoded on its own latent grid
+//!   ([`MiniMaxH3ImageVaeEncoder`]), noised to `t = 0.999` and packed in front of the generated
+//!   rows ([`ImageLayout::edit`]), held there for every step. The output size is the request's.
 //!
 //! # Phases (staged; nothing is co-resident)
 //!
@@ -11,6 +23,12 @@
 //! 2. **Denoise.** `transformer_diffusers/` ([`MiniMaxH3ImageDit`]) over the `[text | image]`
 //!    sequence, six fixed steps on [`SigmaSchedule::h3_image_distilled`], step `i` through head `i`,
 //!    velocity Euler. Released.
+//!
+//! Under rung 4 (a [`mlx_gen::gen_core::LoadShape::DeferredMaterialization`] load and a request
+//! whose memory block streams, SW-7094) phases 1 and 2 run H3's deferred text encoder and
+//! [`MiniMaxH3ImageDit::load_dir_deferred`] one layer / block at a time
+//! ([`MiniMaxH3Image::requested_transformer_window`]).
+//!
 //! 3. **Decode.** `vae_diffusers/` ([`MiniMaxH3ImageVae`]), tiled at the shipped 256 / 64; pixel
 //!    normalization reverted; 8-bit by truncation (decoders.py); resized back to the requested size
 //!    with Lanczos when the canvas differs.
@@ -28,11 +46,14 @@ use mlx_rs::ops::{add, clip, multiply};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::gen_core::h3_image::{
-    latent_grid, t2i_prompt_ids, validate_request as validate_h3_image, FIXED_GUIDANCE, FIXED_STEPS,
+    edit_reference_images, latent_grid, reference_vae_size, reference_vision_size, t2i_prompt_ids,
+    validate_request as validate_h3_image, FIXED_GUIDANCE, FIXED_STEPS, REFERENCE_NOISE_AUG,
+    VAE_SPATIAL_RATIO,
 };
 use mlx_gen::gen_core::{
-    reject_unknown_components, Capabilities, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, Precision, Progress, StepSupport, WeightsSource,
+    reject_unknown_components, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, StepSupport,
+    WeightsSource,
 };
 use mlx_gen::{default_seed, Error, Result};
 
@@ -40,11 +61,13 @@ use crate::config::LATENT_CHANNELS;
 use crate::denoise::schedule::SigmaSchedule;
 use crate::h3_image::dit::{ImageDenoiser, MiniMaxH3ImageDit, IMAGE_DIT_COMPONENT};
 use crate::h3_image::layout::ImageLayout;
-use crate::image_vae::{MiniMaxH3ImageVae, IMAGE_VAE_COMPONENT};
+use crate::image_vae::{MiniMaxH3ImageVae, MiniMaxH3ImageVaeEncoder, IMAGE_VAE_COMPONENT};
 use crate::model::TEXT_ENCODER_COMPONENT;
 use crate::pipeline::{patchify_video_latents, unpatchify_video_rows, PIXEL_MEAN, PIXEL_STD};
 use crate::spatial_tiling::SpatialTiling;
-use crate::text_encoder::{MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, LM_PREFIX};
+use crate::text_encoder::{
+    MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer, LM_PREFIX, VISION_PREFIX,
+};
 
 /// The published provider id.
 pub const IMAGE_MODEL_ID: &str = "minimax_h3_image";
@@ -60,10 +83,18 @@ pub const MAX_COUNT: u32 = 8;
 pub struct MiniMaxH3Image {
     descriptor: ModelDescriptor,
     root: PathBuf,
+    dit_dir: PathBuf,
     text_encoder_dir: PathBuf,
     dtype: Dtype,
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
     memory_tier: mlx_gen::gen_core::MemoryNumericTier,
+    /// LoRA / LoKr adapters (SW-7096), installed on the DiT each time it is mapped for a render
+    /// and released with it.
+    adapters: Vec<mlx_gen::gen_core::AdapterSpec>,
+    /// The load shape this generator was loaded at — the one field rung 4's declaration and its
+    /// runtime admission ([`MiniMaxH3Image::requested_transformer_window`]) both read, so the two
+    /// cannot disagree about whether the rung exists (SW-7094).
+    load_shape: mlx_gen::gen_core::LoadShape,
 }
 
 /// The identity, modality and capability surface.
@@ -85,11 +116,19 @@ pub fn descriptor() -> ModelDescriptor {
             // documented no-op (`validate` clears it before the shared floor).
             supports_negative_prompt: false,
             supports_guidance: false,
-            // text2image only in this item; edit (reference images) is a separate route.
-            conditioning: vec![],
-            supports_lora: false,
-            supports_lokr: false,
-            supported_quants: &[],
+            // `edit`: 1..=16 reference images, as single references and/or one multi-reference
+            // list, in request order. No reference is `text2image`.
+            conditioning: vec![
+                ConditioningKind::Reference,
+                ConditioningKind::MultiReference,
+            ],
+            // SW-7096: H3's adapter install over the image DiT's block/refiner surface --
+            // diffusers/PEFT, kohya `lora_unet_`, ComfyUI and LoKr, each at its own scale.
+            supports_lora: true,
+            supports_lokr: true,
+            // Pre-quantized tiers only (SW-7093): packed offline by
+            // `crate::convert::quantize_minimax_h3_image_dit`, staged as the DiT component.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // Upstream requires only a positive size: no maximum area or edge.
             min_size: 1,
             max_size: u32::MAX,
@@ -126,20 +165,15 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             )))
         }
     };
-    reject_unknown_components(spec, &[TEXT_ENCODER_COMPONENT], IMAGE_MODEL_ID)?;
-    if spec.quantize.is_some() {
-        return Err(Error::Unsupported(format!(
-            "{IMAGE_MODEL_ID}: only the published bf16 checkpoint loads on MLX; no packed tier exists"
-        )));
-    }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Unsupported(format!(
-            "{IMAGE_MODEL_ID}: adapters are not supported"
-        )));
-    }
+    reject_unknown_components(
+        spec,
+        &[TEXT_ENCODER_COMPONENT, IMAGE_DIT_COMPONENT],
+        IMAGE_MODEL_ID,
+    )?;
     let text_encoder_dir = resolve_text_encoder_dir(&root, spec);
+    let dit_dir = crate::h3_image::tier::resolve_dit_dir(&root, spec);
     let mut probes: Vec<PathBuf> = vec![
-        root.join(IMAGE_DIT_COMPONENT).join("config.json"),
+        dit_dir.join("config.json"),
         root.join(IMAGE_VAE_COMPONENT).join("config.json"),
         root.join("tokenizer").join("tokenizer.json"),
         root.join("tokenizer").join("tokenizer_config.json"),
@@ -159,6 +193,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             )));
         }
     }
+    crate::h3_image::tier::reconcile(&dit_dir, &text_encoder_dir, spec)?;
     let dtype = match spec.precision {
         Precision::Fp32 => Dtype::Float32,
         _ => Dtype::Bfloat16,
@@ -167,10 +202,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(MiniMaxH3Image {
         descriptor: descriptor(),
         root,
+        dit_dir,
         text_encoder_dir,
         dtype,
         memory_strategy,
         memory_tier: mlx_gen::request_scope::loaded_tier(spec),
+        adapters: spec.adapters.clone(),
+        load_shape: spec.load_shape,
     }))
 }
 
@@ -182,6 +220,8 @@ pub fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<
             "{IMAGE_MODEL_ID}: prompt must not be empty"
         )));
     }
+    let references = edit_reference_images(&req.conditioning)
+        .map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
     validate_h3_image(
         req.width,
         req.height,
@@ -191,7 +231,7 @@ pub fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<
         req.negative_prompt
             .as_deref()
             .is_some_and(|n| !n.trim().is_empty()),
-        req.conditioning.len(),
+        references.len(),
     )
     .map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
     // Guidance 1.0 is the family's documented no-op, admitted above; the shared floor refuses any
@@ -296,6 +336,81 @@ pub fn resize_to_request(
     })
 }
 
+/// One reference resized for one of its consumers, PIL-Lanczos as `VaeImageProcessor.resize`
+/// does; a reference already at `(width, height)` keeps its pixels.
+pub fn resize_reference(
+    image: &mlx_gen::media::Image,
+    (width, height): (u32, u32),
+) -> Result<mlx_gen::media::Image> {
+    resize_to_request(image.clone(), width, height)
+}
+
+/// The VAE copy's pixels: cropped at the top left to whole [`VAE_SPATIAL_RATIO`] cells, then
+/// ImageNet-normalized to `[1, 3, H, W]` (`MiniMaxH3ImageEditVaeEncoderStep`).
+pub fn reference_vae_pixels(image: &mlx_gen::media::Image) -> Result<Array> {
+    let r = VAE_SPATIAL_RATIO;
+    let (w, h) = (image.width / r * r, image.height / r * r);
+    if w == 0 || h == 0 {
+        return Err(Error::Msg(format!(
+            "{IMAGE_MODEL_ID}: a {}x{} reference holds no whole {r}px VAE cell",
+            image.width, image.height
+        )));
+    }
+    let mut pixels = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h as usize {
+        let row = y * image.width as usize * 3;
+        pixels.extend_from_slice(&image.pixels[row..row + w as usize * 3]);
+    }
+    let cropped = mlx_gen::media::Image {
+        width: w,
+        height: h,
+        pixels,
+    };
+    Ok(crate::keyframe::keyframe_to_vae_pixels(&cropped)?.reshape(&[1, 3, h as i32, w as i32])?)
+}
+
+/// Seeded `[shape]` standard-normal noise for an edit's per-reference draws: the posterior
+/// sample (`stream` 0) and the conditioning augmentation (`stream` 1) of reference `index`, each
+/// its own key so no two draws share a stream and none disturbs the generated image's noise.
+pub fn reference_noise(seed: u64, stream: u64, index: usize, shape: &[i32]) -> Result<Array> {
+    let key = mlx_rs::random::key(
+        seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(stream.wrapping_mul(1 << 32))
+            .wrapping_add(index as u64 + 1),
+    )?;
+    Ok(mlx_rs::random::normal::<f32>(
+        shape,
+        None,
+        None,
+        Some(&key),
+    )?)
+}
+
+/// An edit's conditioning rows: every reference latent `[1, 24, h, w]` noised to
+/// [`REFERENCE_NOISE_AUG`] with its `noise` (`scale_noise`, `t · x + (1 - t) · n` in float32),
+/// patchified as one latent frame, and concatenated in packed order —
+/// `MiniMaxH3ImageEditPrepareLatentsStep`. Returns `[1, num_reference_rows, 96]`.
+pub fn reference_condition_rows(
+    latents: &[Array],
+    noise: &[Array],
+    patch: [i32; 3],
+) -> Result<Array> {
+    if latents.len() != noise.len() || latents.is_empty() {
+        return Err(Error::Msg(format!(
+            "{IMAGE_MODEL_ID}: {} reference latents for {} noise tensors",
+            latents.len(),
+            noise.len()
+        )));
+    }
+    let mut rows = Vec::with_capacity(latents.len());
+    for (latent, n) in latents.iter().zip(noise) {
+        let latent = latent.as_dtype(Dtype::Float32)?;
+        let noised = crate::conditioning::scale_noise(&latent, REFERENCE_NOISE_AUG, n)?;
+        rows.push(patchify_video_latents(&noised.expand_dims(2)?, patch)?);
+    }
+    Ok(mlx_rs::ops::concatenate_axis(&rows, 1)?)
+}
+
 /// Drop a component and drain MLX's allocator cache (H3's retried drain).
 fn release<T>(component: T) {
     drop(component);
@@ -313,10 +428,42 @@ impl MiniMaxH3Image {
         &self.text_encoder_dir
     }
 
-    /// Encode the prompt (layer-50 hidden state) and release the text encoder.
+    /// Build the request's text encoder at the residency [`Self::requested_transformer_window`]
+    /// admitted: resident over the mapped shards, or H3's deferred encoder with a per-window
+    /// layer rebuild (rung 4, SW-7094). One constructor for both presentations, so `text2image`
+    /// cannot stream while `edit` silently stays resident.
+    fn build_te(
+        &self,
+        w: Option<&mlx_gen::weights::Weights>,
+        cfg: &MiniMaxH3TeConfig,
+        window: Option<u32>,
+        cancel: &mlx_gen::CancelFlag,
+    ) -> Result<MiniMaxH3TextEncoder> {
+        match (window, w) {
+            (None, Some(w)) => MiniMaxH3TextEncoder::from_weights(w, LM_PREFIX, cfg),
+            (Some(window), None) => {
+                let mut te = MiniMaxH3TextEncoder::from_dir_deferred(
+                    &self.text_encoder_dir,
+                    LM_PREFIX,
+                    cfg,
+                )?;
+                te.set_block_window(window as usize, cancel.clone())?;
+                Ok(te)
+            }
+            _ => Err(Error::Msg(format!(
+                "{IMAGE_MODEL_ID}: a resident text encoder builds from mapped shards and a \
+                 windowed one from none"
+            ))),
+        }
+    }
+
+    /// Encode the prompt (layer-50 hidden state) and release the text encoder. `window` is the
+    /// rung-4 layer window, `None` for the resident encoder.
     pub fn encode_prompt(
         &self,
         prompt: &str,
+        window: Option<u32>,
+        cancel: &mlx_gen::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
@@ -324,15 +471,170 @@ impl MiniMaxH3Image {
         let len = ids.len() as i32;
         let input_ids = Array::from_slice(&ids, &[1, len]);
         let mask = Array::from_slice(&vec![1i32; ids.len()], &[1, len]);
-        let w = crate::text_encoder::map_shards(&self.text_encoder_dir, false)?;
+        // Under a window the shard map is skipped: `from_dir_deferred` reads only `embed_tokens`,
+        // and a retained map would keep every layer tensor reachable across the windowed walk.
+        let w = match window {
+            None => Some(crate::text_encoder::map_shards(
+                &self.text_encoder_dir,
+                false,
+            )?),
+            Some(_) => None,
+        };
         let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
-        let te = MiniMaxH3TextEncoder::from_weights(&w, LM_PREFIX, &cfg)?;
+        let te = self.build_te(w.as_ref(), &cfg, window, cancel)?;
         let context =
             mlx_gen::gen_core::with_prompt_encoding(on_progress, || te.forward(&input_ids, &mask))?;
         // Force before the encoder is dropped: a lazy context still references every weight.
         mlx_rs::transforms::eval([&context])?;
         release((te, w));
         Ok(context)
+    }
+
+    /// The `edit` presentation (`MiniMaxH3ImageEditTextEncoderStep`): H3's Qwen3-VL vision tower
+    /// over every vision-resized reference, spliced into the `Picture i: ` + vision-block
+    /// presentation, then the layer-50 context. Returns the context and its per-row tags.
+    pub fn encode_edit_prompt(
+        &self,
+        prompt: &str,
+        vision_images: &[mlx_gen::media::Image],
+        window: Option<u32>,
+        cancel: &mlx_gen::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(Array, Vec<i32>)> {
+        let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
+        let shard = self.text_encoder_dir.join(format!(
+            "model-{:05}-of-00014.safetensors",
+            crate::text_encoder::VISION_SHARD
+        ));
+        if !shard.is_file() {
+            return Err(Error::Msg(format!(
+                "{IMAGE_MODEL_ID}: an edit reads the vision tower from {} (MiniMax-H3's \
+                 text_encoder/ shard {}), which is missing",
+                shard.display(),
+                crate::text_encoder::VISION_SHARD
+            )));
+        }
+        let mut w = crate::text_encoder::map_shards(&self.text_encoder_dir, true)?;
+        let vision = mlx_gen_boogu::vision::VisionTower::from_weights(
+            &w,
+            crate::text_encoder::minimax_h3_vision_config(),
+            VISION_PREFIX,
+            crate::model::VISION_GROUP_SIZE,
+        )?;
+        w.materialize_accessed()?;
+        let refs: Vec<&mlx_gen::media::Image> = vision_images.iter().collect();
+        let grounded = crate::text_encoder::run_vision(&vision, &refs)?;
+        let mut forced: Vec<&Array> = grounded.embeds.iter().collect();
+        forced.extend(grounded.deepstack.iter().flatten());
+        mlx_rs::transforms::eval(forced)?;
+        release(vision);
+        w.remove_prefix(VISION_PREFIX);
+
+        let (ids, tags) = tok.image_edit_ids(prompt, &grounded.counts)?;
+        let len = ids.len() as i32;
+        let input_ids = Array::from_slice(&ids, &[1, len]);
+        let mask = Array::from_slice(&vec![1i32; ids.len()], &[1, len]);
+        let cfg = MiniMaxH3TeConfig::qwen3_vl_32b();
+        // Under a window the mapped shards are released before the encoder is built: the deferred
+        // loader reopens the staged directory per window (H3's `encode_prompt_grounded`).
+        let w = match window {
+            None => Some(w),
+            Some(_) => {
+                release(w);
+                None
+            }
+        };
+        let te = self.build_te(w.as_ref(), &cfg, window, cancel)?;
+        let context = mlx_gen::gen_core::with_prompt_encoding(on_progress, || {
+            te.forward_with_images(
+                &input_ids,
+                &mask,
+                &grounded.embeds,
+                &grounded.deepstack,
+                &grounded.grids,
+            )
+        })?;
+        mlx_rs::transforms::eval([&context])?;
+        release((te, w, grounded));
+        if context.shape()[1] != tags.len() as i32 {
+            return Err(Error::Msg(format!(
+                "{IMAGE_MODEL_ID}: the edit context has {} rows but {} modality tags",
+                context.shape()[1],
+                tags.len()
+            )));
+        }
+        Ok((context, tags))
+    }
+
+    /// Every VAE-resized reference's conditioning latent `[1, 24, h, w]` on its own grid
+    /// (`MiniMaxH3ImageEditVaeEncoderStep`), the posterior sampled with [`reference_noise`]
+    /// stream 0. The encoder is loaded, used and released here.
+    pub fn encode_reference_latents(
+        &self,
+        vae_images: &[mlx_gen::media::Image],
+        seed: u64,
+        patch: [i32; 3],
+    ) -> Result<Vec<Array>> {
+        let encoder = MiniMaxH3ImageVaeEncoder::load(&self.root)?;
+        let mut latents = Vec::with_capacity(vae_images.len());
+        for (i, image) in vae_images.iter().enumerate() {
+            let posterior = encoder.encode(&reference_vae_pixels(image)?)?;
+            let noise = reference_noise(seed, 0, i, posterior.mean().shape())?;
+            let latent = encoder.reference_latent(&posterior, &noise, (patch[1], patch[2]))?;
+            mlx_rs::transforms::eval([&latent])?;
+            latents.push(latent);
+        }
+        release(encoder);
+        Ok(latents)
+    }
+
+    /// The rung-4 admission for one request (SW-7094): `Some(window)` routes the render through
+    /// the deferred loaders ([`MiniMaxH3ImageDit::load_dir_deferred`],
+    /// [`MiniMaxH3TextEncoder::from_dir_deferred`]), `None` is the resident staged path.
+    ///
+    /// Each guard mirrors a declaration clause of [`crate::h3_image::memory`], because a request
+    /// the contract refuses must be refused here even without a request scope, and one it admits
+    /// must not be silently downgraded:
+    ///
+    /// * the load shape must be [`mlx_gen::gen_core::LoadShape::DeferredMaterialization`] — rung
+    ///   4's prerequisite, and what `memory::streamable` resolves `Implemented` on;
+    /// * the component must be [`mlx_gen::gen_core::TransformerComponent::Both`] — the only
+    ///   declared arm (the conditioning phase is the taller one at every tier);
+    /// * the window must be the published singleton
+    ///   [`crate::h3_image::memory::IMAGE_TRANSFORMER_WINDOW_SIZE`].
+    ///
+    /// Adapters are admitted: the block stream re-applies them to every rebuilt block (SW-7096).
+    pub fn requested_transformer_window(&self, req: &GenerationRequest) -> Result<Option<u32>> {
+        use mlx_gen::gen_core::{LoadShape, TransformerComponent};
+        let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
+            return Ok(None);
+        };
+        if self.load_shape != LoadShape::DeferredMaterialization {
+            return Err(Error::Unsupported(format!(
+                "{IMAGE_MODEL_ID}: transformer streaming (rung 4) requires a \
+                 LoadShape::DeferredMaterialization load; this generator was loaded resident, \
+                 where the rung is declared Missing"
+            )));
+        }
+        let component = memory
+            .transformer_window_component
+            .unwrap_or(TransformerComponent::Dit);
+        if component != TransformerComponent::Both {
+            return Err(Error::Unsupported(format!(
+                "{IMAGE_MODEL_ID}: transformer streaming is declared for TransformerComponent::Both \
+                 only — got {component:?}"
+            )));
+        }
+        let size = memory
+            .transformer_window_size
+            .unwrap_or(crate::h3_image::memory::IMAGE_TRANSFORMER_WINDOW_SIZE);
+        if size != crate::h3_image::memory::IMAGE_TRANSFORMER_WINDOW_SIZE {
+            return Err(Error::Unsupported(format!(
+                "{IMAGE_MODEL_ID}: transformer window {size} is outside the published domain [{}]",
+                crate::h3_image::memory::IMAGE_TRANSFORMER_WINDOW_SIZE
+            )));
+        }
+        Ok(Some(size))
     }
 
     fn generate_impl(
@@ -344,8 +646,12 @@ impl MiniMaxH3Image {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        // Resolved before any weight maps, so an unadmitted geometry is a request error.
+        // Resolved before any weight maps, so an unadmitted geometry or window is a request error.
         let tiling = decode_tiling_for(req)?;
+        let window = self.requested_transformer_window(req)?;
+        // Rung 3: an undeclared chunk size is refused here; the budget itself depends on the
+        // packed sequence and is resolved once the layout is known.
+        crate::h3_image::memory::requested_bounded_attention(req.memory, 0).map_err(Error::from)?;
         // The same canvas admission sized this request's resources from.
         let (canvas_w, canvas_h) = crate::h3_image::memory::admission_canvas(req.width, req.height)
             .map_err(Error::from)?;
@@ -353,41 +659,138 @@ impl MiniMaxH3Image {
         let seed = req.seed.unwrap_or_else(default_seed);
         let count = req.count.max(1);
 
+        let references = edit_reference_images(&req.conditioning)
+            .map_err(|r| Error::from(mlx_gen::gen_core::Error::from(r)))?;
+        let patch = crate::dit::config::MiniMaxH3ImageDitConfig::default()
+            .base
+            .patch_size;
+
         // --- 1. conditioning ---------------------------------------------------------------
+        // An edit's references are resized once per consumer; neither copy is resized to the
+        // generated image's size.
         on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::TextEncoder));
-        let context = self.encode_prompt(&req.prompt, on_progress)?;
+        let (context, text_tags, reference_latents) = if references.is_empty() {
+            let context = self.encode_prompt(&req.prompt, window, &req.cancel, on_progress)?;
+            let n = context.shape()[1];
+            (
+                context,
+                vec![mlx_gen::gen_core::h3_image::TEXT_TAG; n as usize],
+                Vec::new(),
+            )
+        } else {
+            let vision_images = references
+                .iter()
+                .map(|r| resize_reference(r, reference_vision_size(r.width, r.height)))
+                .collect::<Result<Vec<_>>>()?;
+            let (context, tags) = self.encode_edit_prompt(
+                &req.prompt,
+                &vision_images,
+                window,
+                &req.cancel,
+                on_progress,
+            )?;
+            drop(vision_images);
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            let vae_images = references
+                .iter()
+                .map(|r| resize_reference(r, reference_vae_size(r.width, r.height)))
+                .collect::<Result<Vec<_>>>()?;
+            let latents = self.encode_reference_latents(&vae_images, seed, patch)?;
+            (context, tags, latents)
+        };
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
 
         // --- 2. denoise --------------------------------------------------------------------
         on_progress(Progress::Loading(mlx_gen::gen_core::LoadPhase::Renderer));
-        let dit = MiniMaxH3ImageDit::load(&self.root, self.dtype)?;
-        let layout = ImageLayout::t2i(
-            context.shape()[1],
-            latent_h as i32,
-            latent_w as i32,
-            dit.config().base.patch_size,
-        )?;
-        let denoiser = ImageDenoiser::new(
-            dit,
-            layout.clone(),
-            &context,
-            SigmaSchedule::h3_image_distilled()?,
-        )?;
+        let mut dit = match window {
+            None => MiniMaxH3ImageDit::load_dir(&self.dit_dir, self.dtype)?,
+            Some(_) => MiniMaxH3ImageDit::load_dir_deferred(&self.dit_dir, self.dtype)?,
+        };
+        if !self.adapters.is_empty() {
+            // Strict, like H3 video: an unmatched target or a file that matched nothing fails the
+            // render here rather than producing an image the LoRA barely touched. Under rung 4 the
+            // block residuals land in the stream's overlay and are forced once here.
+            crate::adapters::apply_minimax_h3_adapters(&mut dit, &self.adapters)?;
+            dit.materialize_streamed_adapters()?;
+        }
+        debug_assert_eq!(patch, dit.config().base.patch_size);
+        let layout = if reference_latents.is_empty() {
+            ImageLayout::t2i(
+                context.shape()[1],
+                latent_h as i32,
+                latent_w as i32,
+                dit.config().base.patch_size,
+            )?
+        } else {
+            let grids: Vec<(i32, i32)> = reference_latents
+                .iter()
+                .map(|l| (l.shape()[2], l.shape()[3]))
+                .collect();
+            ImageLayout::edit(
+                &text_tags,
+                &grids,
+                latent_h as i32,
+                latent_w as i32,
+                dit.config().base.patch_size,
+            )?
+        };
+        let mut denoiser = match window {
+            None => ImageDenoiser::new(
+                dit,
+                layout.clone(),
+                &context,
+                SigmaSchedule::h3_image_distilled()?,
+            )?,
+            Some(window) => ImageDenoiser::new_windowed(
+                dit,
+                layout.clone(),
+                &context,
+                SigmaSchedule::h3_image_distilled()?,
+                window as usize,
+                req.cancel.clone(),
+            )?,
+        };
+        // Rung 3 (SW-7094): every block's attention on whole heads, resident or windowed.
+        if let Some((budget, axis)) = crate::h3_image::memory::requested_bounded_attention(
+            req.memory,
+            layout.seq_len() as u64,
+        )
+        .map_err(Error::from)?
+        {
+            denoiser.set_bounded_attention(budget, axis);
+        }
         release(context);
         let steps = denoiser.num_steps() as u32;
         let total = steps * count;
         let mut latents = Vec::with_capacity(count as usize);
         for n in 0..count {
-            let noise = initial_rows(&layout, seed.wrapping_add(u64::from(n)))?;
+            let image_seed = seed.wrapping_add(u64::from(n));
+            let noise = initial_rows(&layout, image_seed)?;
+            // An edit's reference rows lead the packed image stream, noised to 0.999 with one draw
+            // per reference after the generated image's own.
+            let packed = if reference_latents.is_empty() {
+                noise
+            } else {
+                let aug = reference_latents
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| reference_noise(image_seed, 1, i, l.shape()))
+                    .collect::<Result<Vec<_>>>()?;
+                let condition = reference_condition_rows(&reference_latents, &aug, patch)?;
+                mlx_rs::ops::concatenate_axis(&[condition, noise], 1)?
+            };
             let done = n * steps;
-            let rows = denoiser.denoise(&noise, &req.cancel, &mut |s| {
+            let rows = denoiser.denoise(&packed, &req.cancel, &mut |s| {
                 on_progress(Progress::Step {
                     current: done + s as u32,
                     total,
                 })
             })?;
+            let rows = denoiser.generated_rows(&rows)?;
             let latent = unpatchify_video_rows(
                 &rows,
                 LATENT_CHANNELS as i32,
@@ -405,7 +808,7 @@ impl MiniMaxH3Image {
             mlx_rs::transforms::eval([&latent])?;
             latents.push(latent);
         }
-        release(denoiser);
+        release((denoiser, reference_latents));
 
         // --- 3. decode ---------------------------------------------------------------------
         on_progress(Progress::Decoding);
@@ -571,6 +974,103 @@ mod tests {
         assert!(decode_tiling_for(&r).is_err());
     }
 
+    fn generator(shape: mlx_gen::gen_core::LoadShape) -> MiniMaxH3Image {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-minimax-h3-image".into()));
+        spec.load_shape = shape;
+        MiniMaxH3Image {
+            descriptor: descriptor(),
+            root: "/nonexistent-minimax-h3-image".into(),
+            dit_dir: "/nonexistent-minimax-h3-image/transformer_diffusers".into(),
+            text_encoder_dir: "/nonexistent-minimax-h3-image/text_encoder".into(),
+            dtype: Dtype::Bfloat16,
+            memory_strategy: crate::h3_image::memory::weights_free_contract(&spec).unwrap(),
+            memory_tier: mlx_gen::request_scope::loaded_tier(&spec),
+            adapters: Vec::new(),
+            load_shape: shape,
+        }
+    }
+
+    /// SW-7094: rung 4's runtime admission mirrors the declaration — the generation memory the
+    /// contract derives for its own rung-4 selection is admitted with window 1; a resident load,
+    /// a DiT-only scope or another window is refused rather than silently run resident.
+    #[test]
+    fn transformer_streaming_is_admitted_exactly_as_declared() {
+        use mlx_gen::gen_core::{
+            GenerationMemory, LoadShape, MemorySelection, MemoryStrategy, MemoryStrategyParameters,
+            TransformerComponent,
+        };
+        let deferred = generator(LoadShape::DeferredMaterialization);
+        let selection = MemorySelection {
+            strategy: MemoryStrategy::BoundedTransformerResidency,
+            parameters: MemoryStrategyParameters {
+                decode_tile_edge: Some(256),
+                decode_overlap: Some(64),
+                transformer_window_size: Some(1),
+                transformer_window_component: Some(TransformerComponent::Both),
+                attention_chunk_size: Some(crate::h3_image::memory::IMAGE_ATTENTION_CHUNK_SIZE),
+                ..Default::default()
+            },
+            tier: deferred.memory_tier,
+        };
+        let declared = deferred.memory_strategy.generation_memory(&selection);
+        let streamed = GenerationRequest {
+            memory: declared,
+            ..req(4096, 4096)
+        };
+        assert_eq!(
+            deferred.requested_transformer_window(&streamed).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            deferred
+                .requested_transformer_window(&req(4096, 4096))
+                .unwrap(),
+            None
+        );
+        let with = |memory: GenerationMemory| GenerationRequest {
+            memory: Some(memory),
+            ..req(4096, 4096)
+        };
+        let both = GenerationMemory {
+            stream_transformer_blocks: true,
+            transformer_window_component: Some(TransformerComponent::Both),
+            ..Default::default()
+        };
+        assert_eq!(
+            deferred.requested_transformer_window(&with(both)).unwrap(),
+            Some(1)
+        );
+        for refused in [
+            GenerationMemory {
+                transformer_window_component: Some(TransformerComponent::Dit),
+                ..both
+            },
+            GenerationMemory {
+                transformer_window_component: None,
+                ..both
+            },
+            GenerationMemory {
+                transformer_window_size: Some(2),
+                ..both
+            },
+        ] {
+            assert!(deferred
+                .requested_transformer_window(&with(refused))
+                .is_err());
+        }
+        let resident = generator(LoadShape::EagerMaterialization);
+        let e = resident
+            .requested_transformer_window(&with(both))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("DeferredMaterialization"), "{e}");
+        // Declaration and admission agree: the resident contract does not admit the selection.
+        assert!(resident
+            .memory_strategy
+            .validate_selection(&selection)
+            .is_err());
+    }
+
     /// A missing component is a load-time error naming the path, and only the text-encoder
     /// component key is accepted.
     #[test]
@@ -600,5 +1100,90 @@ mod tests {
         let down = resize_to_request(image(px), 2, 3).unwrap();
         assert_eq!((down.width, down.height), (2, 3));
         assert_eq!(down.pixels, vec![10u8; 2 * 3 * 3]);
+    }
+
+    fn image(w: u32, h: u32) -> mlx_gen::media::Image {
+        mlx_gen::media::Image {
+            width: w,
+            height: h,
+            pixels: (0..w * h * 3).map(|v| (v % 251) as u8).collect(),
+        }
+    }
+
+    fn with_refs(n: usize, w: u32, h: u32) -> GenerationRequest {
+        GenerationRequest {
+            conditioning: vec![mlx_gen::gen_core::Conditioning::MultiReference {
+                images: (0..n).map(|_| image(w, h)).collect(),
+            }],
+            ..req(1024, 1024)
+        }
+    }
+
+    /// `edit` is advertised as reference images, and the validator admits 1..=16 references of
+    /// at least 32 px a side and refuses 17 or a 31 px one.
+    #[test]
+    fn edit_admits_one_to_sixteen_references_of_at_least_32_px() {
+        let caps = descriptor().capabilities;
+        assert!(caps.conditioning.contains(&ConditioningKind::Reference));
+        assert!(caps
+            .conditioning
+            .contains(&ConditioningKind::MultiReference));
+        validate_request(&caps, &with_refs(1, 32, 32)).unwrap();
+        validate_request(&caps, &with_refs(16, 64, 40)).unwrap();
+        let e = validate_request(&caps, &with_refs(17, 64, 64))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("17"), "{e}");
+        let e = validate_request(&caps, &with_refs(2, 31, 64))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("32"), "{e}");
+    }
+
+    /// The VAE copy is cropped at the top left to whole 16 px cells before normalization.
+    #[test]
+    fn reference_vae_pixels_crop_to_whole_cells() {
+        let img = image(40, 35);
+        let px = reference_vae_pixels(&img).unwrap();
+        assert_eq!(px.shape(), &[1, 3, 32, 32]);
+        // Pixel (y=1, x=2) red channel survives the crop at the same place.
+        let want = (f32::from(img.pixels[(40 + 2) * 3]) / 255.0 - PIXEL_MEAN[0]) / PIXEL_STD[0];
+        let got: Vec<f32> = px
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        assert!((got[32 + 2] - want).abs() < 1e-6);
+        assert!(reference_vae_pixels(&image(15, 64)).is_err());
+    }
+
+    /// Reference rows: `0.999 · x + 0.001 · n`, one latent frame each, concatenated in order.
+    #[test]
+    fn reference_condition_rows_noise_then_pack_in_order() {
+        let a = Array::from_slice(&vec![1.0f32; 24 * 2 * 4], &[1, 24, 2, 4]);
+        let b = Array::from_slice(&vec![2.0f32; 24 * 4 * 2], &[1, 24, 4, 2]);
+        let za = Array::from_slice(&vec![0.0f32; 24 * 8], &[1, 24, 2, 4]);
+        let zb = Array::from_slice(&vec![1000.0f32; 24 * 8], &[1, 24, 4, 2]);
+        let rows = reference_condition_rows(&[a, b], &[za, zb], [1, 2, 2]).unwrap();
+        assert_eq!(rows.shape(), &[1, 2 + 2, 96]);
+        let v: Vec<f32> = rows.as_slice::<f32>().to_vec();
+        assert!((v[0] - 0.999).abs() < 1e-6);
+        assert!((v[2 * 96] - (2.0 * 0.999 + 1000.0 * (1.0 - 0.999f32))).abs() < 1e-3);
+        assert!(reference_condition_rows(&[], &[], [1, 2, 2]).is_err());
+    }
+
+    /// Distinct references and streams draw distinct noise; the same key draws the same noise.
+    #[test]
+    fn reference_noise_streams_are_distinct_and_deterministic() {
+        let draw = |seed, stream, i| -> Vec<f32> {
+            reference_noise(seed, stream, i, &[1, 4])
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec()
+        };
+        assert_eq!(draw(7, 0, 0), draw(7, 0, 0));
+        assert_ne!(draw(7, 0, 0), draw(7, 1, 0));
+        assert_ne!(draw(7, 0, 0), draw(7, 0, 1));
+        assert_ne!(draw(7, 0, 0), draw(8, 0, 0));
     }
 }

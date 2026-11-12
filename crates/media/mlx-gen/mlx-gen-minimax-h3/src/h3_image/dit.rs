@@ -16,26 +16,37 @@
 //! * **One output head per step.** Step `i` projects with `pdd_proj_out.{i}`
 //!   ([`crate::dit::heads::PddHeads::select`]); the step index is an argument of [`ImageDenoiser::velocity`]
 //!   rather than a property of the model, so it reaches the head application on every call.
-//! * **One row class.** Every row of a `text2image` sequence sits at the step's timestep (upstream
-//!   `row_timestep_plan` with no reference rows), so the AdaLN schedule has a single row class and
-//!   the gather index is `global_timestep · 3 + tag`. The six timesteps are enumerated up front,
+//! * **At most two row classes.** Every text and generated row sits at the step's timestep
+//!   (upstream `row_timestep_plan`); an edit's reference rows sit at `0.999` for every step. The
+//!   gather index is `global_timestep · 3 + tag`. The six timesteps are enumerated up front,
 //!   which lets the whole run's modulation be projected once and `adaln_proj` evicted — H3's own
 //!   [`AdaLnCache::precompute_and_evict`].
 //!
 //! The sampler is the H3-Image checkpoint's: the [`SigmaSchedule::h3_image_distilled`] grid, and
 //! the `velocity` Euler form its scheduler config selects ([`ImageDenoiser::step`]).
+//!
+//! **Rung 4 (SW-7094).** [`MiniMaxH3ImageDit::load_dir_deferred`] keeps only the non-block tensors
+//! (the I/O projections, the six heads, the refiner) and hands the 50 blocks to H3's
+//! [`DitBlockStream`]; [`ImageDenoiser::new_windowed`] projects the modulation through H3's
+//! windowed precompute and rebuilds the block bodies a window at a time on every step.
 
 use std::path::Path;
 
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::attention::{AttentionBudget, AttentionChunkAxis, AttentionPlan, BoundedAttention};
+use mlx_gen::block_residency::{run_windowed, BlockPlan};
+use mlx_gen::gen_core::h3_image::REFERENCE_NOISE_AUG;
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Result};
+
+use crate::block_stream::{precompute_adaln_windowed, DitBlockStream};
 
 use crate::denoise::schedule::SigmaSchedule;
 use crate::dit::adaln::{AdaLnCache, AdaLnResidency, TimestepSchedule};
-use crate::dit::block::DitBlock;
+use crate::dit::block::{AdaLnModulation, DitBlock};
 use crate::dit::config::MiniMaxH3ImageDitConfig;
 use crate::dit::heads::{AdaLayerNormOut, ImageDitProjections, NormOutModulation};
 use crate::dit::model::UnverifiedSources;
@@ -57,7 +68,11 @@ pub struct MiniMaxH3ImageDit {
     cfg: MiniMaxH3ImageDitConfig,
     projections: ImageDitProjections,
     refiner: TokenRefiner,
+    /// Empty under a deferred load (SW-7094, rung 4) — the blocks live in `stream` instead.
     blocks: Vec<DitBlock>,
+    /// `Some` under [`mlx_gen::gen_core::LoadShape::DeferredMaterialization`]: H3's
+    /// [`DitBlockStream`] over this DiT's 50 blocks (bodies per step, `adaln_proj` once per request).
+    stream: Option<DitBlockStream>,
     rope: MmRope,
     dtype: Dtype,
     /// Source tensors not yet GPU-verified, grouped by first consumer (H3's sc-23402 scheme).
@@ -85,20 +100,71 @@ impl MiniMaxH3ImageDit {
             projections,
             refiner,
             blocks,
+            stream: None,
             rope: MmRope::new(cfg.base.rope_freq_dim, cfg.base.rope_theta)?,
             dtype,
             unverified: UnverifiedSources::partition(w.accessed_entries()),
         })
     }
 
-    /// Load `transformer_diffusers/` from a snapshot root.
-    pub fn load(root: impl AsRef<Path>, dtype: Dtype) -> Result<Self> {
-        Self::load_dir(root.as_ref().join(IMAGE_DIT_COMPONENT), dtype)
+    /// Load **only** the non-block tensors — the I/O projections, the six per-step output heads
+    /// (`pdd_proj_out.{0..6}`) and the token refiner — and describe the 600 block tensors as an H3
+    /// [`DitBlockStream`]: rung 4's [`mlx_gen::gen_core::LoadShape::DeferredMaterialization`] loader
+    /// (SW-7094).
+    ///
+    /// The heads stay resident because each one is used once per request and together they are
+    /// `6 · 5376 · 96` float32 weights (12.4 MB): windowing them would re-read a head per step to
+    /// bound bytes one block window already exceeds 60-fold. Everything under `transformer_blocks.`
+    /// is left unread; the map is dropped before returning so no retained handle keeps a block
+    /// tensor reachable across windows (the hazard `run_windowed` documents).
+    pub fn load_dir_deferred(dir: impl AsRef<Path>, dtype: Dtype) -> Result<Self> {
+        let dir = dir.as_ref();
+        let cfg = Self::read_config(dir)?;
+        cfg.validate()?;
+        let stream = DitBlockStream::new(dir, dtype, cfg.base.clone())?;
+        let (projections, refiner, unverified) = {
+            let mut w = Weights::from_dir(dir)?;
+            let projections = ImageDitProjections::from_weights(&mut w, &cfg)?;
+            let refiner = TokenRefiner::from_weights(&mut w, "token_refiner", &cfg.base, dtype)?;
+            // Only the head tensors were read, so only the `head` group is populated.
+            (
+                projections,
+                refiner,
+                UnverifiedSources::partition(w.accessed_entries()),
+            )
+        };
+        Ok(Self {
+            cfg: cfg.clone(),
+            projections,
+            refiner,
+            blocks: Vec::new(),
+            stream: Some(stream),
+            rope: MmRope::new(cfg.base.rope_freq_dim, cfg.base.rope_theta)?,
+            dtype,
+            unverified,
+        })
     }
 
-    /// Load from a resolved component directory: its `config.json` and its shards.
-    pub fn load_dir(dir: impl AsRef<Path>, dtype: Dtype) -> Result<Self> {
-        let dir = dir.as_ref();
+    /// The block stream backing a deferred load, `None` for a resident one.
+    pub fn stream(&self) -> Option<&DitBlockStream> {
+        self.stream.as_ref()
+    }
+
+    /// Whether this load defers block materialization (rung 4).
+    pub fn is_deferred(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// Evaluate the adapter residuals a deferred load holds for its streamed blocks, once, so no
+    /// window pulls a lazy adapter-file read into its per-block eval. A no-op on a resident load.
+    pub fn materialize_streamed_adapters(&self) -> Result<()> {
+        match &self.stream {
+            Some(stream) => stream.adapters().materialize(),
+            None => Ok(()),
+        }
+    }
+
+    fn read_config(dir: &Path) -> Result<MiniMaxH3ImageDitConfig> {
         let config_path = dir.join("config.json");
         let text = mlx_gen::gen_core::__model_input_choose!(
             std::fs::read_to_string(&config_path),
@@ -110,7 +176,18 @@ impl MiniMaxH3ImageDit {
                 config_path.display()
             ))
         })?;
-        let cfg = MiniMaxH3ImageDitConfig::from_diffusers_json(&text)?;
+        MiniMaxH3ImageDitConfig::from_diffusers_json(&text)
+    }
+
+    /// Load `transformer_diffusers/` from a snapshot root.
+    pub fn load(root: impl AsRef<Path>, dtype: Dtype) -> Result<Self> {
+        Self::load_dir(root.as_ref().join(IMAGE_DIT_COMPONENT), dtype)
+    }
+
+    /// Load from a resolved component directory: its `config.json` and its shards.
+    pub fn load_dir(dir: impl AsRef<Path>, dtype: Dtype) -> Result<Self> {
+        let dir = dir.as_ref();
+        let cfg = Self::read_config(dir)?;
         let mut w = Weights::from_dir(dir)?;
         Self::from_weights(&mut w, &cfg, dtype)
     }
@@ -123,6 +200,11 @@ impl MiniMaxH3ImageDit {
             v.extend(DitBlock::names(&format!("transformer_blocks.{i}")));
         }
         v
+    }
+
+    /// The resident blocks, in order — empty under a deferred load.
+    pub fn blocks(&self) -> &[DitBlock] {
+        &self.blocks
     }
 
     /// The geometry in force.
@@ -140,9 +222,12 @@ impl MiniMaxH3ImageDit {
         &self.projections
     }
 
-    /// Blocks in the stack.
+    /// Blocks in the stack — the streamed depth under a deferred load.
     pub fn num_layers(&self) -> usize {
-        self.blocks.len()
+        match &self.stream {
+            Some(stream) => stream.n_blocks(),
+            None => self.blocks.len(),
+        }
     }
 
     /// `context_embedder` then the token refiner: the text rows of the packed sequence.
@@ -175,6 +260,74 @@ pub fn velocity_euler_delta(timesteps: &[f32], step: usize) -> Result<f32> {
     Ok(sigma(step) - sigma(step + 1))
 }
 
+/// Per sequence row, its AdaLN row class: `1` for an edit's reference rows (held at
+/// [`REFERENCE_NOISE_AUG`]), `0` for every text and generated row (the step's timestep).
+pub fn image_row_classes(layout: &ImageLayout) -> Vec<i32> {
+    let mut classes = vec![0i32; layout.seq_len() as usize];
+    let start = layout.num_text_tokens() as usize;
+    let end = start + layout.num_reference_rows() as usize;
+    classes[start..end].fill(1);
+    classes
+}
+
+/// The image DiT's LoRA target surface (SW-7096): **every linear layer it has**, under the
+/// `MiniMaxH3ImageTransformer2DModel` (diffusers) module names a PEFT/diffusers LoRA uses:
+///
+/// | path | module |
+/// | --- | --- |
+/// | `transformer_blocks.{i}.attn.{to_q,to_k,to_v,to_out.0}`, `….ff.net.{0.proj,2}` | block leaves |
+/// | `transformer_blocks.{i}.adaln_proj.linear` | the block's AdaLN projection |
+/// | `token_refiner.refiner_blocks.{i}.…` | refiner leaves (its only linears) |
+/// | `proj_in`, `context_embedder` | input projections |
+/// | `time_embedder.linear_1`, `time_embedder.linear_2` | the timestep MLP |
+/// | `norm_out.linear` | the final AdaLN projection |
+/// | `pdd_proj_out.{i}` | per-step output head `i` |
+///
+/// `pdd_proj_out` is an `nn.ModuleList` in the reference, so PEFT addresses each head on its own
+/// and a LoRA on head `i` changes only step `i`'s output; there is no `proj_out` module, so a
+/// `proj_out` target names no module and is refused, as PEFT would fail to inject it.
+///
+/// **The AdaLN cache stays exact.** The image denoiser enumerates its six timesteps up front and
+/// precomputes every block's modulation (and `norm_out`'s) from `time_embedder` once, then evicts
+/// `adaln_proj`. Adapters are installed when the DiT is mapped for a render, before
+/// [`ImageDenoiser::new`] runs that precompute, so the tables are computed **with** every
+/// `time_embedder` / `adaln_proj` / `norm_out` residual applied; a new adapter set means a new
+/// load and therefore a new precompute.
+impl AdaptableHost for MiniMaxH3ImageDit {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            // SW-7094: a deferred load holds no blocks; every block residual (the AdaLN projection
+            // included — this surface admits it) lands in the stream's overlay, which re-applies
+            // it to each block a window rebuilds.
+            ["transformer_blocks", ..] if self.stream.is_some() => {
+                self.stream.as_mut()?.adaptable_mut(path)
+            }
+            ["transformer_blocks", i, "adaln_proj", "linear"] => {
+                let idx: usize = i.parse().ok()?;
+                self.blocks.get_mut(idx)?.adaln_linear_mut()
+            }
+            ["transformer_blocks", i, rest @ ..] => {
+                let idx: usize = i.parse().ok()?;
+                self.blocks.get_mut(idx)?.adaptable_mut(rest)
+            }
+            ["token_refiner", rest @ ..] => self.refiner.adaptable_mut(rest),
+            ["proj_in"] => self.projections.proj_in.adaptable_mut(),
+            ["context_embedder"] => self.projections.context_embedder.adaptable_mut(),
+            ["time_embedder", linear] => self
+                .projections
+                .time_embedder
+                .linear_mut(linear)?
+                .adaptable_mut(),
+            ["norm_out", "linear"] => self.projections.norm_out.linear_mut()?.adaptable_mut(),
+            ["pdd_proj_out", i] => {
+                let idx: usize = i.parse().ok()?;
+                self.projections.pdd_heads.head_mut(idx)?.adaptable_mut()
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The intermediate stages one [`ImageDenoiser::velocity_traced`] records: the residual stream after
 /// each of [`Self::layers`] (`[1, seq_len, hidden_size]`, in layer order) and `norm_out`'s output
 /// over the whole packed sequence. Diagnostic only — the real-weight parity gate compares each
@@ -199,6 +352,32 @@ impl ImageDitTrace {
     }
 }
 
+/// Every linear of the image DiT is addressable, so an unmatched target is reported as naming no
+/// module (see [`crate::adapters::AdaLnSurface::ImageAllLinears`]).
+impl crate::adapters::MiniMaxH3AdapterHost for MiniMaxH3ImageDit {
+    fn adapter_surface(&self) -> crate::adapters::AdaLnSurface {
+        crate::adapters::AdaLnSurface::ImageAllLinears
+    }
+}
+
+/// Every module path an adapter can address on the image DiT at `cfg` (SW-7096).
+pub fn image_adapter_target_paths(cfg: &MiniMaxH3ImageDitConfig) -> Vec<String> {
+    let mut v = crate::adapters::adapter_target_paths(&cfg.base);
+    v.extend((0..cfg.base.num_layers).map(|i| format!("transformer_blocks.{i}.adaln_proj.linear")));
+    v.extend(
+        [
+            "proj_in",
+            "context_embedder",
+            "time_embedder.linear_1",
+            "time_embedder.linear_2",
+            "norm_out.linear",
+        ]
+        .map(String::from),
+    );
+    v.extend((0..cfg.num_pdd_heads).map(|i| format!("pdd_proj_out.{i}")));
+    v
+}
+
 /// The image DiT as the fixed 6-step sampler's velocity model: everything constant across a
 /// request (refined text rows, rotary tables, the whole run's modulation and the per-step gather
 /// indices) built once, so a step is "project, concat, 50 blocks, norm, head `i`".
@@ -217,6 +396,92 @@ pub struct ImageDenoiser {
     /// Per step: `[seq_len]` bare timestep index, what `norm_out` gathers with.
     timestep_indices: Vec<Array>,
     released_bytes: usize,
+    /// Rung 4 (SW-7094): `Some` over a deferred DiT — the 50 blocks are rebuilt from the staged
+    /// tier one window at a time on every step. Set by [`Self::new_windowed`] only.
+    block_window: Option<BlockPlan>,
+    window_cancel: CancelFlag,
+    /// Rung 3 (SW-7094): `UNBOUNDED` (byte-identical to the pre-rung forward) unless the request
+    /// engages the rung, when the generator sets the whole-head plan
+    /// ([`crate::h3_image::memory::requested_bounded_attention`]).
+    attention_budget: AttentionBudget,
+    attention_axis: AttentionChunkAxis,
+}
+
+/// What [`ImageDenoiser`] shares between its resident and windowed constructors: the checks, the
+/// text rows, the rotary tables and the per-step gather indices.
+struct DenoiserParts {
+    text_rows: Array,
+    tables: MmRopeTables,
+    adaln_schedule: TimestepSchedule,
+    adaln_indices: Vec<Array>,
+    timestep_indices: Vec<Array>,
+}
+
+fn denoiser_parts(
+    dit: &mut MiniMaxH3ImageDit,
+    layout: &ImageLayout,
+    context: &Array,
+    schedule: &SigmaSchedule,
+) -> Result<DenoiserParts> {
+    let steps = schedule.num_evals();
+    if steps != dit.projections.pdd_heads.len() {
+        return Err(Error::Msg(format!(
+            "minimax-h3-image dit: a {steps}-step schedule against a checkpoint distilled to {} \
+             steps (one output head per step)",
+            dit.projections.pdd_heads.len()
+        )));
+    }
+    if layout.patch() != dit.cfg.base.patch_size {
+        return Err(Error::Msg(format!(
+            "minimax-h3-image dit: the layout was packed with patch {:?}, the DiT expects {:?}",
+            layout.patch(),
+            dit.cfg.base.patch_size
+        )));
+    }
+    UnverifiedSources::verify(&mut dit.unverified.head)?;
+    let text_rows = dit.embed_context(context)?;
+    if text_rows.shape()[1] != layout.num_text_tokens() {
+        return Err(Error::Msg(format!(
+            "minimax-h3-image dit: the context carries {} rows but the layout declares {} text \
+             rows",
+            text_rows.shape()[1],
+            layout.num_text_tokens()
+        )));
+    }
+    let tables = dit.rope.tables(layout.position_ids())?;
+
+    // Row class 0 is the step's timestep, which every text and generated row sits at; an
+    // edit's reference rows are class 1, held at `REFERENCE_NOISE_AUG` for every step
+    // (`MiniMaxH3ImageSetTimestepsStep.row_timestep_plan`).
+    let has_references = layout.num_reference_rows() > 0;
+    let adaln_schedule = TimestepSchedule::new(
+        schedule
+            .timesteps()
+            .iter()
+            .map(|&t| {
+                if has_references {
+                    vec![t, REFERENCE_NOISE_AUG]
+                } else {
+                    vec![t]
+                }
+            })
+            .collect(),
+    )?;
+    let row_classes = Array::from_slice(&image_row_classes(layout), &[layout.seq_len()]);
+    let mut adaln_indices = Vec::with_capacity(steps);
+    let mut timestep_indices = Vec::with_capacity(steps);
+    for step in 0..steps {
+        let idx = adaln_schedule.adaln_indices(step, &row_classes, layout.token_tags())?;
+        timestep_indices.push(AdaLayerNormOut::timestep_indices_from_adaln(&idx)?);
+        adaln_indices.push(idx);
+    }
+    Ok(DenoiserParts {
+        text_rows,
+        tables,
+        adaln_schedule,
+        adaln_indices,
+        timestep_indices,
+    })
 }
 
 impl ImageDenoiser {
@@ -233,45 +498,14 @@ impl ImageDenoiser {
         context: &Array,
         schedule: SigmaSchedule,
     ) -> Result<Self> {
-        let steps = schedule.num_evals();
-        if steps != dit.projections.pdd_heads.len() {
-            return Err(Error::Msg(format!(
-                "minimax-h3-image dit: a {steps}-step schedule against a checkpoint distilled to {} \
-                 steps (one output head per step)",
-                dit.projections.pdd_heads.len()
-            )));
+        if dit.is_deferred() {
+            return Err(Error::Msg(
+                "minimax-h3-image dit: ImageDenoiser::new needs a resident load; a deferred \
+                 (rung 4) DiT is driven through ImageDenoiser::new_windowed"
+                    .into(),
+            ));
         }
-        if layout.patch() != dit.cfg.base.patch_size {
-            return Err(Error::Msg(format!(
-                "minimax-h3-image dit: the layout was packed with patch {:?}, the DiT expects {:?}",
-                layout.patch(),
-                dit.cfg.base.patch_size
-            )));
-        }
-        UnverifiedSources::verify(&mut dit.unverified.head)?;
-        let text_rows = dit.embed_context(context)?;
-        if text_rows.shape()[1] != layout.num_text_tokens() {
-            return Err(Error::Msg(format!(
-                "minimax-h3-image dit: the context carries {} rows but the layout declares {} text \
-                 rows",
-                text_rows.shape()[1],
-                layout.num_text_tokens()
-            )));
-        }
-        let tables = dit.rope.tables(layout.position_ids())?;
-
-        // One row class: every row of a text2image sequence is at the step's timestep.
-        let timesteps = schedule.timesteps().to_vec();
-        let adaln_schedule = TimestepSchedule::new(timesteps.iter().map(|&t| vec![t]).collect())?;
-        let seq_len = layout.seq_len();
-        let row_classes = Array::from_slice(&vec![0i32; seq_len as usize], &[seq_len]);
-        let mut adaln_indices = Vec::with_capacity(steps);
-        let mut timestep_indices = Vec::with_capacity(steps);
-        for step in 0..steps {
-            let idx = adaln_schedule.adaln_indices(step, &row_classes, layout.token_tags())?;
-            timestep_indices.push(AdaLayerNormOut::timestep_indices_from_adaln(&idx)?);
-            adaln_indices.push(idx);
-        }
+        let parts = denoiser_parts(&mut dit, &layout, context, &schedule)?;
 
         // Project the whole run's modulation once, then release `adaln_proj`. `norm_out` reads the
         // SAME `temb` the blocks were projected from.
@@ -280,7 +514,7 @@ impl ImageDenoiser {
         let mut captured: Option<Array> = None;
         let (cache, released_bytes) = AdaLnCache::precompute_and_evict(
             &mut dit.blocks,
-            adaln_schedule,
+            parts.adaln_schedule,
             AdaLnResidency::PrecomputeAndEvict,
             |ts| {
                 let temb = embedder.forward(ts)?;
@@ -300,16 +534,107 @@ impl ImageDenoiser {
         Ok(Self {
             dit,
             layout,
-            tables,
-            text_rows,
+            tables: parts.tables,
+            text_rows: parts.text_rows,
             cache,
             norm_out,
             temb,
             schedule,
-            adaln_indices,
-            timestep_indices,
+            adaln_indices: parts.adaln_indices,
+            timestep_indices: parts.timestep_indices,
             released_bytes,
+            block_window: None,
+            window_cancel: CancelFlag::default(),
+            attention_budget: AttentionBudget::UNBOUNDED,
+            attention_axis: AttentionChunkAxis::Heads,
         })
+    }
+
+    /// The velocity model over a **deferred** DiT with a bounded block window — rung 4 (SW-7094).
+    ///
+    /// The two differences from [`Self::new`] are forced by the residency:
+    ///
+    /// * the AdaLN modulation is projected through H3's
+    ///   [`crate::block_stream::precompute_adaln_windowed`], holding `window` projections at a time,
+    ///   instead of `AdaLnCache::precompute_and_evict` — a deferred load never held the projections,
+    ///   so nothing is evicted and [`Self::released_adaln_bytes`] is `0`;
+    /// * every step rebuilds the blocks from the staged tier, `window` at a time, through
+    ///   [`DitBlockStream::materialize`], which re-applies the configured LoRA residuals to each
+    ///   rebuilt block (SW-7096).
+    ///
+    /// The per-step heads, `norm_out`, `proj_in`, `context_embedder`, `time_embedder` and the
+    /// refiner stay resident (see [`MiniMaxH3ImageDit::load_dir_deferred`]).
+    pub fn new_windowed(
+        mut dit: MiniMaxH3ImageDit,
+        layout: ImageLayout,
+        context: &Array,
+        schedule: SigmaSchedule,
+        window: usize,
+        cancel: CancelFlag,
+    ) -> Result<Self> {
+        let stream = dit
+            .stream()
+            .ok_or_else(|| {
+                Error::Msg(
+                    "minimax-h3-image dit: ImageDenoiser::new_windowed needs a deferred load; use \
+                     MiniMaxH3ImageDit::load_dir_deferred"
+                        .into(),
+                )
+            })?
+            .clone();
+        let plan = stream.plan(window)?;
+        let parts = denoiser_parts(&mut dit, &layout, context, &schedule)?;
+        let temb = dit
+            .projections
+            .time_embedder
+            .forward(parts.adaln_schedule.distinct_timesteps())?;
+        mlx_rs::transforms::eval([&temb])?;
+        let cache =
+            precompute_adaln_windowed(&stream, &plan, &cancel, parts.adaln_schedule, &temb)?;
+        let norm_out = dit.projections.norm_out.modulation(&temb)?;
+        mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale])?;
+        Ok(Self {
+            dit,
+            layout,
+            tables: parts.tables,
+            text_rows: parts.text_rows,
+            cache,
+            norm_out,
+            temb,
+            schedule,
+            adaln_indices: parts.adaln_indices,
+            timestep_indices: parts.timestep_indices,
+            // Nothing was released, because nothing was ever resident.
+            released_bytes: 0,
+            block_window: Some(plan),
+            window_cancel: cancel,
+            attention_budget: AttentionBudget::UNBOUNDED,
+            attention_axis: AttentionChunkAxis::Heads,
+        })
+    }
+
+    /// Rung 3: the attention plan every block runs under, resident and windowed. The generator
+    /// sets it when a request engages the rung; the default `UNBOUNDED` plan is the pre-rung
+    /// forward byte for byte.
+    pub fn set_bounded_attention(&mut self, budget: AttentionBudget, axis: AttentionChunkAxis) {
+        self.attention_budget = budget;
+        self.attention_axis = axis;
+    }
+
+    /// The block window in force: `Some` under rung 4.
+    pub fn block_window(&self) -> Option<&BlockPlan> {
+        self.block_window.as_ref()
+    }
+
+    fn bounded_attention(&self) -> BoundedAttention<'_> {
+        // The shipped path is the literal pre-rung forward, not a plan that happens to be unbounded.
+        if self.attention_budget == AttentionBudget::UNBOUNDED {
+            return BoundedAttention::UNBOUNDED;
+        }
+        BoundedAttention::new(
+            AttentionPlan::budgeted(self.attention_budget),
+            self.attention_axis,
+        )
     }
 
     /// The packed layout this denoiser was built for.
@@ -349,10 +674,50 @@ impl ImageDenoiser {
         &self.norm_out
     }
 
+    /// Block `layer` alone at sampling step `step`, over a packed residual stream `hidden`
+    /// (`[1, seq_len, hidden_size]`, the stream dtype) — the diagnostic the real-weight edit gate
+    /// runs from the reference's own block input, to separate the block's compute from the error
+    /// it inherits (SW-7092). `modulation` defaults to the block's cached tables; a caller may hand
+    /// in tables of the cache's shape instead (the reference's own projection). Resident loads
+    /// only.
+    pub fn block_forward(
+        &self,
+        step: usize,
+        layer: usize,
+        hidden: &Array,
+        modulation: Option<&AdaLnModulation>,
+    ) -> Result<Array> {
+        let block = self.dit.blocks.get(layer).ok_or_else(|| {
+            Error::Msg(format!(
+                "minimax-h3-image dit: block {layer} is not resident (a {}-block resident stack)",
+                self.dit.blocks.len()
+            ))
+        })?;
+        let adaln = self.adaln_indices.get(step).ok_or_else(|| {
+            Error::Msg(format!(
+                "minimax-h3-image dit: step {step} is outside the {}-step schedule",
+                self.adaln_indices.len()
+            ))
+        })?;
+        let modulation = match modulation {
+            Some(m) => m,
+            None => self.cache.modulation(layer)?,
+        };
+        block.forward_bounded(
+            hidden,
+            modulation,
+            adaln,
+            &self.dit.rope,
+            &self.tables,
+            self.bounded_attention(),
+        )
+    }
+
     /// The DiT velocity of every image row at sampling step `step`, through head `step`.
     ///
-    /// `image_rows` is `[1, num_image_rows, in_channels · prod(patch)]`; the result has the same
-    /// shape, float32 (the heads are float32).
+    /// `image_rows` is `[1, num_packed_image_rows, in_channels · prod(patch)]` — an edit's
+    /// reference rows first, then the generated rows; the result has the same shape, float32 (the
+    /// heads are float32), exactly what the reference transformer returns.
     pub fn velocity(&self, step: usize, image_rows: &Array) -> Result<Array> {
         self.velocity_inner(step, image_rows, None)
     }
@@ -381,7 +746,7 @@ impl ImageDenoiser {
                 self.adaln_indices.len()
             ))
         })?;
-        let rows = self.layout.num_image_rows();
+        let rows = self.layout.num_packed_image_rows();
         let want = [1, rows, self.dit.cfg.base.video_patch_dim()];
         if image_rows.shape() != want {
             return Err(Error::Msg(format!(
@@ -397,21 +762,64 @@ impl ImageDenoiser {
             .proj_in
             .forward(image_rows)?
             .as_dtype(stream)?;
-        let mut x = concatenate_axis(&[self.text_rows.clone(), image], 1)?;
-        for (layer, block) in self.dit.blocks.iter().enumerate() {
-            x = block.forward(
-                &x,
-                self.cache.modulation(layer)?,
-                adaln,
-                &self.dit.rope,
-                &self.tables,
-            )?;
-            if let Some(trace) = trace.as_deref_mut() {
-                if trace.layers.contains(&layer) {
-                    trace.hidden.push((layer, x.clone()));
+        let x = concatenate_axis(&[self.text_rows.clone(), image], 1)?;
+        let x =
+            match (&self.block_window, self.dit.stream()) {
+                (None, None) => {
+                    let mut x = x;
+                    for (layer, block) in self.dit.blocks.iter().enumerate() {
+                        x = block.forward_bounded(
+                            &x,
+                            self.cache.modulation(layer)?,
+                            adaln,
+                            &self.dit.rope,
+                            &self.tables,
+                            self.bounded_attention(),
+                        )?;
+                        if let Some(trace) = trace.as_deref_mut() {
+                            if trace.layers.contains(&layer) {
+                                trace.hidden.push((layer, x.clone()));
+                            }
+                        }
+                    }
+                    x
                 }
-            }
-        }
+                (Some(plan), Some(stream)) => run_windowed(
+                    plan,
+                    &self.window_cancel,
+                    x,
+                    || stream.open(),
+                    |mut hidden: Array, view: &mut Weights, range: std::ops::Range<usize>| {
+                        for layer in range {
+                            let block = stream.materialize(view, layer)?;
+                            hidden = block.forward_bounded(
+                                &hidden,
+                                self.cache.modulation(layer)?,
+                                adaln,
+                                &self.dit.rope,
+                                &self.tables,
+                                self.bounded_attention(),
+                            )?;
+                            // The block drops per iteration, not per window.
+                            if let Some(trace) = trace.as_deref_mut() {
+                                if trace.layers.contains(&layer) {
+                                    trace.hidden.push((layer, hidden.clone()));
+                                }
+                            }
+                        }
+                        Ok(hidden)
+                    },
+                    // LOAD-BEARING: the carried activation references this window's weights until it
+                    // is forced (H3's `run_windowed_stack` measured 8.0 MiB with against 238.4 MiB
+                    // without).
+                    |hidden: &Array| mlx_rs::transforms::eval([hidden]).map_err(Into::into),
+                )?,
+                _ => return Err(Error::Msg(
+                    "minimax-h3-image dit: the block window and the DiT's residency disagree — a \
+                     window over a resident load, or a deferred load with no window"
+                        .into(),
+                )),
+            };
         let x = self.dit.projections.norm_out.apply(
             &x,
             &self.norm_out,
@@ -428,17 +836,43 @@ impl ImageDenoiser {
     /// One sampler step: the velocity at step `step` through head `step`, then the checkpoint's
     /// `euler_update_form = "velocity"` update `x_next = x_t + (sigma - sigma_next) · v`, in float32
     /// (`scheduler/scheduler_config.json`; `MiniMaxH3Scheduler.step`).
+    ///
+    /// Only the generated rows are written: an edit's reference rows ride through every step
+    /// unchanged (`MiniMaxH3ImageLoopSchedulerStep`).
     pub fn step(&self, step: usize, image_rows: &Array) -> Result<Array> {
         let v = self.velocity(step, image_rows)?;
         let delta = velocity_euler_delta(self.schedule.timesteps(), step)?;
         let x = image_rows.as_dtype(Dtype::Float32)?;
-        Ok(mlx_rs::ops::add(
-            &x,
-            &mlx_rs::ops::multiply(&v.as_dtype(Dtype::Float32)?, Array::from_f32(delta))?,
+        let refs = self.layout.num_reference_rows();
+        let all = self.layout.num_packed_image_rows();
+        let generated = mlx_rs::ops::add(
+            &slice_axis(&x, 1, refs, all)?,
+            &mlx_rs::ops::multiply(
+                &slice_axis(&v.as_dtype(Dtype::Float32)?, 1, refs, all)?,
+                Array::from_f32(delta),
+            )?,
+        )?;
+        if refs == 0 {
+            return Ok(generated);
+        }
+        Ok(concatenate_axis(
+            &[slice_axis(&x, 1, 0, refs)?, generated],
+            1,
         )?)
     }
 
-    /// The whole fixed-step loop, forcing each step and checking `cancel` between steps.
+    /// The generated rows of a packed `[1, num_packed_image_rows, ·]` image stream.
+    pub fn generated_rows(&self, packed: &Array) -> Result<Array> {
+        slice_axis(
+            packed,
+            1,
+            self.layout.num_reference_rows(),
+            self.layout.num_packed_image_rows(),
+        )
+    }
+
+    /// The whole fixed-step loop over the packed image rows (an edit's reference rows first),
+    /// forcing each step and checking `cancel` between steps. Returns the packed rows.
     pub fn denoise(
         &self,
         noise_rows: &Array,
@@ -501,5 +935,14 @@ mod tests {
         let names = crate::dit::MiniMaxH3Dit::names(&crate::dit::MiniMaxH3DitConfig::default());
         assert_eq!(names.len(), crate::dit::PUBLISHED_DIT_TENSORS);
         assert!(names.iter().any(|n| n == "audio_proj_out.weight"));
+    }
+
+    /// An edit's reference rows are the only class-1 rows.
+    #[test]
+    fn reference_rows_are_the_held_row_class() {
+        let layout = ImageLayout::edit(&[1, 0, 1], &[(2, 4)], 2, 2, [1, 2, 2]).unwrap();
+        assert_eq!(image_row_classes(&layout), vec![0, 0, 0, 1, 1, 0]);
+        let t2i = ImageLayout::t2i(2, 2, 2, [1, 2, 2]).unwrap();
+        assert_eq!(image_row_classes(&t2i), vec![0, 0, 0]);
     }
 }

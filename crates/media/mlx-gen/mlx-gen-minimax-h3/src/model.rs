@@ -111,7 +111,7 @@ pub const MAX_STEPS: u32 = 200;
 
 /// Quantization group size the shared vision tower is built with — the same value every other
 /// consumer of `mlx-gen-boogu`'s tower passes.
-const VISION_GROUP_SIZE: i32 = 64;
+pub(crate) const VISION_GROUP_SIZE: i32 = 64;
 
 /// Which MiniMax-H3 **task** a request is, and therefore which DiT partition it loads.
 ///
@@ -373,9 +373,9 @@ impl Generator for MiniMaxH3 {
     /// **Two axes, not one.** The route gate can only judge what a `MemoryRunContext` carries —
     /// geometry, tier, parameters — so everything that is a property of the *load* rather than the
     /// request is judged by the capability table instead, from a contract resolved at load time.
-    /// The deferred-shape and no-adapter prerequisites of rung 4 are both in that half
-    /// ([`crate::memory_strategy::streamable`]). A selection this accepts is one `generate` can run
-    /// only while both halves stay complete; sc-18650 fixed the case where the second was missing.
+    /// Rung 4's deferred-shape prerequisite is in that half
+    /// ([`crate::memory_strategy::streamable`]); since SW-7096 an adapter no longer bears on it,
+    /// because the block stream re-applies the residuals to every rebuilt block.
     fn memory_strategy_safety_check(
         &self,
         context: &mlx_gen::gen_core::MemoryRunContext,

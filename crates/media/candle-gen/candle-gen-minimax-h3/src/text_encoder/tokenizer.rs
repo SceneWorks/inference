@@ -375,6 +375,51 @@ impl MiniMaxH3Tokenizer {
         Self::to_arrays(ids.into_iter().map(|i| i as u32).collect(), device)
     }
 
+    /// The MiniMax-H3-Image **`edit`** presentation (SW-7092, `MiniMaxH3ImageEditTextEncoderStep`):
+    /// per reference a `"Picture i: "` label and a `<|image_pad|>` vision block of
+    /// `num_image_tokens[i]` pads, then the prompt verbatim — no chat template, no special tokens,
+    /// label and prompt each truncated to 4096 ids ([`candle_gen::gen_core::h3_image::edit_presentation`]).
+    /// Returns `(ids, tags)`: vision-block rows image-tagged, label and prompt rows text-tagged.
+    pub fn image_edit_ids(
+        &self,
+        prompt: &str,
+        num_image_tokens: &[usize],
+    ) -> Result<(Vec<u32>, Vec<u32>)> {
+        let specials = candle_gen::gen_core::h3_image::VisionBlockIds {
+            vision_start: self.special_id("<|vision_start|>")? as i32,
+            image_pad: self.special_id("<|image_pad|>")? as i32,
+            vision_end: self.special_id("<|vision_end|>")? as i32,
+        };
+        let (ids, tags) = candle_gen::gen_core::h3_image::edit_presentation(
+            prompt,
+            num_image_tokens,
+            specials,
+            |text| {
+                self.encode(text)
+                    .map(|v| v.into_iter().map(|i| i as i32).collect())
+                    .map_err(|e| candle_gen::gen_core::Error::Msg(e.to_string()))
+            },
+        )
+        .map_err(|e| CandleError::Msg(e.to_string()))?;
+        Ok((
+            ids.into_iter().map(|i| i as u32).collect(),
+            tags.into_iter().map(|t| t as u32).collect(),
+        ))
+    }
+
+    /// [`Self::image_edit_ids`] as `(input_ids, attention_mask, tags)`, the ids `[1, L]` u32 on
+    /// `device`.
+    pub fn encode_image_edit(
+        &self,
+        prompt: &str,
+        num_image_tokens: &[usize],
+        device: &Device,
+    ) -> Result<(Tensor, Tensor, Vec<u32>)> {
+        let (ids, tags) = self.image_edit_ids(prompt, num_image_tokens)?;
+        let (ids, mask) = Self::to_arrays(ids, device)?;
+        Ok((ids, mask, tags))
+    }
+
     /// Encode the visual presentation → `(input_ids, attention_mask)` `[1, L]` u32 on `device`.
     /// `num_image_tokens[k]` is reference `k`'s merged vision-token count.
     pub fn encode_with_images(

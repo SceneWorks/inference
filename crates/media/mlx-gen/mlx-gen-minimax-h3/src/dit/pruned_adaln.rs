@@ -311,11 +311,7 @@ impl PrunedReducedLinear {
         // to TF32 (10 fraction bits). The pinned curve runtime projects in full F32.
         // N=1 vector dispatch retains F32 accumulation on both older Metal and NAX,
         // as in the existing precise FLUX2 encoder. This applies to block AND final linears.
-        let projected = self
-            .weight
-            .matmul(&coords.expand_dims(-1)?)?
-            .squeeze_axes(&[-1])?;
-        Ok(add(&projected, &self.bias)?)
+        mlx_gen::nn::linear_precise(coords, &self.weight, Some(&self.bias))
     }
 }
 

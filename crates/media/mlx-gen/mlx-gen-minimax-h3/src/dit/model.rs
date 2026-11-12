@@ -285,6 +285,15 @@ impl MiniMaxH3Dit {
         self.stream.is_some()
     }
 
+    /// Evaluate the adapter residuals a deferred load holds for its streamed blocks (SW-7096).
+    /// A no-op on a resident load, whose residuals live on its blocks.
+    pub fn materialize_streamed_adapters(&self) -> Result<()> {
+        match &self.stream {
+            Some(stream) => stream.adapters().materialize(),
+            None => Ok(()),
+        }
+    }
+
     /// The two residency modes are mutually exclusive, and a load that satisfied both would bound
     /// nothing while reporting that it did.
     fn assert_one_residency_mode(&self) -> Result<()> {
@@ -714,6 +723,17 @@ impl AdaptableHost for MiniMaxH3Dit {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
             ["transformer_blocks", i, rest @ ..] => {
+                // SW-7096: a deferred load holds no blocks; its residuals go to the stream, which
+                // re-applies them to each block a window rebuilds.
+                if let Some(stream) = self.stream.as_mut() {
+                    // The video surface keeps `adaln_proj` non-addressable (sc-26688), on both
+                    // residency modes, so a deferred load must not admit what a resident one
+                    // refuses.
+                    if rest.first() == Some(&"adaln_proj") {
+                        return None;
+                    }
+                    return stream.adaptable_mut(path);
+                }
                 let idx: usize = i.parse().ok()?;
                 self.blocks.get_mut(idx)?.adaptable_mut(rest)
             }

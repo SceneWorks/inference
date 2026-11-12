@@ -112,11 +112,22 @@ pub fn begin_request(
     config.default_frames = context.geometry.frames;
     config.attention_chunk_size = context.selection.parameters.attention_chunk_size;
     config.transformer_window = context.selection.parameters.transformer_window_size;
+    Ok(Some(activate(config, context)))
+}
+
+/// Install `context` as this thread's selected H3 memory policy for the life of the returned
+/// scope — the attention budget (`crate::nn::attention_budget`) reads it — and observe the
+/// completed attention routes on exit. Shared by H3 video and MiniMax-H3-Image (SW-7095); the
+/// caller has already admitted the context.
+pub(crate) fn activate(
+    config: CandleRequestScopeConfig,
+    context: &MemoryRunContext,
+) -> Box<dyn MemoryRequestScope> {
     let scope = RequestScope {
         core: CandleRequestScopeCore::new(config),
         active: true,
     };
     crate::nn::reset_attention_execution_report();
     ACTIVE.with(|active| *active.borrow_mut() = Some(context.clone()));
-    Ok(Some(Box::new(scope)))
+    Box::new(scope)
 }

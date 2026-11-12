@@ -66,7 +66,7 @@ use candle_gen::{CandleError, Result, Weights};
 use crate::dit::config::MiniMaxH3DitConfig;
 use crate::dit::rope::{MmRope, MmRopeTables};
 use crate::layout::split_gate_value;
-use crate::nn::{rms_weighted, sdpa_planned, silu};
+use crate::nn::{rms_weighted, sdpa_planned, silu_f32_rounded};
 
 #[cfg(all(feature = "cuda", feature = "model-inference-proof"))]
 #[cfg(test)]
@@ -226,12 +226,57 @@ impl LinearNoBias {
         let in_features = *dims.last().expect("LinearNoBias::forward: x has no axes");
         let rows = x.elem_count() / in_features;
         let x = x.reshape((rows, in_features))?;
-        let mut y = self.inner.forward_upcast(&x)?;
+        let y = self.inner.forward_upcast(&x)?;
+        let y = self.add_lokr(&x, y)?;
+        let mut out_dims = dims;
+        *out_dims
+            .last_mut()
+            .expect("LinearNoBias::forward: x has no axes") = self.inner.out_features();
+        Ok(y.reshape(out_dims)?)
+    }
+
+    /// A **residual-only** projection slot (SW-7096): no base tensor at all (the shared seam's
+    /// external-base storage), so the strict install can push LoRA/LoKr residuals onto it — shape-
+    /// checked against `[out, in]` exactly as onto a real leaf — for a projection whose own base is
+    /// not a `LinearNoBias` (the raw bias-Linear heads, the AdaLN projection). The owner computes
+    /// its base, then calls [`Self::add_residuals`].
+    pub(crate) fn residual_slot(
+        in_features: usize,
+        out_features: usize,
+        dtype: DType,
+        device: &candle_gen::candle_core::Device,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: AdaptLinear::for_external_base(in_features, out_features, dtype, device)?,
+            base_bytes: 0,
+            adapters: Vec::new(),
+            lokr_adapters: Vec::new(),
+        })
+    }
+
+    /// `y + Σ residual(x)` over any leading dims, under the same rules as [`Self::forward`].
+    pub(crate) fn add_residuals(&self, x: &Tensor, y: Tensor) -> Result<Tensor> {
+        if !self.is_adapted() {
+            return Ok(y);
+        }
+        let in_features = *x.dims().last().expect("add_residuals: x has no axes");
+        let out_dims = y.dims().to_vec();
+        let out_features = *out_dims.last().expect("add_residuals: y has no axes");
+        let rows = x.elem_count() / in_features;
+        let x = x.reshape((rows, in_features))?;
+        let y = y.reshape((rows, out_features))?;
+        let y = self.inner.apply_residuals(&x, y)?;
+        let y = self.add_lokr(&x, y)?;
+        Ok(y.reshape(out_dims)?)
+    }
+
+    /// Add every structured-LoKr residual to a 2-D `y`.
+    fn add_lokr(&self, x: &Tensor, mut y: Tensor) -> Result<Tensor> {
         for adapter in &self.lokr_adapters {
             if adapter.scale == 0.0 {
                 continue;
             }
-            let residual = adapter.factors.residual(&x)?;
+            let residual = adapter.factors.residual(x)?;
             let output_dtype = y.dtype();
             let residual = residual.to_dtype(output_dtype)?;
             if adapter.swap_output_halves {
@@ -256,11 +301,7 @@ impl LinearNoBias {
                 y = (y + residual)?;
             }
         }
-        let mut out_dims = dims;
-        *out_dims
-            .last_mut()
-            .expect("LinearNoBias::forward: x has no axes") = self.inner.out_features();
-        Ok(y.reshape(out_dims)?)
+        Ok(y)
     }
 
     /// Attach a forward-time LoRA residual. `a` is `[in, rank]`, `b` is `[rank, out]` with
@@ -838,7 +879,9 @@ impl DitFeedForward {
     fn forward_span(&self, x: &Tensor) -> Result<Tensor> {
         let h = self.proj.forward(x)?;
         let (gate, value) = split_gate_value(&h)?;
-        self.out.forward(&(silu(&gate)?.mul(&value)?))
+        // torch's `hidden_states * F.silu(gate)`: SiLU at float32, rounded once (SW-7092).
+        let activated = silu_f32_rounded(&gate)?;
+        self.out.forward(&activated.mul(&value)?)
     }
 }
 

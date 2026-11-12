@@ -52,7 +52,7 @@ use candle_gen::{CandleError, Result, Weights};
 
 use crate::denoise::{JointStep, JointVelocity, PackedLayout};
 use crate::dit::adaln::{AdaLnCache, AdaLnResidency, TimestepSchedule};
-use crate::dit::block::DitBlock;
+use crate::dit::block::{AdaLnModulation, DitBlock};
 use crate::dit::config::{MiniMaxH3DitConfig, MODALITY_NUM};
 use crate::dit::curve::CurveAdaLn;
 use crate::dit::heads::{AdaLayerNormOut, DitProjections, NormOutModulation};
@@ -349,6 +349,8 @@ impl MiniMaxH3Dit {
     pub fn adapter_surface(&self) -> crate::adapters::AdaLnSurface {
         match self.curve {
             Some(_) => crate::adapters::AdaLnSurface::PrunedCurve,
+            // SW-7096: the image transformer addresses every linear it has.
+            None if !self.cfg.has_audio() => crate::adapters::AdaLnSurface::ImageAllLinears,
             None => crate::adapters::AdaLnSurface::FullTimestepMlp,
         }
     }
@@ -379,13 +381,41 @@ impl MiniMaxH3Dit {
     /// else — in particular not `adaln_proj`, not the 17 input/output projections, and not any norm.
     /// See [`crate::adapters::adapter_target_paths`], which enumerates exactly this set from the
     /// config and is asserted to resolve here.
+    ///
+    /// **The image transformer adds every other linear it has** (SW-7096): each block's
+    /// `adaln_proj.linear`, `proj_in`, `context_embedder`, `time_embedder.linear_{1,2}`,
+    /// `norm_out.linear` and every `pdd_proj_out.{i}` head (a PEFT `nn.ModuleList`, one module per
+    /// head). The image denoiser precomputes its six timesteps' modulation from `time_embedder`
+    /// once, after the install, so those tables carry the residuals. The video transformer keeps
+    /// the sc-26688 surface above unchanged.
     pub fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut LinearNoBias> {
+        let image = !self.cfg.has_audio() && self.curve.is_none();
         match path {
+            ["transformer_blocks", idx, "adaln_proj", "linear"] if image => {
+                let i: usize = idx.parse().ok()?;
+                let device = self.device.clone();
+                self.blocks.get_mut(i)?.adaln_adaptable_mut(&device)
+            }
             ["transformer_blocks", idx, rest @ ..] => {
                 let i: usize = idx.parse().ok()?;
                 self.blocks.get_mut(i)?.adaptable_mut(rest)
             }
             ["token_refiner", rest @ ..] => self.refiner.adaptable_mut(rest),
+            ["proj_in"] if image => self.projections.proj_in.adaptable_mut(),
+            ["context_embedder"] if image => self.projections.context_embedder.adaptable_mut(),
+            ["time_embedder", linear] if image => self
+                .projections
+                .time_embedder
+                .as_mut()?
+                .linear_mut(linear)?
+                .adaptable_mut(),
+            ["norm_out", "linear"] if image => {
+                self.projections.norm_out.linear_mut()?.adaptable_mut()
+            }
+            ["pdd_proj_out", idx] if image => {
+                let i: usize = idx.parse().ok()?;
+                self.projections.pdd_proj_out.get_mut(i)?.adaptable_mut()
+            }
             _ => None,
         }
     }
@@ -397,6 +427,18 @@ impl MiniMaxH3Dit {
             b.clear_adapters();
         }
         self.refiner.clear_adapters();
+        let p = &mut self.projections;
+        p.proj_in.clear_adapters();
+        p.context_embedder.clear_adapters();
+        if let Some(t) = p.time_embedder.as_mut() {
+            t.clear_adapters();
+        }
+        if let Some(l) = p.norm_out.linear_mut() {
+            l.clear_adapters();
+        }
+        for head in &mut p.pdd_proj_out {
+            head.clear_adapters();
+        }
     }
 
     /// How many projections currently carry at least one residual — the count a caller checks
@@ -1299,8 +1341,8 @@ pub const PUBLISHED_IMAGE_DIT_TENSORS: usize = 644;
 /// tables and the whole schedule's modulation are built once, and a step is "project, scatter, 50
 /// blocks, norm, the step's head".
 ///
-/// The fixed schedule enumerates every timestep the run evaluates at (six, one row class — text
-/// and image rows share each step's `t`), so construction always takes the precompute-and-evict
+/// The fixed schedule enumerates every timestep the run evaluates at (six, plus an edit's
+/// reference rows' constant `0.999`), so construction always takes the precompute-and-evict
 /// lever: [`AdaLnCache::precompute_and_evict`] projects the six timesteps' modulation for every
 /// block and releases `adaln_proj` (26.02 GB at the shipped geometry, the same tensors H3 video
 /// evicts).
@@ -1349,10 +1391,10 @@ impl ImageDit {
                 timesteps.len()
             )));
         }
-        if dit.stream_window.is_some() || dit.curve.is_some() {
+        if dit.curve.is_some() {
             return Err(CandleError::Msg(
-                "minimax-h3-image dit: the streamed and modulation-pruned DiT paths are not wired \
-                 for the image transformer"
+                "minimax-h3-image dit: the modulation-pruned DiT path is not wired for the image \
+                 transformer"
                     .into(),
             ));
         }
@@ -1367,32 +1409,84 @@ impl ImageDit {
         }
         let device = dit.device.clone();
         let tables = dit.rope.tables_from_rows(layout.position_ids(), &device)?;
-        // One row class (text and image share the step's timestep), one step per head.
-        let schedule = TimestepSchedule::new(timesteps.iter().map(|&t| vec![t]).collect())?;
-        let mut captured: Option<Tensor> = None;
-        let embedder = dit.projections.time_embedder.clone().ok_or_else(|| {
-            CandleError::Msg("minimax-h3-image dit: the checkpoint has no timestep MLP".into())
-        })?;
-        let (cache, released_bytes) = AdaLnCache::precompute_and_evict(
-            &mut dit.blocks,
-            schedule,
-            AdaLnResidency::PrecomputeAndEvict,
-            &device,
-            |ts| {
-                let temb = embedder.forward(ts, &device)?;
-                captured = Some(temb.clone());
-                Ok(temb)
-            },
+        // Row class 0 is the step's timestep, which every text and generated row sits at; an
+        // edit's reference rows are class 1, held at `REFERENCE_NOISE_AUG` for every step
+        // (`MiniMaxH3ImageSetTimestepsStep.row_timestep_plan`). One step per head.
+        let has_references = layout.num_reference_rows() > 0;
+        let schedule = TimestepSchedule::new(
+            timesteps
+                .iter()
+                .map(|&t| {
+                    if has_references {
+                        vec![t, candle_gen::gen_core::h3_image::REFERENCE_NOISE_AUG]
+                    } else {
+                        vec![t]
+                    }
+                })
+                .collect(),
         )?;
-        let temb = captured.ok_or_else(|| {
-            CandleError::Msg(
-                "minimax-h3-image dit: the AdaLN precompute did not evaluate the timestep \
-                 embedding"
-                    .into(),
-            )
-        })?;
-        // `norm_out`'s table from the SAME `temb` the block stack's was projected from.
-        let norm_out = dit.projections.norm_out.modulation(&temb)?;
+        let (cache, released_bytes, norm_out, temb) = if let Some(window) = dit.stream_window {
+            // SW-7095, rung 4: the blocks stay on the host in runtime format. Each block's
+            // `adaln_proj` is copied to the device, projected over the whole schedule and dropped
+            // — one block at a time, exactly as H3 video's `JointDit` streamed precompute — then
+            // every host projection is released. The device never held the 26 GB, so no device
+            // eviction saving is claimed.
+            let policy = crate::block_stream::current().ok_or_else(|| {
+                CandleError::Msg(
+                    "minimax-h3-image dit: streamed AdaLN requires an active request".into(),
+                )
+            })?;
+            let temb = dit.embed_timesteps(schedule.distinct_timesteps())?;
+            let norm_out = dit.projections.norm_out.modulation(&temb)?;
+            let plan = candle_gen::block_window::BlockPlan::new(dit.blocks.len(), window)?;
+            let layers = candle_gen::block_window::run_windowed(
+                &device,
+                &plan,
+                &policy.cancel,
+                Vec::with_capacity(dit.blocks.len()),
+                || Ok(()),
+                |mut layers, _, range| {
+                    for layer in range {
+                        if policy.cancel.is_cancelled() {
+                            return Err(CandleError::Canceled);
+                        }
+                        layers.push(dit.blocks[layer].modulation_for_window(&temb, &device)?);
+                    }
+                    Ok(layers)
+                },
+            )?;
+            let cache = AdaLnCache::assemble(schedule, layers, dit.pruning_identity())?;
+            for block in &mut dit.blocks {
+                block.evict_adaln();
+            }
+            (cache, 0, norm_out, temb)
+        } else {
+            let mut captured: Option<Tensor> = None;
+            let embedder = dit.projections.time_embedder.clone().ok_or_else(|| {
+                CandleError::Msg("minimax-h3-image dit: the checkpoint has no timestep MLP".into())
+            })?;
+            let (cache, released_bytes) = AdaLnCache::precompute_and_evict(
+                &mut dit.blocks,
+                schedule,
+                AdaLnResidency::PrecomputeAndEvict,
+                &device,
+                |ts| {
+                    let temb = embedder.forward(ts, &device)?;
+                    captured = Some(temb.clone());
+                    Ok(temb)
+                },
+            )?;
+            let temb = captured.ok_or_else(|| {
+                CandleError::Msg(
+                    "minimax-h3-image dit: the AdaLN precompute did not evaluate the timestep \
+                     embedding"
+                        .into(),
+                )
+            })?;
+            // `norm_out`'s table from the SAME `temb` the block stack's was projected from.
+            let norm_out = dit.projections.norm_out.modulation(&temb)?;
+            (cache, released_bytes, norm_out, temb)
+        };
         Ok(Self {
             dit,
             tables,
@@ -1400,7 +1494,7 @@ impl ImageDit {
             cache,
             norm_out,
             temb,
-            row_classes: vec![0; layout.seq_len()],
+            row_classes: layout.row_classes(),
             token_tags: layout.token_tags().to_vec(),
             text_indices: layout.text_indices().to_vec(),
             image_indices: layout.image_indices().to_vec(),
@@ -1445,6 +1539,53 @@ impl ImageDit {
     /// `norm_out`'s per-timestep `(shift, scale)` table.
     pub fn norm_out_modulation(&self) -> &NormOutModulation {
         &self.norm_out
+    }
+
+    /// Block `layer` alone at sampling step `step`, over a packed residual stream `hidden`
+    /// (`[1, seq_len, hidden_size]`, the stream dtype) — the diagnostic the real-weight edit gate
+    /// runs from the reference's own block input, to separate the block's compute from the error
+    /// it inherits (SW-7092). `modulation` defaults to the block's cached tables; a caller may hand
+    /// in tables of the cache's shape instead (the reference's own projection). Not counted as a
+    /// forward.
+    pub fn block_forward(
+        &self,
+        step: usize,
+        layer: usize,
+        hidden: &Tensor,
+        modulation: Option<&AdaLnModulation>,
+    ) -> Result<Tensor> {
+        let block = self.dit.blocks.get(layer).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "minimax-h3-image dit: block {layer} is outside the {}-block stack",
+                self.dit.blocks.len()
+            ))
+        })?;
+        let device = self.dit.device.clone();
+        let adaln_indices = self.cache.schedule().adaln_indices(
+            step,
+            &self.row_classes,
+            &self.token_tags,
+            &device,
+        )?;
+        let modulation = match modulation {
+            Some(m) => m,
+            None => self.cache.modulation(layer)?,
+        };
+        crate::dit::block::check_adaln_indices(&adaln_indices, modulation.scale_msa.dims()[0])?;
+        let transferred;
+        let block = if self.dit.stream_window.is_some() {
+            transferred = block.copy_to_device(&device)?;
+            &transferred
+        } else {
+            block
+        };
+        block.forward(
+            hidden,
+            modulation,
+            &adaln_indices,
+            &self.dit.rope,
+            &self.tables,
+        )
     }
 
     /// One step's velocity, also recording the stages `trace` asks for — the diagnostic twin of
