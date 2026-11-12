@@ -32,8 +32,8 @@ pub struct GenerationRequest {
     pub scheduler: Option<String>,
     pub scheduler_shift: Option<f32>,
     /// MiniMax-H3-Image's sampler with its parameters (SW-7106): `None` runs the sampler
-    /// [`sampler`](Self::sampler) names (`"euler"`, the default, or `"lcm"` at ComfyUI's
-    /// defaults); `Some` selects one explicitly and, for LCM, sets `s_noise` (> 0), `s_noise_end`
+    /// [`sampler`](Self::sampler) names — `"lcm"` or no name runs the default LCM
+    /// (`s_noise` 1.1 → `s_noise_end` 0.9, no clipping), `"euler"` the released Euler; `Some` selects one explicitly and, for LCM, sets `s_noise` (> 0), `s_noise_end`
     /// (>= 0) and `noise_clip_std` (>= 0, 0 = off). A `sampler` name that disagrees is refused.
     /// Gated by [`Capabilities::supports_h3_image_sampler`]: every other model refuses a `Some` on
     /// the shared floor. Contract and step: [`crate::h3_image::H3ImageSampler`].

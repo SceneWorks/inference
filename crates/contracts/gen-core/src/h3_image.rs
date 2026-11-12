@@ -252,10 +252,13 @@ pub fn validate_request(
 // below is ComfyUI's `comfy/k_diffusion/sampling.py::sample_lcm` on the published sigmas.
 
 /// The sampler names a request may give in [`crate::GenerationRequest::sampler`], in the order the
-/// descriptor advertises them. `euler` is the released sampler and the default.
+/// descriptor advertises them. `lcm` (at [`H3ImageSampler::lcm_default`]) is the default;
+/// `euler` is the released deterministic sampler, selected by name or block.
 pub const SAMPLER_NAMES: &[&str] = &["euler", "lcm"];
-/// ComfyUI's default LCM noise scale.
-pub const LCM_S_NOISE_DEFAULT: f32 = 1.0;
+/// The default LCM noise scale at step 0.
+pub const LCM_S_NOISE_DEFAULT: f32 = 1.1;
+/// The default LCM noise scale at the last step; `s` ramps linearly from [`LCM_S_NOISE_DEFAULT`].
+pub const LCM_S_NOISE_END_DEFAULT: f32 = 0.9;
 /// LCM noise clipping is off unless asked for.
 pub const LCM_NOISE_CLIP_STD_DEFAULT: f32 = 0.0;
 
@@ -265,10 +268,10 @@ pub const LCM_NOISE_CLIP_STD_DEFAULT: f32 = 0.0;
 /// is `x + (σᵢ − σᵢ₊₁)·v` with `σ` falling, so the clean estimate is `x0 = x + σᵢ·v`. ComfyUI's
 /// `CONST` model sampling writes the same estimate as `x - σ·v'` over its noise-ward velocity
 /// `v' = -v`; the two are the same arithmetic.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum H3ImageSampler {
-    /// The released deterministic velocity Euler step, `x ← x + (σᵢ − σᵢ₊₁)·v`.
-    #[default]
+    /// The released deterministic velocity Euler step, `x ← x + (σᵢ − σᵢ₊₁)·v`. The diffusers
+    /// reference pipeline runs this sampler.
     Euler,
     /// ComfyUI `sample_lcm`: jump to the clean estimate `x0 = x + σᵢ·v`, then, unless `σᵢ₊₁` is
     /// the terminal 0, re-noise it to `σᵢ₊₁` with fresh seeded noise:
@@ -282,10 +285,21 @@ pub enum H3ImageSampler {
     },
 }
 
+/// The default sampler is [`H3ImageSampler::lcm_default`].
+impl Default for H3ImageSampler {
+    fn default() -> Self {
+        Self::lcm_default()
+    }
+}
+
 impl H3ImageSampler {
-    /// LCM with ComfyUI's defaults: `s_noise = 1`, `s_noise_end = s_noise`, no clipping.
+    /// The default sampler: LCM with `s_noise = 1.1` ramping to `s_noise_end = 0.9`, no clipping.
     pub const fn lcm_default() -> Self {
-        Self::lcm(LCM_S_NOISE_DEFAULT)
+        Self::Lcm {
+            s_noise: LCM_S_NOISE_DEFAULT,
+            s_noise_end: LCM_S_NOISE_END_DEFAULT,
+            noise_clip_std: LCM_NOISE_CLIP_STD_DEFAULT,
+        }
     }
 
     /// LCM at a constant `s_noise` (`s_noise_end = s_noise`), no clipping.
@@ -373,8 +387,8 @@ impl H3ImageSampler {
 }
 
 /// The sampler a request runs: the typed `h3_image_sampler` block when present (validated), else
-/// the `sampler` name — `None` or `"euler"` is [`H3ImageSampler::Euler`], `"lcm"` is
-/// [`H3ImageSampler::lcm_default`]. A name that disagrees with the typed block is refused rather
+/// the `sampler` name — `None` or `"lcm"` is the default [`H3ImageSampler::lcm_default`],
+/// `"euler"` is [`H3ImageSampler::Euler`]. A name that disagrees with the typed block is refused rather
 /// than either one winning.
 pub fn resolve_sampler(
     name: Option<&str>,
@@ -393,8 +407,9 @@ pub fn resolve_sampler(
             })
         }
         (_, Some(typed)) => typed,
-        (Some("lcm"), None) => H3ImageSampler::lcm_default(),
-        _ => H3ImageSampler::Euler,
+        (Some("euler"), None) => H3ImageSampler::Euler,
+        // No name, or `"lcm"`: the only other name the check above admits.
+        (_, None) => H3ImageSampler::lcm_default(),
     };
     sampler.validate()?;
     Ok(sampler)
@@ -1725,30 +1740,38 @@ mod tests {
         assert_eq!(H3ImageSampler::Euler.noise_scale(0, 6), 0.0);
     }
 
-    /// No sampler named and no block is Euler — byte-identical to the released loop.
+    /// No sampler named and no block is the default LCM at 1.1 → 0.9 with no clipping; `"lcm"`
+    /// alone is the same; `"euler"` alone is the released Euler.
     #[test]
-    fn the_default_sampler_is_euler() {
-        assert_eq!(H3ImageSampler::default(), H3ImageSampler::Euler);
-        assert_eq!(resolve_sampler(None, None).unwrap(), H3ImageSampler::Euler);
+    fn the_default_sampler_is_lcm() {
+        let default = H3ImageSampler::Lcm {
+            s_noise: 1.1,
+            s_noise_end: 0.9,
+            noise_clip_std: 0.0,
+        };
+        assert_eq!(H3ImageSampler::lcm_default(), default);
+        assert_eq!(H3ImageSampler::default(), default);
+        assert_eq!(resolve_sampler(None, None).unwrap(), default);
         assert_eq!(
             request_sampler(&crate::GenerationRequest::default()).unwrap(),
-            H3ImageSampler::Euler
+            default
         );
+        assert_eq!(resolve_sampler(Some("lcm"), None).unwrap(), default);
         assert_eq!(
             resolve_sampler(Some("euler"), None).unwrap(),
             H3ImageSampler::Euler
         );
         assert_eq!(
-            resolve_sampler(Some("lcm"), None).unwrap(),
-            H3ImageSampler::Lcm {
-                s_noise: 1.0,
-                s_noise_end: 1.0,
-                noise_clip_std: 0.0
-            }
+            resolve_sampler(Some("euler"), Some(H3ImageSampler::Euler)).unwrap(),
+            H3ImageSampler::Euler
+        );
+        assert_eq!(
+            resolve_sampler(None, Some(H3ImageSampler::Euler)).unwrap(),
+            H3ImageSampler::Euler
         );
         let typed = H3ImageSampler::Lcm {
-            s_noise: 1.1,
-            s_noise_end: 0.9,
+            s_noise: 1.3,
+            s_noise_end: 0.7,
             noise_clip_std: 2.5,
         };
         assert_eq!(resolve_sampler(Some("lcm"), Some(typed)).unwrap(), typed);

@@ -139,7 +139,7 @@ pub fn descriptor() -> ModelDescriptor {
             // selection stages whatever residency it names.
             unconditionally_engages_staged_residency: true,
             max_prompt_tokens: Some(mlx_gen::gen_core::h3_image::MAX_PROMPT_TOKENS as u32),
-            // SW-7106: the released velocity Euler (the default) or ComfyUI's stochastic LCM on
+            // SW-7106: ComfyUI's stochastic LCM (the default, 1.1 → 0.9) or the released Euler on
             // the same six-step grid, named by `sampler` and parameterized by `h3_image_sampler`.
             samplers: mlx_gen::gen_core::h3_image::SAMPLER_NAMES.to_vec(),
             supports_h3_image_sampler: true,

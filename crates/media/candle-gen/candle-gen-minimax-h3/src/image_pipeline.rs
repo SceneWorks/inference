@@ -370,8 +370,8 @@ pub trait ImageVelocity {
 
 /// **The six-step loop**: one forward per step, then gen-core's shared
 /// [`sampler_step`] in float32 — under
-/// [`H3ImageSampler::Euler`] (the default) `x ← x + (σᵢ − σᵢ₊₁) · v`, under
-/// [`H3ImageSampler::Lcm`] ComfyUI's re-noised LCM step with noise seeded from `image_seed`
+/// [`H3ImageSampler::Euler`] `x ← x + (σᵢ − σᵢ₊₁) · v`, under
+/// [`H3ImageSampler::Lcm`] (the request default) ComfyUI's re-noised LCM step with noise seeded from `image_seed`
 /// ([`crate::image_sampler`]). Both rungs (resident and streamed) run through this one loop.
 ///
 /// Cancellation is checked before every step and the device synchronized after it, so a cancel

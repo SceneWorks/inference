@@ -128,7 +128,7 @@ pub fn image_descriptor() -> ModelDescriptor {
             // PDD-distilled: one output head per step, so six is the only legal count.
             supported_steps: StepSupport::Exact(vec![contract::FIXED_STEPS]),
             component_precision_floors: &[],
-            // SW-7106: the released velocity Euler (the default) or ComfyUI's stochastic LCM on
+            // SW-7106: ComfyUI's stochastic LCM (the default, 1.1 → 0.9) or the released Euler on
             // the same six-step grid, named by `sampler` and parameterized by `h3_image_sampler`.
             samplers: contract::SAMPLER_NAMES.to_vec(),
             supports_h3_image_sampler: true,
