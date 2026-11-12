@@ -425,3 +425,90 @@ fn a_non_aligned_request_is_admitted_and_sized_at_its_canvas() {
         .configure_request(&mut request(canvas.0, canvas.1))
         .is_err());
 }
+
+/// SW-7095 AC2's admission: under a budget between the 16 MP streamed and staged estimates,
+/// `admission::admit` lands on rung 4, and that exact selection is what the generator's safety
+/// check accepts at the same budget, while the staged rung is refused there. This is the
+/// selection the real-weights 16 MP gate renders through.
+#[test]
+fn the_admitted_streamed_selection_is_accepted_at_the_budget_that_chose_it() {
+    let load = spec(LoadShape::DeferredMaterialization);
+    let c = weights_free_contract(&load).unwrap();
+    let facts = admission::shipped_scale_facts(0);
+    let shape = admission::ImageRequestShape::text_to_image(4096, 4096);
+    let streamed_context = fixture_context(&c, &load, MemoryStrategy::BoundedTransformerResidency);
+    let tier = streamed_context.selection.tier;
+    let rungs = admission::ladder(&c, tier);
+    let at = |strategy| {
+        let selection = rungs.iter().find(|s| s.strategy == strategy).unwrap();
+        admission::estimate(&c, &facts, &shape, selection).unwrap()
+    };
+    let staged = at(MemoryStrategy::StagedResidency);
+    let streamed = at(MemoryStrategy::BoundedTransformerResidency);
+    let budget = MemoryBudget {
+        total_bytes: (staged.peak_device_bytes() + streamed.peak_device_bytes()) / 2,
+        committed_bytes: 0,
+        reclaimable_bytes: 0,
+        reserved_headroom_bytes: 0,
+    };
+    let admitted = admission::admit(&c, &facts, &shape, tier, budget).unwrap();
+    assert_eq!(
+        admitted.estimate.selection.strategy,
+        MemoryStrategy::BoundedTransformerResidency
+    );
+    let in_budget = |mut context: MemoryRunContext| {
+        context.geometry.width = 4096;
+        context.geometry.height = 4096;
+        context.budget = budget;
+        context.predicted_peak_bytes = admitted.estimate.peak_device_bytes();
+        context
+    };
+    let mut context = in_budget(streamed_context);
+    context.selection = admitted.estimate.selection;
+    assert_eq!(
+        safety_check_with(Some(&facts), &load, &c, &context),
+        MemorySafetyDecision::Accept
+    );
+    let staged_context = in_budget(fixture_context(&c, &load, MemoryStrategy::StagedResidency));
+    assert!(matches!(
+        safety_check_with(Some(&facts), &load, &c, &staged_context),
+        MemorySafetyDecision::Reject { .. }
+    ));
+}
+
+/// SW-7096 AC2: configured adapters do not take rung 4 away from the image generator. The
+/// streamed window copies each host block with its installed residuals, so a deferred load with
+/// LoRAs still declares bounded transformer residency Implemented, conforms, and accepts the
+/// rung-4 fixture with the adapter bytes priced.
+#[test]
+fn rung_4_stays_implemented_with_adapters_configured() {
+    let load = spec(LoadShape::DeferredMaterialization).with_adapters(vec![
+        gen_core::AdapterSpec::new(
+            "/nonexistent/style.safetensors".into(),
+            0.75,
+            gen_core::AdapterKind::Lora,
+        ),
+        gen_core::AdapterSpec::new(
+            "/nonexistent/detail.safetensors".into(),
+            0.5,
+            gen_core::AdapterKind::Lora,
+        ),
+    ]);
+    let c = weights_free_contract(&load).unwrap();
+    assert_eq!(
+        support(&c, MemoryStrategy::BoundedTransformerResidency),
+        MemoryStrategySupport::Implemented
+    );
+    assert!(c.lifecycle.transformer_window_materialization);
+    assert!(
+        c.conformance_errors().is_empty(),
+        "{:?}",
+        c.conformance_errors()
+    );
+    let facts = admission::shipped_scale_facts(admission::BYTES_PER_GB);
+    let context = fixture_context(&c, &load, MemoryStrategy::BoundedTransformerResidency);
+    assert_eq!(
+        safety_check_with(Some(&facts), &load, &c, &context),
+        MemorySafetyDecision::Accept
+    );
+}

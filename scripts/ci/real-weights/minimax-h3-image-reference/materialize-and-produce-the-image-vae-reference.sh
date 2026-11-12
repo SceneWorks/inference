@@ -7,7 +7,7 @@
 # 2. Produce the diffusers reference with the hash-pinned producer, in the reviewed hash-locked Mage
 #    reference environment (CPU torch + diffusers 0.38.0; the producer loads the pinned upstream
 #    `AutoencoderKLMiniMaxH3Image` module by SHA-256). The reference lands in the workspace-relative
-#    `minimax-h3-image-vae-reference/`, the directory the cache saves and the artifact uploads.
+#    `minimax-h3-image-vae-reference/`, the directory the runner store publishes and the artifact uploads.
 set -o pipefail
 python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
 export HF_HUB_DISABLE_XET=1

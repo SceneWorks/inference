@@ -4852,29 +4852,26 @@ jobs:
       - id: key
         name: Compute the reference cache key
         run: source scripts/ci/real-weights/minimax-h3-image-reference/compute-the-reference-cache-key.sh
-      - id: cache
-        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
-        with:
-          path: minimax-h3-image-vae-reference
-          key: ${{ steps.key.outputs.key }}
+      - id: store
+        name: Restore the reference from the runner store
+        env:
+          H3I_REFERENCE_KEY: ${{ steps.key.outputs.key }}
+        run: source scripts/ci/real-weights/minimax-h3-image-reference/restore-the-reference-from-the-runner-store.sh
       - name: Materialize and produce the image VAE reference
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.store.outputs.hit != 'true'
         shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
         run: source scripts/ci/real-weights/minimax-h3-image-reference/materialize-and-produce-the-image-vae-reference.sh
       - name: Materialize the DiT and produce its reference
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.store.outputs.hit != 'true'
         shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
         run: source scripts/ci/real-weights/minimax-h3-image-reference/materialize-the-dit-and-produce-its-reference.sh
       - name: Report the reference
         env:
-          H3I_REFERENCE_KEY: ${{ steps.key.outputs.key }}
-          H3I_REFERENCE_CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          H3I_REFERENCE_STORE_HIT: ${{ steps.store.outputs.hit }}
         run: source scripts/ci/real-weights/minimax-h3-image-reference/report-the-reference.sh
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
-        with:
-          path: minimax-h3-image-vae-reference
-          key: ${{ steps.key.outputs.key }}
+      - name: Publish the reference to the runner store
+        if: steps.store.outputs.hit != 'true'
+        run: source scripts/ci/real-weights/minimax-h3-image-reference/publish-the-reference-to-the-runner-store.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: minimax-h3-image-vae-reference

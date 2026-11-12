@@ -172,6 +172,7 @@ pub use audio_vae_encoder::{
     DacEncoder, EncoderBlock, MiniMaxH3AudioVaeEncoder, ResidualUnit, WnConv1d, ATTN_PROJ_HEADS,
     LAYER_NORM_EPS, MLP_RATIO,
 };
+pub use block_stream::RequestGuard as StreamedRequestScope;
 pub use blocks::{blend, TransformerBlock};
 pub use chunking::{ChunkSpan, TemporalGeometry, TemporalPlan};
 pub use conditioning::{

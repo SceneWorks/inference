@@ -69,9 +69,11 @@ rem streamed route: the one-block window over the text encoder and the DiT.
 call :run_unchecked integration real_weights::image_t2i_renders_16mp_streamed_on_cuda
 rem SW-7093 - then the q8 / q4 tiers: convert, audit and render each.
 call :tiers
-rem SW-7096: the three LoRA layouts fold identically on the real image DiT; ten stack with their scales.
+rem SW-7096: the three LoRA layouts fold identically on the real image DiT; ten stack with their scales;
+rem blocks streamed through the one-block window carry the LoRA like resident ones.
 call :run_lora h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda
 call :run_lora h3_image_adaln_and_output_head_loras_reach_the_denoiser_cuda
+call :run_lora h3_image_streamed_blocks_carry_the_lora_like_resident_ones_cuda
 if defined H3I_FAILED goto :failed
 exit /b 0
 

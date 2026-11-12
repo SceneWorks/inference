@@ -1286,6 +1286,16 @@ fn audit_tier(label: &str, bits: i32) {
     }
 }
 
+/// The text encoder `quant`'s tier declares (SW-7093 AC2): MiniMax-H3's own tier artifact in
+/// `SceneWorks/minimax-h3-mlx`, as a directory under `MINIMAX_H3_TIER_SNAPSHOT`.
+fn declared_text_encoder(quant: mlx_gen::gen_core::Quant) -> String {
+    let declared = gen_core_h3::h3_image_tier::ImageTier::from_bits(quant.bits())
+        .expect("a packed tier")
+        .text_encoder();
+    assert_eq!(declared.repo, gen_core_h3::h3_image_tier::H3_TIER_REPO);
+    declared.dir
+}
+
 /// Audit the converted tier, then render 2048² through the registered generator at it. The text encoder is MiniMax-H3's
 /// own tier artifact from `SceneWorks/minimax-h3-mlx` (`MINIMAX_H3_TIER_SNAPSHOT/{tier}/text_encoder`,
 /// AC2) -- never a copy under the image repository.
@@ -1294,8 +1304,7 @@ fn render_tier(label: &str, quant: mlx_gen::gen_core::Quant) {
     audit_tier(label, quant.bits());
     let root = image_snapshot();
     let te = PathBuf::from(std::env::var("MINIMAX_H3_TIER_SNAPSHOT").unwrap_or_default())
-        .join(label)
-        .join("text_encoder");
+        .join(declared_text_encoder(quant));
     assert!(
         te.join("config.json").is_file(),
         "MINIMAX_H3_TIER_SNAPSHOT must hold MiniMax-H3's {label}/text_encoder/ (found no {})",
@@ -1396,8 +1405,7 @@ fn h3_image_t2i_renders_2048_q4() {
 /// The q4 tier's load spec: the converted DiT and MiniMax-H3's own q4 text encoder, at `shape`.
 fn q4_spec(shape: mlx_gen::gen_core::LoadShape) -> LoadSpec {
     let te = PathBuf::from(std::env::var("MINIMAX_H3_TIER_SNAPSHOT").unwrap_or_default())
-        .join("q4")
-        .join("text_encoder");
+        .join(declared_text_encoder(mlx_gen::gen_core::Quant::Q4));
     assert!(
         te.join("config.json").is_file(),
         "MINIMAX_H3_TIER_SNAPSHOT must hold MiniMax-H3's q4/text_encoder/ (found no {})",

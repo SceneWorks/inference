@@ -62,8 +62,16 @@ SC26691_ADDED_STEPS = {
 SC26691_STEP_DIGESTS = {
     'synthetic-w4a8-mlx': '5475ed6448f16a7d1f8c5e6b87bbaea1091c0d4320ff83199606e3cb3eacc2c3',
 }
+# SW-7096 adds one committed-fixture CPU proof to the reviewed synthetic-w4a8-cuda Veda
+# route: `three_layouts_install_on_every_tier_with_their_own_scales` (PEFT/kohya/ComfyUI
+# adapters installed on dense, q8 and q4 targets). The route now pins 3 names instead of 2;
+# no snapshot reader, dispatch condition, cleanup or controller changed.
+SW7096_STEP_DIGESTS = {
+    'synthetic-w4a8-cuda': '400dd184c3b84ae920831355200f189d7a04aaef52c931ef149f82cf7e479f45',
+}
 CURRENT_STEP_DIGESTS = {
-    **STEP_DIGESTS, **REPAIRED_H3_STEP_DIGESTS, **REVIEWED_STORAGE_STEP_DIGESTS, **SC26691_STEP_DIGESTS
+    **STEP_DIGESTS, **REPAIRED_H3_STEP_DIGESTS, **REVIEWED_STORAGE_STEP_DIGESTS, **SC26691_STEP_DIGESTS,
+    **SW7096_STEP_DIGESTS,
 }
 
 # sc-27365 repins only the receipt-upload action of these jobs from the drifted v7.0.1 SHA to
