@@ -145,6 +145,13 @@ impl LoraResidual {
     pub fn scale(&self) -> f64 {
         self.scale
     }
+
+    /// `a · b`, the `[in, out]` delta this residual adds before its strength — read by the
+    /// layout-and-tier install test, which compares the folds of differently spelled files.
+    #[cfg(test)]
+    pub(crate) fn delta(&self) -> Result<Tensor> {
+        Ok(self.a.matmul(&self.b)?)
+    }
 }
 
 /// `y = x · Wᵀ` for a stored `[out, in]` weight — an `nn.Linear(..., bias=False)` — plus any

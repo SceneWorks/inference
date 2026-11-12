@@ -1,6 +1,7 @@
 //! SW-7096: MiniMax-H3-Image LoRAs on real weights (candle/CUDA) — the diffusers/PEFT, kohya
 //! `lora_unet_` and ComfyUI layouts of the same synthetic factors fold identically onto the real
-//! image DiT's projections, the fold moves them, and ten stacked files keep their own scales.
+//! image DiT's projections, the fold moves them, and ten stacked files keep their own scales; and
+//! blocks streamed through rung 4's one-block window carry the LoRA exactly as the resident ones.
 //!
 //! `#[ignore]`d: needs `MiniMaxAI/MiniMax-H3-Image` (`MINIMAX_H3_IMAGE_SNAPSHOT`) and CUDA. The
 //! `minimax-h3-image` real-weights profile runs it on the `candle-minimax-h3-image` job. It
@@ -113,9 +114,9 @@ fn scalar(v: f32) -> Tensor {
     Tensor::new(&[v], &Device::Cpu).unwrap()
 }
 
-fn write_peft(cfg: &MiniMaxH3DitConfig, dir: &Path, seed: u32) -> PathBuf {
+fn write_peft(cfg: &MiniMaxH3DitConfig, dir: &Path, seed: u32, blocks: usize) -> PathBuf {
     let mut t = Vec::new();
-    for b in 0..BLOCKS {
+    for b in 0..blocks {
         for leaf in BLOCK_TARGETS {
             let (down, up) = factors(cfg, b, leaf, seed);
             let stem = format!("transformer.transformer_blocks.{b}.{leaf}");
@@ -130,7 +131,13 @@ fn write_peft(cfg: &MiniMaxH3DitConfig, dir: &Path, seed: u32) -> PathBuf {
 
 /// The native-module form: fused qkv (concatenated `A`, block-diagonal `B`, alpha × 3), `mlp.fc1`
 /// with native `[gate | value]` halves, and the two renames — kohya-flattened or ComfyUI.
-fn write_native(cfg: &MiniMaxH3DitConfig, dir: &Path, seed: u32, kohya: bool) -> PathBuf {
+fn write_native(
+    cfg: &MiniMaxH3DitConfig,
+    dir: &Path,
+    seed: u32,
+    kohya: bool,
+    blocks: usize,
+) -> PathBuf {
     let stem = |b: usize, leaf: &str| {
         if kohya {
             format!("lora_unet_blocks_{b}_{}", leaf.replace('.', "_"))
@@ -144,7 +151,7 @@ fn write_native(cfg: &MiniMaxH3DitConfig, dir: &Path, seed: u32, kohya: bool) ->
         (".lora_A.weight", ".lora_B.weight")
     };
     let mut t = Vec::new();
-    for b in 0..BLOCKS {
+    for b in 0..blocks {
         let qkv: Vec<(Tensor, Tensor)> = ["attn.to_q", "attn.to_k", "attn.to_v"]
             .iter()
             .map(|l| factors(cfg, b, l, seed))
@@ -259,7 +266,7 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda() {
     let cfg = dit.config().clone();
     let bare = leaf_outputs(&mut dit, &device);
 
-    let peft = write_peft(&cfg, dir.path(), 1);
+    let peft = write_peft(&cfg, dir.path(), 1, BLOCKS);
     apply_minimax_h3_adapters(&mut dit, &[spec(peft, 1.0)]).expect("PEFT install");
     let with_peft = leaf_outputs(&mut dit, &device);
     let moved = rel(&with_peft, &bare);
@@ -271,7 +278,7 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda() {
 
     for kohya in [true, false] {
         dit.clear_adapters();
-        let native = write_native(&cfg, dir.path(), 1, kohya);
+        let native = write_native(&cfg, dir.path(), 1, kohya, BLOCKS);
         let report = apply_minimax_h3_adapters(&mut dit, &[spec(native, 1.0)]).expect("install");
         assert_eq!(report.applied, BLOCKS * BLOCK_TARGETS.len());
         let drift = rel(&leaf_outputs(&mut dit, &device), &with_peft);
@@ -288,9 +295,9 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda() {
         .map(|i| {
             let seed = 100 + i;
             let path = match i % 3 {
-                0 => write_peft(&cfg, dir.path(), seed),
-                1 => write_native(&cfg, dir.path(), seed, true),
-                _ => write_native(&cfg, dir.path(), seed, false),
+                0 => write_peft(&cfg, dir.path(), seed, BLOCKS),
+                1 => write_native(&cfg, dir.path(), seed, true, BLOCKS),
+                _ => write_native(&cfg, dir.path(), seed, false, BLOCKS),
             };
             spec(path, 0.1 * (i + 1) as f32)
         })
@@ -314,6 +321,138 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda() {
     #[cfg(feature = "model-inference-proof")]
     println!(
         "\nMODEL_INFERENCE_BODY_COMPLETED h3_image_lora_real::h3_image_lora_layouts_fold_identically_on_the_real_dit_cuda"
+    );
+}
+
+/// Blocks the streamed-vs-resident gate runs — the MLX twin's `BLOCKS`.
+const STREAM_BLOCKS: usize = 3;
+/// The strength the streamed-vs-resident gate applies its block-leaf LoRAs at — the MLX twin's
+/// `STRENGTH`: the residual stream carries activations far larger than one leaf's output, so a
+/// strength-1 file barely moves a 3-block output; the fold is linear in strength.
+const STRENGTH: f32 = 64.0;
+
+/// The first [`STREAM_BLOCKS`] blocks' output at step 0 over a fixed residual stream, from a
+/// freshly loaded image DiT carrying `specs` — resident on `device`, or `streamed`: loaded on the
+/// host, adapters installed there, and run through rung 4's one-block window inside the request
+/// scope the generator enters ([`candle_gen_minimax_h3::StreamedRequestScope`]), each block copied
+/// to `device` with its residuals for its turn.
+fn block_outputs(root: &Path, device: &Device, specs: &[AdapterSpec], streamed: bool) -> Vec<f32> {
+    use candle_gen::gen_core::{
+        GenerationMemory, GenerationRequest, LoadShape, TransformerComponent,
+    };
+    use candle_gen_minimax_h3::dit::ImageDit;
+    use candle_gen_minimax_h3::{ImageLayout, StreamedRequestScope};
+    let request = GenerationRequest {
+        memory: streamed.then(|| GenerationMemory {
+            stream_transformer_blocks: true,
+            transformer_window_size: Some(1),
+            transformer_window_component: Some(TransformerComponent::Both),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let _scope = StreamedRequestScope::enter(&request, LoadShape::DeferredMaterialization, device)
+        .expect("enter the request scope");
+    let load_device = if streamed {
+        Device::Cpu
+    } else {
+        device.clone()
+    };
+    let mut dit = MiniMaxH3Dit::load_from_dir(
+        root.join("transformer_diffusers"),
+        &load_device,
+        DType::BF16,
+    )
+    .expect("load the image DiT");
+    if !specs.is_empty() {
+        let report = apply_minimax_h3_adapters(&mut dit, specs).expect("install");
+        assert_eq!(
+            report.applied,
+            specs.len() * BLOCK_TARGETS.len() * STREAM_BLOCKS,
+            "every leaf of every LoRA'd block, from each file"
+        );
+    }
+    if streamed {
+        dit.prepare_streamed(device, 1)
+            .expect("prepare the streamed DiT");
+    }
+    let cfg = dit.config().clone();
+    let layout = ImageLayout::text_to_image(8, 16, 16, cfg.patch_size).expect("layout");
+    let context = seeded(&[1, 8, cfg.text_dim], 21)
+        .affine(50.0, 0.0)
+        .and_then(|t| t.to_dtype(DType::BF16))
+        .and_then(|t| t.to_device(device))
+        .unwrap();
+    let schedule = gen_core_h3::h3_schedule::SigmaSchedule::h3_image_distilled().unwrap();
+    let model = ImageDit::new(dit, &layout, &context, schedule.timesteps()).expect("ImageDit");
+    let mut x = seeded(&[1, layout.seq_len(), cfg.hidden_size], 7)
+        .affine(50.0, 0.0)
+        .and_then(|t| t.to_dtype(DType::BF16))
+        .and_then(|t| t.to_device(device))
+        .unwrap();
+    for layer in 0..STREAM_BLOCKS {
+        x = model.block_forward(0, layer, &x, None).expect("block");
+    }
+    let out = x
+        .to_dtype(DType::F32)
+        .and_then(|v| v.flatten_all())
+        .and_then(|v| v.to_vec1::<f32>())
+        .unwrap();
+    drop(model);
+    candle_gen_minimax_h3::release_device_memory(device).unwrap();
+    out
+}
+
+/// AC2 on candle/CUDA, the MLX gate `h3_image_streamed_blocks_carry_the_lora_like_resident_ones`
+/// mirrored: the same synthetic PEFT and kohya LoRAs at the same strengths over the first
+/// [`STREAM_BLOCKS`] real image-DiT blocks, installed through the production install on a host
+/// load and run through rung 4's one-block window, match the resident blocks carrying the same
+/// LoRAs. The drift is measured against **the LoRA's own effect** (`max |resident − bare|`):
+/// a streamed window that dropped the residuals would equal the bare output and score 1, so the
+/// comparison cannot pass by accident.
+#[test]
+#[ignore = "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT) and CUDA; two resident 66 GB bf16 DiT loads and one host load"]
+fn h3_image_streamed_blocks_carry_the_lora_like_resident_ones_cuda() {
+    let root = image_snapshot();
+    let dir = scratch();
+    let device = candle_gen::default_device().expect("a candle device");
+    let cfg = MiniMaxH3DitConfig::from_image_diffusers_json(
+        &std::fs::read_to_string(root.join("transformer_diffusers").join("config.json")).unwrap(),
+    )
+    .unwrap();
+    let peft = write_peft(&cfg, dir.path(), 3, STREAM_BLOCKS);
+    let kohya = write_native(&cfg, dir.path(), 4, true, STREAM_BLOCKS);
+    let specs = [spec(peft, 0.75 * STRENGTH), spec(kohya, 0.5 * STRENGTH)];
+
+    let bare = block_outputs(&root, &device, &[], false);
+    let resident = block_outputs(&root, &device, &specs, false);
+    let streamed = block_outputs(&root, &device, &specs, true);
+
+    let max_diff = |a: &[f32], b: &[f32]| {
+        assert_eq!(a.len(), b.len());
+        a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()))
+    };
+    let moved = rel1(&resident, &bare);
+    println!("[sw-7096 candle] LoRA moved the resident output by rel-max-abs {moved:.3e}");
+    assert!(
+        moved > 1e-3,
+        "the LoRA must move the output, got {moved:.3e}"
+    );
+    let effect = max_diff(&resident, &bare);
+    assert!(
+        effect > 0.0,
+        "the LoRA changed nothing, so no drift can be judged"
+    );
+    let drift = max_diff(&streamed, &resident) / effect;
+    println!("[sw-7096 candle] streamed vs resident, relative to the LoRA's effect: {drift:.3e}");
+    assert!(
+        drift < REL_TOL,
+        "streamed must match resident, {drift:.3e} of the LoRA's effect"
+    );
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED h3_image_lora_real::h3_image_streamed_blocks_carry_the_lora_like_resident_ones_cuda"
     );
 }
 

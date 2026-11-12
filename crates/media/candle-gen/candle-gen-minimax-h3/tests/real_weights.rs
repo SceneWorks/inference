@@ -2906,10 +2906,14 @@ fn render_image_tier(label: &str, quant: candle_gen::gen_core::Quant) {
     // Audit the converted index and heads before spending a render on them.
     audit_image_tier(label, if label == "q8" { 8 } else { 4 });
 
+    // The declared text encoder of this tier (SW-7093 AC2): MiniMax-H3's own tier artifact.
+    let declared = gen_core_h3::h3_image_tier::ImageTier::from_bits(quant.bits())
+        .expect("a packed tier")
+        .text_encoder();
+    assert_eq!(declared.repo, gen_core_h3::h3_image_tier::H3_TIER_REPO);
     let te =
         std::path::PathBuf::from(std::env::var("MINIMAX_H3_TIER_SNAPSHOT").unwrap_or_default())
-            .join(label)
-            .join("text_encoder");
+            .join(&declared.dir);
     assert!(
         te.join("config.json").is_file(),
         "MINIMAX_H3_TIER_SNAPSHOT must hold MiniMax-H3's {label}/text_encoder/ (no {})",
@@ -3011,14 +3015,15 @@ fn image_t2i_renders_2048_q4_on_cuda() {
 /// AC2 (candle/CUDA): a 16 MP (4096 x 4096) bf16 text-to-image request that does not fit
 /// resident is admitted and completes through the streamed route.
 ///
-/// The admission budget is the device's **actually-free** memory (`cuMemGetInfo` after a
+/// The free memory is the device's **actually-free** memory (`cuMemGetInfo` after a
 /// synchronize), not its total: the shared runner's cards carry other work. The per-phase host
 /// and GPU estimates of the staged and streamed rungs are printed in decimal GB and binary GiB.
-/// The test asserts the streamed estimate fits that free memory, that the selector lands on rung 4
-/// for any budget between the two estimates (on a busy card, the real one), that the loaded
-/// generator refuses the staged rung whenever its estimate exceeds the free memory and admits the
-/// streamed one, and then renders through the request scope that admission returns — the
-/// one-block window over the text encoder and the DiT. The image is written to
+/// The test asserts the streamed estimate fits that free memory, then runs admission against a
+/// budget the resident route cannot hold — the lower of the free memory and a budget between the
+/// staged and streamed estimates — and asserts it selects rung 4 after refusing the staged rung.
+/// The loaded generator refuses the staged rung and accepts the admitted selection at that budget,
+/// and the render runs through the request scope that admission returns — the one-block window
+/// over the text encoder and the DiT. The image is written to
 /// `MINIMAX_H3_IMAGE_STREAMED_RENDER_OUT` when set.
 #[test]
 #[ignore = "needs a real MiniMax-H3-Image snapshot (MINIMAX_H3_IMAGE_SNAPSHOT), MiniMax-H3's text encoder (MINIMAX_H3_SNAPSHOT) and CUDA; full 4096x4096 streamed render"]
@@ -3148,26 +3153,43 @@ fn image_t2i_renders_16mp_streamed_on_cuda() {
                 .strategy,
             MemoryStrategy::BoundedTransformerResidency
         );
-        let resident_fits = staged.peak_device_bytes() <= free;
+        // AC2's admission: a budget the resident route cannot fit. The walk is run against the
+        // lower of the card's free memory and a budget between the two estimates, so the staged
+        // rung is refused even on a card with room for it, and the admitted selection is the
+        // route the render below takes.
+        let admitted_budget = between.min(free);
+        assert!(
+            admitted_budget < staged.peak_device_bytes()
+                && admitted_budget >= streamed.peak_device_bytes(),
+            "the admission budget must refuse the staged rung and hold the streamed one"
+        );
+        let admission = admit(&contract, &facts, &shape, tier, budget_of(admitted_budget))
+            .expect("a rung fits the admission budget");
         println!(
-            "resident {} on this card; admission picks {:?}",
-            if resident_fits {
-                "fits"
-            } else {
-                "does NOT fit"
-            },
-            admit(&contract, &facts, &shape, tier, budget_of(free))
-                .map(|a| a.estimate.selection.strategy)
-                .ok()
+            "admission budget {:.2} GB ({:.2} GiB): admits {:?} after refusing {:?}",
+            decimal_gb(admitted_budget),
+            binary_gib(admitted_budget),
+            admission.estimate.selection.strategy,
+            admission
+                .rejected
+                .iter()
+                .map(|e| e.selection.strategy)
+                .collect::<Vec<_>>()
+        );
+        for rejected in &admission.rejected {
+            println!("refused:  {rejected}");
+        }
+        println!("admitted: {}", admission.estimate);
+        assert_eq!(
+            admission.estimate.selection.strategy,
+            MemoryStrategy::BoundedTransformerResidency
         );
 
-        // Admission through the loaded generator, at the real free memory.
+        // Admission through the loaded generator, at the same budget.
         let calibration = contract.calibration.clone().expect("calibration identity");
-        let context_for = |strategy, predicted| MemoryRunContext {
+        let context_for = |selection, predicted| MemoryRunContext {
             reference_resources: None,
-            selection: contract
-                .representative_selection(strategy, tier, false)
-                .expect("selection"),
+            selection,
             optimization_authority: MemoryOptimizationAuthority::Estimated,
             calibration_abi: calibration.abi,
             calibration_fingerprint: calibration.fingerprint.clone(),
@@ -3184,32 +3206,27 @@ fn image_t2i_renders_16mp_streamed_on_cuda() {
                 reference_count: 0,
             },
             overlay: None,
-            budget: MemoryBudget {
-                total_bytes: free,
-                committed_bytes: 0,
-                reclaimable_bytes: 0,
-                reserved_headroom_bytes: 0,
-            },
+            budget: budget_of(admitted_budget),
             predicted_peak_bytes: predicted,
             cache_state: MemoryCacheState::Cold,
             evidence_revision: "sw-7095-16mp-streamed".into(),
         };
         let staged_context = context_for(
-            MemoryStrategy::StagedResidency,
+            contract
+                .representative_selection(MemoryStrategy::StagedResidency, tier, false)
+                .expect("selection"),
             streamed.peak_device_bytes(),
         );
-        if !resident_fits {
-            assert!(
-                matches!(
-                    generator.memory_strategy_safety_check(&staged_context),
-                    MemorySafetyDecision::Reject { .. }
-                ),
-                "the staged rung must be refused where its estimate exceeds the free memory"
-            );
-        }
+        assert!(
+            matches!(
+                generator.memory_strategy_safety_check(&staged_context),
+                MemorySafetyDecision::Reject { .. }
+            ),
+            "the staged rung must be refused where its estimate exceeds the admission budget"
+        );
         let context = context_for(
-            MemoryStrategy::BoundedTransformerResidency,
-            streamed.peak_device_bytes(),
+            admission.estimate.selection,
+            admission.estimate.peak_device_bytes(),
         );
         assert_eq!(
             generator.memory_strategy_safety_check(&context),
