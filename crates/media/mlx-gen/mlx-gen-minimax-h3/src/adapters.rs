@@ -584,24 +584,9 @@ pub fn resolve_target_alpha(in_band: Option<f32>, blob_alpha: Option<f32>, file_
 
 // ─── sc-19443: the ComfyUI key space ───────────────────────────────────────────────────────────
 
-/// The ComfyUI container prefix for the 50-block stack. Its diffusers spelling is
-/// `transformer_blocks.`; raw `token_refiner.blocks.` uses `token_refiner.refiner_blocks.`.
-const COMFY_BLOCK_CONTAINER: &str = "blocks.";
-
-/// Map leading raw H3 containers to diffusers without rewriting nested or unknown containers.
-/// Canonical `transformer_blocks.` and `token_refiner.refiner_blocks.` stay unchanged.
-fn normalize_comfy_container(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("token_refiner.blocks.") {
-        return format!("token_refiner.refiner_blocks.{rest}");
-    }
-    if path.starts_with("transformer_blocks.") || path.starts_with("token_refiner.") {
-        return path.to_string();
-    }
-    match path.strip_prefix(COMFY_BLOCK_CONTAINER) {
-        Some(rest) => format!("transformer_blocks.{rest}"),
-        None => path.to_string(),
-    }
-}
+/// Map leading raw H3 containers (`blocks.`, `token_refiner.blocks.`) to diffusers without
+/// rewriting nested or unknown containers — the shared normalizer the pricer uses too.
+use gen_core_h3::h3_adapter_memory::normalize_raw_container as normalize_comfy_container;
 
 /// The four ComfyUI module names a MiniMax-H3 LoRA can name.
 ///
@@ -870,10 +855,11 @@ pub fn convert_comfyui_key_space(w: &Weights) -> Result<Weights> {
 /// Every key goes through the shared
 /// [`rewrite_minimax_h3_kohya_keys`],
 /// so the Candle install and the adapter-memory pricing read the same mapping; a key that names no
-/// MiniMax-H3 module refuses the **whole** file, listing every such key. The result is in either
-/// diffusers names (`transformer_blocks.{i}.attn.to_q`) or native ones (`blocks.{i}.attn.qkv_proj`)
-/// — whichever the file used — so a native-named file still goes through
-/// [`convert_comfyui_key_space`]'s qkv split and SwiGLU half swap.
+/// MiniMax-H3 module refuses the **whole** file, listing every such key. The result always uses
+/// the diffusers containers (`transformer_blocks.{i}`, `token_refiner.refiner_blocks.{i}`) but
+/// keeps the file's own leaf spelling — diffusers (`attn.to_q`) or native (`attn.qkv_proj`) — so a
+/// native-named file still goes through [`convert_comfyui_key_space`]'s qkv split and SwiGLU half
+/// swap, and every other target already names the module it installs on.
 ///
 /// The rewritten map is rebuilt key by key and carries no metadata, so **every target gets an
 /// explicit `.alpha`**: its own in-band one when the file has it (kohya always writes one), else the
@@ -893,6 +879,10 @@ pub fn convert_kohya_key_space(w: &Weights) -> Result<Weights> {
     let mut out = Weights::empty();
     let mut stems: BTreeMap<String, bool> = BTreeMap::new();
     for (source, dotted) in pairs {
+        // Every rewritten target gets the diffusers container here, not only the ones a later
+        // ComfyUI leaf conversion would normalize: an AdaLN-only or diffusers-leaf
+        // `blocks_{i}_` / `token_refiner_blocks_{i}_` file never reaches that conversion.
+        let dotted = normalize_comfy_container(&dotted);
         let (stem, has_alpha) = match dotted.strip_suffix(".alpha") {
             Some(stem) => (stem.to_owned(), true),
             None => (
@@ -1505,9 +1495,9 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "blocks.0.attn.qkv_proj.alpha",
-                "blocks.0.attn.qkv_proj.lora_down.weight",
-                "blocks.0.attn.qkv_proj.lora_up.weight",
+                "transformer_blocks.0.attn.qkv_proj.alpha",
+                "transformer_blocks.0.attn.qkv_proj.lora_down.weight",
+                "transformer_blocks.0.attn.qkv_proj.lora_up.weight",
                 "transformer_blocks.1.ff.net.2.alpha",
                 "transformer_blocks.1.ff.net.2.lora_down.weight",
                 "transformer_blocks.1.ff.net.2.lora_up.weight",
@@ -1521,7 +1511,7 @@ mod tests {
                 .item::<f32>()
         };
         assert_eq!(
-            alpha("blocks.0.attn.qkv_proj.alpha"),
+            alpha("transformer_blocks.0.attn.qkv_proj.alpha"),
             3.0,
             "the in-band alpha is kept"
         );
@@ -1530,6 +1520,172 @@ mod tests {
             DEFAULT_LORA_ALPHA,
             "a missing alpha resolves through the file chain, never to the rank"
         );
+    }
+
+    /// `(key, factor shape)` pairs of one synthetic adapter file.
+    type FileKeys<'a> = &'a [(&'a str, &'a [i32])];
+
+    /// The module paths one generic kohya file installs on: the installer's own kohya rewrite,
+    /// then its ComfyUI leaf conversion only when the rewritten keys need one.
+    fn kohya_install_paths(keys: FileKeys<'_>) -> Result<BTreeSet<String>> {
+        let w = Weights::from_map(
+            keys.iter()
+                .enumerate()
+                .map(|(i, (k, shape))| (k.to_string(), seeded(shape, i as u32)))
+                .collect(),
+        );
+        let mut out = convert_kohya_key_space(&w)?;
+        if is_comfyui_key_space(&out) {
+            out = convert_comfyui_key_space(&out)?;
+        }
+        Ok(module_paths(&out))
+    }
+
+    /// The module path of every LoRA factor/alpha key in `w`, namespace-stripped.
+    fn module_paths(w: &Weights) -> BTreeSet<String> {
+        w.keys()
+            .filter_map(|k| {
+                SUFFIXES
+                    .iter()
+                    .find_map(|(suffix, _)| k.strip_suffix(suffix))
+                    .map(normalize_minimax_h3_key)
+            })
+            .collect()
+    }
+
+    /// PR #1430 review: every rewritten kohya target gets the diffusers container, so an
+    /// AdaLN-only `blocks_{i}_` file and a diffusers-leaf `token_refiner_blocks_{i}_` file — neither
+    /// of which carries a ComfyUI leaf — name image-DiT modules; QKV/MLP kohya and ComfyUI files
+    /// still map; and a key naming no module still refuses the file.
+    #[test]
+    fn every_rewritten_kohya_target_names_its_diffusers_container() {
+        let targets: BTreeSet<String> = crate::h3_image::dit::image_adapter_target_paths(
+            &crate::dit::config::MiniMaxH3ImageDitConfig::default(),
+        )
+        .into_iter()
+        .collect();
+        let cases: [(FileKeys<'_>, &[&str]); 3] = [
+            (
+                &[
+                    (
+                        "lora_unet_blocks_4_adaln_proj_linear.lora_down.weight",
+                        &[2, 8],
+                    ),
+                    (
+                        "lora_unet_blocks_4_adaln_proj_linear.lora_up.weight",
+                        &[8, 2],
+                    ),
+                ],
+                &["transformer_blocks.4.adaln_proj.linear"],
+            ),
+            (
+                &[
+                    (
+                        "lora_unet_token_refiner_blocks_1_attn_to_q.lora_down.weight",
+                        &[2, 8],
+                    ),
+                    (
+                        "lora_unet_token_refiner_blocks_1_attn_to_q.lora_up.weight",
+                        &[8, 2],
+                    ),
+                    (
+                        "lora_unet_token_refiner_blocks_0_ff_net_2.lora_down.weight",
+                        &[2, 8],
+                    ),
+                    (
+                        "lora_unet_token_refiner_blocks_0_ff_net_2.lora_up.weight",
+                        &[8, 2],
+                    ),
+                ],
+                &[
+                    "token_refiner.refiner_blocks.0.ff.net.2",
+                    "token_refiner.refiner_blocks.1.attn.to_q",
+                ],
+            ),
+            (
+                &[
+                    ("lora_unet_blocks_0_attn_qkv_proj.lora_down.weight", &[2, 8]),
+                    ("lora_unet_blocks_0_attn_qkv_proj.lora_up.weight", &[36, 2]),
+                    ("lora_unet_blocks_2_mlp_fc1.lora_down.weight", &[2, 8]),
+                    ("lora_unet_blocks_2_mlp_fc1.lora_up.weight", &[16, 2]),
+                    (
+                        "lora_unet_token_refiner_blocks_1_attn_out_proj.lora_down.weight",
+                        &[2, 8],
+                    ),
+                    (
+                        "lora_unet_token_refiner_blocks_1_attn_out_proj.lora_up.weight",
+                        &[8, 2],
+                    ),
+                ],
+                &[
+                    "token_refiner.refiner_blocks.1.attn.to_out.0",
+                    "transformer_blocks.0.attn.to_k",
+                    "transformer_blocks.0.attn.to_q",
+                    "transformer_blocks.0.attn.to_v",
+                    "transformer_blocks.2.ff.net.0.proj",
+                ],
+            ),
+        ];
+        for (keys, want) in cases {
+            let paths = kohya_install_paths(keys).unwrap();
+            let want: BTreeSet<String> = want.iter().map(|p| p.to_string()).collect();
+            assert_eq!(paths, want, "{keys:?}");
+            assert!(paths.is_subset(&targets), "{paths:?}");
+        }
+
+        // A ComfyUI (dotted, native-named) file still converts onto the same modules.
+        let comfy = Weights::from_map(std::collections::HashMap::from([
+            (
+                "diffusion_model.blocks.3.attn.qkv_proj.lora_A.weight".to_string(),
+                seeded(&[2, 8], 1),
+            ),
+            (
+                "diffusion_model.blocks.3.attn.qkv_proj.lora_B.weight".to_string(),
+                seeded(&[36, 2], 2),
+            ),
+            (
+                "diffusion_model.token_refiner.blocks.0.mlp.fc2.lora_A.weight".to_string(),
+                seeded(&[2, 8], 3),
+            ),
+            (
+                "diffusion_model.token_refiner.blocks.0.mlp.fc2.lora_B.weight".to_string(),
+                seeded(&[8, 2], 4),
+            ),
+        ]));
+        assert!(is_comfyui_key_space(&comfy));
+        let want: BTreeSet<String> = [
+            "token_refiner.refiner_blocks.0.ff.net.2",
+            "transformer_blocks.3.attn.to_k",
+            "transformer_blocks.3.attn.to_q",
+            "transformer_blocks.3.attn.to_v",
+        ]
+        .map(String::from)
+        .into();
+        assert_eq!(
+            module_paths(&convert_comfyui_key_space(&comfy).unwrap()),
+            want
+        );
+
+        // A key that names no module still refuses the whole file.
+        let Err(error) = kohya_install_paths(&[
+            (
+                "lora_unet_blocks_4_adaln_proj_linear.lora_down.weight",
+                &[2, 8],
+            ),
+            (
+                "lora_unet_blocks_4_adaln_proj_linear.lora_up.weight",
+                &[8, 2],
+            ),
+            ("lora_unet_blocks_4_adaln_norm.lora_down.weight", &[2, 8]),
+        ]) else {
+            panic!("an unknown kohya key must refuse the file");
+        };
+        let error = error.to_string();
+        assert!(
+            error.contains("lora_unet_blocks_4_adaln_norm.lora_down.weight"),
+            "{error}"
+        );
+        assert!(!error.contains("adaln_proj_linear"), "{error}");
     }
 
     /// An unknown layout is refused naming every unmatched key, on both key spaces.

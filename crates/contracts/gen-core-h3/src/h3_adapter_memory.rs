@@ -114,7 +114,15 @@ fn normalize(path: &str) -> String {
         .unwrap_or(stem)
         .to_string()
 }
-fn raw_container(path: &str) -> String {
+/// Map a leading raw H3 block container to its diffusers spelling: `blocks.{i}.` →
+/// `transformer_blocks.{i}.` and `token_refiner.blocks.{i}.` → `token_refiner.refiner_blocks.{i}.`.
+/// Canonical, nested and unknown containers pass through unchanged, and only the leading container
+/// is rewritten, so a full key (role suffix included) normalizes the same as its module path.
+///
+/// One function for both backends' installers (every rewritten kohya target and every ComfyUI
+/// target) and this pricer, so the container a LoRA is installed on and the one it is priced on
+/// cannot drift apart.
+pub fn normalize_raw_container(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("blocks.") {
         format!("transformer_blocks.{rest}")
     } else if let Some(rest) = path.strip_prefix("token_refiner.blocks.") {
@@ -146,7 +154,7 @@ fn lora_key(key: &str) -> Option<(String, bool)> {
 /// so the larger supported route is used without reading any weight tensor. This
 /// bounds both shared-A and block-diagonal files, never rejects either representation.
 fn lora_routes(path: &str) -> Vec<String> {
-    let path = raw_container(path);
+    let path = normalize_raw_container(path);
     for (raw, runtime) in [
         (".attn.out_proj", ".attn.to_out.0"),
         (".mlp.fc1", ".ff.net.0.proj"),
@@ -744,6 +752,36 @@ mod tests {
             schedule: 0,
             visual_elements: 0,
             global: 0,
+        }
+    }
+
+    /// The shared container normalizer rewrites only a leading raw block container.
+    #[test]
+    fn raw_block_containers_normalize_and_everything_else_passes_through() {
+        for (raw, want) in [
+            (
+                "blocks.4.adaln_proj.linear.lora_up.weight",
+                "transformer_blocks.4.adaln_proj.linear.lora_up.weight",
+            ),
+            (
+                "token_refiner.blocks.1.attn.to_q",
+                "token_refiner.refiner_blocks.1.attn.to_q",
+            ),
+            (
+                "transformer_blocks.0.ff.net.2",
+                "transformer_blocks.0.ff.net.2",
+            ),
+            (
+                "token_refiner.refiner_blocks.0.attn.to_out.0",
+                "token_refiner.refiner_blocks.0.attn.to_out.0",
+            ),
+            (
+                "unrelated.token_refiner.blocks.0.attn.out_proj",
+                "unrelated.token_refiner.blocks.0.attn.out_proj",
+            ),
+            ("norm_out.linear", "norm_out.linear"),
+        ] {
+            assert_eq!(normalize_raw_container(raw), want, "{raw}");
         }
     }
 
