@@ -58,11 +58,15 @@ NO_LEARNED_WORK = {
     'h3_image_real::h3_image_edit_presentation_matches_the_processor_template',
     'real_weights::image_edit_presentation_matches_the_processor_template',
 }
+# The streamed 16 MP render's text encoder keeps its dense token-embedding table on the host and
+# gathers the selected rows there before upload, so its registered set is the host plus CUDA.
+HOST_AND_CUDA = {'real_weights::image_t2i_renders_16mp_streamed_on_cuda'}
 
 
-def log(fqn: str, device: str | None, *, body: int = 1,
+def log(fqn: str, device: str | list[str] | None, *, body: int = 1,
         summary: str = 'ok. 1 passed; 0 failed; 0 ignored;') -> str:
-    lines = ['running 1 test'] + ([f'MODEL_INFERENCE_DEVICE {fqn} {device}'] if device else [])
+    devices = [device] if isinstance(device, str) else device or []
+    lines = ['running 1 test'] + [f'MODEL_INFERENCE_DEVICE {fqn} {each}' for each in devices]
     lines += [f'MODEL_INFERENCE_BODY_COMPLETED {fqn}'] * body
     return '\n'.join(lines + [f'test result: {summary} 0 measured; 3 filtered out']) + '\n'
 
@@ -95,12 +99,14 @@ class GateEvidenceTests(unittest.TestCase):
                 if fqn in NO_LEARNED_WORK:
                     continue
                 row = check.registered_case(self.rows, package, fqn, None, backend)
+                devices = ['candle-cpu', device] if fqn in HOST_AND_CUDA else [device]
                 with self.subTest(gate=fqn):
-                    self.assertEqual(proofs.verify_execution(row, log(fqn, device))['actual_devices'], [device])
+                    self.assertEqual(proofs.verify_execution(row, log(fqn, devices))['actual_devices'], devices)
                     wrong = 'candle-cuda' if backend == 'mlx' else 'candle-cpu'
-                    for bad in (log(fqn, wrong), log(fqn, None), log(fqn, device, body=0),
-                                log(fqn, device, body=2),
-                                log(fqn, device, summary='ok. 0 passed; 0 failed; 1 ignored;')):
+                    partial = [log(fqn, device)] if fqn in HOST_AND_CUDA else []
+                    for bad in (log(fqn, wrong), log(fqn, None), log(fqn, devices, body=0),
+                                log(fqn, devices, body=2), *partial,
+                                log(fqn, devices, summary='ok. 0 passed; 0 failed; 1 ignored;')):
                         with self.assertRaises(ValueError):
                             proofs.verify_execution(row, bad)
 
