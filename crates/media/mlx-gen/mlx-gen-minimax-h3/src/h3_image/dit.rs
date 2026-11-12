@@ -23,7 +23,8 @@
 //!   [`AdaLnCache::precompute_and_evict`].
 //!
 //! The sampler is the H3-Image checkpoint's: the [`SigmaSchedule::h3_image_distilled`] grid, and
-//! the `velocity` Euler form its scheduler config selects ([`ImageDenoiser::step`]).
+//! the `velocity` Euler form its scheduler config selects ([`ImageDenoiser::step`]), or ComfyUI's
+//! stochastic LCM on the same grid ([`ImageDenoiser::step_with`], SW-7106).
 //!
 //! **Rung 4 (SW-7094).** [`MiniMaxH3ImageDit::load_dir_deferred`] keeps only the non-block tensors
 //! (the I/O projections, the six heads, the refiner) and hands the 50 blocks to H3's
@@ -38,7 +39,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::{AttentionBudget, AttentionChunkAxis, AttentionPlan, BoundedAttention};
 use mlx_gen::block_residency::{run_windowed, BlockPlan};
-use mlx_gen::gen_core::h3_image::REFERENCE_NOISE_AUG;
+use mlx_gen::gen_core::h3_image::{sampler_step, H3ImageSampler, SamplerStep, REFERENCE_NOISE_AUG};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
 
@@ -53,6 +54,7 @@ use crate::dit::model::UnverifiedSources;
 use crate::dit::refiner::TokenRefiner;
 use crate::dit::rope::{MmRope, MmRopeTables};
 use crate::h3_image::layout::ImageLayout;
+use crate::h3_image::sampler::MlxStepOps;
 use crate::tensor::slice_axis;
 
 /// The published component directory the image DiT loads from. `transformer/` is the native
@@ -840,17 +842,43 @@ impl ImageDenoiser {
     /// Only the generated rows are written: an edit's reference rows ride through every step
     /// unchanged (`MiniMaxH3ImageLoopSchedulerStep`).
     pub fn step(&self, step: usize, image_rows: &Array) -> Result<Array> {
+        self.step_with(&H3ImageSampler::Euler, 0, step, image_rows)
+    }
+
+    /// One step of `sampler` (SW-7106): the velocity at step `step` through head `step`, then
+    /// gen-core's [`sampler_step`] over the generated rows, in float32. The sigmas are the ones
+    /// [`velocity_euler_delta`] steps between (`1 - t`, the terminal one 0), so
+    /// [`H3ImageSampler::Euler`] is exactly [`Self::step`]. `image_seed` seeds the LCM noise
+    /// ([`mlx_gen::gen_core::h3_image::lcm_noise_seed`]); Euler ignores it.
+    ///
+    /// Only the generated rows are written: an edit's reference rows ride through every step
+    /// unchanged, under either sampler.
+    pub fn step_with(
+        &self,
+        sampler: &H3ImageSampler,
+        image_seed: u64,
+        step: usize,
+        image_rows: &Array,
+    ) -> Result<Array> {
         let v = self.velocity(step, image_rows)?;
-        let delta = velocity_euler_delta(self.schedule.timesteps(), step)?;
+        let timesteps = self.schedule.timesteps();
+        velocity_euler_delta(timesteps, step)?;
+        let sigma = |i: usize| timesteps.get(i).map_or(0.0, |&t| 1.0 - t);
         let x = image_rows.as_dtype(Dtype::Float32)?;
         let refs = self.layout.num_reference_rows();
         let all = self.layout.num_packed_image_rows();
-        let generated = mlx_rs::ops::add(
+        let generated = sampler_step(
+            &mut MlxStepOps,
+            sampler,
+            SamplerStep {
+                step,
+                num_steps: self.num_steps(),
+                sigma: sigma(step),
+                sigma_next: sigma(step + 1),
+                image_seed,
+            },
             &slice_axis(&x, 1, refs, all)?,
-            &mlx_rs::ops::multiply(
-                &slice_axis(&v.as_dtype(Dtype::Float32)?, 1, refs, all)?,
-                Array::from_f32(delta),
-            )?,
+            &slice_axis(&v.as_dtype(Dtype::Float32)?, 1, refs, all)?,
         )?;
         if refs == 0 {
             return Ok(generated);
@@ -879,12 +907,24 @@ impl ImageDenoiser {
         cancel: &mlx_gen::CancelFlag,
         on_step: &mut dyn FnMut(usize),
     ) -> Result<Array> {
+        self.denoise_with(&H3ImageSampler::Euler, 0, noise_rows, cancel, on_step)
+    }
+
+    /// [`Self::denoise`] under `sampler` ([`Self::step_with`]); `image_seed` seeds its noise.
+    pub fn denoise_with(
+        &self,
+        sampler: &H3ImageSampler,
+        image_seed: u64,
+        noise_rows: &Array,
+        cancel: &mlx_gen::CancelFlag,
+        on_step: &mut dyn FnMut(usize),
+    ) -> Result<Array> {
         let mut x = noise_rows.as_dtype(Dtype::Float32)?;
         for step in 0..self.num_steps() {
             if cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
-            x = self.step(step, &x)?;
+            x = self.step_with(sampler, image_seed, step, &x)?;
             mlx_rs::transforms::eval([&x])?;
             on_step(step + 1);
         }

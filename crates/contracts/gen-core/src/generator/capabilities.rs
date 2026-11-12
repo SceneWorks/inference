@@ -180,6 +180,9 @@ pub struct Capabilities {
     /// Whether this model honours [`GenerationRequest::caption_overflow`] (epic sc-25678). `Default`
     /// is `false`; the shared floor refuses a `Some` policy otherwise.
     pub supports_caption_overflow_policy: bool,
+    /// Whether this model honours [`GenerationRequest::h3_image_sampler`] (SW-7106). `Default` is
+    /// `false`; the shared floor refuses a `Some` sampler block otherwise.
+    pub supports_h3_image_sampler: bool,
     /// The longest prompt, in the model's own text-encoder tokens, that this model conditions on
     /// (sc-24217). `None` (the `Default`) advertises no limit.
     ///
@@ -690,6 +693,11 @@ impl Capabilities {
         {
             return Err(Error::Unsupported(format!(
                 "{id}: MOSS controls require a MOSS-Image provider"
+            )));
+        }
+        if req.h3_image_sampler.is_some() && !self.supports_h3_image_sampler {
+            return Err(Error::Unsupported(format!(
+                "{id}: `h3_image_sampler` is supported only by MiniMax-H3-Image"
             )));
         }
         if req.veda.as_ref().is_some_and(|v| v.enabled) && id != "minimax_h3" {

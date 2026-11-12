@@ -87,6 +87,9 @@ mod h3_image_lora_real;
 #[path = "h3_image_real.rs"]
 mod h3_image_real;
 
+#[path = "h3_image_sampler_real.rs"]
+mod h3_image_sampler_real;
+
 #[path = "int8_gemm_parity.rs"]
 mod int8_gemm_parity;
 

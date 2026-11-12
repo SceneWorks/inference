@@ -135,7 +135,7 @@ fn h3_image_dit_names_match_the_published_index() {
     assert_eq!(published.len(), PUBLISHED_IMAGE_DIT_TENSORS);
     assert_eq!(declared, published, "declared vs published tensor names");
     assert!(!published.iter().any(|n| n.contains("audio")));
-    println!("MODEL_INFERENCE_BODY_COMPLETED h3_image_real::h3_image_dit_names_match_the_published_index");
+    println!("\nMODEL_INFERENCE_BODY_COMPLETED h3_image_real::h3_image_dit_names_match_the_published_index");
 }
 
 /// AC1 / AC2: the MLX DiT's step-0 and step-3 velocities against diffusers'

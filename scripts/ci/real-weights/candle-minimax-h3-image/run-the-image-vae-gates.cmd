@@ -1,6 +1,9 @@
 rem SW-7089 - MiniMax-H3-Image 2-D VAE decoder on real weights (candle/CUDA). Materializes only
 rem vae_diffusers/ of the pinned snapshot under CANDLE_GEN_MODELS_ROOT, then runs both gates against
 rem the reference the macOS job produced with the hash-pinned producer (downloaded artifact).
+rem Each gate is built with the registered cuda,model-inference-proof features and run with
+rem MODEL_INFERENCE_CASE_FQN set; verify_model_inference_log.py then applies the proof runner's own
+rem check - one passing summary, one BODY marker and the candle-cuda device set.
 set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
 set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 set "MINIMAX_H3_IMAGE_VAE_REFERENCE=%RUNNER_TEMP%\minimax-h3-image-vae-reference\reference.safetensors"
@@ -25,7 +28,15 @@ exit /b 0
 
 :run_one
 set "log=%RUNNER_TEMP%\minimax-h3-image-%~1.log"
-cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration real_weights::%~1 -- --ignored --exact --nocapture > "%log%" 2>&1 || (type "%log%" & exit /b 1)
+set "MODEL_INFERENCE_CASE_FQN=real_weights::%~1"
+cargo test --locked -p candle-gen-minimax-h3 --features cuda,model-inference-proof --release --test integration real_weights::%~1 -- --ignored --exact --nocapture > "%log%" 2>&1
+set "H3I_STATUS=%ERRORLEVEL%"
+set "MODEL_INFERENCE_CASE_FQN="
 type "%log%"
-findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
+if not "%H3I_STATUS%"=="0" goto :run_one_failed
+"%REVIEWED_PYTHON%" -I scripts/ci/verify_model_inference_log.py --package candle-gen-minimax-h3 --backend candle-cuda --fqn real_weights::%~1 --log "%log%" || goto :run_one_failed
 exit /b 0
+
+:run_one_failed
+echo ::error::%~1 failed or lacks its registered proof evidence - exit %H3I_STATUS%
+exit /b 1

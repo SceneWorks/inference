@@ -22,6 +22,7 @@
 //! guidance-distilled — and step `i` projects through `pdd_proj_out.{i}`.
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::gen_core::h3_image::{sampler_step, H3ImageSampler, SamplerStep};
 use candle_gen::gen_core::{CancelFlag, Image};
 use candle_gen::seed::seeded_normal_vec;
 use candle_gen::{CandleError, Result};
@@ -33,6 +34,7 @@ use crate::denoise::{TEXT_TAG, VIDEO_TAG};
 use crate::dit::positions::{
     frame_grid, reference_block_position_ids, text_position_ids, ReferenceLatentGeometry,
 };
+use crate::image_sampler::CandleStepOps;
 use crate::pipeline::{patchify_video_latents, unpatchify_video_rows, PIXEL_MEAN, PIXEL_STD};
 
 /// The modality tag an image row carries — `gen_core::h3_image::IMAGE_TAG`, MiniMax-H3's video
@@ -366,7 +368,11 @@ pub trait ImageVelocity {
     fn forward(&mut self, step: usize, image_rows: &Tensor) -> Result<Tensor>;
 }
 
-/// **The six-step loop**: one forward per step, `x ← x + (σᵢ − σᵢ₊₁) · v` in float32.
+/// **The six-step loop**: one forward per step, then gen-core's shared
+/// [`sampler_step`] in float32 — under
+/// [`H3ImageSampler::Euler`] `x ← x + (σᵢ − σᵢ₊₁) · v`, under
+/// [`H3ImageSampler::Lcm`] (the request default) ComfyUI's re-noised LCM step with noise seeded from `image_seed`
+/// ([`crate::image_sampler`]). Both rungs (resident and streamed) run through this one loop.
 ///
 /// Cancellation is checked before every step and the device synchronized after it, so a cancel
 /// lands within one step and `on_step(completed)` reports work the GPU has actually done.
@@ -379,6 +385,8 @@ pub trait ImageVelocity {
 pub fn denoise_image(
     model: &mut dyn ImageVelocity,
     schedule: &SigmaSchedule,
+    sampler: &H3ImageSampler,
+    image_seed: u64,
     initial_rows: &Tensor,
     num_reference_rows: usize,
     device: &Device,
@@ -398,11 +406,14 @@ pub fn denoise_image(
     let mut x = initial_rows
         .narrow(1, num_reference_rows, total - num_reference_rows)?
         .to_dtype(DType::F32)?;
-    for step in 0..schedule.num_evals() {
+    let num_steps = schedule.num_evals();
+    let mut ops = CandleStepOps { device };
+    for step in 0..num_steps {
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
-        let delta = schedule
+        // Checks the step against the grid, as the Euler coefficient always has.
+        schedule
             .velocity_delta(step)
             .map_err(|e| CandleError::Msg(e.to_string()))?;
         let packed = if num_reference_rows == 0 {
@@ -418,8 +429,23 @@ pub fn denoise_image(
                 packed.dims()
             )));
         }
-        let velocity = velocity.narrow(1, num_reference_rows, x.dims()[1])?;
-        x = (x + (velocity.to_dtype(DType::F32)? * f64::from(delta))?)?;
+        let velocity = velocity
+            .narrow(1, num_reference_rows, x.dims()[1])?
+            .to_dtype(DType::F32)?;
+        let sigmas = schedule.sigmas();
+        x = sampler_step(
+            &mut ops,
+            sampler,
+            SamplerStep {
+                step,
+                num_steps,
+                sigma: sigmas[step],
+                sigma_next: sigmas[step + 1],
+                image_seed,
+            },
+            &x,
+            &velocity,
+        )?;
         device.synchronize()?;
         on_step(step + 1);
     }
@@ -572,6 +598,8 @@ mod tests {
         let out = denoise_image(
             &mut model,
             &schedule,
+            &H3ImageSampler::Euler,
+            0,
             &x0,
             0,
             &d,
@@ -588,7 +616,17 @@ mod tests {
         cancel.cancel();
         let mut model = Recorder { steps: Vec::new() };
         assert!(matches!(
-            denoise_image(&mut model, &schedule, &x0, 0, &d, &cancel, &mut |_| {}),
+            denoise_image(
+                &mut model,
+                &schedule,
+                &H3ImageSampler::Euler,
+                0,
+                &x0,
+                0,
+                &d,
+                &cancel,
+                &mut |_| {}
+            ),
             Err(CandleError::Canceled)
         ));
         assert!(model.steps.is_empty());
@@ -651,6 +689,72 @@ mod tests {
         );
     }
 
+    /// Records the reference rows every step was evaluated with, and returns a unit velocity.
+    struct RefRecorder {
+        refs: usize,
+        seen: Vec<Vec<f32>>,
+    }
+
+    impl ImageVelocity for RefRecorder {
+        fn forward(&mut self, _step: usize, rows: &Tensor) -> Result<Tensor> {
+            self.seen.push(
+                rows.narrow(1, 0, self.refs)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+            );
+            Ok(Tensor::ones_like(rows)?)
+        }
+    }
+
+    /// SW-7106: under LCM the reference rows still ride through every step unchanged, the run is
+    /// a pure function of the image seed, and it differs from Euler and from another seed.
+    #[test]
+    fn the_lcm_loop_holds_reference_rows_and_is_seeded() {
+        let d = Device::Cpu;
+        let schedule = SigmaSchedule::h3_image_distilled().unwrap();
+        let x0 = Tensor::arange(0f32, 5.0 * 96.0, &d)
+            .unwrap()
+            .reshape((1, 5, 96))
+            .unwrap();
+        let lcm = H3ImageSampler::Lcm {
+            s_noise: 1.1,
+            s_noise_end: 0.9,
+            noise_clip_std: 0.0,
+        };
+        let run = |sampler: &H3ImageSampler, seed: u64| {
+            let mut model = RefRecorder {
+                refs: 3,
+                seen: Vec::new(),
+            };
+            let out = denoise_image(
+                &mut model,
+                &schedule,
+                sampler,
+                seed,
+                &x0,
+                3,
+                &d,
+                &CancelFlag::default(),
+                &mut |_| {},
+            )
+            .unwrap();
+            let want = x0.narrow(1, 0, 3).unwrap().flatten_all().unwrap();
+            let want = want.to_vec1::<f32>().unwrap();
+            assert_eq!(model.seen.len(), 6);
+            assert!(
+                model.seen.iter().all(|r| *r == want),
+                "reference rows moved"
+            );
+            assert_eq!(out.dims(), &[1, 2, 96]);
+            out.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+        let a = run(&lcm, 11);
+        assert!(a.iter().all(|v| v.is_finite()));
+        assert_eq!(a, run(&lcm, 11));
+        assert_ne!(a, run(&lcm, 12));
+        assert_ne!(a, run(&H3ImageSampler::Euler, 11));
+    }
+
     /// The reference rows ride through the loop unchanged and only the generated rows are returned.
     #[test]
     fn the_loop_holds_reference_rows_and_returns_generated_rows() {
@@ -661,6 +765,8 @@ mod tests {
         let out = denoise_image(
             &mut model,
             &schedule,
+            &H3ImageSampler::Euler,
+            0,
             &x0,
             3,
             &d,
@@ -674,6 +780,8 @@ mod tests {
         assert!(denoise_image(
             &mut model,
             &schedule,
+            &H3ImageSampler::Euler,
+            0,
             &x0,
             5,
             &d,
