@@ -61636,6 +61636,60 @@
     "package": "candle-gen-minimax-h3",
     "target": "candle_gen_minimax_h3",
     "target_kind": "lib",
+    "fqn": "dit::model::veda_controls_tests::three_layouts_install_on_every_tier_with_their_own_scales",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs",
+    "cargo_target_metadata": {
+      "name": "candle_gen_minimax_h3",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": "candle-cpu",
+    "expected_devices": [
+      "candle-cpu"
+    ],
+    "cargo_features": [
+      "model-inference-proof"
+    ],
+    "fixture_identity": "Committed converted H3 video/audio/DiT/LoRA goldens or deterministic synthetic learned modules, CPU helpers; crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::three_layouts_install_on_every_tier_with_their_own_scales",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::three_layouts_install_on_every_tier_with_their_own_scales",
+    "required_environment": [],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": "fixed_cpu",
+    "configurations": {
+      "fixed_cpu": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::three_layouts_install_on_every_tier_with_their_own_scales/fixed_cpu",
+        "environment": {},
+        "cargo_features": [
+          "model-inference-proof"
+        ],
+        "backend": "candle-cpu",
+        "expected_devices": [
+          "candle-cpu"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "source-defined",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs::dit::model::veda_controls_tests::three_layouts_install_on_every_tier_with_their_own_scales",
+      "requirements": []
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "candle_gen_minimax_h3",
+    "target_kind": "lib",
     "fqn": "dit::model::veda_controls_tests::native_base_and_all_published_turbo_steps_reach_attention",
     "source": "crates/media/candle-gen/candle-gen-minimax-h3/src/dit/model.rs",
     "cargo_target_metadata": {
@@ -312855,6 +312909,71 @@
     "input_contract": {
       "fixture_kind": "external",
       "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_adaln_and_output_head_loras_reach_the_denoiser_cuda",
+      "requirements": [
+        {
+          "slot": "h3-image-dit-weights",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::Weights::from_files"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-minimax-h3",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "h3_image_lora_real::h3_image_streamed_blocks_carry_the_lora_like_resident_ones_cuda",
+    "source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Real MiniMax-H3-Image transformer_diffusers/ bf16 (first three blocks) loaded resident on CUDA and on the host streamed through rung 4's one-block window, plus seeded synthetic PEFT and kohya LoRAs (SW-7096); crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_streamed_blocks_carry_the_lora_like_resident_ones_cuda",
+    "configuration_source": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_streamed_blocks_carry_the_lora_like_resident_ones_cuda",
+    "required_environment": [
+      "MINIMAX_H3_IMAGE_SNAPSHOT"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_streamed_blocks_carry_the_lora_like_resident_ones_cuda/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-minimax-h3/tests/h3_image_lora_real.rs::h3_image_lora_real::h3_image_streamed_blocks_carry_the_lora_like_resident_ones_cuda",
       "requirements": [
         {
           "slot": "h3-image-dit-weights",

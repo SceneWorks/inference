@@ -1889,6 +1889,190 @@ mod tests {
         );
     }
 
+    /// Block 0's `to_q` / `to_k` / `to_v` as resident [`AdaptableLinear`]s at one tier: dense, or
+    /// packed through the shared affine quantizer at `bits`.
+    struct TierHost([mlx_gen::adapters::AdaptableLinear; 3]);
+
+    impl AdaptableHost for TierHost {
+        fn adaptable_mut(
+            &mut self,
+            path: &[&str],
+        ) -> Option<&mut mlx_gen::adapters::AdaptableLinear> {
+            let leaf = match path {
+                ["transformer_blocks", "0", "attn", leaf] => *leaf,
+                _ => return None,
+            };
+            let i = ["to_q", "to_k", "to_v"].iter().position(|l| *l == leaf)?;
+            Some(&mut self.0[i])
+        }
+    }
+
+    impl MiniMaxH3AdapterHost for TierHost {
+        fn adapter_surface(&self) -> AdaLnSurface {
+            AdaLnSurface::FullTimestepMlp
+        }
+    }
+
+    /// SW-7096 AC1 at every tier: the diffusers/PEFT, kohya `lora_unet_` and ComfyUI (fused
+    /// `qkv_proj`) spellings of one `to_q` factor pair install through the production installer
+    /// onto a dense, a q8 and a q4 resident `to_q`, fold to the same `a · b`, and stacked together
+    /// keep their own scales in file order. The residuals are read back as installed.
+    #[test]
+    fn three_layouts_install_on_every_tier_with_their_own_scales() {
+        let dir = tempfile::tempdir().unwrap();
+        let (width, r) = (64, 2);
+        let host = |bits: Option<i32>| {
+            TierHost(std::array::from_fn(|i| {
+                let mut lin = mlx_gen::adapters::AdaptableLinear::dense(
+                    seeded(&[width, width], 500 + i as u32),
+                    None,
+                );
+                if let Some(bits) = bits {
+                    lin.quantize(bits, Some(64)).unwrap();
+                }
+                lin
+            }))
+        };
+        let qkv: Vec<(Array, Array)> = (0..3u32)
+            .map(|i| (seeded(&[r, width], 10 * i), seeded(&[width, r], 10 * i + 1)))
+            .collect();
+        let (down, up) = qkv[0].clone();
+        let rank = r.to_string();
+        let peft = save(
+            dir.path(),
+            "peft.safetensors",
+            &[
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_A.weight",
+                    down.clone(),
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_B.weight",
+                    up.clone(),
+                ),
+            ],
+            &[("alpha", &rank)],
+        );
+        let kohya = save(
+            dir.path(),
+            "kohya.safetensors",
+            &[
+                (
+                    "lora_unet_transformer_blocks_0_attn_to_q.lora_down.weight",
+                    down,
+                ),
+                (
+                    "lora_unet_transformer_blocks_0_attn_to_q.lora_up.weight",
+                    up,
+                ),
+                (
+                    "lora_unet_transformer_blocks_0_attn_to_q.alpha",
+                    Array::from_slice(&[r as f32], &[1]),
+                ),
+            ],
+            &[("ss_network_module", "networks.lora")],
+        );
+        // ComfyUI's fused projection: concatenated downs, a block-diagonal up, alpha x 3.
+        let fused_down = concatenate_axis(&[&qkv[0].0, &qkv[1].0, &qkv[2].0], 0).unwrap();
+        let zero = Array::zeros::<f32>(&[width, r]).unwrap();
+        let rows: Vec<Array> = (0..3)
+            .map(|i| {
+                let parts: Vec<&Array> = (0..3)
+                    .map(|j| if i == j { &qkv[i].1 } else { &zero })
+                    .collect();
+                concatenate_axis(&parts, 1).unwrap()
+            })
+            .collect();
+        let fused_up = concatenate_axis(&rows.iter().collect::<Vec<_>>(), 0).unwrap();
+        let comfy = save(
+            dir.path(),
+            "comfyui.safetensors",
+            &[
+                (
+                    "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight",
+                    fused_down,
+                ),
+                (
+                    "diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight",
+                    fused_up,
+                ),
+                (
+                    "diffusion_model.blocks.0.attn.qkv_proj.alpha",
+                    Array::from_slice(&[3.0 * r as f32], &[1]),
+                ),
+            ],
+            &[],
+        );
+        let installed = |host: &mut TierHost, leaf: &str| -> Vec<(f32, Array)> {
+            host.adaptable_mut(&["transformer_blocks", "0", "attn", leaf])
+                .unwrap()
+                .adapters()
+                .iter()
+                .map(|a| match a {
+                    Adapter::Lora { a, b, scale } => (
+                        *scale,
+                        a.as_dtype(Dtype::Float32)
+                            .unwrap()
+                            .matmul(b.as_dtype(Dtype::Float32).unwrap())
+                            .unwrap(),
+                    ),
+                    _ => panic!("{leaf}: expected a LoRA residual"),
+                })
+                .collect()
+        };
+        for bits in [None, Some(8), Some(4)] {
+            let mut folds = Vec::new();
+            for file in [&peft, &kohya, &comfy] {
+                let mut h = host(bits);
+                assert_eq!(
+                    h.adaptable_mut(&["transformer_blocks", "0", "attn", "to_q"])
+                        .unwrap()
+                        .quantized_params()
+                        .is_some(),
+                    bits.is_some()
+                );
+                apply_minimax_h3_adapters(&mut h, std::slice::from_ref(file))
+                    .unwrap_or_else(|e| panic!("{bits:?} {}: {e}", file.path.display()));
+                let mut got = installed(&mut h, "to_q");
+                assert_eq!(got.len(), 1, "{bits:?} {}", file.path.display());
+                folds.push(got.remove(0).1);
+            }
+            let peak = mlx_gen::testing::max_abs(&folds[0]);
+            assert!(peak > 0.0);
+            for (name, fold) in [("kohya", &folds[1]), ("comfyui", &folds[2])] {
+                let diff = mlx_gen::testing::max_abs_diff_f32(fold, &folds[0]);
+                assert!(
+                    diff <= 1e-2 * peak,
+                    "{bits:?}: {name} folds unlike PEFT ({diff} of {peak})"
+                );
+            }
+
+            let mut h = host(bits);
+            let scales = [0.25f32, 0.5, 1.5];
+            let specs: Vec<AdapterSpec> = [&peft, &kohya, &comfy]
+                .into_iter()
+                .zip(scales)
+                .map(|(file, scale)| AdapterSpec {
+                    scale,
+                    ..file.clone()
+                })
+                .collect();
+            apply_minimax_h3_adapters(&mut h, &specs).unwrap();
+            let stacked = installed(&mut h, "to_q");
+            assert_eq!(
+                stacked.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+                scales,
+                "{bits:?}: every file at its own scale, in order"
+            );
+            for (_, fold) in &stacked {
+                assert!(mlx_gen::testing::max_abs_diff_f32(fold, &folds[0]) <= 1e-2 * peak);
+            }
+            // Only the fused file reaches to_k, at its own scale.
+            let to_k: Vec<f32> = installed(&mut h, "to_k").iter().map(|(s, _)| *s).collect();
+            assert_eq!(to_k, vec![1.5], "{bits:?}");
+        }
+    }
+
     /// SW-7096: every block-leaf key the MLX real-weight LoRA gate writes names an image-DiT
     /// module — PEFT through the prefix strip, kohya through the shared rewrite (native spellings
     /// then through the ComfyUI conversion) — so the gate's adapters cannot miss silently.

@@ -968,4 +968,69 @@ mod tests {
         assert!(validate_decode_geometry(512, 64).is_err());
         assert!(validate_decode_geometry(256, 0).is_err());
     }
+
+    /// SW-7096 AC2: configured adapters keep rung 4 Implemented on a deferred image load. The
+    /// block stream re-applies every installed residual to each rebuilt block, so the declaration
+    /// is the same with and without a LoRA, and the factors are charged as the overlay.
+    #[test]
+    fn rung_4_stays_implemented_with_adapters_configured() {
+        use mlx_gen::gen_core::{AdapterKind, AdapterSpec};
+        let root = tempfile::tempdir().unwrap();
+        // Every adapter target as a header-only 8x8 linear: the profile resolves the whole
+        // selected surface, not only the file's own targets.
+        let cfg = crate::dit::config::MiniMaxH3ImageDitConfig::default();
+        let leaves: Vec<(String, &[usize])> =
+            crate::h3_image::dit::image_adapter_target_paths(&cfg)
+                .into_iter()
+                .map(|path| (format!("{path}.weight"), &[8, 8][..]))
+                .collect();
+        let dit: Vec<(&str, &str, &[usize])> = leaves
+            .iter()
+            .map(|(name, shape)| (name.as_str(), "BF16", *shape))
+            .collect();
+        write_safetensors(
+            &root
+                .path()
+                .join(IMAGE_DIT_COMPONENT)
+                .join("model.safetensors"),
+            &dit,
+        );
+        write_safetensors(
+            &root
+                .path()
+                .join(IMAGE_VAE_COMPONENT)
+                .join("model.safetensors"),
+            &[("decoder.proj_in.weight", "BF16", &[4, 8])],
+        );
+        let lora = root.path().join("style.safetensors");
+        write_safetensors(
+            &lora,
+            &[
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_A.weight",
+                    "BF16",
+                    &[2, 8],
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_B.weight",
+                    "BF16",
+                    &[8, 2],
+                ),
+            ],
+        );
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()));
+        spec.load_shape = LoadShape::DeferredMaterialization;
+        let spec = spec.with_adapters(vec![AdapterSpec::new(lora, 0.75, AdapterKind::Lora)]);
+        let c = contract_for(&spec).unwrap();
+        let rung4 = c
+            .capability(MemoryStrategy::BoundedTransformerResidency)
+            .unwrap();
+        assert_eq!(rung4.support, MemoryStrategySupport::Implemented);
+        assert_eq!(
+            rung4.parameters.transformer_window_components,
+            vec![TransformerComponent::Both]
+        );
+        assert!(c.lifecycle.transformer_window_materialization);
+        assert!(c.asset_facts.overlay_bytes > 0, "{:?}", c.asset_facts);
+    }
 }

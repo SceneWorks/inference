@@ -1224,6 +1224,55 @@ mod tests {
         assert!(narrow.phases[1].device_bytes < wide.phases[1].device_bytes);
     }
 
+    /// SW-7095 AC1: rung 3 is declared Implemented and priced at image geometry — the 16 MP
+    /// canvas (16,384 image rows, a 20,480-row text-to-image sequence) with sixteen 2048²
+    /// references — at its smallest declared chunk. That chunk is the materializing budget the
+    /// vision tower and the text encoder are priced at, so rung 3 lowers both phases below rung 2's
+    /// default-budget estimate, while the denoise phase prices the edit's whole sequence.
+    #[test]
+    fn rung_3_is_priced_at_16_mp_with_sixteen_references() {
+        let c = contract(LoadShape::DeferredMaterialization);
+        let declared = c.capability(MemoryStrategy::BoundedAttention).unwrap();
+        assert_eq!(
+            declared.support,
+            gen_core::MemoryStrategySupport::Implemented
+        );
+        let chunk = super::super::IMAGE_ATTENTION_CHUNK_SIZES[0];
+        assert_eq!(declared.parameters.attention_chunk_sizes[0], chunk);
+        let rung3 = selection(&c, MemoryStrategy::BoundedAttention);
+        assert_eq!(rung3.parameters.attention_chunk_size, Some(chunk));
+        assert_eq!(score_budget(true, Some(chunk)), u64::from(chunk));
+        assert!(u64::from(chunk) < gen_core::veda::workspace::CUDA_DENSE_SCORE_ELEMENTS);
+
+        assert_eq!(ImageRequestRows::of(&t2i_16mp()).sequence_rows(), 20_480);
+        let edit = ImageRequestShape::with_reference_count(4096, 4096, 16);
+        let rows = ImageRequestRows::of(&edit);
+        assert_eq!(rows.image_rows, 16_384);
+        assert_eq!(rows.reference_rows, vec![4096; 16]);
+
+        let facts = shipped_scale_facts(0);
+        let at = |shape: &ImageRequestShape, strategy| {
+            estimate(&c, &facts, shape, &selection(&c, strategy)).unwrap()
+        };
+        let phase = |e: &ImageMemoryEstimate, p: ImagePhase| {
+            e.phases.iter().find(|x| x.phase == p).unwrap().device_bytes
+        };
+        let rung2 = at(&edit, MemoryStrategy::BoundedDecode);
+        let priced = at(&edit, MemoryStrategy::BoundedAttention);
+        assert_eq!(priced.phases.len(), 5, "{priced}");
+        assert!(!priced.streamed);
+        for p in [ImagePhase::VisionTower, ImagePhase::Conditioning] {
+            assert!(
+                phase(&priced, p) < phase(&rung2, p),
+                "{p:?}: {priced} vs {rung2}"
+            );
+        }
+        assert!(priced.peak_device_bytes() <= rung2.peak_device_bytes());
+        // The denoise phase carries the references' rows: the edit outprices the bare canvas.
+        let t2i = at(&t2i_16mp(), MemoryStrategy::BoundedAttention);
+        assert!(phase(&priced, ImagePhase::Denoise) > phase(&t2i, ImagePhase::Denoise));
+    }
+
     /// Decimal GB and binary GiB are distinct, named conversions.
     #[test]
     fn unit_conversions_are_explicit() {

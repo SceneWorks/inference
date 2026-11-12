@@ -82,7 +82,9 @@ pub struct MiniMaxH3Dit {
 impl MiniMaxH3Dit {
     /// Move only shared/root modules after the host stack and its residuals are prepared.
     /// Block bases are already in runtime format: window execution transfers bytes, never repacks.
-    pub(crate) fn prepare_streamed(&mut self, device: &Device, window: usize) -> Result<()> {
+    /// Rung 4's DiT step: the generator calls it inside a [`crate::StreamedRequestScope`] on a
+    /// host-loaded DiT with its adapters installed.
+    pub fn prepare_streamed(&mut self, device: &Device, window: usize) -> Result<()> {
         let _ = candle_gen::block_window::BlockPlan::new(self.blocks.len(), window)?;
         self.projections = self.projections.copy_to_device(device)?;
         self.refiner = self.refiner.copy_to_device(device)?;
@@ -1789,6 +1791,200 @@ mod veda_controls_tests {
         }
         Weights::from_map(map)
     }
+
+    /// SW-7096 AC1 at every tier: the diffusers/PEFT, kohya `lora_unet_` and ComfyUI (fused
+    /// `qkv_proj`) spellings of one `to_q` factor pair install through the production installer
+    /// onto a dense, a q8 and a q4 `to_q`, fold to the same `[in, out]` delta, and stacked together
+    /// keep their own scales in file order. Nothing is executed: the residuals are read back as
+    /// installed, so this holds without a forward.
+    #[test]
+    #[ignore = "constructs complete synthetic DiTs to install adapters; dispatched only by the manual H3 native suite"]
+    fn three_layouts_install_on_every_tier_with_their_own_scales() {
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        let dir = tempfile::tempdir().unwrap();
+        let (inner, hidden, rank) = (96usize, 64usize, 2usize);
+        let seeded = |shape: &[usize], seed: u32| {
+            let n: usize = shape.iter().product();
+            let values: Vec<f32> = (0..n as u32)
+                .map(|i| ((i.wrapping_mul(2_654_435_761) ^ seed) % 997) as f32 / 997.0 - 0.5)
+                .collect();
+            Tensor::from_vec(values, shape, &Device::Cpu).unwrap()
+        };
+        let write = |name: &str, tensors: Vec<(String, Tensor)>, meta: &[(&str, &str)]| {
+            let bytes: Vec<(String, Vec<usize>, Vec<u8>)> = tensors
+                .iter()
+                .map(|(k, t)| {
+                    let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    (
+                        k.clone(),
+                        t.dims().to_vec(),
+                        v.into_iter().flat_map(f32::to_le_bytes).collect(),
+                    )
+                })
+                .collect();
+            let views: Vec<(String, safetensors::tensor::TensorView)> = bytes
+                .iter()
+                .map(|(k, shape, raw)| {
+                    let view = safetensors::tensor::TensorView::new(
+                        safetensors::Dtype::F32,
+                        shape.clone(),
+                        raw,
+                    )
+                    .unwrap();
+                    (k.clone(), view)
+                })
+                .collect();
+            let meta: std::collections::HashMap<String, String> = meta
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            let path = dir.path().join(name);
+            safetensors::serialize_to_file(views, &Some(meta), &path).unwrap();
+            path
+        };
+        let scalar = |v: f32| Tensor::new(&[v], &Device::Cpu).unwrap();
+        let qkv: Vec<(Tensor, Tensor)> = (0..3)
+            .map(|i| {
+                (
+                    seeded(&[rank, hidden], 10 * i),
+                    seeded(&[inner, rank], 10 * i + 1),
+                )
+            })
+            .collect();
+        let (down, up) = qkv[0].clone();
+        let r = rank.to_string();
+        let peft = write(
+            "peft.safetensors",
+            vec![
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_A.weight".into(),
+                    down.clone(),
+                ),
+                (
+                    "transformer.transformer_blocks.0.attn.to_q.lora_B.weight".into(),
+                    up.clone(),
+                ),
+            ],
+            &[("alpha", &r)],
+        );
+        let stem = "lora_unet_transformer_blocks_0_attn_to_q";
+        let kohya = write(
+            "kohya.safetensors",
+            vec![
+                (format!("{stem}.lora_down.weight"), down),
+                (format!("{stem}.lora_up.weight"), up),
+                (format!("{stem}.alpha"), scalar(rank as f32)),
+            ],
+            &[("ss_network_module", "networks.lora")],
+        );
+        // ComfyUI's fused projection: concatenated downs, a block-diagonal up, alpha x 3.
+        let fused_down = Tensor::cat(&[&qkv[0].0, &qkv[1].0, &qkv[2].0], 0).unwrap();
+        let zero = Tensor::zeros((inner, rank), DType::F32, &Device::Cpu).unwrap();
+        let rows: Vec<Tensor> = (0..3)
+            .map(|i| {
+                let parts: Vec<&Tensor> = (0..3)
+                    .map(|j| if i == j { &qkv[i].1 } else { &zero })
+                    .collect();
+                Tensor::cat(&parts, 1).unwrap()
+            })
+            .collect();
+        let fused_up = Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0).unwrap();
+        let comfy = write(
+            "comfyui.safetensors",
+            vec![
+                (
+                    "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight".into(),
+                    fused_down,
+                ),
+                (
+                    "diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight".into(),
+                    fused_up,
+                ),
+                (
+                    "diffusion_model.blocks.0.attn.qkv_proj.alpha".into(),
+                    scalar(3.0 * rank as f32),
+                ),
+            ],
+            &[],
+        );
+        let spec = |path: &std::path::PathBuf, scale: f32| {
+            AdapterSpec::new(path.clone(), scale, AdapterKind::Lora)
+        };
+        let to_q = ["transformer_blocks", "0", "attn", "to_q"];
+        let installed = |dit: &mut MiniMaxH3Dit, path: &[&str]| -> Vec<(f64, Vec<f32>)> {
+            dit.adaptable_mut(path)
+                .unwrap()
+                .adapters()
+                .iter()
+                .map(|r| {
+                    let d = __model_proof_output!(r.delta())
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap();
+                    (r.scale(), d.to_vec1::<f32>().unwrap())
+                })
+                .collect()
+        };
+        let max_diff = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+        for bits in [None, Some(8), Some(4)] {
+            let fresh = || {
+                let w = weights_on(bits, &Device::Cpu);
+                MiniMaxH3Dit::from_weights(&w, &config(), &Device::Cpu, DType::F32).unwrap()
+            };
+            let mut folds = Vec::new();
+            for path in [&peft, &kohya, &comfy] {
+                let mut dit = fresh();
+                assert_eq!(
+                    dit.adaptable_mut(&to_q).unwrap().is_packed(),
+                    bits.is_some()
+                );
+                crate::adapters::apply_minimax_h3_adapters(&mut dit, &[spec(path, 1.0)])
+                    .unwrap_or_else(|e| panic!("{bits:?} {}: {e}", path.display()));
+                let mut got = installed(&mut dit, &to_q);
+                assert_eq!(got.len(), 1, "{bits:?} {}", path.display());
+                folds.push(got.remove(0).1);
+            }
+            let peak = folds[0].iter().fold(0f32, |m, v| m.max(v.abs()));
+            assert!(peak > 0.0);
+            for (name, fold) in [("kohya", &folds[1]), ("comfyui", &folds[2])] {
+                assert!(
+                    max_diff(fold, &folds[0]) <= 1e-6 * peak,
+                    "{bits:?}: {name} folds unlike PEFT"
+                );
+            }
+
+            let mut dit = fresh();
+            let scales = [0.25f32, 0.5, 1.5];
+            let specs: Vec<AdapterSpec> = [&peft, &kohya, &comfy]
+                .into_iter()
+                .zip(scales)
+                .map(|(path, scale)| spec(path, scale))
+                .collect();
+            crate::adapters::apply_minimax_h3_adapters(&mut dit, &specs).unwrap();
+            let stacked = installed(&mut dit, &to_q);
+            let want: Vec<f64> = scales.iter().map(|&s| f64::from(s)).collect();
+            assert_eq!(
+                stacked.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+                want,
+                "{bits:?}: every file at its own scale, in order"
+            );
+            for (_, fold) in &stacked {
+                assert!(max_diff(fold, &folds[0]) <= 1e-6 * peak, "{bits:?}");
+            }
+            // Only the fused file reaches to_k, at its own scale.
+            let to_k = installed(&mut dit, &["transformer_blocks", "0", "attn", "to_k"]);
+            assert_eq!(to_k.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![1.5]);
+        }
+
+        #[cfg(feature = "model-inference-proof")]
+        println!("\nMODEL_INFERENCE_BODY_COMPLETED dit::model::veda_controls_tests::three_layouts_install_on_every_tier_with_their_own_scales");
+    }
+
     fn layout_on(mode: usize, channels: usize, dev: &Device) -> PackedLayout {
         let geometry = JointGeometry::new(5, 2, 2).unwrap();
         let anchors = match mode {
