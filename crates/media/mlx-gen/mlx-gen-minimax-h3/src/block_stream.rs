@@ -95,7 +95,12 @@ pub struct DitBlockStream {
     /// The configured adapters' residuals for the streamed blocks, re-applied to each block as a
     /// window rebuilds it. Empty on an un-adapted render.
     adapters: StreamedBlockAdapters,
+    /// The staged directory's tensor headers (names, dtypes, shapes — no data), read on the first
+    /// adapter probe: what [`AdaptableHost::adaptable_facts`] answers a leaf's packed status from.
+    headers: std::sync::OnceLock<std::sync::Arc<StagedHeaders>>,
 }
+
+type StagedHeaders = BTreeMap<String, mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>;
 
 /// The adapter residuals of a streamed block stack, keyed by `(block, leaf)` (SW-7096).
 ///
@@ -154,6 +159,31 @@ impl AdaptableHost for DitBlockStream {
             _ => None,
         }
     }
+
+    /// The probe answers from the **staged** projection, not from the slot's shape-only dense
+    /// base: a Q4/Q8 tier's leaf reports `is_quantized`, so the shared LyCORIS install keeps a
+    /// LoKr's structured Kronecker factors exactly as on the resident packed block (and as
+    /// admission prices it) instead of building a full `[out, in]` delta per streamed leaf.
+    fn adaptable_facts(&mut self, path: &[&str]) -> Option<mlx_gen::adapters::LinearFacts> {
+        let ["transformer_blocks", i, rest @ ..] = path else {
+            return None;
+        };
+        let index: usize = i.parse().ok()?;
+        let (name, _) = block_leaf_shape(&self.cfg, &rest.join("."))?;
+        let headers = self.staged_headers().ok()?;
+        let staged = mlx_gen::adapters::facts::linear_header_facts(
+            &headers,
+            &format!("transformer_blocks.{index}.{name}"),
+            crate::quant::GROUP_SIZE,
+            None,
+        )
+        .ok()?;
+        let slot = mlx_gen::adapters::LinearFacts::of(self.adapter_slot_mut(index, rest)?);
+        (staged.base_shape == slot.base_shape).then_some(mlx_gen::adapters::LinearFacts {
+            is_quantized: staged.is_quantized,
+            ..slot
+        })
+    }
 }
 
 /// The AdaLN projection's leaf path inside a block.
@@ -198,6 +228,7 @@ impl DitBlockStream {
             dtype,
             cfg,
             adapters: StreamedBlockAdapters::default(),
+            headers: std::sync::OnceLock::new(),
         })
     }
 
@@ -220,6 +251,27 @@ impl DitBlockStream {
                 Some(slot.insert(AdaptableLinear::dense(base, None)))
             }
         }
+    }
+
+    /// The staged directory's tensor headers, read once.
+    fn staged_headers(&self) -> Result<std::sync::Arc<StagedHeaders>> {
+        if let Some(headers) = self.headers.get() {
+            return Ok(headers.clone());
+        }
+        let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&self.dir)
+            .map_err(|error| {
+                Error::Msg(format!(
+                    "minimax-h3 block stream: reading {} headers: {error}",
+                    self.dir.display()
+                ))
+            })?
+            .into_iter()
+            .map(|h| (h.name.clone(), h))
+            .collect();
+        Ok(self
+            .headers
+            .get_or_init(|| std::sync::Arc::new(headers))
+            .clone())
     }
 
     /// The adapter residuals this stream re-applies to every rebuilt block.
@@ -431,6 +483,55 @@ mod tests {
 
     /// SW-7096: the stream is an adapter host over exactly the six adaptable leaves of each of its
     /// blocks, at each leaf's logical shape; everything else is unmatched, as on a resident block.
+    /// SW-7096: the stream's probe reports each leaf's **staged** packed status, read off the
+    /// headers, so a LoKr install over a Q4/Q8 stream keeps structured factors as on the resident
+    /// packed block. A dense leaf stays dense; a leaf whose headers are absent is no target.
+    #[test]
+    fn stream_adapter_probe_reports_the_staged_packed_status() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let tensors: &[(&str, &str, &[usize])] = &[
+            ("transformer_blocks.0.attn.to_q.weight", "BF16", &[128, 128]),
+            ("transformer_blocks.1.attn.to_q.weight", "U32", &[128, 16]),
+            ("transformer_blocks.1.attn.to_q.scales", "BF16", &[128, 2]),
+            ("transformer_blocks.1.attn.to_q.biases", "BF16", &[128, 2]),
+        ];
+        let mut header = serde_json::Map::new();
+        let mut offset = 0_usize;
+        for (name, dtype, shape) in tensors {
+            let len = shape.iter().product::<usize>() * if *dtype == "U32" { 4 } else { 2 };
+            header.insert(
+                (*name).into(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + len]}),
+            );
+            offset += len;
+        }
+        let json = serde_json::Value::Object(header).to_string().into_bytes();
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(json);
+        bytes.resize(bytes.len() + offset, 0);
+        std::fs::write(dir.path().join("model.safetensors"), bytes).unwrap();
+        let cfg = MiniMaxH3DitConfig {
+            num_attention_heads: 1,
+            attention_head_dim: 128,
+            hidden_size: 128,
+            num_layers: 3,
+            ..MiniMaxH3DitConfig::default()
+        };
+        let mut stream = DitBlockStream::new(dir.path(), Dtype::Bfloat16, cfg).unwrap();
+        let facts = |stream: &mut DitBlockStream, block: &str| {
+            stream.adaptable_facts(&["transformer_blocks", block, "attn", "to_q"])
+        };
+        let dense = facts(&mut stream, "0").expect("dense leaf");
+        assert!(!dense.is_quantized);
+        assert_eq!(dense.base_shape, vec![128, 128]);
+        let packed = facts(&mut stream, "1").expect("packed leaf");
+        assert!(packed.is_quantized, "the staged q4 leaf is packed");
+        assert_eq!(packed.base_shape, vec![128, 128]);
+        assert!(facts(&mut stream, "2").is_none(), "no staged header");
+        assert!(stream.adapters().is_empty(), "probing holds no residual");
+    }
+
     #[test]
     fn stream_adapter_slots_cover_exactly_the_block_leaves() {
         let dir = tempfile::tempdir().expect("temp dir");

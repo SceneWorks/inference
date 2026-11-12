@@ -396,17 +396,35 @@ impl Golden {
         &self.data[self.data_start + e.start..self.data_start + e.end]
     }
 
-    /// The f32 values of `key`, in logical (row-major) order.
+    /// The f32 values of `key`, in logical (row-major) order. A `BF16` tensor (the SW-7092 edit
+    /// reference's bf16-compute sweep) widens exactly: a bfloat16 is the top half of an f32.
     pub fn f32(&self, key: &str) -> Vec<f32> {
         let e = self
             .entries
             .get(key)
             .unwrap_or_else(|| panic!("missing tensor {key}"));
-        assert_eq!(e.dtype, "F32", "{key} is {}, not F32", e.dtype);
-        self.raw(key)
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().expect("4 bytes")))
-            .collect()
+        match e.dtype.as_str() {
+            "F32" => self
+                .raw(key)
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().expect("4 bytes")))
+                .collect(),
+            "BF16" => self
+                .raw(key)
+                .chunks_exact(2)
+                .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+                .collect(),
+            other => panic!("{key} is {other}, not F32 or BF16"),
+        }
+    }
+
+    /// The safetensors dtype string of `key` (`"F32"`, `"BF16"`, ...).
+    pub fn dtype(&self, key: &str) -> &str {
+        &self
+            .entries
+            .get(key)
+            .unwrap_or_else(|| panic!("missing tensor {key}"))
+            .dtype
     }
 
     /// `key` as a CPU f32 tensor.

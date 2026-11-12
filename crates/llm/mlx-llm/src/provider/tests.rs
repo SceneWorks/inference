@@ -361,6 +361,59 @@ fn qwen35_workspace_estimate_is_checked_and_keeps_ordinary_requests_available() 
 }
 
 #[test]
+fn schema_constraint_applies_after_reasoning_closes_and_survives_rewind() {
+    let schema = core_llm::JsonSchema::compile(&serde_json::json!({
+        "type": "object",
+        "properties": {"r": {"type": "string", "enum": ["1:1"]}},
+        "required": ["r"],
+        "additionalProperties": false
+    }))
+    .unwrap();
+    let constraint = core_llm::Constraint::JsonSchema(schema);
+    // ids: 0="plan" 1="</think>" 2="\n\n" 3="{\"r\":" 4="\"1:1\"" 5="}" 6=eos 7="{\"x\":"
+    // 8="</think>{\"r\":"
+    let table = core_llm::ConstraintDecodeTable {
+        pieces: vec![
+            "plan".into(),
+            "</think>".into(),
+            "\n\n".into(),
+            "{\"r\":".into(),
+            "\"1:1\"".into(),
+            "}".into(),
+            String::new(),
+            "{\"x\":".into(),
+            "</think>{\"r\":".into(),
+        ],
+        special: [6].into_iter().collect(),
+    };
+    let mut mask = JsonMask::for_constraint(&constraint, &table, [6], true);
+    let m = mask.allowed().to_vec();
+    assert!(m[0] && m[2] && m[7], "reasoning text is free");
+    assert!(
+        m[1] && m[8],
+        "the reasoning may close, alone or with a valid answer start"
+    );
+    assert!(!m[6], "EOS cannot end an open reasoning block");
+    mask.accept(0);
+    mask.accept(1);
+    let checkpoint = mask.checkpoint();
+    let m = mask.allowed().to_vec();
+    assert!(m[3], "the answer opens with the schema's first key");
+    assert!(!m[2], "no whitespace after </think>");
+    assert!(!m[7], "an undeclared key is masked");
+    mask.accept(3);
+    mask.accept(4);
+    mask.accept(5);
+    assert!(mask.allowed()[6], "stop once the document is complete");
+    mask.rewind(checkpoint);
+    let m = mask.allowed().to_vec();
+    assert!(
+        m[3] && !m[6] && !m[2],
+        "rewind restores the schema state, not plain JSON"
+    );
+}
+
+#[test]
 fn reasoning_boundary_commits_same_token_json_in_release_builds() {
     let table = core_llm::ConstraintDecodeTable {
         pieces: vec!["</think>{}".into(), String::new(), "{".into()],

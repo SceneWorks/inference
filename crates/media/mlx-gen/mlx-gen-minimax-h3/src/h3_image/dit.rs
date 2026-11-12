@@ -47,7 +47,7 @@ use crate::block_stream::{precompute_adaln_windowed, DitBlockStream};
 
 use crate::denoise::schedule::SigmaSchedule;
 use crate::dit::adaln::{AdaLnCache, AdaLnResidency, TimestepSchedule};
-use crate::dit::block::DitBlock;
+use crate::dit::block::{AdaLnModulation, DitBlock};
 use crate::dit::config::MiniMaxH3ImageDitConfig;
 use crate::dit::heads::{AdaLayerNormOut, ImageDitProjections, NormOutModulation};
 use crate::dit::model::UnverifiedSources;
@@ -674,6 +674,45 @@ impl ImageDenoiser {
     /// `norm_out`'s per-timestep `(shift, scale)` table.
     pub fn norm_out_modulation(&self) -> &NormOutModulation {
         &self.norm_out
+    }
+
+    /// Block `layer` alone at sampling step `step`, over a packed residual stream `hidden`
+    /// (`[1, seq_len, hidden_size]`, the stream dtype) — the diagnostic the real-weight edit gate
+    /// runs from the reference's own block input, to separate the block's compute from the error
+    /// it inherits (SW-7092). `modulation` defaults to the block's cached tables; a caller may hand
+    /// in tables of the cache's shape instead (the reference's own projection). Resident loads
+    /// only.
+    pub fn block_forward(
+        &self,
+        step: usize,
+        layer: usize,
+        hidden: &Array,
+        modulation: Option<&AdaLnModulation>,
+    ) -> Result<Array> {
+        let block = self.dit.blocks.get(layer).ok_or_else(|| {
+            Error::Msg(format!(
+                "minimax-h3-image dit: block {layer} is not resident (a {}-block resident stack)",
+                self.dit.blocks.len()
+            ))
+        })?;
+        let adaln = self.adaln_indices.get(step).ok_or_else(|| {
+            Error::Msg(format!(
+                "minimax-h3-image dit: step {step} is outside the {}-step schedule",
+                self.adaln_indices.len()
+            ))
+        })?;
+        let modulation = match modulation {
+            Some(m) => m,
+            None => self.cache.modulation(layer)?,
+        };
+        block.forward_bounded(
+            hidden,
+            modulation,
+            adaln,
+            &self.dit.rope,
+            &self.tables,
+            self.bounded_attention(),
+        )
     }
 
     /// The DiT velocity of every image row at sampling step `step`, through head `step`.

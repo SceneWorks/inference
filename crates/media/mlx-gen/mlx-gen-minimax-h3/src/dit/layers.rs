@@ -17,13 +17,14 @@
 //! [`DitFeedForward::forward`] runs the projection in one call. The asymmetry is a backend fact,
 //! not a missing port: do not mirror the candle chunking here.
 
+use mlx_rs::error::Exception;
 use mlx_rs::fast::rms_norm;
-use mlx_rs::ops::multiply;
+use mlx_rs::ops::{multiply, sigmoid};
+use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::{sdpa_bounded_bhsd, AttentionChunkAxis, BoundedAttention};
-use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -364,7 +365,8 @@ impl DitAttention {
     }
 }
 
-/// Bias-free SwiGLU feed-forward: `w2( silu(gate) · value )`.
+/// Bias-free SwiGLU feed-forward: `w2( silu(gate) · value )`, with `silu` at torch's float32
+/// rounding ([`swiglu_product`]).
 ///
 /// **The published `ff.net.0.proj` emits `[value | gate]`**, so the gate is the SECOND half — the
 /// split is delegated to [`crate::layout::split_gate_value`], the crate's single implementation.
@@ -395,8 +397,35 @@ impl DitFeedForward {
         let h = self.proj.forward(x)?;
         let axis = (h.shape().len() - 1) as i32;
         let (gate, value) = split_gate_value(&h, axis)?;
-        self.out.forward(&multiply(&silu(&gate)?, &value)?)
+        self.out.forward(&swiglu_product(&gate, &value)?)
     }
+}
+
+/// The reference's `hidden_states * F.silu(gate)` at torch's rounding (SW-7092).
+///
+/// PyTorch's bf16 `silu` computes `x · sigmoid(x)` in float32 and rounds **once**; the product with
+/// `value` is a second op that rounds once more. The shared [`mlx_gen::nn::silu`] instead runs
+/// `x · sigmoid(x)` in the input dtype — `sigmoid` rounds to bf16, then the product rounds again —
+/// and other families' calibrated outputs depend on that, so this DiT carries its own.
+///
+/// One fused kernel (`mx.compile`, shapeless) so the float32 intermediates never materialize: the
+/// kernel reads the bf16 gate and value and writes the bf16 product, holding no more than the
+/// eager `silu · value` did. Run eagerly, the float32 widen and its sigmoid would add 6 bytes per
+/// gate element (~1.41 GB per block over the 16,384 image rows of a 16 MP canvas). At float32
+/// compute both casts are identities.
+pub fn swiglu_product(gate: &Array, value: &Array) -> Result<Array> {
+    Ok(compile(swiglu_product_impl, true)((gate, value))?)
+}
+
+/// The traced body of [`swiglu_product`]; exposed so a test can run it eagerly against the fused
+/// kernel.
+#[doc(hidden)]
+pub fn swiglu_product_impl(
+    (gate, value): (&Array, &Array),
+) -> std::result::Result<Array, Exception> {
+    let wide = gate.as_dtype(Dtype::Float32)?;
+    let activated = multiply(&wide, &sigmoid(&wide)?)?.as_dtype(gate.dtype())?;
+    multiply(&activated, value)
 }
 
 /// Affine RMSNorm as a loadable block-level norm (`norm1` / `norm2` / `final_norm` / `norm_out.norm`).
@@ -452,5 +481,72 @@ impl AdaptableHost for DitFeedForward {
             ["net", "2"] => Some(self.out.adaptable_mut()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bf16_grid(n: usize, scale: f32, phase: f32) -> Array {
+        let v: Vec<f32> = (0..n)
+            .map(|i| scale * ((i as f32 * 0.618_034 + phase).fract() * 2.0 - 1.0))
+            .collect();
+        Array::from_slice(&v, &[1, n as i32])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap()
+    }
+
+    fn host(x: &Array) -> Vec<f32> {
+        x.as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec()
+    }
+
+    /// SW-7092: the fused SwiGLU product is its traced body run eagerly, element for element, and
+    /// it keeps the activation dtype.
+    #[test]
+    fn the_fused_swiglu_product_is_its_eager_body() {
+        let (gate, value) = (bf16_grid(4096, 12.0, 0.1), bf16_grid(4096, 3.0, 0.7));
+        let fused = swiglu_product(&gate, &value).unwrap();
+        let eager = swiglu_product_impl((&gate, &value)).unwrap();
+        assert_eq!(fused.dtype(), Dtype::Bfloat16);
+        assert_eq!(fused.shape(), gate.shape());
+        assert_eq!(host(&fused), host(&eager));
+    }
+
+    /// SW-7092: computing `silu` at float32 and rounding once lands closer to the exact product
+    /// than the shared bf16 `x · sigmoid(x)` — and the two differ, so the change is observable.
+    #[test]
+    fn swiglu_rounds_silu_once_like_torch() {
+        let (gate, value) = (bf16_grid(4096, 12.0, 0.3), bf16_grid(4096, 3.0, 0.9));
+        let ours = host(&swiglu_product(&gate, &value).unwrap());
+        let shared = host(&multiply(mlx_gen::nn::silu(&gate).unwrap(), &value).unwrap());
+        let (g, v) = (host(&gate), host(&value));
+        let exact: Vec<f64> = g
+            .iter()
+            .zip(&v)
+            .map(|(&g, &v)| {
+                let g = f64::from(g);
+                g / (1.0 + (-g).exp()) * f64::from(v)
+            })
+            .collect();
+        let err = |got: &[f32]| -> f64 {
+            got.iter()
+                .zip(&exact)
+                .map(|(&a, &b)| (f64::from(a) - b).abs())
+                .sum()
+        };
+        assert!(
+            ours != shared,
+            "the f32 SiLU must change some bf16 products"
+        );
+        assert!(
+            err(&ours) < err(&shared),
+            "f32 SiLU error {:.4e} must undercut the bf16 path's {:.4e}",
+            err(&ours),
+            err(&shared)
+        );
     }
 }

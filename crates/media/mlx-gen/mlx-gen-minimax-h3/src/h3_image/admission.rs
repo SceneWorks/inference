@@ -758,6 +758,27 @@ pub fn estimate(
         retained,
         co_resident(facts.dit_bytes()),
     ]);
+    // The adapter install (`apply_minimax_h3_adapters`) runs right after the DiT load and before
+    // the precompute evicts any AdaLN projection: its ordered construction peak (one file's source
+    // map, its converted factors and every earlier file's installed factors —
+    // `H3AdapterMemoryProfile::install_peak_bytes`) coexists with the DiT as loaded (the whole
+    // DiT resident, the trunk alone under rung 4's deferred load) and the carried conditioning.
+    let install_device = if facts.adapters.install_peak_bytes == 0 {
+        0
+    } else {
+        sum([
+            if e.stream_dit {
+                facts.dit_trunk_bytes
+            } else {
+                facts.dit_bytes()
+            },
+            facts.adapters.install_peak_bytes,
+            context,
+            ref_latents,
+            co_resident(facts.dit_bytes()),
+        ])
+    };
+    let denoise_device = denoise_device.max(install_device);
 
     // ---- decode ------------------------------------------------------------------------------
     let (cw, ch) = (u64::from(rows.canvas.0), u64::from(rows.canvas.1));
@@ -1220,6 +1241,44 @@ mod tests {
             generation.attention_chunk_size,
             Some(crate::h3_image::memory::IMAGE_ATTENTION_CHUNK_SIZE)
         );
+    }
+
+    /// LoRA install: the ordered construction peak is its own denoise-phase envelope — the DiT as
+    /// loaded (whole when resident, the trunk alone when streamed) plus the peak and the carried
+    /// conditioning — so a stack whose install outgrows the forward's residency binds admission.
+    #[test]
+    fn the_adapter_install_peak_binds_the_denoise_phase() {
+        let c = contract(LoadShape::DeferredMaterialization);
+        let plain = ImageMemoryFacts::derived(Some(4));
+        let shape = ImageRequestShape::text_to_image(4096, 4096);
+        let peak = 200 * GB;
+        let mut lora = plain.clone();
+        lora.adapters = H3AdapterMemoryProfile {
+            install_peak_bytes: peak,
+            ..H3AdapterMemoryProfile::default()
+        };
+        let context = Rows::of(&shape).unwrap().text
+            * MiniMaxH3TeConfig::qwen3_vl_32b().hidden_size as u64
+            * 4;
+        for (strategy, loaded) in [
+            (MemoryStrategy::StagedResidency, plain.dit_bytes()),
+            (
+                MemoryStrategy::BoundedTransformerResidency,
+                plain.dit_trunk_bytes,
+            ),
+        ] {
+            let selection = at(&c, strategy);
+            let without = estimate(&c, &plain, &shape, &selection).unwrap();
+            assert!(without.phases[1].device_bytes < peak, "{strategy:?}");
+            let with = estimate(&c, &lora, &shape, &selection).unwrap();
+            assert_eq!(
+                with.phases[1].device_bytes,
+                loaded + peak + context,
+                "{strategy:?}"
+            );
+            assert_eq!(with.phases[0], without.phases[0], "{strategy:?}");
+            assert_eq!(with.phases[2], without.phases[2], "{strategy:?}");
+        }
     }
 
     /// LoRA: the overlay is charged in full at every rung — never window-bounded — plus one

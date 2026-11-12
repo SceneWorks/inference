@@ -224,6 +224,13 @@ impl MiniMaxH3Image {
         })
     }
 
+    /// The resolved DiT's config — the staged tier directory when `LoadSpec.components` names
+    /// one, which is the directory [`Self::load`] validated and the denoise loads, not the snapshot
+    /// root's `transformer_diffusers/`.
+    fn dit_config(&self) -> Result<crate::dit::MiniMaxH3DitConfig> {
+        image_dit_config_at(&self.dit_dir)
+    }
+
     /// The snapshot root a render reads from.
     pub fn root(&self) -> &Path {
         &self.root
@@ -286,7 +293,7 @@ impl MiniMaxH3Image {
         }
 
         let phase = PhaseLog::start("image_vae_encode");
-        let patch = image_dit_config(&self.root)?.patch_size;
+        let patch = self.dit_config()?.patch_size;
         let encoder = MiniMaxH3ImageVaeEncoder::load(&self.root, &self.device)?;
         let mut latents = Vec::with_capacity(references.len());
         for (i, r) in references.iter().enumerate() {
@@ -312,6 +319,16 @@ impl MiniMaxH3Image {
         let _stream_request =
             crate::block_stream::RequestGuard::enter(req, self.load_shape, &self.device)?;
         Generator::validate(self, req)?;
+        // Admission priced the references by count; re-price the admitted selection at their
+        // actual sizes before any phase runs (a non-square reference outgrows the count bound).
+        if let Some(context) = crate::memory_strategy::active_context() {
+            crate::image_memory_strategy::admit_exact_request(
+                self.memory_facts.as_ref(),
+                &self.contract,
+                &context,
+                req,
+            )?;
+        }
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -845,6 +862,45 @@ mod tests {
             .components
             .insert("transformer".into(), WeightsSource::Dir("/x".into()));
         assert!(load_image(&other).is_err());
+    }
+
+    /// The edit reads its VAE patch size from the resolved DiT — a staged tier directory — so a
+    /// snapshot root that holds only the VAE and tokenizer assets still edits, as it text-to-images.
+    #[test]
+    fn the_edit_patch_size_comes_from_the_staged_dit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let dit_dir = tmp.path().join("q4").join(IMAGE_DIT_PARTITION);
+        std::fs::create_dir_all(&dit_dir).unwrap();
+        std::fs::write(
+            dit_dir.join("config.json"),
+            r#"{
+                "_class_name": "MiniMaxH3ImageTransformer2DModel",
+                "num_attention_heads": 56, "attention_head_dim": 128, "hidden_size": 5376,
+                "num_layers": 50, "num_refiner_layers": 2, "ffn_dim": 14336, "in_channels": 24,
+                "patch_size": [1, 2, 2], "text_dim": 5120, "freq_dim": 256,
+                "time_embed_hidden_dim": 5376, "time_embed_dim": 2688, "rope_freq_dim": 16,
+                "rope_theta": 10000.0, "norm_eps": 1e-05, "qk_norm_eps": 1e-05,
+                "final_norm_eps": 1e-05, "num_pdd_heads": 6
+            }"#,
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let image = MiniMaxH3Image {
+            descriptor: image_descriptor(),
+            root: root.clone(),
+            dit_dir,
+            text_encoder_dir: root.join(IMAGE_TEXT_ENCODER),
+            device: Device::Cpu,
+            contract: crate::image_memory_strategy::weights_free_contract(&spec).unwrap(),
+            spec,
+            load_shape: LoadShape::EagerMaterialization,
+            memory_facts: None,
+        };
+        assert_eq!(image.dit_config().unwrap().patch_size, [1, 2, 2]);
+        // The root has no `transformer_diffusers/`: reading it there is what failed every edit.
+        assert!(image_dit_config(&root).is_err());
     }
 
     /// The on-disk `quantization` marker is authoritative: a q4 DiT staged under a Q8 request is

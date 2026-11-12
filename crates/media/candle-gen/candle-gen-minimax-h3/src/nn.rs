@@ -22,6 +22,20 @@ pub fn silu(x: &Tensor) -> Result<Tensor> {
     Ok((x * sigmoid(x)?)?)
 }
 
+/// SiLU computed in float32 and rounded **once** to `x`'s dtype — PyTorch's bf16 `F.silu`
+/// numerics, which the DiT's SwiGLU (`hidden_states * F.silu(gate)`) reproduces (SW-7092).
+///
+/// [`silu`] rounds `sigmoid` to the input dtype and then rounds the product again. Each float32
+/// temporary is dropped as soon as its consumer has run, so the peak over the bf16 [`silu`] is
+/// 4 bytes per element (the widened input and the float32 result coexist; the bf16 path held a
+/// bf16 sigmoid and product). At float32 both casts are identities.
+pub fn silu_f32_rounded(x: &Tensor) -> Result<Tensor> {
+    let wide = x.to_dtype(DType::F32)?;
+    let activated = wide.silu()?;
+    drop(wide);
+    Ok(activated.to_dtype(x.dtype())?)
+}
+
 /// `y = x · Wᵀ` for a stored `[out, in]` weight, no bias, over the **last** axis of `x` (any
 /// leading dims).
 ///
@@ -673,6 +687,31 @@ mod tests {
         let y = linear(&x, &w, &b).unwrap();
         assert_eq!(y.dims(), &[1, 2, 3, 4, 7]);
         assert!((flat(&y)[0] - 5.0).abs() < 1e-6);
+    }
+
+    /// SW-7092: the SwiGLU's SiLU is the float32 SiLU rounded once to bf16 — element for element —
+    /// and that differs from the bf16 `x · sigmoid(x)` somewhere, so the change is observable.
+    #[test]
+    fn the_f32_silu_rounds_once_to_bf16() {
+        let v: Vec<f32> = (0..4096)
+            .map(|i| 12.0 * ((i as f32 * 0.618_034 + 0.3).fract() * 2.0 - 1.0))
+            .collect();
+        let x = Tensor::from_vec(v, 4096, &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let got = silu_f32_rounded(&x).unwrap();
+        assert_eq!(got.dtype(), DType::BF16);
+        let want = x
+            .to_dtype(DType::F32)
+            .unwrap()
+            .silu()
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let wide = |t: &Tensor| flat(&t.to_dtype(DType::F32).unwrap());
+        assert_eq!(wide(&got), wide(&want));
+        assert_ne!(wide(&got), wide(&silu(&x).unwrap()));
     }
 
     #[test]

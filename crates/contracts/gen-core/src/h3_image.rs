@@ -512,6 +512,38 @@ pub const DIT_PARITY_MAX_REL_L2: f32 = 5e-2;
 /// Family DiT parity bound: the flattened velocity's cosine similarity against diffusers is at
 /// least this. Asserted next to [`DIT_PARITY_MAX_REL_L2`] by both backends.
 pub const DIT_PARITY_MIN_COSINE: f32 = 0.995;
+/// Edit-path DiT parity bound, relative to the reference's own bf16 rounding: a backend's edit
+/// velocity passes when `rel-L2(ours, f32 reference)` is at most this times
+/// `rel-L2(reference bf16, reference f32)`, computed per step from the same reference file.
+///
+/// Why: on edit inputs the deep-stack blocks amplify bf16 rounding, so upstream's own bf16 forward
+/// misses the fixed [`DIT_PARITY_MAX_REL_L2`] (5.33e-2 at step 0, 4.98e-2 at step 3). Michael
+/// approved this bound on 2026-11-11. The text-to-image gates keep the fixed
+/// [`DIT_PARITY_MAX_REL_L2`]. Use [`edit_parity_limit`] to apply it.
+pub const EDIT_DIT_PARITY_MAX_RATIO_TO_REFERENCE_BF16: f64 = 2.0;
+/// A reference bf16 drift below this is not a genuine bf16 forward (bf16 rounding through a deep
+/// stack is never this small), so [`edit_parity_limit`] refuses it.
+pub const EDIT_DIT_MIN_PLAUSIBLE_REFERENCE_BF16_DRIFT: f64 = 1e-4;
+
+/// The edit-path rel-L2 limit for one step: [`EDIT_DIT_PARITY_MAX_RATIO_TO_REFERENCE_BF16`] times
+/// the reference's bf16-vs-f32 rel-L2 drift at that step. Refuses a non-finite drift and one below
+/// [`EDIT_DIT_MIN_PLAUSIBLE_REFERENCE_BF16_DRIFT`], so the gate can never pass vacuously.
+pub fn edit_parity_limit(reference_bf16_drift: f64) -> Result<f64, Error> {
+    if !reference_bf16_drift.is_finite() {
+        return Err(Error::Msg(format!(
+            "the edit reference's bf16-vs-f32 drift is {reference_bf16_drift}; the reference must \
+             contain a finite bf16 forward (diag.bf16.*)"
+        )));
+    }
+    if reference_bf16_drift < EDIT_DIT_MIN_PLAUSIBLE_REFERENCE_BF16_DRIFT {
+        return Err(Error::Msg(format!(
+            "the edit reference's bf16-vs-f32 drift {reference_bf16_drift:.3e} is below \
+             {EDIT_DIT_MIN_PLAUSIBLE_REFERENCE_BF16_DRIFT:.0e}: the bf16 reference is not a \
+             genuine bf16 forward"
+        )));
+    }
+    Ok(EDIT_DIT_PARITY_MAX_RATIO_TO_REFERENCE_BF16 * reference_bf16_drift)
+}
 /// VAE spatial compression: one latent cell per 16x16 pixels.
 pub const VAE_SPATIAL_RATIO: u32 = 16;
 
@@ -760,9 +792,521 @@ pub fn reference_latent_grid(width: u32, height: u32, patch: (u32, u32)) -> (u32
     (lh / patch.0 * patch.0, lw / patch.1 * patch.1)
 }
 
+/// The per-block DiT parity sweep both backends' real-weight `edit` gates print (SW-7092).
+///
+/// The edit reference records the residual stream after a set of blocks from two diffusers
+/// forwards over the same inputs: float32 activations (what the gates assert against) and bf16
+/// compute (the checkpoint as published). For each block this module compares a backend's stream
+/// with both, next to the reference's own bf16-vs-f32 drift, over the whole packed sequence and
+/// over each row class (`[text | reference | generated]`), and locates the largest reference
+/// activation and the largest error. Host-side and tensor-free so the arithmetic is unit-tested
+/// once rather than per backend. Diagnostic only: nothing here is a bound.
+pub mod dit_sweep {
+    use std::fmt;
+    use std::ops::Range;
+
+    /// A backend has *departed* from diffusers' bf16 compute at a block when its error against
+    /// the bf16 reference exceeds this multiple of the reference's own bf16-vs-f32 drift there.
+    /// Two independent bf16 roundings of similar size sit about `sqrt(2)` times one of them apart,
+    /// so twice the drift is more than rounding alone accounts for.
+    pub const DEPARTURE_FACTOR: f32 = 2.0;
+
+    /// The packed sequence's row classes, in order: text rows, reference rows, generated rows.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RowRegions {
+        pub text: usize,
+        pub reference: usize,
+        pub generated: usize,
+    }
+
+    impl RowRegions {
+        /// Names of [`Self::ranges`], in order.
+        pub const NAMES: [&'static str; 4] = ["all", "text", "reference", "generated"];
+
+        pub fn seq_len(&self) -> usize {
+            self.text + self.reference + self.generated
+        }
+
+        /// Row ranges of the whole sequence and of each class, in [`Self::NAMES`] order.
+        pub fn ranges(&self) -> [Range<usize>; 4] {
+            let (t, r) = (self.text, self.text + self.reference);
+            [0..self.seq_len(), 0..t, t..r, r..self.seq_len()]
+        }
+
+        /// The class name of sequence row `row`.
+        pub fn class_of(&self, row: usize) -> &'static str {
+            let [_, text, reference, _] = self.ranges();
+            if text.contains(&row) {
+                "text"
+            } else if reference.contains(&row) {
+                "reference"
+            } else {
+                "generated"
+            }
+        }
+    }
+
+    /// `||got - want|| / ||want||` over rows `rows` of two row-major `[seq_len, width]` buffers,
+    /// accumulated in f64. `0` when both are zero there, infinite when only `want` is.
+    pub fn rel_l2_rows(got: &[f32], want: &[f32], width: usize, rows: Range<usize>) -> f32 {
+        let span = rows.start * width..rows.end * width;
+        let (mut diff, mut norm) = (0f64, 0f64);
+        for (g, w) in got[span.clone()].iter().zip(&want[span]) {
+            let e = f64::from(*g) - f64::from(*w);
+            diff += e * e;
+            norm += f64::from(*w) * f64::from(*w);
+        }
+        if norm == 0.0 {
+            return if diff == 0.0 { 0.0 } else { f32::INFINITY };
+        }
+        (diff / norm).sqrt() as f32
+    }
+
+    /// One row class's errors at one block.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct RegionErrors {
+        /// The backend against the float32-activation reference (what the gate asserts against).
+        pub vs_f32: f32,
+        /// The backend against the bf16-compute reference.
+        pub vs_bf16: f32,
+        /// The reference's own bf16-compute stream against its float32 one.
+        pub drift: f32,
+    }
+
+    impl RegionErrors {
+        /// `vs_bf16 / drift`: about `sqrt(2)` for a backend whose only difference from diffusers is
+        /// its own bf16 rounding; a block where it jumps is where the backend computes something
+        /// else. Infinite when the reference has no drift there.
+        pub fn departure_ratio(&self) -> f32 {
+            if self.drift > 0.0 {
+                self.vs_bf16 / self.drift
+            } else {
+                f32::INFINITY
+            }
+        }
+    }
+
+    /// One element of the stream, located, with the three values there.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct Located {
+        pub row: usize,
+        pub channel: usize,
+        pub class: &'static str,
+        pub f32_ref: f32,
+        pub bf16_ref: f32,
+        pub got: f32,
+    }
+
+    /// One block of the sweep.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct SweepRow {
+        pub layer: usize,
+        /// In [`RowRegions::NAMES`] order.
+        pub regions: [RegionErrors; 4],
+        /// The largest `|f32 reference|` — where a massive activation sits.
+        pub peak: Located,
+        /// The largest `|got - f32 reference|`.
+        pub worst: Located,
+    }
+
+    impl SweepRow {
+        /// Compare a backend's residual stream after block `layer` with both references. All three
+        /// buffers are row-major `[seq_len, width]` (a leading batch of 1 flattens to the same).
+        pub fn new(
+            layer: usize,
+            got: &[f32],
+            f32_ref: &[f32],
+            bf16_ref: &[f32],
+            width: usize,
+            regions: RowRegions,
+        ) -> Result<Self, String> {
+            let len = regions.seq_len() * width;
+            if width == 0 || [got.len(), f32_ref.len(), bf16_ref.len()] != [len; 3] {
+                return Err(format!(
+                    "dit sweep block {layer}: buffers of {}, {} and {} values against {} rows x \
+                     {width} channels",
+                    got.len(),
+                    f32_ref.len(),
+                    bf16_ref.len(),
+                    regions.seq_len()
+                ));
+            }
+            let errors = |rows: Range<usize>| RegionErrors {
+                vs_f32: rel_l2_rows(got, f32_ref, width, rows.clone()),
+                vs_bf16: rel_l2_rows(got, bf16_ref, width, rows.clone()),
+                drift: rel_l2_rows(bf16_ref, f32_ref, width, rows),
+            };
+            let argmax = |key: &dyn Fn(usize) -> f32| -> usize {
+                (0..len).fold(0, |best, i| if key(i) > key(best) { i } else { best })
+            };
+            let locate = |i: usize| Located {
+                row: i / width,
+                channel: i % width,
+                class: regions.class_of(i / width),
+                f32_ref: f32_ref[i],
+                bf16_ref: bf16_ref[i],
+                got: got[i],
+            };
+            Ok(Self {
+                layer,
+                regions: regions.ranges().map(errors),
+                peak: locate(argmax(&|i| f32_ref[i].abs())),
+                worst: locate(argmax(&|i| (got[i] - f32_ref[i]).abs())),
+            })
+        }
+    }
+
+    impl fmt::Display for Located {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "row {} ({}) ch {}: f32 {:.4e} bf16 {:.4e} got {:.4e}",
+                self.row, self.class, self.channel, self.f32_ref, self.bf16_ref, self.got
+            )
+        }
+    }
+
+    impl fmt::Display for SweepRow {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "sweep block {:>2}", self.layer)?;
+            for (name, e) in RowRegions::NAMES.iter().zip(&self.regions) {
+                write!(
+                    f,
+                    " | {name} vs-f32 {:.3e} vs-bf16 {:.3e} drift {:.3e} ratio {:.2}",
+                    e.vs_f32,
+                    e.vs_bf16,
+                    e.drift,
+                    e.departure_ratio()
+                )?;
+            }
+            write!(
+                f,
+                " | peak |f32| {} | worst |got-f32| {}",
+                self.peak, self.worst
+            )
+        }
+    }
+
+    /// Per row class (in [`RowRegions::NAMES`] order), the first block whose `vs_bf16` exceeds
+    /// [`DEPARTURE_FACTOR`] times its `drift`.
+    pub fn first_departure(rows: &[SweepRow]) -> [Option<usize>; 4] {
+        std::array::from_fn(|c| {
+            rows.iter()
+                .find(|r| r.regions[c].vs_bf16 > DEPARTURE_FACTOR * r.regions[c].drift)
+                .map(|r| r.layer)
+        })
+    }
+
+    /// The consecutive pair of swept blocks across which the whole-sequence `vs_f32` grows by the
+    /// largest factor: `(from_layer, to_layer, from, to)`.
+    pub fn largest_growth(rows: &[SweepRow]) -> Option<(usize, usize, f32, f32)> {
+        rows.windows(2)
+            .map(|w| {
+                (
+                    w[0].layer,
+                    w[1].layer,
+                    w[0].regions[0].vs_f32,
+                    w[1].regions[0].vs_f32,
+                )
+            })
+            .filter(|(_, _, from, _)| *from > 0.0)
+            .max_by(|a, b| (a.3 / a.2).total_cmp(&(b.3 / b.2)))
+    }
+
+    /// Per row class, the consecutive pair of swept blocks across which
+    /// [`RegionErrors::departure_ratio`] rises the most: `(from_layer, to_layer, from, to)`.
+    pub fn largest_ratio_rise(rows: &[SweepRow], class: usize) -> Option<(usize, usize, f32, f32)> {
+        rows.windows(2)
+            .map(|w| {
+                (
+                    w[0].layer,
+                    w[1].layer,
+                    w[0].regions[class].departure_ratio(),
+                    w[1].regions[class].departure_ratio(),
+                )
+            })
+            .filter(|(_, _, from, to)| from.is_finite() && to.is_finite())
+            .max_by(|a, b| (a.3 - a.2).total_cmp(&(b.3 - b.2)))
+    }
+
+    /// The closing summary lines: per row class the first departure and the largest rise of the
+    /// departure ratio, then the largest whole-sequence growth of `vs_f32`.
+    pub fn summary(rows: &[SweepRow]) -> Vec<String> {
+        let mut lines: Vec<String> = RowRegions::NAMES
+            .iter()
+            .zip(first_departure(rows))
+            .zip(0..)
+            .map(|((name, layer), class)| {
+                let first = match layer {
+                    Some(layer) => format!(
+                        "sweep {name} rows: first departure from diffusers bf16 (vs-bf16 > \
+                         {DEPARTURE_FACTOR} x drift) at block {layer}"
+                    ),
+                    None => format!(
+                        "sweep {name} rows: no departure from diffusers bf16 (vs-bf16 > \
+                         {DEPARTURE_FACTOR} x drift) at any swept block"
+                    ),
+                };
+                match largest_ratio_rise(rows, class) {
+                    Some((a, b, from, to)) => format!(
+                        "{first}; largest ratio rise between swept blocks {a} and {b}: {from:.2} \
+                         -> {to:.2}"
+                    ),
+                    None => first,
+                }
+            })
+            .collect();
+        if let Some((a, b, from, to)) = largest_growth(rows) {
+            lines.push(format!(
+                "sweep all rows: largest vs-f32 growth between swept blocks {a} and {b}: {from:.3e} \
+                 -> {to:.3e} ({:.2}x)",
+                to / from
+            ));
+        }
+        lines
+    }
+
+    /// The block the edit gate re-runs alone, from the reference's own input (SW-7092): the block
+    /// where both backends under-build the reference's massive activation at [`PROBE`].
+    pub const ISOLATED_BLOCK: usize = 39;
+
+    /// `(row, channel)` of the massive activation the isolation line reads: text row 74, channel
+    /// 3474 — about `-2.2e6` after block 39 in the float32 edit reference.
+    pub const PROBE: (usize, usize) = (74, 3474);
+
+    impl Located {
+        /// The element at `(row, channel)` of three row-major `[seq_len, width]` buffers; `None`
+        /// when it lies outside any of them.
+        pub fn at(
+            (row, channel): (usize, usize),
+            got: &[f32],
+            f32_ref: &[f32],
+            bf16_ref: &[f32],
+            width: usize,
+            regions: RowRegions,
+        ) -> Option<Self> {
+            let i = row.checked_mul(width)?.checked_add(channel)?;
+            if channel >= width || row >= regions.seq_len() {
+                return None;
+            }
+            Some(Self {
+                row,
+                channel,
+                class: regions.class_of(row),
+                f32_ref: *f32_ref.get(i)?,
+                bf16_ref: *bf16_ref.get(i)?,
+                got: *got.get(i)?,
+            })
+        }
+    }
+
+    /// One block run in isolation: `isolated block {layer} [{label}]`, then per row class the
+    /// rel-L2 against the float32 and the bf16 reference after that block, then the [`PROBE`]
+    /// element. With the reference's own input, a large error here is the block's own compute;
+    /// a small one puts the full forward's error at that block on what it inherited.
+    pub fn isolation_line(label: &str, row: &SweepRow, probe: &Located) -> String {
+        let mut line = format!("isolated block {} [{label}]", row.layer);
+        for (name, e) in RowRegions::NAMES.iter().zip(&row.regions) {
+            line.push_str(&format!(
+                " | {name} vs-f32 {:.3e} vs-bf16 {:.3e}",
+                e.vs_f32, e.vs_bf16
+            ));
+        }
+        line.push_str(&format!(" | probe {probe} | worst |got-f32| {}", row.worst));
+        line
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const REGIONS: RowRegions = RowRegions {
+            text: 2,
+            reference: 3,
+            generated: 1,
+        };
+
+        #[test]
+        fn row_ranges_partition_the_sequence_in_packed_order() {
+            let [all, text, reference, generated] = REGIONS.ranges();
+            assert_eq!(all, 0..6);
+            assert_eq!((text, reference, generated), (0..2, 2..5, 5..6));
+            let classes: Vec<_> = (0..6).map(|r| REGIONS.class_of(r)).collect();
+            assert_eq!(
+                classes,
+                [
+                    "text",
+                    "text",
+                    "reference",
+                    "reference",
+                    "reference",
+                    "generated"
+                ]
+            );
+            let no_refs = RowRegions {
+                text: 1,
+                reference: 0,
+                generated: 2,
+            };
+            assert_eq!(no_refs.ranges()[2], 1..1);
+            assert_eq!(no_refs.class_of(1), "generated");
+        }
+
+        #[test]
+        fn rel_l2_reads_only_the_requested_rows() {
+            // Width 2, three rows; row 1 is wildly wrong, rows 0 and 2 off by 10%.
+            let want = [1.0f32, 0.0, 3.0, 4.0, 0.0, 2.0];
+            let got = [1.1f32, 0.0, -30.0, 40.0, 0.0, 2.2];
+            assert!((rel_l2_rows(&got, &want, 2, 0..1) - 0.1).abs() < 1e-6);
+            assert!((rel_l2_rows(&got, &want, 2, 2..3) - 0.1).abs() < 1e-6);
+            assert!(rel_l2_rows(&got, &want, 2, 1..2) > 5.0);
+            assert_eq!(rel_l2_rows(&got, &want, 2, 1..1), 0.0);
+            assert_eq!(rel_l2_rows(&[1.0], &[0.0], 1, 0..1), f32::INFINITY);
+        }
+
+        #[test]
+        fn a_sweep_row_splits_errors_by_class_and_locates_peak_and_worst() {
+            // Width 2 over [text 2 | reference 3 | generated 1].
+            let f32_ref = [
+                1.0f32, 1.0, 1.0, 1.0, 50.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            ];
+            let bf16_ref = f32_ref;
+            let mut got = f32_ref;
+            got[11] = 4.0; // generated row 5, channel 1: the worst error, not the peak
+            let row = SweepRow::new(7, &got, &f32_ref, &bf16_ref, 2, REGIONS).unwrap();
+            assert_eq!(row.layer, 7);
+            let [_, text, reference, generated] = row.regions;
+            assert_eq!((text.vs_f32, reference.vs_f32), (0.0, 0.0));
+            assert!(generated.vs_f32 > 2.0);
+            assert_eq!(generated.drift, 0.0);
+            assert_eq!(
+                (
+                    row.peak.row,
+                    row.peak.channel,
+                    row.peak.class,
+                    row.peak.f32_ref
+                ),
+                (2, 0, "reference", 50.0)
+            );
+            assert_eq!(
+                (
+                    row.worst.row,
+                    row.worst.channel,
+                    row.worst.class,
+                    row.worst.got
+                ),
+                (5, 1, "generated", 4.0)
+            );
+            assert!(SweepRow::new(7, &got[..10], &f32_ref, &bf16_ref, 2, REGIONS).is_err());
+        }
+
+        #[test]
+        fn the_isolation_line_reads_the_probe_and_every_row_class() {
+            let f32_ref = [
+                1.0f32, 1.0, 1.0, 1.0, 50.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            ];
+            let bf16_ref = f32_ref;
+            let mut got = f32_ref;
+            got[4] = 25.0; // reference row 2, channel 0: half the massive activation
+            let probe = Located::at((2, 0), &got, &f32_ref, &bf16_ref, 2, REGIONS).unwrap();
+            assert_eq!(
+                (probe.class, probe.f32_ref, probe.got),
+                ("reference", 50.0, 25.0)
+            );
+            assert!(Located::at((6, 0), &got, &f32_ref, &bf16_ref, 2, REGIONS).is_none());
+            assert!(Located::at((0, 2), &got, &f32_ref, &bf16_ref, 2, REGIONS).is_none());
+            let row = SweepRow::new(39, &got, &f32_ref, &bf16_ref, 2, REGIONS).unwrap();
+            let line = isolation_line("ref input", &row, &probe);
+            assert!(line.starts_with("isolated block 39 [ref input]"), "{line}");
+            for name in RowRegions::NAMES {
+                assert!(line.contains(&format!("| {name} vs-f32")), "{line}");
+            }
+            assert!(line.contains("probe row 2 (reference) ch 0"), "{line}");
+        }
+
+        fn row(layer: usize, vs_f32: f32, vs_bf16: f32, drift: f32) -> SweepRow {
+            let e = RegionErrors {
+                vs_f32,
+                vs_bf16,
+                drift,
+            };
+            let at = Located {
+                row: 0,
+                channel: 0,
+                class: "text",
+                f32_ref: 0.0,
+                bf16_ref: 0.0,
+                got: 0.0,
+            };
+            SweepRow {
+                layer,
+                regions: [e; 4],
+                peak: at,
+                worst: at,
+            }
+        }
+
+        #[test]
+        fn departure_is_the_first_block_past_twice_the_reference_drift() {
+            let rows = [
+                row(0, 0.01, 0.012, 0.008),
+                row(24, 0.02, 0.02, 0.01),
+                row(30, 0.05, 0.05, 0.02),
+                row(31, 0.06, 0.06, 0.02),
+            ];
+            assert_eq!(first_departure(&rows), [Some(30); 4]);
+            assert_eq!(first_departure(&rows[..2]), [None; 4]);
+            assert_eq!(largest_growth(&rows), Some((24, 30, 0.02, 0.05)));
+            // Ratios 1.5, 2.0, 2.5, 3.0 rise by 0.5 at every pair.
+            let (_, _, from, to) = largest_ratio_rise(&rows, 0).unwrap();
+            assert!((to - from - 0.5).abs() < 1e-5, "{from} -> {to}");
+            let jump = [
+                row(0, 0.01, 0.015, 0.01),
+                row(5, 0.02, 0.016, 0.01),
+                row(6, 0.02, 0.06, 0.01),
+            ];
+            let (a, b, from, to) = largest_ratio_rise(&jump, 2).unwrap();
+            assert_eq!((a, b), (5, 6));
+            assert!(
+                (from - 1.6).abs() < 1e-5 && (to - 6.0).abs() < 1e-5,
+                "{from} -> {to}"
+            );
+            assert_eq!(
+                row(0, 0.0, 0.1, 0.0).regions[0].departure_ratio(),
+                f32::INFINITY
+            );
+            let lines = summary(&rows);
+            assert_eq!(lines.len(), 5);
+            assert!(lines[0].contains("at block 30"), "{}", lines[0]);
+            assert!(lines[0].contains("largest ratio rise"), "{}", lines[0]);
+            assert!(lines[4].contains("blocks 24 and 30"), "{}", lines[4]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_parity_limit_scales_the_reference_bf16_drift() {
+        let limit = edit_parity_limit(5.33e-2).unwrap();
+        assert!((limit - 2.0 * 5.33e-2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn edit_parity_limit_refuses_a_missing_or_nan_drift() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(edit_parity_limit(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn edit_parity_limit_refuses_a_tiny_drift() {
+        assert!(edit_parity_limit(0.0).is_err());
+        assert!(edit_parity_limit(9e-5).is_err());
+        assert!(edit_parity_limit(1e-4).is_ok());
+    }
 
     #[test]
     fn prompt_ids_truncate_at_4096_and_refuse_empty() {

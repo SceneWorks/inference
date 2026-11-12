@@ -362,12 +362,25 @@ fn route_gate(
             context.selection.parameters.decode_overlap,
         )?;
     }
+    chunk_gate(
+        contract,
+        context,
+        &admission::ImageRequestShape::with_reference_count(g.width, g.height, references),
+    )?;
+    admission_canvas(g.width, g.height)?;
+    Ok(())
+}
+
+/// The materializing fallback cannot split one query row: a selected attention chunk below one
+/// row of the longest attention of `shape` (every DiT head over its packed sequence) fails at
+/// runtime, so it is refused here.
+fn chunk_gate(
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    shape: &admission::ImageRequestShape,
+) -> gen_core::Result<()> {
     if let Some(elements) = context.selection.parameters.attention_chunk_size {
-        // The materializing fallback cannot split one query row; a chunk below one row of the
-        // longest attention (every DiT head over the packed sequence) fails at runtime.
-        let rows = admission::ImageRequestRows::of(
-            &admission::ImageRequestShape::with_reference_count(g.width, g.height, references),
-        );
+        let rows = admission::ImageRequestRows::of(shape);
         let heads = contract.architecture_facts.attention_heads.map_or(
             crate::dit::MiniMaxH3DitConfig::image().num_attention_heads as u64,
             u64::from,
@@ -378,13 +391,13 @@ fn route_gate(
             .is_none_or(|row| row > u64::from(elements))
         {
             return Err(gen_core::Error::Unsupported(format!(
-                "{id}: one materializing attention row ({heads} heads x {} keys) exceeds the \
+                "{}: one materializing attention row ({heads} heads x {} keys) exceeds the \
                  selected {elements}-element chunk",
+                contract.provider_id,
                 rows.sequence_rows()
             )));
         }
     }
-    admission_canvas(g.width, g.height)?;
     Ok(())
 }
 
@@ -416,6 +429,22 @@ fn estimate_gate(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<()> {
+    let g = context.geometry;
+    estimate_shape(
+        facts,
+        contract,
+        context,
+        &admission::ImageRequestShape::with_reference_count(g.width, g.height, g.reference_count),
+    )
+}
+
+/// [`estimate_gate`] at an explicit request shape.
+fn estimate_shape(
+    facts: Option<&admission::ImageMemoryFacts>,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    shape: &admission::ImageRequestShape,
+) -> gen_core::Result<()> {
     let Some(facts) = facts else {
         return Ok(());
     };
@@ -426,10 +455,7 @@ fn estimate_gate(
     {
         return Ok(());
     }
-    let g = context.geometry;
-    let shape =
-        admission::ImageRequestShape::with_reference_count(g.width, g.height, g.reference_count);
-    let plan = admission::estimate(contract, facts, &shape, &context.selection)?;
+    let plan = admission::estimate(contract, facts, shape, &context.selection)?;
     let budget = context.budget.effective_bytes();
     if plan.peak_device_bytes() > budget {
         return Err(gen_core::Error::Unsupported(format!(
@@ -448,6 +474,24 @@ fn estimate_gate(
 pub fn facts_for(spec: &LoadSpec) -> Option<admission::ImageMemoryFacts> {
     gen_core::resolved_snapshot_root(spec)?;
     admission::ImageMemoryFacts::resolve(spec).ok()
+}
+
+/// The admitted request re-priced at its **exact** geometry (SW-7092 edit), run by the generator
+/// before any work. Admission sees only the reference count (`MemoryGeometry` carries no
+/// reference sizes) and prices each reference as a 2048² VAE copy, but `reference_vae_size` caps
+/// the short edge only: a 4096x2048 reference keeps 8192 rows where that bound priced 4096. So
+/// the chunk-row check and the per-phase estimate run again against the admitted selection and
+/// budget with every reference's own size, and a request whose real sequence does not fit is
+/// refused instead of running out of memory.
+pub(crate) fn admit_exact_request(
+    facts: Option<&admission::ImageMemoryFacts>,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+    req: &gen_core::GenerationRequest,
+) -> gen_core::Result<()> {
+    let shape = admission::ImageRequestShape::from_request(req)?;
+    chunk_gate(contract, context, &shape)?;
+    estimate_shape(facts, contract, context, &shape)
 }
 
 /// The loaded generator's safety check: the shared handshake, this route's gate, then the

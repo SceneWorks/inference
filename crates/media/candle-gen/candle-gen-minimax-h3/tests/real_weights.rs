@@ -1680,7 +1680,10 @@ fn image_vae_tiled_decode_lowers_the_16mp_peak() {
 // The DiT gate asserts the family bounds (requirement E9, `gen_core::h3_image`), the same metric and
 // values as the MLX gate: rel-L2 and cosine of the velocity against diffusers' float32-activation
 // forward over the same bf16 weights. Peak and mean errors are printed as diagnostics only.
-use candle_gen::gen_core::h3_image::{DIT_PARITY_MAX_REL_L2, DIT_PARITY_MIN_COSINE};
+use candle_gen::gen_core::h3_image::dit_sweep::{self, RowRegions, SweepRow};
+use candle_gen::gen_core::h3_image::{
+    edit_parity_limit, DIT_PARITY_MAX_REL_L2, DIT_PARITY_MIN_COSINE,
+};
 
 /// `(||got - want|| / ||want||, cosine)` over the flattened tensors, in f32.
 fn image_dit_rel_l2_cosine(got: &Tensor, want: &Tensor) -> (f32, f32) {
@@ -2086,6 +2089,200 @@ fn image_edit_reference() -> common::Golden {
     reference
 }
 
+/// Print the per-block sweep of one traced step-0 forward against the reference's
+/// `diag.sweep.{f32,bf16}.block{k}` (see `gen_core::h3_image::dit_sweep`). Diagnostic only.
+fn image_edit_block_sweep(
+    reference: &common::Golden,
+    trace: &candle_gen_minimax_h3::dit::ImageDitTrace,
+    layers: &[usize],
+    regions: RowRegions,
+) {
+    println!(
+        "sweep (step 0): per block, rel-L2 vs the f32 reference, vs the bf16 reference, and the \
+         reference's own bf16-vs-f32 drift — all rows, then text / reference / generated rows"
+    );
+    let mut rows = Vec::with_capacity(layers.len());
+    for &layer in layers {
+        let (_, hidden) = trace
+            .hidden
+            .iter()
+            .find(|(l, _)| *l == layer)
+            .unwrap_or_else(|| panic!("the trace recorded block {layer}"));
+        let (f32_key, bf16_key) = (
+            format!("diag.sweep.f32.block{layer}"),
+            format!("diag.sweep.bf16.block{layer}"),
+        );
+        assert_eq!(
+            hidden.dims(),
+            reference.shape(&f32_key),
+            "sweep block {layer} shape"
+        );
+        assert_eq!(
+            reference.dtype(&bf16_key),
+            "BF16",
+            "sweep block {layer} bf16 dtype"
+        );
+        let width = *hidden.dims().last().expect("hidden width");
+        let row = SweepRow::new(
+            layer,
+            &flat(hidden),
+            &reference.f32(&f32_key),
+            &reference.f32(&bf16_key),
+            width,
+            regions,
+        )
+        .expect("sweep row");
+        println!("{row}");
+        rows.push(row);
+    }
+    for line in dit_sweep::summary(&rows) {
+        println!("{line}");
+    }
+}
+
+/// SW-7092 diagnostic: block [`dit_sweep::ISOLATED_BLOCK`] run ALONE at step 0 from the reference's
+/// own input (`diag.sweep.{f32,bf16}.block{k-1}`), against `diag.sweep.{f32,bf16}.block{k}`, with
+/// per row class rel-L2 and the [`dit_sweep::PROBE`] massive activation. Three runs: the f32 input
+/// with the reference's own AdaLN tables (`diag.step0.block{k}.adaln`, spliced into the cache's
+/// step-0 rows), the f32 input with this backend's tables, and the bf16 input with this backend's
+/// tables (read against `vs-bf16`: diffusers' bf16 forward ran block k on exactly that input). A
+/// small error from the reference's input names the inherited error; a large one names block k's
+/// own compute. Printed, never asserted.
+fn image_edit_block_isolation(
+    reference: &common::Golden,
+    model: &candle_gen_minimax_h3::dit::ImageDit,
+    stream: DType,
+    regions: RowRegions,
+) {
+    use candle_gen_minimax_h3::dit::{AdaLnModulation, MODALITY_NUM};
+    let layer = dit_sweep::ISOLATED_BLOCK;
+    assert_eq!(
+        reference.meta("isolated_block").unwrap_or_default(),
+        layer.to_string(),
+        "the reference records the isolated block's AdaLN"
+    );
+    let dev = model.dit().device().clone();
+    let (in_f32_key, in_bf16_key) = (
+        format!("diag.sweep.f32.block{}", layer - 1),
+        format!("diag.sweep.bf16.block{}", layer - 1),
+    );
+    let input = |key: &str| {
+        reference
+            .tensor(key)
+            .to_dtype(stream)
+            .and_then(|t| t.to_device(&dev))
+            .expect("isolated block input")
+    };
+    let f32_out = reference.f32(&format!("diag.sweep.f32.block{layer}"));
+    let bf16_out = reference.f32(&format!("diag.sweep.bf16.block{layer}"));
+    let width = *reference
+        .shape(&format!("diag.sweep.f32.block{layer}"))
+        .last()
+        .expect("width");
+
+    let ours = model.adaln_cache().modulation(layer).expect("modulation");
+    let schedule = model.adaln_cache().schedule();
+    let want = reference.tensor(&format!("diag.step0.block{layer}.adaln"));
+    let rows_of = |table: &Tensor, class: usize| -> Tensor {
+        let g = schedule
+            .global_timestep_index(0, class)
+            .expect("timestep row") as usize;
+        table
+            .narrow(0, g * MODALITY_NUM, MODALITY_NUM)
+            .expect("rows")
+    };
+    let ours_step0: Vec<Tensor> = ours
+        .tables()
+        .map(|t| Tensor::cat(&[rows_of(t, 0), rows_of(t, 1)], 0).expect("cat"))
+        .collect();
+    println!(
+        "{}",
+        image_dit_stage_line(
+            0,
+            &format!("block{layer}.adaln"),
+            &Tensor::stack(&ours_step0, 0).expect("stack"),
+            &want
+        )
+    );
+    let spliced: Vec<Tensor> = ours
+        .tables()
+        .enumerate()
+        .map(|(i, table)| {
+            let reference_rows = want
+                .get(i)
+                .and_then(|t| t.to_dtype(table.dtype()))
+                .and_then(|t| t.to_device(&dev))
+                .expect("reference tables");
+            let total = table.dims()[0];
+            let mut table = table.clone();
+            for class in 0..2 {
+                let g = schedule
+                    .global_timestep_index(0, class)
+                    .expect("timestep row") as usize;
+                let block = reference_rows
+                    .narrow(0, class * MODALITY_NUM, MODALITY_NUM)
+                    .expect("block");
+                let mut parts = Vec::new();
+                if g > 0 {
+                    parts.push(table.narrow(0, 0, g * MODALITY_NUM).expect("head"));
+                }
+                parts.push(block);
+                let tail = (g + 1) * MODALITY_NUM;
+                if tail < total {
+                    parts.push(table.narrow(0, tail, total - tail).expect("tail"));
+                }
+                table = Tensor::cat(&parts, 0).expect("splice");
+            }
+            table
+        })
+        .collect();
+    let [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]: [Tensor; 6] =
+        spliced.try_into().expect("six tables");
+    let reference_adaln = AdaLnModulation {
+        shift_msa,
+        scale_msa,
+        gate_msa,
+        shift_mlp,
+        scale_mlp,
+        gate_mlp,
+    };
+    let (f32_in, bf16_in) = (input(&in_f32_key), input(&in_bf16_key));
+    let input_probe = dit_sweep::Located::at(
+        dit_sweep::PROBE,
+        &flat(&f32_in),
+        &reference.f32(&in_f32_key),
+        &reference.f32(&in_bf16_key),
+        width,
+        regions,
+    )
+    .expect("probe inside the sequence");
+    println!(
+        "isolated block {layer} input (block {} out, cast to {stream:?}): probe {input_probe}",
+        layer - 1
+    );
+    for (label, hidden, modulation) in [
+        (
+            "f32 input, reference AdaLN",
+            &f32_in,
+            Some(&reference_adaln),
+        ),
+        ("f32 input, own AdaLN", &f32_in, None),
+        ("bf16 input, own AdaLN", &bf16_in, None),
+    ] {
+        let got = flat(
+            &model
+                .block_forward(0, layer, hidden, modulation)
+                .expect("isolated block"),
+        );
+        let row =
+            SweepRow::new(layer, &got, &f32_out, &bf16_out, width, regions).expect("sweep row");
+        let probe =
+            dit_sweep::Located::at(dit_sweep::PROBE, &got, &f32_out, &bf16_out, width, regions)
+                .expect("probe inside the sequence");
+        println!("{}", dit_sweep::isolation_line(label, &row, &probe));
+    }
+}
+
 /// AC2 (candle): the `edit` presentation built with the snapshot's own tokenizer is the processor
 /// template's (`Picture i: ` + vision block per reference, then the prompt, no chat template), id
 /// for id and tag for tag, as diffusers' `MiniMaxH3ImageEditTextEncoderStep` builds it.
@@ -2218,6 +2415,12 @@ fn image_edit_reference_latents_match_the_official_diffusers_vae() {
 /// block 0's AdaLN tables, the residual stream after the `diag_layers`, `norm_out`'s output), the
 /// velocity error over the reference rows and the generated rows separately, step 3 on the step-0
 /// rows, and both asserted velocities against the reference's own bf16-compute forward.
+///
+/// Also printed at step 0: the per-block sweep (`diag.sweep.*`, `gen_core::h3_image::dit_sweep`)
+/// — after every block in `sweep_layers`, the error against the f32 and the bf16 reference and the
+/// reference's own bf16-vs-f32 drift, over all rows and per row class, with the largest reference
+/// activation and the largest error located — then the first block where this backend departs
+/// from diffusers' bf16 compute.
 #[test]
 #[ignore = "needs MINIMAX_H3_IMAGE_SNAPSHOT (transformer_diffusers/) + MINIMAX_H3_IMAGE_EDIT_REFERENCE; 66 GB bf16 DiT"]
 fn image_edit_first_step_matches_the_official_diffusers_transformer() {
@@ -2268,6 +2471,11 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
     );
     let num_ref = layout.num_reference_rows();
     let num_packed = layout.num_packed_image_rows();
+    let sweep_regions = RowRegions {
+        text: layout.num_text_tokens(),
+        reference: num_ref,
+        generated: num_packed - num_ref,
+    };
 
     let schedule = SigmaSchedule::h3_image_distilled().expect("schedule");
     let want_t: Vec<f32> = reference
@@ -2284,6 +2492,13 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
     let diag_layers: Vec<usize> = reference
         .meta("diag_layers")
         .expect("the reference records its diag_layers")
+        .split(',')
+        .map(|k| k.parse().unwrap())
+        .collect();
+    assert_eq!(reference.meta("sweep_step").unwrap_or_default(), "0");
+    let sweep_layers: Vec<usize> = reference
+        .meta("sweep_layers")
+        .expect("the reference records its sweep_layers")
         .split(',')
         .map(|k| k.parse().unwrap())
         .collect();
@@ -2333,7 +2548,11 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
         }
     };
     let run = |model: &mut ImageDit, step: usize| -> Tensor {
-        let mut trace = ImageDitTrace::new(&diag_layers);
+        let mut layers = diag_layers.clone();
+        if step == 0 {
+            layers.extend(&sweep_layers);
+        }
+        let mut trace = ImageDitTrace::new(&layers);
         let got = host(
             &model
                 .forward_traced(step, &rows, &mut trace)
@@ -2374,7 +2593,7 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
             ),
             image_dit_stage_line(step, "block0.adaln", &block0, &d("block0.adaln")),
         ];
-        for (layer, hidden) in &trace.hidden {
+        for (layer, hidden) in trace.hidden.iter().filter(|(l, _)| diag_layers.contains(l)) {
             lines.push(image_dit_stage_line(
                 step,
                 &format!("hidden.block{layer}"),
@@ -2394,6 +2613,11 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
             println!("{line}");
         }
         regions(step, "velocity", &got, &want);
+        if step == 0 {
+            image_edit_block_sweep(&reference, &trace, &sweep_layers, sweep_regions);
+            let stream = trace.hidden[0].1.dtype();
+            image_edit_block_isolation(&reference, model, stream, sweep_regions);
+        }
         got
     };
     let got0 = run(&mut model, 0);
@@ -2433,7 +2657,7 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
     let (l3, c3) = image_dit_rel_l2_cosine(&got3, &want3);
     let (between, _) = image_dit_rel_l2_cosine(&want3, &want0);
     println!(
-        "image edit DiT vs diffusers (family bounds rel-L2 {DIT_PARITY_MAX_REL_L2:.0e}, cosine \
+        "image edit DiT vs diffusers (t2i rel-L2 bound {DIT_PARITY_MAX_REL_L2:.0e}; edit limit is 2x reference bf16 drift; cosine \
          {DIT_PARITY_MIN_COSINE}): step0 rel-L2 {l0:.3e} cosine {c0:.6}; step3 on-trajectory \
          rel-L2 {lt:.3e} cosine {ct:.6}; reference step0 vs step3 rel-L2 {between:.3e}"
     );
@@ -2445,10 +2669,23 @@ fn image_edit_first_step_matches_the_official_diffusers_transformer() {
         "image edit DiT step 3 off-trajectory (step-0 rows at t = 0.25; diagnostic, not \
          asserted): rel-L2 {l3:.3e} cosine {c3:.6} peak {p3:.3e} mean {m3:.3e}"
     );
-    for (what, l2, cos) in [("step 0", l0, c0), ("step 3 on-trajectory", lt, ct)] {
+    // The edit bound is relative to the reference's own bf16 rounding (see
+    // `EDIT_DIT_PARITY_MAX_RATIO_TO_REFERENCE_BF16`); `tensor` fails if the reference lacks it.
+    let (d0, _) = image_dit_rel_l2_cosine(&bf16_step0, &want0);
+    let (dt, _) = image_dit_rel_l2_cosine(&bf16_traj, &traj_want);
+    for ((what, l2, cos), drift) in [("step 0", l0, c0), ("step 3 on-trajectory", lt, ct)]
+        .into_iter()
+        .zip([d0 as f64, dt as f64])
+    {
+        let limit = edit_parity_limit(drift).unwrap_or_else(|e| panic!("{what}: {e}"));
+        println!(
+            "image edit DiT {what} gate: limit {limit:.3e}, reference bf16 drift {drift:.3e}, \
+             ours/drift ratio {:.3}",
+            l2 as f64 / drift
+        );
         assert!(
-            l2 <= DIT_PARITY_MAX_REL_L2,
-            "{what} diverges: rel-L2 {l2:.3e}"
+            (l2 as f64) <= limit,
+            "{what} diverges: rel-L2 {l2:.3e} > limit {limit:.3e}"
         );
         assert!(
             cos >= DIT_PARITY_MIN_COSINE,

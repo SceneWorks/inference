@@ -153,6 +153,15 @@ fn prepare_hf(spec: &PrepareSpec) -> Result<PrepareReport> {
     // shard headers only; then each shard is read, rounded and written on its own, so peak host
     // memory is one shard. The source dtype is preserved (the loader casts to its compute dtype).
     let mut config = read_json(&config_path)?;
+    // A ModelOpt NVFP4 source stores packed U8 projections plus scale companions; quantizing those
+    // bytes as ordinary weights would write a snapshot that cannot load. Refuse before any write.
+    if core_llm::modelopt::modelopt_nvfp4(&config) != Ok(None) {
+        return Err(Error::Unsupported(format!(
+            "prepare: {} is a ModelOpt-quantized checkpoint and cannot be re-quantized to Q4/Q8; \
+             run convert_snapshot_to_bf16 on it first, then prepare the bf16 output",
+            src.display()
+        )));
+    }
     let shards = safetensors_shards(src)?;
     if shards.is_empty() {
         return Err(Error::Msg(format!(
@@ -637,6 +646,46 @@ mod tests {
             );
         }
         assert!(!src.join("q4").exists());
+    }
+
+    /// A Q4/Q8 prepare of a ModelOpt-quantized source is refused before anything is written, and
+    /// the refusal names `convert_snapshot_to_bf16`; the dense passthrough is unaffected.
+    #[test]
+    fn a_quantized_prepare_refuses_a_modelopt_source_without_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let config = serde_json::json!({
+            "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+            "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 1,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "vocab_size": 8,
+            "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+            "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4",
+                                    "group_size": 16}
+        });
+        std::fs::write(src.join("config.json"), config.to_string()).unwrap();
+        std::fs::write(src.join("tokenizer.json"), "{}").unwrap();
+        let json =
+            br#"{"model.embed_tokens.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut shard = (json.len() as u64).to_le_bytes().to_vec();
+        shard.extend_from_slice(json);
+        shard.extend_from_slice(&[0; 4]);
+        std::fs::write(src.join("model.safetensors"), &shard).unwrap();
+
+        let out = root.path().join("out");
+        for q in [Quantize::Q4, Quantize::Q8] {
+            let err = prepare(&PrepareSpec::quantized(&src, &out, q)).unwrap_err();
+            assert!(
+                err.to_string().contains("convert_snapshot_to_bf16"),
+                "{err}"
+            );
+            assert!(!out.exists(), "nothing is written on refusal");
+        }
+        assert!(
+            prepare(&PrepareSpec::dense(&src, &out))
+                .unwrap()
+                .passthrough
+        );
     }
 
     /// sc-19375: the preparer stores blocks for exactly the tensors the loader quantizes and load

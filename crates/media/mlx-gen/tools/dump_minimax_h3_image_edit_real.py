@@ -51,14 +51,25 @@ float32 activations for the same reason the ``text2image`` gates do.
 * ``diag.step{0,3}.*`` — the reference's intermediate stages, recorded by forward hooks as in the
   ``text2image`` producer: ``temb`` (``[2, time_embed_dim]``, one row per distinct timestep in
   ascending order — the step's timestep, then the reference rows' ``0.999``), ``norm_out.shift`` /
-  ``norm_out.scale`` (same rows), ``block0.adaln`` (``[6, 2 * MODALITY_NUM, hidden_size]``),
-  ``hidden.block{k}`` for every ``k`` in ``diag_layers`` and ``pre_head``.
+  ``norm_out.scale`` (same rows), ``block0.adaln`` and ``block39.adaln`` (each
+  ``[6, 2 * MODALITY_NUM, hidden_size]``; block 39 is ``ISOLATED_BLOCK``, which the gates re-run
+  alone from ``diag.sweep.f32.block38`` with these tables), ``hidden.block{k}`` for every ``k`` in
+  ``diag_layers`` and ``pre_head``;
+* ``diag.sweep.{f32,bf16}.block{k}`` — the per-block sweep: the residual stream after every block
+  ``k`` in ``sweep_layers`` (every 5th block of the first half, block ``num_layers / 2 - 1``, then
+  every block of the second half) at step 0, from BOTH step-0 forwards: the float32-activation one
+  (stored float32) and the bf16-compute one (stored bfloat16, its own dtype, so losslessly). The
+  gates print, per block and per row class (text, reference, generated), their error against each
+  and the reference's own bf16-vs-f32 drift, so the first block where a backend departs from
+  diffusers' own bf16 rounding is named rather than inferred from three samples.
 
 Hash-pinned: the output carries ``producer_sha256``, the SHA-256 of THIS file's bytes, and the Rust
-gates compare it to the committed copy. The output is a few MB and is not committed.
+gates compare it to the committed copy. The output is not committed. It is ~0.47 GB, almost all of
+it the sweep: 31 blocks x ``[1, seq_len, hidden_size]`` (462 x 5376 here) at 9.9 MB float32 plus
+5.0 MB bfloat16.
 
 Run (CPU torch, in the reviewed Mage reference environment; ~70 GB of host RAM: the bf16 DiT plus
-one module's float32 copy):
+one module's float32 copy, plus the sweep's ~0.47 GB of retained block outputs):
 
     MINIMAX_H3_IMAGE_SNAPSHOT=<snapshot-root> python3 tools/dump_minimax_h3_image_edit_real.py \
         --out <dir>/edit-reference.safetensors
@@ -83,7 +94,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from safetensors.numpy import save_file
+from safetensors.torch import save_file
 
 SEED = 7092
 REFERENCE_COMMIT = "875373ac7f5856071e345a3e394c74efccc6b9e6"
@@ -106,6 +117,9 @@ REFERENCE_SIZES = ((160, 96), (330, 272), (128, 128))
 VISION_TOKENS = (16, 12, 20)
 PROMPT = "Put the striped object from <Picture 1> on the table in <Picture 2>, lit like <Picture 3>."
 TARGET_LATENT_HW = (32, 32)
+# The block the gates re-run alone from the float32 sweep's input (`gen_core::h3_image::dit_sweep`
+# `ISOLATED_BLOCK`); its AdaLN tables are recorded so the re-run can take the reference's own.
+ISOLATED_BLOCK = 39
 
 
 def load_pinned(module_name: str, relative: str, sha256: str, stub_tensor_parallel: bool):
@@ -272,6 +286,9 @@ class StageTaps:
         model.time_embedder.register_forward_hook(self._put("temb"))
         model.norm_out.linear.register_forward_hook(self._put("norm_out.linear"))
         model.transformer_blocks[0].adaln_proj.register_forward_hook(self._put("block0.adaln"))
+        model.transformer_blocks[ISOLATED_BLOCK].adaln_proj.register_forward_hook(
+            self._put(f"block{ISOLATED_BLOCK}.adaln")
+        )
         model.norm_out.register_forward_hook(self._put("pre_head"))
         for k in layers:
             model.transformer_blocks[k].register_forward_hook(self._put(f"hidden.block{k}"))
@@ -292,11 +309,42 @@ class StageTaps:
             f"diag.step{step}.norm_out.shift": f32(shift),
             f"diag.step{step}.norm_out.scale": f32(scale),
             f"diag.step{step}.block0.adaln": f32(torch.stack(seen["block0.adaln"])),
+            f"diag.step{step}.block{ISOLATED_BLOCK}.adaln": f32(torch.stack(seen[f"block{ISOLATED_BLOCK}.adaln"])),
             f"diag.step{step}.pre_head": f32(seen["pre_head"]),
         }
         for k in self.layers:
             out[f"diag.step{step}.hidden.block{k}"] = f32(seen[f"hidden.block{k}"])
         return out
+
+
+def sweep_layers(num_layers: int) -> tuple[int, ...]:
+    """Every 5th block of the first half, the first half's last block, every block of the second."""
+    half = num_layers // 2
+    return tuple(sorted(set(range(0, half, 5)) | {half - 1} | set(range(half, num_layers))))
+
+
+class BlockSweep:
+    """Forward hooks keeping the residual stream after every ``layers`` block, in its own dtype.
+
+    ``label`` names the forward being recorded (``None`` records nothing). An output is kept as the
+    block returned it — float32 under ``F32Compute``, bfloat16 without it — so the bf16 sweep is
+    stored losslessly. A block returns a fresh tensor (no later in-place op touches it), so keeping
+    the reference costs one ``[1, seq_len, hidden_size]`` tensor per block and no copy.
+    """
+
+    def __init__(self, model, layers: tuple[int, ...]):
+        self.layers = layers
+        self.label: str | None = None
+        self.seen: dict[str, torch.Tensor] = {}
+        for k in layers:
+            model.transformer_blocks[k].register_forward_hook(self._put(k))
+
+    def _put(self, k: int):
+        def hook(_module, _inputs, output):
+            if self.label is not None:
+                self.seen[f"diag.sweep.{self.label}.block{k}"] = output.detach().contiguous()
+
+        return hook
 
 
 def main() -> None:
@@ -389,6 +437,8 @@ def main() -> None:
     seq = position_ids.shape[0]
     diag_layers = (0, cfg.num_layers // 2 - 1, cfg.num_layers - 1)
     taps = StageTaps(model, diag_layers)
+    sweep = BlockSweep(model, sweep_layers(cfg.num_layers))
+    assert {ISOLATED_BLOCK - 1, ISOLATED_BLOCK} <= set(sweep.layers), "the isolated block's input and output"
     # Every top-level module holding bf16 parameters; `proj_in`, `time_embedder` and the heads are
     # float32 in the checkpoint already. The coverage assert inside refuses a missed one.
     f32 = F32Compute(
@@ -425,8 +475,10 @@ def main() -> None:
         f32.enabled = True
         for step in STEPS:
             taps.armed = True
+            sweep.label = "f32" if step == 0 else None
             outputs[step] = forward(image_rows, step)
             taps.armed = False
+            sweep.label = None
             assert taps.seen["hidden.block0"].dtype == torch.float32, "the block stack must run in float32"
             diag.update(taps.take(step))
         # On-trajectory step 3: the sampler's own x_3, reached from the same rows. Only the generated
@@ -441,7 +493,9 @@ def main() -> None:
         diag["diag.traj.out3"] = velocity.numpy().copy()
         # The reference's own rounding: the same two asserted inputs at bf16 compute.
         f32.enabled = False
+        sweep.label = "bf16"
         diag["diag.bf16.step0"] = forward(image_rows, 0).numpy().copy()
+        sweep.label = None
         diag["diag.bf16.traj.out3"] = forward(rows, 3).numpy().copy()
 
     tensors["in.context"] = context.to(torch.float32).numpy().copy()
@@ -452,6 +506,10 @@ def main() -> None:
     for step, out in outputs.items():
         tensors[f"out.step{step}"] = out.numpy().copy()
     tensors.update(diag)
+    for key, value in sweep.seen.items():
+        want = torch.bfloat16 if ".bf16." in key else torch.float32
+        assert value.dtype == want, f"{key} is {value.dtype}, expected {want}"
+    assert len(sweep.seen) == 2 * len(sweep.layers), sorted(sweep.seen)
     meta = {
         "provenance": "converted-checkpoint",
         "reference": "diffusers.MiniMaxH3ImageTransformer2DModel+AutoencoderKLMiniMaxH3Image",
@@ -472,12 +530,19 @@ def main() -> None:
         "steps": ",".join(str(s) for s in STEPS),
         "timesteps": ",".join(f"{timesteps[s].item():.9g}" for s in STEPS),
         "diag_layers": ",".join(str(k) for k in diag_layers),
+        "sweep_layers": ",".join(str(k) for k in sweep.layers),
+        "sweep_step": "0",
+        "isolated_block": str(ISOLATED_BLOCK),
+        "sweep_dtypes": "diag.sweep.f32.* float32, diag.sweep.bf16.* bfloat16",
         "producer": "crates/media/mlx-gen/tools/dump_minimax_h3_image_edit_real.py",
         "producer_sha256": producer_sha256,
         "story": "SW-7092",
     }
     out_path = Path(args.out).expanduser()
-    save_file(tensors, str(out_path), metadata=meta)
+    # `safetensors.torch` rather than `.numpy`: numpy has no bfloat16 for the bf16 sweep.
+    payload = {k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in tensors.items()}
+    payload.update(sweep.seen)
+    save_file(payload, str(out_path), metadata=meta)
     print(f"wrote {out_path} from {meta['reference']} {meta['reference_version']} @ {snapshot.name}")
     print(f"producer_sha256 {producer_sha256}")
 

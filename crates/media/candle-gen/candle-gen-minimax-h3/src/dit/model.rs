@@ -52,7 +52,7 @@ use candle_gen::{CandleError, Result, Weights};
 
 use crate::denoise::{JointStep, JointVelocity, PackedLayout};
 use crate::dit::adaln::{AdaLnCache, AdaLnResidency, TimestepSchedule};
-use crate::dit::block::DitBlock;
+use crate::dit::block::{AdaLnModulation, DitBlock};
 use crate::dit::config::{MiniMaxH3DitConfig, MODALITY_NUM};
 use crate::dit::curve::CurveAdaLn;
 use crate::dit::heads::{AdaLayerNormOut, DitProjections, NormOutModulation};
@@ -1539,6 +1539,53 @@ impl ImageDit {
     /// `norm_out`'s per-timestep `(shift, scale)` table.
     pub fn norm_out_modulation(&self) -> &NormOutModulation {
         &self.norm_out
+    }
+
+    /// Block `layer` alone at sampling step `step`, over a packed residual stream `hidden`
+    /// (`[1, seq_len, hidden_size]`, the stream dtype) — the diagnostic the real-weight edit gate
+    /// runs from the reference's own block input, to separate the block's compute from the error
+    /// it inherits (SW-7092). `modulation` defaults to the block's cached tables; a caller may hand
+    /// in tables of the cache's shape instead (the reference's own projection). Not counted as a
+    /// forward.
+    pub fn block_forward(
+        &self,
+        step: usize,
+        layer: usize,
+        hidden: &Tensor,
+        modulation: Option<&AdaLnModulation>,
+    ) -> Result<Tensor> {
+        let block = self.dit.blocks.get(layer).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "minimax-h3-image dit: block {layer} is outside the {}-block stack",
+                self.dit.blocks.len()
+            ))
+        })?;
+        let device = self.dit.device.clone();
+        let adaln_indices = self.cache.schedule().adaln_indices(
+            step,
+            &self.row_classes,
+            &self.token_tags,
+            &device,
+        )?;
+        let modulation = match modulation {
+            Some(m) => m,
+            None => self.cache.modulation(layer)?,
+        };
+        crate::dit::block::check_adaln_indices(&adaln_indices, modulation.scale_msa.dims()[0])?;
+        let transferred;
+        let block = if self.dit.stream_window.is_some() {
+            transferred = block.copy_to_device(&device)?;
+            &transferred
+        } else {
+            block
+        };
+        block.forward(
+            hidden,
+            modulation,
+            &adaln_indices,
+            &self.dit.rope,
+            &self.tables,
+        )
     }
 
     /// One step's velocity, also recording the stages `trace` asks for — the diagnostic twin of

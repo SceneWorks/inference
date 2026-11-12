@@ -33,15 +33,33 @@
 //! `preserve_thinking` on). The card ships no edit-specific parameters; the Diffusers blocks it
 //! recommends reuse the T2I ones for edit, and so does this adapter.
 //!
-//! The JSON schema the card enforces through XGrammar is enforced here by [`parse_t2i`] /
-//! [`parse_edit`] on the finished answer: a reply that is not exactly the schema is refused, never
-//! repaired.
+//! The card serves the expander with a reasoning parser and XGrammar (`--reasoning-parser qwen3
+//! --grammar-backend xgrammar --constrained-json-disable-any-whitespace`, `response_format` = the
+//! reply schema): the thinking trace is free, the answer after `</think>` is schema-constrained
+//! compact JSON, and the client (`scripts/expand_prompt.py`) `json.loads` it with no retry,
+//! fallback or extraction. This adapter mirrors that: every request carries a
+//! [`Constraint::JsonSchema`], which both backends apply only after the reasoning block closes
+//! (an unconstrained run produced non-JSON answers, SW-7099 run 42954971396, candle-bf16 `t2i-0`
+//! and mlx-q4 `t2i-3`).
+//!
+//! - **T2I** uses the schema `request_params.json` publishes (`response_format.json_schema.schema`:
+//!   both keys required, `aspect_ratio` from the enum, no other property), read from the snapshot.
+//! - **Edit**: upstream publishes no edit schema (the card's client is T2I-only), so
+//!   [`edit_reply_schema`] states the one the edit task prompt specifies — exactly
+//!   `expanded_caption` then `target_aspect_ratio`, the ratio a positive-integer `W:H`, and, for an
+//!   explicit selection, that exact string.
+//!
+//! [`parse_t2i`] / [`parse_edit`] still check the finished answer (a non-empty caption, a ratio the
+//! schema cannot express such as a `u64` overflow): a reply that is not exactly the schema is
+//! refused, never repaired.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::constraint::Constraint;
+use crate::json_schema::JsonSchema;
 use crate::message::{Content, ImageRef, Message, Role};
 use crate::request::{ReasoningEffort, Sampling, TextLlmRequest, ThinkingMode};
 
@@ -73,6 +91,8 @@ pub struct RequestParams {
     pub preserve_thinking: Option<bool>,
     /// The T2I reply's allowed `aspect_ratio` values, in the schema's order.
     pub aspect_ratios: Vec<String>,
+    /// The T2I reply schema (`response_format.json_schema.schema`), compiled.
+    pub t2i_schema: JsonSchema,
 }
 
 /// The verified prompt files of one snapshot.
@@ -178,6 +198,11 @@ pub fn parse_request_params(text: &str) -> Result<RequestParams, String> {
         .map(|r| r.as_str().map(str::to_string))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| format!("{REPO}: {T2I_PARAMS} aspect_ratio enum is not all strings"))?;
+    let schema = v
+        .pointer("/response_format/json_schema/schema")
+        .ok_or_else(|| format!("{REPO}: {T2I_PARAMS} has no response_format schema"))?;
+    let t2i_schema = JsonSchema::compile(schema)
+        .map_err(|e| format!("{REPO}: {T2I_PARAMS} response_format: {e}"))?;
     let min_p = v.get("min_p").and_then(Value::as_f64).unwrap_or(0.0);
     if min_p != 0.0 {
         return Err(format!("{REPO}: min_p {min_p} is not supported"));
@@ -203,6 +228,7 @@ pub fn parse_request_params(text: &str) -> Result<RequestParams, String> {
         enable_thinking: kwarg("enable_thinking").unwrap_or(true),
         preserve_thinking: kwarg("preserve_thinking"),
         aspect_ratios: ratios,
+        t2i_schema,
     })
 }
 
@@ -242,7 +268,7 @@ pub fn python_format_one(template: &str, arg: &str) -> Result<String, String> {
     Ok(out)
 }
 
-fn request(messages: Vec<Message>, params: &RequestParams) -> TextLlmRequest {
+fn request(messages: Vec<Message>, params: &RequestParams, schema: JsonSchema) -> TextLlmRequest {
     let mut req = TextLlmRequest::new(messages, params.max_new_tokens);
     req.sampling = params.sampling;
     req.thinking = if params.enable_thinking {
@@ -252,7 +278,34 @@ fn request(messages: Vec<Message>, params: &RequestParams) -> TextLlmRequest {
     };
     req.reasoning_effort = params.reasoning_effort;
     req.preserve_thinking = params.preserve_thinking;
+    // Upstream constrains the answer with XGrammar after the reasoning parser splits the thinking
+    // off (module docs); the backends apply this constraint only after `</think>`.
+    req.constraint = Some(Constraint::JsonSchema(schema));
     req
+}
+
+/// The `target_aspect_ratio` shape [`is_ratio`] accepts: two positive integers, `W:H`.
+const RATIO_PATTERN: &str = "^0*[1-9][0-9]*:0*[1-9][0-9]*$";
+
+/// The edit reply schema the edit task prompt specifies (upstream publishes none): exactly
+/// `expanded_caption` and `target_aspect_ratio`, in that order; the ratio a positive-integer
+/// `W:H`, or exactly the selection when one is explicit.
+pub fn edit_reply_schema(aspect: &AspectSelection) -> Result<JsonSchema, String> {
+    let ratio = match aspect {
+        AspectSelection::Adaptive => {
+            serde_json::json!({"type": "string", "pattern": RATIO_PATTERN})
+        }
+        AspectSelection::Explicit(r) => serde_json::json!({"type": "string", "enum": [r]}),
+    };
+    JsonSchema::compile(&serde_json::json!({
+        "type": "object",
+        "properties": {
+            "expanded_caption": {"type": "string"},
+            "target_aspect_ratio": ratio
+        },
+        "required": ["expanded_caption", "target_aspect_ratio"],
+        "additionalProperties": false
+    }))
 }
 
 /// The text-to-image expansion request for a short `prompt`.
@@ -268,6 +321,7 @@ pub fn t2i_request(files: &PromptFiles, prompt: &str) -> Result<TextLlmRequest, 
             Message::text(Role::User, user),
         ],
         &files.params,
+        files.params.t2i_schema.clone(),
     ))
 }
 
@@ -390,7 +444,11 @@ pub fn edit_request(
         thinking: None,
         tool_calls: Vec::new(),
     };
-    Ok(request(vec![message], &files.params))
+    Ok(request(
+        vec![message],
+        &files.params,
+        edit_reply_schema(aspect)?,
+    ))
 }
 
 /// A parsed expansion.
@@ -643,6 +701,9 @@ pub mod quality {
         /// The last [`THINKING_TAIL_CHARS`] characters of the reasoning trace, kept as evidence
         /// for a reply that broke the schema (a looping or unfinished trace shows here).
         pub thinking_tail: Option<String>,
+        /// The first [`ANSWER_HEAD_CHARS`] characters of the raw answer (the text after the
+        /// thinking block), kept as evidence for a reply that broke the schema.
+        pub answer_head: Option<String>,
     }
 
     /// Base seed of the quality set; case `i` of the run uses `QUALITY_SEED + i`, so a rerun on
@@ -651,6 +712,15 @@ pub mod quality {
 
     /// How much of a failed reply's reasoning trace the evidence keeps.
     pub const THINKING_TAIL_CHARS: usize = 800;
+
+    /// How much of a failed reply's raw answer the evidence keeps.
+    pub const ANSWER_HEAD_CHARS: usize = 800;
+
+    /// What every quality-set request constrains its answer to, as the evidence states it.
+    pub const ANSWER_CONSTRAINT: &str =
+        "json_schema: compact schema-conforming JSON after </think> (upstream: XGrammar \
+         response_format, any_whitespace off); t2i schema from request_params.json, edit schema \
+         from edit_reply_schema; parse_t2i/parse_edit re-check the answer";
 
     /// Judge a finished reply: the parsed expansion, or why it is refused. A reply that stopped on
     /// the token budget is named as a truncation — in the reasoning trace (no answer text at all)
@@ -704,6 +774,9 @@ pub mod quality {
                 }
                 _ => None,
             };
+            let answer_head = error
+                .as_ref()
+                .map(|_| out.text.chars().take(ANSWER_HEAD_CHARS).collect());
             runs.push(CaseRun {
                 id,
                 expansion,
@@ -711,6 +784,7 @@ pub mod quality {
                 generated_tokens: out.usage.generated_tokens,
                 finish_reason: out.finish_reason.map(|f| format!("{f:?}").to_lowercase()),
                 thinking_tail,
+                answer_head,
             });
             Ok(())
         };
@@ -740,10 +814,16 @@ pub mod quality {
                     "generated_tokens": r.generated_tokens,
                     "finish_reason": r.finish_reason,
                     "thinking_tail": r.thinking_tail,
+                    "answer_head": r.answer_head,
                 })
             })
             .collect();
-        serde_json::json!({"label": label, "revision": super::REVISION, "cases": cases})
+        serde_json::json!({
+            "label": label,
+            "revision": super::REVISION,
+            "answer_constraint": ANSWER_CONSTRAINT,
+            "cases": cases,
+        })
     }
 
     /// Read the reference expansions back out of [`runs_to_json`]'s document, by case id.
@@ -823,8 +903,15 @@ mod tests {
                     "reasoning_effort": "xhigh", "temperature": 1.0, "top_p": 0.95, "top_k": 20,
                     "min_p": 0.0, "presence_penalty": 0.0, "repetition_penalty": 1.0,
                     "chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true},
-                    "response_format": {"json_schema": {"schema": {"properties": {
-                        "aspect_ratio": {"enum": ["1:1", "16:9"]}}}}},
+                    "response_format": {"type": "json_schema", "json_schema": {
+                        "name": "synthetic", "strict": true, "schema": {
+                        "type": "object",
+                        "properties": {
+                            "expanded_caption": {"type": "string"},
+                            "aspect_ratio": {"type": "string", "enum": ["1:1", "16:9"]}
+                        },
+                        "required": ["expanded_caption", "aspect_ratio"],
+                        "additionalProperties": false}}},
                     "max_tokens": 4096
                 })
                 .to_string(),
@@ -861,6 +948,16 @@ mod tests {
         assert_eq!(req.thinking, ThinkingMode::Enabled);
         assert_eq!(req.reasoning_effort, Some(ReasoningEffort::XHigh));
         assert_eq!(req.preserve_thinking, Some(true));
+        let Some(Constraint::JsonSchema(schema)) = &req.constraint else {
+            panic!(
+                "the t2i request is schema-constrained: {:?}",
+                req.constraint
+            )
+        };
+        assert_eq!(schema, &files.params().t2i_schema);
+        assert!(schema.accepts(r#"{"expanded_caption":"A cat.","aspect_ratio":"16:9"}"#));
+        assert!(!schema.accepts(r#"{"expanded_caption":"A cat.","aspect_ratio":"4:3"}"#));
+        assert!(!schema.accepts(r#"{"expanded_caption": "A cat.","aspect_ratio":"1:1"}"#));
         assert_eq!(files.params().aspect_ratios, ["1:1", "16:9"]);
     }
 
@@ -888,6 +985,12 @@ mod tests {
         let case = &cases[1];
         let req = edit_request(&files, case.instruction, &case.references, &case.aspect).unwrap();
         assert_eq!(req.messages.len(), 1);
+        assert_eq!(
+            req.constraint,
+            Some(Constraint::JsonSchema(
+                edit_reply_schema(&case.aspect).unwrap()
+            ))
+        );
         let parts = &req.messages[0].content;
         assert_eq!(parts.len(), 2 + 2 * 2 + 1);
         assert_eq!(parts[0], Content::text("EDIT TASK"));
@@ -1012,6 +1115,7 @@ mod tests {
                 generated_tokens: 9,
                 finish_reason: Some("stop".into()),
                 thinking_tail: None,
+                answer_head: None,
             },
             CaseRun {
                 id: "edit-0".into(),
@@ -1020,6 +1124,7 @@ mod tests {
                 generated_tokens: 7,
                 finish_reason: Some("stop".into()),
                 thinking_tail: None,
+                answer_head: None,
             },
         ];
         let doc = runs_to_json("nvfp4", &reference);
@@ -1073,6 +1178,98 @@ mod tests {
         assert!(stopped.contains("not JSON"), "{stopped}");
         let ok = r#"{"expanded_caption":"A cat.","aspect_ratio":"1:1"}"#;
         assert!(judge_reply(ok, Some(FinishReason::Length), 4096, &parse).is_ok());
+    }
+
+    #[test]
+    fn every_quality_request_is_json_constrained_and_a_refused_answer_is_kept() {
+        use crate::output::{StreamEvent, TextLlmOutput};
+        use crate::{TextLlm, TextLlmDescriptor};
+        // Answers every request with prose, as an unconstrained run did (run 42954971396).
+        struct Prose(std::cell::RefCell<Vec<Option<Constraint>>>);
+        impl TextLlm for Prose {
+            fn descriptor(&self) -> &TextLlmDescriptor {
+                unreachable!("run_set never reads the descriptor")
+            }
+            fn validate(&self, _: &TextLlmRequest) -> crate::Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                req: &TextLlmRequest,
+                _: &mut dyn FnMut(StreamEvent),
+            ) -> crate::Result<TextLlmOutput> {
+                self.0.borrow_mut().push(req.constraint.clone());
+                Ok(TextLlmOutput {
+                    text: "Here is the caption: a red bicycle.".into(),
+                    thinking: Some("plan".into()),
+                    finish_reason: Some(crate::FinishReason::Stop),
+                    ..Default::default()
+                })
+            }
+        }
+        let (dir, digest) = synthetic_tree();
+        let files = PromptFiles::load_with_manifest_digest(dir.path(), &digest).unwrap();
+        let llm = Prose(Default::default());
+        let runs = quality::run_set(&llm, &files).unwrap();
+        let seen = llm.0.borrow();
+        assert_eq!(seen.len(), runs.len());
+        assert!(
+            seen.iter()
+                .all(|c| matches!(c, Some(Constraint::JsonSchema(_)))),
+            "{seen:?}"
+        );
+        for run in &runs {
+            assert!(run.expansion.is_none());
+            assert!(
+                run.error.as_deref().unwrap().contains("not JSON"),
+                "{run:?}"
+            );
+            assert_eq!(
+                run.answer_head.as_deref(),
+                Some("Here is the caption: a red bicycle.")
+            );
+            assert_eq!(run.thinking_tail.as_deref(), Some("plan"));
+        }
+        let doc = quality::runs_to_json("candle-bf16", &runs);
+        assert_eq!(doc["answer_constraint"], quality::ANSWER_CONSTRAINT);
+        assert_eq!(
+            doc["cases"][0]["answer_head"],
+            "Here is the caption: a red bicycle."
+        );
+    }
+
+    #[test]
+    fn the_edit_reply_schema_follows_the_selection() {
+        let adaptive = edit_reply_schema(&AspectSelection::Adaptive).unwrap();
+        for ok in ["16:9", "09:16", "1024:768"] {
+            let doc = format!(r#"{{"expanded_caption":"B","target_aspect_ratio":"{ok}"}}"#);
+            assert!(adaptive.accepts(&doc), "{doc}");
+            assert!(is_ratio(ok));
+        }
+        for bad in ["0:9", "adaptive", "16 : 9", "16:"] {
+            let doc = format!(r#"{{"expanded_caption":"B","target_aspect_ratio":"{bad}"}}"#);
+            assert!(!adaptive.accepts(&doc), "{doc}");
+            assert!(!is_ratio(bad));
+        }
+        assert!(!adaptive.accepts(r#"{"target_aspect_ratio":"1:1","expanded_caption":"B"}"#));
+        let explicit = edit_reply_schema(&AspectSelection::Explicit("4:5".into())).unwrap();
+        assert!(explicit.accepts(r#"{"expanded_caption":"B","target_aspect_ratio":"4:5"}"#));
+        assert!(!explicit.accepts(r#"{"expanded_caption":"B","target_aspect_ratio":"16:9"}"#));
+    }
+
+    #[test]
+    fn a_published_schema_outside_the_subset_is_refused_at_load() {
+        let mut params: Value = serde_json::from_str(
+            r#"{"temperature":1.0,"top_p":0.95,"top_k":20,"max_tokens":4096,
+                "response_format":{"json_schema":{"schema":{"type":"object",
+                "properties":{"aspect_ratio":{"type":"string","enum":["1:1"]}},
+                "required":["aspect_ratio"],"additionalProperties":false}}}}"#,
+        )
+        .unwrap();
+        assert!(parse_request_params(&params.to_string()).is_ok());
+        params["response_format"]["json_schema"]["schema"]["additionalProperties"] = true.into();
+        let err = parse_request_params(&params.to_string()).unwrap_err();
+        assert!(err.contains("additionalProperties"), "{err}");
     }
 
     #[test]

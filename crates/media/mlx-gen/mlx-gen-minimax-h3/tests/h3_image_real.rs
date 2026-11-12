@@ -25,10 +25,13 @@ use mlx_gen_minimax_h3::tensor::slice_axis;
 /// The committed producer whose output the parity gate accepts.
 const DIT_PRODUCER: &[u8] = include_bytes!("../../tools/dump_minimax_h3_image_dit_real.py");
 
+use mlx_gen::gen_core::h3_image::dit_sweep::{self, RowRegions, SweepRow};
+
 /// The family DiT parity bounds (requirement E9), shared with the Candle gate: a bf16 50-block DiT
 /// against the diffusers forward (CPU torch, float32 activations over the same bf16-stored weights).
 use mlx_gen::gen_core::h3_image::{
-    DIT_PARITY_MAX_REL_L2 as DIT_REL_L2_TOL, DIT_PARITY_MIN_COSINE as DIT_MIN_COSINE,
+    edit_parity_limit, DIT_PARITY_MAX_REL_L2 as DIT_REL_L2_TOL,
+    DIT_PARITY_MIN_COSINE as DIT_MIN_COSINE,
 };
 
 fn image_snapshot() -> PathBuf {
@@ -488,6 +491,191 @@ fn peak_rel(got: &Array, want: &Array) -> f32 {
         / peak
 }
 
+/// Print the per-block sweep of one traced step-0 forward against the reference's
+/// `diag.sweep.{f32,bf16}.block{k}` (see `gen_core::h3_image::dit_sweep`). Diagnostic only.
+fn edit_block_sweep(r: &Weights, trace: &ImageDitTrace, layers: &[usize], regions: RowRegions) {
+    println!(
+        "sweep (step 0): per block, rel-L2 vs the f32 reference, vs the bf16 reference, and the \
+         reference's own bf16-vs-f32 drift — all rows, then text / reference / generated rows"
+    );
+    let mut rows = Vec::with_capacity(layers.len());
+    for &layer in layers {
+        let (_, hidden) = trace
+            .hidden
+            .iter()
+            .find(|(l, _)| *l == layer)
+            .unwrap_or_else(|| panic!("the trace recorded block {layer}"));
+        let f32_ref = r.require(&format!("diag.sweep.f32.block{layer}")).unwrap();
+        let bf16_ref = r.require(&format!("diag.sweep.bf16.block{layer}")).unwrap();
+        assert_eq!(hidden.shape(), f32_ref.shape(), "sweep block {layer} shape");
+        assert_eq!(
+            bf16_ref.dtype(),
+            Dtype::Bfloat16,
+            "sweep block {layer} bf16 dtype"
+        );
+        let width = *hidden.shape().last().unwrap() as usize;
+        let row = SweepRow::new(
+            layer,
+            &host_f32(hidden),
+            &host_f32(f32_ref),
+            &host_f32(bf16_ref),
+            width,
+            regions,
+        )
+        .unwrap();
+        println!("{row}");
+        rows.push(row);
+    }
+    for line in dit_sweep::summary(&rows) {
+        println!("{line}");
+    }
+}
+
+/// `table` with row block `g` (`MODALITY_NUM` rows) replaced by `block`.
+fn splice_row_block(table: &Array, g: i32, block: &Array) -> Array {
+    let rows = mlx_gen_minimax_h3::dit::MODALITY_NUM;
+    let total = table.shape()[0];
+    let mut parts = Vec::new();
+    if g > 0 {
+        parts.push(slice_axis(table, 0, 0, g * rows).unwrap());
+    }
+    parts.push(block.as_dtype(table.dtype()).unwrap());
+    if (g + 1) * rows < total {
+        parts.push(slice_axis(table, 0, (g + 1) * rows, total).unwrap());
+    }
+    mlx_rs::ops::concatenate_axis(&parts, 0).unwrap()
+}
+
+/// SW-7092 diagnostic: block [`dit_sweep::ISOLATED_BLOCK`] run ALONE at step 0 from the reference's
+/// own input (`diag.sweep.{f32,bf16}.block{k-1}`), against `diag.sweep.{f32,bf16}.block{k}`, with
+/// per row class rel-L2 and the [`dit_sweep::PROBE`] massive activation. Three runs: the f32 input
+/// with the reference's own AdaLN tables (`diag.step0.block{k}.adaln`, spliced into the cache's
+/// step-0 rows), the f32 input with this backend's tables, and the bf16 input with this backend's
+/// tables (read against `vs-bf16`: diffusers' bf16 forward ran block k on exactly that input). A
+/// small error from the reference's input names the inherited error; a large one names block k's
+/// own compute. Printed, never asserted.
+fn edit_block_isolation(r: &Weights, denoiser: &ImageDenoiser, stream: Dtype, regions: RowRegions) {
+    use mlx_gen_minimax_h3::dit::{AdaLnModulation, MODALITY_NUM};
+    let layer = dit_sweep::ISOLATED_BLOCK;
+    assert_eq!(
+        r.metadata("isolated_block").unwrap_or_default(),
+        layer.to_string(),
+        "the reference records the isolated block's AdaLN"
+    );
+    let input = |dtype: &str| {
+        r.require(&format!("diag.sweep.{dtype}.block{}", layer - 1))
+            .unwrap()
+            .as_dtype(stream)
+            .unwrap()
+    };
+    let f32_out = host_f32(r.require(&format!("diag.sweep.f32.block{layer}")).unwrap());
+    let bf16_out = host_f32(r.require(&format!("diag.sweep.bf16.block{layer}")).unwrap());
+    let width = *r
+        .require(&format!("diag.sweep.f32.block{layer}"))
+        .unwrap()
+        .shape()
+        .last()
+        .unwrap() as usize;
+
+    let ours = denoiser.adaln_cache().modulation(layer).unwrap();
+    let schedule = denoiser.adaln_cache().schedule();
+    let want = r
+        .require(&format!("diag.step0.block{layer}.adaln"))
+        .unwrap();
+    let ours_step0: Vec<Array> = ours
+        .tables()
+        .map(|table| {
+            let parts: Vec<Array> = (0..2)
+                .map(|class| {
+                    let g = schedule.global_timestep_index(0, class).unwrap();
+                    slice_axis(table, 0, g * MODALITY_NUM, (g + 1) * MODALITY_NUM).unwrap()
+                })
+                .collect();
+            mlx_rs::ops::concatenate_axis(&parts, 0).unwrap()
+        })
+        .collect();
+    println!(
+        "{}",
+        stage_line(
+            0,
+            &format!("block{layer}.adaln"),
+            &mlx_rs::ops::stack_axis(&ours_step0, 0).unwrap(),
+            want
+        )
+    );
+    let spliced: Vec<Array> = ours
+        .tables()
+        .enumerate()
+        .map(|(i, table)| {
+            let reference = slice_axis(want, 0, i as i32, i as i32 + 1)
+                .unwrap()
+                .squeeze_axes(&[0])
+                .unwrap();
+            let mut table = table.clone();
+            for class in 0..2 {
+                let g = schedule.global_timestep_index(0, class).unwrap();
+                let block = slice_axis(
+                    &reference,
+                    0,
+                    class * MODALITY_NUM,
+                    (class + 1) * MODALITY_NUM,
+                )
+                .unwrap();
+                table = splice_row_block(&table, g, &block);
+            }
+            table
+        })
+        .collect();
+    let [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]: [Array; 6] =
+        spliced.try_into().unwrap();
+    let reference_adaln = AdaLnModulation {
+        shift_msa,
+        scale_msa,
+        gate_msa,
+        shift_mlp,
+        scale_mlp,
+        gate_mlp,
+    };
+    let f32_in = input("f32");
+    let bf16_in = input("bf16");
+    let input_probe = dit_sweep::Located::at(
+        dit_sweep::PROBE,
+        &host_f32(&f32_in),
+        &host_f32(
+            r.require(&format!("diag.sweep.f32.block{}", layer - 1))
+                .unwrap(),
+        ),
+        &host_f32(&bf16_in),
+        width,
+        regions,
+    )
+    .unwrap();
+    println!(
+        "isolated block {layer} input (block {} out, cast to {stream:?}): probe {input_probe}",
+        layer - 1
+    );
+    for (label, hidden, modulation) in [
+        (
+            "f32 input, reference AdaLN",
+            &f32_in,
+            Some(&reference_adaln),
+        ),
+        ("f32 input, own AdaLN", &f32_in, None),
+        ("bf16 input, own AdaLN", &bf16_in, None),
+    ] {
+        let got = denoiser
+            .block_forward(0, layer, hidden, modulation)
+            .unwrap();
+        mlx_rs::transforms::eval([&got]).unwrap();
+        let got = host_f32(&got);
+        let row = SweepRow::new(layer, &got, &f32_out, &bf16_out, width, regions).unwrap();
+        let probe =
+            dit_sweep::Located::at(dit_sweep::PROBE, &got, &f32_out, &bf16_out, width, regions)
+                .unwrap();
+        println!("{}", dit_sweep::isolation_line(label, &row, &probe));
+    }
+}
+
 /// AC2: the `edit` presentation this crate builds with the snapshot's own tokenizer — a
 /// `Picture i: ` label and a vision block per reference, then the prompt, no chat template — is
 /// the processor template's, id for id and tag for tag, as diffusers'
@@ -613,6 +801,12 @@ fn h3_image_edit_reference_latents_match_diffusers() {
 /// residual stream after the `diag_layers`, `norm_out`'s output), the velocity error over the
 /// reference rows and over the generated rows separately, step 3 on the step-0 rows, and both
 /// asserted velocities against the reference's own bf16-compute forward (`diag.bf16.*`).
+///
+/// Also printed at step 0: the per-block sweep (`diag.sweep.*`, `gen_core::h3_image::dit_sweep`)
+/// — after every block in `sweep_layers`, the error against the f32 and the bf16 reference and the
+/// reference's own bf16-vs-f32 drift, over all rows and per row class, with the largest reference
+/// activation and the largest error located — then the first block where this backend departs
+/// from diffusers' bf16 compute.
 #[test]
 #[ignore = "needs MINIMAX_H3_IMAGE_SNAPSHOT + MINIMAX_H3_IMAGE_EDIT_REFERENCE; ~40 GB resident"]
 fn h3_image_edit_first_step_matches_diffusers() {
@@ -670,6 +864,11 @@ fn h3_image_edit_first_step_matches_diffusers() {
     );
     let num_ref = layout.num_reference_rows();
     let num_packed = layout.num_packed_image_rows();
+    let sweep_regions = RowRegions {
+        text: layout.num_text_tokens() as usize,
+        reference: num_ref as usize,
+        generated: (num_packed - num_ref) as usize,
+    };
     let denoiser = ImageDenoiser::new(
         dit,
         layout,
@@ -692,6 +891,13 @@ fn h3_image_edit_first_step_matches_diffusers() {
     let diag_layers: Vec<usize> = r
         .metadata("diag_layers")
         .expect("the reference records its diag_layers")
+        .split(',')
+        .map(|k| k.parse().unwrap())
+        .collect();
+    assert_eq!(r.metadata("sweep_step").unwrap_or_default(), "0");
+    let sweep_layers: Vec<usize> = r
+        .metadata("sweep_layers")
+        .expect("the reference records its sweep_layers")
         .split(',')
         .map(|k| k.parse().unwrap())
         .collect();
@@ -725,7 +931,11 @@ fn h3_image_edit_first_step_matches_diffusers() {
     };
     let mut results = Vec::new();
     for step in [0usize, 3] {
-        let mut trace = ImageDitTrace::new(&diag_layers);
+        let mut layers = diag_layers.clone();
+        if step == 0 {
+            layers.extend(&sweep_layers);
+        }
+        let mut trace = ImageDitTrace::new(&layers);
         let got = denoiser.velocity_traced(step, &rows, &mut trace).unwrap();
         mlx_rs::transforms::eval([&got]).unwrap();
         let want = r.require(&format!("out.step{step}")).unwrap();
@@ -758,7 +968,7 @@ fn h3_image_edit_first_step_matches_diffusers() {
             ),
             stage_line(step, "block0.adaln", &block0, d("block0.adaln")),
         ];
-        for (layer, hidden) in &trace.hidden {
+        for (layer, hidden) in trace.hidden.iter().filter(|(l, _)| diag_layers.contains(l)) {
             lines.push(stage_line(
                 step,
                 &format!("hidden.block{layer}"),
@@ -777,6 +987,11 @@ fn h3_image_edit_first_step_matches_diffusers() {
             println!("{line}");
         }
         regions(step, "velocity", &got, want);
+        if step == 0 {
+            edit_block_sweep(&r, &trace, &sweep_layers, sweep_regions);
+            let stream = trace.hidden[0].1.dtype();
+            edit_block_isolation(&r, &denoiser, stream, sweep_regions);
+        }
         results.push((step, rel_l2(&got, want), cosine(&got, want), got));
     }
     // Asserted step 3: the sampler's own x_3, reached by the reference from the same rows.
@@ -826,9 +1041,24 @@ fn h3_image_edit_first_step_matches_diffusers() {
          asserted): rel-L2 {off_rel:.3e}, cosine {off_cos:.6}"
     );
     println!("step-0 vs step-3 velocity rel-L2 gap {head_gap:.3e}");
-    for (what, rel, cos) in &asserted {
-        assert!(*rel < DIT_REL_L2_TOL, "{what} diverges: rel-L2 {rel:.3e}");
-        assert!(*cos > DIT_MIN_COSINE, "{what} cosine {cos:.6}");
+    // The edit bound is relative to the reference's own bf16 rounding (see
+    // `EDIT_DIT_PARITY_MAX_RATIO_TO_REFERENCE_BF16`); `require` fails if the reference lacks it.
+    let drifts = [
+        rel_l2(bf16_step0, want0) as f64,
+        rel_l2(bf16_traj, traj_want) as f64,
+    ];
+    for ((what, rel, cos), drift) in asserted.iter().zip(drifts) {
+        let limit = edit_parity_limit(drift).unwrap_or_else(|e| panic!("{what}: {e}"));
+        println!(
+            "h3-image edit DiT {what} gate: limit {limit:.3e}, reference bf16 drift {drift:.3e}, \
+             ours/drift ratio {:.3}",
+            *rel as f64 / drift
+        );
+        assert!(
+            (*rel as f64) <= limit,
+            "{what} diverges: rel-L2 {rel:.3e} > limit {limit:.3e}"
+        );
+        assert!(*cos >= DIT_MIN_COSINE, "{what} cosine {cos:.6}");
     }
     assert!(
         head_gap > DIT_REL_L2_TOL,
