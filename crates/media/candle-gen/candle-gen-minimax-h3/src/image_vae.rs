@@ -255,7 +255,7 @@ impl MiniMaxH3ImageVae {
         }
         let z = z.to_dtype(self.dtype)?;
         let nhwc = z.permute((0, 2, 3, 1))?.contiguous()?;
-        let mapped = linear(&nhwc, &self.post_quant_w, &self.post_quant_b)?;
+        let mapped = __model_proof_output!(linear(&nhwc, &self.post_quant_w, &self.post_quant_b))?;
         self.decoder
             .forward_image(&mapped.permute((0, 3, 1, 2))?.contiguous()?)
     }

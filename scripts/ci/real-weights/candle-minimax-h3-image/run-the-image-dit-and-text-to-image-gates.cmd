@@ -18,6 +18,11 @@ rem of failing. The VAE-only, streamed and quantized-tier gates need less than t
 rem unchecked. Every gate runs and reports even when an earlier one fails or is refused; the step
 rem fails at the end if any did.
 rem
+rem Every gate is built with the registered cuda,model-inference-proof features and run with
+rem MODEL_INFERENCE_CASE_FQN set; verify_model_inference_log.py then applies the proof runner's own
+rem check - one passing summary, one BODY marker and the candle-cuda device set. The edit
+rem presentation gate runs the tokenizer only, no learned tensor, so its check drops the device set.
+rem
 rem No command here sits inside a parenthesized block and no echoed text carries a parenthesis:
 rem an unescaped closing parenthesis in an echo ends the enclosing block early.
 set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
@@ -121,15 +126,19 @@ rem %1 the test binary, %2 the test path; runs it without the resident-DiT memor
 set "H3I_NAME=%~2"
 set "H3I_NAME=%H3I_NAME:*::=%"
 set "log=%H3I_EVIDENCE%\%H3I_NAME%.log"
-cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test %~1 %~2 -- --ignored --exact --nocapture > "%log%" 2>&1
+set "H3I_LEARNED="
+if "%H3I_NAME%"=="image_edit_presentation_matches_the_processor_template" set "H3I_LEARNED=--no-learned-work"
+set "MODEL_INFERENCE_CASE_FQN=%~2"
+cargo test --locked -p candle-gen-minimax-h3 --features cuda,model-inference-proof --release --test %~1 %~2 -- --ignored --exact --nocapture > "%log%" 2>&1
 set "H3I_STATUS=%ERRORLEVEL%"
+set "MODEL_INFERENCE_CASE_FQN="
 type "%log%"
 if not "%H3I_STATUS%"=="0" goto :fail_one
-findstr /C:"test result: ok. 1 passed" "%log%" >nul || goto :fail_one
+"%REVIEWED_PYTHON%" -I scripts/ci/verify_model_inference_log.py --package candle-gen-minimax-h3 --backend candle-cuda --fqn %~2 %H3I_LEARNED% --log "%log%" || goto :fail_one
 exit /b 0
 
 :fail_one
-echo ::error::%H3I_NAME% failed or did not run exactly one passing test - exit %H3I_STATUS%; a rename would make this step vacuously green
+echo ::error::%H3I_NAME% failed or lacks its registered proof evidence - exit %H3I_STATUS%; a rename would make this step vacuously green
 set "H3I_FAILED=%H3I_FAILED% %H3I_NAME%"
 exit /b 0
 

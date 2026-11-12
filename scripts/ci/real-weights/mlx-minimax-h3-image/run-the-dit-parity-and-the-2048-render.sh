@@ -2,8 +2,11 @@
 # against the diffusers reference, and a 2048² bf16 text-to-image render through the registered
 # generator. SW-7092: the `edit` gates — the presentation against the processor template, the
 # reference VAE latents, the 3-reference first-step DiT parity — and a 3-reference edit render.
-# Name-selected with `--exact` plus a pass-count assertion, so a rename cannot go
-# vacuously green; one process per test, so each heavy test starts from a reaped allocator. Every
+# Name-selected with `--exact`, built with the registered `model-inference-proof` feature and run
+# with MODEL_INFERENCE_CASE_FQN set; verify_model_inference_log.py then applies the proof runner's
+# own check (one passing summary, one BODY, the actual device set), so a rename cannot go
+# vacuously green. The index and tokenizer gates run no learned tensor, so their check drops only
+# the device set. One process per test, so each heavy test starts from a reaped allocator. Every
 # gate runs and reports even when an earlier one fails; the step fails at the end if any did.
 # SW-7096 adds the LoRA gates: three community layouts fold identically on the real DiT, ten
 # stacked files keep their scales, and a block streamed through DitBlockStream carries the LoRA.
@@ -11,13 +14,21 @@ set -o pipefail
 export MINIMAX_H3_IMAGE_RENDER_OUT="$RUNNER_TEMP/minimax-h3-image-2048.png"
 export MINIMAX_H3_IMAGE_EDIT_RENDER_OUT="$RUNNER_TEMP/minimax-h3-image-edit.png"
 failed=()
+logs="$RUNNER_TEMP/minimax-h3-image-gate-logs"
+mkdir -p "$logs"
 # $1 the test path inside the integration binary
 run_gate() {
-  local name="$1" status=0 out
-  out="$(cargo test --locked --release -p mlx-gen-minimax-h3 --test integration \
-    "$name" -- --exact --ignored --nocapture 2>&1 | tee /dev/stderr)" || status=$?
-  if ((status)) || ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
-    echo "::error::'$name' failed or did not run exactly one passing test (exit $status) — a rename would make this step vacuously green" >&2
+  local name="$1" status=0 log="$logs/${1##*::}.log" learned=()
+  case "$name" in
+    *::h3_image_dit_names_match_the_published_index | *::h3_image_edit_presentation_matches_the_processor_template)
+      learned=(--no-learned-work) ;;
+  esac
+  MODEL_INFERENCE_CASE_FQN="$name" cargo test --locked --release -p mlx-gen-minimax-h3 \
+    --features model-inference-proof --test integration \
+    "$name" -- --exact --ignored --nocapture 2>&1 | tee "$log" >&2 || status=$?
+  if ((status)) || ! python3.12 -I scripts/ci/verify_model_inference_log.py --package mlx-gen-minimax-h3 \
+    --backend mlx --fqn "$name" "${learned[@]}" --log "$log"; then
+    echo "::error::'$name' failed or lacks its registered proof evidence (exit $status)" >&2
     failed+=("$name")
   fi
 }
