@@ -1148,6 +1148,33 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             self.assertNotIn(forbidden, runs)
         self.assertNotIn("SANA_SNAPSHOT", boundary["env"])
 
+    def test_model_producer_steps_run_under_the_metal_lease_launcher(self) -> None:
+        """A step that runs a real-weights model producer (a `dump_*_real.py` tool) on a self-hosted
+        macOS runner must run under `inference_metal_launcher.py`, via the step or job default shell.
+        The check also reads scripts a step sources, so moving the body into a script cannot hide it."""
+        workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        producer = re.compile(r"dump_[A-Za-z0-9_]*_real\.py")
+        repo = REAL_WEIGHTS_WORKFLOW.parents[2]
+        seen = 0
+        for name, job in workflow["jobs"].items():
+            if "macOS" not in job.get("runs-on", []):
+                continue
+            default_shell = job.get("defaults", {}).get("run", {}).get("shell", "")
+            for step in job.get("steps", []):
+                run = step.get("run")
+                if not run:
+                    continue
+                text = run
+                for script in re.findall(r"source (scripts/ci/\S+\.sh)", run):
+                    text += (repo / script).read_text(encoding="utf-8")
+                if not producer.search(text):
+                    continue
+                seen += 1
+                shell = step.get("shell", default_shell)
+                self.assertIn("scripts/ci/inference_metal_launcher.py", shell,
+                              f"{name}: step {step.get('name')!r} runs a model producer without the Metal lease launcher")
+        self.assertGreater(seen, 0)
+
     def test_ios_prequant_is_single_manual_cpu_route_with_receipt_only(self) -> None:
         workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
         dispatch = workflow.get("on", workflow.get(True))["workflow_dispatch"]["inputs"]
