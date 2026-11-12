@@ -4859,11 +4859,11 @@ jobs:
           key: ${{ steps.key.outputs.key }}
       - name: Materialize and produce the image VAE reference
         if: steps.cache.outputs.cache-hit != 'true'
-        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
         run: source scripts/ci/real-weights/minimax-h3-image-reference/materialize-and-produce-the-image-vae-reference.sh
       - name: Materialize the DiT and produce its reference
         if: steps.cache.outputs.cache-hit != 'true'
-        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
         run: source scripts/ci/real-weights/minimax-h3-image-reference/materialize-the-dit-and-produce-its-reference.sh
       - name: Report the reference
         env:
