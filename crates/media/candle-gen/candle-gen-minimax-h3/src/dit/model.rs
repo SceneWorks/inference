@@ -1917,7 +1917,10 @@ mod veda_controls_tests {
                 .adapters()
                 .iter()
                 .map(|r| {
-                    let d = r.delta().unwrap().flatten_all().unwrap();
+                    let d = __model_proof_output!(r.delta())
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap();
                     (r.scale(), d.to_vec1::<f32>().unwrap())
                 })
                 .collect()

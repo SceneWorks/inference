@@ -242,10 +242,10 @@ impl AdaLnProjection {
         }
         let activated = silu(temb)?.to_dtype(self.compute_dtype)?;
         let projected = self.inner.forward_upcast(&activated)?;
-        let projected = match &self.adapters {
-            Some(slot) => slot.add_residuals(&activated, projected)?,
-            None => projected,
-        };
+        let projected = __model_proof_output!(match &self.adapters {
+            Some(slot) => slot.add_residuals(&activated, projected),
+            None => Ok(projected),
+        })?;
 
         // `view(-1, 6·hidden)` BEFORE the chunk: modality becomes a row axis, not a column one.
         let rows = steps * MODALITY_NUM;
