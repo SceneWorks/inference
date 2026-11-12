@@ -458,7 +458,13 @@ jobs:
     steps:
       - name: Require immutable source and non-dev-Mac placement before checkout/build
         shell: bash
-        run: source scripts/ci/real-weights/ios-pricing-compile-only/require-immutable-source-and-non-dev-mac-placement.sh
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] && [[ "$SOURCE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]]
+          [[ "$COMPILE_HOST" == second-mac ]]
+          [[ "$COMPILE_PHASE" == compile-only || "$COMPILE_PHASE" == compile-host || "$COMPILE_PHASE" == prerequisite-probe ]]
+          [[ "$RUNNER_NAME" == nax-macos-2 ]]
+          command -v python3.12 >/dev/null || { echo "::error::Preinstalled Python3.12 required; no provisioning"; exit 1; }
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ fromJSON(inputs.ios_pricing_compile_binding).source_sha }}
@@ -1568,8 +1574,7 @@ jobs:
       - name: Stage the eight CUDA accelerator cells
         if: always() && inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true
         shell: cmd
-        run: |
-          "%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_artifacts.py stage-cuda --source "%RUNNER_TEMP%\qwen38-bonsai-candle" --output "%RUNNER_TEMP%\qwen38-bonsai-cuda-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%" --runtime-sha "%GITHUB_SHA%" || exit /b 1
+        run: call scripts\ci\real-weights\qwen38-bonsai-candle\stage-the-eight-cuda-accelerator-cells.cmd
       - name: Upload immutable Candle CUDA row evidence
         if: always() && inputs.qwen38_bonsai_preflight_only != true && inputs.qwen38_bonsai_provision_only != true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

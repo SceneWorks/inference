@@ -5784,6 +5784,40 @@ class WorkflowFileSizeTests(unittest.TestCase):
             set(yaml.safe_load(workflow_text)["jobs"]),
         )
 
+    # A step that runs before a job's first `actions/checkout` sees either no repository (fresh
+    # workspace) or the previous run's tree (stale workspace), so it must never execute a
+    # checked-in script or local action: that guard would be missing or out of date.
+    PRE_CHECKOUT_REPOSITORY_SCRIPT = re.compile(
+        r"(?<![\w.-])(?:\./)?(?:scripts|\.github)[/\\][\w./\\-]+\.(?:sh|cmd|ps1|py|bat|js|mjs)\b"
+    )
+
+    @classmethod
+    def pre_checkout_repository_script_errors(cls, workflow: dict) -> list[str]:
+        errors = []
+        for job_name, job in (workflow.get("jobs") or {}).items():
+            for step in job.get("steps") or []:
+                uses = str(step.get("uses", ""))
+                if uses.startswith("actions/checkout@"):
+                    break
+                if uses.startswith("./") or cls.PRE_CHECKOUT_REPOSITORY_SCRIPT.search(step.get("run") or ""):
+                    errors.append(f"{job_name}: {step.get('name', uses)!r} runs a repository file before checkout")
+        return errors
+
+    def test_no_step_before_checkout_runs_a_repository_script(self) -> None:
+        for path in sorted(WORKFLOW.parent.glob("*.y*ml")):
+            with self.subTest(workflow=path.name):
+                workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+                self.assertEqual(self.pre_checkout_repository_script_errors(workflow), [])
+        mutant = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        steps = mutant["jobs"]["ios-pricing-compile-only"]["steps"]
+        self.assertNotIn("actions/checkout@", str(steps[0].get("uses", "")))
+        steps[0]["run"] = ("source scripts/ci/real-weights/ios-pricing-compile-only/"
+                           "require-immutable-source-and-non-dev-mac-placement.sh")
+        self.assertEqual(len(self.pre_checkout_repository_script_errors(mutant)), 1)
+        steps[0]["run"] = "true"
+        steps.insert(0, {"uses": "./.github/actions/cleanup-runner-storage"})
+        self.assertEqual(len(self.pre_checkout_repository_script_errors(mutant)), 1)
+
 
 class Qwen21TerminalPhysicalCeilingTests(unittest.TestCase):
     CAP = "QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB"

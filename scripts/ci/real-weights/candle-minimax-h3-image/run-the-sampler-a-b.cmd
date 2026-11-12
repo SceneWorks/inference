@@ -5,6 +5,10 @@ rem std above 10 - and that each LCM render differs from its Euler twin; the eig
 rem log are uploaded as minimax-h3-image-sampler-ab-candle. The bf16 DiT stays resident, so the
 rem card with the most free memory is selected, as the gates step does, and the gate is REFUSED
 rem when that card has less free memory than the DiT's shard bytes plus H3I_HEADROOM_MIB.
+rem The test is built with the registered model-inference-proof feature and run with
+rem MODEL_INFERENCE_CASE_FQN set, so the log carries its BODY marker and the actual device of each
+rem learned tensor boundary; verify_model_inference_log.py then applies the proof runner's own check -
+rem one passing summary, one BODY and exactly the registered fixed_cuda device set.
 rem No command here sits inside a parenthesized block and no echoed text carries a parenthesis.
 set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
 set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
@@ -30,15 +34,22 @@ set "CUDA_VISIBLE_DEVICES=%H3I_CARD%"
 echo CUDA_VISIBLE_DEVICES=%H3I_CARD% free_mib=%H3I_FREE% required_mib=%H3I_REQUIRED_MIB%
 if %H3I_FREE% LSS %H3I_REQUIRED_MIB% goto :refused
 call "%VCVARS%"
-cargo test --locked -p candle-gen-minimax-h3 --features cuda --release --test integration h3_image_sampler_real::image_sampler_ab_renders_2048_on_cuda -- --ignored --exact --nocapture > "%log%" 2>&1
+set "H3I_FQN=h3_image_sampler_real::image_sampler_ab_renders_2048_on_cuda"
+set "MODEL_INFERENCE_CASE_FQN=%H3I_FQN%"
+cargo test --locked -p candle-gen-minimax-h3 --features cuda,model-inference-proof --release --test integration %H3I_FQN% -- --ignored --exact --nocapture > "%log%" 2>&1
 set "H3I_STATUS=%ERRORLEVEL%"
+set "MODEL_INFERENCE_CASE_FQN="
 type "%log%"
 if not "%H3I_STATUS%"=="0" goto :failed
-findstr /C:"test result: ok. 1 passed" "%log%" >nul || goto :failed
+"%REVIEWED_PYTHON%" -I scripts/ci/verify_model_inference_log.py --package candle-gen-minimax-h3 --fqn %H3I_FQN% --configuration fixed_cuda --log "%log%" || goto :no_evidence
 exit /b 0
 
 :failed
-echo ::error::the sampler A/B failed or did not run exactly one passing test - exit %H3I_STATUS%
+echo ::error::the sampler A/B failed - exit %H3I_STATUS%
+exit /b 1
+
+:no_evidence
+echo ::error::the sampler A/B log lacks the registered proof evidence: one passing summary, one BODY marker and the candle-cuda device set
 exit /b 1
 
 :refused
