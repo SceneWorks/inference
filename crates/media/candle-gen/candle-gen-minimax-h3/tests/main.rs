@@ -55,6 +55,9 @@ mod h3_image_lora_real;
 #[path = "h3_image_sampler_real.rs"]
 mod h3_image_sampler_real;
 
+#[path = "h3_image_train_lora_load_real.rs"]
+mod h3_image_train_lora_load_real;
+
 #[path = "joint_denoise.rs"]
 mod joint_denoise;
 

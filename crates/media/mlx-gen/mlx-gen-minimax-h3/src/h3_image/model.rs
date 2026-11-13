@@ -160,6 +160,12 @@ fn resolve_text_encoder_dir(root: &Path, spec: &LoadSpec) -> PathBuf {
 /// Load the generator from a `MiniMaxAI/MiniMax-H3-Image` snapshot root. Probes every file the
 /// render reads and reads no tensor.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    Ok(Box::new(load_image(spec)?))
+}
+
+/// [`load`] without the box — the trainer (SW-7097) encodes its dataset and renders its previews
+/// through the generator's own phases.
+pub(crate) fn load_image(spec: &LoadSpec) -> Result<MiniMaxH3Image> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
@@ -203,7 +209,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         _ => Dtype::Bfloat16,
     };
     let memory_strategy = crate::h3_image::memory::contract_for(spec).map_err(Error::from)?;
-    Ok(Box::new(MiniMaxH3Image {
+    Ok(MiniMaxH3Image {
         descriptor: descriptor(),
         root,
         dit_dir,
@@ -213,7 +219,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory_tier: mlx_gen::request_scope::loaded_tier(spec),
         adapters: spec.adapters.clone(),
         load_shape: spec.load_shape,
-    }))
+    })
 }
 
 /// Reject a request this model cannot serve, before any weight is read: the family contract
@@ -426,6 +432,11 @@ impl MiniMaxH3Image {
     /// The snapshot root this generator reads.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The resolved DiT directory (the staged tier's `transformer_diffusers/`).
+    pub fn dit_dir(&self) -> &Path {
+        &self.dit_dir
     }
 
     /// The resolved text-encoder directory.

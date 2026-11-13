@@ -540,6 +540,26 @@ impl Rows {
     }
 }
 
+/// `(text, reference, image)` rows of `shape`'s packed DiT sequence, counted exactly as [`estimate`]
+/// counts them — what the trainer (SW-7097) prices its train phase over.
+pub fn sequence_rows(shape: &ImageRequestShape) -> Result<(u64, u64, u64)> {
+    let rows = Rows::of(shape)?;
+    Ok((rows.text, rows.reference, rows.image))
+}
+
+/// The modulation tables one request's precompute holds: every block, every distinct timestep (the
+/// six steps, plus the reference class on an edit), every modality, at width `a`.
+pub fn modulation_table_bytes(edit: bool, a: u64) -> u64 {
+    let b = MiniMaxH3ImageDitConfig::default().base;
+    let distinct_timesteps = FIXED_STEPS as u64 + u64::from(edit);
+    MODULATION_PARAMS as u64
+        * distinct_timesteps
+        * MODALITY_NUM as u64
+        * b.hidden_size as u64
+        * b.num_layers as u64
+        * a
+}
+
 /// What a selection engages, read through the contract so an undeclared rung never prices.
 #[derive(Clone, Copy, Debug)]
 struct Engaged {
@@ -635,13 +655,7 @@ pub fn estimate(
         facts.te_bytes()
     };
     let vision_weights = if edit { facts.vision_bytes } else { 0 };
-    let distinct_timesteps = FIXED_STEPS as u64 + u64::from(edit);
-    let table = MODULATION_PARAMS as u64
-        * distinct_timesteps
-        * MODALITY_NUM as u64
-        * hidden
-        * b.num_layers as u64
-        * a;
+    let table = modulation_table_bytes(edit, a);
     let (precompute_weights, step_weights) = if e.stream_dit {
         (
             sum([

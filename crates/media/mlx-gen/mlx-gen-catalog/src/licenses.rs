@@ -1098,14 +1098,15 @@ mod tests {
         // licences on `gen_core_iris::restoration_train::TRAINING_RESOURCES` and never ship in an
         // export). sc-26240 adds the `flux3_klein_base` trainer, which reuses the sc-26239
         // generator row. The epic's MOSS trainers (`moss_image_base`, `moss_image_sft`) reuse
-        // their generator rows, so they add two registrations without adding two rows.
+        // their generator rows, so they add two registrations without adding two rows. SW-7097's
+        // `minimax_h3_image` trainer reuses the minimax_h3_image generator row.
         let unique: BTreeSet<_> = trainers.iter().collect();
         assert_eq!(
             unique.len(),
             trainers.len(),
             "duplicate native trainer registrations"
         );
-        assert_eq!(trainers.len(), 23);
+        assert_eq!(trainers.len(), 24);
         for id in ["moss_image_base", "moss_image_sft"] {
             assert!(
                 trainers.iter().any(|trainer| trainer == id),

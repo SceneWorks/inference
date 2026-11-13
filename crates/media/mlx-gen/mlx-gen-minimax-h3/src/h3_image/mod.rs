@@ -36,9 +36,9 @@ pub use model::{
     MiniMaxH3Image, IMAGE_MODEL_ID,
 };
 
-/// Add the MLX MiniMax-H3-Image generator and its three memory registrations to an explicit media
-/// registry builder. Separate from [`crate::register_providers`] so H3 video's catalog surface is
-/// unchanged; the media catalog composes both.
+/// Add the MLX MiniMax-H3-Image generator, its three memory registrations and its trainer
+/// (SW-7097) to an explicit media registry builder. Separate from [`crate::register_providers`] so
+/// H3 video's catalog surface is unchanged; the media catalog composes both.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
@@ -47,6 +47,7 @@ pub fn register_providers(
         .register_memory_strategy(memory::IMAGE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory::IMAGE_MEMORY_CONTRACT_FIXTURE)
         .register_memory_behavior(memory::IMAGE_MEMORY_BEHAVIOR)
+        .register_trainer(crate::training::TRAINER_REGISTRATION)
 }
 
 #[cfg(test)]
