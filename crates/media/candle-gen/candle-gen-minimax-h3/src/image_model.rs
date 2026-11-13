@@ -308,6 +308,56 @@ impl MiniMaxH3Image {
         Ok((context, tags, latents))
     }
 
+    /// The conditioning phase (step 1 of a render): the prompt through the layer-50 conditioner,
+    /// or — for an edit — the vision tower, the conditioner and every reference's VAE latent
+    /// ([`Self::encode_edit`], posterior noise from `seed`). Returns the context, its per-row tags
+    /// and the reference latents (empty for text-to-image). The trainer (SW-7098) encodes its
+    /// dataset through this same phase.
+    pub(crate) fn encode_conditioning(
+        &self,
+        prompt: &str,
+        references: &[&candle_gen::gen_core::Image],
+        seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(Tensor, Vec<u32>, Vec<Tensor>)> {
+        Ok(if references.is_empty() {
+            let phase = PhaseLog::start("text_encoder");
+            let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
+            let (ids, mask) =
+                tok.encode_prompt_truncated(prompt, contract::MAX_PROMPT_TOKENS, &self.device)?;
+            let context = run_conditioner(
+                &self.text_encoder_dir,
+                &ids,
+                &mask,
+                None,
+                &self.device,
+                on_progress,
+            )?;
+            drop((ids, mask));
+            phase.done();
+            let n = context.dims()[1];
+            (context, vec![contract::TEXT_TAG as u32; n], Vec::new())
+        } else {
+            self.encode_edit(prompt, references, seed, on_progress)?
+        })
+    }
+
+    /// Map the validated DiT partition onto `device` with its block stack at `dtype` — the one
+    /// image DiT load site, shared by the render and the trainer (SW-7098).
+    pub(crate) fn load_dit(&self, device: &Device, dtype: DType) -> Result<MiniMaxH3Dit> {
+        MiniMaxH3Dit::load_from_dir(&self.dit_dir, device, dtype)
+    }
+
+    /// The DiT partition directory this load validated.
+    pub(crate) fn dit_dir(&self) -> &Path {
+        &self.dit_dir
+    }
+
+    /// The compute device.
+    pub(crate) fn device(&self) -> &Device {
+        &self.device
+    }
+
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -354,29 +404,8 @@ impl MiniMaxH3Image {
             .map_err(|r| CandleError::Msg(r.to_string()))?;
 
         // --- 1. conditioning ---------------------------------------------------------------
-        let (context, text_tags, reference_latents) = if references.is_empty() {
-            let phase = PhaseLog::start("text_encoder");
-            let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
-            let (ids, mask) = tok.encode_prompt_truncated(
-                &req.prompt,
-                contract::MAX_PROMPT_TOKENS,
-                &self.device,
-            )?;
-            let context = run_conditioner(
-                &self.text_encoder_dir,
-                &ids,
-                &mask,
-                None,
-                &self.device,
-                on_progress,
-            )?;
-            drop((ids, mask));
-            phase.done();
-            let n = context.dims()[1];
-            (context, vec![contract::TEXT_TAG as u32; n], Vec::new())
-        } else {
-            self.encode_edit(&req.prompt, &references, seed, on_progress)?
-        };
+        let (context, text_tags, reference_latents) =
+            self.encode_conditioning(&req.prompt, &references, seed, on_progress)?;
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -393,7 +422,7 @@ impl MiniMaxH3Image {
         } else {
             &self.device
         };
-        let mut dit = MiniMaxH3Dit::load_from_dir(&self.dit_dir, load_device, DType::BF16)?;
+        let mut dit = self.load_dit(load_device, DType::BF16)?;
         if !self.spec.adapters.is_empty() {
             // Strict, like H3 video: an unmatched target or a file that matched nothing fails the
             // render here rather than producing an image the LoRA barely touched.

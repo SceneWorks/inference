@@ -668,16 +668,7 @@ impl MiniMaxH3Dit {
         let sync_between_layers = layer_cancel_needs_sync(x.dims()[1]);
         let mut apply = |mut x: Tensor, range: std::ops::Range<usize>| -> Result<Tensor> {
             for layer in range {
-                let transferred;
-                let block = if self.stream_window.is_some() {
-                    transferred = self.blocks[layer].copy_to_device(&self.device)?;
-                    tracing::trace!(event="h3_transformer_window_materialized", component="dit",
-                        first_block=layer, block_count=1, base_bytes=transferred.body_nbytes(),
-                        device=?self.device.location(), "Materialized prepared DiT body window");
-                    &transferred
-                } else {
-                    &self.blocks[layer]
-                };
+                let block = self.window_block(layer)?;
                 if let Some(cancel) = cancel {
                     if sync_between_layers {
                         self.device.synchronize()?;
@@ -738,6 +729,51 @@ impl MiniMaxH3Dit {
         Ok(x)
     }
 
+    /// Block `layer` as one forward runs it: the resident block, or — streamed (rung 4) — a device
+    /// copy of the host-resident block and its adapter factors, dropped by the caller after use.
+    pub(crate) fn window_block(&self, layer: usize) -> Result<std::borrow::Cow<'_, DitBlock>> {
+        let block = self.blocks.get(layer).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "minimax-h3 dit: block {layer} is outside the {}-block stack",
+                self.blocks.len()
+            ))
+        })?;
+        if self.stream_window.is_none() {
+            return Ok(std::borrow::Cow::Borrowed(block));
+        }
+        let transferred = block.copy_to_device(&self.device)?;
+        tracing::trace!(event="h3_transformer_window_materialized", component="dit",
+            first_block=layer, block_count=1, base_bytes=transferred.body_nbytes(),
+            device=?self.device.location(), "Materialized prepared DiT body window");
+        Ok(std::borrow::Cow::Owned(transferred))
+    }
+
+    /// Whether the blocks stay on the host and run through a device window (rung 4).
+    pub(crate) fn is_streamed(&self) -> bool {
+        self.stream_window.is_some()
+    }
+
+    /// The image transformer's stack input: `proj_in` over the packed image rows, cast to the text
+    /// stream's dtype, scattered with the refined text rows into one `[1, seq_len, hidden]`
+    /// sequence — the first stage of [`Self::forward_image`], shared with the trainer (SW-7098).
+    pub(crate) fn image_stack_input(
+        &self,
+        image_rows: &Tensor,
+        text_rows: &Tensor,
+        text_indices: &[u32],
+        image_indices: &[u32],
+    ) -> Result<Tensor> {
+        let image = self
+            .projections
+            .proj_in
+            .forward(image_rows)?
+            .to_dtype(text_rows.dtype())?;
+        scatter_blocks(&[
+            (text_rows, text_indices, "text"),
+            (&image, image_indices, "image"),
+        ])
+    }
+
     /// **One MiniMax-H3-Image evaluation** (SW-7091): `MiniMaxH3ImageTransformer2DModel.forward`
     /// over the `[text | image]` packed sequence, with the output projection of sampling step
     /// `pdd_step` — `pdd_proj_out.{pdd_step}`.
@@ -778,17 +814,12 @@ impl MiniMaxH3Dit {
         }
         // Resolve the head FIRST: a step past the last head is refused before 50 blocks run.
         let head = self.projections.output_head(Some(pdd_step))?;
-        let stream = packed.text_rows.dtype();
-        let image = self
-            .projections
-            .proj_in
-            .forward(packed.image_rows)?
-            .to_dtype(stream)?;
-        let x = scatter_blocks(&[
-            (packed.text_rows, packed.text_indices, "text"),
-            (&image, packed.image_indices, "image"),
-        ])?;
-        drop(image);
+        let x = self.image_stack_input(
+            packed.image_rows,
+            packed.text_rows,
+            packed.text_indices,
+            packed.image_indices,
+        )?;
         let mut record = |layer: usize, x: &Tensor| -> Result<()> {
             if let Some(trace) = trace.as_deref_mut() {
                 if trace.layers.contains(&layer) {
@@ -1379,27 +1410,29 @@ impl ImageDit {
         context: &Tensor,
         timesteps: &[f32],
     ) -> Result<Self> {
-        let heads = dit.cfg.num_pdd_heads().ok_or_else(|| {
-            CandleError::Msg(
-                "minimax-h3-image dit: ImageDit needs the image transformer; this is the \
-                 audio+video one"
-                    .into(),
-            )
-        })?;
-        if timesteps.is_empty() || timesteps.len() > heads {
-            return Err(CandleError::Msg(format!(
-                "minimax-h3-image dit: {} sampling steps for a checkpoint with {heads} per-step \
-                 heads",
-                timesteps.len()
-            )));
-        }
-        if dit.curve.is_some() {
-            return Err(CandleError::Msg(
-                "minimax-h3-image dit: the modulation-pruned DiT path is not wired for the image \
-                 transformer"
-                    .into(),
-            ));
-        }
+        // SW-7095, rung 4: the streamed precompute observes the active request's cancel flag.
+        let cancel = if dit.stream_window.is_some() {
+            crate::block_stream::current()
+                .ok_or_else(|| {
+                    CandleError::Msg(
+                        "minimax-h3-image dit: streamed AdaLN requires an active request".into(),
+                    )
+                })?
+                .cancel
+        } else {
+            CancelFlag::default()
+        };
+        let ImageModulation {
+            cache,
+            norm_out,
+            temb,
+            released_bytes,
+        } = image_modulation(
+            &mut dit,
+            timesteps,
+            layout.num_reference_rows() > 0,
+            &cancel,
+        )?;
         let text_rows = dit.embed_context(context)?;
         if text_rows.dims()[1] != layout.num_text_tokens() {
             return Err(CandleError::Msg(format!(
@@ -1411,84 +1444,6 @@ impl ImageDit {
         }
         let device = dit.device.clone();
         let tables = dit.rope.tables_from_rows(layout.position_ids(), &device)?;
-        // Row class 0 is the step's timestep, which every text and generated row sits at; an
-        // edit's reference rows are class 1, held at `REFERENCE_NOISE_AUG` for every step
-        // (`MiniMaxH3ImageSetTimestepsStep.row_timestep_plan`). One step per head.
-        let has_references = layout.num_reference_rows() > 0;
-        let schedule = TimestepSchedule::new(
-            timesteps
-                .iter()
-                .map(|&t| {
-                    if has_references {
-                        vec![t, candle_gen::gen_core::h3_image::REFERENCE_NOISE_AUG]
-                    } else {
-                        vec![t]
-                    }
-                })
-                .collect(),
-        )?;
-        let (cache, released_bytes, norm_out, temb) = if let Some(window) = dit.stream_window {
-            // SW-7095, rung 4: the blocks stay on the host in runtime format. Each block's
-            // `adaln_proj` is copied to the device, projected over the whole schedule and dropped
-            // — one block at a time, exactly as H3 video's `JointDit` streamed precompute — then
-            // every host projection is released. The device never held the 26 GB, so no device
-            // eviction saving is claimed.
-            let policy = crate::block_stream::current().ok_or_else(|| {
-                CandleError::Msg(
-                    "minimax-h3-image dit: streamed AdaLN requires an active request".into(),
-                )
-            })?;
-            let temb = dit.embed_timesteps(schedule.distinct_timesteps())?;
-            let norm_out = dit.projections.norm_out.modulation(&temb)?;
-            let plan = candle_gen::block_window::BlockPlan::new(dit.blocks.len(), window)?;
-            let layers = candle_gen::block_window::run_windowed(
-                &device,
-                &plan,
-                &policy.cancel,
-                Vec::with_capacity(dit.blocks.len()),
-                || Ok(()),
-                |mut layers, _, range| {
-                    for layer in range {
-                        if policy.cancel.is_cancelled() {
-                            return Err(CandleError::Canceled);
-                        }
-                        layers.push(dit.blocks[layer].modulation_for_window(&temb, &device)?);
-                    }
-                    Ok(layers)
-                },
-            )?;
-            let cache = AdaLnCache::assemble(schedule, layers, dit.pruning_identity())?;
-            for block in &mut dit.blocks {
-                block.evict_adaln();
-            }
-            (cache, 0, norm_out, temb)
-        } else {
-            let mut captured: Option<Tensor> = None;
-            let embedder = dit.projections.time_embedder.clone().ok_or_else(|| {
-                CandleError::Msg("minimax-h3-image dit: the checkpoint has no timestep MLP".into())
-            })?;
-            let (cache, released_bytes) = AdaLnCache::precompute_and_evict(
-                &mut dit.blocks,
-                schedule,
-                AdaLnResidency::PrecomputeAndEvict,
-                &device,
-                |ts| {
-                    let temb = embedder.forward(ts, &device)?;
-                    captured = Some(temb.clone());
-                    Ok(temb)
-                },
-            )?;
-            let temb = captured.ok_or_else(|| {
-                CandleError::Msg(
-                    "minimax-h3-image dit: the AdaLN precompute did not evaluate the timestep \
-                     embedding"
-                        .into(),
-                )
-            })?;
-            // `norm_out`'s table from the SAME `temb` the block stack's was projected from.
-            let norm_out = dit.projections.norm_out.modulation(&temb)?;
-            (cache, released_bytes, norm_out, temb)
-        };
         Ok(Self {
             dit,
             tables,
@@ -1634,6 +1589,130 @@ impl ImageDit {
             trace,
         )
     }
+}
+
+/// One image request's whole-schedule modulation: the block stack's AdaLN tables over every
+/// distinct timestep the run evaluates at (the six steps, plus an edit's reference rows' constant
+/// `0.999`), `norm_out`'s table from the same timestep embedding, and the bytes the precompute
+/// released. Every block's `adaln_proj` is evicted afterwards — resident, by the
+/// precompute-and-evict lever; streamed (rung 4), one host block at a time through the device
+/// window, observing `cancel`. Shared by [`ImageDit::new`] and the trainer (SW-7098), so a training
+/// step gathers the modulation the render does.
+pub(crate) struct ImageModulation {
+    pub(crate) cache: AdaLnCache,
+    pub(crate) norm_out: NormOutModulation,
+    pub(crate) temb: Tensor,
+    pub(crate) released_bytes: usize,
+}
+
+/// See [`ImageModulation`]. `timesteps` are the schedule's `t = 1 − σ`, one per step, at most one
+/// per output head.
+pub(crate) fn image_modulation(
+    dit: &mut MiniMaxH3Dit,
+    timesteps: &[f32],
+    has_references: bool,
+    cancel: &CancelFlag,
+) -> Result<ImageModulation> {
+    let heads = dit.cfg.num_pdd_heads().ok_or_else(|| {
+        CandleError::Msg(
+            "minimax-h3-image dit: ImageDit needs the image transformer; this is the \
+                 audio+video one"
+                .into(),
+        )
+    })?;
+    if timesteps.is_empty() || timesteps.len() > heads {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3-image dit: {} sampling steps for a checkpoint with {heads} per-step \
+                 heads",
+            timesteps.len()
+        )));
+    }
+    if dit.curve.is_some() {
+        return Err(CandleError::Msg(
+            "minimax-h3-image dit: the modulation-pruned DiT path is not wired for the image \
+                 transformer"
+                .into(),
+        ));
+    }
+    // Row class 0 is the step's timestep, which every text and generated row sits at; an
+    // edit's reference rows are class 1, held at `REFERENCE_NOISE_AUG` for every step
+    // (`MiniMaxH3ImageSetTimestepsStep.row_timestep_plan`). One step per head.
+    let schedule = TimestepSchedule::new(
+        timesteps
+            .iter()
+            .map(|&t| {
+                if has_references {
+                    vec![t, candle_gen::gen_core::h3_image::REFERENCE_NOISE_AUG]
+                } else {
+                    vec![t]
+                }
+            })
+            .collect(),
+    )?;
+    let device = dit.device.clone();
+    let (cache, released_bytes, norm_out, temb) = if let Some(window) = dit.stream_window {
+        // SW-7095, rung 4: the blocks stay on the host in runtime format. Each block's
+        // `adaln_proj` is copied to the device, projected over the whole schedule and dropped
+        // — one block at a time, exactly as H3 video's `JointDit` streamed precompute — then
+        // every host projection is released. The device never held the 26 GB, so no device
+        // eviction saving is claimed.
+        let temb = dit.embed_timesteps(schedule.distinct_timesteps())?;
+        let norm_out = dit.projections.norm_out.modulation(&temb)?;
+        let plan = candle_gen::block_window::BlockPlan::new(dit.blocks.len(), window)?;
+        let layers = candle_gen::block_window::run_windowed(
+            &device,
+            &plan,
+            cancel,
+            Vec::with_capacity(dit.blocks.len()),
+            || Ok(()),
+            |mut layers, _, range| {
+                for layer in range {
+                    if cancel.is_cancelled() {
+                        return Err(CandleError::Canceled);
+                    }
+                    layers.push(dit.blocks[layer].modulation_for_window(&temb, &device)?);
+                }
+                Ok(layers)
+            },
+        )?;
+        let cache = AdaLnCache::assemble(schedule, layers, dit.pruning_identity())?;
+        for block in &mut dit.blocks {
+            block.evict_adaln();
+        }
+        (cache, 0, norm_out, temb)
+    } else {
+        let mut captured: Option<Tensor> = None;
+        let embedder = dit.projections.time_embedder.clone().ok_or_else(|| {
+            CandleError::Msg("minimax-h3-image dit: the checkpoint has no timestep MLP".into())
+        })?;
+        let (cache, released_bytes) = AdaLnCache::precompute_and_evict(
+            &mut dit.blocks,
+            schedule,
+            AdaLnResidency::PrecomputeAndEvict,
+            &device,
+            |ts| {
+                let temb = embedder.forward(ts, &device)?;
+                captured = Some(temb.clone());
+                Ok(temb)
+            },
+        )?;
+        let temb = captured.ok_or_else(|| {
+            CandleError::Msg(
+                "minimax-h3-image dit: the AdaLN precompute did not evaluate the timestep \
+                     embedding"
+                    .into(),
+            )
+        })?;
+        // `norm_out`'s table from the SAME `temb` the block stack's was projected from.
+        let norm_out = dit.projections.norm_out.modulation(&temb)?;
+        (cache, released_bytes, norm_out, temb)
+    };
+    Ok(ImageModulation {
+        cache,
+        norm_out,
+        temb,
+        released_bytes,
+    })
 }
 
 impl crate::image_pipeline::ImageVelocity for ImageDit {

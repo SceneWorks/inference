@@ -9,8 +9,11 @@ name: Real-weight validation (MiniMax-H3-Image)
 # * `minimax-h3-image-train` — the SW-7097 trainer: on the MLX real-weights Mac (the
 #   `mlx-minimax-h3-image` job's label), materialize the snapshot and MiniMax-H3's text encoder,
 #   convert the q4 DiT tier, and run the gradient-correctness, t2i train/reproduce/resume and edit
-#   train/reproduce gates; then on the CUDA host load the MLX-trained adapter through the Candle
-#   H3-Image install.
+#   train/reproduce gates; then on the CUDA host run the SW-7098 Candle trainer's same three gates
+#   over a candle-converted q4 tier and load the MLX-trained adapter through the Candle H3-Image
+#   install; then back on the Mac load the Candle-trained adapter through the MLX install;
+# * `minimax-h3-image-train-cuda` — the same without the MLX trainer gates: the Candle trainer
+#   gates, then the Candle-trained adapter loaded on MLX.
 #
 # Moved out of `real-weights.yml` (which is at its size budget) unchanged: same job ids, names,
 # runners, scripts under `scripts/ci/real-weights/<job>/`, MODEL_INFERENCE_CASE_FQN proofs and
@@ -287,10 +290,10 @@ jobs:
 
   candle-minimax-h3-image-train:
     needs: mlx-minimax-h3-image-train
-    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.profile == 'minimax-h3-image-train' }}
-    name: Candle loads the MLX-trained H3-Image LoRA (CUDA)
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && (inputs.profile == 'minimax-h3-image-train' || inputs.profile == 'minimax-h3-image-train-cuda') }}
+    name: Candle H3-Image trainer gates and the MLX-trained LoRA load (CUDA)
     runs-on: [self-hosted, windows, cuda, real-weights]
-    timeout-minutes: 240
+    timeout-minutes: 720
     env:
       CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
       CUDA_COMPUTE_CAP: "80"
@@ -306,10 +309,49 @@ jobs:
         shell: cmd
         run: call scripts\ci\real-weights\candle-minimax-h3-image-train\install-reviewed-cpython-3-12.cmd
       - uses: ./.github/actions/setup-rust
+      - name: Run the Candle trainer gates
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-minimax-h3-image-train\run-the-candle-trainer-gates.cmd
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: minimax-h3-image-candle-trained-lora
+          path: ${{ runner.temp }}/minimax-h3-image-candle-trained-lora
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: minimax-h3-image-train-candle-logs
+          path: ${{ runner.temp }}/minimax-h3-image-train-candle-logs
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: ${{ !cancelled() && inputs.profile == 'minimax-h3-image-train' }}
         with:
           name: minimax-h3-image-trained-lora
           path: ${{ runner.temp }}/minimax-h3-image-trained-lora
       - name: Load the MLX-trained adapter on the real image DiT
+        if: ${{ !cancelled() && inputs.profile == 'minimax-h3-image-train' }}
         shell: cmd
         run: call scripts\ci\real-weights\candle-minimax-h3-image-train\load-the-mlx-trained-adapter.cmd
+
+  mlx-minimax-h3-image-train-load:
+    needs: candle-minimax-h3-image-train
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && (inputs.profile == 'minimax-h3-image-train' || inputs.profile == 'minimax-h3-image-train-cuda') }}
+    name: MLX loads the Candle-trained H3-Image LoRA
+    defaults:
+      run:
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 9000 -- /bin/bash -e {0}
+    runs-on: [self-hosted, macOS, ARM64, rw-mage]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Materialize the image DiT
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-train-load/materialize-the-image-dit.sh
+      - name: Set up the MLX build environment
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-train-load/set-up-the-mlx-build-environment.sh
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: minimax-h3-image-candle-trained-lora
+          path: ${{ runner.temp }}/minimax-h3-image-candle-trained-lora
+      - name: Load the Candle-trained adapter on the real image DiT
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-train-load/load-the-candle-trained-adapter.sh

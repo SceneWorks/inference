@@ -151,6 +151,7 @@ pub mod spatial_tiling;
 pub mod tensor;
 pub mod text_encoder;
 pub mod tier;
+pub mod training;
 pub mod vae;
 pub mod vae_encoder;
 pub mod veda;
@@ -298,7 +299,9 @@ pub fn register_providers(
     let registry = registry
         .register_generator(model::REGISTRATION)
         // SW-7091: MiniMax-H3-Image text-to-image, its own engine id and image descriptor.
-        .register_generator(image_model::IMAGE_REGISTRATION);
+        .register_generator(image_model::IMAGE_REGISTRATION)
+        // SW-7098: the MiniMax-H3-Image LoRA/LoKr trainer, at the generator's id.
+        .register_trainer(training::TRAINER_REGISTRATION);
     // The fleet shape (see candle-gen-flux): the memory route rides `register_providers` only on
     // the build that can execute it; every other platform appends the same weights-free surfaces
     // through `register_memory_contract_surfaces` from the catalog, and registering both would be

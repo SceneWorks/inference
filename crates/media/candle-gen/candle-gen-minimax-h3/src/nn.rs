@@ -138,7 +138,8 @@ pub fn sdpa_planned(
     let (b, h, sq, _) = q.dims4()?;
     let sk = k.dim(2)?;
     let (query_rows, score_elements) = materializing_chunk_shape(b, h, sq, sk, plan.budget)?;
-    let force_materialized = force_materialized_attention();
+    // A differentiated forward (SW-7098) must not reach the fused kernel: it has no backward.
+    let force_materialized = force_materialized_attention() || differentiable_attention();
     let kernel = candle_gen::fused_attention::select_attention_kernel(q, k, v, None);
     let materialized =
         force_materialized || matches!(kernel, candle_gen::AttentionKernel::Budgeted(_));
@@ -200,17 +201,16 @@ fn sdpa_materialized(
     scale: f64,
     plan: AttentionPlan<'_>,
 ) -> Result<Tensor> {
-    use candle_gen::candle_nn::ops::softmax_last_dim;
+    // `softmax_last_dim` is a fused kernel with no backward; a differentiated forward takes the
+    // composable softmax over the same f32 scores.
+    let softmax: fn(&Tensor) -> candle_gen::candle_core::Result<Tensor> =
+        if differentiable_attention() {
+            composable_softmax
+        } else {
+            candle_gen::candle_nn::ops::softmax_last_dim
+        };
     if q.dtype() == DType::F32 {
-        return candle_gen::attention::sdpa_planned_bhsd(
-            q,
-            k,
-            v,
-            scale,
-            None,
-            softmax_last_dim,
-            plan,
-        );
+        return candle_gen::attention::sdpa_planned_bhsd(q, k, v, scale, None, softmax, plan);
     }
     let (b, h, sq, _) = q.dims4()?;
     let sk = k.dim(2)?;
@@ -222,7 +222,7 @@ fn sdpa_materialized(
         let probs = {
             let q = q.narrow(2, start, len)?.to_dtype(DType::F32)?;
             let scores = (q.matmul(&k_t)? * scale)?;
-            softmax_last_dim(&scores)?
+            softmax(&scores)?
         };
         Ok(probs.to_dtype(v.dtype())?.matmul(&v)?)
     };
@@ -362,6 +362,35 @@ pub fn reset_attention_execution_report() {
 }
 pub fn attention_execution_report() -> AttentionExecutionReport {
     ATTENTION_EXECUTION.with(|r| *r.borrow())
+}
+
+thread_local! {
+    static DIFFERENTIABLE_ATTENTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with every DiT attention on this thread taking the materialized route with a
+/// composable softmax, so a loss built inside it reaches the adapter factors (SW-7098). The fused
+/// FlashAttention kernel and `softmax_last_dim` have no backward. The scores and softmax stay f32,
+/// so the numerics are the materialized route's. The previous setting is restored on exit, panics
+/// included.
+pub(crate) fn with_differentiable_attention<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DIFFERENTIABLE_ATTENTION.set(self.0);
+        }
+    }
+    let _restore = Restore(DIFFERENTIABLE_ATTENTION.replace(true));
+    f()
+}
+
+fn differentiable_attention() -> bool {
+    DIFFERENTIABLE_ATTENTION.get()
+}
+
+/// The composable last-axis softmax (`exp(x − max) / Σ`), which candle can differentiate.
+fn composable_softmax(x: &Tensor) -> candle_gen::candle_core::Result<Tensor> {
+    candle_gen::candle_nn::ops::softmax(x, D::Minus1)
 }
 
 fn force_materialized_attention() -> bool {

@@ -354,6 +354,13 @@ impl LinearNoBias {
         });
     }
 
+    /// The shared projection itself, for the trainer's live `Var`-backed residuals (SW-7098) —
+    /// pushed through [`AdaptLinear::push_trainable_lora`] and its LoKr twins, so a device copy of
+    /// a host block carries the same leaves and every loss reaches them.
+    pub(crate) fn trainable_mut(&mut self) -> &mut AdaptLinear {
+        &mut self.inner
+    }
+
     /// Drop every attached residual, reverting to the bare base.
     pub fn clear_adapters(&mut self) {
         self.inner.clear_adapters();

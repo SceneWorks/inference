@@ -343,22 +343,22 @@ pub struct ImageMemoryFacts {
     /// The f32 vision tower.
     vision_bytes: u64,
     dit_hidden: u64,
-    dit_text_dim: u64,
+    pub(crate) dit_text_dim: u64,
     dit_patch_dim: u64,
-    task: NativeTaskAllocation,
+    pub(crate) task: NativeTaskAllocation,
     window: WindowAllocation,
     /// Host bytes to prepare the DiT (source map + runtime packs + one repack scratch).
-    dit_prepare_host: u64,
+    pub(crate) dit_prepare_host: u64,
     /// Host bytes of the runtime-format DiT stack a streamed request keeps on the host.
-    dit_retained_host: u64,
+    pub(crate) dit_retained_host: u64,
     /// Every installed adapter factor plus its prepared cache.
     adapter_resident: u64,
     /// The adapter install high-water (not additional to `adapter_resident`).
     adapter_install: u64,
     decoder_bytes: u64,
-    encoder_bytes: u64,
+    pub(crate) encoder_bytes: u64,
     /// The streamable DiT as the shared phase facts spell it ([`transformer_stream`]).
-    stream: StreamedWeightFacts,
+    pub(crate) stream: StreamedWeightFacts,
     /// Whether the source supports the streamed route (rung 4).
     pub streamable: bool,
 }

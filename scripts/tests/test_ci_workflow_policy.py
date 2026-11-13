@@ -888,8 +888,9 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 45 since SW-7099 added the dispatch-only `mlx-minimax-h3-image-pe` job;
         # 46 since `minimax-h3-image-reference` materializes the VAE row it produces from on a
         # reference cache miss, separately from the `mlx-minimax-h3-image` gate job;
-        # 47 since SW-7097 added the dispatch-only `mlx-minimax-h3-image-train` job.
-        MACOS_HUB_LOCK: 47,
+        # 47 since SW-7097 added the dispatch-only `mlx-minimax-h3-image-train` job;
+        # 48 since SW-7098 added the dispatch-only `mlx-minimax-h3-image-train-load` job.
+        MACOS_HUB_LOCK: 48,
         # 21 since SW-7089 added the dispatch-only `candle-minimax-h3-image` job;
         # 22 since SW-7099 added the dispatch-only `candle-minimax-h3-image-pe` job;
         # 20 since sc-24214 added the dispatch-only `candle-supra2` job;
@@ -902,8 +903,9 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
         # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
         # 11 since sc-18932 added the `candle-minimax-h3` job;
-        # 23 since SW-7097 added the dispatch-only `candle-minimax-h3-image-train` job.
-        WINDOWS_HUB_LOCK: 23,
+        # 23 since SW-7097 added the dispatch-only `candle-minimax-h3-image-train` job;
+        # 24 since SW-7098's Candle trainer gates install the lock in that job too.
+        WINDOWS_HUB_LOCK: 24,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -1571,9 +1573,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
-        # 47 macOS / 23 Windows after SW-7097 added the H3-Image trainer pair.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 47)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 23)
+        # 47 macOS / 23 Windows after SW-7097 added the H3-Image trainer pair; 48 / 24 after SW-7098
+        # added the MLX load of the Candle-trained adapter and the Candle trainer gates.
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 48)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 24)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
