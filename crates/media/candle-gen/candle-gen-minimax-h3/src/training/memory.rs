@@ -9,7 +9,7 @@
 //! | phase | priced as |
 //! | --- | --- |
 //! | conditioning | inference admission's own vision-tower / conditioning / reference-encode phases for each item at rung 4, plus the cache built so far |
-//! | latents | the VAE encoder over the largest target, plus the cache |
+//! | latents | the VAE encoder's tiled encode of the largest target (admission's own tiled-encode term), plus the cache |
 //! | train | [`gen_core_train::h3_image::train_step_bytes`] (one streamed block, every block input, one block's backward) plus candle's float32 attention scores and allocator slack, plus the cache; host: the runtime-format DiT stack the streamed route keeps |
 //! | preview | inference admission's whole-render peak at rung 4 for the preview request, plus the training state that stays resident through it |
 //!
@@ -227,12 +227,7 @@ pub fn estimate_training(
     let cache = cache_bytes(geometry.hidden, run);
     let edit = run.items.iter().any(|i| !i.references.is_empty());
     let weights = dit_weights(facts, edit);
-    let widest = crate::config::MiniMaxH3VaeConfig::image()
-        .block_out_channels
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0) as u64;
+
     let host_dit = if run.checkpointed {
         facts.dit_prepare_host.max(facts.dit_retained_host)
     } else {
@@ -254,12 +249,15 @@ pub fn estimate_training(
         );
         conditioning.device = conditioning.device.max(c.device);
         conditioning.host = conditioning.host.max(c.host);
-        // The target encode: the encoder, its widest full-resolution activation (three live at
-        // once, float32) and the target's pixels.
+        // The target encode: the VAE encoder tiles it exactly as an edit reference's encode is
+        // tiled, so it is priced by admission's own tiled-encode term.
         let pixels = u64::from(item.canvas.0) * u64::from(item.canvas.1);
-        latents.device = latents
-            .device
-            .max(facts.encoder_bytes + pixels * widest * 4 * 3 + pixels * 3 * 4);
+        latents.device =
+            latents
+                .device
+                .max(crate::image_memory_strategy::admission::tiled_encode_bytes(
+                    facts, pixels,
+                )?);
         latents.host = latents.host.max(pixels * 3 * (1 + 4));
         let (text_rows, reference_rows, image_rows) = train_rows(item);
         let s = TrainStepShape {
@@ -530,6 +528,19 @@ mod tests {
         let edit = estimate_training(&c, &f, t, &edit).unwrap();
         assert!(edit.train.device > t2i.train.device);
         assert!(edit.conditioning.device > t2i.conditioning.device);
+    }
+
+    /// The target encode is tiled by design: at 2048² it is admission's tiled-encode term, a few
+    /// GB, and sits well under the training step.
+    #[test]
+    fn the_target_encode_is_tiled_and_under_the_train_phase() {
+        let c = contract();
+        let f = facts();
+        let est = estimate_training(&c, &f, tier(None), &run(true)).unwrap();
+        let tiled =
+            crate::image_memory_strategy::admission::tiled_encode_bytes(&f, 2048 * 2048).unwrap();
+        assert_eq!(est.latents.device, tiled + cache_bytes(5376, &run(true)));
+        assert!(est.latents.device * 2 < est.train.device, "{est:?}");
     }
 
     /// A preview adds the generator's whole render on top of the training state.

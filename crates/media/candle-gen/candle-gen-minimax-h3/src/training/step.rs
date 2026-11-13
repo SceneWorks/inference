@@ -197,3 +197,121 @@ pub(crate) fn loss_and_grads(
         }
     })
 }
+
+/// Diagnostics for the real-weights gradient gate (SW-7098): the cotangent arriving at block
+/// `from`'s input — the stack restarted at `from` from its forward input `h_from`, then the
+/// streamed path's segmented VJP or, resident, one `backward()` through a leaf input — and, for
+/// one block, the vector-Jacobian product against a given output cotangent under either attention.
+#[cfg(test)]
+pub(crate) mod diagnostics {
+    use super::*;
+
+    /// `h_from`: the stack's input to block `from`, no graph kept.
+    pub(crate) fn block_input(
+        dit: &MiniMaxH3Dit,
+        modulation: &ImageModulation,
+        inputs: &StepInputs<'_>,
+        from: usize,
+    ) -> Result<Tensor> {
+        crate::nn::with_differentiable_attention(|| {
+            let constants = StepConstants::new(dit, modulation, inputs)?;
+            let mut x = dit
+                .image_stack_input(
+                    inputs.packed,
+                    inputs.text_rows,
+                    inputs.layout.text_indices(),
+                    inputs.layout.image_indices(),
+                )?
+                .detach();
+            for layer in 0..from {
+                x = run_block(dit, modulation, &constants, layer, &x)?.detach();
+            }
+            Ok(x)
+        })
+    }
+
+    /// `dL/d h_from` through blocks `from..` and the tail.
+    pub(crate) fn boundary_cotangent(
+        dit: &MiniMaxH3Dit,
+        modulation: &ImageModulation,
+        vars: &[Var],
+        inputs: &StepInputs<'_>,
+        h_from: &Tensor,
+        from: usize,
+        mae: bool,
+    ) -> Result<Tensor> {
+        crate::nn::with_differentiable_attention(|| {
+            let constants = StepConstants::new(dit, modulation, inputs)?;
+            if dit.is_streamed() {
+                let constants = &constants;
+                let mut segments: Vec<Segment<'_>> = (from..dit.num_layers())
+                    .map(|layer| -> Segment<'_> {
+                        Box::new(move |state: &[Tensor]| {
+                            Ok(vec![run_block(
+                                dit, modulation, constants, layer, &state[0],
+                            )
+                            .map_err(core)?])
+                        })
+                    })
+                    .collect();
+                segments.push(Box::new(move |state: &[Tensor]| {
+                    Ok(vec![tail_loss(
+                        dit, modulation, constants, inputs, &state[0], mae,
+                    )
+                    .map_err(core)?])
+                }));
+                let (_, _, mut cot) =
+                    candle_gen::train::gradient_checkpoint::checkpointed_backward_with_input_grad(
+                        &segments,
+                        std::slice::from_ref(h_from),
+                        vars,
+                    )?;
+                Ok(cot.remove(0))
+            } else {
+                let leaf = Var::from_tensor(h_from)?;
+                let mut x = leaf.as_tensor().clone();
+                for layer in from..dit.num_layers() {
+                    x = run_block(dit, modulation, &constants, layer, &x)?;
+                }
+                let grads = tail_loss(dit, modulation, &constants, inputs, &x, mae)?.backward()?;
+                grads.get(leaf.as_tensor()).cloned().ok_or_else(|| {
+                    CandleError::Msg(format!("no cotangent reached block {from}'s input"))
+                })
+            }
+        })
+    }
+
+    /// Block `layer`'s VJP against `cot` at input `x`: the gradients of `⟨block(x), cot⟩` for `x`
+    /// and the adapter `vars`, under the bounded training attention (`composable == false`) or the
+    /// unbounded composable one.
+    pub(crate) fn block_vjp(
+        dit: &MiniMaxH3Dit,
+        modulation: &ImageModulation,
+        inputs: &StepInputs<'_>,
+        layer: usize,
+        x: &Tensor,
+        cot: &Tensor,
+        composable: bool,
+    ) -> Result<(Tensor, GradStore)> {
+        let run = || -> Result<(Tensor, GradStore)> {
+            let constants = StepConstants::new(dit, modulation, inputs)?;
+            let leaf = Var::from_tensor(x)?;
+            let y = run_block(dit, modulation, &constants, layer, leaf.as_tensor())?;
+            let grads = (y.to_dtype(DType::F32)? * cot.to_dtype(DType::F32)?)?
+                .sum_all()?
+                .backward()?;
+            let gx = grads
+                .get(leaf.as_tensor())
+                .cloned()
+                .ok_or_else(|| CandleError::Msg("no input cotangent".into()))?;
+            Ok((gx, grads))
+        };
+        crate::nn::with_differentiable_attention(|| {
+            if composable {
+                crate::nn::with_composable_training_attention(run)
+            } else {
+                run()
+            }
+        })
+    }
+}

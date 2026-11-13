@@ -369,6 +369,22 @@ pub fn attention_execution_report() -> AttentionExecutionReport {
 
 thread_local! {
     static DIFFERENTIABLE_ATTENTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static COMPOSABLE_TRAINING_ATTENTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Inside [`with_differentiable_attention`], take the unbounded composable softmax attention
+/// instead of the bounded owner — the reference the real-weights gate compares the owner's
+/// backward with, block by block (SW-7098). Test-only.
+#[cfg(test)]
+pub(crate) fn with_composable_training_attention<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COMPOSABLE_TRAINING_ATTENTION.set(self.0);
+        }
+    }
+    let _restore = Restore(COMPOSABLE_TRAINING_ATTENTION.replace(true));
+    f()
 }
 
 /// Run `f` with every DiT attention on this thread differentiable and bounded by design
@@ -404,6 +420,18 @@ fn differentiable_sdpa(
     plan: AttentionPlan<'_>,
 ) -> Result<Tensor> {
     let dtype = q.dtype();
+    if COMPOSABLE_TRAINING_ATTENTION.get() {
+        let out = candle_gen::attention::sdpa_planned_bhsd(
+            &q.to_dtype(DType::F32)?,
+            &k.to_dtype(DType::F32)?,
+            &v.to_dtype(DType::F32)?,
+            scale,
+            None,
+            |s| candle_gen::candle_nn::ops::softmax(s, D::Minus1),
+            plan,
+        )?;
+        return Ok(out.to_dtype(dtype)?);
+    }
     let out = candle_gen::fused_attention::training_sdpa_standard_bhsd(
         &q.to_dtype(DType::F32)?,
         &k.to_dtype(DType::F32)?,

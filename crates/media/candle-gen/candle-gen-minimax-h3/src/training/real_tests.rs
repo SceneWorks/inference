@@ -3,8 +3,12 @@
 //!
 //! The streamed, checkpointed backward (one block copied into the device window at a time, one
 //! segment VJP per block) must give the gradients of the resident whole-graph `loss.backward()`
-//! over the same DiT, and both must agree with a central finite difference of the loss along a
-//! random direction. Float32 compute, so the finite difference measures the gradient rather than
+//! over the same DiT, and both must agree with a central finite difference of the loss — along the
+//! gradient and per factor along a random direction — whose step stands far above the loss's own
+//! noise floor (a repeat at the same factors, floored at f32's relative precision). The gate also
+//! logs, for comparison with MLX, every factor's streamed-vs-resident norm ratio and cosine, the
+//! cotangent at four block boundaries streamed vs resident, and two blocks' VJPs under the bounded
+//! training attention against the unbounded composable one. Float32 compute, so the finite difference measures the gradient rather than
 //! bf16 rounding.
 
 use std::collections::HashMap;
@@ -16,7 +20,7 @@ use candle_gen::gen_core::CancelFlag;
 
 use gen_core_train::h3_image::training_step;
 
-use super::step::{loss_and_grads, noised_rows, StepInputs};
+use super::step::{diagnostics, loss_and_grads, noised_rows, StepInputs};
 use super::{install_adapters, LoraSet};
 use crate::dit::model::image_modulation;
 use crate::dit::MiniMaxH3Dit;
@@ -45,6 +49,14 @@ fn rel_l2(a: &Tensor, b: &Tensor) -> f32 {
     let d = sum(&(a - b).unwrap().sqr().unwrap());
     let n = sum(&b.sqr().unwrap());
     (d / n.max(1e-30)).sqrt()
+}
+
+fn norm(t: &Tensor) -> f32 {
+    sum(&t.sqr().unwrap()).sqrt()
+}
+
+fn cosine(a: &Tensor, b: &Tensor) -> f32 {
+    sum(&(a * b).unwrap()) / (norm(a) * norm(b)).max(1e-30)
 }
 
 fn values(set: &LoraSet) -> HashMap<String, Tensor> {
@@ -154,43 +166,120 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
         })
         .collect();
 
-    // Finite difference along a random direction, through the streamed path.
-    let direction: HashMap<String, Tensor> = params
-        .iter()
-        .enumerate()
-        .map(|(i, (k, v))| (k.clone(), normal(v.dims(), 500 + i as u64, 1.0, &device)))
-        .collect();
-    let dot = |a: &HashMap<String, Tensor>, b: &HashMap<String, Tensor>| -> f32 {
-        a.iter().map(|(k, v)| sum(&(v * &b[k]).unwrap())).sum()
-    };
-    let norm = dot(&direction, &direction).sqrt();
-    let eps = 1e-2 / norm;
-    let loss_at = |sign: f32| -> f32 {
-        let shifted: HashMap<String, Tensor> = params
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    (v + (&direction[k] * f64::from(sign * eps)).unwrap()).unwrap(),
-                )
-            })
-            .collect();
-        assign(&set_s, &shifted);
+    let loss_of = |set: &LoraSet, values: &HashMap<String, Tensor>| -> f32 {
+        assign(set, values);
         loss_and_grads(
             &streamed,
             &modulation_s,
-            &set_s.vars,
+            &set.vars,
             &inputs(&text_s, &layout, &packed, &target, step),
             false,
         )
         .unwrap()
         .0
     };
-    let (plus, minus) = (loss_at(1.0), loss_at(-1.0));
-    let fd = (plus - minus) / (2.0 * eps);
-    let analytic = dot(&grads_s, &direction);
+    // The loss's own resolution: a repeat at the same factors, floored at f32's relative
+    // precision over the mean the loss reduces. A finite difference whose predicted change does
+    // not stand far above it measures noise, not the gradient.
+    let repeat = loss_of(&set_s, &params);
+    let floor = (repeat - loss_s).abs().max(loss_s.abs() * 1e-6);
+    let shifted = |dir: &HashMap<String, Tensor>, by: f32| -> HashMap<String, Tensor> {
+        params
+            .iter()
+            .map(|(k, v)| {
+                let d = dir
+                    .get(k)
+                    .map(|d| (d * f64::from(by)).unwrap())
+                    .unwrap_or_else(|| v.zeros_like().unwrap());
+                (k.clone(), (v + d).unwrap())
+            })
+            .collect()
+    };
+    let dot = |a: &HashMap<String, Tensor>, b: &HashMap<String, Tensor>| -> f32 {
+        a.iter()
+            .filter_map(|(k, v)| b.get(k).map(|w| sum(&(v * w).unwrap())))
+            .sum()
+    };
+    // Central difference along `dir`, its step sized so the predicted one-sided change is 1e3 x the
+    // floor (capped at 10 % of the factors' norm along `dir`).
+    let central = |dir: &HashMap<String, Tensor>| -> (f32, f32, f32, bool) {
+        let analytic = dot(&grads_s, dir);
+        let size = dot(dir, dir).sqrt().max(1e-30);
+        let cap = 0.1 * dot(&params, &params).sqrt().max(1e-6) / size;
+        let eps = (1e3 * floor / analytic.abs().max(1e-30)).min(cap);
+        let fd = (loss_of(&set_s, &shifted(dir, eps)) - loss_of(&set_s, &shifted(dir, -eps)))
+            / (2.0 * eps);
+        let measurable = analytic.abs() * eps >= 1e2 * floor;
+        (analytic, fd, eps, measurable)
+    };
+    // 1. Along the analytic gradient: the predicted change is |g|^2 * eps.
+    let (analytic, fd, eps, measurable) = central(&grads_s);
     let fd_rel = (fd - analytic).abs() / analytic.abs().max(1e-12);
-    println!("[sw-7098 candle] directional derivative: analytic {analytic:.6e}, finite difference {fd:.6e}, rel {fd_rel:.3e}");
+    println!("[sw-7098 candle] directional derivative along g: analytic {analytic:.6e}, finite difference {fd:.6e} at step {eps:.3e} (loss {loss_s:.6e}, noise floor {floor:.3e}, measurable {measurable}), rel {fd_rel:.3e}");
+    // 2. Per factor, along a random direction inside that factor only, scaled like the factor: a
+    //    factor whose analytic gradient missed a path shows here even when the total along g agrees.
+    let mut per_factor = Vec::new();
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    for (i, key) in keys.iter().enumerate() {
+        let p = &params[*key];
+        let r = normal(p.dims(), 500 + i as u64, 1.0, &device);
+        let scale =
+            (sum(&p.sqr().unwrap()).sqrt() / sum(&r.sqr().unwrap()).sqrt().max(1e-30)).max(1e-3);
+        let dir: HashMap<String, Tensor> =
+            [((*key).clone(), (r * f64::from(scale)).unwrap())].into();
+        let (a, f, e, ok) = central(&dir);
+        let rel = (f - a).abs() / a.abs().max(1e-12);
+        println!("[sw-7098 candle] per-factor FD {key}: analytic {a:.6e}, finite difference {f:.6e}, ratio {:.4e}, step {e:.3e}, measurable {ok}, rel {rel:.3e}", f / a);
+        per_factor.push((key.to_string(), rel, ok));
+    }
+    assign(&set_s, &params);
+
+    // 3. Per boundary, the streamed cotangent arriving at block inputs (compared with the resident
+    //    run's below), and per block the bounded attention's VJP against the unbounded composable
+    //    one's on the same input and output cotangent.
+    let last = streamed.num_layers();
+    let boundaries = [0usize, 1, 2, last - 1];
+    let cot_s: Vec<Tensor> = boundaries
+        .iter()
+        .map(|&b| {
+            let h = diagnostics::block_input(
+                &streamed,
+                &modulation_s,
+                &inputs(&text_s, &layout, &packed, &target, step),
+                b,
+            )
+            .unwrap();
+            diagnostics::boundary_cotangent(
+                &streamed,
+                &modulation_s,
+                &set_s.vars,
+                &inputs(&text_s, &layout, &packed, &target, step),
+                &h,
+                b,
+                false,
+            )
+            .unwrap()
+            .copy()
+            .unwrap()
+        })
+        .collect();
+    for layer in [0usize, 1] {
+        let si = inputs(&text_s, &layout, &packed, &target, step);
+        let x = diagnostics::block_input(&streamed, &modulation_s, &si, layer).unwrap();
+        let g = normal(x.dims(), 900 + layer as u64, 1.0, &device);
+        let (gx_o, grads_o) =
+            diagnostics::block_vjp(&streamed, &modulation_s, &si, layer, &x, &g, false).unwrap();
+        let (gx_c, grads_c) =
+            diagnostics::block_vjp(&streamed, &modulation_s, &si, layer, &x, &g, true).unwrap();
+        println!("[sw-7098 candle] block {layer} input VJP, bounded vs composable attention: norm ratio {:.6e}, cosine {:.6e}", norm(&gx_o) / norm(&gx_c), cosine(&gx_o, &gx_c));
+        for (key, var) in set_s.named_vars() {
+            if let (Some(a), Some(b)) = (grads_o.get(var.as_tensor()), grads_c.get(var.as_tensor()))
+            {
+                println!("[sw-7098 candle] block {layer} {key} VJP, bounded vs composable attention: norm ratio {:.6e}, cosine {:.6e}", norm(a) / norm(b), cosine(a, b));
+            }
+        }
+    }
     drop((streamed, modulation_s, set_s, text_s));
     crate::dit::release_device_memory(&device).unwrap();
 
@@ -208,20 +297,47 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
     )
     .unwrap();
     let loss_rel = (loss_s - loss_r).abs() / loss_r.abs().max(1e-12);
-    let worst = set_r
-        .named_vars()
-        .into_iter()
-        .map(|(k, v)| {
-            rel_l2(
-                &grads_s[&k],
-                grads_r.get(v.as_tensor()).expect("a gradient"),
-            )
-        })
-        .fold(0f32, f32::max);
+    let mut worst = 0f32;
+    for (k, v) in set_r.named_vars() {
+        let (a, b) = (
+            &grads_s[&k],
+            grads_r.get(v.as_tensor()).expect("a gradient"),
+        );
+        let r = rel_l2(a, b);
+        worst = worst.max(r);
+        println!("[sw-7098 candle] streamed vs resident {k}: norm ratio {:.6e}, cosine {:.6e}, rel L2 {r:.3e}", norm(a) / norm(b), cosine(a, b));
+    }
+    for (b, cs) in boundaries.iter().zip(&cot_s) {
+        let ri = inputs(&text_r, &layout, &packed, &target, step);
+        let h = diagnostics::block_input(&resident, &modulation_r, &ri, *b).unwrap();
+        let cr = diagnostics::boundary_cotangent(
+            &resident,
+            &modulation_r,
+            &set_r.vars,
+            &ri,
+            &h,
+            *b,
+            false,
+        )
+        .unwrap();
+        println!("[sw-7098 candle] boundary {b} cotangent, streamed vs resident: norm ratio {:.6e}, cosine {:.6e}, |streamed| {:.6e}", norm(cs) / norm(&cr), cosine(cs, &cr), norm(cs));
+    }
     println!("[sw-7098 candle] streamed vs resident: loss {loss_s:.6e} / {loss_r:.6e} (rel {loss_rel:.3e}), worst grad rel L2 {worst:.3e}");
     assert!(loss_rel <= LOSS_REL_TOL, "loss rel {loss_rel}");
     assert!(worst <= GRAD_REL_L2_TOL, "grad rel L2 {worst}");
+    assert!(
+        measurable,
+        "the finite difference along g stays within the loss's noise floor"
+    );
     assert!(fd_rel <= FD_REL_TOL, "finite difference rel {fd_rel}");
+    let measured: Vec<_> = per_factor.iter().filter(|(_, _, ok)| *ok).collect();
+    assert!(
+        !measured.is_empty(),
+        "no factor's finite difference rose above the noise floor"
+    );
+    for (key, rel, _) in measured {
+        assert!(*rel <= FD_REL_TOL, "{key}: finite difference rel {rel}");
+    }
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED training::real_tests::streamed_backward_matches_resident_and_finite_differences_q4_cuda");
 }
