@@ -219,6 +219,15 @@ pub(crate) fn loss_and_grads(
     inputs: &StepInputs<'_>,
 ) -> Result<(f32, LoraParams)> {
     let parts = parts(dit, inputs)?;
+    // Every array the step's graph shares across blocks is forced before the graph is built, so
+    // no block re-derives a lazy shared input inside it.
+    eval([
+        &parts.text_rows,
+        &parts.tables.cos,
+        &parts.tables.sin,
+        &parts.adaln_indices[inputs.step.index],
+        &parts.timestep_indices[inputs.step.index],
+    ])?;
     if spec.streamed {
         streamed_loss_and_grads(dit, modulation, &parts, params, spec, inputs, None)
     } else {
@@ -286,7 +295,7 @@ pub(crate) fn materialize(dit: &MiniMaxH3ImageDit, layer: usize) -> Result<DitBl
 
 /// The concrete (untraced) factors of block `layer`, installed for a forward that is not
 /// differentiated.
-fn install_concrete(
+pub(crate) fn install_concrete(
     block: &mut DitBlock,
     layer: usize,
     trainables: &BlockTrainables,
