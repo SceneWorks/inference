@@ -74,8 +74,9 @@ fn backend() -> &'static str {
 }
 
 /// Weightless probe: can the candle backend prepare `spec.source`? A `*.gguf` container is accepted;
-/// an HF source must be a directory holding `config.json` and must not be a multimodal snapshot (a
-/// `vision_config` block belongs to the vision provider's preparer). Reads only `config.json`, never a
+/// an HF source must be a directory holding `config.json` and be text-only or a `qwen3_5` VLM (see
+/// [`prepares_multimodal_or_text`]; every other `vision_config` snapshot is declined). Reads only
+/// `config.json`, never a
 /// weight shard — mirrors [`provider::can_load`](crate::provider::can_load).
 pub fn can_prepare(spec: &PrepareSpec) -> bool {
     match detect_format(&spec.source) {
@@ -83,7 +84,7 @@ pub fn can_prepare(spec: &PrepareSpec) -> bool {
         Ok(ModelFormat::Safetensors) => {
             spec.source.is_dir()
                 && spec.source.join("config.json").is_file()
-                && !has_vision_config(&spec.source.join("config.json"))
+                && prepares_multimodal_or_text(&spec.source.join("config.json"))
         }
         Err(_) => false,
     }
@@ -150,6 +151,10 @@ fn prepare_hf(spec: &PrepareSpec) -> Result<PrepareReport> {
     std::fs::copy(&tokenizer_path, spec.out_dir.join("tokenizer.json"))?;
     copy_optional(src, &spec.out_dir, "tokenizer_config.json")?;
     copy_optional(src, &spec.out_dir, "special_tokens_map.json")?;
+    // A snapshot whose chat template or sampling defaults live beside the weights (Qwen3.8) keeps
+    // them, so the tier is self-contained.
+    copy_optional(src, &spec.out_dir, "chat_template.jinja")?;
+    copy_optional(src, &spec.out_dir, "generation_config.json")?;
 
     Ok(PrepareReport {
         input_format: ModelFormat::Safetensors,
@@ -388,14 +393,21 @@ fn resolve_gguf_path(source: &Path) -> Result<PathBuf> {
         .ok_or_else(|| Error::Unsupported(format!("prepare: no *.gguf in {}", source.display())))
 }
 
-/// Whether a `config.json` declares a `vision_config` (a multimodal snapshot the text preparer
-/// declines). Any read/parse failure ⇒ `false` (the format probe handles non-snapshots).
-fn has_vision_config(config_json: &Path) -> bool {
-    std::fs::read_to_string(config_json)
+/// Whether this preparer takes the snapshot `config_json` describes: every text-only snapshot, and
+/// the one multimodal family whose loader reads a prepared tier, `qwen3_5` (Qwen3.5/3.6/3.8-VL).
+/// Its decoder and MTP projections are the tensors [`QuantizedTensors`] selects; the vision tower
+/// (`model.visual.*`) is not among them, so it is written exactly as read and the prepared tier
+/// still takes image input. Every other multimodal snapshot (a `vision_config` block) is declined.
+/// Any read/parse failure ⇒ text (the format probe handles non-snapshots).
+fn prepares_multimodal_or_text(config_json: &Path) -> bool {
+    let Some(config) = std::fs::read_to_string(config_json)
         .ok()
         .and_then(|t| serde_json::from_str::<Json>(&t).ok())
-        .map(|v| v.get("vision_config").is_some())
-        .unwrap_or(false)
+    else {
+        return true;
+    };
+    config.get("vision_config").is_none()
+        || config.get("model_type").and_then(Json::as_str) == Some("qwen3_5")
 }
 
 /// Count weight tensors across every `*.safetensors` shard in `dir` by reading only the headers (no
