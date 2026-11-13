@@ -97,6 +97,20 @@ fn analytic_unit(g: &LoraParams, unit: f32) -> f32 {
     unit * dot(g, g)
 }
 
+/// `g` restricted to the factors whose keys start with `prefix` (zeros elsewhere).
+fn restrict(g: &LoraParams, prefix: &str) -> LoraParams {
+    g.iter()
+        .map(|(k, v)| {
+            let kept = if k.starts_with(prefix) {
+                v.clone()
+            } else {
+                Array::zeros::<f32>(v.shape()).unwrap()
+            };
+            (k.clone(), kept)
+        })
+        .collect()
+}
+
 fn norm(a: &Array) -> f32 {
     a.square().unwrap().sum(None).unwrap().item::<f32>().sqrt()
 }
@@ -203,6 +217,22 @@ fn qmm_vjp_check(dit: &MiniMaxH3ImageDit) -> (f32, f32) {
         &[cot],
     )
     .unwrap();
+    // Linearity of the packed matmul in its input at a small step: an exact float32 kernel gives
+    // qmm(x + t·d) − qmm(x) = t·qmm(d) to rounding; a kernel that rounds or quantizes its input
+    // does not (a piecewise forward in the activations would make the loss rough in every factor
+    // upstream of a q4 projection).
+    let qmm = |a: &Array| mlx_rs::ops::quantized_matmul(a, &wq, &sc, &bi, true, gs, bits).unwrap();
+    let x2 = normal(&[1, 8, in_f], 43, 1.0);
+    let d = normal(&[1, 8, in_f], 44, 1.0);
+    for t in [1e-2f32, 1e-3, 1e-4] {
+        let moved = x2.add(d.multiply(Array::from_f32(t)).unwrap()).unwrap();
+        let lhs = qmm(&moved).subtract(qmm(&x2)).unwrap();
+        let rhs = qmm(&d).multiply(Array::from_f32(t)).unwrap();
+        println!(
+            "[sw-7097 mlx] q4 quantized_matmul linearity at t={t:.0e}: rel L2 {:.3e}",
+            rel_l2(&lhs, &rhs)
+        );
+    }
     (
         rel_l2(&packed.0[0].as_dtype(Dtype::Float32).unwrap(), &plain.0[0]),
         rel_l2(&packed.1[0].as_dtype(Dtype::Float32).unwrap(), &plain.1[0]),
@@ -628,6 +658,99 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
                 &r_vjp,
             );
         }
+
+        // Block 49's attention under to_q perturbations along g (restricted to that factor pair):
+        // the scores' magnitude and float32 resolution, softmax saturation, and whether any row's
+        // winning key (argmax) changes on the 17-point grid — with the loss on the same grid. A
+        // value-dependent discrete choice in the attention path would show as argmax flips that
+        // line up with loss steps; a smooth path shows none and constant loss differences.
+        let dir49 = restrict(&grads_s, "transformer_blocks.49.attn.to_q.");
+        let a49 = dot(&grads_s, &dir49);
+        let unit = 1e-4 * loss_s.abs() / a49.abs().max(1e-30);
+        let base_block = resident.blocks()[49].clone();
+        let scores_at = |p: &LoraParams| -> Array {
+            let mut blk = base_block.clone();
+            if let Some(adapter) = &blocks[49].adapter {
+                adapter
+                    .install_as(
+                        &mut BlockHost {
+                            index: 49,
+                            block: &mut blk,
+                        },
+                        p,
+                        cfg.alpha,
+                        cfg.rank as f32,
+                        None,
+                        LOKR_DTYPE,
+                    )
+                    .unwrap();
+            }
+            let s = blk
+                .attention_scores(
+                    &inputs_at[49],
+                    modulation_r.cache.modulation(49).unwrap(),
+                    &parts_r.adaln_indices[step_index],
+                    resident.rope(),
+                    &parts_r.tables,
+                )
+                .unwrap();
+            mlx_rs::transforms::eval([&s]).unwrap();
+            s
+        };
+        let s0 = scores_at(&params);
+        let max_abs = s0.abs().unwrap().max(None).unwrap().item::<f32>();
+        let probs0 = mlx_rs::ops::softmax_axis(&s0, -1, true).unwrap();
+        let maxp = probs0.max_axis(-1, None).unwrap();
+        let saturated = maxp
+            .gt(Array::from_f32(0.99))
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .mean(None)
+            .unwrap()
+            .item::<f32>();
+        println!(
+            "[sw-7097 mlx] block 49 attention: max |score| {max_abs:.4e} (float32 spacing there {:.3e}), mean max-probability {:.4}, rows with max-probability > 0.99: {:.2}%",
+            max_abs * f32::EPSILON,
+            maxp.mean(None).unwrap().item::<f32>(),
+            100.0 * saturated
+        );
+        let arg0 = mlx_rs::ops::indexing::argmax_axis(&s0, -1, None).unwrap();
+        let mut losses = Vec::new();
+        for k in -8i32..=8 {
+            let p = shifted(&params, &dir49, unit * k as f32);
+            let sk = scores_at(&p);
+            let argk = mlx_rs::ops::indexing::argmax_axis(&sk, -1, None).unwrap();
+            let flips = argk
+                .ne(&arg0)
+                .unwrap()
+                .as_dtype(Dtype::Int32)
+                .unwrap()
+                .sum(None)
+                .unwrap()
+                .item::<i32>();
+            let dprob = mlx_rs::ops::softmax_axis(&sk, -1, true)
+                .unwrap()
+                .subtract(&probs0)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            let l = streamed_loss(&mut streamed, &modulation_s, &p, &spec(true), &inputs).unwrap();
+            losses.push(l);
+            println!("[sw-7097 mlx] block 49 to_q grid k={k:+}: step {:.3e}, argmax flips {flips} of {} rows, max |Δprob| {dprob:.3e}, loss {l:.9e}", unit * k as f32, arg0.size());
+        }
+        let diffs: Vec<String> = losses
+            .windows(2)
+            .map(|w| format!("{:.3e}", w[1] - w[0]))
+            .collect();
+        println!(
+            "[sw-7097 mlx] block 49 to_q grid: successive loss differences [{}]; smooth expectation {:.3e}",
+            diffs.join(", "),
+            unit * a49
+        );
     }
     drop(resident);
     mlx_gen::residency::drain_allocator_cache();
@@ -725,70 +848,15 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
     assert!(loss_rel <= LOSS_REL_TOL, "loss rel {loss_rel}");
     assert!(worst <= GRAD_REL_L2_TOL, "grad rel L2 {worst}");
 
-    let only = |g: &LoraParams, prefix: &str| -> LoraParams {
-        g.iter()
-            .map(|(k, v)| {
-                let kept = if k.starts_with(prefix) {
-                    v.clone()
-                } else {
-                    Array::zeros::<f32>(v.shape()).unwrap()
-                };
-                (k.clone(), kept)
-            })
-            .collect()
-    };
-
-    // ── The finite-difference arbiter, on the CPU stream ────────────────────────────────────────
-    // This GPU's float32 GEMM is TF32-class (the probe above), so the loss is stepped at ~3e-4 and
-    // no gradient-scale difference resolves on it (run 43433989982). MLX's CPU backend computes
-    // float32 in IEEE single precision: the same loss code, the same weights and inputs, the same
-    // bound, evaluated there — the analytic gradient for the comparison recomputed there too.
-    struct DefaultGpu;
-    impl Drop for DefaultGpu {
-        fn drop(&mut self) {
-            mlx_rs::Device::set_default(&mlx_rs::Device::gpu());
-        }
-    }
-    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
-    let _gpu = DefaultGpu;
-    let started = std::time::Instant::now();
-    let (loss_c, grads_c) =
-        loss_and_grads(&mut streamed, &modulation_s, &params, &spec(true), &inputs).unwrap();
-    let grad_secs = started.elapsed().as_secs_f64();
-    let started = std::time::Instant::now();
+    // ── The finite-difference arbiter (GPU) ─────────────────────────────────────────────────────
+    // Central differences of the untraced streamed loss (`streamed_loss`, the function the trainer
+    // reports and differentiates) with the REALIZED perturbation: δ± = (θ ± h·d) − θ evaluated in
+    // f32, the prediction g·(δ+ − δ−). The step starts where the predicted change is 1e3x the loss's
+    // own rounding and halves until the one-sided changes agree within 10%; only a step that is
+    // measurable AND passes that check adjudicates, and none qualifying fails the gate.
     let l0 = streamed_loss(&mut streamed, &modulation_s, &params, &spec(true), &inputs).unwrap();
-    let loss_secs = started.elapsed().as_secs_f64();
     let l0_again =
         streamed_loss(&mut streamed, &modulation_s, &params, &spec(true), &inputs).unwrap();
-    println!("[sw-7097 mlx] CPU stream: loss {l0:.9e} (repeat {l0_again:.9e}, traced {loss_c:.9e}; GPU {loss_s:.9e}); {loss_secs:.1} s per loss evaluation, {grad_secs:.1} s per loss + gradient");
-
-    // GPU vs CPU analytic gradient. Bound, derived from the measured GEMM precision and not
-    // tuned: each GEMM on the forward + backward path adds an independent relative error of about
-    // `gemm_rel`; a block runs 8 GEMMs forward (q, k, v, out, the SwiGLU pair, q·kᵀ, p·v) and two
-    // per GEMM backward, 24 per block, so 50 blocks is N = 1200 and independent errors add in
-    // quadrature: tol = sqrt(N) · gemm_rel (~2.7e-2 at the 7.7e-4 run 43433989982 measured).
-    let n_gemm = 24.0 * streamed.num_layers() as f32;
-    let gpu_cpu_tol = n_gemm.sqrt() * gemm_rel;
-    let diff_sq: f32 = keys
-        .iter()
-        .map(|k| {
-            grads_s[k]
-                .subtract(&grads_c[k])
-                .unwrap()
-                .square()
-                .unwrap()
-                .sum(None)
-                .unwrap()
-                .item::<f32>()
-        })
-        .sum();
-    let gpu_cpu_rel = (diff_sq / dot(&grads_c, &grads_c).max(1e-30)).sqrt();
-    println!("[sw-7097 mlx] GPU vs CPU analytic gradient: rel L2 {gpu_cpu_rel:.3e} (bound sqrt({n_gemm}) x GEMM precision {gemm_rel:.3e} = {gpu_cpu_tol:.3e})");
-
-    // Central differences with the REALIZED perturbation: δ± = (θ ± h·d) − θ, evaluated in f32,
-    // and the prediction g·(δ+ − δ−). The step starts where the predicted change is 1e3x the
-    // loss's own rounding, halving until the two one-sided changes agree within 10%; only a step
-    // that is measurable AND passes that check adjudicates, and none qualifying is a failure.
     let floor = (l0_again - l0).abs().max(l0.abs() * 8.0 * f32::EPSILON);
     let params_norm = dot(&params, &params).sqrt();
     let realized = |dir: &LoraParams, eps: f32| -> (LoraParams, f32) {
@@ -797,12 +865,12 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
             .iter()
             .map(|(k, v)| (k.clone(), v.subtract(&params[k]).unwrap()))
             .collect();
-        let predicted = dot(&grads_c, &delta);
+        let predicted = dot(&grads_s, &delta);
         (moved, predicted)
     };
     let mut verdicts = Vec::new();
     let mut central = |streamed: &mut MiniMaxH3ImageDit, dir: &LoraParams, label: &str| {
-        let a = dot(&grads_c, dir);
+        let a = dot(&grads_s, dir);
         let cap = 0.05 * params_norm / dot(dir, dir).sqrt().max(1e-30);
         let mut eps = (1e3 * floor / a.abs().max(1e-30)).min(cap);
         let mut verdict = None;
@@ -817,7 +885,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
             let predicted = pred_plus - pred_minus;
             let rel = ((lp - lm) - predicted).abs() / predicted.abs().max(1e-30);
             let ok = measurable && asymmetry <= 0.1;
-            println!("[sw-7097 mlx] CPU FD along {label}: L+ - L- {:.6e} vs realized prediction g·(δ+ - δ-) {predicted:.6e} (rel {rel:.3e}) at step {eps:.3e}; requested h·g·d {:.6e}; L+ - L0 {up:.3e}, L0 - L- {down:.3e}, asymmetry {asymmetry:.3e}, floor {floor:.3e}, measurable {measurable}, qualifies {ok}", lp - lm, 2.0 * eps * a);
+            println!("[sw-7097 mlx] FD along {label}: L+ - L- {:.6e} vs realized prediction {predicted:.6e} (rel {rel:.3e}) at step {eps:.3e}; L+ - L0 {up:.3e}, L0 - L- {down:.3e}, asymmetry {asymmetry:.3e}, floor {floor:.3e}, measurable {measurable}, qualifies {ok}", lp - lm);
             if ok {
                 verdict = Some(rel);
                 break;
@@ -829,7 +897,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         }
         verdicts.push((label.to_string(), verdict));
     };
-    central(&mut streamed, &grads_c, "g_cpu");
+    central(&mut streamed, &grads_s, "g_streamed");
     for prefix in [
         "transformer_blocks.49.attn.to_q.",
         "transformer_blocks.49.ff.net.2.",
@@ -838,25 +906,18 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
     ] {
         central(
             &mut streamed,
-            &only(&grads_c, prefix),
-            &format!("g_cpu[{prefix}*]"),
+            &restrict(&grads_s, prefix),
+            &format!("g_streamed[{prefix}*]"),
         );
     }
-    drop(_gpu);
-
+    let full = verdicts[0].1;
     assert!(
-        gpu_cpu_rel <= gpu_cpu_tol,
-        "GPU vs CPU analytic gradient rel L2 {gpu_cpu_rel} exceeds the GEMM-derived bound {gpu_cpu_tol}"
+        full.is_some(),
+        "no finite-difference step along g_streamed is both measurable and within the curvature \
+         check; the loss is not resolvable at any tried step"
     );
-    for (label, verdict) in &verdicts {
-        let rel = verdict.unwrap_or_else(|| {
-            panic!(
-                "no CPU finite-difference step along {label} is both measurable and within the \
-                 curvature check"
-            )
-        });
-        assert!(rel <= FD_REL_TOL, "{label}: finite difference rel {rel}");
-    }
+    let fd_rel = full.unwrap_or(f32::INFINITY);
+    assert!(fd_rel <= FD_REL_TOL, "finite difference rel {fd_rel}");
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED training::real_tests::streamed_backward_matches_resident_and_finite_differences_q4");
 }

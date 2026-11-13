@@ -310,6 +310,40 @@ impl DitAttention {
         self.forward_bounded_veda(x, rope, bounded, None)
     }
 
+    /// The scaled pre-softmax scores `q·kᵀ / √d`, `[B, H, S, S]` — the trainer's gradient gate
+    /// inspects them (SW-7097). Same q/k path as the forward: projection, qk-norm, rotary.
+    #[cfg(test)]
+    pub(crate) fn scores(
+        &self,
+        x: &Array,
+        rope: Option<(&MmRope, &MmRopeTables)>,
+    ) -> Result<Array> {
+        let s = x.shape();
+        let (b, seq) = (s[0], s[1]);
+        let shape = [b, seq, self.heads, self.head_dim];
+        let q = rms_affine(
+            &self.to_q.forward(x)?.reshape(&shape)?,
+            &self.norm_q,
+            self.qk_norm_eps,
+        )?;
+        let k = rms_affine(
+            &self.to_k.forward(x)?.reshape(&shape)?,
+            &self.norm_k,
+            self.qk_norm_eps,
+        )?;
+        let (q, k) = match rope {
+            Some((rope, tables)) => (rope.apply(&q, tables)?, rope.apply(&k, tables)?),
+            None => (q, k),
+        };
+        let q = q.transpose_axes(&[0, 2, 1, 3])?;
+        let k = k.transpose_axes(&[0, 2, 1, 3])?;
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        Ok(mlx_rs::ops::matmul(
+            &q.multiply(Array::from_f32(scale).as_dtype(q.dtype())?)?,
+            k.swap_axes(-1, -2)?,
+        )?)
+    }
+
     pub(crate) fn forward_bounded_veda(
         &self,
         x: &Array,
