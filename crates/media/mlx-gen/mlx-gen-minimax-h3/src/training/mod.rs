@@ -554,7 +554,7 @@ impl MiniMaxH3ImageTrainer {
         let mut dit = if plan.checkpointed {
             MiniMaxH3ImageDit::load_dir_deferred(&dit_dir, plan.compute_dtype)?
         } else {
-            MiniMaxH3ImageDit::load_dir(&dit_dir, plan.compute_dtype)?
+            MiniMaxH3ImageDit::load_dir_materialized(&dit_dir, plan.compute_dtype)?
         };
         let modulation = dit.training_modulation(
             plan.edit,

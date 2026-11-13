@@ -17,8 +17,9 @@ use gen_core_train::h3_image::training_step;
 
 use super::block_trainables;
 use super::step::{
-    attention, block_vjp, loss_and_grads, materialize, noised_rows, parts, run_block, stack_input,
-    streamed_loss_and_grads, tail_loss, BlockHost, FactorGrads, LossSpec, StepInputs, LOKR_DTYPE,
+    attention, block_vjp, install_concrete, loss_and_grads, materialize, noised_rows, parts,
+    run_block, stack_input, streamed_loss_and_grads, tail_loss, BlockHost, FactorGrads, LossSpec,
+    StepInputs, LOKR_DTYPE,
 };
 use crate::h3_image::dit::MiniMaxH3ImageDit;
 use crate::h3_image::layout::ImageLayout;
@@ -429,10 +430,20 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
     println!("[sw-7097 mlx] streamed loss repeat: {loss_s:.9e} / {again:.9e}");
 
     // The resident reference, with every block boundary's cotangent.
-    let mut resident = MiniMaxH3ImageDit::load_dir(&dir, Dtype::Float32).unwrap();
+    // The resident reference: independent whole-graph autodiff over a DiT whose every tensor is
+    // forced before the graph is built (the trainer's own resident load).
+    let mut resident = MiniMaxH3ImageDit::load_dir_materialized(&dir, Dtype::Float32).unwrap();
     let modulation_r = resident.training_modulation(false, None).unwrap();
     let (loss_r, grads_r) =
         loss_and_grads(&mut resident, &modulation_r, &params, &spec(false), &inputs).unwrap();
+    // (a) The resident forward + backward again in the same process.
+    let (loss_r2, grads_r2) =
+        loss_and_grads(&mut resident, &modulation_r, &params, &spec(false), &inputs).unwrap();
+    let repeat_worst = grads_r
+        .iter()
+        .map(|(k, g)| rel_l2(&grads_r2[k], g))
+        .fold(0f32, f32::max);
+    println!("[sw-7097 mlx] resident repeat: loss {loss_r:.9e} / {loss_r2:.9e}, worst grad rel L2 {repeat_worst:.3e}");
     let cot_r =
         resident_boundary_cotangents(&mut resident, &modulation_r, &params, &spec(false), &inputs);
     // Single-block isolation, blocks 0 and 49: the same input and output cotangent through the
@@ -470,6 +481,42 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
             mlx_rs::transforms::eval([&h]).unwrap();
             inputs_at.push(h.clone());
         }
+        // (b) The resident untraced forward's block inputs against the streamed forward's (the
+        // trainer's: one rebuilt block at a time, concrete factors installed).
+        let mut hs = stack_input(&streamed, &parts_s, &packed).unwrap();
+        let mut worst_h = (0usize, 0f32);
+        for layer in 0..=streamed.num_layers() {
+            let rel = rel_l2(&hs, &inputs_at[layer]);
+            if layer % 7 == 0 || layer >= 47 || rel > worst_h.1 {
+                println!(
+                    "[sw-7097 mlx] activation h_{layer:02}: streamed vs resident rel L2 {rel:.3e}"
+                );
+            }
+            if rel > worst_h.1 {
+                worst_h = (layer, rel);
+            }
+            if layer == streamed.num_layers() {
+                break;
+            }
+            let mut block = materialize(&streamed, layer).unwrap();
+            install_concrete(&mut block, layer, &blocks[layer], &params, &spec(true)).unwrap();
+            hs = run_block(
+                &streamed,
+                &block,
+                layer,
+                &hs,
+                &modulation_s,
+                &parts_s,
+                step_index,
+                bounded,
+            )
+            .unwrap();
+            mlx_rs::transforms::eval([&hs]).unwrap();
+        }
+        println!(
+            "[sw-7097 mlx] activations: worst streamed vs resident rel L2 {:.3e} at h_{:02}",
+            worst_h.1, worst_h.0
+        );
         for layer in [49usize, 0] {
             let cot = &cot_s.iter().find(|(l, _)| *l == layer + 1).unwrap().1;
             let input = &inputs_at[layer];

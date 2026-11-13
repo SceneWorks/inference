@@ -194,6 +194,19 @@ impl MiniMaxH3ImageDit {
         Self::from_weights(&mut w, &cfg, dtype)
     }
 
+    /// [`Self::load_dir`], with every tensor the DiT holds forced and GPU-verified before return —
+    /// for a caller that builds one whole-graph transform over the resident DiT (the trainer's
+    /// resident backward, SW-7097), so no source tensor is first read inside that graph (the
+    /// sc-24245 class: a lazy weight read inside a large evaluation can come back silently wrong).
+    pub(crate) fn load_dir_materialized(dir: impl AsRef<Path>, dtype: Dtype) -> Result<Self> {
+        let dir = dir.as_ref();
+        let cfg = Self::read_config(dir)?;
+        let mut w = Weights::from_dir(dir)?;
+        let dit = Self::from_weights(&mut w, &cfg, dtype)?;
+        w.materialize_accessed()?;
+        Ok(dit)
+    }
+
     /// Every tensor name the image DiT consumes — the published 644 at the shipped geometry.
     pub fn names(cfg: &MiniMaxH3ImageDitConfig) -> Vec<String> {
         let mut v = ImageDitProjections::names(cfg);
