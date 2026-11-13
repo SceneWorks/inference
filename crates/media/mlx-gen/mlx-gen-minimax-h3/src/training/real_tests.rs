@@ -664,6 +664,108 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         // winning key (argmax) changes on the 17-point grid — with the loss on the same grid. A
         // value-dependent discrete choice in the attention path would show as argmax flips that
         // line up with loss steps; a smooth path shows none and constant loss differences.
+        // Is the near-hard attention the base model's or the fixture's? Blocks 0, 25 and 49's
+        // score magnitude and mean max-probability with the LoRA up factors zeroed (the base model
+        // plus a zero delta, as training starts), with B seeded only where the Candle gate seeds it
+        // (blocks 0-1, the same N(0, 0.02)), and with this gate's seed — plus the seeded block 49
+        // to_q delta's size against its weight.
+        {
+            let zeroed: LoraParams = params
+                .iter()
+                .map(|(k, v)| {
+                    let kept = if k.ends_with("lora_b") {
+                        Array::zeros::<f32>(v.shape()).unwrap()
+                    } else {
+                        v.clone()
+                    };
+                    (k.clone(), kept)
+                })
+                .collect();
+            for (label, variant) in [
+                ("B = 0 (base)", &zeroed),
+                ("B ~ N(0, 0.02) (gate seed)", &params),
+            ] {
+                spec(false)
+                    .adapter
+                    .install_as(
+                        &mut resident,
+                        variant,
+                        cfg.alpha,
+                        cfg.rank as f32,
+                        None,
+                        LOKR_DTYPE,
+                    )
+                    .unwrap();
+                let mut h = stack_input(&resident, &parts_r, &packed).unwrap();
+                for (layer, block) in resident.blocks().iter().enumerate() {
+                    if [0usize, 25, 49].contains(&layer) {
+                        let sc = block
+                            .attention_scores(
+                                &h,
+                                modulation_r.cache.modulation(layer).unwrap(),
+                                &parts_r.adaln_indices[step_index],
+                                resident.rope(),
+                                &parts_r.tables,
+                            )
+                            .unwrap();
+                        let max_abs = sc.abs().unwrap().max(None).unwrap().item::<f32>();
+                        let maxp = mlx_rs::ops::softmax_axis(&sc, -1, true)
+                            .unwrap()
+                            .max_axis(-1, None)
+                            .unwrap()
+                            .mean(None)
+                            .unwrap()
+                            .item::<f32>();
+                        println!("[sw-7097 mlx] scores, {label}: block {layer} max |score| {max_abs:.4e}, mean max-probability {maxp:.4}");
+                    }
+                    h = run_block(
+                        &resident,
+                        block,
+                        layer,
+                        &h,
+                        &modulation_r,
+                        &parts_r,
+                        step_index,
+                        bounded,
+                    )
+                    .unwrap();
+                    mlx_rs::transforms::eval([&h]).unwrap();
+                }
+            }
+            // Restore the gate's factors on the resident blocks.
+            spec(false)
+                .adapter
+                .install_as(
+                    &mut resident,
+                    &params,
+                    cfg.alpha,
+                    cfg.rank as f32,
+                    None,
+                    LOKR_DTYPE,
+                )
+                .unwrap();
+            use mlx_gen::adapters::AdaptableHost;
+            let mut blk = resident.blocks()[49].clone();
+            let lin = blk.adaptable_mut(&["attn", "to_q"]).unwrap();
+            let (wq, sc, bi, _, gs, bits) = lin.quantized_params().expect("a q4 leaf");
+            let w = mlx_rs::ops::dequantize(wq, sc, bi, gs, bits)
+                .unwrap()
+                .as_dtype(Dtype::Float32)
+                .unwrap();
+            let a = &params[&std::rc::Rc::from("transformer_blocks.49.attn.to_q.lora_a")];
+            let b = &params[&std::rc::Rc::from("transformer_blocks.49.attn.to_q.lora_b")];
+            let delta = b
+                .matmul(a)
+                .unwrap()
+                .multiply(Array::from_f32(cfg.alpha / cfg.rank as f32))
+                .unwrap();
+            println!(
+                "[sw-7097 mlx] block 49 to_q: |ΔW|/|W| {:.3e} with the gate seed (|ΔW| {:.3e}, |W| {:.3e})",
+                norm(&delta) / norm(&w).max(1e-30),
+                norm(&delta),
+                norm(&w)
+            );
+        }
         let dir49 = restrict(&grads_s, "transformer_blocks.49.attn.to_q.");
         let a49 = dot(&grads_s, &dir49);
         let unit = 1e-4 * loss_s.abs() / a49.abs().max(1e-30);
