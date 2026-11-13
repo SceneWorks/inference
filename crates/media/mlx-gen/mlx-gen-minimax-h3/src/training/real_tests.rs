@@ -18,8 +18,8 @@ use gen_core_train::h3_image::training_step;
 use super::block_trainables;
 use super::step::{
     attention, block_vjp, install_concrete, loss_and_grads, materialize, noised_rows, parts,
-    run_block, stack_input, streamed_loss_and_grads, tail_loss, BlockHost, FactorGrads, LossSpec,
-    StepInputs, LOKR_DTYPE,
+    run_block, stack_input, streamed_loss, streamed_loss_and_grads, tail_loss, BlockHost,
+    FactorGrads, LossSpec, StepInputs, LOKR_DTYPE,
 };
 use crate::h3_image::dit::MiniMaxH3ImageDit;
 use crate::h3_image::layout::ImageLayout;
@@ -662,10 +662,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
     let (rms_out, rms_grad) = rms_norm_vjp_check();
     println!("[sw-7097 mlx] fast rms_norm vs explicit: output rel L2 {rms_out:.3e}, input VJP rel L2 {rms_grad:.3e}");
 
-    // Central differences of the loss the streamed forward evaluates — the same function the
-    // gradients claim to differentiate: same install, same kernels, same inputs.
-    let noise_floor = (again - loss_s).abs().max(loss_s.abs() * 1e-6);
-    let params_norm = dot(&params, &params).sqrt();
+    let gemm_rel;
     // Where smoothness goes: (i) dtypes on the LoRA path; (ii) the realized perturbation of one
     // factor against the requested h·g; (iii) this GPU's float32 GEMM against the CPU stream's at a
     // block projection's shape; (iv) the loss along g on a fine grid around θ — its successive
@@ -691,9 +688,9 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         let b = normal(&[5376, 7168], 72, 0.02);
         let gpu = a.matmul(&b).unwrap();
         let cpu = a.matmul_device(&b, mlx_rs::StreamOrDevice::cpu()).unwrap();
+        gemm_rel = rel_l2(&gpu, &cpu);
         println!(
-            "[sw-7097 mlx] float32 GEMM [272,5376]x[5376,7168]: default stream vs CPU stream rel L2 {:.3e}",
-            rel_l2(&gpu, &cpu)
+            "[sw-7097 mlx] GPU float32 GEMM precision (evidence): [272,5376]x[5376,7168] default (GPU) stream vs CPU stream rel L2 {gemm_rel:.3e} — IEEE float32 accumulation gives ~1e-6; TF32-class is ~5e-4"
         );
         let unit = 0.183 / 16.0;
         let mut row = Vec::new();
@@ -719,85 +716,6 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
             analytic_unit(&grads_s, unit)
         );
     }
-    let central = |streamed: &mut MiniMaxH3ImageDit, dir: &LoraParams, label: &str| {
-        let a_s = dot(&grads_s, dir);
-        let a_r = dot(&grads_r, dir);
-        let dir_norm = dot(dir, dir).sqrt();
-        let cap = 0.05 * params_norm / dir_norm.max(1e-30);
-        // Start where the predicted change is 1e3x the noise floor and halve until the two
-        // one-sided changes agree within 10% (the curvature check), while still measurable.
-        let mut eps = (1e3 * noise_floor / a_s.abs().max(1e-30)).min(cap);
-        // Only a step that is measurable AND passes the curvature check may adjudicate; the first
-        // such step (the largest) is the verdict, and none qualifying is a failure, not a pick.
-        let mut qualified: Option<(f32, f32)> = None;
-        for _ in 0..12 {
-            let mut at = |e: f32| {
-                loss_and_grads(
-                    streamed,
-                    &modulation_s,
-                    &shifted(&params, dir, e),
-                    &spec(true),
-                    &inputs,
-                )
-                .unwrap()
-                .0
-            };
-            let (lp, lm) = (at(eps), at(-eps));
-            let (up, down) = (lp - loss_s, loss_s - lm);
-            let asymmetry = (up - down).abs() / up.abs().max(down.abs()).max(1e-30);
-            let measurable = (lp - lm).abs() >= 1e2 * noise_floor;
-            let fd = (lp - lm) / (2.0 * eps);
-            let ok = measurable && asymmetry <= 0.1;
-            println!("[sw-7097 mlx] FD along {label}: streamed analytic {a_s:.6e}, resident analytic {a_r:.6e}, finite difference {fd:.6e} at step {eps:.3e} (L+ - L0 {up:.3e}, L0 - L- {down:.3e}, asymmetry {asymmetry:.3e}, noise floor {noise_floor:.3e}, measurable {measurable}, qualifies {ok})");
-            if ok {
-                qualified = Some((fd, eps));
-                break;
-            }
-            if !measurable {
-                break;
-            }
-            eps /= 2.0;
-        }
-        (a_s, a_r, qualified)
-    };
-    let only = |g: &LoraParams, prefix: &str| -> LoraParams {
-        g.iter()
-            .map(|(k, v)| {
-                let keep = k.starts_with(prefix);
-                (
-                    k.clone(),
-                    if keep {
-                        v.clone()
-                    } else {
-                        Array::zeros::<f32>(v.shape()).unwrap()
-                    },
-                )
-            })
-            .collect()
-    };
-    let (analytic, _, verdict) = central(&mut streamed, &grads_s, "g_streamed");
-    central(&mut streamed, &grads_r, "g_resident");
-    for prefix in [
-        "transformer_blocks.49.attn.to_q.",
-        "transformer_blocks.49.ff.net.2.",
-        "transformer_blocks.0.attn.to_q.",
-        "transformer_blocks.0.ff.net.2.",
-    ] {
-        central(
-            &mut streamed,
-            &only(&grads_s, prefix),
-            &format!("g_streamed[{prefix}*]"),
-        );
-        central(
-            &mut streamed,
-            &only(&grads_r, prefix),
-            &format!("g_resident[{prefix}*]"),
-        );
-    }
-    let fd = verdict.map(|(fd, _)| fd);
-    let fd_rel = fd.map_or(f32::INFINITY, |fd| {
-        (fd - analytic).abs() / analytic.abs().max(1e-12)
-    });
     let loss_rel = (loss_s - loss_r).abs() / loss_r.abs().max(1e-12);
     let worst = keys
         .iter()
@@ -806,12 +724,139 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
     println!("[sw-7097 mlx] streamed vs resident: loss {loss_s:.6e} / {loss_r:.6e} (rel {loss_rel:.3e}), worst grad rel L2 {worst:.3e}");
     assert!(loss_rel <= LOSS_REL_TOL, "loss rel {loss_rel}");
     assert!(worst <= GRAD_REL_L2_TOL, "grad rel L2 {worst}");
+
+    let only = |g: &LoraParams, prefix: &str| -> LoraParams {
+        g.iter()
+            .map(|(k, v)| {
+                let kept = if k.starts_with(prefix) {
+                    v.clone()
+                } else {
+                    Array::zeros::<f32>(v.shape()).unwrap()
+                };
+                (k.clone(), kept)
+            })
+            .collect()
+    };
+
+    // ── The finite-difference arbiter, on the CPU stream ────────────────────────────────────────
+    // This GPU's float32 GEMM is TF32-class (the probe above), so the loss is stepped at ~3e-4 and
+    // no gradient-scale difference resolves on it (run 43433989982). MLX's CPU backend computes
+    // float32 in IEEE single precision: the same loss code, the same weights and inputs, the same
+    // bound, evaluated there — the analytic gradient for the comparison recomputed there too.
+    struct DefaultGpu;
+    impl Drop for DefaultGpu {
+        fn drop(&mut self) {
+            mlx_rs::Device::set_default(&mlx_rs::Device::gpu());
+        }
+    }
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    let _gpu = DefaultGpu;
+    let started = std::time::Instant::now();
+    let (loss_c, grads_c) =
+        loss_and_grads(&mut streamed, &modulation_s, &params, &spec(true), &inputs).unwrap();
+    let grad_secs = started.elapsed().as_secs_f64();
+    let started = std::time::Instant::now();
+    let l0 = streamed_loss(&mut streamed, &modulation_s, &params, &spec(true), &inputs).unwrap();
+    let loss_secs = started.elapsed().as_secs_f64();
+    let l0_again =
+        streamed_loss(&mut streamed, &modulation_s, &params, &spec(true), &inputs).unwrap();
+    println!("[sw-7097 mlx] CPU stream: loss {l0:.9e} (repeat {l0_again:.9e}, traced {loss_c:.9e}; GPU {loss_s:.9e}); {loss_secs:.1} s per loss evaluation, {grad_secs:.1} s per loss + gradient");
+
+    // GPU vs CPU analytic gradient. Bound, derived from the measured GEMM precision and not
+    // tuned: each GEMM on the forward + backward path adds an independent relative error of about
+    // `gemm_rel`; a block runs 8 GEMMs forward (q, k, v, out, the SwiGLU pair, q·kᵀ, p·v) and two
+    // per GEMM backward, 24 per block, so 50 blocks is N = 1200 and independent errors add in
+    // quadrature: tol = sqrt(N) · gemm_rel (~2.7e-2 at the 7.7e-4 run 43433989982 measured).
+    let n_gemm = 24.0 * streamed.num_layers() as f32;
+    let gpu_cpu_tol = n_gemm.sqrt() * gemm_rel;
+    let diff_sq: f32 = keys
+        .iter()
+        .map(|k| {
+            grads_s[k]
+                .subtract(&grads_c[k])
+                .unwrap()
+                .square()
+                .unwrap()
+                .sum(None)
+                .unwrap()
+                .item::<f32>()
+        })
+        .sum();
+    let gpu_cpu_rel = (diff_sq / dot(&grads_c, &grads_c).max(1e-30)).sqrt();
+    println!("[sw-7097 mlx] GPU vs CPU analytic gradient: rel L2 {gpu_cpu_rel:.3e} (bound sqrt({n_gemm}) x GEMM precision {gemm_rel:.3e} = {gpu_cpu_tol:.3e})");
+
+    // Central differences with the REALIZED perturbation: δ± = (θ ± h·d) − θ, evaluated in f32,
+    // and the prediction g·(δ+ − δ−). The step starts where the predicted change is 1e3x the
+    // loss's own rounding, halving until the two one-sided changes agree within 10%; only a step
+    // that is measurable AND passes that check adjudicates, and none qualifying is a failure.
+    let floor = (l0_again - l0).abs().max(l0.abs() * 8.0 * f32::EPSILON);
+    let params_norm = dot(&params, &params).sqrt();
+    let realized = |dir: &LoraParams, eps: f32| -> (LoraParams, f32) {
+        let moved = shifted(&params, dir, eps);
+        let delta: LoraParams = moved
+            .iter()
+            .map(|(k, v)| (k.clone(), v.subtract(&params[k]).unwrap()))
+            .collect();
+        let predicted = dot(&grads_c, &delta);
+        (moved, predicted)
+    };
+    let mut verdicts = Vec::new();
+    let mut central = |streamed: &mut MiniMaxH3ImageDit, dir: &LoraParams, label: &str| {
+        let a = dot(&grads_c, dir);
+        let cap = 0.05 * params_norm / dot(dir, dir).sqrt().max(1e-30);
+        let mut eps = (1e3 * floor / a.abs().max(1e-30)).min(cap);
+        let mut verdict = None;
+        for _ in 0..12 {
+            let (plus, pred_plus) = realized(dir, eps);
+            let (minus, pred_minus) = realized(dir, -eps);
+            let lp = streamed_loss(streamed, &modulation_s, &plus, &spec(true), &inputs).unwrap();
+            let lm = streamed_loss(streamed, &modulation_s, &minus, &spec(true), &inputs).unwrap();
+            let (up, down) = (lp - l0, l0 - lm);
+            let asymmetry = (up - down).abs() / up.abs().max(down.abs()).max(1e-30);
+            let measurable = (lp - lm).abs() >= 1e2 * floor;
+            let predicted = pred_plus - pred_minus;
+            let rel = ((lp - lm) - predicted).abs() / predicted.abs().max(1e-30);
+            let ok = measurable && asymmetry <= 0.1;
+            println!("[sw-7097 mlx] CPU FD along {label}: L+ - L- {:.6e} vs realized prediction g·(δ+ - δ-) {predicted:.6e} (rel {rel:.3e}) at step {eps:.3e}; requested h·g·d {:.6e}; L+ - L0 {up:.3e}, L0 - L- {down:.3e}, asymmetry {asymmetry:.3e}, floor {floor:.3e}, measurable {measurable}, qualifies {ok}", lp - lm, 2.0 * eps * a);
+            if ok {
+                verdict = Some(rel);
+                break;
+            }
+            if !measurable {
+                break;
+            }
+            eps /= 2.0;
+        }
+        verdicts.push((label.to_string(), verdict));
+    };
+    central(&mut streamed, &grads_c, "g_cpu");
+    for prefix in [
+        "transformer_blocks.49.attn.to_q.",
+        "transformer_blocks.49.ff.net.2.",
+        "transformer_blocks.0.attn.to_q.",
+        "transformer_blocks.0.ff.net.2.",
+    ] {
+        central(
+            &mut streamed,
+            &only(&grads_c, prefix),
+            &format!("g_cpu[{prefix}*]"),
+        );
+    }
+    drop(_gpu);
+
     assert!(
-        fd.is_some(),
-        "no finite-difference step along g_streamed is both measurable and within the curvature \
-         check; the loss is not resolvable at any tried step"
+        gpu_cpu_rel <= gpu_cpu_tol,
+        "GPU vs CPU analytic gradient rel L2 {gpu_cpu_rel} exceeds the GEMM-derived bound {gpu_cpu_tol}"
     );
-    assert!(fd_rel <= FD_REL_TOL, "finite difference rel {fd_rel}");
+    for (label, verdict) in &verdicts {
+        let rel = verdict.unwrap_or_else(|| {
+            panic!(
+                "no CPU finite-difference step along {label} is both measurable and within the \
+                 curvature check"
+            )
+        });
+        assert!(rel <= FD_REL_TOL, "{label}: finite difference rel {rel}");
+    }
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED training::real_tests::streamed_backward_matches_resident_and_finite_differences_q4");
 }

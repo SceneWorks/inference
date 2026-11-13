@@ -320,6 +320,64 @@ pub(crate) fn install_concrete(
     Ok(())
 }
 
+/// The streamed forward: every block input `h_0..h_L`, each forced, one rebuilt block at a time
+/// with the concrete factors installed.
+#[allow(clippy::too_many_arguments)]
+fn streamed_forward(
+    dit: &MiniMaxH3ImageDit,
+    modulation: &Modulation,
+    parts: &DenoiserParts,
+    params: &LoraParams,
+    spec: &LossSpec<'_>,
+    inputs: &StepInputs<'_>,
+    bounded: BoundedAttention<'_>,
+) -> Result<Vec<Array>> {
+    let layers = dit.num_layers();
+    let step = inputs.step.index;
+    let mut saved = Vec::with_capacity(layers + 1);
+    let h0 = stack_input(dit, parts, inputs.packed)?;
+    eval([&h0])?;
+    saved.push(h0);
+    for layer in 0..layers {
+        let mut block = materialize(dit, layer)?;
+        install_concrete(&mut block, layer, &spec.blocks[layer], params, spec)?;
+        let h = run_block(
+            dit,
+            &block,
+            layer,
+            &saved[layer],
+            modulation,
+            parts,
+            step,
+            bounded,
+        )?;
+        eval([&h])?;
+        drop(block);
+        saved.push(h);
+    }
+    Ok(saved)
+}
+
+/// The loss alone, untraced: the streamed forward, then the tail — the function
+/// [`loss_and_grads`]'s streamed path reports and differentiates, without the backward (the
+/// gradient gate's finite differences).
+#[cfg(test)]
+pub(crate) fn streamed_loss(
+    dit: &mut MiniMaxH3ImageDit,
+    modulation: &Modulation,
+    params: &LoraParams,
+    spec: &LossSpec<'_>,
+    inputs: &StepInputs<'_>,
+) -> Result<f32> {
+    let _eager = crate::dit::layers::EagerSwigluScope::enter();
+    let parts = parts(dit, inputs)?;
+    let dit: &MiniMaxH3ImageDit = dit;
+    let bounded = attention(spec, inputs.layout.seq_len() as u64);
+    let saved = streamed_forward(dit, modulation, &parts, params, spec, inputs, bounded)?;
+    let last = saved.last().expect("the stack output was saved");
+    Ok(tail_loss(dit, last, modulation, &parts, inputs, spec.mae)?.item::<f32>())
+}
+
 /// A block's factor gradients, in its trainables' key order.
 pub(crate) type FactorGrads = Vec<(Rc<str>, Array)>;
 
@@ -415,27 +473,7 @@ pub(crate) fn streamed_loss_and_grads(
     let bounded = attention(spec, inputs.layout.seq_len() as u64);
 
     // Forward: keep every block's input, forced, and nothing else.
-    let mut saved = Vec::with_capacity(layers + 1);
-    let h0 = stack_input(dit, parts, inputs.packed)?;
-    eval([&h0])?;
-    saved.push(h0);
-    for layer in 0..layers {
-        let mut block = materialize(dit, layer)?;
-        install_concrete(&mut block, layer, &spec.blocks[layer], params, spec)?;
-        let h = run_block(
-            dit,
-            &block,
-            layer,
-            &saved[layer],
-            modulation,
-            parts,
-            step,
-            bounded,
-        )?;
-        eval([&h])?;
-        drop(block);
-        saved.push(h);
-    }
+    let mut saved = streamed_forward(dit, modulation, parts, params, spec, inputs, bounded)?;
 
     // The tail's loss and its cotangent into the last block's output.
     let last = saved.pop().expect("the stack output was saved");
