@@ -105,6 +105,10 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
         seed: 7098,
         ..TrainingConfig::default()
     };
+    println!(
+        "[sw-7098 candle] gate weights: the q4 tier at {} (packed q4 DiT, float32 compute)",
+        dir.display()
+    );
     let mut streamed = MiniMaxH3Dit::load_from_dir(&dir, &Device::Cpu, DType::F32).unwrap();
     let set_s = install_adapters(&mut streamed, &paths, &cfg, &device).unwrap();
     for (i, (key, var)) in set_s.named_vars().into_iter().enumerate() {
@@ -286,6 +290,28 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
             }
         }
     }
+    // Evidence for the MLX comparison: the base model's attention sharpness with the LoRA delta
+    // zeroed (every up factor at zero), at the same fixture.
+    let zeroed: HashMap<String, Tensor> = params
+        .iter()
+        .map(|(k, v)| {
+            let v = if k.ends_with("lora_B.weight") {
+                v.zeros_like().unwrap()
+            } else {
+                v.clone()
+            };
+            (k.clone(), v)
+        })
+        .collect();
+    assign(&set_s, &zeroed);
+    for layer in [0usize, 25, last - 1] {
+        let si = inputs(&text_s, &layout, &packed, &target, step);
+        let x = diagnostics::block_input(&streamed, &modulation_s, &si, layer).unwrap();
+        let (max_abs, mean_max_prob) =
+            diagnostics::attention_score_stats(&streamed, &modulation_s, &si, layer, &x).unwrap();
+        println!("[sw-7098 candle] block {layer} attention, LoRA delta zeroed: max |q·k·scale| {max_abs:.6e}, mean max-probability {mean_max_prob:.6e}");
+    }
+    assign(&set_s, &params);
     drop((streamed, modulation_s, set_s, text_s));
     crate::dit::release_device_memory(&device).unwrap();
 

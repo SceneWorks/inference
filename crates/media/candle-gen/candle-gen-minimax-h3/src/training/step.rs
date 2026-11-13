@@ -281,6 +281,25 @@ pub(crate) mod diagnostics {
         })
     }
 
+    /// Block `layer`'s attention scores at input `x`: `(max |q·kᵀ·scale|, mean max-probability)`.
+    pub(crate) fn attention_score_stats(
+        dit: &MiniMaxH3Dit,
+        modulation: &ImageModulation,
+        inputs: &StepInputs<'_>,
+        layer: usize,
+        x: &Tensor,
+    ) -> Result<(f32, f32)> {
+        let constants = StepConstants::new(dit, modulation, inputs)?;
+        let block = dit.window_block(layer)?;
+        block.attention_score_stats(
+            x,
+            modulation.cache.modulation(layer)?,
+            &constants.adaln,
+            dit.rope(),
+            &constants.tables,
+        )
+    }
+
     /// Block `layer`'s VJP against `cot` at input `x`: the gradients of `⟨block(x), cot⟩` for `x`
     /// and the adapter `vars`, under the bounded training attention (`composable == false`) or the
     /// unbounded composable one.

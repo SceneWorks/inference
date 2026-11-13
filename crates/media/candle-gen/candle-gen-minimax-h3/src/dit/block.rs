@@ -556,6 +556,26 @@ impl DitBlock {
         self.forward_veda(x, modulation, adaln_indices, rope, tables, None, None)
     }
 
+    /// [`DitAttention::score_stats`] of this block's attention input (`mod(norm1(x))`). Test-only.
+    #[cfg(test)]
+    pub(crate) fn attention_score_stats(
+        &self,
+        x: &Tensor,
+        modulation: &AdaLnModulation,
+        adaln_indices: &Tensor,
+        rope: &MmRope,
+        tables: &MmRopeTables,
+    ) -> Result<(f32, f32)> {
+        let idx = adaln_indices.to_dtype(DType::U32)?;
+        let normed = modulate(
+            &self.norm1.forward(x)?,
+            &modulation.scale_msa,
+            &modulation.shift_msa,
+            &idx,
+        )?;
+        self.attn.score_stats(&normed, Some((rope, tables)))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_veda(
         &self,
