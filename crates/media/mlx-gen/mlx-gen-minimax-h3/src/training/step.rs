@@ -101,9 +101,9 @@ pub(crate) fn noised_rows(x0: &Array, noise: &Array, step: TrainingStep) -> Resu
 
 /// A one-block adapter host: `transformer_blocks.{index}.<leaf>` resolves on `block`, so a block's
 /// [`TrainAdapter`] installs on a block rebuilt outside the DiT.
-struct BlockHost<'a> {
-    index: usize,
-    block: &'a mut DitBlock,
+pub(crate) struct BlockHost<'a> {
+    pub(crate) index: usize,
+    pub(crate) block: &'a mut DitBlock,
 }
 
 impl AdaptableHost for BlockHost<'_> {
@@ -309,6 +309,77 @@ fn install_concrete(
     Ok(())
 }
 
+/// A block's factor gradients, in its trainables' key order.
+pub(crate) type FactorGrads = Vec<(Rc<str>, Array)>;
+
+/// One block's backward: `vjp` of `block(input, θ_block)` against the cotangent of its output.
+/// Returns the input's cotangent and the block's factor gradients, in its trainables' key order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn block_vjp(
+    dit: &MiniMaxH3ImageDit,
+    block: &mut DitBlock,
+    layer: usize,
+    trainables: &BlockTrainables,
+    params: &LoraParams,
+    spec: &LossSpec<'_>,
+    modulation: &Modulation,
+    parts: &DenoiserParts,
+    step: usize,
+    bounded: BoundedAttention<'_>,
+    input: Array,
+    cotangent: &Array,
+) -> Result<(Array, FactorGrads)> {
+    let mut primals = Vec::with_capacity(1 + trainables.keys.len());
+    primals.push(input);
+    for key in &trainables.keys {
+        primals.push(
+            params
+                .get(key)
+                .ok_or_else(|| Error::Msg(format!("LoRA param missing: {key}")))?
+                .clone(),
+        );
+    }
+    let (_, grads) = fallible_vjp(
+        |xs: &[Array]| -> MlxResult<Vec<Array>> {
+            if let Some(adapter) = &trainables.adapter {
+                let traced: LoraParams = trainables
+                    .keys
+                    .iter()
+                    .cloned()
+                    .zip(xs[1..].iter().cloned())
+                    .collect();
+                adapter.install_as(
+                    &mut BlockHost {
+                        index: layer,
+                        block: &mut *block,
+                    },
+                    &traced,
+                    spec.alpha,
+                    spec.rank,
+                    spec.lora_dtype,
+                    LOKR_DTYPE,
+                )?;
+            }
+            Ok(vec![run_block(
+                dit, block, layer, &xs[0], modulation, parts, step, bounded,
+            )
+            .map_err(mlx_err)?])
+        },
+        &primals,
+        std::slice::from_ref(cotangent),
+    )?;
+    let mut grads = grads.into_iter();
+    let input_cotangent = grads.next().ok_or_else(|| {
+        Error::Msg(format!(
+            "minimax_h3_image trainer: block {layer} returned no input cotangent"
+        ))
+    })?;
+    Ok((
+        input_cotangent,
+        trainables.keys.iter().cloned().zip(grads).collect(),
+    ))
+}
+
 /// The streamed backward. `trace`, when given, receives the cotangent of every block's output
 /// `(l + 1, dL/dh_{l+1})` from the stack output down, then block 0's input `(0, dL/dh_0)` — the
 /// gradient gate's per-boundary diagnostic.
@@ -381,54 +452,12 @@ pub(crate) fn streamed_loss_and_grads(
     for layer in (0..layers).rev() {
         let input = saved.pop().expect("one saved input per block");
         let trainables = &spec.blocks[layer];
-        let mut primals = Vec::with_capacity(1 + trainables.keys.len());
-        primals.push(input);
-        for key in &trainables.keys {
-            primals.push(
-                params
-                    .get(key)
-                    .ok_or_else(|| Error::Msg(format!("LoRA param missing: {key}")))?
-                    .clone(),
-            );
-        }
         let mut block = materialize(dit, layer)?;
-        let (_, grads) = fallible_vjp(
-            |xs: &[Array]| -> MlxResult<Vec<Array>> {
-                if let Some(adapter) = &trainables.adapter {
-                    let traced: LoraParams = trainables
-                        .keys
-                        .iter()
-                        .cloned()
-                        .zip(xs[1..].iter().cloned())
-                        .collect();
-                    adapter.install_as(
-                        &mut BlockHost {
-                            index: layer,
-                            block: &mut block,
-                        },
-                        &traced,
-                        spec.alpha,
-                        spec.rank,
-                        spec.lora_dtype,
-                        LOKR_DTYPE,
-                    )?;
-                }
-                Ok(vec![run_block(
-                    dit, &block, layer, &xs[0], modulation, parts, step, bounded,
-                )
-                .map_err(mlx_err)?])
-            },
-            &primals,
-            std::slice::from_ref(&cotangent),
+        let (next, block_grads) = block_vjp(
+            dit, &mut block, layer, trainables, params, spec, modulation, parts, step, bounded,
+            input, &cotangent,
         )?;
-        let mut grads = grads.into_iter();
-        cotangent = grads.next().ok_or_else(|| {
-            Error::Msg(format!(
-                "minimax_h3_image trainer: block {layer} returned no input cotangent"
-            ))
-        })?;
-        let block_grads: Vec<(Rc<str>, Array)> =
-            trainables.keys.iter().cloned().zip(grads).collect();
+        cotangent = next;
         let mut forced: Vec<&Array> = block_grads.iter().map(|(_, g)| g).collect();
         if layer > 0 {
             forced.push(&cotangent);
