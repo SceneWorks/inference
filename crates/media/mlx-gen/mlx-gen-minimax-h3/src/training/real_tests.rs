@@ -308,25 +308,39 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         .map(|(i, (k, v))| (k.clone(), normal(v.shape(), 500 + i as u64, 1.0)))
         .collect();
     let analytic = dot(&grads_s, &direction);
-    let noise_floor = (loss_s - loss_r).abs().max(loss_s.abs() * f32::EPSILON);
+    // The noise floor is the loss's own rounding within one evaluation path (a repeat of the same
+    // streamed evaluation, at least f32 epsilon relative). The streamed-vs-resident loss gap is NOT
+    // a noise floor: run 43347516939 sized the step from it (1.49e-3 -> step 3.7 per unit of a
+    // N(0, 1) direction, ~180x the 0.02-scale factors), where the loss is dominated by its even
+    // (curvature) part and the central difference cancels to ~0.
+    let noise_floor = (again - loss_s).abs().max(loss_s.abs() * 1e-6);
     let eps = FD_SIGNAL_OVER_NOISE * noise_floor / analytic.abs().max(1e-30);
-    let (plus, _) = loss_and_grads(
-        &mut streamed,
-        &modulation_s,
-        &shifted(&params, &direction, eps),
-        &spec(true),
-        &inputs,
-    )
-    .unwrap();
-    let (minus, _) = loss_and_grads(
-        &mut streamed,
-        &modulation_s,
-        &shifted(&params, &direction, -eps),
-        &spec(true),
-        &inputs,
-    )
-    .unwrap();
-    let fd = (plus - minus) / (2.0 * eps);
+    let fd_at = |streamed: &mut MiniMaxH3ImageDit, eps: f32| {
+        let (plus, _) = loss_and_grads(
+            streamed,
+            &modulation_s,
+            &shifted(&params, &direction, eps),
+            &spec(true),
+            &inputs,
+        )
+        .unwrap();
+        let (minus, _) = loss_and_grads(
+            streamed,
+            &modulation_s,
+            &shifted(&params, &direction, -eps),
+            &spec(true),
+            &inputs,
+        )
+        .unwrap();
+        println!(
+            "[sw-7097 mlx] fd step {eps:.3e}: L+ {plus:.9e} L0 {loss_s:.9e} L- {minus:.9e}, second difference {:.3e}",
+            plus - 2.0 * loss_s + minus
+        );
+        (plus - minus) / (2.0 * eps)
+    };
+    let fd = fd_at(&mut streamed, eps);
+    let fd_half = fd_at(&mut streamed, eps / 2.0);
+    println!("[sw-7097 mlx] finite difference at step {eps:.3e}: {fd:.6e}; at half the step: {fd_half:.6e}");
     let fd_rel = (fd - analytic).abs() / analytic.abs().max(1e-12);
     println!("[sw-7097 mlx] directional derivative: analytic {analytic:.6e}, finite difference {fd:.6e} at step {eps:.3e} (noise floor {noise_floor:.3e}), rel {fd_rel:.3e}");
 
