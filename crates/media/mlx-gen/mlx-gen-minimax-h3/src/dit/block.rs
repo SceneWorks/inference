@@ -456,6 +456,22 @@ impl DitBlock {
         self.forward_bounded_veda(x, modulation, adaln_indices, rope, tables, bounded, None)
     }
 
+    /// Block attention's modulated input `modulate(norm1(x))` (SW-7097 gate).
+    #[cfg(test)]
+    pub(crate) fn attention_input(
+        &self,
+        x: &Array,
+        modulation: &AdaLnModulation,
+        adaln_indices: &Array,
+    ) -> Result<Array> {
+        modulate(
+            &self.norm1.forward(x)?,
+            &modulation.scale_msa,
+            &modulation.shift_msa,
+            adaln_indices,
+        )
+    }
+
     /// Block attention's scaled pre-softmax scores at these modulation indices (SW-7097 gate).
     #[cfg(test)]
     pub(crate) fn attention_scores(
@@ -466,13 +482,14 @@ impl DitBlock {
         rope: &MmRope,
         tables: &MmRopeTables,
     ) -> Result<Array> {
-        let normed = modulate(
-            &self.norm1.forward(x)?,
-            &modulation.scale_msa,
-            &modulation.shift_msa,
-            adaln_indices,
-        )?;
+        let normed = self.attention_input(x, modulation, adaln_indices)?;
         self.attn.scores(&normed, Some((rope, tables)))
+    }
+
+    /// The block's attention (SW-7097 gate).
+    #[cfg(test)]
+    pub(crate) fn attention(&self) -> &DitAttention {
+        &self.attn
     }
 
     #[allow(clippy::too_many_arguments)]

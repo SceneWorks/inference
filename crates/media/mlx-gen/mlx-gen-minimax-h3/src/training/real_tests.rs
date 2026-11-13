@@ -367,6 +367,139 @@ fn compare_block(label: &str, x: &(Array, FactorGrads), y: &(Array, FactorGrads)
     }
 }
 
+/// Per tier: the base model's (no LoRA) blocks 0, 25 and 49 attention — max |score|, mean
+/// max-probability, the qk-norm weights' largest magnitude — walked through the streamed forward.
+/// Returns block 49's attention input and the block itself.
+fn tier_walk(
+    label: &str,
+    dir: &std::path::Path,
+    inputs: &StepInputs<'_>,
+    cancel: &CancelFlag,
+) -> (Array, crate::dit::block::DitBlock) {
+    let _eager = crate::dit::layers::EagerSwigluScope::enter();
+    let mut dit = MiniMaxH3ImageDit::load_dir_deferred(dir, Dtype::Float32).unwrap();
+    let modulation = dit.training_modulation(false, Some((1, cancel))).unwrap();
+    let parts = parts(&mut dit, inputs).unwrap();
+    let step = inputs.step.index;
+    let bounded = mlx_gen::attention::BoundedAttention::UNBOUNDED;
+    let mut h = stack_input(&dit, &parts, inputs.packed).unwrap();
+    let mut last = None;
+    for layer in 0..dit.num_layers() {
+        let block = materialize(&dit, layer).unwrap();
+        if [0usize, 25, 49].contains(&layer) {
+            let m = modulation.cache.modulation(layer).unwrap();
+            let sc = block
+                .attention_scores(&h, m, &parts.adaln_indices[step], dit.rope(), &parts.tables)
+                .unwrap();
+            let max_abs = sc.abs().unwrap().max(None).unwrap().item::<f32>();
+            let maxp = mlx_rs::ops::softmax_axis(&sc, -1, true)
+                .unwrap()
+                .max_axis(-1, None)
+                .unwrap()
+                .mean(None)
+                .unwrap()
+                .item::<f32>();
+            let (nq, nk) = block.attention().qk_norm_weights();
+            let wmax = |a: &Array| a.abs().unwrap().max(None).unwrap().item::<f32>();
+            println!("[sw-7097 mlx] tier {label}: block {layer} max |score| {max_abs:.4e}, mean max-probability {maxp:.4}, max |norm_q| {:.4e}, max |norm_k| {:.4e}", wmax(nq), wmax(nk));
+            if layer == 49 {
+                let input = block
+                    .attention_input(&h, m, &parts.adaln_indices[step])
+                    .unwrap();
+                mlx_rs::transforms::eval([&input]).unwrap();
+                // Which channels make the top score: q ⊙ k at the arg-max (head, query, key).
+                let (q, k) = block
+                    .attention()
+                    .qk(&input, Some((dit.rope(), &parts.tables)))
+                    .unwrap();
+                let s = sc.shape().to_vec();
+                let flat = mlx_rs::ops::indexing::argmax(sc.abs().unwrap(), None)
+                    .unwrap()
+                    .item::<u32>() as i32;
+                let (hh, i, j) = (flat / (s[2] * s[3]), (flat / s[3]) % s[2], flat % s[3]);
+                let row = |t: &Array, r: i32| {
+                    crate::tensor::slice_axis(
+                        &crate::tensor::slice_axis(t, 1, hh, hh + 1).unwrap(),
+                        2,
+                        r,
+                        r + 1,
+                    )
+                    .unwrap()
+                    .reshape(&[-1])
+                    .unwrap()
+                };
+                let contrib = row(&q, i).multiply(row(&k, j)).unwrap();
+                let total = contrib.sum(None).unwrap().item::<f32>();
+                let mut values: Vec<f32> = contrib.as_slice::<f32>().to_vec();
+                let mut idx: Vec<usize> = (0..values.len()).collect();
+                idx.sort_by(|&a, &b| values[b].abs().total_cmp(&values[a].abs()));
+                let top: Vec<String> = idx
+                    .iter()
+                    .take(5)
+                    .map(|&c| format!("ch{c} {:.3e}", values[c]))
+                    .collect();
+                values.clear();
+                println!("[sw-7097 mlx] tier {label}: block 49 top |score| at head {hh}, query {i}, key {j}: q·k {total:.4e} (unscaled); largest channel terms [{}]", top.join(", "));
+                last = Some((input, block.clone()));
+            }
+        }
+        h = run_block(&dit, &block, layer, &h, &modulation, &parts, step, bounded).unwrap();
+        mlx_rs::transforms::eval([&h]).unwrap();
+    }
+    last.expect("block 49 was walked")
+}
+
+/// The q4 tier's block 49 against the dense bf16 tier's ([`tier_walk`] on both) and, on the same
+/// input, the q4 vs bf16 `to_q` / `to_k` projection outputs and weights. Logs only.
+fn tier_attention_report(q4_dir: &std::path::Path, inputs: &StepInputs<'_>, cancel: &CancelFlag) {
+    let snapshot = std::env::var("MINIMAX_H3_IMAGE_SNAPSHOT").unwrap_or_default();
+    let bf16_dir = std::path::Path::new(&snapshot).join(IMAGE_DIT_COMPONENT);
+    if !bf16_dir.join("config.json").is_file() {
+        println!(
+            "[sw-7097 mlx] tier comparison skipped: no bf16 tier at {}",
+            bf16_dir.display()
+        );
+        return;
+    }
+    let (bf16_input, mut bf16_block) = tier_walk("bf16", &bf16_dir, inputs, cancel);
+    let (_, mut q4_block) = tier_walk("q4", q4_dir, inputs, cancel);
+    use mlx_gen::adapters::AdaptableHost;
+    for leaf in ["to_q", "to_k"] {
+        let dense = bf16_block.adaptable_mut(&["attn", leaf]).unwrap().clone();
+        let packed = q4_block.adaptable_mut(&["attn", leaf]).unwrap().clone();
+        let yd = dense.forward(&bf16_input).unwrap();
+        let yq = packed.forward(&bf16_input).unwrap();
+        let wd = match dense.quantized_params() {
+            None => dense
+                .dense_weight()
+                .map(|(w, _)| w.as_dtype(Dtype::Float32).unwrap()),
+            Some(_) => None,
+        };
+        let wq = packed.quantized_params().map(|(w, sc, bi, _, gs, bits)| {
+            mlx_rs::ops::dequantize(w, sc, bi, gs, bits)
+                .unwrap()
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+        });
+        let weights = match (&wd, &wq) {
+            (Some(d), Some(q)) => {
+                let err = q.subtract(d).unwrap().abs().unwrap();
+                format!(
+                    "weight rel L2 {:.3e}, max |w| {:.4e}, max |w_q4 - w| {:.4e}",
+                    rel_l2(q, d),
+                    d.abs().unwrap().max(None).unwrap().item::<f32>(),
+                    err.max(None).unwrap().item::<f32>()
+                )
+            }
+            _ => "weights not comparable (tier layout)".to_string(),
+        };
+        println!(
+            "[sw-7097 mlx] block 49 {leaf}: q4 vs bf16 projection output rel L2 {:.3e} on the bf16 path's input; {weights}",
+            rel_l2(&yq, &yd)
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs the converted q4 DiT tier (MINIMAX_H3_IMAGE_TIERS_ROOT); loads the q4 image DiT streamed and resident"]
 fn streamed_backward_matches_resident_and_finite_differences_q4() {
@@ -461,6 +594,11 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         streamed,
         chunked_attention: true,
     };
+
+    // Is block 49's near-hard attention the model's or the q4 tier's? The dense bf16 tier against
+    // the q4 tier, base model (no LoRA), same fixture — run 43516258270: q4 block 49 max |score|
+    // 5.18e3 against ~20-27 at blocks 0 and 25.
+    tier_attention_report(&dir, &inputs, &cancel);
 
     let mut cot_s = Vec::new();
     let parts_s = parts(&mut streamed, &inputs).unwrap();
