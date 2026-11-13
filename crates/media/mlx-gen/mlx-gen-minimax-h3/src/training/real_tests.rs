@@ -92,6 +92,11 @@ fn shifted(p: &LoraParams, d: &LoraParams, eps: f32) -> LoraParams {
         .collect()
 }
 
+/// The first-order loss change of one step of `unit` along `g`: `unit · |g|²`.
+fn analytic_unit(g: &LoraParams, unit: f32) -> f32 {
+    unit * dot(g, g)
+}
+
 fn norm(a: &Array) -> f32 {
     a.square().unwrap().sum(None).unwrap().item::<f32>().sqrt()
 }
@@ -661,6 +666,59 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
     // gradients claim to differentiate: same install, same kernels, same inputs.
     let noise_floor = (again - loss_s).abs().max(loss_s.abs() * 1e-6);
     let params_norm = dot(&params, &params).sqrt();
+    // Where smoothness goes: (i) dtypes on the LoRA path; (ii) the realized perturbation of one
+    // factor against the requested h·g; (iii) this GPU's float32 GEMM against the CPU stream's at a
+    // block projection's shape; (iv) the loss along g on a fine grid around θ — its successive
+    // differences show whether L is smooth or stepped at the FD's scale.
+    {
+        let key = keys
+            .iter()
+            .find(|k| k.ends_with("49.attn.to_q.lora_b"))
+            .unwrap()
+            .clone();
+        let h = 1e-3f32;
+        let moved = shifted(&params, &grads_s, h);
+        let realized = moved[&key].subtract(&params[&key]).unwrap();
+        let wanted = grads_s[&key].multiply(Array::from_f32(h)).unwrap();
+        println!(
+            "[sw-7097 mlx] dtypes: params {:?}, grads {:?}, perturbed {:?}; realized vs requested perturbation of {key}: rel L2 {:.3e}",
+            params[&key].dtype(),
+            grads_s[&key].dtype(),
+            moved[&key].dtype(),
+            rel_l2(&realized, &wanted)
+        );
+        let a = normal(&[272, 5376], 71, 1.0);
+        let b = normal(&[5376, 7168], 72, 0.02);
+        let gpu = a.matmul(&b).unwrap();
+        let cpu = a.matmul_device(&b, mlx_rs::StreamOrDevice::cpu()).unwrap();
+        println!(
+            "[sw-7097 mlx] float32 GEMM [272,5376]x[5376,7168]: default stream vs CPU stream rel L2 {:.3e}",
+            rel_l2(&gpu, &cpu)
+        );
+        let unit = 0.183 / 16.0;
+        let mut row = Vec::new();
+        for k in -8i32..=8 {
+            let l = loss_and_grads(
+                &mut streamed,
+                &modulation_s,
+                &shifted(&params, &grads_s, unit * k as f32),
+                &spec(true),
+                &inputs,
+            )
+            .unwrap()
+            .0;
+            row.push(l);
+        }
+        let diffs: Vec<String> = row
+            .windows(2)
+            .map(|w| format!("{:.3e}", w[1] - w[0]))
+            .collect();
+        println!(
+            "[sw-7097 mlx] loss along g at steps k*{unit:.3e}, k=-8..8: successive differences [{}] (a smooth L has them ~constant ≈ {:.3e})",
+            diffs.join(", "),
+            analytic_unit(&grads_s, unit)
+        );
+    }
     let central = |streamed: &mut MiniMaxH3ImageDit, dir: &LoraParams, label: &str| {
         let a_s = dot(&grads_s, dir);
         let a_r = dot(&grads_r, dir);
@@ -669,7 +727,9 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         // Start where the predicted change is 1e3x the noise floor and halve until the two
         // one-sided changes agree within 10% (the curvature check), while still measurable.
         let mut eps = (1e3 * noise_floor / a_s.abs().max(1e-30)).min(cap);
-        let mut fd = f32::NAN;
+        // Only a step that is measurable AND passes the curvature check may adjudicate; the first
+        // such step (the largest) is the verdict, and none qualifying is a failure, not a pick.
+        let mut qualified: Option<(f32, f32)> = None;
         for _ in 0..12 {
             let mut at = |e: f32| {
                 loss_and_grads(
@@ -686,14 +746,19 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
             let (up, down) = (lp - loss_s, loss_s - lm);
             let asymmetry = (up - down).abs() / up.abs().max(down.abs()).max(1e-30);
             let measurable = (lp - lm).abs() >= 1e2 * noise_floor;
-            fd = (lp - lm) / (2.0 * eps);
-            println!("[sw-7097 mlx] FD along {label}: streamed analytic {a_s:.6e}, resident analytic {a_r:.6e}, finite difference {fd:.6e} at step {eps:.3e} (L+ - L0 {up:.3e}, L0 - L- {down:.3e}, asymmetry {asymmetry:.3e}, noise floor {noise_floor:.3e}, measurable {measurable})");
-            if asymmetry <= 0.1 || !measurable {
+            let fd = (lp - lm) / (2.0 * eps);
+            let ok = measurable && asymmetry <= 0.1;
+            println!("[sw-7097 mlx] FD along {label}: streamed analytic {a_s:.6e}, resident analytic {a_r:.6e}, finite difference {fd:.6e} at step {eps:.3e} (L+ - L0 {up:.3e}, L0 - L- {down:.3e}, asymmetry {asymmetry:.3e}, noise floor {noise_floor:.3e}, measurable {measurable}, qualifies {ok})");
+            if ok {
+                qualified = Some((fd, eps));
+                break;
+            }
+            if !measurable {
                 break;
             }
             eps /= 2.0;
         }
-        (a_s, a_r, fd)
+        (a_s, a_r, qualified)
     };
     let only = |g: &LoraParams, prefix: &str| -> LoraParams {
         g.iter()
@@ -710,7 +775,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
             })
             .collect()
     };
-    let (analytic, _, fd) = central(&mut streamed, &grads_s, "g_streamed");
+    let (analytic, _, verdict) = central(&mut streamed, &grads_s, "g_streamed");
     central(&mut streamed, &grads_r, "g_resident");
     for prefix in [
         "transformer_blocks.49.attn.to_q.",
@@ -729,7 +794,10 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
             &format!("g_resident[{prefix}*]"),
         );
     }
-    let fd_rel = (fd - analytic).abs() / analytic.abs().max(1e-12);
+    let fd = verdict.map(|(fd, _)| fd);
+    let fd_rel = fd.map_or(f32::INFINITY, |fd| {
+        (fd - analytic).abs() / analytic.abs().max(1e-12)
+    });
     let loss_rel = (loss_s - loss_r).abs() / loss_r.abs().max(1e-12);
     let worst = keys
         .iter()
@@ -738,6 +806,11 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
     println!("[sw-7097 mlx] streamed vs resident: loss {loss_s:.6e} / {loss_r:.6e} (rel {loss_rel:.3e}), worst grad rel L2 {worst:.3e}");
     assert!(loss_rel <= LOSS_REL_TOL, "loss rel {loss_rel}");
     assert!(worst <= GRAD_REL_L2_TOL, "grad rel L2 {worst}");
+    assert!(
+        fd.is_some(),
+        "no finite-difference step along g_streamed is both measurable and within the curvature \
+         check; the loss is not resolvable at any tried step"
+    );
     assert!(fd_rel <= FD_REL_TOL, "finite difference rel {fd_rel}");
     crate::model_inference_device::record_model_inference_device();
     println!("MODEL_INFERENCE_BODY_COMPLETED training::real_tests::streamed_backward_matches_resident_and_finite_differences_q4");
