@@ -218,6 +218,8 @@ pub(crate) fn loss_and_grads(
     spec: &LossSpec<'_>,
     inputs: &StepInputs<'_>,
 ) -> Result<(f32, LoraParams)> {
+    // One SwiGLU implementation for the untraced forward and every traced graph.
+    let _eager = crate::dit::layers::EagerSwigluScope::enter();
     let parts = parts(dit, inputs)?;
     // Every array the step's graph shares across blocks is forced before the graph is built, so
     // no block re-derives a lazy shared input inside it.
