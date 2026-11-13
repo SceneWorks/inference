@@ -244,7 +244,8 @@ pub enum AttentionChunkAxis {
     /// [`Heads`](Self::Heads), with each chunk's attention under an MLX `checkpoint`: a VJP saves
     /// only the chunk's q/k/v and recomputes its scores in the backward, so neither the forward
     /// nor the backward of a chunked call ever holds the whole `[B, H, Sq, Sk]` score domain — the
-    /// training axis (SW-7097). The forward value is the [`Heads`](Self::Heads) value exactly.
+    /// training axis (SW-7097). Every call, chunked or not, runs MLX's unfused SDPA graph
+    /// explicitly, traced or untraced, so the forward is the function the backward differentiates.
     HeadsRecomputed,
 }
 
@@ -398,6 +399,9 @@ fn head_budgeted_bhsd(
         // query-row kernel owns the remaining decision (which for an in-budget call is the
         // byte-identical single fused call).
         record_head_chunk_count(1);
+        if recompute {
+            return sdpa_unfused_bhsd(q, k, v, scale, mask);
+        }
         return sdpa_budgeted_bhsd(q, k, v, scale, mask, plan);
     }
     let per_chunk = (heads.heads_per_chunk().max(1) as i32).min(h);
@@ -427,16 +431,13 @@ fn head_budgeted_bhsd(
         // query rows when a single head still exceeds the budget — the order the shared planner
         // prescribes, and the reason this axis stays bit-exact whenever it can.
         let out = if recompute {
-            let inner_plan = AttentionPlan::budgeted(plan.budget);
             let mut chunk = mlx_rs::transforms::checkpoint(
                 move |xs: &[Array]| -> mlx_rs::error::Result<Vec<Array>> {
                     let mask = xs.get(3);
-                    Ok(vec![sdpa_budgeted_bhsd(
-                        &xs[0], &xs[1], &xs[2], scale, mask, inner_plan,
-                    )
-                    .map_err(|e| {
-                        mlx_rs::error::Exception::custom(e.to_string())
-                    })?])
+                    Ok(vec![sdpa_unfused_bhsd(&xs[0], &xs[1], &xs[2], scale, mask)
+                        .map_err(|e| {
+                            mlx_rs::error::Exception::custom(e.to_string())
+                        })?])
                 },
             );
             let mut inputs = vec![q_chunk, k_chunk, v_chunk];
@@ -461,6 +462,36 @@ fn head_budgeted_bhsd(
     record_head_chunk_count(outs.len());
     let refs: Vec<&Array> = outs.iter().collect();
     Ok(concatenate_axis(&refs, 1)?)
+}
+
+/// MLX's own unfused SDPA, op for op (`mlx/fast.cpp` v0.32.0 `:717-787`, no mask/sinks/GQA
+/// repeat beyond an additive or boolean mask): `softmax(q·scale · kᵀ, precise) · v`.
+///
+/// The training axis ([`AttentionChunkAxis::HeadsRecomputed`], SW-7097) runs this in the forward
+/// AND the backward. `scaled_dot_product_attention` picks its fused Metal kernel outside a
+/// gradient trace and this unfused graph inside one (`backend/metal/scaled_dot_product_attention.cpp`
+/// `:601-605`), so a trainer whose forward runs untraced (a streamed backward that keeps the
+/// forward's block inputs and recomputes each block under `vjp`) would otherwise differentiate a
+/// different function from the one its forward evaluated.
+fn sdpa_unfused_bhsd(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    scale: f32,
+    mask: Option<&Array>,
+) -> Result<Array> {
+    let q = mlx_rs::ops::multiply(Array::from_f32(scale).as_dtype(q.dtype())?, q)?;
+    let mut scores = mlx_rs::ops::matmul(&q, k.swap_axes(-1, -2)?)?;
+    if let Some(m) = mask {
+        scores = if m.dtype() == mlx_rs::Dtype::Bool {
+            let min = Array::from_f32(f32::MIN).as_dtype(scores.dtype())?;
+            mlx_rs::ops::r#where(m, &scores, &min)?
+        } else {
+            mlx_rs::ops::add(&scores, m)?
+        };
+    }
+    let probs = mlx_rs::ops::softmax_axis(&scores, -1, true)?;
+    Ok(mlx_rs::ops::matmul(&probs, v)?)
 }
 
 /// Debug/test observation of how many chunks the last [`sdpa_budgeted_bhsd`] call actually ran.
