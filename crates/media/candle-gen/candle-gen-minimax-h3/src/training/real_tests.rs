@@ -201,23 +201,29 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
             .sum()
     };
     // Central difference along `dir`, its step sized so the predicted one-sided change is 1e3 x the
-    // floor (capped at 10 % of the factors' norm along `dir`).
-    let central = |dir: &HashMap<String, Tensor>| -> (f32, f32, f32, bool) {
+    // floor, capped at `cap` (a step that moves the factors by `cap · |dir|`). A change under 100 x
+    // the floor is reported but not asserted: it measures noise.
+    let central = |dir: &HashMap<String, Tensor>, cap: f32| -> (f32, f32, f32, bool) {
         let analytic = dot(&grads_s, dir);
-        let size = dot(dir, dir).sqrt().max(1e-30);
-        let cap = 0.1 * dot(&params, &params).sqrt().max(1e-6) / size;
         let eps = (1e3 * floor / analytic.abs().max(1e-30)).min(cap);
         let fd = (loss_of(&set_s, &shifted(dir, eps)) - loss_of(&set_s, &shifted(dir, -eps)))
             / (2.0 * eps);
         let measurable = analytic.abs() * eps >= 1e2 * floor;
         (analytic, fd, eps, measurable)
     };
-    // 1. Along the analytic gradient: the predicted change is |g|^2 * eps.
-    let (analytic, fd, eps, measurable) = central(&grads_s);
+    // 1. Along the analytic gradient: the predicted change is |g|^2 * eps, the step capped at 10 %
+    //    of all the factors' norm.
+    let (analytic, fd, eps, measurable) = central(
+        &grads_s,
+        0.1 * dot(&params, &params).sqrt().max(1e-6) / dot(&grads_s, &grads_s).sqrt().max(1e-30),
+    );
     let fd_rel = (fd - analytic).abs() / analytic.abs().max(1e-12);
     println!("[sw-7098 candle] directional derivative along g: analytic {analytic:.6e}, finite difference {fd:.6e} at step {eps:.3e} (loss {loss_s:.6e}, noise floor {floor:.3e}, measurable {measurable}), rel {fd_rel:.3e}");
     // 2. Per factor, along a random direction inside that factor only, scaled like the factor: a
     //    factor whose analytic gradient missed a path shows here even when the total along g agrees.
+    //    The direction has the factor's own norm, so a step of at most 1 moves the factor by at most
+    //    its own size (the 10 % of ALL factors' norm used above left every factor under the floor on
+    //    run 43355678592).
     let mut per_factor = Vec::new();
     let mut keys: Vec<&String> = params.keys().collect();
     keys.sort();
@@ -228,7 +234,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4_cuda() {
             (sum(&p.sqr().unwrap()).sqrt() / sum(&r.sqr().unwrap()).sqrt().max(1e-30)).max(1e-3);
         let dir: HashMap<String, Tensor> =
             [((*key).clone(), (r * f64::from(scale)).unwrap())].into();
-        let (a, f, e, ok) = central(&dir);
+        let (a, f, e, ok) = central(&dir, 1.0);
         let rel = (f - a).abs() / a.abs().max(1e-12);
         println!("[sw-7098 candle] per-factor FD {key}: analytic {a:.6e}, finite difference {f:.6e}, ratio {:.4e}, step {e:.3e}, measurable {ok}, rel {rel:.3e}", f / a);
         per_factor.push((key.to_string(), rel, ok));

@@ -314229,9 +314229,10 @@
         ],
         "backend": "candle-cuda",
         "expected_devices": [
+          "candle-cpu",
           "candle-cuda"
         ],
-        "scope": "whole selected source case",
+        "scope": "whole selected source case; the trainer's caption phase streams the text encoder, which keeps its dense token-embedding table on the host and gathers the selected rows there before upload (candle-gen-minimax-h3 src/text_encoder/encoder.rs embed), so that one lookup observes candle-cpu; every other learned boundary (TE layers, VAE encode, streamed DiT train and preview render) runs on CUDA",
         "required_work": [
           "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
         ]
@@ -314296,9 +314297,10 @@
         ],
         "backend": "candle-cuda",
         "expected_devices": [
+          "candle-cpu",
           "candle-cuda"
         ],
-        "scope": "whole selected source case",
+        "scope": "whole selected source case; the trainer's caption phase streams the text encoder, which keeps its dense token-embedding table on the host and gathers the selected rows there before upload (candle-gen-minimax-h3 src/text_encoder/encoder.rs embed), so that one lookup observes candle-cpu; every other learned boundary (TE layers, VAE encode, streamed DiT train and preview render) runs on CUDA",
         "required_work": [
           "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
         ]
