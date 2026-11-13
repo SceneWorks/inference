@@ -414,7 +414,35 @@ impl DitFeedForward {
 /// gate element (~1.41 GB per block over the 16,384 image rows of a 16 MP canvas). At float32
 /// compute both casts are identities.
 pub fn swiglu_product(gate: &Array, value: &Array) -> Result<Array> {
+    if EAGER_SWIGLU.with(std::cell::Cell::get) {
+        return Ok(swiglu_product_impl((gate, value))?);
+    }
     Ok(compile(swiglu_product_impl, true)((gate, value))?)
+}
+
+thread_local! {
+    /// Set while an [`EagerSwigluScope`] is alive on this thread.
+    static EAGER_SWIGLU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, [`swiglu_product`] on this thread runs its eager body instead of the compiled
+/// kernel (SW-7097). The trainer differentiates block forwards it also evaluates outside a
+/// gradient trace (the streamed backward keeps the untraced forward's block inputs); the compiled
+/// kernel and its traced graph are not bit-identical, so a forward that mixes them differentiates
+/// a different function from the one it evaluated. Inference never enters the scope.
+pub(crate) struct EagerSwigluScope(bool);
+
+impl EagerSwigluScope {
+    pub(crate) fn enter() -> Self {
+        Self(EAGER_SWIGLU.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for EagerSwigluScope {
+    fn drop(&mut self) {
+        let previous = self.0;
+        EAGER_SWIGLU.with(|flag| flag.set(previous));
+    }
 }
 
 /// The traced body of [`swiglu_product`]; exposed so a test can run it eagerly against the fused

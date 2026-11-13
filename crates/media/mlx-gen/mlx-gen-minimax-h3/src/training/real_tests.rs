@@ -346,6 +346,22 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         swiglu <= SWIGLU_VJP_REL_TOL,
         "compiled SwiGLU VJP rel L2 {swiglu}"
     );
+    // Untraced, at the FFN's real width: the compiled kernel against its eager body. Nonzero means
+    // a forward evaluated through the kernel and differentiated through the traced graph are two
+    // functions — what the trainer's EagerSwigluScope removes.
+    {
+        use crate::dit::layers::{swiglu_product, swiglu_product_impl};
+        let gate = normal(&[1, 272, 14336], 61, 4.0);
+        let value = normal(&[1, 272, 14336], 62, 4.0);
+        let fused = swiglu_product(&gate, &value).unwrap();
+        let eager = swiglu_product_impl((&gate, &value)).unwrap();
+        println!(
+            "[sw-7097 mlx] compiled vs eager SwiGLU forward (untraced): rel L2 {:.3e}",
+            rel_l2(&fused, &eager)
+        );
+    }
+    // Every block forward below — the trainer's and the test's own — runs the eager SwiGLU.
+    let _eager = crate::dit::layers::EagerSwigluScope::enter();
     let cancel = CancelFlag::new();
     let mut streamed = MiniMaxH3ImageDit::load_dir_deferred(&dir, Dtype::Float32).unwrap();
     let modulation_s = streamed
@@ -371,9 +387,14 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         ..TrainingConfig::default()
     };
     let (adapter, mut params) = build_adapter(&mut streamed, &paths, &cfg).unwrap();
-    for (i, (key, value)) in params.iter_mut().enumerate() {
+    // Seeded by sorted key, not by HashMap iteration order (which is randomized per process and
+    // made earlier runs' parameters — and so their losses and gradients — differ run to run).
+    let mut keys_sorted: Vec<_> = params.keys().cloned().collect();
+    keys_sorted.sort();
+    for (i, key) in keys_sorted.iter().enumerate() {
         if key.ends_with("lora_b") {
-            *value = normal(value.shape(), 100 + i as u64, 0.02);
+            let shape = params[key].shape().to_vec();
+            params.insert(key.clone(), normal(&shape, 100 + i as u64, 0.02));
         }
     }
     let blocks = block_trainables(&mut streamed, &paths, &params, &cfg).unwrap();
@@ -446,6 +467,42 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
     println!("[sw-7097 mlx] resident repeat: loss {loss_r:.9e} / {loss_r2:.9e}, worst grad rel L2 {repeat_worst:.3e}");
     let cot_r =
         resident_boundary_cotangents(&mut resident, &modulation_r, &params, &spec(false), &inputs);
+    // (b) The post-stack head on its own: the untraced tail loss over the resident's untraced h_50
+    // against both paths' reported (traced) losses.
+    {
+        let parts_r = parts(&mut resident, &inputs).unwrap();
+        let bounded = attention(&spec(false), layout.seq_len() as u64);
+        spec(false)
+            .adapter
+            .install_as(
+                &mut resident,
+                &params,
+                cfg.alpha,
+                cfg.rank as f32,
+                None,
+                LOKR_DTYPE,
+            )
+            .unwrap();
+        let mut h = stack_input(&resident, &parts_r, &packed).unwrap();
+        for (layer, block) in resident.blocks().iter().enumerate() {
+            h = run_block(
+                &resident,
+                block,
+                layer,
+                &h,
+                &modulation_r,
+                &parts_r,
+                inputs.step.index,
+                bounded,
+            )
+            .unwrap();
+            mlx_rs::transforms::eval([&h]).unwrap();
+        }
+        let tail = tail_loss(&resident, &h, &modulation_r, &parts_r, &inputs, false)
+            .unwrap()
+            .item::<f32>();
+        println!("[sw-7097 mlx] loss: untraced resident forward + tail {tail:.9e}, streamed (traced tail) {loss_s:.9e}, resident (traced graph) {loss_r:.9e}");
+    }
     // Single-block isolation, blocks 0 and 49: the same input and output cotangent through the
     // trainer's per-block vjp and through plain autodiff, on the streamed block (rebuilt from the
     // tier) and on the resident one — separating "differentiation mechanism" from "block/state".
