@@ -158,6 +158,7 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         mae: false,
         lora_dtype: None,
         streamed,
+        chunked_attention: true,
     };
 
     let (loss_s, grads_s) =

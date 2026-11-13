@@ -38,6 +38,27 @@ const METAL_BUFFER_BYTES: u64 = 51 << 20;
 /// Headroom for MLX's own evaluation scratch around one forced graph.
 const EVAL_SLACK_BYTES: u64 = 1 << 30;
 
+/// Whole heads one training attention chunk covers over `seq_len` rows: inference rung 3's own
+/// plan ([`crate::h3_image::memory::image_attention_budget`] at the declared
+/// [`crate::h3_image::memory::IMAGE_ATTENTION_CHUNK_SIZE`], floored at one whole head).
+pub fn training_attention_heads_per_chunk(seq_len: u64) -> u64 {
+    let heads = DitGeometry::SHIPPED.heads;
+    crate::h3_image::memory::image_attention_heads_per_chunk(
+        training_attention_budget(seq_len),
+        heads,
+        seq_len,
+    )
+    .clamp(1, heads)
+}
+
+/// The training attention budget over `seq_len` rows (see [`training_attention_heads_per_chunk`]).
+pub fn training_attention_budget(seq_len: u64) -> mlx_gen::attention::AttentionBudget {
+    crate::h3_image::memory::image_attention_budget(
+        crate::h3_image::memory::IMAGE_ATTENTION_CHUNK_SIZE,
+        seq_len,
+    )
+}
+
 /// One dataset item as the estimate sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrainingItemShape {
@@ -62,6 +83,9 @@ pub struct TrainingRunShape {
     pub lokr_delta_block_max: u64,
     pub lokr_delta_total: u64,
     pub checkpointed: bool,
+    /// Training attention chunked on whole heads, each chunk recomputed in the backward (E20) —
+    /// the trainer always runs this; `false` prices the unchunked call.
+    pub chunked_attention: bool,
     /// The preview request (`None` when previews are off): item 0's canvas and references.
     pub preview: Option<TrainingItemShape>,
 }
@@ -212,13 +236,20 @@ pub fn estimate_training(
             lokr_delta_block_max: run.lokr_delta_block_max,
             lokr_delta_total: run.lokr_delta_total,
             checkpointed: run.checkpointed,
+            attention_heads_per_chunk: if run.chunked_attention {
+                training_attention_heads_per_chunk(text_rows + reference_rows + image_rows)
+            } else {
+                geometry.heads
+            },
         };
         let bytes = train_step_bytes(&geometry, &weights, &s);
         let seq = s.sequence();
-        let largest_call = geometry.heads * seq * seq * a;
+        // Uncompleted buffers pinning non-score operands: the widest is the SwiGLU's float32
+        // `[S, 2·ffn]` widen. Score-sized arrays a buffer pins are already among the attention
+        // call's own (`SCORE_ARRAYS_PER_ATTENTION_VJP` / `PINNED_COMMAND_BUFFERS`).
         let pipelined = BUFFER_INPUT_OUTPUTS
             * (MAX_ACTIVE_TASKS + 1)
-            * (largest_call + seq * geometry.ffn * 2 * 4 + METAL_BUFFER_BYTES);
+            * (seq * geometry.ffn * 2 * 4 + METAL_BUFFER_BYTES);
         let total = bytes.total() + pipelined + EVAL_SLACK_BYTES;
         if total > train {
             train = total;
@@ -359,6 +390,7 @@ mod tests {
             lokr_delta_block_max: 0,
             lokr_delta_total: 0,
             checkpointed,
+            chunked_attention: true,
             preview: None,
         }
     }
@@ -429,6 +461,40 @@ mod tests {
         let edit = estimate_training(&c, &facts, t, &edit).unwrap();
         assert!(edit.train > t2i.train);
         assert!(edit.conditioning > t2i.conditioning);
+    }
+
+    /// E20: the 2048² edit with two 1024² references (about 8.2 k rows) is admitted on a 128 GB
+    /// machine with training attention chunked by design. Unchunked, the call's six full
+    /// `[56, S, S]` score arrays (~50 GB) make the train phase the binding phase: it still fits
+    /// 128 GB after the double-count correction, and is refused at 80 GB where the chunked run fits.
+    #[test]
+    fn the_2048_two_reference_edit_fits_128_gb_with_chunked_attention() {
+        let c = contract();
+        let facts = ImageMemoryFacts::derived(Some(4));
+        let t = tier(Some(Quant::Q4));
+        let mut edit = run(true);
+        edit.items = vec![item(vec![(1024, 1024); 2])];
+        let (text, reference, image) = train_rows(&edit.items[0]).unwrap();
+        let seq = text + reference + image;
+        assert!(seq > 8_000, "{text} + {reference} + {image}");
+        assert!(training_attention_heads_per_chunk(seq) < 56);
+        let chunked = estimate_training(&c, &facts, t, &edit).unwrap();
+        admit_training(&chunked, budget_of(128 * GB), &edit, 2048).unwrap();
+        let unchunked_run = TrainingRunShape {
+            chunked_attention: false,
+            ..edit.clone()
+        };
+        let unchunked = estimate_training(&c, &facts, t, &unchunked_run).unwrap();
+        let full_scores = 6 * 56 * seq * seq * 2;
+        assert!(unchunked.step.block_backward >= full_scores);
+        // Chunked: one head's 6 + 11 arrays in place of 56 heads' 6.
+        assert_eq!(
+            unchunked.step.block_backward - chunked.step.block_backward,
+            full_scores - 17 * seq * seq * 2
+        );
+        assert!(unchunked.train > chunked.train + full_scores / 2);
+        admit_training(&chunked, budget_of(80 * GB), &edit, 2048).unwrap();
+        assert!(admit_training(&unchunked, budget_of(80 * GB), &unchunked_run, 2048).is_err());
     }
 
     #[test]
