@@ -275,7 +275,7 @@ fn resident_loss_and_grads(
 }
 
 /// Block `layer` rebuilt from the staged tier, by itself.
-fn materialize(dit: &MiniMaxH3ImageDit, layer: usize) -> Result<DitBlock> {
+pub(crate) fn materialize(dit: &MiniMaxH3ImageDit, layer: usize) -> Result<DitBlock> {
     let stream = dit.stream().ok_or_else(|| {
         Error::Msg("minimax_h3_image trainer: the streamed backward needs a deferred DiT".into())
     })?;

@@ -29,9 +29,6 @@ const LOSS_REL_TOL: f32 = 1e-4;
 const GRAD_REL_L2_TOL: f32 = 1e-3;
 /// The finite difference against the analytic directional derivative.
 const FD_REL_TOL: f32 = 5e-2;
-/// The finite-difference step is sized so the predicted loss change is this many times the
-/// measured noise floor (the streamed-vs-resident loss disagreement, at least f32 rounding).
-const FD_SIGNAL_OVER_NOISE: f32 = 100.0;
 /// The DiT's fused (compiled) SwiGLU product against its eager body under a VJP: the same float32
 /// arithmetic, so the gradients must agree to rounding.
 const SWIGLU_VJP_REL_TOL: f32 = 1e-6;
@@ -171,6 +168,70 @@ fn resident_boundary_cotangents(
     out
 }
 
+/// `(output rel L2, input-VJP rel L2)` of block 49's q4 `attn.to_q` base against the same weights
+/// dequantized to a dense float32 matmul.
+fn qmm_vjp_check(dit: &MiniMaxH3ImageDit) -> (f32, f32) {
+    use mlx_gen::adapters::AdaptableHost;
+    let mut block = super::step::materialize(dit, 49).unwrap();
+    let lin = block.adaptable_mut(&["attn", "to_q"]).unwrap();
+    let (wq, sc, bi, _, gs, bits) = lin.quantized_params().expect("a q4 leaf");
+    let (wq, sc, bi) = (wq.clone(), sc.clone(), bi.clone());
+    let dense = mlx_rs::ops::dequantize(&wq, &sc, &bi, gs, bits)
+        .unwrap()
+        .as_dtype(Dtype::Float32)
+        .unwrap();
+    let in_f = dense.shape()[1];
+    let x = normal(&[1, 8, in_f], 41, 1.0);
+    let cot = normal(&[1, 8, dense.shape()[0]], 42, 1.0);
+    let packed = mlx_rs::transforms::vjp(
+        |xs: &[Array]| {
+            vec![mlx_rs::ops::quantized_matmul(&xs[0], &wq, &sc, &bi, true, gs, bits).unwrap()]
+        },
+        std::slice::from_ref(&x),
+        std::slice::from_ref(&cot),
+    )
+    .unwrap();
+    let plain = mlx_rs::transforms::vjp(
+        |xs: &[Array]| vec![mlx_rs::ops::matmul(&xs[0], dense.t()).unwrap()],
+        &[x],
+        &[cot],
+    )
+    .unwrap();
+    (
+        rel_l2(&packed.0[0].as_dtype(Dtype::Float32).unwrap(), &plain.0[0]),
+        rel_l2(&packed.1[0].as_dtype(Dtype::Float32).unwrap(), &plain.1[0]),
+    )
+}
+
+/// `(output rel L2, input-VJP rel L2)` of MLX's fused `rms_norm` against `x · rsqrt(mean(x²) + ε) · w`
+/// over the per-head q/k-norm shape.
+fn rms_norm_vjp_check() -> (f32, f32) {
+    let x = normal(&[1, 8, 56, 128], 51, 3.0);
+    let w = normal(&[128], 52, 1.0);
+    let cot = normal(&[1, 8, 56, 128], 53, 1.0);
+    let eps = 1e-5f32;
+    let fused = mlx_rs::transforms::vjp(
+        |xs: &[Array]| vec![mlx_rs::fast::rms_norm(&xs[0], &w, eps).unwrap()],
+        std::slice::from_ref(&x),
+        std::slice::from_ref(&cot),
+    )
+    .unwrap();
+    let explicit = mlx_rs::transforms::vjp(
+        |xs: &[Array]| {
+            let ms = xs[0].square().unwrap().mean_axis(-1, true).unwrap();
+            let inv = mlx_rs::ops::rsqrt(ms.add(Array::from_f32(eps)).unwrap()).unwrap();
+            vec![xs[0].multiply(&inv).unwrap().multiply(&w).unwrap()]
+        },
+        &[x],
+        &[cot],
+    )
+    .unwrap();
+    (
+        rel_l2(&fused.0[0], &explicit.0[0]),
+        rel_l2(&fused.1[0], &explicit.1[0]),
+    )
+}
+
 #[test]
 #[ignore = "needs the converted q4 DiT tier (MINIMAX_H3_IMAGE_TIERS_ROOT); loads the q4 image DiT streamed and resident"]
 fn streamed_backward_matches_resident_and_finite_differences_q4() {
@@ -301,49 +362,81 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         );
     }
 
-    // The finite difference along a random direction, its step sized from the noise floor.
-    let direction: LoraParams = params
-        .iter()
-        .enumerate()
-        .map(|(i, (k, v))| (k.clone(), normal(v.shape(), 500 + i as u64, 1.0)))
-        .collect();
-    let analytic = dot(&grads_s, &direction);
-    // The noise floor is the loss's own rounding within one evaluation path (a repeat of the same
-    // streamed evaluation, at least f32 epsilon relative). The streamed-vs-resident loss gap is NOT
-    // a noise floor: run 43347516939 sized the step from it (1.49e-3 -> step 3.7 per unit of a
-    // N(0, 1) direction, ~180x the 0.02-scale factors), where the loss is dominated by its even
-    // (curvature) part and the central difference cancels to ~0.
-    let noise_floor = (again - loss_s).abs().max(loss_s.abs() * 1e-6);
-    let eps = FD_SIGNAL_OVER_NOISE * noise_floor / analytic.abs().max(1e-30);
-    let fd_at = |streamed: &mut MiniMaxH3ImageDit, eps: f32| {
-        let (plus, _) = loss_and_grads(
-            streamed,
-            &modulation_s,
-            &shifted(&params, &direction, eps),
-            &spec(true),
-            &inputs,
-        )
-        .unwrap();
-        let (minus, _) = loss_and_grads(
-            streamed,
-            &modulation_s,
-            &shifted(&params, &direction, -eps),
-            &spec(true),
-            &inputs,
-        )
-        .unwrap();
-        println!(
-            "[sw-7097 mlx] fd step {eps:.3e}: L+ {plus:.9e} L0 {loss_s:.9e} L- {minus:.9e}, second difference {:.3e}",
-            plus - 2.0 * loss_s + minus
-        );
-        (plus - minus) / (2.0 * eps)
-    };
-    let fd = fd_at(&mut streamed, eps);
-    let fd_half = fd_at(&mut streamed, eps / 2.0);
-    println!("[sw-7097 mlx] finite difference at step {eps:.3e}: {fd:.6e}; at half the step: {fd_half:.6e}");
-    let fd_rel = (fd - analytic).abs() / analytic.abs().max(1e-12);
-    println!("[sw-7097 mlx] directional derivative: analytic {analytic:.6e}, finite difference {fd:.6e} at step {eps:.3e} (noise floor {noise_floor:.3e}), rel {fd_rel:.3e}");
+    // The op-level suspects first: the q4 quantized matmul's input VJP against the dequantized
+    // dense matmul, and MLX's fused RMSNorm VJP against its explicit formula.
+    let (qmm_out, qmm_grad) = qmm_vjp_check(&streamed);
+    println!("[sw-7097 mlx] q4 quantized_matmul vs dequantized dense: output rel L2 {qmm_out:.3e}, input VJP rel L2 {qmm_grad:.3e}");
+    let (rms_out, rms_grad) = rms_norm_vjp_check();
+    println!("[sw-7097 mlx] fast rms_norm vs explicit: output rel L2 {rms_out:.3e}, input VJP rel L2 {rms_grad:.3e}");
 
+    // Central differences of the loss the streamed forward evaluates — the same function the
+    // gradients claim to differentiate: same install, same kernels, same inputs.
+    let noise_floor = (again - loss_s).abs().max(loss_s.abs() * 1e-6);
+    let params_norm = dot(&params, &params).sqrt();
+    let central = |streamed: &mut MiniMaxH3ImageDit, dir: &LoraParams, label: &str| {
+        let a_s = dot(&grads_s, dir);
+        let a_r = dot(&grads_r, dir);
+        let dir_norm = dot(dir, dir).sqrt();
+        let cap = 0.05 * params_norm / dir_norm.max(1e-30);
+        let eps = (1e3 * noise_floor / a_s.abs().max(1e-30)).min(cap);
+        let lp = loss_and_grads(
+            streamed,
+            &modulation_s,
+            &shifted(&params, dir, eps),
+            &spec(true),
+            &inputs,
+        )
+        .unwrap()
+        .0;
+        let lm = loss_and_grads(
+            streamed,
+            &modulation_s,
+            &shifted(&params, dir, -eps),
+            &spec(true),
+            &inputs,
+        )
+        .unwrap()
+        .0;
+        let fd = (lp - lm) / (2.0 * eps);
+        let measurable = (lp - lm).abs() >= 1e2 * noise_floor;
+        println!("[sw-7097 mlx] FD along {label}: streamed analytic {a_s:.6e}, resident analytic {a_r:.6e}, finite difference {fd:.6e} at step {eps:.3e} (L+ {lp:.9e} L0 {loss_s:.9e} L- {lm:.9e}, noise floor {noise_floor:.3e}, measurable {measurable})");
+        (a_s, a_r, fd)
+    };
+    let only = |g: &LoraParams, prefix: &str| -> LoraParams {
+        g.iter()
+            .map(|(k, v)| {
+                let keep = k.starts_with(prefix);
+                (
+                    k.clone(),
+                    if keep {
+                        v.clone()
+                    } else {
+                        Array::zeros::<f32>(v.shape()).unwrap()
+                    },
+                )
+            })
+            .collect()
+    };
+    let (analytic, _, fd) = central(&mut streamed, &grads_s, "g_streamed");
+    central(&mut streamed, &grads_r, "g_resident");
+    for prefix in [
+        "transformer_blocks.49.attn.to_q.",
+        "transformer_blocks.49.ff.net.2.",
+        "transformer_blocks.0.attn.to_q.",
+        "transformer_blocks.0.ff.net.2.",
+    ] {
+        central(
+            &mut streamed,
+            &only(&grads_s, prefix),
+            &format!("g_streamed[{prefix}*]"),
+        );
+        central(
+            &mut streamed,
+            &only(&grads_r, prefix),
+            &format!("g_resident[{prefix}*]"),
+        );
+    }
+    let fd_rel = (fd - analytic).abs() / analytic.abs().max(1e-12);
     let loss_rel = (loss_s - loss_r).abs() / loss_r.abs().max(1e-12);
     let worst = keys
         .iter()
