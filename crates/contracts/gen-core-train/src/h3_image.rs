@@ -394,9 +394,31 @@ pub const FFN_SAVED_WIDE: u64 = 4;
 /// `[S, hidden]` modulation rows a block gathers from the AdaLN table (`shift`/`scale`/`gate`, for
 /// attention and for the MLP).
 pub const MODULATION_ROWS: u64 = 6;
-/// Score-shaped buffers the unfused softmax backward holds (`s`, the cotangent, `s·g`,
-/// `s·Σ(s·g)` and their difference).
-pub const SOFTMAX_VJP_SCORE_BUFFERS: u64 = 5;
+/// Score-sized (`[B, heads, Sq, Sk]`) arrays one attention call's backward ever creates on MLX
+/// Metal — derived from MLX v0.32.0, the version the pinned mlx-rs links:
+///
+/// * training runs the unfused SDPA for the forward and the backward:
+///   `backend/metal/scaled_dot_product_attention.cpp:601-605` (`is_training` ⇒ fallback) and
+///   `:792-794` (`ScaledDotProductAttentionVJP::use_fallback` is always true), so the VJP is the
+///   autodiff of `fast.cpp:717-787`'s fallback;
+/// * that forward creates two: `fast.cpp:733` `scores = matmul(q·scale, kᵀ)` (`q·scale` at
+///   `:724` is q-sized) and `fast.cpp:776` `softmax(scores)` — this DiT passes no mask, no sinks and
+///   no GQA repeat (`mlx-gen-minimax-h3/src/dit/layers.rs:358` calls `sdpa_bounded_bhsd(.., None,
+///   ..)` with equal q/kv heads), and it has no dropout;
+/// * the backward creates four: `Matmul::vjp` of `softmax · v` (`primitives.cpp:3010`,
+///   `dP = g · vᵀ`), and `Softmax::vjp` (`primitives.cpp:5355-5358`) `s·dP`, `s·Σ(s·dP)` and their
+///   difference — the row sum is `[.., Sq, 1]`; the `q·kᵀ` grads (`primitives.cpp:3010/3013`) read
+///   that difference through a transpose view and are q/k-sized.
+///
+/// At the softmax VJP five of the six are live (`s`, `dP`, `s·dP`, `s·Σ`, the difference); the
+/// sixth, the pre-softmax scores, can still be pinned by an uncompleted command buffer. An array
+/// a buffer pins is one of these six, so six bound the score bytes one call holds — the earlier
+/// "five live plus eleven buffers each pinning a whole score call" pricing counted the same arrays
+/// twice. Correction, not loosening: every array is still charged once, at full size.
+pub const SCORE_ARRAYS_PER_ATTENTION_VJP: u64 = 6;
+/// Command buffers MLX keeps in flight (`transforms.cpp`'s ten) plus the one being encoded: under
+/// chunked attention, the most earlier chunks' score arrays an uncompleted buffer can still pin.
+pub const PINNED_COMMAND_BUFFERS: u64 = 11;
 /// f32 buffers every trainable element carries whatever the optimizer: the factor, its gradient
 /// and the gradient-accumulation buffer.
 pub const TRAINABLE_BASE_BUFFERS: u64 = 3;
@@ -463,6 +485,10 @@ pub struct TrainStepShape {
     /// `true`: the blocks stream one at a time and the backward recomputes each from its saved
     /// input; `false`: the whole DiT is resident and every block's activations are retained.
     pub checkpointed: bool,
+    /// Heads one attention chunk covers (`heads` when attention is not chunked). Chunked training
+    /// attention recomputes each chunk in the backward, so no call ever holds more than one chunk's
+    /// scores (E20).
+    pub attention_heads_per_chunk: u64,
 }
 
 impl TrainStepShape {
@@ -482,7 +508,8 @@ pub struct TrainStepBytes {
     /// The forward's retained activations: every block input (streamed) or every block's saved
     /// tensors and softmax output (resident).
     pub retained: u64,
-    /// One block's backward working set: its saved tensors, modulation rows and the softmax VJP.
+    /// One block's backward working set: its saved tensors, modulation rows and the attention
+    /// call's score arrays ([`SCORE_ARRAYS_PER_ATTENTION_VJP`]).
     pub block_backward: u64,
     /// The output head's tail: `norm_out`, head and loss over the image rows, f32.
     pub tail: u64,
@@ -527,7 +554,22 @@ pub fn train_step_bytes(
         + FFN_SAVED_WIDE * s * geometry.ffn
         + MODULATION_ROWS * s * geometry.hidden)
         * a;
-    let scores = geometry.heads * s * s * a;
+    let chunk_heads = shape
+        .attention_heads_per_chunk
+        .clamp(1, geometry.heads.max(1));
+    let chunked = chunk_heads < geometry.heads;
+    let chunk_scores = chunk_heads * s * s * a;
+    // Unchunked: the six arrays of the one call, at full size, and the forward's saved softmax per
+    // retained block. Chunked: the backward's six for the chunk being differentiated plus at most
+    // the eleven a pending buffer can still pin from earlier chunks; a chunk saves only its q/k/v.
+    let (score_bytes, saved_scores) = if chunked {
+        (
+            (SCORE_ARRAYS_PER_ATTENTION_VJP + PINNED_COMMAND_BUFFERS) * chunk_scores,
+            0,
+        )
+    } else {
+        (SCORE_ARRAYS_PER_ATTENTION_VJP * chunk_scores, chunk_scores)
+    };
     let (weights_bytes, precompute) = if shape.checkpointed {
         (
             weights.trunk + weights.modulation_tables + max(&weights.block_body),
@@ -541,7 +583,7 @@ pub fn train_step_bytes(
     let retained = if shape.checkpointed {
         (geometry.layers + 1) * row
     } else {
-        geometry.layers * (block_saved + scores)
+        geometry.layers * (block_saved + saved_scores)
     };
     let image = shape.reference_rows + shape.image_rows;
     TrainStepBytes {
@@ -550,7 +592,7 @@ pub fn train_step_bytes(
             * (TRAINABLE_BASE_BUFFERS + shape.optimizer_state_per_element)
             * 4,
         retained,
-        block_backward: block_saved + SOFTMAX_VJP_SCORE_BUFFERS * scores,
+        block_backward: block_saved + score_bytes,
         tail: 3 * row + image * geometry.patch_dim * 4 * 4,
         lokr_deltas: 2 * if shape.checkpointed {
             2 * shape.lokr_delta_block_max
@@ -714,6 +756,7 @@ mod tests {
             lokr_delta_block_max: 0,
             lokr_delta_total: 0,
             checkpointed,
+            attention_heads_per_chunk: 56,
         }
     }
 
@@ -729,8 +772,19 @@ mod tests {
         assert_eq!(streamed.retained, 51 * s * 5376 * 2);
         assert_eq!(
             streamed.block_backward,
-            (14 * s * 7168 + 3 * s * 5376 + 4 * s * 14336 + 6 * s * 5376) * 2 + 5 * 56 * s * s * 2
+            (14 * s * 7168 + 3 * s * 5376 + 4 * s * 14336 + 6 * s * 5376) * 2 + 6 * 56 * s * s * 2
         );
+        // Chunked to one head: 6 + 11 one-head score arrays, and no block saves its scores.
+        let one = TrainStepShape {
+            attention_heads_per_chunk: 1,
+            ..shape(true)
+        };
+        let chunked = train_step_bytes(&g, &w, &one);
+        assert_eq!(
+            chunked.block_backward,
+            (14 * s * 7168 + 3 * s * 5376 + 4 * s * 14336 + 6 * s * 5376) * 2 + 17 * s * s * 2
+        );
+        assert!(chunked.total() < streamed.total());
         let resident = train_step_bytes(&g, &w, &shape(false));
         assert!(resident.weights > 50 * 760_000_000);
         assert!(resident.retained > 20 * streamed.retained);

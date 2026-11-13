@@ -241,6 +241,11 @@ pub enum AttentionChunkAxis {
     /// Split complete heads first, and fall back to query rows **inside** a head chunk only when one
     /// head still exceeds the budget — the order [`AttentionBudget::head_chunks`] prescribes.
     Heads,
+    /// [`Heads`](Self::Heads), with each chunk's attention under an MLX `checkpoint`: a VJP saves
+    /// only the chunk's q/k/v and recomputes its scores in the backward, so neither the forward
+    /// nor the backward of a chunked call ever holds the whole `[B, H, Sq, Sk]` score domain — the
+    /// training axis (SW-7097). The forward value is the [`Heads`](Self::Heads) value exactly.
+    HeadsRecomputed,
 }
 
 /// A [`AttentionPlan`] plus the axis its chunks are cut on — everything a bounded MLX attention call
@@ -307,6 +312,9 @@ pub fn sdpa_bounded_bhsd(
     match bounded.axis {
         AttentionChunkAxis::QueryRows => sdpa_budgeted_bhsd(q, k, v, scale, mask, bounded.plan),
         AttentionChunkAxis::Heads => sdpa_head_budgeted_bhsd(q, k, v, scale, mask, bounded.plan),
+        AttentionChunkAxis::HeadsRecomputed => {
+            head_budgeted_bhsd(q, k, v, scale, mask, bounded.plan, true)
+        }
     }
 }
 
@@ -337,6 +345,20 @@ pub fn sdpa_head_budgeted_bhsd(
     scale: f32,
     mask: Option<&Array>,
     plan: AttentionPlan<'_>,
+) -> Result<Array> {
+    head_budgeted_bhsd(q, k, v, scale, mask, plan, false)
+}
+
+/// [`sdpa_head_budgeted_bhsd`]; with `recompute`, each head chunk runs under `checkpoint`
+/// ([`AttentionChunkAxis::HeadsRecomputed`]).
+fn head_budgeted_bhsd(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    scale: f32,
+    mask: Option<&Array>,
+    plan: AttentionPlan<'_>,
+    recompute: bool,
 ) -> Result<Array> {
     let qs = q.shape();
     if qs.len() != 4 {
@@ -404,15 +426,33 @@ pub fn sdpa_head_budgeted_bhsd(
         // The inner call re-plans the query axis against the NARROWED head count, so it only chunks
         // query rows when a single head still exceeds the budget — the order the shared planner
         // prescribes, and the reason this axis stays bit-exact whenever it can.
-        let out = sdpa_budgeted_bhsd(
-            &q_chunk,
-            &k_chunk,
-            &v_chunk,
-            scale,
-            chunk_mask.as_ref(),
-            plan,
-        )?;
-        if plan.budget.eval_per_chunk() {
+        let out = if recompute {
+            let inner_plan = AttentionPlan::budgeted(plan.budget);
+            let mut chunk = mlx_rs::transforms::checkpoint(
+                move |xs: &[Array]| -> mlx_rs::error::Result<Vec<Array>> {
+                    let mask = xs.get(3);
+                    Ok(vec![sdpa_budgeted_bhsd(
+                        &xs[0], &xs[1], &xs[2], scale, mask, inner_plan,
+                    )
+                    .map_err(|e| {
+                        mlx_rs::error::Exception::custom(e.to_string())
+                    })?])
+                },
+            );
+            let mut inputs = vec![q_chunk, k_chunk, v_chunk];
+            inputs.extend(chunk_mask);
+            chunk(&inputs)?.remove(0)
+        } else {
+            sdpa_budgeted_bhsd(
+                &q_chunk,
+                &k_chunk,
+                &v_chunk,
+                scale,
+                chunk_mask.as_ref(),
+                plan,
+            )?
+        };
+        if !recompute && plan.budget.eval_per_chunk() {
             mlx_rs::transforms::eval([&out])?;
         }
         outs.push(out);

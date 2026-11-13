@@ -399,6 +399,7 @@ impl MiniMaxH3ImageTrainer {
             lokr_delta_block_max: block_max,
             lokr_delta_total: total,
             checkpointed: plan.checkpointed,
+            chunked_attention: true,
             preview: preview.transpose()?,
         })
     }
@@ -580,6 +581,7 @@ impl MiniMaxH3ImageTrainer {
             mae: mae_loss(&cfg.loss_type, LossTypeFold::Normalized),
             lora_dtype: plan.lora_dtype,
             streamed: plan.checkpointed,
+            chunked_attention: true,
         };
         let schedule = BucketSchedule::new(
             cache.len() / plan.edges.len(),

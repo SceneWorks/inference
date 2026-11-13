@@ -102,7 +102,7 @@ pub fn planned_attention_chunks(
     let budget = bounded.plan.budget;
     let (head_chunks, heads_in_chunk) = match bounded.axis {
         AttentionChunkAxis::QueryRows => (1usize, heads),
-        AttentionChunkAxis::Heads => {
+        AttentionChunkAxis::Heads | AttentionChunkAxis::HeadsRecomputed => {
             let plan = budget.head_chunks(
                 b.max(0) as u64,
                 heads.max(0) as u64,

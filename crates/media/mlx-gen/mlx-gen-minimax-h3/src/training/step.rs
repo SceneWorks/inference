@@ -31,7 +31,7 @@ use mlx_rs::transforms::{eval, fallible_vjp, keyed_value_and_grad};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
-use mlx_gen::attention::BoundedAttention;
+use mlx_gen::attention::{AttentionChunkAxis, AttentionPlan, BoundedAttention};
 use mlx_gen::train::lora::{LoraParams, TrainAdapter};
 use mlx_gen::train::loss::reduce_loss;
 use mlx_gen::{Error, Result};
@@ -68,6 +68,9 @@ pub(crate) struct LossSpec<'a> {
     pub(crate) lora_dtype: Option<Dtype>,
     /// Streamed + checkpointed (`true`) or resident (`false`).
     pub(crate) streamed: bool,
+    /// Attention chunked on whole heads, each chunk recomputed in the backward, at inference rung
+    /// 3's plan (E20): no attention call ever holds the whole `[56, S, S]` score domain.
+    pub(crate) chunked_attention: bool,
 }
 
 /// One micro-step's inputs.
@@ -120,7 +123,7 @@ fn mlx_err(e: impl std::fmt::Display) -> Exception {
 
 /// The per-step constants of the forward: the refined caption rows, rotary tables and gather
 /// indices for `inputs.layout`.
-fn parts(dit: &mut MiniMaxH3ImageDit, inputs: &StepInputs<'_>) -> Result<DenoiserParts> {
+pub(crate) fn parts(dit: &mut MiniMaxH3ImageDit, inputs: &StepInputs<'_>) -> Result<DenoiserParts> {
     denoiser_parts(
         dit,
         inputs.layout,
@@ -130,7 +133,11 @@ fn parts(dit: &mut MiniMaxH3ImageDit, inputs: &StepInputs<'_>) -> Result<Denoise
 }
 
 /// `[text | proj_in(image)]` — the stack's input.
-fn stack_input(dit: &MiniMaxH3ImageDit, parts: &DenoiserParts, packed: &Array) -> Result<Array> {
+pub(crate) fn stack_input(
+    dit: &MiniMaxH3ImageDit,
+    parts: &DenoiserParts,
+    packed: &Array,
+) -> Result<Array> {
     let stream = parts.text_rows.dtype();
     let image = dit
         .projections()
@@ -140,8 +147,22 @@ fn stack_input(dit: &MiniMaxH3ImageDit, parts: &DenoiserParts, packed: &Array) -
     Ok(concatenate_axis(&[parts.text_rows.clone(), image], 1)?)
 }
 
+/// The attention plan every training block runs under: [`AttentionChunkAxis::HeadsRecomputed`] at
+/// the training budget ([`super::memory::training_attention_budget`]) when chunked.
+pub(crate) fn attention(spec: &LossSpec<'_>, seq_len: u64) -> BoundedAttention<'static> {
+    if spec.chunked_attention {
+        BoundedAttention::new(
+            AttentionPlan::budgeted(super::memory::training_attention_budget(seq_len)),
+            AttentionChunkAxis::HeadsRecomputed,
+        )
+    } else {
+        BoundedAttention::UNBOUNDED
+    }
+}
+
 /// Block `layer` at the step's indices.
-fn run_block(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_block(
     dit: &MiniMaxH3ImageDit,
     block: &DitBlock,
     layer: usize,
@@ -149,6 +170,7 @@ fn run_block(
     modulation: &Modulation,
     parts: &DenoiserParts,
     step: usize,
+    bounded: BoundedAttention<'_>,
 ) -> Result<Array> {
     block.forward_bounded(
         x,
@@ -156,12 +178,12 @@ fn run_block(
         &parts.adaln_indices[step],
         dit.rope(),
         &parts.tables,
-        BoundedAttention::UNBOUNDED,
+        bounded,
     )
 }
 
 /// `norm_out`, the step's head over the image rows, and the loss over the generated rows.
-fn tail_loss(
+pub(crate) fn tail_loss(
     dit: &MiniMaxH3ImageDit,
     x: &Array,
     modulation: &Modulation,
@@ -198,7 +220,7 @@ pub(crate) fn loss_and_grads(
 ) -> Result<(f32, LoraParams)> {
     let parts = parts(dit, inputs)?;
     if spec.streamed {
-        streamed_loss_and_grads(dit, modulation, &parts, params, spec, inputs)
+        streamed_loss_and_grads(dit, modulation, &parts, params, spec, inputs, None)
     } else {
         resident_loss_and_grads(dit, modulation, &parts, params, spec, inputs)
     }
@@ -217,6 +239,7 @@ fn resident_loss_and_grads(
             "minimax_h3_image trainer: the resident backward needs a resident DiT".into(),
         ));
     }
+    let bounded = attention(spec, inputs.layout.seq_len() as u64);
     let loss_fn = |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
         spec.adapter.install_as(
             &mut *dit,
@@ -229,8 +252,17 @@ fn resident_loss_and_grads(
         let dit: &MiniMaxH3ImageDit = dit;
         let mut x = stack_input(dit, parts, inputs.packed).map_err(mlx_err)?;
         for (layer, block) in dit.blocks().iter().enumerate() {
-            x = run_block(dit, block, layer, &x, modulation, parts, inputs.step.index)
-                .map_err(mlx_err)?;
+            x = run_block(
+                dit,
+                block,
+                layer,
+                &x,
+                modulation,
+                parts,
+                inputs.step.index,
+                bounded,
+            )
+            .map_err(mlx_err)?;
         }
         Ok(vec![tail_loss(
             dit, &x, modulation, parts, inputs, spec.mae,
@@ -277,13 +309,17 @@ fn install_concrete(
     Ok(())
 }
 
-fn streamed_loss_and_grads(
+/// The streamed backward. `trace`, when given, receives the cotangent of every block's output
+/// `(l + 1, dL/dh_{l+1})` from the stack output down, then block 0's input `(0, dL/dh_0)` — the
+/// gradient gate's per-boundary diagnostic.
+pub(crate) fn streamed_loss_and_grads(
     dit: &mut MiniMaxH3ImageDit,
     modulation: &Modulation,
     parts: &DenoiserParts,
     params: &LoraParams,
     spec: &LossSpec<'_>,
     inputs: &StepInputs<'_>,
+    mut trace: Option<&mut Vec<(usize, Array)>>,
 ) -> Result<(f32, LoraParams)> {
     let dit: &MiniMaxH3ImageDit = dit;
     let layers = dit.num_layers();
@@ -294,6 +330,7 @@ fn streamed_loss_and_grads(
         )));
     }
     let step = inputs.step.index;
+    let bounded = attention(spec, inputs.layout.seq_len() as u64);
 
     // Forward: keep every block's input, forced, and nothing else.
     let mut saved = Vec::with_capacity(layers + 1);
@@ -303,7 +340,16 @@ fn streamed_loss_and_grads(
     for layer in 0..layers {
         let mut block = materialize(dit, layer)?;
         install_concrete(&mut block, layer, &spec.blocks[layer], params, spec)?;
-        let h = run_block(dit, &block, layer, &saved[layer], modulation, parts, step)?;
+        let h = run_block(
+            dit,
+            &block,
+            layer,
+            &saved[layer],
+            modulation,
+            parts,
+            step,
+            bounded,
+        )?;
         eval([&h])?;
         drop(block);
         saved.push(h);
@@ -326,6 +372,9 @@ fn streamed_loss_and_grads(
         Error::Msg("minimax_h3_image trainer: the tail returned no cotangent".into())
     })?;
     eval([&cotangent])?;
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.push((layers, cotangent.clone()));
+    }
 
     // Backward: block `l` again, one vjp against the cotangent from block `l + 1`.
     let mut out = LoraParams::new();
@@ -365,7 +414,7 @@ fn streamed_loss_and_grads(
                     )?;
                 }
                 Ok(vec![run_block(
-                    dit, &block, layer, &xs[0], modulation, parts, step,
+                    dit, &block, layer, &xs[0], modulation, parts, step, bounded,
                 )
                 .map_err(mlx_err)?])
             },
@@ -387,6 +436,9 @@ fn streamed_loss_and_grads(
         eval(forced)?;
         drop(block);
         out.extend(block_grads);
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.push((layer, cotangent.clone()));
+        }
     }
     Ok((loss, out))
 }
