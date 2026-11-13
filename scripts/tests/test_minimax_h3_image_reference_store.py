@@ -14,7 +14,8 @@ import yaml
 from scripts.ci import minimax_h3_image_reference_store as store
 
 ROOT = Path(__file__).resolve().parents[2]
-WORKFLOW = ROOT / ".github" / "workflows" / "real-weights.yml"
+# SW-F363: the H3-Image lanes run in the reusable workflow `real-weights.yml` calls.
+WORKFLOW = ROOT / ".github" / "workflows" / "real-weights-minimax-h3-image.yml"
 JOB = "minimax-h3-image-reference"
 LAUNCHER = "python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}"
 KEY = "h3img-ref-v1-" + "b" * 64

@@ -14,7 +14,7 @@
 //!
 //! `#[ignore]`d: needs `MiniMaxAI/MiniMax-H3-Image` (`MINIMAX_H3_IMAGE_SNAPSHOT`), the converted q4
 //! DiT tier (`MINIMAX_H3_IMAGE_TIERS_ROOT/q4`) and MiniMax-H3's `text_encoder/`
-//! (`MINIMAX_H3_SNAPSHOT`). The `H3-Image training (real weights)` workflow runs it on its MLX job. The dataset is drawn procedurally into a scratch directory;
+//! (`MINIMAX_H3_SNAPSHOT`). The `minimax-h3-image-train` real-weights profile runs it on `mlx-minimax-h3-image-train`. The dataset is drawn procedurally into a scratch directory;
 //! nothing is downloaded. The t2i adapter is copied to `MINIMAX_H3_IMAGE_TRAINED_LORA_OUT` for the
 //! Candle load gate.
 

@@ -1,5 +1,5 @@
 //! SW-7097 gradient correctness on real weights (MLX, q4 tier). `#[ignore]`d: run only by the
-//! `H3-Image training (real weights)` workflow — never by ordinary CI, which runs no model.
+//! `minimax-h3-image-train` real-weights profile — never by ordinary CI, which runs no model.
 //!
 //! The streamed, checkpointed backward (one block rebuilt at a time, one `vjp` per block) must give
 //! the gradients of the resident whole-graph `keyed_value_and_grad` over the same DiT, and both must

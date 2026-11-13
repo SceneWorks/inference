@@ -4,7 +4,7 @@
 //!
 //! `#[ignore]`d: needs `MiniMaxAI/MiniMax-H3-Image` (`MINIMAX_H3_IMAGE_SNAPSHOT`), CUDA, and the
 //! MLX job's trained adapter (`MINIMAX_H3_IMAGE_TRAINED_LORA`, the `minimax-h3-image-trained-lora`
-//! artifact). The `H3-Image training (real weights)` workflow runs it on its `candle-load` job after
+//! artifact). The `minimax-h3-image-train` real-weights profile runs it on `candle-minimax-h3-image-train` after
 //! the MLX training job.
 
 use std::path::PathBuf;

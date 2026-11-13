@@ -157,7 +157,7 @@ on:
         default: ""
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: ["", synthetic-w4a8-mlx, synthetic-w4a8-cuda, synthetic-w4a8-both, moss-edit-cuda, moss-edit-metal, moss-cpu-fixture, moss-metal-fixture, llm-decoder-fixture, moss-cuda-unit, model-exhaustive-tests, model-inference-proofs, ios-selected-captures, ios-pricing-compile-only, ios-prequant, ios-simulator-sana, veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx, flux3-klein-mlx, flux3-klein-cuda, supra2, minimax-h3-image, minimax-h3-image-pe]
+        options: ["", synthetic-w4a8-mlx, synthetic-w4a8-cuda, synthetic-w4a8-both, moss-edit-cuda, moss-edit-metal, moss-cpu-fixture, moss-metal-fixture, llm-decoder-fixture, moss-cuda-unit, model-exhaustive-tests, model-inference-proofs, ios-selected-captures, ios-pricing-compile-only, ios-prequant, ios-simulator-sana, veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx, flux3-klein-mlx, flux3-klein-cuda, supra2, minimax-h3-image, minimax-h3-image-pe, minimax-h3-image-train]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -4840,127 +4840,14 @@ jobs:
             ${{ runner.temp }}/minimax-h3-vram-bf16.json
           if-no-files-found: error
 
-  minimax-h3-image-reference:
+  # SW-F363 MiniMax-H3-Image gates (reference, VAE, DiT parity, t2i/edit renders, tiers, LoRA,
+  # sampler A/B, PE, and the SW-7097 trainer) live in the reusable real-weights-minimax-h3-image.yml.
+  minimax-h3-image:
     needs: validate-selection
-    name: H3-Image diffusers reference
-    if: inputs.profile == 'minimax-h3-image'
-    runs-on: [self-hosted, macOS, ARM64, rw-mage]
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - id: key
-        name: Compute the reference cache key
-        run: source scripts/ci/real-weights/minimax-h3-image-reference/compute-the-reference-cache-key.sh
-      - id: store
-        name: Restore the reference from the runner store
-        env:
-          H3I_REFERENCE_KEY: ${{ steps.key.outputs.key }}
-        run: source scripts/ci/real-weights/minimax-h3-image-reference/restore-the-reference-from-the-runner-store.sh
-      - name: Materialize and produce the image VAE reference
-        if: steps.store.outputs.hit != 'true'
-        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
-        run: source scripts/ci/real-weights/minimax-h3-image-reference/materialize-and-produce-the-image-vae-reference.sh
-      - name: Materialize the DiT and produce its reference
-        if: steps.store.outputs.hit != 'true'
-        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 7200 -- /bin/bash -e {0}
-        run: source scripts/ci/real-weights/minimax-h3-image-reference/materialize-the-dit-and-produce-its-reference.sh
-      - name: Report the reference
-        env:
-          H3I_REFERENCE_STORE_HIT: ${{ steps.store.outputs.hit }}
-        run: source scripts/ci/real-weights/minimax-h3-image-reference/report-the-reference.sh
-      - name: Publish the reference to the runner store
-        if: steps.store.outputs.hit != 'true'
-        run: source scripts/ci/real-weights/minimax-h3-image-reference/publish-the-reference-to-the-runner-store.sh
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: minimax-h3-image-vae-reference
-          path: minimax-h3-image-vae-reference
-          if-no-files-found: error
-      - if: always()
-        run: rm -rf minimax-h3-image-vae-reference
-
-  mlx-minimax-h3-image:
-    needs: [validate-selection, minimax-h3-image-reference]
-    defaults:
-      run:
-        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 9000 -- /bin/bash -e {0}
-    name: MLX H3-Image VAE
-    if: inputs.profile == 'minimax-h3-image'
-    runs-on: [self-hosted, macOS, ARM64, rw-mage]
-    timeout-minutes: 360
-    env:
-      MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Resolve runner-local snapshot paths
-        run: python3.12 scripts/release/resolve_snapshot_paths.py MLX_GEN_MODELS_ROOT
-      - name: Report runner disk headroom
-        continue-on-error: true
-        run: scripts/ci/report_runner_disk_headroom.sh MLX_GEN_MODELS_ROOT
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: minimax-h3-image-vae-reference
-          path: ${{ runner.temp }}/minimax-h3-image-vae-reference
-      - name: Materialize the image weights
-        run: source scripts/ci/real-weights/mlx-minimax-h3-image/materialize-the-image-weights.sh
-      - name: Set up the MLX build environment
-        run: source scripts/ci/real-weights/mlx-minimax-h3-image/set-up-the-mlx-build-environment.sh
-      - name: Run the image VAE gates
-        run: source scripts/ci/real-weights/mlx-minimax-h3-image/run-the-image-vae-gates.sh
-      - name: Run the DiT parity and the 2048 render
-        run: source scripts/ci/real-weights/mlx-minimax-h3-image/run-the-dit-parity-and-the-2048-render.sh
-      - name: Run the sampler A/B
-        if: ${{ !cancelled() }}
-        run: source scripts/ci/real-weights/mlx-minimax-h3-image/run-the-sampler-a-b.sh
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: ${{ !cancelled() }}
-        with:
-          name: minimax-h3-image-sampler-ab-mlx
-          path: ${{ runner.temp }}/minimax-h3-image-sampler-ab
-
-  candle-minimax-h3-image:
-    needs: [validate-selection, minimax-h3-image-reference]
-    name: Candle H3-Image VAE + t2i (CUDA)
-    if: ${{ !cancelled() && needs.validate-selection.result == 'success' && inputs.profile == 'minimax-h3-image' }}
-    runs-on: [self-hosted, windows, cuda, real-weights]
-    timeout-minutes: 360
-    env:
-      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
-      CUDA_COMPUTE_CAP: "80"
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-        with:
-          version: "0.12.3"
-          enable-cache: false
-      - name: Install reviewed CPython 3.12
-        shell: cmd
-        run: call scripts\ci\real-weights\candle-minimax-h3-image\install-reviewed-cpython-3-12.cmd
-      - uses: ./.github/actions/setup-rust
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: minimax-h3-image-vae-reference
-          path: ${{ runner.temp }}/minimax-h3-image-vae-reference
-      - name: Run the image VAE gates
-        shell: cmd
-        run: call scripts\ci\real-weights\candle-minimax-h3-image\run-the-image-vae-gates.cmd
-      - name: Run the image DiT and text-to-image gates
-        shell: cmd
-        run: call scripts\ci\real-weights\candle-minimax-h3-image\run-the-image-dit-and-text-to-image-gates.cmd
-      - name: Run the sampler A/B
-        if: ${{ !cancelled() }}
-        shell: cmd
-        run: call scripts\ci\real-weights\candle-minimax-h3-image\run-the-sampler-a-b.cmd
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: ${{ !cancelled() }}
-        with:
-          name: minimax-h3-image-sampler-ab-candle
-          path: ${{ runner.temp }}/minimax-h3-image-sampler-ab
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: always()
-        with:
-          name: minimax-h3-image-cuda-evidence
-          path: ${{ runner.temp }}/minimax-h3-image-evidence
+    if: inputs.profile == 'minimax-h3-image' || inputs.profile == 'minimax-h3-image-pe' || inputs.profile == 'minimax-h3-image-train'
+    uses: ./.github/workflows/real-weights-minimax-h3-image.yml
+    with:
+      profile: ${{ inputs.profile }}
 
   # sc-24114 — Qwen-Image 2.1 real-weight evidence on candle/CUDA. DISPATCH-ONLY (`qwen-image-2-1`
   # profile; never `all`, never the schedule): it renders at the upstream 2048² / 40-step default and
@@ -5549,108 +5436,6 @@ jobs:
         with:
           name: supra2-mlx-evidence
           path: ${{ runner.temp }}/supra2-mlx-evidence
-          if-no-files-found: error
-          retention-days: 30
-
-  # SW-7099 MiniMax-H3-Image-PE: native NVFP4 reference on Blackwell, then bf16/Q8/Q4 tiers scored
-  # against it on both backends. Tiers stay runner-local.
-  candle-minimax-h3-image-pe:
-    needs: validate-selection
-    name: Candle MiniMax-H3-Image-PE (CUDA)
-    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'minimax-h3-image-pe'
-    runs-on: [self-hosted, windows, cuda, real-weights]
-    timeout-minutes: 600
-    outputs:
-      nvfp4_reference: ${{ steps.nvfp4.outputs.nvfp4_reference }}
-    env:
-      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
-      MINIMAX_PE_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--MiniMaxAI--MiniMax-H3-Image-PE\snapshots\35603d4b63949afa12cb098227fffefedf081afa
-      MINIMAX_PE_TIERS_ROOT: D:\sceneworks-terminal\weights\minimax-h3-image-pe-tiers
-      CUDA_COMPUTE_CAP: "80"
-      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
-      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Install pinned uv
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-        with:
-          version: "0.12.3"
-          enable-cache: false
-      - name: Install reviewed CPython 3.12
-        shell: cmd
-        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe\install-reviewed-cpython-3-12.cmd
-      - name: Select Git Bash
-        shell: cmd
-        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe\select-git-bash.cmd
-      - uses: ./.github/actions/setup-rust
-      - name: Disable unstable sccache wrapper for the heavy Candle lane
-        shell: powershell
-        run: |
-          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
-          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
-      - name: Initialize evidence and require a Blackwell device
-        shell: cmd
-        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe\initialize-evidence-and-require-blackwell.cmd
-      - name: Materialize and verify immutable snapshots
-        shell: cmd
-        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe\materialize-and-verify-immutable-snapshots.cmd
-      - name: Run the native NVFP4 reference
-        id: nvfp4
-        shell: cmd
-        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe\run-the-nvfp4-reference.cmd
-      - name: Keep the NVFP4 reference
-        if: steps.nvfp4.outputs.nvfp4_reference == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: minimax-h3-image-pe-nvfp4-reference
-          path: ${{ runner.temp }}/minimax-pe-cuda-evidence/nvfp4.json
-      - name: Convert and score the Candle tiers
-        shell: cmd
-        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe\convert-and-score-the-candle-tiers.cmd
-      - name: Keep the evidence
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: minimax-h3-image-pe-cuda-evidence
-          path: ${{ runner.temp }}/minimax-pe-cuda-evidence
-          if-no-files-found: error
-          retention-days: 30
-
-  mlx-minimax-h3-image-pe:
-    needs: candle-minimax-h3-image-pe
-    name: MLX MiniMax-H3-Image-PE (Metal)
-    if: always() && github.event_name == 'workflow_dispatch' && inputs.profile == 'minimax-h3-image-pe' && needs.candle-minimax-h3-image-pe.outputs.nvfp4_reference == 'true'
-    runs-on: [self-hosted, macOS, ARM64, rw-llm]
-    timeout-minutes: 600
-    env:
-      MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
-      MINIMAX_PE_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--MiniMaxAI--MiniMax-H3-Image-PE/snapshots/35603d4b63949afa12cb098227fffefedf081afa
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Initialize the evidence
-        run: source scripts/ci/real-weights/mlx-minimax-h3-image-pe/initialize-the-evidence.sh
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: minimax-h3-image-pe-nvfp4-reference
-          path: ${{ runner.temp }}/minimax-pe-cuda-evidence
-      - name: Resolve runner-local snapshot paths
-        run: python3.12 scripts/release/resolve_snapshot_paths.py MLX_GEN_MODELS_ROOT MINIMAX_PE_SNAPSHOT
-      - name: Report runner disk headroom
-        continue-on-error: true
-        run: scripts/ci/report_runner_disk_headroom.sh MLX_GEN_MODELS_ROOT MINIMAX_PE_SNAPSHOT
-      - name: Build the test binary and the converters
-        run: source scripts/ci/real-weights/mlx-minimax-h3-image-pe/build-the-test-binary-and-converters.sh
-      - name: Materialize and verify immutable snapshots
-        run: source scripts/ci/real-weights/mlx-minimax-h3-image-pe/materialize-and-verify-immutable-snapshots.sh
-      - name: Convert and score the MLX tiers
-        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
-        run: source scripts/ci/real-weights/mlx-minimax-h3-image-pe/convert-and-score-the-mlx-tiers.sh
-      - name: Keep the evidence
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: minimax-h3-image-pe-mlx-evidence
-          path: ${{ runner.temp }}/minimax-pe-mlx-evidence
           if-no-files-found: error
           retention-days: 30
 

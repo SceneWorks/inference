@@ -313965,7 +313965,7 @@
     "device_binding": "runtime-stream",
     "fixture_identity": "real MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/ converted to the q4 tier, vae_diffusers/, tokenizer/) plus MiniMaxAI/MiniMax-H3@939557dc text_encoder/ (shards 1-12 and the vision tower); procedurally drawn dataset",
     "configuration_source": "body-local construction (preserved verbatim)",
-    "output_contract": "original asserts preserved; end-only body marker; H3-Image training real-weights workflow (mlx-train job)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image-train real-weights profile (mlx-minimax-h3-image-train job)",
     "cargo_features": [
       "model-inference-proof"
     ],
@@ -313977,7 +313977,7 @@
     "route_metadata": {
       "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT, the q4 DiT tier and MINIMAX_H3_SNAPSHOT's text encoder; trains 2048\u00b2 twice and renders once",
       "env_gates": [],
-      "route": "#[ignore] manual workflow (env-gated); run by the H3-Image training real-weights workflow with --ignored --exact --nocapture"
+      "route": "#[ignore] manual workflow (env-gated); run by the minimax-h3-image-train real-weights profile with --ignored --exact --nocapture"
     },
     "cargo_target_metadata": {
       "name": "integration",
@@ -314000,7 +314000,7 @@
     "device_binding": "runtime-stream",
     "fixture_identity": "real MiniMaxAI/MiniMax-H3-Image@492fd8c4 (transformer_diffusers/ converted to the q4 tier, vae_diffusers/, tokenizer/) plus MiniMaxAI/MiniMax-H3@939557dc text_encoder/ (shards 1-12 and the vision tower); procedurally drawn dataset",
     "configuration_source": "body-local construction (preserved verbatim)",
-    "output_contract": "original asserts preserved; end-only body marker; H3-Image training real-weights workflow (mlx-train job)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image-train real-weights profile (mlx-minimax-h3-image-train job)",
     "cargo_features": [
       "model-inference-proof"
     ],
@@ -314012,7 +314012,7 @@
     "route_metadata": {
       "ignore_reason": "needs MINIMAX_H3_IMAGE_SNAPSHOT, the q4 DiT tier and MINIMAX_H3_SNAPSHOT's text encoder; trains a 2048\u00b2 edit pair and renders once",
       "env_gates": [],
-      "route": "#[ignore] manual workflow (env-gated); run by the H3-Image training real-weights workflow with --ignored --exact --nocapture"
+      "route": "#[ignore] manual workflow (env-gated); run by the minimax-h3-image-train real-weights profile with --ignored --exact --nocapture"
     },
     "cargo_target_metadata": {
       "name": "integration",
@@ -314035,7 +314035,7 @@
     "device_binding": "runtime-stream",
     "fixture_identity": "real MiniMaxAI/MiniMax-H3-Image@492fd8c4 transformer_diffusers/ converted to the q4 tier; seeded synthetic context and latents",
     "configuration_source": "body-local construction (preserved verbatim)",
-    "output_contract": "original asserts preserved; end-only body marker; H3-Image training real-weights workflow (mlx-train job)",
+    "output_contract": "original asserts preserved; end-only body marker; minimax-h3-image-train real-weights profile (mlx-minimax-h3-image-train job)",
     "cargo_features": [
       "model-inference-proof"
     ],
@@ -314045,7 +314045,7 @@
     "route_metadata": {
       "ignore_reason": "needs the converted q4 DiT tier (MINIMAX_H3_IMAGE_TIERS_ROOT); loads the q4 image DiT streamed and resident",
       "env_gates": [],
-      "route": "#[ignore] manual workflow (env-gated); run by the H3-Image training real-weights workflow with --ignored --exact --nocapture"
+      "route": "#[ignore] manual workflow (env-gated); run by the minimax-h3-image-train real-weights profile with --ignored --exact --nocapture"
     },
     "cargo_target_metadata": {
       "name": "mlx_gen_minimax_h3",
