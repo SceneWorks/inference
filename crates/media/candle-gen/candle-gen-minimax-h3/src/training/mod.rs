@@ -37,9 +37,11 @@
 //!   ([`MiniMaxH3Dit::window_block`]) rather than blocks rebuilt from the tier's shards, because
 //!   CUDA memory is separate from the host's. The memory estimate prices the host stack in its own
 //!   column.
-//! * The attention of a differentiated forward takes the materialized route with a composable
-//!   float32 softmax ([`crate::nn::with_differentiable_attention`]): candle's fused kernels have no
-//!   backward. The estimate prices those float32 score buffers.
+//! * Training attention is bounded by design through candle's shared training SDPA
+//!   ([`crate::nn::with_differentiable_attention`]): its reference owner keeps only q / k / v and the
+//!   output, and recomputes the float32 probabilities one query tile at a time in the backward,
+//!   where MLX chunks whole heads under a checkpoint. The estimate prices one tile, rounded up to
+//!   whole heads, through the shared envelope.
 //! * The trainable factors are installed once on the host blocks; a window copy carries them as
 //!   the same `Var` leaves, so no per-step re-install exists.
 //!
@@ -616,6 +618,7 @@ impl MiniMaxH3ImageTrainer {
             lokr_delta_block_max: block_max,
             lokr_delta_total: total,
             checkpointed: plan.checkpointed,
+            chunked_attention: true,
             preview,
         })
     }

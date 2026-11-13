@@ -30,11 +30,26 @@ use crate::image_memory_strategy::admission::{
     estimate, ladder, ImageMemoryEstimate, ImageMemoryFacts, ImagePhase, ImageRequestShape,
 };
 
-/// Float32 score-shaped tensors candle's differentiated materialized attention holds per block
-/// beyond the activation-width ones [`train_step_bytes`] counts: the scores, the max-shifted
-/// scores, their exponent and the float32 probabilities (`crate::nn::sdpa_materialized` keeps the
-/// score and softmax island in float32, and the composable softmax retains each for its backward).
+/// Float32 score-shaped tensors an **unbounded** composable attention would hold per block beyond
+/// the activation-width ones [`train_step_bytes`] counts: the scores, the max-shifted scores, their
+/// exponent and the float32 probabilities. Priced only when `chunked_attention` is off.
 pub const F32_SCORE_BUFFERS: u64 = 4;
+/// Float32 `[S, heads·head_dim]` tensors the bounded training attention keeps per live block: its
+/// q / k / v operands taken to float32 and its float32 output ([`crate::nn`]'s
+/// `differentiable_sdpa`), which its reference owner retains in place of any score.
+pub const F32_ATTENTION_OPERANDS: u64 = 4;
+
+/// Heads whose `[S, S]` scores cover one training attention tile over `seq_len` rows: the
+/// reference owner's [`candle_gen::fused_attention::TRAINING_SCORE_TILE_ELEMENTS`] bound, rounded
+/// UP to whole heads so the shared envelope's chunk arrays over-cover the tile, at least one.
+pub fn training_attention_heads_per_chunk(seq_len: u64) -> u64 {
+    let heads = DitGeometry::SHIPPED.heads;
+    let per_head = seq_len.saturating_mul(seq_len).max(1);
+    candle_gen::fused_attention::TRAINING_SCORE_TILE_ELEMENTS
+        .div_ceil(per_head)
+        .clamp(1, heads)
+}
+
 /// Headroom for the CUDA caching allocator's fragmentation around one block's backward.
 const ALLOCATOR_SLACK_BYTES: u64 = 1 << 30;
 
@@ -62,6 +77,10 @@ pub struct TrainingRunShape {
     pub lokr_delta_block_max: u64,
     pub lokr_delta_total: u64,
     pub checkpointed: bool,
+    /// Training attention through the bounded reference owner (no call holds more than one score
+    /// tile; the backward recomputes it) — the trainer always runs this; `false` prices an
+    /// unbounded composable attention.
+    pub chunked_attention: bool,
     /// The preview request (`None` when previews are off): item 0's canvas and references.
     pub preview: Option<TrainingItemShape>,
 }
@@ -253,12 +272,24 @@ pub fn estimate_training(
             lokr_delta_block_max: run.lokr_delta_block_max,
             lokr_delta_total: run.lokr_delta_total,
             checkpointed: run.checkpointed,
+            attention_heads_per_chunk: if run.chunked_attention {
+                training_attention_heads_per_chunk(text_rows + reference_rows + image_rows)
+            } else {
+                geometry.heads
+            },
         };
         let bytes = train_step_bytes(&geometry, &weights, &s);
         let seq = s.sequence();
-        let f32_scores = geometry.heads * seq * seq * 4 * F32_SCORE_BUFFERS;
+        // Bounded: the shared envelope's 6 + 11 one-chunk arrays at activation width cover the
+        // owner's float32 tile working set (at most five float32 tile arrays); what candle adds is
+        // the float32 operands each live block keeps. Unbounded: the float32 score island.
+        let f32_attention = if run.chunked_attention {
+            F32_ATTENTION_OPERANDS * seq * geometry.heads * geometry.head_dim * 4
+        } else {
+            geometry.heads * seq * seq * 4 * F32_SCORE_BUFFERS
+        };
         let live_blocks = if run.checkpointed { 1 } else { geometry.layers };
-        let total = bytes.total() + live_blocks * f32_scores + ALLOCATOR_SLACK_BYTES;
+        let total = bytes.total() + live_blocks * f32_attention + ALLOCATOR_SLACK_BYTES;
         if total > train.device {
             train.device = total;
             step = bytes;
@@ -422,6 +453,7 @@ mod tests {
             lokr_delta_block_max: 0,
             lokr_delta_total: 0,
             checkpointed,
+            chunked_attention: true,
             preview: None,
         }
     }
@@ -513,6 +545,44 @@ mod tests {
         let render = estimate(&c, &f, &request_shape(&with.items[0]), &sel).unwrap();
         assert!(est.preview.device > render.peak_device_bytes());
         assert!(est.preview.host >= render.peak_host_bytes() + f.dit_retained_host);
+    }
+
+    /// The 2048² edit with two 1024² references (about 8.4 k rows) is admitted on an 80 GB card
+    /// with the bounded training attention by design. Unbounded, the six full `[56, S, S]` score
+    /// arrays and the float32 score island make the train phase the binding phase and the run is
+    /// refused at 80 GB.
+    #[test]
+    fn the_2048_two_reference_edit_fits_80_gb_with_bounded_attention() {
+        let c = contract();
+        let f = facts();
+        let t = tier(None);
+        let mut edit = run(true);
+        edit.items = vec![item(vec![(1024, 1024); 2])];
+        let (text, reference, image) = train_rows(&edit.items[0]);
+        let seq = text + reference + image;
+        assert!(seq > 8_000, "{text} + {reference} + {image}");
+        assert!(training_attention_heads_per_chunk(seq) < 56);
+        let bounded = estimate_training(&c, &f, t, &edit).unwrap();
+        admit_training(&bounded, budget_of(80 * GB), &edit, 2048).unwrap();
+        let unbounded_run = TrainingRunShape {
+            chunked_attention: false,
+            ..edit.clone()
+        };
+        let unbounded = estimate_training(&c, &f, t, &unbounded_run).unwrap();
+        assert!(unbounded.train.device > bounded.train.device + 6 * 56 * seq * seq * 2 / 2);
+        assert_eq!(unbounded.binding_phase(), "the training step");
+        assert!(admit_training(&unbounded, budget_of(80 * GB), &unbounded_run, 2048).is_err());
+    }
+
+    /// One tile's heads over-cover the owner's score tile and never exceed the head count.
+    #[test]
+    fn a_training_attention_chunk_covers_one_score_tile() {
+        let tile = candle_gen::fused_attention::TRAINING_SCORE_TILE_ELEMENTS;
+        for seq in [256u64, 4216, 8400, 20_000] {
+            let heads = training_attention_heads_per_chunk(seq);
+            assert!((1..=56).contains(&heads));
+            assert!(heads == 56 || heads * seq * seq >= tile, "{seq}: {heads}");
+        }
     }
 
     #[test]

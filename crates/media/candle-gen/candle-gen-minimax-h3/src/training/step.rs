@@ -6,8 +6,9 @@
 //! (`proj_in` over the packed image rows, scattered with the refined caption rows), the 50 blocks
 //! gathering their modulation from the run's precomputed tables at the step's AdaLN indices,
 //! `norm_out` and the step's own head. Only the generated rows enter the loss. The attention runs
-//! inside [`crate::nn::with_differentiable_attention`]: the materialized route with a composable
-//! softmax, because the fused kernels have no backward.
+//! inside [`crate::nn::with_differentiable_attention`]: candle's shared training SDPA, which holds
+//! one float32 score tile at a time and recomputes it in the backward (the fused kernels have no
+//! backward).
 //!
 //! # Streamed, checkpointed backward (the default)
 //!
