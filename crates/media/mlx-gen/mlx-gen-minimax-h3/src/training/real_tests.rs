@@ -17,8 +17,8 @@ use gen_core_train::h3_image::training_step;
 
 use super::block_trainables;
 use super::step::{
-    attention, loss_and_grads, noised_rows, parts, run_block, stack_input, streamed_loss_and_grads,
-    tail_loss, LossSpec, StepInputs, LOKR_DTYPE,
+    attention, block_vjp, loss_and_grads, materialize, noised_rows, parts, run_block, stack_input,
+    streamed_loss_and_grads, tail_loss, BlockHost, FactorGrads, LossSpec, StepInputs, LOKR_DTYPE,
 };
 use crate::h3_image::dit::MiniMaxH3ImageDit;
 use crate::h3_image::layout::ImageLayout;
@@ -232,6 +232,105 @@ fn rms_norm_vjp_check() -> (f32, f32) {
     )
 }
 
+/// One block's backward two ways on the same block, input and output cotangent: the trainer's
+/// [`block_vjp`] and plain `keyed_value_and_grad` autodiff of `Σ block(input, θ) · cotangent`.
+#[allow(clippy::too_many_arguments)]
+fn block_backward_both(
+    dit: &MiniMaxH3ImageDit,
+    block: &crate::dit::block::DitBlock,
+    layer: usize,
+    trainables: &super::step::BlockTrainables,
+    params: &LoraParams,
+    spec: &LossSpec<'_>,
+    modulation: &crate::h3_image::dit::Modulation,
+    parts: &crate::h3_image::dit::DenoiserParts,
+    step: usize,
+    bounded: mlx_gen::attention::BoundedAttention<'_>,
+    input: &Array,
+    cot: &Array,
+) -> ((Array, FactorGrads), (Array, FactorGrads)) {
+    let mut a = block.clone();
+    let via_vjp = block_vjp(
+        dit,
+        &mut a,
+        layer,
+        trainables,
+        params,
+        spec,
+        modulation,
+        parts,
+        step,
+        bounded,
+        input.clone(),
+        cot,
+    )
+    .unwrap();
+    let mut b = block.clone();
+    let input_key: std::rc::Rc<str> = std::rc::Rc::from("input");
+    let mut map: LoraParams = trainables
+        .keys
+        .iter()
+        .map(|k| (k.clone(), params[k].clone()))
+        .collect();
+    map.insert(input_key.clone(), input.clone());
+    let err = |e: mlx_gen::Error| mlx_rs::error::Exception::custom(e.to_string());
+    let loss_fn = |p: LoraParams, _: i32| -> mlx_rs::error::Result<Vec<Array>> {
+        if let Some(adapter) = &trainables.adapter {
+            adapter.install_as(
+                &mut BlockHost {
+                    index: layer,
+                    block: &mut b,
+                },
+                &p,
+                spec.alpha,
+                spec.rank,
+                spec.lora_dtype,
+                LOKR_DTYPE,
+            )?;
+        }
+        let out = run_block(
+            dit,
+            &b,
+            layer,
+            &p["input"],
+            modulation,
+            parts,
+            step,
+            bounded,
+        )
+        .map_err(err)?;
+        Ok(vec![out.multiply(cot)?.sum(None)?])
+    };
+    let mut vg = mlx_rs::transforms::keyed_value_and_grad(loss_fn);
+    let (_, grads) = vg(map, 0).unwrap();
+    let via_autodiff = (
+        grads[&input_key].clone(),
+        trainables
+            .keys
+            .iter()
+            .map(|k| (k.clone(), grads[k].clone()))
+            .collect(),
+    );
+    (via_vjp, via_autodiff)
+}
+
+fn compare_block(label: &str, x: &(Array, FactorGrads), y: &(Array, FactorGrads)) {
+    println!(
+        "[sw-7097 mlx] {label}: input cotangent rel L2 {:.3e}, |x|/|y| {:.6}, cosine {:.6}",
+        rel_l2(&x.0, &y.0),
+        norm(&x.0) / norm(&y.0).max(1e-30),
+        cosine(&x.0, &y.0)
+    );
+    for ((k, gx), (_, gy)) in x.1.iter().zip(&y.1) {
+        println!(
+            "[sw-7097 mlx] {label}: {k} rel L2 {:.3e}, |x|/|y| {:.6}, cosine {:.6}",
+            rel_l2(gx, gy),
+            norm(gx) / norm(gy).max(1e-30),
+            cosine(gx, gy)
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs the converted q4 DiT tier (MINIMAX_H3_IMAGE_TIERS_ROOT); loads the q4 image DiT streamed and resident"]
 fn streamed_backward_matches_resident_and_finite_differences_q4() {
@@ -336,6 +435,91 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         loss_and_grads(&mut resident, &modulation_r, &params, &spec(false), &inputs).unwrap();
     let cot_r =
         resident_boundary_cotangents(&mut resident, &modulation_r, &params, &spec(false), &inputs);
+    // Single-block isolation, blocks 0 and 49: the same input and output cotangent through the
+    // trainer's per-block vjp and through plain autodiff, on the streamed block (rebuilt from the
+    // tier) and on the resident one — separating "differentiation mechanism" from "block/state".
+    {
+        let parts_r = parts(&mut resident, &inputs).unwrap();
+        let bounded = attention(&spec(true), layout.seq_len() as u64);
+        let step_index = inputs.step.index;
+        spec(false)
+            .adapter
+            .install_as(
+                &mut resident,
+                &params,
+                cfg.alpha,
+                cfg.rank as f32,
+                None,
+                LOKR_DTYPE,
+            )
+            .unwrap();
+        let mut h = stack_input(&resident, &parts_r, &packed).unwrap();
+        let mut inputs_at = vec![h.clone()];
+        for (layer, block) in resident.blocks().iter().enumerate() {
+            h = run_block(
+                &resident,
+                block,
+                layer,
+                &h,
+                &modulation_r,
+                &parts_r,
+                step_index,
+                bounded,
+            )
+            .unwrap();
+            mlx_rs::transforms::eval([&h]).unwrap();
+            inputs_at.push(h.clone());
+        }
+        for layer in [49usize, 0] {
+            let cot = &cot_s.iter().find(|(l, _)| *l == layer + 1).unwrap().1;
+            let input = &inputs_at[layer];
+            let streamed_block = materialize(&streamed, layer).unwrap();
+            let resident_block = resident.blocks()[layer].clone();
+            let (s_vjp, s_auto) = block_backward_both(
+                &streamed,
+                &streamed_block,
+                layer,
+                &blocks[layer],
+                &params,
+                &spec(true),
+                &modulation_s,
+                &parts_s,
+                step_index,
+                bounded,
+                input,
+                cot,
+            );
+            let (r_vjp, r_auto) = block_backward_both(
+                &resident,
+                &resident_block,
+                layer,
+                &blocks[layer],
+                &params,
+                &spec(false),
+                &modulation_r,
+                &parts_r,
+                step_index,
+                bounded,
+                input,
+                cot,
+            );
+            compare_block(
+                &format!("block {layer} streamed block: vjp vs autodiff"),
+                &s_vjp,
+                &s_auto,
+            );
+            compare_block(
+                &format!("block {layer} resident block: vjp vs autodiff"),
+                &r_vjp,
+                &r_auto,
+            );
+            compare_block(
+                &format!("block {layer} vjp: streamed vs resident block"),
+                &s_vjp,
+                &r_vjp,
+            );
+        }
+    }
     drop(resident);
     mlx_gen::residency::drain_allocator_cache();
 
@@ -378,28 +562,33 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         let a_r = dot(&grads_r, dir);
         let dir_norm = dot(dir, dir).sqrt();
         let cap = 0.05 * params_norm / dir_norm.max(1e-30);
-        let eps = (1e3 * noise_floor / a_s.abs().max(1e-30)).min(cap);
-        let lp = loss_and_grads(
-            streamed,
-            &modulation_s,
-            &shifted(&params, dir, eps),
-            &spec(true),
-            &inputs,
-        )
-        .unwrap()
-        .0;
-        let lm = loss_and_grads(
-            streamed,
-            &modulation_s,
-            &shifted(&params, dir, -eps),
-            &spec(true),
-            &inputs,
-        )
-        .unwrap()
-        .0;
-        let fd = (lp - lm) / (2.0 * eps);
-        let measurable = (lp - lm).abs() >= 1e2 * noise_floor;
-        println!("[sw-7097 mlx] FD along {label}: streamed analytic {a_s:.6e}, resident analytic {a_r:.6e}, finite difference {fd:.6e} at step {eps:.3e} (L+ {lp:.9e} L0 {loss_s:.9e} L- {lm:.9e}, noise floor {noise_floor:.3e}, measurable {measurable})");
+        // Start where the predicted change is 1e3x the noise floor and halve until the two
+        // one-sided changes agree within 10% (the curvature check), while still measurable.
+        let mut eps = (1e3 * noise_floor / a_s.abs().max(1e-30)).min(cap);
+        let mut fd = f32::NAN;
+        for _ in 0..12 {
+            let mut at = |e: f32| {
+                loss_and_grads(
+                    streamed,
+                    &modulation_s,
+                    &shifted(&params, dir, e),
+                    &spec(true),
+                    &inputs,
+                )
+                .unwrap()
+                .0
+            };
+            let (lp, lm) = (at(eps), at(-eps));
+            let (up, down) = (lp - loss_s, loss_s - lm);
+            let asymmetry = (up - down).abs() / up.abs().max(down.abs()).max(1e-30);
+            let measurable = (lp - lm).abs() >= 1e2 * noise_floor;
+            fd = (lp - lm) / (2.0 * eps);
+            println!("[sw-7097 mlx] FD along {label}: streamed analytic {a_s:.6e}, resident analytic {a_r:.6e}, finite difference {fd:.6e} at step {eps:.3e} (L+ - L0 {up:.3e}, L0 - L- {down:.3e}, asymmetry {asymmetry:.3e}, noise floor {noise_floor:.3e}, measurable {measurable})");
+            if asymmetry <= 0.1 || !measurable {
+                break;
+            }
+            eps /= 2.0;
+        }
         (a_s, a_r, fd)
     };
     let only = |g: &LoraParams, prefix: &str| -> LoraParams {
