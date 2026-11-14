@@ -4,6 +4,7 @@
 //! helpers live in `gen_core_moss_image::moss_image` (sc-27316). Source authority and precision
 //! policies are recorded in `docs/models/moss-image.md`.
 
+use gen_core_moss_image_policy as policy;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -105,45 +106,12 @@ pub struct MossImageOptions {
 }
 impl Default for MossImageOptions {
     fn default() -> Self {
-        Self {
-            acceleration: MossImageAcceleration::Off,
-            max_sequence_length: 4096,
-            uncond_skip_layers: None,
-            slg: None,
-            training_shift: None,
-        }
+        policy::MossImageOptions::default().into()
     }
 }
 impl MossImageOptions {
     pub fn first_nonfinite_float(&self) -> Option<(&'static str, f32)> {
-        let Self {
-            acceleration: _,
-            max_sequence_length: _,
-            uncond_skip_layers: _,
-            slg,
-            training_shift,
-        } = self;
-        if let Some(x) = training_shift.filter(|x| !x.is_finite()) {
-            return Some(("moss_image.training_shift", x));
-        }
-        if let Some(MossSkipLayerGuidance {
-            layers: _,
-            scale,
-            start,
-            stop,
-        }) = slg
-        {
-            for (key, x) in [
-                ("moss_image.slg.scale", *scale),
-                ("moss_image.slg.start", *start),
-                ("moss_image.slg.stop", *stop),
-            ] {
-                if !x.is_finite() {
-                    return Some((key, x));
-                }
-            }
-        }
-        None
+        policy::MossImageOptions::from(self.clone()).first_nonfinite_float()
     }
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -158,8 +126,149 @@ pub struct MossImageResolved {
     pub uncond_skip_layers: Vec<u32>,
     pub slg: Option<MossSkipLayerGuidance>,
 }
+impl From<MossImageVariant> for policy::MossImageVariant {
+    fn from(value: MossImageVariant) -> Self {
+        match value {
+            MossImageVariant::Base => Self::Base,
+            MossImageVariant::Sft => Self::Sft,
+        }
+    }
+}
+impl From<policy::MossImageVariant> for MossImageVariant {
+    fn from(value: policy::MossImageVariant) -> Self {
+        match value {
+            policy::MossImageVariant::Base => Self::Base,
+            policy::MossImageVariant::Sft => Self::Sft,
+        }
+    }
+}
+impl From<MossImageAcceleration> for policy::MossImageAcceleration {
+    fn from(value: MossImageAcceleration) -> Self {
+        match value {
+            MossImageAcceleration::Off => Self::Off,
+            MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16) => {
+                Self::Dmd(policy::MossDmdPrecision::UnmergedBf16)
+            }
+            MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32) => {
+                Self::Dmd(policy::MossDmdPrecision::FullFp32)
+            }
+        }
+    }
+}
+impl From<policy::MossImageAcceleration> for MossImageAcceleration {
+    fn from(value: policy::MossImageAcceleration) -> Self {
+        match value {
+            policy::MossImageAcceleration::Off => Self::Off,
+            policy::MossImageAcceleration::Dmd(policy::MossDmdPrecision::UnmergedBf16) => {
+                Self::Dmd(MossDmdPrecision::UnmergedBf16)
+            }
+            policy::MossImageAcceleration::Dmd(policy::MossDmdPrecision::FullFp32) => {
+                Self::Dmd(MossDmdPrecision::FullFp32)
+            }
+        }
+    }
+}
+impl From<MossSkipLayerGuidance> for policy::MossSkipLayerGuidance {
+    fn from(value: MossSkipLayerGuidance) -> Self {
+        Self {
+            layers: value.layers,
+            scale: value.scale,
+            start: value.start,
+            stop: value.stop,
+        }
+    }
+}
+impl From<policy::MossSkipLayerGuidance> for MossSkipLayerGuidance {
+    fn from(value: policy::MossSkipLayerGuidance) -> Self {
+        Self {
+            layers: value.layers,
+            scale: value.scale,
+            start: value.start,
+            stop: value.stop,
+        }
+    }
+}
+impl From<MossImageOptions> for policy::MossImageOptions {
+    fn from(value: MossImageOptions) -> Self {
+        Self {
+            acceleration: value.acceleration.into(),
+            max_sequence_length: value.max_sequence_length,
+            uncond_skip_layers: value.uncond_skip_layers,
+            slg: value.slg.map(Into::into),
+            training_shift: value.training_shift,
+        }
+    }
+}
+impl From<policy::MossImageOptions> for MossImageOptions {
+    fn from(value: policy::MossImageOptions) -> Self {
+        Self {
+            acceleration: value.acceleration.into(),
+            max_sequence_length: value.max_sequence_length,
+            uncond_skip_layers: value.uncond_skip_layers,
+            slg: value.slg.map(Into::into),
+            training_shift: value.training_shift,
+        }
+    }
+}
+impl From<MossImageResolved> for policy::MossImageResolved {
+    fn from(value: MossImageResolved) -> Self {
+        Self {
+            variant: value.variant.into(),
+            acceleration: value.acceleration.into(),
+            steps: value.steps,
+            guidance: value.guidance,
+            shift: value.shift,
+            training_shift: value.training_shift,
+            max_sequence_length: value.max_sequence_length,
+            uncond_skip_layers: value.uncond_skip_layers,
+            slg: value.slg.map(Into::into),
+        }
+    }
+}
+impl From<policy::MossImageResolved> for MossImageResolved {
+    fn from(value: policy::MossImageResolved) -> Self {
+        Self {
+            variant: value.variant.into(),
+            acceleration: value.acceleration.into(),
+            steps: value.steps,
+            guidance: value.guidance,
+            shift: value.shift,
+            training_shift: value.training_shift,
+            max_sequence_length: value.max_sequence_length,
+            uncond_skip_layers: value.uncond_skip_layers,
+            slg: value.slg.map(Into::into),
+        }
+    }
+}
+
+/// Project the native request onto the portable policy's complete MOSS control surface.
+pub fn moss_policy_request(request: &GenerationRequest) -> policy::MossPolicyRequest {
+    policy::MossPolicyRequest {
+        width: request.width,
+        height: request.height,
+        count: request.count,
+        steps: request.steps,
+        guidance: request.guidance,
+        scheduler_shift: request.scheduler_shift,
+        sampler: request.sampler.clone(),
+        scheduler: request.scheduler.clone(),
+        guidance_method: request.guidance_method.clone(),
+        guidance_eta: request.guidance_eta,
+        guidance_momentum: request.guidance_momentum,
+        guidance_norm_threshold: request.guidance_norm_threshold,
+        true_cfg: request.true_cfg,
+        timestep_to_start_cfg: request.timestep_to_start_cfg,
+        cfg_interval: request.cfg_interval,
+        phases_present: request.phases.is_some(),
+        conditioning_present: !request.conditioning.is_empty(),
+        negative_prompt: request.negative_prompt.clone(),
+        moss_image: request.moss_image.clone().map(Into::into),
+    }
+}
 impl MossImageResolved {
     pub fn resolve(variant: MossImageVariant, request: &GenerationRequest) -> Result<Self> {
+        // The native request also carries other families' float knobs. Keep its exhaustive
+        // finiteness floor before projecting the MOSS controls into the portable owner.
         let options = request.moss_image.clone().unwrap_or_default();
         require(
             options.first_nonfinite_float().is_none(),
@@ -169,128 +278,12 @@ impl MossImageResolved {
             request.first_nonfinite_float().is_none(),
             "nonfinite request control",
         )?;
-        require(
-            request.width > 0
-                && request.height > 0
-                && request.width.is_multiple_of(16)
-                && request.height.is_multiple_of(16),
-            "dimensions must be positive multiples of 16",
-        )?;
-        require(request.count > 0, "image count must be positive")?;
-        require(
-            (1..=4096).contains(&options.max_sequence_length),
-            "context limit must be in 1..=4096",
-        )?;
-        require(
-            request.conditioning.is_empty(),
-            "reference/edit/control conditioning is not supported",
-        )?;
-        require(
-            request.sampler.as_deref().is_none_or(|v| v == "euler"),
-            "only the published Euler sampler is supported",
-        )?;
-        require(
-            request
-                .scheduler
-                .as_deref()
-                .is_none_or(|v| v == "moss_training_grid"),
-            "only the MOSS training-grid scheduler is supported",
-        )?;
-        require(
-            request.true_cfg.is_none()
-                && request.timestep_to_start_cfg.is_none()
-                && request.cfg_interval.is_none()
-                && request.phases.is_none(),
-            "generic CFG scheduling and phases are not MOSS controls",
-        )?;
-        require(
-            request
-                .guidance_method
-                .as_deref()
-                .is_none_or(|v| v == "cfg")
-                && request.guidance_eta.is_none()
-                && request.guidance_momentum.is_none()
-                && request.guidance_norm_threshold.is_none(),
-            "only published MOSS CFG/SLG guidance is supported",
-        )?;
-        let accelerated = matches!(options.acceleration, MossImageAcceleration::Dmd(_));
-        let steps = request.steps.unwrap_or(if accelerated { 8 } else { 50 });
-        let guidance = request
-            .guidance
-            .unwrap_or(if accelerated { 0.0 } else { 3.0 });
-        let shift = request.scheduler_shift.unwrap_or(5.0);
-        let training_shift = options.training_shift.unwrap_or(1.0);
-        require(
-            guidance.is_finite()
-                && guidance >= 0.0
-                && shift.is_finite()
-                && shift > 0.0
-                && training_shift > 0.0,
-            "guidance must be nonnegative and shifts positive",
-        )?;
-        require(steps > 0, "steps must be positive")?;
-        if let Some(layers) = &options.uncond_skip_layers {
-            validate_layers(layers)?;
-        }
-        if let Some(slg) = &options.slg {
-            validate_layers(&slg.layers)?;
-            require(
-                slg.scale >= 0.0 && 0.0 <= slg.start && slg.start <= slg.stop && slg.stop <= 1.0,
-                "SLG requires nonnegative scale and 0 <= start <= stop <= 1",
-            )?;
-        }
-        if accelerated {
-            require(
-                variant == MossImageVariant::Sft,
-                "DMD requires the exact SFT parent",
-            )?;
-            require(
-                (1..=8).contains(&steps),
-                "DMD steps must select a trained prefix in 1..=8",
-            )?;
-            require(
-                request.guidance.is_none_or(|g| g == 0.0)
-                    && request.negative_prompt.as_deref().is_none_or(str::is_empty),
-                "DMD does not support CFG or negative prompts",
-            )?;
-            require(
-                request.sampler.is_none()
-                    && request.scheduler.is_none()
-                    && request.scheduler_shift.is_none()
-                    && options.training_shift.is_none()
-                    && options.slg.is_none()
-                    && options.uncond_skip_layers.is_none()
-                    && request.guidance_method.is_none(),
-                "DMD uses fixed step codes, no Euler, layer skipping or SLG",
-            )?;
-        }
-        Ok(Self {
-            variant,
-            acceleration: options.acceleration,
-            steps,
-            guidance,
-            shift,
-            training_shift,
-            max_sequence_length: options.max_sequence_length,
-            uncond_skip_layers: if accelerated {
-                vec![]
-            } else {
-                options.uncond_skip_layers.unwrap_or_else(|| vec![22])
-            },
-            slg: options.slg,
-        })
+        policy::MossImageResolved::resolve(variant.into(), &moss_policy_request(request))
+            .map(Into::into)
+            .map_err(|error| Error::Unsupported(error.to_string()))
     }
     pub fn skipping_active(&self, step: usize, actual_steps: usize) -> bool {
-        if actual_steps == 0 || step >= actual_steps {
-            return false;
-        }
-        let (start, stop) = self
-            .slg
-            .as_ref()
-            .map(|s| (s.start, s.stop))
-            .unwrap_or((0.0, 1.0));
-        let fraction = step as f32 / actual_steps as f32;
-        start <= fraction && fraction < stop
+        policy::MossImageResolved::from(self.clone()).skipping_active(step, actual_steps)
     }
 }
 fn require(condition: bool, message: &str) -> Result<()> {
@@ -299,12 +292,6 @@ fn require(condition: bool, message: &str) -> Result<()> {
     } else {
         Err(Error::Unsupported(format!("MOSS-Image: {message}")))
     }
-}
-fn validate_layers(layers: &[u32]) -> Result<()> {
-    require(
-        layers.iter().all(|i| *i < 42),
-        "skip layers must be zero-based indices in 0..42",
-    )
 }
 /// Checked CPU representation for native advanced entry points. Supplied embeddings remain F32
 /// until transformer projection; binary masks compact each sample before the DiT forward.
@@ -423,167 +410,72 @@ pub enum MossImageAdvancedOutput {
     Images(Vec<Image>),
     Latents { values: Vec<f32>, shape: [usize; 4] },
 }
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum AccelerationWire {
-    Off,
-    UnmergedBf16,
-    FullFp32,
-}
 impl Serialize for MossImageAcceleration {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        match self {
-            Self::Off => AccelerationWire::Off,
-            Self::Dmd(MossDmdPrecision::UnmergedBf16) => AccelerationWire::UnmergedBf16,
-            Self::Dmd(MossDmdPrecision::FullFp32) => AccelerationWire::FullFp32,
-        }
-        .serialize(serializer)
+        policy::MossImageAcceleration::from(*self).serialize(serializer)
     }
 }
 impl<'de> Deserialize<'de> for MossImageAcceleration {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        Ok(match AccelerationWire::deserialize(deserializer)? {
-            AccelerationWire::Off => Self::Off,
-            AccelerationWire::UnmergedBf16 => Self::Dmd(MossDmdPrecision::UnmergedBf16),
-            AccelerationWire::FullFp32 => Self::Dmd(MossDmdPrecision::FullFp32),
-        })
+        policy::MossImageAcceleration::deserialize(deserializer).map(Into::into)
+    }
+}
+impl Serialize for MossSkipLayerGuidance {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        policy::MossSkipLayerGuidance::from(self.clone()).serialize(serializer)
     }
 }
 impl<'de> Deserialize<'de> for MossSkipLayerGuidance {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            layers: Vec<u32>,
-            scale: f32,
-            start: f32,
-            stop: f32,
-        }
-        let w = Wire::deserialize(deserializer)?;
-        let out = Self {
-            layers: w.layers,
-            scale: w.scale,
-            start: w.start,
-            stop: w.stop,
-        };
-        if out.layers.iter().any(|i| *i >= 42)
-            || !out.scale.is_finite()
-            || out.scale < 0.0
-            || !out.start.is_finite()
-            || !out.stop.is_finite()
-            || !(0.0 <= out.start && out.start <= out.stop && out.stop <= 1.0)
-        {
-            return Err(serde::de::Error::custom("invalid MOSS SLG controls"));
-        }
-        Ok(out)
+        policy::MossSkipLayerGuidance::deserialize(deserializer).map(Into::into)
+    }
+}
+impl Serialize for MossImageOptions {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        policy::MossImageOptions::from(self.clone()).serialize(serializer)
     }
 }
 impl<'de> Deserialize<'de> for MossImageOptions {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        fn context() -> u32 {
-            4096
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            #[serde(default)]
-            acceleration: MossImageAcceleration,
-            #[serde(default = "context")]
-            max_sequence_length: u32,
-            #[serde(default)]
-            uncond_skip_layers: Option<Vec<u32>>,
-            #[serde(default)]
-            slg: Option<MossSkipLayerGuidance>,
-            #[serde(default)]
-            training_shift: Option<f32>,
-        }
-        let w = Wire::deserialize(deserializer)?;
-        let out = Self {
-            acceleration: w.acceleration,
-            max_sequence_length: w.max_sequence_length,
-            uncond_skip_layers: w.uncond_skip_layers,
-            slg: w.slg,
-            training_shift: w.training_shift,
-        };
-        // A mode's inner controls can be checked without knowing Base/SFT; the provider resolver
-        // additionally enforces variant and generic-request compatibility.
-        MossImageResolved::resolve(
-            MossImageVariant::Sft,
-            &GenerationRequest {
-                moss_image: Some(out.clone()),
-                ..Default::default()
-            },
-        )
-        .map_err(serde::de::Error::custom)?;
-        Ok(out)
+        policy::MossImageOptions::deserialize(deserializer).map(Into::into)
     }
 }
 impl MossImageResolved {
-    /// Validate externally decoded effective controls against the same canonical request resolver.
+    /// Validate externally decoded effective controls against the portable request resolver.
     pub fn validate(&self) -> Result<()> {
-        let ordinary = matches!(self.acceleration, MossImageAcceleration::Off);
-        let expected = Self::resolve(
-            self.variant,
-            &GenerationRequest {
-                steps: Some(self.steps),
-                guidance: Some(self.guidance),
-                scheduler_shift: ordinary.then_some(self.shift),
-                moss_image: Some(MossImageOptions {
-                    acceleration: self.acceleration,
-                    max_sequence_length: self.max_sequence_length,
-                    uncond_skip_layers: ordinary.then(|| self.uncond_skip_layers.clone()),
-                    slg: self.slg.clone(),
-                    training_shift: ordinary.then_some(self.training_shift),
-                }),
-                ..Default::default()
-            },
-        )?;
-        require(
-            *self == expected,
-            "resolved controls are inconsistent with their execution mode",
-        )
+        policy::MossImageResolved::from(self.clone())
+            .validate()
+            .map_err(|error| Error::Unsupported(error.to_string()))
+    }
+}
+impl Serialize for MossImageResolved {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        policy::MossImageResolved::from(self.clone()).serialize(serializer)
     }
 }
 impl<'de> Deserialize<'de> for MossImageResolved {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            variant: MossImageVariant,
-            acceleration: MossImageAcceleration,
-            steps: u32,
-            guidance: f32,
-            shift: f32,
-            training_shift: f32,
-            max_sequence_length: u32,
-            uncond_skip_layers: Vec<u32>,
-            slg: Option<MossSkipLayerGuidance>,
-        }
-        let w = Wire::deserialize(deserializer)?;
-        let out = Self {
-            variant: w.variant,
-            acceleration: w.acceleration,
-            steps: w.steps,
-            guidance: w.guidance,
-            shift: w.shift,
-            training_shift: w.training_shift,
-            max_sequence_length: w.max_sequence_length,
-            uncond_skip_layers: w.uncond_skip_layers,
-            slg: w.slg,
-        };
-        out.validate().map_err(serde::de::Error::custom)?;
-        Ok(out)
+        policy::MossImageResolved::deserialize(deserializer).map(Into::into)
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -986,51 +878,6 @@ fn validate_execution_receipt(data: &MossImageExecutionData) -> Result<()> {
     }
     Ok(())
 }
-impl Serialize for MossSkipLayerGuidance {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        MossImageResolved::resolve(
-            MossImageVariant::Sft,
-            &GenerationRequest {
-                moss_image: Some(MossImageOptions {
-                    slg: Some(self.clone()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )
-        .map_err(serde::ser::Error::custom)?;
-        serde_json::json!({"layers":self.layers,"scale":self.scale,"start":self.start,"stop":self.stop}).serialize(serializer)
-    }
-}
-impl Serialize for MossImageOptions {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        MossImageResolved::resolve(
-            MossImageVariant::Sft,
-            &GenerationRequest {
-                moss_image: Some(self.clone()),
-                ..Default::default()
-            },
-        )
-        .map_err(serde::ser::Error::custom)?;
-        serde_json::json!({"acceleration":self.acceleration,"max_sequence_length":self.max_sequence_length,"uncond_skip_layers":self.uncond_skip_layers,"slg":self.slg,"training_shift":self.training_shift}).serialize(serializer)
-    }
-}
-impl Serialize for MossImageResolved {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        self.validate().map_err(serde::ser::Error::custom)?;
-        serde_json::json!({"variant":self.variant,"acceleration":self.acceleration,"steps":self.steps,"guidance":self.guidance,"shift":self.shift,"training_shift":self.training_shift,"max_sequence_length":self.max_sequence_length,"uncond_skip_layers":self.uncond_skip_layers,"slg":self.slg}).serialize(serializer)
-    }
-}
-
 /// Training V2 grid: FP32 shift, nearest training sigma (ties choose lower), unique consecutive.
 /// Returns sigmas including terminal zero; transformer times are sigmas[..len-1] * 1000.
 pub fn moss_image_schedule(steps: u32, shift: f32, training_shift: f32) -> Result<Vec<f32>> {

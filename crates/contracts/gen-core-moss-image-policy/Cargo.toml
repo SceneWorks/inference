@@ -1,0 +1,16 @@
+[package]
+name = "sceneworks-gen-core-moss-image-policy"
+version = "0.1.0"
+edition = "2021"
+description = "Portable serde-only MOSS-Image request and edit policy."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+
+[lib]
+name = "gen_core_moss_image_policy"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

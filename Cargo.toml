@@ -33,6 +33,7 @@ members = [
     "crates/contracts/gen-core-ltx",
     "crates/contracts/gen-core-memory-wan",
     "crates/contracts/gen-core-moss-image",
+    "crates/contracts/gen-core-moss-image-policy",
     "crates/contracts/gen-core-telemetry",
     "crates/contracts/gen-core-testkit",
     "crates/contracts/gen-core-tokenizer",
@@ -86,6 +87,7 @@ sceneworks-gen-core-iris = { path = "crates/contracts/gen-core-iris" }
 sceneworks-gen-core-ltx = { path = "crates/contracts/gen-core-ltx" }
 sceneworks-gen-core-memory-wan = { path = "crates/contracts/gen-core-memory-wan" }
 sceneworks-gen-core-moss-image = { path = "crates/contracts/gen-core-moss-image" }
+sceneworks-gen-core-moss-image-policy = { path = "crates/contracts/gen-core-moss-image-policy" }
 sceneworks-gen-core-tokenizer = { path = "crates/contracts/gen-core-tokenizer" }
 sceneworks-gen-core-train = { path = "crates/contracts/gen-core-train" }
 runtime-catalog = { path = "crates/bundles/runtime-catalog" }
