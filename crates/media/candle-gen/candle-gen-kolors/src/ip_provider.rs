@@ -364,6 +364,10 @@ impl IpAdapterKolors {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::unobserved_adapters(
+                self.paths.adapters.len(),
+                "candle-gen-kolors/src/ip_provider.rs",
+            );
             candle_gen::execution::policy("direct_route", "kolors/ip_provider/generate".into());
             let image = self
                 .generate(req, reference, &mut report_progress)
@@ -398,6 +402,10 @@ impl IpAdapterKolors {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::unobserved_adapters(
+                self.paths.adapters.len(),
+                "candle-gen-kolors/src/ip_provider.rs",
+            );
             candle_gen::execution::policy(
                 "direct_route",
                 "kolors/ip_provider/generate_with_memory_context".into(),
@@ -495,7 +503,8 @@ impl IpAdapterKolors {
             return Err(CandleError::Canceled);
         }
         common::reject_zero_steps("kolors ip-adapter", req.steps)?;
-        let use_guide = req.guidance > 1.0;
+        let guidance = candle_gen::execution::f32_policy("kolors/direct_guidance", req.guidance);
+        let use_guide = guidance > 1.0;
         candle_gen::execution::policy(
             "kolors/ip_provider/use_guide",
             format!("{use_guide:?}").into(),
@@ -535,10 +544,13 @@ impl IpAdapterKolors {
 
         // Set the IP image tokens on the UNet (constant across the denoise) — picked up by BOTH the
         // native and curated denoise paths via `forward_instantid`'s decoupled-attn branch.
-        resident
-            .denoise
-            .unet
-            .set_ip_context(Some(&ip_tokens), req.ip_adapter_scale as f64)?;
+        resident.denoise.unet.set_ip_context(
+            Some(&ip_tokens),
+            candle_gen::execution::f64_policy(
+                "kolors/ip_adapter_scale",
+                req.ip_adapter_scale as f64,
+            ),
+        )?;
 
         // Curated unified-sampler path (epic 7114, sc-7297): a curated solver name (≠ the native
         // `euler_discrete`) OR a curated scheduler routes the IP denoise through the additive
@@ -644,7 +656,8 @@ impl IpAdapterKolors {
             return Err(CandleError::Canceled);
         }
         common::reject_zero_steps("kolors ip-adapter", req.steps)?;
-        let use_guide = req.guidance > 1.0;
+        let guidance = candle_gen::execution::f32_policy("kolors/direct_guidance", req.guidance);
+        let use_guide = guidance > 1.0;
         candle_gen::execution::policy(
             "kolors/ip_provider/use_guide",
             format!("{use_guide:?}").into(),
@@ -693,9 +706,13 @@ impl IpAdapterKolors {
             self.device.clone(),
         );
         let projected = denoise.encoder_hid_proj.forward(&context)?;
-        denoise
-            .unet
-            .set_ip_context(Some(&ip_tokens), req.ip_adapter_scale as f64)?;
+        denoise.unet.set_ip_context(
+            Some(&ip_tokens),
+            candle_gen::execution::f64_policy(
+                "kolors/ip_adapter_scale",
+                req.ip_adapter_scale as f64,
+            ),
+        )?;
         let (lat_h, lat_w) = ((req.height / 8) as usize, (req.width / 8) as usize);
         let curated = curated_route(req.sampler.as_deref(), req.scheduler.as_deref());
         let latents = if let Some(sampler_name) = curated {

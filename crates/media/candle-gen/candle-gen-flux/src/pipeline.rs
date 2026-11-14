@@ -297,6 +297,10 @@ pub(crate) struct PackedTextEncoders {
 }
 
 impl Pipeline {
+    pub(crate) fn observe_adapter_provenance(&self) {
+        candle_gen::execution::unobserved_adapters(self.adapters.len(), "FLUX loaded pipeline");
+    }
+
     /// Build the (light) pipeline handle for the FLUX snapshot `root` at the given device/dtype. Does
     /// **no** weight I/O — components load lazily via [`load_components`](Self::load_components).
     pub(crate) fn load(
@@ -1418,11 +1422,7 @@ impl Pipeline {
             .map(|s| s as usize)
             .unwrap_or(self.variant.default_steps() as usize);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let guidance: f64 = if self.variant.supports_guidance() {
-            req.guidance.unwrap_or(self.variant.default_guidance()) as f64
-        } else {
-            0.0
-        };
+        let guidance = self.variant.resolved_guidance(req.guidance) as f64;
         let lat_h = (req.height as usize).div_ceil(16) * 2;
         let lat_w = (req.width as usize).div_ceil(16) * 2;
 
@@ -2061,5 +2061,40 @@ mod tests {
             Err(CandleError::Canceled)
         ));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+    #[test]
+    fn execution_loaded_adapter_stack_never_projects_selected_specs_as_applied_bytes() {
+        let make = |adapters| {
+            let pipeline = Pipeline::load(
+                Variant::Dev,
+                Path::new("unused-fixture-root"),
+                &Device::Cpu,
+                DType::F32,
+                None,
+                adapters,
+            );
+            candle_gen::testkit::execution_policy(|| {
+                candle_gen::execution::policy("fixture", true.into());
+                pipeline.observe_adapter_provenance();
+            })
+        };
+        assert!(matches!(
+            make(vec![]),
+            gen_core::generator::ExecutionIdentity::Resolved { .. }
+        ));
+        let adapter = AdapterSpec::new(
+            "not-read.safetensors".into(),
+            0.7,
+            gen_core::AdapterKind::Lora,
+        );
+        assert!(matches!(
+            make(vec![adapter]),
+            gen_core::generator::ExecutionIdentity::Unavailable { .. }
+        ));
     }
 }

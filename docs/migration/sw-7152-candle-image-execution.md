@@ -23,6 +23,28 @@ produce `Unavailable(candle_execution_observation_incomplete)`, with the missing
 facts listed. A new branch cannot inherit observations from a previous attempt.
 The ordinary compatibility default is not used by these registered providers.
 
+Complete observation is not a deterministic-kernel attestation. This implementation
+reports `NonDeterministic` unless a route supplies a more specific refusal reason;
+it does not promise exact replay merely because every metadata field is present.
+The consumer still binds exact inference/model/component identities separately.
+
+Loaded user adapters also require a byte-bound installation receipt. These Candle
+owners retain selected adapter specs (and Iris retains applied/skipped counts), but
+not an authoritative digest tying the installed targets to consumed adapter bytes.
+Adapter-bearing execution therefore returns a specific `Unavailable` instead of
+projecting the selected stack into applied provenance. This covers the registered
+SDXL/SD3/FLUX/Krea/Z-Image/Qwen/Qwen2.1/Chroma/Lens/Mage/Anima/Ideogram/Iris/Kolors
+routes and their adapter-bearing direct counterparts. Empty stacks retain resolved
+reports. Boogu, Sana, SenseNova and Supra2 reject user adapter stacks at load.
+
+Direct controls record consumed numeric CFG/control/IP strengths as IEEE bits.
+FLUX IP uses its loaded dev/schnell descriptor and effective guidance; generic FLUX
+injectors must expose their resolved policy or the report is unavailable. PuLID's
+implementation reports its stored weight and block-injection settings. Krea's
+retained staged prompt context reports its cache-key-bound effective style gain.
+Preview projection and sink callbacks execute outside the output attempt, while
+nested completed calls retain their own scope.
+
 ## Registered route inventory
 
 Paths in this table are relative to `crates/media/candle-gen/`.
@@ -88,11 +110,16 @@ and interleaved-document API belongs to SW-7156.
 
 ## Validation boundaries
 
-The new attempt tests use raw tensor arithmetic and metadata only: actual shared
-solver fallback, exact schedule digests, omitted and wrapping seeds, streaming,
+The new attempt tests use metadata only: the shared pure solver-name resolver,
+injected schedule digests, omitted and wrapping seeds, streaming,
 missing facts, nested/concurrent scopes, panic/error retry, terminal cancellation,
 staged decoder output binding, explicit-noise hashes, and compute dtype transitions.
+Provider-boundary metadata regressions distinguish FLUX dev/schnell guidance,
+absent/zero control scales, known/unknown injectors, loaded adapter provenance, Qwen
+and Boogu defaults/overrides, Qwen2.1 negative gating, and Krea style-gain no-ops.
 Existing SDXL default-routing and FLUX control-route source tests remain applicable.
+No model, Tensor fixture, or production sampler loop runs in the new ordinary tests.
+Sampler/model numerical proof belongs only in separately dispatched workflows.
 No learned inference or training was added to normal CI. All affected targets must
 compile and pass strict lint in their platform lanes. These checks do not substitute
 for separately dispatched model/device evidence or application replay acceptance.

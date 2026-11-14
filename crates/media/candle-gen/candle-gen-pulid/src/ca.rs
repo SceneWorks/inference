@@ -158,6 +158,14 @@ impl PulidCa {
 }
 
 impl DitImageInjector for PulidCa {
+    fn execution_policy(&self) -> Option<serde_json::Value> {
+        Some(
+            serde_json::json!({"kind":"pulid-ca-v1", "id_weight_bits":self.id_weight.to_bits(),
+            "double_interval":self.double_interval, "single_interval":self.single_interval,
+            "double_injections":self.n_double_inject, "modules":self.ca.len()}),
+        )
+    }
+
     fn after_double(
         &self,
         block_idx: usize,

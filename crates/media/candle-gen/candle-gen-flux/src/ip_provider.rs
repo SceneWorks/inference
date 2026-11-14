@@ -260,13 +260,17 @@ impl IpAdapterFlux {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&crate::descriptor_dev(), &req.cancel, || {
-            candle_gen::execution::policy("direct_route", "flux/ip_provider/generate".into());
-            let image = self
-                .generate(req, reference, &mut report_progress)
-                .map_err(candle_gen::gen_core::Error::from)?;
-            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
-        })
+        candle_gen::execution::capture_direct(
+            &crate::descriptor_for(self.variant),
+            &req.cancel,
+            || {
+                candle_gen::execution::policy("direct_route", "flux/ip_provider/generate".into());
+                let image = self
+                    .generate(req, reference, &mut report_progress)
+                    .map_err(candle_gen::gen_core::Error::from)?;
+                Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            },
+        )
     }
 
     pub fn generate(
@@ -317,11 +321,7 @@ impl IpAdapterFlux {
         } else {
             get_schedule(req.steps, None)
         };
-        let guidance: f64 = if self.variant.supports_guidance() {
-            req.guidance as f64
-        } else {
-            0.0
-        };
+        let guidance = self.variant.resolved_guidance(Some(req.guidance)) as f64;
 
         // Per-step latent preview (epic 16948, sc-16956), bound to the SAME `(width, height)` the
         // decode below is given. The XLabs reference tokens are injected inside the DiT forward and

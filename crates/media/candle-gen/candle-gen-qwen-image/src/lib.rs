@@ -378,6 +378,13 @@ struct Pipeline {
     comfyui_vae: Option<gen_core::PinnedWeightsFile>,
 }
 
+fn resolved_guidance(requested: Option<f32>) -> f32 {
+    candle_gen::execution::f32_policy(
+        "qwen/effective_guidance",
+        requested.unwrap_or(DEFAULT_GUIDANCE),
+    )
+}
+
 impl Pipeline {
     fn load<S: Into<TextEncoderSource>>(
         root: &Path,
@@ -511,7 +518,7 @@ impl Pipeline {
         phase: &TextPhase,
         req: &GenerationRequest,
     ) -> CResult<(Tensor, Option<Tensor>, f32)> {
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        let guidance = resolved_guidance(req.guidance);
         let encode = |te: &QwenTextEncoder, tok: &TextTokenizer| -> CResult<_> {
             let pos = self.encode(te, tok, &req.prompt)?;
             let neg = if guidance > 1.0 {
@@ -958,6 +965,10 @@ impl Generator for QwenImageGenerator {
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::unobserved_adapters(
+                self.pipe.adapters.len(),
+                "candle-gen-qwen-image/src/lib.rs",
+            );
             candle_gen::execution::policy(
                 "loaded/loaded_quant",
                 format!("{:?}", self.loaded_quant).into(),
@@ -2174,5 +2185,21 @@ mod tests {
             pipe.root.join("tokenizer/tokenizer.json").is_file(),
             "loader must resolve the overlaid tokenizer.json under tokenizer/"
         );
+    }
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+    #[test]
+    fn execution_guidance_distinguishes_default_off_and_override() {
+        let report = |requested| {
+            candle_gen::testkit::execution_policy(|| {
+                resolved_guidance(requested);
+            })
+        };
+        assert_eq!(report(None), report(Some(DEFAULT_GUIDANCE)));
+        assert_ne!(report(None), report(Some(1.0)));
+        assert_ne!(report(None), report(Some(DEFAULT_GUIDANCE + 1.0)));
     }
 }

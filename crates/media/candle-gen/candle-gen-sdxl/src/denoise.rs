@@ -280,6 +280,10 @@ pub fn denoise_ip_multi_control(
         candle_gen::execution::runtime(latents.device(), latents.dtype());
         return Ok(latents);
     }
+    let cfg = candle_gen::execution::f64_policy("sdxl/consumed_cfg", cfg);
+    for control in controls {
+        candle_gen::execution::f64_policy("sdxl/control_scale", control.scale);
+    }
     let cfg_on = cfg > 1.0;
     candle_gen::execution::policy("sdxl/denoise/cfg_on", format!("{cfg_on:?}").into());
     let total = steps.len() as u32;
@@ -461,6 +465,10 @@ pub fn denoise_curated(
     controls: &[ControlContext],
     controlnet_encoder: &Tensor,
 ) -> Result<Tensor> {
+    let cfg = candle_gen::execution::f64_policy("sdxl/consumed_cfg", cfg);
+    for control in controls {
+        candle_gen::execution::f64_policy("sdxl/control_scale", control.scale);
+    }
     let cfg_on = cfg > 1.0;
     candle_gen::execution::policy("sdxl/denoise/cfg_on", format!("{cfg_on:?}").into());
     let out = candle_gen::run_curated_sampler(

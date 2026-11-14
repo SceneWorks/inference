@@ -328,6 +328,10 @@ impl Generator for MageEditGenerator {
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::unobserved_adapters(
+                self.adapters.len(),
+                "candle-gen-mage/src/lib.rs",
+            );
             candle_gen::execution::policy("loaded/quant", format!("{:?}", self.quant).into());
             candle_gen::execution::policy(
                 "loaded/loaded_quant",
@@ -627,6 +631,10 @@ impl Generator for MageGenerator {
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::unobserved_adapters(
+                self.adapters.len(),
+                "candle-gen-mage/src/lib.rs",
+            );
             candle_gen::execution::policy("loaded/quant", format!("{:?}", self.quant).into());
             candle_gen::execution::policy(
                 "loaded/loaded_quant",

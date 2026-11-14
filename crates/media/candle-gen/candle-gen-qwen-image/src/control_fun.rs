@@ -155,6 +155,7 @@ fn load_selected_text_encoder(
 /// The loaded Qwen-Image 2512-Fun control model: the reused base text encoder / DiT / VAE-decoder, plus
 /// the VAE encoder (to encode the control hint) and the VACE control branch.
 pub struct QwenFunControl {
+    unobserved_adapter_count: usize,
     device: Device,
     te: QwenTextEncoder,
     /// Qwen tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
@@ -206,6 +207,7 @@ impl QwenFunControl {
 
         let tokenizer = control_common::load_tokenizer(&text_encoder, &te_cfg, LABEL)?;
         Ok(Self {
+            unobserved_adapter_count: paths.adapters.len(),
             device,
             te,
             tokenizer,
@@ -283,6 +285,10 @@ impl QwenFunControl {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::unobserved_adapters(
+                self.unobserved_adapter_count,
+                "QwenFunControl",
+            );
             candle_gen::execution::policy("direct_route", "qwen-image/control_fun/generate".into());
             let image = self
                 .generate(req, control, &mut report_progress)
@@ -304,7 +310,8 @@ impl QwenFunControl {
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
 
         let pos = self.encode(&req.prompt)?;
-        let neg = if req.guidance != 1.0 {
+        let guidance = candle_gen::execution::f32_policy("qwen/direct_guidance", req.guidance);
+        let neg = if guidance != 1.0 {
             let n = if req.negative.trim().is_empty() {
                 NEGATIVE_FALLBACK
             } else {
@@ -370,7 +377,7 @@ impl QwenFunControl {
                     lat_h,
                     lat_w,
                     Some((&self.controlnet, &control_cond)),
-                    req.control_scale,
+                    candle_gen::execution::f32_policy("qwen/control_scale", req.control_scale),
                 )?;
                 match &neg {
                     Some(neg) => {
@@ -381,7 +388,10 @@ impl QwenFunControl {
                             lat_h,
                             lat_w,
                             Some((&self.controlnet, &control_cond)),
-                            req.control_scale,
+                            candle_gen::execution::f32_policy(
+                                "qwen/control_scale",
+                                req.control_scale,
+                            ),
                         )?;
                         Ok(pipeline::compute_guided_noise(
                             &pos_v,

@@ -150,6 +150,7 @@ impl Default for SdxlEditRequest {
 /// dual-CLIP conditioner + the f16 VAE decoder + the deterministic VAE moments-encoder (img2img init) +
 /// the ancestral sampler.
 pub struct SdxlEdit {
+    unobserved_adapter_count: usize,
     conditioner: SdxlConditioner,
     unet: UNet2DConditionModel,
     vae: SdxlVaeDecoder,
@@ -181,6 +182,7 @@ impl SdxlEdit {
         let vae = load_sdxl_vae(&paths.vae_fp16_fix, &device, DTYPE)?;
         let vae_encoder = load_sdxl_vae_encoder(&paths.vae_fp16_fix, &device, DTYPE)?;
         Ok(Self {
+            unobserved_adapter_count: paths.adapters.len(),
             conditioner,
             unet,
             vae,
@@ -254,6 +256,7 @@ impl SdxlEdit {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::unobserved_adapters(self.unobserved_adapter_count, "SdxlEdit");
             candle_gen::execution::policy("direct_route", "sdxl/edit_provider/generate".into());
             let image = self
                 .generate(req, source, &mut report_progress)
@@ -284,6 +287,7 @@ impl SdxlEdit {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::unobserved_adapters(self.unobserved_adapter_count, "SdxlEdit");
             candle_gen::execution::policy(
                 "direct_route",
                 "sdxl/edit_provider/generate_masked".into(),
@@ -355,7 +359,10 @@ impl SdxlEdit {
         // The clean source latent (deterministic mean × 0.13025), then the strength-scaled init noising.
         let x0 = self.encode_source(source, req.width, req.height)?;
         let (_, lat_c, lat_h, lat_w) = x0.dims4()?;
-        let strength = req.strength.clamp(0.0, 1.0) as f64;
+        let strength = candle_gen::execution::f64_policy(
+            "sdxl/edit_strength",
+            req.strength.clamp(0.0, 1.0) as f64,
+        );
         let start_time = self.sampler.max_time() * strength;
         let mut init_rng =
             StdRng::seed_from_u64(candle_gen::execution::seed("sdxl/edit_provider", req.seed));
@@ -458,6 +465,7 @@ impl SdxlEdit {
             candle_gen::execution::runtime(latents.device(), latents.dtype());
             return Ok(latents);
         }
+        let cfg = candle_gen::execution::f64_policy("sdxl/consumed_cfg", cfg);
         let cfg_on = cfg > 1.0;
         candle_gen::execution::policy("sdxl/edit_provider/cfg_on", format!("{cfg_on:?}").into());
         let total = steps.len() as u32;

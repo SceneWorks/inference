@@ -215,6 +215,7 @@ struct Krea2ControlHeavy {
 /// retain only the heavy phase and its encoded prompt between poses. Sequential still bounds peak at
 /// `max(Qwen3-VL, DiT + branch + VAE)` and drops the heavy phase before encoding a different prompt.
 pub struct Krea2Control {
+    unobserved_adapter_count: usize,
     pub(crate) device: Device,
     residency: candle_gen::Residency<Krea2ControlText, Rc<Krea2ControlHeavy>>,
     staged_cache: StagedPoseCache<Krea2ControlHeavy>,
@@ -286,6 +287,8 @@ impl<Heavy> StagedPoseCache<Heavy> {
                     (*previous == key).then(|| (heavy.clone(), context.clone()))
                 });
             if let Some((heavy, context)) = cached {
+                // The cache key proved these settings produced the retained positive context.
+                crate::pipeline::effective_style_gain(req.text_style_gain);
                 let result = render(&heavy, context, progress);
                 if result.is_err() {
                     self.clear();
@@ -384,6 +387,7 @@ impl Krea2Control {
             },
         );
         Ok(Self {
+            unobserved_adapter_count: paths.adapters.len(),
             device,
             residency,
             staged_cache: StagedPoseCache::default(),
@@ -466,6 +470,11 @@ impl Krea2Control {
         control_image: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        candle_gen::execution::unobserved_adapters(
+            self.unobserved_adapter_count,
+            "Krea control loaded adapters",
+        );
+        candle_gen::execution::policy("krea/control_decode_tiled", req.tile_vae_decode.into());
         validate_request(req)?;
         read_with_prepared_spec(self.prepared_spec.as_ref(), || {
             self.staged_cache.run(
@@ -760,7 +769,9 @@ impl Krea2ControlHeavy {
             .as_ref()
             .map(|context| self.dit.prepare_control_conditioning(context, &ctrl_latent))
             .transpose()?;
-        let scale = req.control_scale as f64;
+        let scale =
+            candle_gen::execution::f64_policy("krea/control_scale", req.control_scale as f64);
+        candle_gen::execution::f32_policy("krea/control_guidance", req.guidance.unwrap_or(0.0));
 
         let (lat_h, lat_w) = (
             (req.height / SPATIAL_SCALE) as usize,

@@ -472,6 +472,10 @@ impl KolorsControl {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::unobserved_adapters(
+                self.paths.adapters.len(),
+                "candle-gen-kolors/src/control.rs",
+            );
             candle_gen::execution::policy("direct_route", "kolors/control/generate".into());
             let image = self
                 .generate(req, skeleton, &mut report_progress)
@@ -506,6 +510,10 @@ impl KolorsControl {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::unobserved_adapters(
+                self.paths.adapters.len(),
+                "candle-gen-kolors/src/control.rs",
+            );
             candle_gen::execution::policy(
                 "direct_route",
                 "kolors/control/generate_with_memory_context".into(),
@@ -603,7 +611,8 @@ impl KolorsControl {
             return Err(CandleError::Canceled);
         }
         common::reject_zero_steps("kolors control", req.steps)?;
-        let use_guide = req.guidance > 1.0;
+        let guidance = candle_gen::execution::f32_policy("kolors/direct_guidance", req.guidance);
+        let use_guide = guidance > 1.0;
         candle_gen::execution::policy("kolors/control/use_guide", format!("{use_guide:?}").into());
 
         // CFG batch is [neg, pos] = uncond-first (the Kolors txt2img convention); without guidance only
@@ -644,7 +653,8 @@ impl KolorsControl {
             control
         };
         let cond_embed = resident.denoise.controlnet.embed_cond(&control)?;
-        let control_scale = req.control_scale as f64;
+        let control_scale =
+            candle_gen::execution::f64_policy("kolors/control_scale", req.control_scale as f64);
         let (lat_h, lat_w) = ((req.height / 8) as usize, (req.width / 8) as usize);
 
         // Curated unified-sampler path (epic 7114, sc-7297): a curated solver name (≠ the native
@@ -771,7 +781,8 @@ impl KolorsControl {
             return Err(CandleError::Canceled);
         }
         common::reject_zero_steps("kolors control", req.steps)?;
-        let use_guide = req.guidance > 1.0;
+        let guidance = candle_gen::execution::f32_policy("kolors/direct_guidance", req.guidance);
+        let use_guide = guidance > 1.0;
         candle_gen::execution::policy("kolors/control/use_guide", format!("{use_guide:?}").into());
 
         let conditioning = SynchronizedPhase::new(
@@ -825,7 +836,8 @@ impl KolorsControl {
             control
         };
         let cond_embed = denoise.controlnet.embed_cond(&control)?;
-        let control_scale = req.control_scale as f64;
+        let control_scale =
+            candle_gen::execution::f64_policy("kolors/control_scale", req.control_scale as f64);
         let (lat_h, lat_w) = ((req.height / 8) as usize, (req.width / 8) as usize);
         let curated = curated_route(req.sampler.as_deref(), req.scheduler.as_deref());
         let latents = if let Some(sampler_name) = curated {

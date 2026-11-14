@@ -1088,7 +1088,11 @@ pub(crate) fn denoise_sprint_masked_memory(
 ) -> Result<Tensor> {
     // The embedded guidance scalar (CFG-free): guidance_scale · guidance_embeds_scale, a [1] tensor
     // fed to the trunk's guidance embedder. Constant across steps.
-    let guidance = Tensor::from_vec(vec![guidance_scale * guidance_embeds_scale], (1,), device)?;
+    let embedded = candle_gen::execution::f32_policy(
+        "sana/embedded_guidance",
+        guidance_scale * guidance_embeds_scale,
+    );
+    let guidance = Tensor::from_vec(vec![embedded], (1,), device)?;
     let predict = |lat_in: &Tensor, scm_t: f32| -> Result<Tensor> {
         // The trunk embeds `scm_t` as its timestep (NOT the raw angle) + the embedded guidance scalar;
         // ONE forward per step (Sprint is CFG-free — no uncond branch).
@@ -1629,7 +1633,11 @@ pub(crate) fn denoise_sprint_from_masked_memory(
     preview: &candle_gen::preview::PreviewHook<'_>,
     memory: Option<candle_gen::gen_core::GenerationMemory>,
 ) -> Result<Tensor> {
-    let guidance = Tensor::from_vec(vec![guidance_scale * guidance_embeds_scale], (1,), device)?;
+    let embedded = candle_gen::execution::f32_policy(
+        "sana/embedded_guidance",
+        guidance_scale * guidance_embeds_scale,
+    );
+    let guidance = Tensor::from_vec(vec![embedded], (1,), device)?;
     let predict = |lat_in: &Tensor, scm_t: f32| -> Result<Tensor> {
         let t = Tensor::from_vec(vec![scm_t], (1,), device)?;
         let budget = memory

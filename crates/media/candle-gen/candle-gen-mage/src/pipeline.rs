@@ -22,6 +22,7 @@ pub(crate) struct MageHeavy {
 }
 
 pub struct MagePipeline {
+    unobserved_adapter_count: usize,
     text: MageTextEncoder,
     transformer: MageTransformer,
     vae: MageVae,
@@ -58,6 +59,7 @@ impl MagePipeline {
         })
         .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
         Ok(Self {
+            unobserved_adapter_count: adapters.len(),
             text: MageTextEncoder::load_component_with_quant(
                 &dirs.text_encoder,
                 false,
@@ -149,6 +151,10 @@ impl MagePipeline {
             &crate::descriptor(),
             &candle_gen::gen_core::CancelFlag::default(),
             || {
+                candle_gen::execution::unobserved_adapters(
+                    self.unobserved_adapter_count,
+                    "MagePipeline",
+                );
                 candle_gen::execution::policy("direct_route", "mage/pipeline/generate".into());
                 let image = self
                     .generate(
@@ -248,6 +254,10 @@ impl MagePipeline {
         let MageEncoded { positive, negative } = encoded;
         let device = positive.device().clone();
         let use_cfg = negative.is_some();
+        candle_gen::execution::f32_policy(
+            "mage/effective_cfg",
+            if use_cfg { guidance } else { 1.0 },
+        );
         candle_gen::execution::policy("mage/pipeline/use_cfg", format!("{use_cfg:?}").into());
         let base = PackLayout::generation(vec![ImgShape::latent(gh, gw)], vec![positive.dim(1)?])?;
         let (layout, text) = if let Some(negative) = &negative {

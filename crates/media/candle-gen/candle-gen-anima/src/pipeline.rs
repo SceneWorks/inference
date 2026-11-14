@@ -75,6 +75,7 @@ pub struct GenOptions {
 
 /// The assembled Anima pipeline.
 pub struct AnimaPipeline {
+    unobserved_adapter_count: usize,
     components: AnimaComponents,
     device: Device,
 }
@@ -87,6 +88,7 @@ impl AnimaPipeline {
         adapters: &[candle_gen::gen_core::AdapterSpec],
     ) -> Result<Self> {
         Ok(Self {
+            unobserved_adapter_count: adapters.len(),
             components: AnimaComponents::load(source, variant, device, adapters)?,
             device: device.clone(),
         })
@@ -142,6 +144,10 @@ impl AnimaPipeline {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         candle_gen::execution::capture_direct(&crate::descriptor_for(variant), cancel, || {
+            candle_gen::execution::unobserved_adapters(
+                self.unobserved_adapter_count,
+                "AnimaPipeline",
+            );
             candle_gen::execution::policy("direct_route", "anima/pipeline/generate".into());
             let image = self
                 .generate(

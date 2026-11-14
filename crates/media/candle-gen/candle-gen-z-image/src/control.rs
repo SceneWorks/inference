@@ -981,7 +981,10 @@ impl ZImageControl {
                     &latents,
                     &t,
                     &dit_prepared,
-                    req.control_scale as f64,
+                    candle_gen::execution::f64_policy(
+                        "z-image/control_scale",
+                        req.control_scale as f64,
+                    ),
                     req.memory,
                     &req.cancel,
                 )?
@@ -1052,7 +1055,10 @@ impl ZImageControl {
             )?),
             None => None,
         };
-        let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+        let guidance = candle_gen::execution::f32_policy(
+            "z-image/control_guidance",
+            req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE),
+        );
         // Per-step latent preview (epic 16948, sc-16957). The CFG blend and the constant control
         // context both live inside the predict closure below, so the hook only ever sees the single
         // conditional target trajectory.
@@ -1073,7 +1079,10 @@ impl ZImageControl {
                         latents,
                         &t,
                         &dit_prepared,
-                        req.control_scale as f64,
+                        candle_gen::execution::f64_policy(
+                            "z-image/control_scale",
+                            req.control_scale as f64,
+                        ),
                         req.memory,
                         &req.cancel,
                     )?
@@ -1085,7 +1094,10 @@ impl ZImageControl {
                                 latents,
                                 &t,
                                 uncond_prepared,
-                                req.control_scale as f64,
+                                candle_gen::execution::f64_policy(
+                                    "z-image/control_scale",
+                                    req.control_scale as f64,
+                                ),
                                 req.memory,
                                 &req.cancel,
                             )?
@@ -1213,6 +1225,7 @@ impl ZImageControl {
             },
             &req.cancel,
             || {
+                self.pipeline.observe_adapter_provenance();
                 candle_gen::execution::policy("direct_route", "z-image/control/generate".into());
                 let image = self
                     .generate(req, skeleton, &mut report_progress)
@@ -1309,7 +1322,8 @@ impl ZImageControl {
         let cap_feats = prepared.cap_feats;
         let cap_mask = prepared.cap_mask;
         let mut latents = prepared.latents;
-        let scale = req.control_scale as f64;
+        let scale =
+            candle_gen::execution::f64_policy("z-image/control_scale", req.control_scale as f64);
         let transformer = self.resident_transformer()?;
         let dit_prepared = transformer.prepare_control_conditioning(
             &latents,
@@ -1395,10 +1409,14 @@ impl ZImageControl {
         };
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
         let lat_w = (req.width / SPATIAL_SCALE) as usize;
-        let scale = req.control_scale as f64;
+        let scale =
+            candle_gen::execution::f64_policy("z-image/control_scale", req.control_scale as f64);
 
         // Real CFG: default 4.0 (the base card); 1.0 turns CFG off (single cond forward).
-        let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+        let guidance = candle_gen::execution::f32_policy(
+            "z-image/control_guidance",
+            req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE),
+        );
         let cfg_on = guidance != 1.0;
 
         // Text embeddings (bf16). The uncond branch (negative prompt, empty when unset — the

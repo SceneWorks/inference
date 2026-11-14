@@ -191,6 +191,8 @@ pub struct FluxIpInjector<'a> {
 impl<'a> FluxIpInjector<'a> {
     /// Bind `adapter` to the precomputed image `tokens` (`[B, num_tokens, cross_attn_dim]`) at `scale`.
     pub fn new(adapter: &'a FluxIpAdapter, tokens: Tensor, scale: f64) -> Self {
+        candle_gen::execution::f64_policy("flux/ip_adapter_scale", scale);
+        candle_gen::execution::policy("flux/ip_adapter_blocks", adapter.blocks.len().into());
         let block_kv = RefCell::new(vec![None; adapter.blocks.len()]);
         Self {
             adapter,

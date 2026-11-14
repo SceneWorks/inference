@@ -189,6 +189,7 @@ pub fn euler_step(latents: &Tensor, velocity: &Tensor, sigmas: &[f32], i: usize)
 /// True-CFG combine with norm correction: `combined = neg + g·(pos − neg)`, then rescale `combined`
 /// to the per-token channel L2 norm of `pos`. Shapes `[1, seq, 64]`.
 pub fn compute_guided_noise(pos: &Tensor, neg: &Tensor, guidance: f32) -> Result<Tensor> {
+    candle_gen::execution::f32_policy("qwen/consumed_cfg", guidance);
     let combined = (neg + ((pos - neg)? * guidance as f64)?)?;
     let cond_norm = l2_over_channels(pos)?;
     let comb_norm = l2_over_channels(&combined)?;

@@ -1879,6 +1879,10 @@ impl Generator for LensGenerator {
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::unobserved_adapters(
+                self.pipeline.adapters.len(),
+                "candle-gen-lens/src/lib.rs",
+            );
             candle_gen::execution::policy(
                 "loaded/sequential",
                 format!("{:?}", self.sequential).into(),

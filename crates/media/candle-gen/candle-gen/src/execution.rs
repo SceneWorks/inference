@@ -224,6 +224,34 @@ pub fn policy(key: &str, value: Value) {
     });
 }
 
+/// Observe a consumed f32 control without changing its value; preserve its exact bits.
+pub fn f32_policy(key: &str, value: f32) -> f32 {
+    match ExecutionFact::f32_bits(value) {
+        Ok(ExecutionFact::Resolved { value }) => policy(key, value),
+        Err(error) => unavailable(&error.to_string()),
+        _ => unreachable!(),
+    }
+    value
+}
+
+/// Observe a consumed f64 control without narrowing it to f32.
+pub fn f64_policy(key: &str, value: f64) -> f64 {
+    match ExecutionFact::f64_bits(value) {
+        Ok(ExecutionFact::Resolved { value }) => policy(key, value),
+        Err(error) => unavailable(&error.to_string()),
+        _ => unreachable!(),
+    }
+    value
+}
+
+/// A retained selected stack is not evidence of the bytes/targets actually installed at load.
+/// Adapter-bearing routes without a retained installation receipt must fail closed.
+pub fn unobserved_adapters(selected_count: usize, owner: &str) {
+    if selected_count != 0 {
+        unavailable(&format!("{owner}: loaded adapters have no retained byte-bound installation receipt; selected adapter count {selected_count} cannot attest the applied stack"));
+    }
+}
+
 /// Record actual compute storage, not the requested or default device/precision.
 pub fn runtime(device: &Device, dtype: DType) {
     observe(|attempt| {
@@ -397,8 +425,8 @@ impl Observations {
             },
             deterministic_replay: match self.non_deterministic {
                 Some(reason) => ExecutionReplaySupport::NonDeterministic { reason },
-                None => ExecutionReplaySupport::Deterministic {
-                    scope: "same inference revision, model/component bytes, device, kernels and resolved policies".into(),
+                None => ExecutionReplaySupport::NonDeterministic {
+                    reason: "candle-execution-v1 observes execution choices but has no provider/runtime deterministic-kernel attestation; exact replay is not supported".into(),
                 },
             },
             geometry: ExecutionFact::resolved(json!(images)),
@@ -453,26 +481,20 @@ mod tests {
             req: &GenerationRequest,
             progress: &mut dyn FnMut(Progress),
         ) -> gen_core::Result<GenerationOutput> {
-            // This is a raw arithmetic fixture, never a learned model forward.
-            rng_scheme("fixture-seeded-raw-arithmetic-v1");
-            let images = crate::for_each_image_seed(req.seed.unwrap_or(91), req.count, |seed| {
-                let tensor = candle_core::Tensor::zeros((1,), DType::F32, &Device::Cpu)
-                    .map_err(crate::CandleError::from)?;
+            // Metadata only: no Tensor, model forward, or production denoising loop.
+            rng_scheme("fixture-observed-seeds-v1");
+            let images = crate::for_each_image_seed(req.seed.unwrap_or(91), req.count, |_seed| {
                 policy(
                     "actual_decoder",
                     json!({"mode":"single_pass","precision":"f32"}),
                 );
-                crate::run_flow_sampler(
-                    req.sampler.as_deref(),
-                    gen_core::sampling::TimestepConvention::Sigma,
-                    &[1.0, 0.25, 0.0],
-                    tensor,
-                    seed,
-                    &req.cancel,
-                    progress,
-                    None,
-                    |x, _| Ok(x.zeros_like()?),
-                )?;
+                let solver = crate::sampler::resolved_solver(req.sampler.as_deref());
+                schedule(solver.name(), &[1.0, 0.25, 0.0], "Flow");
+                runtime(&Device::Cpu, DType::F32);
+                progress(Progress::Step {
+                    current: 1,
+                    total: 1,
+                });
                 Ok::<_, crate::CandleError>(Image {
                     width: 1,
                     height: 1,
@@ -510,6 +532,7 @@ mod tests {
                 .generate_with_execution_report(&req, &mut |_| {})
                 .unwrap(),
         );
+        assert!(!identity.deterministic_replay.is_deterministic());
         assert_eq!(
             identity.sampling,
             ExecutionFact::resolved(json!(["euler", "euler"]))
@@ -744,5 +767,62 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
+    }
+    #[test]
+    fn preview_projection_and_listener_cannot_contaminate_execution() {
+        let attempt = Attempt::begin();
+        draw("outer", 7, 0);
+        let sink = gen_core::PreviewSink::new(|_| {
+            draw("foreign_preview_listener", 900, 99);
+            let nested = resolved(
+                Fixture
+                    .generate_with_execution_report(&GenerationRequest::default(), &mut |_| {})
+                    .unwrap(),
+            );
+            assert_eq!(nested.output_units, 1);
+        });
+        crate::preview::emit_preview_at(
+            &sink,
+            &crate::preview::PreviewCounter::with_steps(1),
+            0,
+            || {
+                draw("decorative_projector", 901, 99);
+                Ok(Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 3],
+                })
+            },
+        );
+        let facts = attempt.finish();
+        assert_eq!(facts.draws.len(), 1);
+        assert_eq!(facts.draws[0].purpose, "outer");
+        assert!(facts.schedules.is_empty());
+    }
+
+    #[test]
+    fn applied_adapter_absence_and_unknown_loaded_stack_are_distinct() {
+        let make = |count| {
+            let scope = Attempt::begin();
+            unobserved_adapters(count, "loaded-fixture");
+            scope.finish()
+        };
+        assert!(make(0).missing.is_empty());
+        let missing = make(2).missing;
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].contains("byte-bound installation receipt"));
+    }
+
+    #[test]
+    fn consumed_scalar_policies_preserve_numeric_bits_and_order() {
+        let scope = Attempt::begin();
+        assert_eq!(f32_policy("control", 0.0).to_bits(), 0.0f32.to_bits());
+        f32_policy("control", -0.0);
+        f64_policy("control", 0.7);
+        let facts = scope.finish();
+        let values = facts.policies["control"].as_array().unwrap();
+        assert_eq!(values.len(), 3);
+        assert_ne!(values[0]["value"], values[1]["value"]);
+        assert_ne!(values[1]["value"], values[2]["value"]);
     }
 }

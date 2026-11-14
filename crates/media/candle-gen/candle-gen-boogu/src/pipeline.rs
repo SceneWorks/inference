@@ -376,7 +376,7 @@ pub(crate) fn stage_encode_base(
         )?),
         _ => None,
     };
-    let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+    let guidance = resolved_guidance(req.guidance, false);
     let (cond, uncond) = candle_gen::gen_core::with_prompt_encoding(
         on_progress,
         || -> std::result::Result<_, candle_gen::CandleError> {
@@ -518,7 +518,7 @@ pub(crate) fn stage_denoise_base(
         ));
     };
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
-    let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+    let guidance = resolved_guidance(req.guidance, false);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let native = base_native_sigmas(steps);
     let sigmas = candle_gen::resolve_flow_schedule_with_shift(
@@ -557,6 +557,17 @@ pub(crate) fn stage_denoise_base(
             },
         )
     })
+}
+
+fn resolved_guidance(requested: Option<f32>, turbo: bool) -> f32 {
+    candle_gen::execution::f32_policy(
+        if turbo {
+            "boogu/turbo_guidance"
+        } else {
+            "boogu/cfg"
+        },
+        requested.unwrap_or(if turbo { 0.0 } else { DEFAULT_GUIDANCE }),
+    )
 }
 
 fn turbo_prediction(
@@ -649,7 +660,7 @@ pub(crate) fn stage_denoise_turbo(
                         &t,
                         &cond,
                         uncond.as_ref(),
-                        req.guidance.unwrap_or(0.0),
+                        resolved_guidance(req.guidance, true),
                     )?
                     .to_dtype(DType::F32)?
                     .neg()?)
@@ -680,7 +691,7 @@ pub(crate) fn stage_denoise_turbo(
                 &t,
                 &cond,
                 uncond.as_ref(),
-                req.guidance.unwrap_or(0.0),
+                resolved_guidance(req.guidance, true),
             )?;
             lat =
                 (lat.to_dtype(DType::F32)? + (pred.to_dtype(DType::F32)? * (1.0 - sigma) as f64)?)?;
@@ -722,7 +733,7 @@ pub(crate) fn stage_denoise_edit(
         ));
     };
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
-    let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+    let guidance = resolved_guidance(req.guidance, false);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let native = base_native_sigmas(steps);
     let sigmas = candle_gen::resolve_flow_schedule_with_shift(
@@ -811,7 +822,7 @@ pub(crate) fn render_base(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
-    let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+    let guidance = resolved_guidance(req.guidance, false);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
     // Condition encoding (seed-independent): positive instruction + CFG-negative (empty) instruction.
@@ -997,7 +1008,7 @@ pub(crate) fn render_turbo(
                         &t,
                         &cond,
                         uncond.as_ref(),
-                        req.guidance.unwrap_or(0.0),
+                        resolved_guidance(req.guidance, true),
                     )?;
                     Ok(v.to_dtype(DType::F32)?.neg()?)
                 },
@@ -1034,7 +1045,7 @@ pub(crate) fn render_turbo(
                 &t,
                 &cond,
                 uncond.as_ref(),
-                req.guidance.unwrap_or(0.0),
+                resolved_guidance(req.guidance, true),
             )?;
             // Predict (clean estimate): x += (1 − sigma)·v, in f32.
             lat =
@@ -1122,7 +1133,7 @@ pub(crate) fn render_edit(
     // `validate_multiple_of(reference, RES_MULTIPLE)`.
     validate_edit_reference_dims(references)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
-    let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+    let guidance = resolved_guidance(req.guidance, false);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
     // Each reference → clean VAE latent [1, 16, rH/8, rW/8] (seed-independent).
@@ -1788,4 +1799,21 @@ fn staged_phase_bundles_never_co_reside_dit_and_native_vae() {
     assert!(StagedDenoise::RESIDENT_COMPONENTS
         .iter()
         .all(|component| !StagedDecode::NATIVE_RESIDENT_COMPONENTS.contains(component)));
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+    #[test]
+    fn execution_guidance_distinguishes_base_turbo_and_override() {
+        let report = |requested, turbo| {
+            candle_gen::testkit::execution_policy(|| {
+                resolved_guidance(requested, turbo);
+            })
+        };
+        assert_eq!(report(None, false), report(Some(DEFAULT_GUIDANCE), false));
+        assert_ne!(report(None, false), report(Some(2.0), false));
+        assert_eq!(report(None, true), report(Some(0.0), true));
+        assert_ne!(report(None, true), report(Some(2.0), true));
+    }
 }

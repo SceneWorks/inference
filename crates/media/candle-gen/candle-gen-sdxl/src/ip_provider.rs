@@ -166,6 +166,7 @@ fn reject_zero_steps(steps: usize) -> Result<()> {
 /// `add_embedding` head) + the dual-CLIP conditioner + the CLIP image encoder/Resampler token source +
 /// the f16 VAE + the ancestral sampler.
 pub struct IpAdapterSdxl {
+    unobserved_adapter_count: usize,
     conditioner: SdxlConditioner,
     unet: UNet2DConditionModel,
     ip_encoder: IpImageEncoder,
@@ -221,6 +222,7 @@ impl IpAdapterSdxl {
 
         let vae = load_sdxl_vae(&paths.vae_fp16_fix, &device, DTYPE)?;
         Ok(Self {
+            unobserved_adapter_count: paths.adapters.len(),
             conditioner,
             unet,
             ip_encoder,
@@ -291,6 +293,10 @@ impl IpAdapterSdxl {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::unobserved_adapters(
+                self.unobserved_adapter_count,
+                "IpAdapterSdxl",
+            );
             candle_gen::execution::policy("direct_route", "sdxl/ip_provider/generate".into());
             let image = self
                 .generate(req, reference, &mut report_progress)
@@ -344,8 +350,10 @@ impl IpAdapterSdxl {
 
         // Set the IP image tokens on the UNet (constant across the denoise — phase 2c/2e design) —
         // picked up by BOTH the native ancestral and the curated denoise paths.
-        self.unet
-            .set_ip_context(Some(&ip_tokens), req.ip_adapter_scale as f64)?;
+        self.unet.set_ip_context(
+            Some(&ip_tokens),
+            candle_gen::execution::f64_policy("sdxl/ip_adapter_scale", req.ip_adapter_scale as f64),
+        )?;
 
         // Curated unified-sampler path (epic 7114, sc-7297): a curated solver name (≠ the bespoke
         // `euler_ancestral` default) OR a non-discrete scheduler routes the IP denoise through the

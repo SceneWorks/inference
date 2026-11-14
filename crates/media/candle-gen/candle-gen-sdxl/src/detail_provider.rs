@@ -192,7 +192,8 @@ impl SdxlDetail {
 
         let x0 = self.encode_source(source, req.width, req.height)?;
         let (_, channels, latent_h, latent_w) = x0.dims4()?;
-        let strength = req.strength as f64;
+        let strength =
+            candle_gen::execution::f64_policy("sdxl/detail_strength", req.strength as f64);
         let start_time = self.sampler.max_time() * strength;
         let mut init_rng = StdRng::seed_from_u64(candle_gen::execution::seed(
             "sdxl/detail_provider",
@@ -217,7 +218,10 @@ impl SdxlDetail {
         let control_ctx = ControlContext {
             controlnet: &self.controlnet,
             cond_embed: self.controlnet.embed_cond(&control)?,
-            scale: req.control_scale as f64,
+            scale: candle_gen::execution::f64_policy(
+                "sdxl/detail_control_scale",
+                req.control_scale as f64,
+            ),
         };
 
         let effective_steps = ancestral_strength_steps(req.steps, req.strength);

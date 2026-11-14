@@ -531,7 +531,12 @@ impl Generator for QwenImage21 {
         req: &candle_gen::gen_core::GenerationRequest,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture(self, req, on_progress)
+        candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::unobserved_adapters(
+                self.spec.adapters.len(),
+                "candle-gen-qwen-image-2-1/src/lib.rs",
+            );
+        })
     }
 
     fn descriptor(&self) -> &ModelDescriptor {
@@ -662,9 +667,12 @@ fn run_params_over(sigmas: Vec<f32>, req: &GenerationRequest) -> RunParams {
         .negative_prompt
         .as_deref()
         .is_some_and(|n| !n.trim().is_empty());
+    let use_negative = true_cfg > 1.0 && has_negative;
+    candle_gen::execution::f32_policy("qwen21/true_cfg", if use_negative { true_cfg } else { 1.0 });
+    candle_gen::execution::policy("qwen21/negative_branch", use_negative.into());
     RunParams {
         true_cfg,
-        use_negative: true_cfg > 1.0 && has_negative,
+        use_negative,
         base_seed: req.seed.unwrap_or_else(gen_core::default_seed),
         sigmas,
     }
@@ -1418,6 +1426,37 @@ mod tests {
             )
             .is_err(),
             "a missing snapshot fails at the tokenizer, for both policies"
+        );
+    }
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+    #[test]
+    fn execution_cfg_records_effective_negative_gating() {
+        let report = |true_cfg, guidance, negative: Option<&str>| {
+            candle_gen::testkit::execution_policy(|| {
+                run_params_over(
+                    vec![1.0, 0.0],
+                    &GenerationRequest {
+                        true_cfg,
+                        guidance,
+                        negative_prompt: negative.map(str::to_owned),
+                        seed: Some(7),
+                        ..Default::default()
+                    },
+                );
+            })
+        };
+        assert_eq!(report(None, None, None), report(Some(7.0), None, None));
+        assert_eq!(
+            report(Some(4.0), Some(9.0), Some("negative")),
+            report(None, Some(4.0), Some("negative"))
+        );
+        assert_ne!(
+            report(Some(4.0), None, Some("negative")),
+            report(Some(5.0), None, Some("negative"))
         );
     }
 }

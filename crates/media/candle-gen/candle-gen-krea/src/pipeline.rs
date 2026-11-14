@@ -1521,14 +1521,18 @@ fn tap_gain_weights(gain: f32, n: usize) -> Vec<f32> {
 /// the context untouched (the no-op fast path), so plain requests pay nothing. Takes the raw
 /// `Option<f32>` (not a `GenerationRequest`) so the bespoke pose-control request can share it. Krea-
 /// only: reached only from the candle-gen-krea render paths.
+pub(crate) fn effective_style_gain(gain: Option<f32>) -> f32 {
+    let effective = gain.filter(|g| (*g - 1.0).abs() > 1e-4).unwrap_or(1.0);
+    candle_gen::execution::f32_policy("krea/text_style_gain", effective)
+}
+
 pub(crate) fn maybe_apply_style_gain(context: Tensor, gain: Option<f32>) -> Result<Tensor> {
-    match gain {
-        Some(g) if (g - 1.0).abs() > 1e-4 => {
-            let n = context.dim(2)?;
-            apply_tap_weights(&context, &tap_gain_weights(g, n))
-        }
-        _ => Ok(context),
+    let gain = effective_style_gain(gain);
+    if gain == 1.0 {
+        return Ok(context);
     }
+    let n = context.dim(2)?;
+    apply_tap_weights(&context, &tap_gain_weights(gain, n))
 }
 
 /// Encode the positive prompt to the DiT context and apply the optional text-style gain — the single
@@ -4277,5 +4281,20 @@ mod tests {
             pixels: vec![0u8; 10],
         };
         assert!(preprocess_img2img_init(&bad, 4, 4, &Device::Cpu).is_err());
+    }
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+    #[test]
+    fn execution_style_gain_records_effective_noop_and_override() {
+        let report = |gain| {
+            candle_gen::testkit::execution_policy(|| {
+                effective_style_gain(gain);
+            })
+        };
+        assert_eq!(report(None), report(Some(1.00005)));
+        assert_ne!(report(None), report(Some(0.75)));
     }
 }

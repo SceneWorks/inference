@@ -49,6 +49,7 @@ impl MageEditVariant {
 }
 
 pub struct MageEdit {
+    unobserved_adapter_count: usize,
     text: MageTextEncoder,
     transformer: MageTransformer,
     vae: MageVae,
@@ -105,6 +106,7 @@ impl MageEdit {
         })
         .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
         Ok(Self {
+            unobserved_adapter_count: adapters.len(),
             text: MageTextEncoder::load_component_with_quant(
                 &dirs.text_encoder,
                 true,
@@ -186,6 +188,7 @@ impl MageEdit {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         candle_gen::execution::capture_direct(&crate::descriptor_edit(), cancel, || {
+            candle_gen::execution::unobserved_adapters(self.unobserved_adapter_count, "MageEdit");
             candle_gen::execution::policy("direct_route", "mage/edit_provider/edit".into());
             let image = self
                 .edit(
@@ -403,6 +406,7 @@ impl MageEdit {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         candle_gen::execution::capture_direct(&crate::descriptor_edit(), cancel, || {
+            candle_gen::execution::unobserved_adapters(self.unobserved_adapter_count, "MageEdit");
             candle_gen::execution::policy("direct_route", "mage/edit_from_reference_tokens".into());
             let image = self
                 .edit_from_reference_tokens(
@@ -500,6 +504,10 @@ impl MageEdit {
             reference_count,
         } = encoded;
         let use_cfg = negative.is_some();
+        candle_gen::execution::f32_policy(
+            "mage/effective_cfg",
+            if use_cfg { guidance } else { 1.0 },
+        );
         candle_gen::execution::policy("mage/edit_provider/use_cfg", format!("{use_cfg:?}").into());
         let gh = height as usize / 16;
         let gw = width as usize / 16;

@@ -486,6 +486,10 @@ fn bounded_host_latent_transfer(
 }
 
 impl Pipeline {
+    pub(crate) fn observe_adapter_provenance(&self) {
+        candle_gen::execution::unobserved_adapters(self.adapters.len(), "Z-Image loaded pipeline");
+    }
+
     /// Build the (light) pipeline handle for the Z-Image snapshot `root` at the given device/dtype,
     /// with `adapters` to merge into the DiT. Does **no** weight I/O — components load lazily via
     /// [`load_components`](Self::load_components).

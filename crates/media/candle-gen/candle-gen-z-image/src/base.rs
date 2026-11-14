@@ -107,6 +107,10 @@ impl Generator for ZImageBaseGenerator {
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::unobserved_adapters(
+                self.adapters.len(),
+                "candle-gen-z-image/src/base.rs",
+            );
             candle_gen::execution::policy("loaded/dtype", format!("{:?}", self.dtype).into());
             candle_gen::execution::policy(
                 "loaded/loaded_quant",
