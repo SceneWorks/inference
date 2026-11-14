@@ -450,7 +450,24 @@ impl KreaMemoryScope {
 impl gen_core::MemoryRequestScope for KreaMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
         self.ensure_active()?;
-        let reference_count =
+        // The pose-control route is admitted as exactly one pose control image (reference count
+        // 1 in the registered behavior routes); every other route counts only image references and
+        // must never accept a control image in their place.
+        let reference_count = if self.provider_id == KREA_2_TURBO_CONTROL_ID {
+            match request.conditioning.as_slice() {
+                [Conditioning::Control {
+                    kind: gen_core::ControlKind::Pose,
+                    ..
+                }] => 1,
+                _ => {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{}: request conditioning does not match the admitted pose-control \
+                         memory route (exactly one pose control image)",
+                        self.provider_id
+                    )))
+                }
+            }
+        } else {
             request.conditioning.iter().try_fold(0_u32, |count, item| {
                 let additional =
                     match item {
@@ -472,7 +489,8 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
                         "krea: reference count exceeds the typed memory-route domain".to_owned(),
                     )
                 })
-            })?;
+            })?
+        };
         if reference_count != self.reference_count
             || request.phases.is_some() != self.has_phases
             || request.use_pid != self.use_pid
@@ -2972,6 +2990,21 @@ fn registered_krea_valid_fixture(
             let context =
                 gen_core::standard_memory_behavior_context(contract, strategy, tier, route)?;
             let mut fixture = gen_core::MemoryBehaviorFixture::new(context);
+            if contract.provider_id == KREA_2_TURBO_CONTROL_ID {
+                // The pose-control route's one admitted image is its pose control at the render
+                // size (what `control_registry::control_input` and its geometry check require),
+                // not the generic placeholder reference.
+                let (width, height) = (fixture.request.width, fixture.request.height);
+                fixture.request.conditioning = vec![Conditioning::Control {
+                    image: gen_core::Image {
+                        width,
+                        height,
+                        pixels: vec![0; width as usize * height as usize * 3],
+                    },
+                    kind: gen_core::ControlKind::Pose,
+                    scale: None,
+                }];
+            }
             if edit {
                 for conditioning in &mut fixture.request.conditioning {
                     if let Conditioning::Reference { strength, .. } = conditioning {
@@ -3295,6 +3328,18 @@ mod weights_free_behavior_tests {
                 fixture.request.memory,
                 contract.generation_memory(&fixture.context.selection)
             );
+            if contract.provider_id == KREA_2_TURBO_CONTROL_ID {
+                // The registered control fixture is a valid pose request for the generator too.
+                assert!(matches!(
+                    fixture.request.conditioning.as_slice(),
+                    [Conditioning::Control {
+                        kind: gen_core::ControlKind::Pose,
+                        image,
+                        ..
+                    }] if (image.width, image.height)
+                        == (fixture.request.width, fixture.request.height)
+                ));
+            }
             scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
         }
     }
@@ -6017,6 +6062,118 @@ mod tests {
         rejected
             .finish(gen_core::MemoryRunOutcome::Canceled)
             .unwrap();
+    }
+
+    /// The pose-control route's request scope accepts exactly one pose control image (the
+    /// conditioning `control_registry::control_input` requires) and rejects references, other
+    /// control kinds and extra images; every reference route still rejects a control image.
+    /// Pure request validation on a CPU device: no model loads or runs.
+    #[test]
+    fn request_scope_conditioning_is_route_aware_for_pose_control() {
+        use gen_core::MemoryRequestScope;
+        let image = || Image {
+            width: 16,
+            height: 16,
+            pixels: vec![0; 16 * 16 * 3],
+        };
+        let pose = |kind: gen_core::ControlKind| Conditioning::Control {
+            image: image(),
+            kind,
+            scale: Some(0.8),
+        };
+        let reference = || Conditioning::Reference {
+            image: image(),
+            strength: None,
+        };
+        let scope = |provider_id: &str, mode, reference_count| KreaMemoryScope {
+            device: Device::Cpu,
+            memory: Some(gen_core::GenerationMemory::default()),
+            provider_id: provider_id.to_owned(),
+            mode,
+            reference_count,
+            use_pid: false,
+            has_phases: false,
+            finished: false,
+        };
+        let request = |conditioning| GenerationRequest {
+            prompt: "a dancer".to_owned(),
+            conditioning,
+            ..Default::default()
+        };
+
+        let mut control = scope(
+            KREA_2_TURBO_CONTROL_ID,
+            gen_core::MemoryMode::ImageToImage,
+            1,
+        );
+        let mut valid = request(vec![pose(gen_core::ControlKind::Pose)]);
+        control.configure_request(&mut valid).unwrap();
+        assert_eq!(valid.memory, Some(gen_core::GenerationMemory::default()));
+        for mismatched in [
+            vec![reference()],
+            vec![pose(gen_core::ControlKind::Canny)],
+            vec![
+                pose(gen_core::ControlKind::Pose),
+                pose(gen_core::ControlKind::Pose),
+            ],
+            vec![pose(gen_core::ControlKind::Pose), reference()],
+            Vec::new(),
+        ] {
+            let error = control
+                .configure_request(&mut request(mismatched))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("pose-control memory route"), "{error}");
+        }
+        control
+            .finish(gen_core::MemoryRunOutcome::Complete)
+            .unwrap();
+
+        // Reference routes keep counting image references and never accept a control image.
+        for (provider_id, mode, references, accepted) in [
+            (
+                KREA_2_TURBO_ID,
+                gen_core::MemoryMode::TextToImage,
+                0,
+                Vec::new(),
+            ),
+            (
+                KREA_2_TURBO_ID,
+                gen_core::MemoryMode::ImageToImage,
+                1,
+                vec![reference()],
+            ),
+            (
+                KREA_2_TURBO_EDIT_ID,
+                gen_core::MemoryMode::ImageToImage,
+                1,
+                vec![reference()],
+            ),
+            (
+                KREA_2_EDIT_ID,
+                gen_core::MemoryMode::ImageToImage,
+                1,
+                vec![reference()],
+            ),
+            (
+                KREA_2_RAW_ID,
+                gen_core::MemoryMode::TextToImage,
+                0,
+                Vec::new(),
+            ),
+        ] {
+            let mut route = scope(provider_id, mode, references);
+            route.configure_request(&mut request(accepted)).unwrap();
+            let error = route
+                .configure_request(&mut request(vec![pose(gen_core::ControlKind::Pose)]))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("does not match the admitted memory route"),
+                "{provider_id}: {error}"
+            );
+            route.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+        }
     }
 
     #[test]
