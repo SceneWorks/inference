@@ -227,9 +227,31 @@ def proof_manifest(body, package):
     return body.replace(anchor, anchor + dependencies)
 
 
+CARGO_FETCH_TIMEOUT_SECONDS = 1_200
+
+
+def fetch_locked(root, timeout=CARGO_FETCH_TIMEOUT_SECONDS):
+    """Download every crate the checkout's own Cargo.lock pins before any offline step.
+
+    A runner's cargo cache can lack a crate both lockfiles pin (run 43558295383: matrixmultiply
+    0.3.11 on nax-macos-2), and the later `cargo metadata --offline` cannot fetch it. `--locked`
+    refuses to touch the lockfile, so the fetched set is exactly the checkout's pinned graph.
+    """
+    command = ["cargo", "fetch", "--locked"]
+    try:
+        subprocess.run(command, cwd=root, check=True, timeout=timeout, stdout=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(f"`cargo fetch --locked` in {root} exceeded {timeout} s") from error
+    except subprocess.CalledProcessError as error:
+        raise ValueError(f"`cargo fetch --locked` in {root} failed with exit {error.returncode}; "
+                         "the runner cannot download the pinned dependency graph") from error
+
+
 def install(root, backend, arm, tier, case):
     if tier != "tier1":
         raise ValueError("conditional FLUX.1 comparison is Tier 1 only")
+    # Fill the cargo cache from the untouched checkout before any manifest edit or offline step.
+    fetch_locked(root)
     # Reuse the audited shallow-depth substitutions and native sampler taps. The base binary is
     # replaced with a route-specific probe in the owning provider package.
     base_package = overlay.install(root, backend, arm, tier)
