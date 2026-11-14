@@ -158,6 +158,11 @@ fn report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
     descriptor
 }
 
+fn record_loaded_unet_compute(device: &Device) {
+    // Both the initial load and resident reload construct the UNet on this device at DTYPE.
+    candle_gen::execution::runtime(device, DTYPE);
+}
+
 fn capture_instantid_action(
     cancel: &CancelFlag,
     action: &'static str,
@@ -1299,6 +1304,8 @@ impl InstantId {
         controlnet_encoder: &Tensor,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
+        let unet = Self::require(&self.unet, "UNet")?;
+        record_loaded_unet_compute(&self.device);
         let sampler_name = req.sampler.as_deref().unwrap_or("euler_ancestral");
         let scheduler_curated = req
             .scheduler
@@ -1322,7 +1329,7 @@ impl InstantId {
                 candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, req.steps, &native);
             let prior = seeded_sigma_prior(req.seed, width, height, sigmas[0], &self.device)?;
             denoise_curated(
-                Self::require(&self.unet, "UNet")?,
+                unet,
                 Some(sampler_name),
                 &ms,
                 &sigmas,
@@ -1352,7 +1359,7 @@ impl InstantId {
             // bit-identical to the historical `denoise_ip_control`).
             let prior = self.seeded_prior_with(req.seed, width, height)?;
             let d = Denoiser {
-                unet: Self::require(&self.unet, "UNet")?,
+                unet,
                 sampler: &self.sampler,
             };
             let steps = self.sampler.timesteps(req.steps, self.sampler.max_time());
@@ -1792,6 +1799,54 @@ mod tests {
             adapter.execution,
             ExecutionIdentity::Unavailable { .. }
         ));
+    }
+
+    #[test]
+    fn direct_report_records_loaded_unet_precision_in_its_own_attempt() {
+        use candle_gen::gen_core::generator::{ExecutionFact, ExecutionIdentity};
+
+        let cancel = CancelFlag::new();
+        let complete = |record_unet| {
+            capture_instantid_action(&cancel, "instantid/generate", 0, &mut |_| {}, |_| {
+                candle_gen::execution::rng_scheme("fixture-std-rng");
+                candle_gen::execution::seed("instantid/prior", 7);
+                candle_gen::execution::schedule("fixture-ancestral", &[1.0, 0.0], "epsilon");
+                if record_unet {
+                    record_loaded_unet_compute(&Device::Cpu);
+                }
+                candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+                Ok(Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                })
+            })
+            .expect("completed fixture image")
+        };
+
+        let with_unet = complete(true);
+        let ExecutionIdentity::Resolved { identity } = with_unet.execution else {
+            panic!("the observed direct action should have a resolved identity")
+        };
+        let ExecutionFact::Resolved { value } = identity.quality_policy else {
+            panic!("compute policy should be resolved")
+        };
+        assert_eq!(value["compute"].as_array().map(Vec::len), Some(2));
+        assert_eq!(value["compute"][0]["device"].as_str(), Some("Cpu"));
+        assert_eq!(value["compute"][0]["dtype"].as_str(), Some("F16"));
+        assert_eq!(value["compute"][1]["device"].as_str(), Some("Cpu"));
+        assert_eq!(value["compute"][1]["dtype"].as_str(), Some("F32"));
+
+        let without_unet = complete(false);
+        let ExecutionIdentity::Resolved { identity } = without_unet.execution else {
+            panic!("the later fixture action should have a resolved identity")
+        };
+        let ExecutionFact::Resolved { value } = identity.quality_policy else {
+            panic!("compute policy should be resolved")
+        };
+        assert_eq!(value["compute"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["compute"][0]["device"].as_str(), Some("Cpu"));
+        assert_eq!(value["compute"][0]["dtype"].as_str(), Some("F32"));
     }
 
     struct RecordingScope(Rc<RefCell<Vec<String>>>);
