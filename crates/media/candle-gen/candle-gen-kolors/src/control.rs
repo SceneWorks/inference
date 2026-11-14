@@ -68,6 +68,12 @@ const CROSS_ATTENTION_DIM: usize = 2048;
 /// the mlx Kolors ControlNet path).
 pub const DEFAULT_CONTROL_SCALE: f32 = 1.0;
 
+fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
+    let mut descriptor = crate::descriptor();
+    descriptor.id = "kolors_control";
+    descriptor
+}
+
 /// Paths to the Kolors ControlNet checkpoints.
 #[derive(Clone)]
 pub struct KolorsControlPaths {
@@ -471,7 +477,7 @@ impl KolorsControl {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+        candle_gen::execution::capture_direct(&control_report_descriptor(), &req.cancel, || {
             candle_gen::execution::unobserved_adapters(
                 self.paths.adapters.len(),
                 "candle-gen-kolors/src/control.rs",
@@ -509,7 +515,7 @@ impl KolorsControl {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+        candle_gen::execution::capture_direct(&control_report_descriptor(), &req.cancel, || {
             candle_gen::execution::unobserved_adapters(
                 self.paths.adapters.len(),
                 "candle-gen-kolors/src/control.rs",
@@ -960,6 +966,13 @@ impl KolorsControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_control_report_names_control_engine() {
+        let descriptor = control_report_descriptor();
+        assert_eq!(descriptor.id, "kolors_control");
+        assert_eq!(descriptor.backend, "candle");
+    }
 
     /// The request defaults match the Kolors production knobs (1024², 50 steps, CFG 5.0, control 1.0).
     #[test]

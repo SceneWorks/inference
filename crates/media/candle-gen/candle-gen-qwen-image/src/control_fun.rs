@@ -53,6 +53,12 @@ pub const CONTROL_IN_DIM: usize =
 /// Default conditioning scale on the VACE hints.
 pub const DEFAULT_CONTROL_SCALE: f32 = 1.0;
 
+fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
+    let mut descriptor = crate::descriptor();
+    descriptor.id = "qwen_image_control";
+    descriptor
+}
+
 /// Paths to the Qwen-Image 2512-Fun control checkpoints.
 pub struct QwenFunControlPaths {
     /// The `Qwen/Qwen-Image-2512` diffusers snapshot dir (`text_encoder/`, `transformer/`, `vae/`,
@@ -284,7 +290,7 @@ impl QwenFunControl {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+        candle_gen::execution::capture_direct(&control_report_descriptor(), &req.cancel, || {
             candle_gen::execution::unobserved_adapters(
                 self.unobserved_adapter_count,
                 "QwenFunControl",
@@ -431,6 +437,13 @@ fn require_prompt(prompt: &str) -> Result<()> {
 mod tests {
     use super::*;
     use candle_gen::gen_core::Image;
+
+    #[test]
+    fn direct_control_report_names_control_engine() {
+        let descriptor = control_report_descriptor();
+        assert_eq!(descriptor.id, "qwen_image_control");
+        assert_eq!(descriptor.backend, "candle");
+    }
 
     #[test]
     fn selected_text_encoder_is_exact_and_dense_only() {

@@ -70,6 +70,20 @@ use crate::pipeline::{DiT, Pipeline, TextEnc};
 /// runs f32 (the encode path's dtype) and its output is cast to bf16 for the control context.
 const DTYPE: DType = DType::BF16;
 
+fn control_report_descriptor(base: bool) -> candle_gen::gen_core::ModelDescriptor {
+    let mut descriptor = if base {
+        crate::base::descriptor()
+    } else {
+        crate::descriptor()
+    };
+    descriptor.id = if base {
+        "z_image_control"
+    } else {
+        "z_image_turbo_control"
+    };
+    descriptor
+}
+
 /// Channel count of the VAE-encoded control context: 16 control latent + 1 zero mask + 16 zero inpaint
 /// (the Fun-Controlnet-Union `control_all_x_embedder`'s 33ch input). Pure-pose control zeroes the mask +
 /// inpaint groups.
@@ -1218,11 +1232,7 @@ impl ZImageControl {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         candle_gen::execution::capture_direct(
-            &if self.base {
-                crate::base::descriptor()
-            } else {
-                crate::descriptor()
-            },
+            &control_report_descriptor(self.base),
             &req.cancel,
             || {
                 self.pipeline.observe_adapter_provenance();
@@ -1761,6 +1771,15 @@ fn control_file_score(path: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_control_reports_name_base_and_turbo_engines() {
+        for (base, expected) in [(true, "z_image_control"), (false, "z_image_turbo_control")] {
+            let descriptor = control_report_descriptor(base);
+            assert_eq!(descriptor.id, expected);
+            assert_eq!(descriptor.backend, "candle");
+        }
+    }
 
     #[test]
     #[ignore = "model inference; explicit model workflow only"]

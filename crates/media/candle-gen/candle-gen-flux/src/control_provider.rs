@@ -50,6 +50,12 @@ fn observe_injector(injector: Option<&dyn DitImageInjector>) {
     }
 }
 
+fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
+    let mut descriptor = crate::descriptor_dev();
+    descriptor.id = "flux1_dev_control";
+    descriptor
+}
+
 #[cfg(test)]
 use crate::vae::native::{DiagonalGaussian, Encoder};
 use candle_core::{DType, Device, Tensor};
@@ -287,7 +293,7 @@ impl Flux1DevControl {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&crate::descriptor_dev(), &req.cancel, || {
+        candle_gen::execution::capture_direct(&control_report_descriptor(), &req.cancel, || {
             candle_gen::execution::policy("direct_route", "flux/control_provider/generate".into());
             let image = self
                 .generate(req, control_image, &mut report_progress)
@@ -319,7 +325,7 @@ impl Flux1DevControl {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&crate::descriptor_dev(), &req.cancel, || {
+        candle_gen::execution::capture_direct(&control_report_descriptor(), &req.cancel, || {
             candle_gen::execution::policy(
                 "direct_route",
                 "flux/control_provider/generate_with_injector".into(),
@@ -559,6 +565,13 @@ impl Flux1DevControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_control_report_names_control_engine() {
+        let descriptor = control_report_descriptor();
+        assert_eq!(descriptor.id, "flux1_dev_control");
+        assert_eq!(descriptor.backend, "candle");
+    }
 
     /// The request defaults match the dev control production knobs (1024², 25 steps, guidance 3.5, pose).
     /// `control_scale` defaults to `None` (absent) — resolved to [`DEFAULT_CONTROL_SCALE`] at generate
