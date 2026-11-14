@@ -29,7 +29,9 @@ use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{self, *};
 use candle_gen_flux2::vae::Flux2Vae;
 use candle_llm::models::qwen35::Qwen35Model;
-use gen_core::generator::{CompletedGeneration, CompletedMossImageEdit, ExecutionIdentity};
+use gen_core::generator::{
+    CompletedGeneration, CompletedMossImageAdvanced, CompletedMossImageEdit, ExecutionIdentity,
+};
 use gen_core_moss_image::{moss_image::*, moss_image_edit::*};
 use loader::Sources;
 use release::release_then_sync;
@@ -603,6 +605,16 @@ impl MossImageAdvancedGenerator for MossImageGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<MossImageAdvancedOutput> {
         self.run(request, inputs, on_progress)
+    }
+
+    fn generate_moss_advanced_with_execution_report(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageAdvancedInputs<'_>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<CompletedMossImageAdvanced> {
+        let (output, execution) = self.run_with_execution(request, inputs, None, on_progress)?;
+        CompletedMossImageAdvanced::new(output, execution, &self.descriptor)
     }
 }
 impl Generator for MossImageGenerator {

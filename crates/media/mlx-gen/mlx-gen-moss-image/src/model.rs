@@ -983,6 +983,17 @@ impl MossImageAdvancedGenerator for MossImage {
         self.execute(request, inputs, on_progress, None)
             .map_err(Into::into)
     }
+
+    fn generate_moss_advanced_with_execution_report(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageAdvancedInputs<'_>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedMossImageAdvanced> {
+        let (output, execution) =
+            self.execute_with_execution(request, inputs, on_progress, None)?;
+        gen_core::generator::CompletedMossImageAdvanced::new(output, execution, &self.descriptor)
+    }
 }
 impl Generator for MossImage {
     fn generate_with_execution_report(

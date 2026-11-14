@@ -1122,6 +1122,19 @@ pub trait MossImageAdvancedGenerator {
         inputs: MossImageAdvancedInputs<'_>,
         on_progress: &mut dyn FnMut(crate::Progress),
     ) -> Result<MossImageAdvancedOutput>;
+
+    /// Return a completed output and the execution identity from the same attempt. Providers
+    /// that have not adopted execution reports keep their existing output-only method.
+    fn generate_moss_advanced_with_execution_report(
+        &self,
+        _request: &GenerationRequest,
+        _inputs: MossImageAdvancedInputs<'_>,
+        _on_progress: &mut dyn FnMut(crate::Progress),
+    ) -> Result<crate::generator::CompletedMossImageAdvanced> {
+        Err(crate::Error::Unsupported(
+            "provider has no completed MOSS advanced report".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1507,12 +1520,147 @@ mod execution_receipt_tests {
         )
         .unwrap();
         assert_eq!(steps, [(1, 1)]);
+        assert!(matches!(
+            fake.generate_moss_advanced_with_execution_report(
+                &request,
+                MossImageAdvancedInputs::default(),
+                &mut |_| {},
+            ),
+            Err(Error::Unsupported(_))
+        ));
         request.cancel.cancel();
         assert!(matches!(
             fake.generate_moss_advanced(
                 &request,
                 MossImageAdvancedInputs::default(),
                 &mut |_| panic!("cancelled callback")
+            ),
+            Err(Error::Canceled)
+        ));
+    }
+
+    #[test]
+    fn advanced_completed_report_is_attempt_local_for_images_latents_retry_and_cancel() {
+        use std::cell::Cell;
+
+        use crate::generator::{
+            CompletedMossImageAdvanced, ExecutionIdentity, ExecutionUnavailable,
+        };
+        use crate::{Capabilities, Image, Modality, ModelDescriptor};
+
+        struct Fake {
+            attempts: Cell<usize>,
+            descriptor: ModelDescriptor,
+        }
+        impl MossImageAdvancedGenerator for Fake {
+            fn generate_moss_advanced(
+                &self,
+                request: &GenerationRequest,
+                inputs: MossImageAdvancedInputs<'_>,
+                progress: &mut dyn FnMut(Progress),
+            ) -> Result<MossImageAdvancedOutput> {
+                self.generate_moss_advanced_with_execution_report(request, inputs, progress)
+                    .map(|completed| completed.output)
+            }
+
+            fn generate_moss_advanced_with_execution_report(
+                &self,
+                request: &GenerationRequest,
+                inputs: MossImageAdvancedInputs<'_>,
+                progress: &mut dyn FnMut(Progress),
+            ) -> Result<CompletedMossImageAdvanced> {
+                let attempt = self.attempts.get() + 1;
+                self.attempts.set(attempt);
+                if request.cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+                if attempt == 1 {
+                    return Err(Error::Msg("first attempt failed".into()));
+                }
+                progress(Progress::Step {
+                    current: 1,
+                    total: 1,
+                });
+                if request.cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+                let output = match inputs.output {
+                    MossImageOutputKind::Images => MossImageAdvancedOutput::Images(vec![Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0; 3],
+                    }]),
+                    MossImageOutputKind::Latents => MossImageAdvancedOutput::Latents {
+                        values: vec![0.0; 128],
+                        shape: [1, 128, 1, 1],
+                    },
+                };
+                CompletedMossImageAdvanced::new(
+                    output,
+                    ExecutionIdentity::unavailable(ExecutionUnavailable {
+                        code: "synthetic_attempt".into(),
+                        detail: format!("attempt {attempt}"),
+                        missing_facts: vec!["test_provider".into()],
+                    }),
+                    &self.descriptor,
+                )
+            }
+        }
+
+        let fake = Fake {
+            attempts: Cell::new(0),
+            descriptor: ModelDescriptor {
+                id: "moss-test",
+                family: "moss_image",
+                backend: "candle",
+                modality: Modality::Image,
+                capabilities: Capabilities::default(),
+                encoder_contract: None,
+                denoiser_output_latent_space: None,
+                control_kinds: None,
+                required_components: &[],
+            },
+        };
+        let generator: &dyn MossImageAdvancedGenerator = &fake;
+        let request = GenerationRequest::default();
+        let run = |output, request: &GenerationRequest| {
+            generator.generate_moss_advanced_with_execution_report(
+                request,
+                MossImageAdvancedInputs {
+                    output,
+                    ..Default::default()
+                },
+                &mut |_| {},
+            )
+        };
+        assert!(run(MossImageOutputKind::Images, &request).is_err());
+        let images = run(MossImageOutputKind::Images, &request).unwrap();
+        assert!(matches!(images.output, MossImageAdvancedOutput::Images(_)));
+        let latents = run(MossImageOutputKind::Latents, &request).unwrap();
+        assert!(matches!(
+            latents.output,
+            MossImageAdvancedOutput::Latents { .. }
+        ));
+        let cancelled = GenerationRequest::default();
+        cancelled.cancel.cancel();
+        assert!(matches!(
+            run(MossImageOutputKind::Images, &cancelled),
+            Err(Error::Canceled)
+        ));
+        let retried = run(MossImageOutputKind::Images, &request).unwrap();
+        let detail = |identity: ExecutionIdentity| match identity {
+            ExecutionIdentity::Unavailable { reason } => reason.detail,
+            ExecutionIdentity::Resolved { .. } => panic!("fake uses unavailable identity"),
+        };
+        assert_eq!(detail(images.execution), "attempt 2");
+        assert_eq!(detail(latents.execution), "attempt 3");
+        assert_eq!(detail(retried.execution), "attempt 5");
+        let in_flight = GenerationRequest::default();
+        assert!(matches!(
+            generator.generate_moss_advanced_with_execution_report(
+                &in_flight,
+                MossImageAdvancedInputs::default(),
+                &mut |_| in_flight.cancel.cancel(),
             ),
             Err(Error::Canceled)
         ));

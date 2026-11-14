@@ -49,31 +49,70 @@ impl CompletedMossImageEdit {
         execution: ExecutionIdentity,
         descriptor: &ModelDescriptor,
     ) -> Result<Self> {
-        let units = match &output {
-            crate::moss_image::MossImageAdvancedOutput::Images(images) => images.len(),
-            crate::moss_image::MossImageAdvancedOutput::Latents { values, shape } => {
-                let valid_length = shape.iter().try_fold(1usize, |elements, dimension| {
-                    elements.checked_mul(*dimension)
-                });
-                if shape[0] == 0
-                    || shape[1] != 128
-                    || shape[2] == 0
-                    || shape[3] == 0
-                    || valid_length != Some(values.len())
-                {
-                    return Err(Error::Msg(
-                        "completed MOSS latents need a nonempty [images,128,height,width] shape matching their values".into(),
-                    ));
-                }
-                shape[0]
-            }
-        };
-        if units == 0 {
-            return Err(Error::Msg("completed MOSS edit has no images".into()));
-        }
-        execution.validate(descriptor.id, descriptor.backend, units)?;
+        validate_moss_advanced_output(
+            &output,
+            &execution,
+            descriptor,
+            "completed MOSS edit has no images",
+        )?;
         Ok(Self { output, execution })
     }
+}
+
+/// One successful public MOSS advanced generation, including a latent output, and its
+/// attempt-local execution facts. Errors and cancellations have no completed value.
+#[derive(Debug)]
+pub struct CompletedMossImageAdvanced {
+    pub output: crate::moss_image::MossImageAdvancedOutput,
+    pub execution: ExecutionIdentity,
+}
+
+impl CompletedMossImageAdvanced {
+    pub fn new(
+        output: crate::moss_image::MossImageAdvancedOutput,
+        execution: ExecutionIdentity,
+        descriptor: &ModelDescriptor,
+    ) -> Result<Self> {
+        validate_moss_advanced_output(
+            &output,
+            &execution,
+            descriptor,
+            "completed MOSS advanced output has no images",
+        )?;
+        Ok(Self { output, execution })
+    }
+}
+
+fn validate_moss_advanced_output(
+    output: &crate::moss_image::MossImageAdvancedOutput,
+    execution: &ExecutionIdentity,
+    descriptor: &ModelDescriptor,
+    empty_message: &'static str,
+) -> Result<()> {
+    let units = match output {
+        crate::moss_image::MossImageAdvancedOutput::Images(images) => images.len(),
+        crate::moss_image::MossImageAdvancedOutput::Latents { values, shape } => {
+            let valid_length = shape.iter().try_fold(1usize, |elements, dimension| {
+                elements.checked_mul(*dimension)
+            });
+            if shape[0] == 0
+                || shape[1] != 128
+                || shape[2] == 0
+                || shape[3] == 0
+                || valid_length != Some(values.len())
+            {
+                return Err(Error::Msg(
+                    "completed MOSS latents need a nonempty [images,128,height,width] shape matching their values".into(),
+                ));
+            }
+            shape[0]
+        }
+    };
+    if units == 0 {
+        return Err(Error::Msg(empty_message.into()));
+    }
+    execution.validate(descriptor.id, descriptor.backend, units)?;
+    Ok(())
 }
 
 /// One successful conversational audio turn and its attempt-local facts. A context-only turn
@@ -246,12 +285,28 @@ mod tests {
             &descriptor(),
         )
         .is_ok());
+        assert!(CompletedMossImageAdvanced::new(
+            output(),
+            ExecutionIdentity::Resolved {
+                identity: Box::new(identity.clone()),
+            },
+            &descriptor(),
+        )
+        .is_ok());
 
         identity.output_units = 1;
         assert!(CompletedMossImageEdit::new(
             output(),
             ExecutionIdentity::Resolved {
                 identity: Box::new(identity),
+            },
+            &descriptor(),
+        )
+        .is_err());
+        assert!(CompletedMossImageAdvanced::new(
+            output(),
+            ExecutionIdentity::Resolved {
+                identity: Box::new(resolved()),
             },
             &descriptor(),
         )
