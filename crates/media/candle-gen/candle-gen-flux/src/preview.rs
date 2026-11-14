@@ -33,8 +33,8 @@
 //!
 //! ## What the hook sees on each route
 //!
-//! Every shipped FLUX.1-family route drives [`candle_gen::run_flow_sampler`], so all of them opt in
-//! with a projector closure rather than by restructuring a loop:
+//! Every shipped FLUX.1-family route drives the planned [`candle_gen::run_flow_sampler_spans`], so
+//! all of them opt in with a projector closure rather than by restructuring a loop:
 //!
 //! * **CFG never reaches the preview.** FLUX.1 dev is guidance-distilled (a single forward with an
 //!   embedded guidance vector) and schnell is timestep-distilled with no guidance at all; neither has a
@@ -826,12 +826,41 @@ mod tests {
 
     // --- Route inventory --------------------------------------------------------------------------
 
-    /// [`candle_gen::run_flow_sampler`]'s argument count before the predict closure. Pinned so a
-    /// signature change — or a scanner mis-split — fails this inventory loudly instead of quietly
+    /// [`candle_gen::run_flow_sampler_spans`]'s argument count before the predict closure. Pinned so
+    /// a signature change — or a scanner mis-split — fails this inventory loudly instead of quietly
     /// shifting which argument "the one before the closure" names.
-    const SAMPLER_ARGUMENTS_BEFORE_PREDICT: usize = 8;
+    const SAMPLER_ARGUMENTS_BEFORE_PREDICT: usize = 11;
 
-    /// The arguments of every `run_flow_sampler` call in `source`, one entry per call site, covering
+    /// The planned driver every shipped FLUX.1 route calls. The unplanned `run_flow_sampler` resolves
+    /// its own schedule at render time, so a route calling it would bypass the pre-load plan.
+    const PLANNED_SAMPLER_CALL: &str = "run_flow_sampler_spans(";
+    const UNPLANNED_SAMPLER_CALL: &str = "run_flow_sampler(";
+
+    /// Assert one route's planned-sampler arguments: the sampler, sigmas and spans all come from the
+    /// route's pre-load `RenderPlan` binding `plan`, the phase scope is the plan's `RenderRun`, and the
+    /// argument immediately before the predict closure is `preview`.
+    fn assert_planned_sampler_arguments(file: &str, args: &[String], plan: &str, preview: &str) {
+        assert_eq!(
+            args.len(),
+            SAMPLER_ARGUMENTS_BEFORE_PREDICT,
+            "{file}: expected {SAMPLER_ARGUMENTS_BEFORE_PREDICT} arguments before the predict \
+             closure, parsed {args:?}"
+        );
+        for (index, expected) in [
+            (0, format!("Some({plan}.sampler())")),
+            (2, format!("{plan}.denoise_sigmas()")),
+            (3, format!("&{plan}.denoise_spans()")),
+            (4, "Some(run)".to_owned()),
+            (10, preview.to_owned()),
+        ] {
+            assert_eq!(
+                args[index], expected,
+                "{file}: planned sampler argument {index} must be `{expected}`, parsed {args:?}"
+            );
+        }
+    }
+
+    /// The arguments of every `run_flow_sampler_spans` call in `source`, one entry per call site, covering
     /// the arguments **before** the predict closure — the window the `preview` argument sits in.
     ///
     /// Ported from sc-16955's FLUX.2 inventory. The window is bounded by the call's own bracket balance
@@ -843,7 +872,14 @@ mod tests {
     /// The match is textual, so writing the driver's name followed by an open paren in prose is read as
     /// a call site: name it without the paren in comments.
     fn sampler_call_sites(file: &str, source: &str) -> Vec<Vec<String>> {
-        const CALL: &str = "run_flow_sampler(";
+        const CALL: &str = PLANNED_SAMPLER_CALL;
+        assert_eq!(
+            code_without_line_comments(source)
+                .matches(UNPLANNED_SAMPLER_CALL)
+                .count(),
+            0,
+            "{file} calls the unplanned flow driver; every FLUX.1 route must run its pre-load plan"
+        );
         let mut sites = Vec::new();
         let mut cursor = 0usize;
         while let Some(at) = source[cursor..].find(CALL) {
@@ -858,9 +894,18 @@ mod tests {
         sites
     }
 
+    /// `source` without its `//` comment lines, so prose naming a driver is not read as a call.
+    fn code_without_line_comments(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// The comma-separated top-level arguments of one call, given everything after its open paren.
     fn sampler_call_arguments(file: &str, index: usize, rest: &str) -> Vec<String> {
-        let site = format!("{file}: run_flow_sampler call #{index}");
+        let site = format!("{file}: run_flow_sampler_spans call #{index}");
         let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
 
         let mut args: Vec<String> = Vec::new();
@@ -967,17 +1012,17 @@ mod tests {
     /// appearing anywhere else in the call.
     #[test]
     fn every_flux1_render_route_passes_a_preview_hook() {
-        for (file, source, expected) in [
-            ("pipeline.rs", include_str!("pipeline.rs"), "Some(preview)"),
+        for (file, source, plan) in [
+            ("pipeline.rs", include_str!("pipeline.rs"), "plan"),
             (
                 "control_provider.rs",
                 include_str!("control_provider.rs"),
-                "Some(preview)",
+                "render_plan",
             ),
             (
                 "ip_provider.rs",
                 include_str!("ip_provider.rs"),
-                "Some(preview)",
+                "render_plan",
             ),
         ] {
             let sites = sampler_call_sites(file, source);
@@ -988,20 +1033,9 @@ mod tests {
                  pass a preview hook and be named in this inventory (and in the catalog's).",
                 sites.len()
             );
-            let args = &sites[0];
-            assert_eq!(
-                args.len(),
-                SAMPLER_ARGUMENTS_BEFORE_PREDICT,
-                "{file}: expected {SAMPLER_ARGUMENTS_BEFORE_PREDICT} arguments before the predict \
-                 closure, parsed {args:?}"
-            );
             // Positional, not `contains`: the preview is the argument immediately before the predict
             // closure, so this cannot be satisfied by the word appearing anywhere else.
-            assert_eq!(
-                args.last().map(String::as_str),
-                Some(expected),
-                "{file} does not pass a preview hook: {args:?}"
-            );
+            assert_planned_sampler_arguments(file, &sites[0], plan, "Some(preview)");
         }
     }
 

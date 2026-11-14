@@ -171,16 +171,41 @@ mod tests {
             .join("\n");
         assert_eq!(
             code.matches("run_flow_sampler(").count(),
+            0,
+            "pulid_flux.rs must not call the unplanned flow driver, which bypasses the pre-load plan"
+        );
+        assert_eq!(
+            code.matches("run_flow_sampler_spans(").count(),
             1,
-            "pulid_flux.rs must drive exactly one sampler site"
+            "pulid_flux.rs must drive exactly one planned sampler site"
         );
-        assert!(
-            code.contains("Some(preview),"),
-            "the one sampler site must pass a preview hook, not `None`"
+        // The one site runs the pre-load plan: sampler, sigmas, spans and phase scope all come from
+        // `render_plan` / its `RenderRun`, and the argument before the predict closure is the hook.
+        let call = &code[code.find("run_flow_sampler_spans(").unwrap()..];
+        let call = &call[..call
+            .find("|img, t|")
+            .expect("the planned site's predict closure")];
+        let args: Vec<String> = call["run_flow_sampler_spans(".len()..]
+            .split(",\n")
+            .map(|arg| arg.trim().to_owned())
+            .filter(|arg| !arg.is_empty())
+            .collect();
+        assert_eq!(
+            args.len(),
+            11,
+            "planned driver arguments before predict: {args:?}"
         );
-        assert!(
-            !code.contains("            None,\n            |img, t|"),
-            "no sampler site may pass `None` immediately before the predict closure"
-        );
+        for (index, expected) in [
+            (0, "Some(render_plan.sampler())"),
+            (2, "render_plan.denoise_sigmas()"),
+            (3, "&render_plan.denoise_spans()"),
+            (4, "Some(run)"),
+            (10, "Some(preview)"),
+        ] {
+            assert_eq!(
+                args[index], expected,
+                "planned sampler argument {index}: {args:?}"
+            );
+        }
     }
 }

@@ -650,8 +650,8 @@ const PROVIDER_CRATES: &[ProviderCrate] = &[
             dir: "candle-gen-flux",
             register: candle_gen_flux::register_providers,
             denoise: Denoise::Shared,
-            // sc-16956's inventory: one hooked `run_flow_sampler` site per shipped render lane — the
-            // registered txt2img route both `flux1_*` descriptors share (`pipeline.rs`), the name-driven
+            // sc-16956's inventory: one hooked `run_flow_sampler_spans` site (the planned driver) per
+            // shipped render lane — the registered txt2img route both `flux1_*` descriptors share (`pipeline.rs`), the name-driven
             // Fun-ControlNet-Union strict-pose provider (`control_provider.rs`, the lane the worker
             // already hands a live sink to), and the name-driven XLabs IP-Adapter provider
             // (`ip_provider.rs`). The latter two carry a `preview` field on their own request types
@@ -1199,10 +1199,10 @@ const BESPOKE_PROVIDER_CRATES: &[BespokeCrate] = &[
         denoise: Denoise::Bespoke,
         routes: &[],
     },
-    // sc-16956's inventory, and the only wired member of this table: ONE hooked
-    // `run_flow_sampler` site, in `PulidFlux::generate_planned`'s dev flow denoise. `preview.rs` is a
-    // `pub use` shim over `candle-gen-flux`'s projector — PuLID composes that crate's own
-    // `FluxRefBackbone`, so the latent, the unpack and the VAE are literally the registered
+    // sc-16956's inventory, and the only wired member of this table: ONE hooked planned
+    // `run_flow_sampler_spans` site, in `PulidFlux::generate_planned`'s dev flow denoise.
+    // `preview.rs` is a `pub use` shim over `candle-gen-flux`'s projector — PuLID composes that
+    // crate's own `FluxRefBackbone`, so the latent, the unpack and the VAE are literally the registered
     // `flux1_dev` route's — so it holds neither a site nor a direct emission. No dark site: this is
     // the crate's only denoise.
     BespokeCrate {
@@ -1267,6 +1267,14 @@ const SAMPLER_DRIVERS: &[SamplerDriver] = &[
         call: "run_flow_sampler(",
         preview_at: 7,
         arity: 9,
+    },
+    // The plan-driven flow driver every FLUX.1-family render route (txt2img, ControlNet, XLabs IP,
+    // PuLID) calls with its pre-load `RenderPlan`'s sampler, sigmas, spans and run scope.
+    SamplerDriver {
+        function: "run_flow_sampler_spans",
+        call: "run_flow_sampler_spans(",
+        preview_at: 10,
+        arity: 12,
     },
     SamplerDriver {
         function: "run_curated_sampler",
@@ -2708,7 +2716,20 @@ fn function_parameters(code: &str, name: &str) -> Vec<String> {
     let at = code
         .find(&needle)
         .unwrap_or_else(|| panic!("{name} is no longer declared in candle-gen/src/sampler.rs"));
-    call_arguments(&format!("fn {name}"), &code[at + needle.len()..])
+    // `call_arguments` splits on every top-level comma, including one inside a type's generic
+    // arguments (`Option<&RenderRun<'_, '_>>`); a piece with no `name:` binding continues the type
+    // of the parameter before it.
+    let mut parameters: Vec<String> = Vec::new();
+    for piece in call_arguments(&format!("fn {name}"), &code[at + needle.len()..]) {
+        match parameters.last_mut() {
+            Some(previous) if !piece.contains(':') || piece.trim_start().starts_with('\'') => {
+                previous.push_str(", ");
+                previous.push_str(&piece);
+            }
+            _ => parameters.push(piece),
+        }
+    }
+    parameters
         .into_iter()
         .map(|parameter| {
             let (binding, _) = parameter.split_once(':').unwrap_or_else(|| {
