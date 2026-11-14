@@ -291,22 +291,44 @@ class ConditionalAssetInventory(unittest.TestCase):
             self.assertIn("cuda-windows-2", windows["runner"])
             self.assertIn("real-weights", windows["runner"])
 
-    def test_inventoried_gemma_stages_through_the_proof_helper(self):
+    def test_inventoried_gemma_stages_by_exact_name_without_listing(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             hub = root / "hub"
             hub.mkdir()
             install_gemma(hub)
             row = self.inventory(hub)["roles"]["pid_gemma"]["candidates"][0]
+            gemma = {"pid_gemma": {"path": row["path"], "files": row["files"],
+                                   "revision": row["revision"]}}
             work = root / "proof"
             work.mkdir()
+            guards = no_listing()
             with patch.dict(os.environ, FLUX1_HUB=str(hub)):
-                _, staged = conditional.prepare_assets(work, assets.ROOT,
-                                                       {"pid_gemma": {"path": row["path"],
-                                                                      "files": row["files"],
-                                                                      "revision": row["revision"]}})
+                for guard in guards:
+                    guard.start()
+                try:
+                    _, staged = conditional.prepare_assets(work, assets.ROOT, gemma)
+                finally:
+                    for guard in guards:
+                        guard.stop()
             self.assertEqual((Path(staged["pid_gemma"]["staged"]) / "config.json").read_bytes(),
                              b"config.json")
+            self.assertEqual(set(staged["pid_gemma"]["files"]), set(row["files"]))
+            # A timed-out stat is refused as unreachable, never treated as absent or present.
+            def hanging(path, *args, **kwargs):
+                raise conditional.Unreachable(f"stat {path} did not return within 10 s")
+            for attempt, failure in (("unreachable", hanging), ("missing", None)):
+                retry = root / attempt
+                retry.mkdir()
+                with self.subTest(attempt=attempt), patch.dict(os.environ, FLUX1_HUB=str(hub)):
+                    if failure:
+                        with patch.object(conditional, "probe", side_effect=failure):
+                            with self.assertRaisesRegex(ValueError, "unreachable"):
+                                conditional.prepare_assets(retry, assets.ROOT, gemma)
+                    else:
+                        (Path(row["path"]) / "LICENSE").unlink()
+                        with self.assertRaisesRegex(ValueError, "missing: PiD Gemma LICENSE"):
+                            conditional.prepare_assets(retry, assets.ROOT, gemma)
 
 
 if __name__ == "__main__":

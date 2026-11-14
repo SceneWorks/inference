@@ -12,6 +12,7 @@ import re
 import shutil
 
 from scripts.ci.flux1_pair.fixture import sha
+from scripts.ci.flux1_pair.fs_probe import Unreachable, probe
 
 REFERENCE = Path("docs/migration/evidence/sc-16956/pulid-reference.png")
 REFERENCE_SHA256 = "3995f2e856346748588e76a5557516d0218f44f5663701c5a50139d50c86a7be"
@@ -109,34 +110,45 @@ def case_metadata(case, backend, assets):
     return variant, normalized
 
 
+def probe_in_hub(path, hub, what):
+    """Stat one exact Hub path without listing any directory; return the probe row."""
+    try:
+        row = probe(path)
+    except Unreachable as error:
+        raise ValueError(f"conditional asset is unreachable ({what}): {error}") from error
+    if not row["exists"]:
+        raise ValueError("conditional asset is missing: " + what)
+    if not Path(row["resolved"]).is_relative_to(hub):
+        raise ValueError("conditional asset lies outside the configured model hub: " + what)
+    return row
+
+
 def prepare_assets(work, source, assets):
-    """Verify every external byte and copy it into the owned proof directory."""
+    """Verify every external byte and copy it into the owned proof directory.
+
+    Hub paths are only ever stat'ed by exact name (see `fs_probe`): a PiD Gemma snapshot is
+    checked file by file against the inventoried names, never listed.
+    """
     hub = Path(os.environ["FLUX1_HUB"]).expanduser().resolve(strict=True)
     staged = work / "conditional-assets"
     staged.mkdir()
     rows = {}
     for role, row in assets.items():
         original = Path(row["path"])
-        resolved = original.resolve(strict=True)
-        if not resolved.is_relative_to(hub):
-            raise ValueError("conditional asset lies outside the configured model hub: " + role)
+        found = probe_in_hub(original, hub, role)
+        resolved = Path(found["resolved"])
         if role == "pid_gemma":
-            if not resolved.is_dir():
+            if not found["is_dir"]:
                 raise ValueError("PiD Gemma asset must be a directory")
-            actual_files = set()
-            def fail_walk(error):
-                raise error
-            for base, dirs, names in os.walk(resolved, followlinks=False, onerror=fail_walk):
-                if any((Path(base) / name).is_symlink() for name in dirs):
-                    raise ValueError("PiD Gemma has a symlink directory")
-                actual_files.update((Path(base) / name).relative_to(resolved).as_posix() for name in names)
-            if actual_files != set(row["files"]):
-                raise ValueError("PiD Gemma file inventory changed")
+            actual_files = set(row["files"])
             for name, digest in row["files"].items():
                 if PurePosixPath(name).is_absolute() or ".." in PurePosixPath(name).parts or "\\" in name:
                     raise ValueError("PiD Gemma file name escapes snapshot")
-                path = (resolved / name).resolve(strict=True)
-                if not path.is_relative_to(hub) or sha(path) != digest:
+                member = probe_in_hub(original / name, hub, "PiD Gemma " + name)
+                if not member["is_file"]:
+                    raise ValueError("PiD Gemma entry is not a file: " + name)
+                path = Path(member["resolved"])
+                if sha(path) != digest:
                     raise ValueError("PiD Gemma file changed: " + name)
                 destination = staged / "pid_gemma" / name
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -148,7 +160,7 @@ def prepare_assets(work, source, assets):
                           "staging": "copy", "bytes": sum((staged / "pid_gemma" / name).stat().st_size
                                                     for name in row["files"])}
             continue
-        if not resolved.is_file() or resolved.stat().st_nlink < 1:
+        if not found["is_file"]:
             raise ValueError("conditional asset is not a file: " + role)
         actual = sha(resolved)
         if actual != row["sha256"]:
