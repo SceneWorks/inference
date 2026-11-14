@@ -47661,6 +47661,121 @@
     "package": "candle-gen-krea",
     "target": "integration",
     "target_kind": "test",
+    "fqn": "e2e_real_weights::turbo_hires_fix_renders_4096x2816",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/e2e_real_weights.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Production Krea 2 Turbo snapshot or caller-owned transformer with companion snapshot; 2048x1408 base and 4096x2816 img2img refinement",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/e2e_real_weights.rs::e2e_real_weights::turbo_hires_fix_renders_4096x2816",
+    "required_environment": [
+      "KREA_TURBO_DIR"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "source_selected_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/e2e_real_weights.rs::e2e_real_weights::turbo_hires_fix_renders_4096x2816/source_selected_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      },
+      "source_selected_metal": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/e2e_real_weights.rs::e2e_real_weights::turbo_hires_fix_renders_4096x2816/source_selected_metal",
+        "environment": {},
+        "cargo_features": [
+          "metal",
+          "model-inference-proof"
+        ],
+        "backend": "candle-metal",
+        "expected_devices": [
+          "candle-metal"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Entire source-selected body, fixture matrix, original numerical assertions and intentional error/cancel controls"
+        ]
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/e2e_real_weights.rs::e2e_real_weights::turbo_hires_fix_renders_4096x2816",
+      "requirements": [
+        {
+          "slot": "krea-model-source-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-vae-component",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-retained-runtime-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::ValidatedTokenizerSource::read_unchanged"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-retained-runtime-encoder",
+          "role": "artifact-input",
+          "readers": [
+            "gen-core::ValidatedEncoderSource::read_unchanged"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case"
+        }
+      ]
+    }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
     "fqn": "edit_real_weights::edit_renders_coherent_with_dual_conditioning",
     "source": "crates/media/candle-gen/candle-gen-krea/tests/edit_real_weights.rs",
     "cargo_target_metadata": {
@@ -48257,6 +48372,115 @@
         }
       ]
     }
+  },
+  {
+    "package": "candle-gen-krea",
+    "target": "integration",
+    "target_kind": "test",
+    "fqn": "imported_cuda_smoke::imported_native_nvfp4_krea_renders_strict_pose",
+    "source": "crates/media/candle-gen/candle-gen-krea/tests/imported_cuda_smoke.rs",
+    "cargo_target_metadata": {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ]
+    },
+    "execution_role": "direct",
+    "backend": null,
+    "expected_devices": [],
+    "cargo_features": [],
+    "fixture_identity": "Externally selected native NVFP4 Krea transformer, retained base encoder/VAE, pose overlay and pose image; seeded control-scale 0 versus 0.6 renders with actual native FP4 projection report",
+    "configuration_source": "crates/media/candle-gen/candle-gen-krea/tests/imported_cuda_smoke.rs::imported_cuda_smoke::imported_native_nvfp4_krea_renders_strict_pose",
+    "required_environment": [
+      "KREA_IMPORTED_DIT",
+      "KREA_BASE_SNAPSHOT",
+      "KREA_CONTROL_BRANCH",
+      "KREA_IMPORTED_POSE_IMAGE"
+    ],
+    "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
+    "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
+    "configuration_controls": [],
+    "default_configuration": null,
+    "configurations": {
+      "fixed_cuda": {
+        "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/imported_cuda_smoke.rs::imported_cuda_smoke::imported_native_nvfp4_krea_renders_strict_pose/fixed_cuda",
+        "environment": {},
+        "cargo_features": [
+          "cuda",
+          "model-inference-proof"
+        ],
+        "backend": "candle-cuda",
+        "expected_devices": [
+          "candle-cuda"
+        ],
+        "scope": "whole selected source case",
+        "required_work": [
+          "Two seeded eight-step renders with control scales 0 and 0.6, actual native FP4 projection assertions, output geometry and control-dependent pixel assertions"
+        ],
+        "cuda_activity_profile": "non-isolated-correctness-headroom",
+        "required_cuda_physical_index": 1
+      }
+    },
+    "configuration_kind": "feature-only",
+    "input_contract": {
+      "fixture_kind": "external",
+      "source_identity": "crates/media/candle-gen/candle-gen-krea/tests/imported_cuda_smoke.rs::imported_cuda_smoke::imported_native_nvfp4_krea_renders_strict_pose",
+      "requirements": [
+        {
+          "slot": "krea-control-model-tensors",
+          "role": "tensor-input",
+          "readers": [
+            "candle-core::safetensors::MmapedSafetensors::multi",
+            "candle-core::safetensors::MmapedSafetensors::new"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-control-vae",
+          "role": "model-weights",
+          "readers": [
+            "candle-gen::loader::mmap_var_builder"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-control-retained-tokenizer",
+          "role": "tokenizer",
+          "readers": [
+            "gen-core::ValidatedTokenizerSource::read_unchanged"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "content",
+          "scope": "case"
+        },
+        {
+          "slot": "krea-actual-reference-pixels",
+          "role": "reference",
+          "readers": [
+            "crates/media/candle-gen/candle-gen-krea/tests/imported_cuda_smoke.rs::read_image::image::open@503"
+          ],
+          "minimum_collections": 1,
+          "minimum_items": 1,
+          "required_grade": "reader-binding",
+          "scope": "case"
+        }
+      ]
+    },
+    "output_artifacts": [
+      "without-control.png",
+      "pose-control.png"
+    ],
+    "required_cuda_device_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
   },
   {
     "package": "candle-gen-krea",

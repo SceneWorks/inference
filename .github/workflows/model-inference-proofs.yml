@@ -178,6 +178,22 @@ jobs:
           "%REVIEWED_PYTHON%" -I scripts\ci\model_inference_proofs.py --plan --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" > "%RUNNER_TEMP%\model-proof-plan.json"
           if errorlevel 1 exit /b %ERRORLEVEL%
           "%REVIEWED_PYTHON%" -I scripts\ci\prepare_bespoke_training_proof_assets.py --plan "%RUNNER_TEMP%\model-proof-plan.json"
+      - name: Bind installed native NVFP4 Krea pose inputs
+        if: matrix.asset_setup == 'krea-native-nvfp4-pose' && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bindings = @{
+            KREA_IMPORTED_DIT = 'E:\huggingface\hub\models--Comfy-Org--Krea-2\snapshots\952f49d49653cb42e7d6cf7cbfad74738073ec7d\diffusion_models\krea2_turbo_nvfp4.safetensors'
+            KREA_BASE_SNAPSHOT = 'E:\huggingface\hub\models--SceneWorks--krea-2-turbo-mlx\snapshots\d009674080cc1bccf2b629d834c34bf5eccdb723\bf16'
+            KREA_CONTROL_BRANCH = 'E:\huggingface\hub\models--SceneWorks--krea2-pose-controlnet-beta\snapshots\cb3a0ac7590f5ec594a4eeb43b95ee1da0b5a0ac\control_step5000.safetensors'
+            KREA_IMPORTED_POSE_IMAGE = Join-Path $env:GITHUB_WORKSPACE 'crates/media/candle-gen/candle-gen-krea/tests/fixtures/native-pose.png'
+          }
+          foreach ($binding in $bindings.GetEnumerator()) {
+            if (-not (Test-Path -LiteralPath $binding.Value)) { throw "Missing native pose input: $($binding.Name)" }
+            "$($binding.Name)=$($binding.Value)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          # These bindings only select installed inputs; source-owned readers record consumed bytes.
       - name: Bind provisioned Raw snapshot for bounded Krea training
         if: matrix.asset_setup == 'krea-training' && runner.os == 'Windows'
         shell: powershell
