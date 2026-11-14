@@ -748,6 +748,110 @@ mod tests {
         ));
     }
     #[test]
+    fn incremental_streaming_report_keeps_chunks_in_one_attempt_and_discards_canceled_results() {
+        struct Incremental {
+            calls: Cell<usize>,
+        }
+        impl Generator for Incremental {
+            fn descriptor(&self) -> &ModelDescriptor {
+                &DESCRIPTOR
+            }
+            fn validate(&self, _: &GenerationRequest) -> gen_core::Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                _: &GenerationRequest,
+                _: &mut dyn FnMut(Progress),
+            ) -> gen_core::Result<GenerationOutput> {
+                panic!("the streaming report must not rerender through one-shot generation")
+            }
+            fn generate_streaming(
+                &self,
+                _: &GenerationRequest,
+                on_chunk: &mut dyn FnMut(gen_core::AudioChunk),
+                on_progress: &mut dyn FnMut(Progress),
+            ) -> gen_core::Result<GenerationOutput> {
+                self.calls.set(self.calls.get() + 1);
+                runtime(&Device::Cpu, DType::F32);
+                sampling("incremental", json!({"blocks": 2}));
+                seed("tokens", "splitmix64", 42);
+                on_chunk(gen_core::AudioChunk {
+                    samples: vec![0.1],
+                    sample_rate: 24_000,
+                    channels: 1,
+                    index: 0,
+                });
+                policy("streaming", json!({"first_chunk_emitted": true}));
+                on_progress(Progress::Decoding);
+                on_chunk(gen_core::AudioChunk {
+                    samples: vec![0.2],
+                    sample_rate: 24_000,
+                    channels: 1,
+                    index: 1,
+                });
+                Ok(GenerationOutput::Audio(track()))
+            }
+        }
+
+        let provider = Incremental {
+            calls: Cell::new(0),
+        };
+        let canceled = GenerationRequest::default();
+        let flag = canceled.cancel.clone();
+        let mut canceled_chunks = Vec::new();
+        let result = capture_streaming(
+            &provider,
+            &canceled,
+            &mut |chunk| {
+                canceled_chunks.push(chunk.index);
+                seed("callback", "foreign", 99);
+                if chunk.index == 1 {
+                    flag.cancel();
+                }
+            },
+            &mut |_| {},
+        );
+        assert!(matches!(result, Err(gen_core::Error::Canceled)));
+        assert_eq!(canceled_chunks, [0, 1]);
+
+        let mut chunks = Vec::new();
+        let completed = capture_streaming(
+            &provider,
+            &GenerationRequest::default(),
+            &mut |chunk| chunks.push(chunk),
+            &mut |_| {
+                seed("progress_callback", "foreign", 100);
+            },
+        )
+        .unwrap();
+        assert_eq!(provider.calls.get(), 2);
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.index).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        let GenerationOutput::Audio(audio) = completed.generation.output.unwrap() else {
+            panic!("audio")
+        };
+        assert_eq!(
+            chunks
+                .iter()
+                .flat_map(|chunk| chunk.samples.iter().copied())
+                .collect::<Vec<_>>(),
+            audio.samples
+        );
+        let resolved = completed.execution.resolved().unwrap();
+        let ExecutionRandomness::Draws { draws, .. } = &resolved.randomness else {
+            panic!("draws")
+        };
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].seed, Some(42));
+        assert!(matches!(
+            resolved.quality_policy,
+            ExecutionFact::Resolved { .. }
+        ));
+    }
+    #[test]
     fn external_rng_and_reused_constructor_evidence_fail_closed() {
         let scope = Attempt::begin();
         facts(1);
