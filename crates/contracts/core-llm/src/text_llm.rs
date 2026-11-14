@@ -90,9 +90,9 @@ impl<S: PartialEq> OwnedExecutionFence<S> {
 /// [`crate::registry`]. `&self`: a loaded provider is immutable and shareable.
 ///
 /// Cancellation rides on [`TextLlmRequest::cancel`]: an already-cancelled request must return
-/// [`Error::Canceled`](crate::Error::Canceled) before any inference; a mid-stream cancel stops
+/// [`Error::Canceled`] before any inference; a mid-stream cancel stops
 /// promptly and may return a partial output marked
-/// [`FinishReason::Cancelled`](crate::FinishReason::Cancelled).
+/// [`FinishReason::Cancelled`].
 pub trait TextLlm {
     /// The provider's identity + declared capabilities (constructible without running inference).
     fn descriptor(&self) -> &TextLlmDescriptor;
