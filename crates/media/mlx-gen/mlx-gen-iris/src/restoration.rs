@@ -20,6 +20,7 @@ use gen_core_iris::{
     },
 };
 use gen_core_iris::{IrisConfig, FAMILY};
+use mlx_gen::gen_core::CompletedTransform;
 use mlx_gen::{
     gen_core, Error, Image, LoadSpec, Progress, Result, Transform, TransformCapabilities,
     TransformDescriptor, TransformRegistration, TransformRequest,
@@ -276,7 +277,7 @@ impl IrisRestorer {
         &self,
         req: &TransformRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
+    ) -> Result<(Image, RestorationPlan)> {
         let plan = self.plan(req)?;
         let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         // The driver's host planes (f32 canvases on the CPU heap, which count toward the iOS
@@ -349,7 +350,7 @@ impl IrisRestorer {
                 ("output_height", u64::from(image.height)),
             ],
         );
-        Ok(image)
+        Ok((image, plan))
     }
 }
 
@@ -540,7 +541,40 @@ impl Transform for IrisRestorer {
         req: &TransformRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<Image> {
-        self.apply_impl(req, on_progress).map_err(Into::into)
+        self.apply_impl(req, on_progress)
+            .map(|(image, _)| image)
+            .map_err(Into::into)
+    }
+
+    fn apply_with_execution_report(
+        &self,
+        req: &TransformRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<CompletedTransform> {
+        let (image, plan) = self.apply_impl(req, on_progress)?;
+        if req.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        let execution = contract::completed_execution_identity(
+            &plan,
+            &image,
+            self.descriptor.backend,
+            concat!(
+                env!("CARGO_PKG_NAME"),
+                "@",
+                env!("CARGO_PKG_VERSION"),
+                ":restore-v1"
+            ),
+            self.settings.model_time(&self.config),
+            self.settings.sigma,
+            serde_json::json!({
+                "precision": format!("{:?}", self.precision),
+                "packed_tier": format!("{:?}", self.tier),
+                "streamed": self.dit.is_streamed(),
+                "device_observation": {"state":"unavailable","reason":"MLX restoration does not expose the selected device"},
+            }),
+        )?;
+        CompletedTransform::new(image, execution, self.descriptor())
     }
 }
 
