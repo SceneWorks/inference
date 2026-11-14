@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 // A caller's budget is an upper limit, not a minimum tile size. Bound transient
 // dense scores in both passes even when the caller asks for unbounded attention.
 // This does not retain scores, change checkpointing, or select the streaming kernel.
-const REFERENCE_SCORE_TILE_ELEMENTS: u64 = 32 * 1024 * 1024;
+pub(crate) const REFERENCE_SCORE_TILE_ELEMENTS: u64 = 32 * 1024 * 1024;
 
 fn reference_plan(plan: AttentionPlan<'_>) -> AttentionPlan<'_> {
     AttentionPlan {

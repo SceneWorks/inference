@@ -927,6 +927,7 @@ dependencies = [
  "sceneworks-gen-core-telemetry",
  "sceneworks-gen-core-testkit",
  "sceneworks-gen-core-tokenizer",
+ "sceneworks-gen-core-train",
  "serde_json",
  "sha2",
  "tempfile",

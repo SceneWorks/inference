@@ -1256,6 +1256,7 @@ fn complete_catalog_has_stable_conforming_surface() {
             "ltx_2_3",
             "ltx_2_5_distilled",
             "mage_flow_base",
+            "minimax_h3_image",
             "moss_image_base",
             "moss_image_sft",
             "qwen_image_2_1",

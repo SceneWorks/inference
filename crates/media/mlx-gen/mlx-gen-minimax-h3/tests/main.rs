@@ -81,6 +81,9 @@ mod fl2va_first_light;
 #[path = "h3_image_bounded_attention_real.rs"]
 mod h3_image_bounded_attention_real;
 
+#[path = "h3_image_candle_lora_load_real.rs"]
+mod h3_image_candle_lora_load_real;
+
 #[path = "h3_image_lora_real.rs"]
 mod h3_image_lora_real;
 

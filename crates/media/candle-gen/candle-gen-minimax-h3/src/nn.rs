@@ -138,6 +138,9 @@ pub fn sdpa_planned(
     let (b, h, sq, _) = q.dims4()?;
     let sk = k.dim(2)?;
     let (query_rows, score_elements) = materializing_chunk_shape(b, h, sq, sk, plan.budget)?;
+    if differentiable_attention() {
+        return differentiable_sdpa(q, k, v, scale, plan);
+    }
     let force_materialized = force_materialized_attention();
     let kernel = candle_gen::fused_attention::select_attention_kernel(q, k, v, None);
     let materialized =
@@ -362,6 +365,82 @@ pub fn reset_attention_execution_report() {
 }
 pub fn attention_execution_report() -> AttentionExecutionReport {
     ATTENTION_EXECUTION.with(|r| *r.borrow())
+}
+
+thread_local! {
+    static DIFFERENTIABLE_ATTENTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static COMPOSABLE_TRAINING_ATTENTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Inside [`with_differentiable_attention`], take the unbounded composable softmax attention
+/// instead of the bounded owner — the reference the real-weights gate compares the owner's
+/// backward with, block by block (SW-7098). Test-only.
+#[cfg(test)]
+pub(crate) fn with_composable_training_attention<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COMPOSABLE_TRAINING_ATTENTION.set(self.0);
+        }
+    }
+    let _restore = Restore(COMPOSABLE_TRAINING_ATTENTION.replace(true));
+    f()
+}
+
+/// Run `f` with every DiT attention on this thread differentiable and bounded by design
+/// (SW-7098): [`differentiable_sdpa`]. The fused FlashAttention kernel and `softmax_last_dim` have
+/// no backward. The previous setting is restored on exit, panics included.
+pub(crate) fn with_differentiable_attention<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DIFFERENTIABLE_ATTENTION.set(self.0);
+        }
+    }
+    let _restore = Restore(DIFFERENTIABLE_ATTENTION.replace(true));
+    f()
+}
+
+fn differentiable_attention() -> bool {
+    DIFFERENTIABLE_ATTENTION.get()
+}
+
+/// The training attention: the shared standard-softmax training SDPA
+/// ([`candle_gen::fused_attention::training_sdpa_standard_bhsd`]), whose reference owner keeps only
+/// q / k / v and the output in the graph and recomputes the probabilities per query tile in the
+/// backward, so no call ever holds more than
+/// [`candle_gen::fused_attention::TRAINING_SCORE_TILE_ELEMENTS`] scores and no block retains its
+/// `[heads, S, S]` scores. The operands are taken to float32 first, so the scores and the softmax
+/// stay in float32 as on the render's materialized route ([`sdpa_materialized`]).
+fn differentiable_sdpa(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    plan: AttentionPlan<'_>,
+) -> Result<Tensor> {
+    let dtype = q.dtype();
+    if COMPOSABLE_TRAINING_ATTENTION.get() {
+        let out = candle_gen::attention::sdpa_planned_bhsd(
+            &q.to_dtype(DType::F32)?,
+            &k.to_dtype(DType::F32)?,
+            &v.to_dtype(DType::F32)?,
+            scale,
+            None,
+            |s| candle_gen::candle_nn::ops::softmax(s, D::Minus1),
+            plan,
+        )?;
+        return Ok(out.to_dtype(dtype)?);
+    }
+    let out = candle_gen::fused_attention::training_sdpa_standard_bhsd(
+        &q.to_dtype(DType::F32)?,
+        &k.to_dtype(DType::F32)?,
+        &v.to_dtype(DType::F32)?,
+        scale,
+        None,
+        plan,
+    )?;
+    Ok(out.to_dtype(dtype)?)
 }
 
 fn force_materialized_attention() -> bool {

@@ -343,22 +343,22 @@ pub struct ImageMemoryFacts {
     /// The f32 vision tower.
     vision_bytes: u64,
     dit_hidden: u64,
-    dit_text_dim: u64,
+    pub(crate) dit_text_dim: u64,
     dit_patch_dim: u64,
-    task: NativeTaskAllocation,
+    pub(crate) task: NativeTaskAllocation,
     window: WindowAllocation,
     /// Host bytes to prepare the DiT (source map + runtime packs + one repack scratch).
-    dit_prepare_host: u64,
+    pub(crate) dit_prepare_host: u64,
     /// Host bytes of the runtime-format DiT stack a streamed request keeps on the host.
-    dit_retained_host: u64,
+    pub(crate) dit_retained_host: u64,
     /// Every installed adapter factor plus its prepared cache.
     adapter_resident: u64,
     /// The adapter install high-water (not additional to `adapter_resident`).
     adapter_install: u64,
     decoder_bytes: u64,
-    encoder_bytes: u64,
+    pub(crate) encoder_bytes: u64,
     /// The streamable DiT as the shared phase facts spell it ([`transformer_stream`]).
-    stream: StreamedWeightFacts,
+    pub(crate) stream: StreamedWeightFacts,
     /// Whether the source supports the streamed route (rung 4).
     pub streamable: bool,
 }
@@ -662,20 +662,10 @@ pub fn estimate(
     )?;
     if rows.has_references() {
         let largest = rows.reference_pixels.iter().copied().max().unwrap_or(0);
-        let tile = mul(
-            TILE_WITH_OVERLAP * TILE_WITH_OVERLAP * ENCODE_TILE_CHANNELS * f32_bytes,
-            ENCODE_TILE_BUFFERS,
-        )?;
-        // The f32 pixels in, and the posterior (mean + log-variance) out at full resolution.
-        let image = mul(largest, 3 * f32_bytes)?;
-        let posterior = mul(largest / 256, 48 * f32_bytes * 2)?;
         phases.push(ImagePhaseBytes {
             phase: ImagePhase::ReferenceEncode,
             device_bytes: add_all([
-                facts.encoder_bytes,
-                tile,
-                image,
-                posterior,
+                tiled_encode_bytes(facts, largest)?,
                 context,
                 reference_latents,
             ])?,
@@ -767,6 +757,22 @@ pub fn estimate(
         streamed,
         phases,
     })
+}
+
+/// The image VAE's tiled encode of one `pixels`-pixel image on the device: the f32 encoder, one
+/// overlapped tile's live feature maps (the encoder tiles at the shipped 256 / 64 by default,
+/// [`crate::spatial_tiling::TILING_IS_ON_BY_DEFAULT`]), the f32 pixels in and the posterior (mean
+/// and log-variance) out at full resolution. An edit's reference encode and the trainer's target
+/// encode (SW-7098) are both priced here.
+pub(crate) fn tiled_encode_bytes(facts: &ImageMemoryFacts, pixels: u64) -> gen_core::Result<u64> {
+    let f32_bytes = 4u64;
+    let tile = mul(
+        TILE_WITH_OVERLAP * TILE_WITH_OVERLAP * ENCODE_TILE_CHANNELS * f32_bytes,
+        ENCODE_TILE_BUFFERS,
+    )?;
+    let image = mul(pixels, 3 * f32_bytes)?;
+    let posterior = mul(pixels / 256, 48 * f32_bytes * 2)?;
+    add_all([facts.encoder_bytes, tile, image, posterior])
 }
 
 /// `(hidden, heads, head_dim, mlp)` of the Qwen3-VL tower H3 ships

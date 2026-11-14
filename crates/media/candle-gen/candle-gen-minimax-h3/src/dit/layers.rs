@@ -354,6 +354,13 @@ impl LinearNoBias {
         });
     }
 
+    /// The shared projection itself, for the trainer's live `Var`-backed residuals (SW-7098) —
+    /// pushed through [`AdaptLinear::push_trainable_lora`] and its LoKr twins, so a device copy of
+    /// a host block carries the same leaves and every loss reaches them.
+    pub(crate) fn trainable_mut(&mut self) -> &mut AdaptLinear {
+        &mut self.inner
+    }
+
     /// Drop every attached residual, reverting to the bare base.
     pub fn clear_adapters(&mut self) {
         self.inner.clear_adapters();
@@ -544,6 +551,49 @@ impl DitAttention {
     ///
     /// `cancel` reaches the attention kernel: the fused path checks it once per call (one call =
     /// one layer), the budgeted fallback before every query chunk (sc-26691).
+    /// The attention scores of `x` (`q·kᵀ·scale` over the normalized, rotated q / k, every head),
+    /// reduced to `(max |score|, mean over heads and query rows of the softmax's largest
+    /// probability)` — evidence for the trainer's real-weight gradient gate (SW-7098). Test-only.
+    #[cfg(test)]
+    pub(crate) fn score_stats(
+        &self,
+        x: &Tensor,
+        rope: Option<(&MmRope, &MmRopeTables)>,
+    ) -> Result<(f32, f32)> {
+        let (b, seq, _) = x.dims3()?;
+        let (h, d) = (self.heads, self.head_dim);
+        let q = self.to_q.forward(x)?.reshape((b, seq, h, d))?;
+        let k = self.to_k.forward(x)?.reshape((b, seq, h, d))?;
+        let q = rms_weighted(&q, &self.norm_q, self.qk_norm_eps)?;
+        let k = rms_weighted(&k, &self.norm_k, self.qk_norm_eps)?;
+        let (q, k) = match rope {
+            Some((rope, tables)) => (rope.apply(&q, tables)?, rope.apply(&k, tables)?),
+            None => (q, k),
+        };
+        let qh = q.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
+        let kt = k
+            .transpose(1, 2)?
+            .transpose(2, 3)?
+            .contiguous()?
+            .to_dtype(DType::F32)?;
+        let mut max_abs = 0f32;
+        let mut prob_sum = 0f64;
+        for head in 0..h {
+            let scores = (qh.narrow(1, head, 1)?.matmul(&kt.narrow(1, head, 1)?)?
+                * (1.0 / (d as f64).sqrt()))?;
+            max_abs = max_abs.max(scores.abs()?.max_all()?.to_scalar::<f32>()?);
+            let probs =
+                candle_gen::candle_nn::ops::softmax(&scores, candle_gen::candle_core::D::Minus1)?;
+            prob_sum += f64::from(
+                probs
+                    .max_keepdim(candle_gen::candle_core::D::Minus1)?
+                    .sum_all()?
+                    .to_scalar::<f32>()?,
+            );
+        }
+        Ok((max_abs, (prob_sum / (b * h * seq) as f64) as f32))
+    }
+
     pub(crate) fn forward_veda(
         &self,
         x: &Tensor,
