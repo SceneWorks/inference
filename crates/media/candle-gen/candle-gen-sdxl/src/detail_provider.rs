@@ -90,6 +90,9 @@ pub struct SdxlDetail {
     sampler: EulerAncestralSampler,
     device: Device,
     memory_admission: Option<(SdxlArtifactSeal, MemoryRunContext)>,
+    /// The UNet loader applied this selected stack or refused the load. It does not retain a
+    /// byte-bound receipt of the targets and strengths that ran.
+    unobserved_adapter_count: usize,
 }
 
 impl SdxlDetail {
@@ -116,6 +119,7 @@ impl SdxlDetail {
             sampler: EulerAncestralSampler::sdxl(),
             device,
             memory_admission: None,
+            unobserved_adapter_count: paths.adapters.len(),
         })
     }
 
@@ -146,8 +150,7 @@ impl SdxlDetail {
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
-        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
-            candle_gen::execution::policy("direct_route", "sdxl/detail_provider/generate".into());
+        capture_detail_execution(&req.cancel, self.unobserved_adapter_count, || {
             let image = self
                 .generate(req, source, control, &mut report_progress)
                 .map_err(candle_gen::gen_core::Error::from)?;
@@ -278,6 +281,20 @@ impl SdxlDetail {
     }
 }
 
+/// A selected adapter stack is not an installation receipt. Keep this fact in the same attempt as
+/// the bespoke detail output so an adapted completion cannot claim a resolved execution identity.
+fn capture_detail_execution(
+    cancel: &CancelFlag,
+    unobserved_adapter_count: usize,
+    body: impl FnOnce() -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationOutput>,
+) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+    candle_gen::execution::capture_direct(&crate::descriptor(), cancel, || {
+        candle_gen::execution::unobserved_adapters(unobserved_adapter_count, "SdxlDetail");
+        candle_gen::execution::policy("direct_route", "sdxl/detail_provider/generate".into());
+        body()
+    })
+}
+
 /// Match the authoritative MLX img2img schedule: strength selects a truncated prefix length.
 /// Rust's float-to-integer cast floors finite non-negative values, which is deliberate here.
 fn ancestral_strength_steps(steps: usize, strength: f32) -> usize {
@@ -343,6 +360,42 @@ fn validate_detail_request(req: &SdxlDetailRequest, source: &Image, control: &Im
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::gen_core::generator::ExecutionIdentity;
+
+    fn fake_completed_detail(
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationOutput> {
+        candle_gen::execution::rng_scheme("sdxl-detail-report-fixture");
+        candle_gen::execution::draw("initial_noise", 7, 0);
+        candle_gen::execution::without_schedule("fixture", "single-step", "ancestral");
+        candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+        Ok(candle_gen::gen_core::GenerationOutput::Images(vec![
+            Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            },
+        ]))
+    }
+
+    #[test]
+    fn detail_report_refuses_adapted_completion_and_clears_on_clean_retry() {
+        let cancel = CancelFlag::default();
+        let adapted = capture_detail_execution(&cancel, 2, fake_completed_detail).unwrap();
+        let ExecutionIdentity::Unavailable { reason } = adapted.execution else {
+            panic!("an adapted detail output needs an installation receipt")
+        };
+        assert_eq!(reason.code, "candle_execution_observation_incomplete");
+        assert!(reason
+            .missing_facts
+            .iter()
+            .any(|fact| fact.contains("selected adapter count 2")));
+
+        let clean = capture_detail_execution(&cancel, 0, fake_completed_detail).unwrap();
+        assert!(matches!(
+            clean.execution,
+            ExecutionIdentity::Resolved { .. }
+        ));
+    }
 
     fn image(width: u32, height: u32) -> Image {
         Image {
