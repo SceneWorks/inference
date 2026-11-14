@@ -199,7 +199,8 @@ impl Generator for Anima {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         mlx_gen::image_execution::without_capture(|| {
-            self.generate_impl(req, on_progress).map_err(Into::into)
+            self.generate_impl(req, &req.preview, on_progress)
+                .map_err(Into::into)
         })
     }
 
@@ -208,10 +209,12 @@ impl Generator for Anima {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        let preview = mlx_gen::image_execution::isolated_preview(&req.preview);
         mlx_gen::image_execution::complete_image_attempt(&self.descriptor, &req.cancel, || {
             let mut progress =
                 |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
-            self.generate_impl(req, &mut progress).map_err(Into::into)
+            self.generate_impl(req, &preview, &mut progress)
+                .map_err(Into::into)
         })
     }
 
@@ -259,6 +262,7 @@ impl Anima {
     fn generate_impl(
         &self,
         req: &GenerationRequest,
+        preview: &mlx_gen::PreviewSink,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
@@ -388,7 +392,7 @@ impl Anima {
                         scheduler.as_deref(),
                         req.scheduler_shift,
                         seed,
-                        &req.preview,
+                        preview,
                         &req.cancel,
                         on_progress,
                         attention,

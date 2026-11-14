@@ -8,7 +8,7 @@ use crate::gen_core::generator::{
     ExecutionReplaySupport, ExecutionUnavailable, NumericScheduleDigest, ResolvedExecutionIdentity,
     EXECUTION_IDENTITY_VERSION,
 };
-use crate::{CancelFlag, GenerationOutput, ModelDescriptor};
+use crate::{CancelFlag, GenerationOutput, ModelDescriptor, PreviewSink};
 use serde_json::{json, Value};
 
 #[derive(Default)]
@@ -123,6 +123,16 @@ impl Drop for Scope {
 pub fn without_capture<T>(body: impl FnOnce() -> T) -> T {
     let _scope = Scope::enter(None);
     body()
+}
+
+/// Preview callbacks belong to the consumer, not the provider attempt. Keep their
+/// synchronous work from adding unrelated sampler and seed observations.
+pub fn isolated_preview(preview: &PreviewSink) -> PreviewSink {
+    if !preview.is_active() {
+        return PreviewSink::default();
+    }
+    let preview = preview.clone();
+    PreviewSink::new(move |frame| without_capture(|| preview.emit(frame)))
 }
 
 /// Run exactly one provider invocation, publishing only after output and cancellation validation.
@@ -522,6 +532,55 @@ mod tests {
             Ok(output())
         })
         .is_err());
+    }
+    #[test]
+    fn preview_callback_cannot_add_another_generators_sampling_to_the_attempt() {
+        let preview = isolated_preview(&PreviewSink::new(|_| observe(99)));
+        let completed = complete_image_attempt(&descriptor(), &CancelFlag::new(), || {
+            observe(2);
+            preview.emit(crate::PreviewFrame {
+                current: 1,
+                total: 1,
+                image: Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                },
+            });
+            Ok(output())
+        })
+        .unwrap();
+        let ExecutionRandomness::Draws { draws, .. } =
+            &completed.execution.resolved().unwrap().randomness
+        else {
+            panic!()
+        };
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].seed, Some(2));
+    }
+    #[test]
+    fn shared_preview_emitter_isolates_consumer_callback() {
+        let preview = PreviewSink::new(|_| observe(99));
+        let counter = crate::preview::PreviewCounter::new(&[1.0, 0.0]);
+        let completed = complete_image_attempt(&descriptor(), &CancelFlag::new(), || {
+            observe(2);
+            crate::preview::emit_preview(&preview, &counter, &[1.0, 0.0], 1.0, || {
+                Ok(Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                })
+            });
+            Ok(output())
+        })
+        .unwrap();
+        let ExecutionRandomness::Draws { draws, .. } =
+            &completed.execution.resolved().unwrap().randomness
+        else {
+            panic!()
+        };
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].seed, Some(2));
     }
     #[test]
     fn extra_sampling_or_unknown_policy_is_unavailable() {
