@@ -147,3 +147,60 @@ mod tests {
         assert_eq!(*log.borrow(), ["init", "denoise", "drop-retained"]);
     }
 }
+
+#[cfg(test)]
+mod execution_tests {
+    use mlx_gen::gen_core::generator::{
+        ExecutionIdentity, ExecutionRandomness, NumericScheduleDigest,
+    };
+    use mlx_gen::image_execution::{
+        complete_image_attempt, policy_debug, sampled_native_from_primary_seed, with_primary_seed,
+    };
+    use mlx_gen::{CancelFlag, GenerationOutput, Image};
+
+    fn image() -> GenerationOutput {
+        GenerationOutput::Images(vec![Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0],
+        }])
+    }
+
+    #[test]
+    fn externally_supplied_noise_cannot_inherit_a_previous_native_output_seed() {
+        let descriptor = crate::model::descriptor();
+        let cancel = CancelFlag::new();
+        let observe = || {
+            policy_debug("decode", &"untiled");
+            sampled_native_from_primary_seed(
+                "native-test",
+                "actual-times",
+                mlx_rs::Dtype::Float32,
+                &[999.0, 7.0, 0.0],
+                "global-normal-v1",
+            );
+        };
+        let first = complete_image_attempt(&descriptor, &cancel, || {
+            with_primary_seed(41, observe);
+            Ok(image())
+        })
+        .unwrap();
+        let identity = first.execution.resolved().unwrap();
+        let ExecutionRandomness::Draws { draws, .. } = &identity.randomness else {
+            panic!("one seeded native output")
+        };
+        assert_eq!(draws[0].seed, Some(41));
+        let schedule = serde_json::to_value(&identity.schedule).unwrap();
+        let digest = NumericScheduleDigest::f32_values(&[999.0, 7.0, 0.0]).unwrap();
+        assert!(schedule.to_string().contains(&digest.sha256));
+
+        let retry = complete_image_attempt(&descriptor, &cancel, || {
+            observe();
+            Ok(image())
+        })
+        .unwrap();
+        assert!(
+            matches!(retry.execution, ExecutionIdentity::Unavailable { reason } if reason.code == "mlx_image_initial_seed_unobserved")
+        );
+    }
+}

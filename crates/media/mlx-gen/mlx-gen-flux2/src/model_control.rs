@@ -405,6 +405,7 @@ impl Flux2DevControl {
         // `resolve_control` is cheap (reads `req.conditioning`), so resolve it before the residency
         // seam runs; the control-context VAE-encode happens in the heavy phase.
         let (control_image, control_scale) = self.resolve_control(req)?;
+        observe_control_scale(control_scale);
         // Optional img2img init (the fork's `image`/`inpaint_image` seed) via a single `Reference`.
         let img2img = self.resolve_reference(req)?;
         let start_step = match &img2img {
@@ -1003,5 +1004,51 @@ mod tests {
             panic!("registered control safety must reject a missing control artifact")
         };
         assert!(reason.contains("Fun-Controlnet-Union"), "{reason}");
+    }
+}
+
+fn observe_control_scale(control_scale: f32) {
+    mlx_gen::image_execution::scalar("flux2.control_scale", control_scale);
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+
+    fn capture(observe: impl FnOnce()) -> mlx_gen::gen_core::generator::ExecutionIdentity {
+        let descriptor = crate::model_control::descriptor_dev_control();
+        mlx_gen::image_execution::complete_image_attempt(
+            &descriptor,
+            &mlx_gen::CancelFlag::new(),
+            || {
+                mlx_gen::image_execution::policy_debug("test.output", &"rgb8");
+                observe();
+                mlx_gen::image_execution::sampled_native(
+                    "test-metadata",
+                    "resolved-sigmas",
+                    mlx_rs::Dtype::Float32,
+                    &[1.0, 0.5, 0.0],
+                    17,
+                );
+                Ok(mlx_gen::GenerationOutput::Images(vec![mlx_gen::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                }]))
+            },
+        )
+        .unwrap()
+        .execution
+    }
+
+    #[test]
+    fn execution_control_strength_distinguishes_same_seed_and_schedule() {
+        let weak = capture(|| observe_control_scale(0.25));
+        let strong = capture(|| observe_control_scale(0.75));
+        let weak = weak.resolved().unwrap();
+        let strong = strong.resolved().unwrap();
+        assert_eq!(weak.randomness, strong.randomness);
+        assert_eq!(weak.schedule, strong.schedule);
+        assert_ne!(weak.provider_choices, strong.provider_choices);
     }
 }

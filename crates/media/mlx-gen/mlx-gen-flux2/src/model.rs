@@ -761,6 +761,7 @@ impl Flux2 {
         req: &GenerationRequest,
     ) -> Result<String> {
         if !req.enhance_prompt {
+            observe_enhancement_outcome("absent", &req.prompt);
             req.prompt_enhancement
                 .emit(mlx_gen::gen_core::PromptEnhancementReport::absent(
                     &req.prompt,
@@ -768,6 +769,7 @@ impl Flux2 {
             return Ok(req.prompt.clone());
         }
         if !self.variant.is_dev() {
+            observe_enhancement_outcome("unsupported_variant", &req.prompt);
             req.prompt_enhancement
                 .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
                     &req.prompt,
@@ -780,6 +782,7 @@ impl Flux2 {
             .map(|output| classify_upsample_output(&req.prompt, output))
         {
             Ok(Ok(p)) => {
+                observe_enhancement_outcome("enhanced", &p);
                 // The log record is machine-parsed on the `ENHANCED_PROMPT:` prefix; sanitize the
                 // model-generated text so an embedded newline can't split the record or forge a
                 // second prefix line (the returned `p` itself is unchanged) (L-log-injection).
@@ -792,6 +795,7 @@ impl Flux2 {
                 Ok(p)
             }
             Ok(Err(reason)) => {
+                observe_enhancement_outcome(reason, &req.prompt);
                 eprintln!("ENHANCER_FALLBACK:{reason}");
                 req.prompt_enhancement
                     .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
@@ -805,6 +809,12 @@ impl Flux2 {
                 if req.cancel.is_cancelled() {
                     return Err(Error::Canceled);
                 }
+                observe_enhancement_outcome("enhancer_error", &req.prompt);
+                mlx_gen::image_execution::unavailable(
+                    "flux2_prompt_enhancement_failed",
+                    "The caption decoder failed and its completed token execution is unavailable",
+                    "prompt_enhancement_execution",
+                );
                 eprintln!("ENHANCER_FALLBACK:{}", sanitize_log_text(&e.to_string()));
                 req.prompt_enhancement
                     .emit(mlx_gen::gen_core::PromptEnhancementReport::fallback(
@@ -4617,5 +4627,61 @@ mod tests {
                 variant.id()
             );
         }
+    }
+}
+
+fn observe_enhancement_outcome(outcome: &str, caption: &str) {
+    use sha2::{Digest, Sha256};
+    mlx_gen::image_execution::policy(
+        "flux2.prompt_enhancement_outcome",
+        serde_json::json!({
+            "outcome": outcome,
+            "effective_caption_sha256": format!("{:x}", Sha256::digest(caption.as_bytes())),
+        }),
+    );
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+
+    fn capture(observe: impl FnOnce()) -> mlx_gen::gen_core::generator::ExecutionIdentity {
+        let descriptor = descriptor_dev();
+        mlx_gen::image_execution::complete_image_attempt(
+            &descriptor,
+            &mlx_gen::CancelFlag::new(),
+            || {
+                mlx_gen::image_execution::policy_debug("test.output", &"rgb8");
+                observe();
+                mlx_gen::image_execution::sampled_native(
+                    "test-metadata",
+                    "resolved-sigmas",
+                    mlx_rs::Dtype::Float32,
+                    &[1.0, 0.5, 0.0],
+                    17,
+                );
+                Ok(mlx_gen::GenerationOutput::Images(vec![mlx_gen::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                }]))
+            },
+        )
+        .unwrap()
+        .execution
+    }
+
+    #[test]
+    fn execution_enhancement_distinguishes_absence_fallback_and_effective_caption() {
+        let absent = capture(|| observe_enhancement_outcome("absent", "cat"));
+        let fallback = capture(|| observe_enhancement_outcome("unsupported_variant", "cat"));
+        let enhanced = capture(|| observe_enhancement_outcome("enhanced", "striped cat"));
+        let other = capture(|| observe_enhancement_outcome("enhanced", "tabby cat"));
+        let quality = |report: &mlx_gen::gen_core::generator::ExecutionIdentity| {
+            report.resolved().unwrap().quality_policy.clone()
+        };
+        assert_ne!(quality(&absent), quality(&fallback));
+        assert_ne!(quality(&fallback), quality(&enhanced));
+        assert_ne!(quality(&enhanced), quality(&other));
     }
 }

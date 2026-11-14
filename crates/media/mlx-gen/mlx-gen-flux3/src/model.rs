@@ -585,6 +585,7 @@ impl Flux3Klein {
             ||{mlx_gen::residency::drain_allocator_cache();},
             on_progress,
         )?;
+        crate::pup::observe_enhancement_outcome(&outcome);
         Ok(GenerationParams::resolve_caption(
             req,
             outcome.caption,

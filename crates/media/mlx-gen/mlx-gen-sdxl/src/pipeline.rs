@@ -845,10 +845,7 @@ fn denoise_core(
     control_encoder: Option<&Array>,
 ) -> Result<Array> {
     let steps = d.sampler.num_steps();
-    let execution_times: Vec<_> = (0..steps)
-        .map(|i| d.sampler.timestep(i))
-        .chain(std::iter::once(0.0))
-        .collect();
+    let execution_schedule = d.sampler.execution_schedule();
     observe_denoise_policy(d.plan, cfg, controls, ip, inpaint.is_some());
     // A zero-step denoise (img2img at strength ≤ 1/steps) is a no-op: return the init latents
     // unchanged, matching the reference's `int(num_steps · strength)` loop count. Guards the
@@ -867,13 +864,7 @@ fn denoise_core(
                 ("state_elements", latents.size() as u64),
             ],
         );
-        mlx_gen::image_execution::sampled_native_from_primary_seed(
-            "sdxl-family-native-v1",
-            "model-timesteps",
-            latents.dtype(),
-            &execution_times,
-            "mlx-global-normal-initial-v1;subsequent-draws=resolved-sampler-policy",
-        );
+        observe_native_sampling(execution_schedule.as_ref(), latents.dtype());
         return Ok(latents);
     }
     // sc-2963 (rollout of sc-2957): fuse the UNet's SiLU activations via `mx.compile` — bit-exact in
@@ -1017,13 +1008,7 @@ fn denoise_core(
             total,
         });
     }
-    mlx_gen::image_execution::sampled_native_from_primary_seed(
-        "sdxl-family-native-v1",
-        "model-timesteps",
-        latents.dtype(),
-        &execution_times,
-        "mlx-global-normal-initial-v1;subsequent-draws=resolved-sampler-policy",
-    );
+    observe_native_sampling(execution_schedule.as_ref(), latents.dtype());
     Ok(latents)
 }
 
@@ -1322,6 +1307,23 @@ pub fn denoise_cfgpp_with_preview(
         "mlx-global-normal-initial-v1;curated-step=seed+golden-ratio*(step+1),wrapping-u64",
     );
     Ok(out)
+}
+
+fn observe_native_sampling(schedule: Option<&(&str, Vec<f32>)>, dtype: mlx_rs::Dtype) {
+    match schedule {
+        Some((encoding, values)) => mlx_gen::image_execution::sampled_native_from_primary_seed(
+            encoding,
+            "native-sampler-scalar-state",
+            dtype,
+            values,
+            "mlx-global-normal-initial-v1;subsequent-draws=resolved-sampler-policy",
+        ),
+        None => mlx_gen::image_execution::unavailable(
+            "native_sampler_schedule_unobserved",
+            "the instantiated native sampler does not expose its consumed scalar state",
+            "schedule",
+        ),
+    }
 }
 
 fn observe_denoise_policy(

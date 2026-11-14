@@ -1222,3 +1222,105 @@ fn native_request_options_preserve_absence_and_frozen_producer_budget() {
     };
     assert_eq!(outcome.caption, request.prompt);
 }
+
+/// A host-only provider whose completed report varies per attempt. The composition must call
+/// this boundary and retain its evidence, including explicit absence, rather than re-projecting
+/// the submitted enhancement options.
+struct ReportedScripted {
+    engine: Scripted,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+impl TextLlm for ReportedScripted {
+    fn descriptor(&self) -> &TextLlmDescriptor {
+        self.engine.descriptor()
+    }
+
+    fn validate(&self, request: &TextLlmRequest) -> core_llm::Result<()> {
+        self.engine.validate(request)
+    }
+
+    fn generate(
+        &self,
+        _request: &TextLlmRequest,
+        _on_event: &mut dyn FnMut(StreamEvent),
+    ) -> core_llm::Result<TextLlmOutput> {
+        panic!("composed provider must retain the completed report")
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        request: &TextLlmRequest,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) -> core_llm::Result<core_llm::CompletedTextLlm> {
+        let attempt = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let output = self.engine.generate(request, on_event)?;
+        let execution = core_llm::ExecutionIdentity::Unavailable {
+            reason: core_llm::ExecutionUnavailable {
+                code: format!("scripted_attempt_{attempt}"),
+                detail: "Host-only provider deliberately lacks runtime execution evidence".into(),
+                missing_facts: vec!["native_execution".into()],
+            },
+        };
+        core_llm::CompletedTextLlm::new(output, execution, self.descriptor())
+    }
+}
+
+#[test]
+fn completed_prompt_stage_retains_same_attempt_refusal_across_cancel_and_retry() {
+    let engine = ReportedScripted {
+        engine: Scripted::new("a striped cat"),
+        attempts: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let plan = UpsamplePlan {
+        mode: UpsampleMode::Text,
+        original_prompt: "cat".into(),
+        system_prompt: "describe".into(),
+        user_text: "cat".into(),
+        locked: None,
+        references: vec![],
+        max_new_tokens: 16,
+    };
+    let options = UpsampleOptions::default();
+    let (text, execution) = pup::run_text_llm_with_execution_report(
+        &engine,
+        &plan,
+        &options,
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(text, "a striped cat");
+    assert!(
+        matches!(execution, core_llm::ExecutionIdentity::Unavailable { reason }
+        if reason.code == "scripted_attempt_0")
+    );
+
+    let cancelled = CancelFlag::new();
+    let result = pup::run_text_llm_with_execution_report(
+        &engine,
+        &plan,
+        &options,
+        &cancelled,
+        &mut |event| {
+            if matches!(event, Progress::Upsampling { tokens: 1, .. }) {
+                cancelled.cancel();
+            }
+        },
+    );
+    assert!(matches!(result, Err(Error::Canceled)));
+    let (_, retry) = pup::run_text_llm_with_execution_report(
+        &engine,
+        &plan,
+        &options,
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert!(
+        matches!(retry, core_llm::ExecutionIdentity::Unavailable { reason }
+        if reason.code == "scripted_attempt_2")
+    );
+}

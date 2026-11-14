@@ -321,6 +321,7 @@ pub(crate) fn denoise_in_with_seeds(
     mlx_gen::image_execution::policy_debug("iris.dit_window", &window);
     mlx_gen::image_execution::policy_debug("iris.pixel_rows", &pixel_rows);
     mlx_gen::image_execution::policy_debug("iris.solver_coefficients", &plan);
+    observe_cfg(params, &plan);
     mlx_gen::image_execution::policy_debug("iris.flow_prediction", &flow.prediction);
     for &seed in seeds {
         mlx_gen::image_execution::sampled_native_with_rng(
@@ -378,4 +379,81 @@ pub fn to_images(samples: &Array) -> Result<Vec<Image>> {
 /// `[1, 3, H, W]` in `[−1, 1]` → RGB8.
 pub fn to_image(sample: &Array) -> Result<Image> {
     mlx_gen::image::decoded_to_image(sample)
+}
+
+fn observe_cfg(params: &GenerationParams, plan: &[gen_core_iris::DpmStep]) {
+    mlx_gen::image_execution::scalar("iris.cfg_scale", params.cfg_scale);
+    mlx_gen::image_execution::policy_debug(
+        "iris.cfg_per_step",
+        &plan
+            .iter()
+            .map(|step| params.cfg_at(step))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+
+    fn capture(observe: impl FnOnce()) -> mlx_gen::gen_core::generator::ExecutionIdentity {
+        let descriptor = crate::model::descriptor();
+        mlx_gen::image_execution::complete_image_attempt(
+            &descriptor,
+            &mlx_gen::CancelFlag::new(),
+            || {
+                mlx_gen::image_execution::policy_debug("test.output", &"rgb8");
+                observe();
+                mlx_gen::image_execution::sampled_native(
+                    "test-metadata",
+                    "resolved-sigmas",
+                    mlx_rs::Dtype::Float32,
+                    &[1.0, 0.5, 0.0],
+                    17,
+                );
+                Ok(mlx_gen::GenerationOutput::Images(vec![mlx_gen::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                }]))
+            },
+        )
+        .unwrap()
+        .execution
+    }
+
+    #[test]
+    fn execution_cfg_scale_and_actual_activation_both_change_identity() {
+        let request = mlx_gen::GenerationRequest {
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            ..Default::default()
+        };
+        let mut params = GenerationParams::resolve(
+            &request,
+            17,
+            &gen_core_iris::IrisConfig::parse("flow:\n  shift: 4.0\n").unwrap(),
+        )
+        .unwrap();
+        let plan = params.plan().unwrap();
+        params.cfg_scale = 2.0;
+        let base = capture(|| observe_cfg(&params, &plan));
+        params.cfg_scale = 3.0;
+        let scale = capture(|| observe_cfg(&params, &plan));
+        params.cfg_interval = (0.25, 0.75);
+        let gated = capture(|| observe_cfg(&params, &plan));
+        assert_ne!(
+            base.resolved().unwrap().provider_choices,
+            scale.resolved().unwrap().provider_choices
+        );
+        assert_ne!(
+            scale.resolved().unwrap().quality_policy,
+            gated.resolved().unwrap().quality_policy
+        );
+        assert_eq!(
+            base.resolved().unwrap().schedule,
+            gated.resolved().unwrap().schedule
+        );
+    }
 }
