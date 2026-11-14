@@ -29,6 +29,7 @@ use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{self, *};
 use candle_gen_flux2::vae::Flux2Vae;
 use candle_llm::models::qwen35::Qwen35Model;
+use gen_core::generator::{CompletedGeneration, CompletedMossImageEdit, ExecutionIdentity};
 use gen_core_moss_image::{moss_image::*, moss_image_edit::*};
 use loader::Sources;
 use release::release_then_sync;
@@ -230,6 +231,16 @@ impl MossImageGenerator {
         edit: Option<MossImageEditInputs<'_>>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<MossImageAdvancedOutput> {
+        self.run_with_execution(request, inputs, edit, on_progress)
+            .map(|(output, _)| output)
+    }
+    fn run_with_execution(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageAdvancedInputs<'_>,
+        edit: Option<MossImageEditInputs<'_>>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<(MossImageAdvancedOutput, ExecutionIdentity)> {
         let mut state = candle_gen::lock_recover(&self.state);
         state.report = None;
         state.edit_report = None;
@@ -247,6 +258,20 @@ impl MossImageGenerator {
             };
             self.run_locked(&mut state, request, inputs, edit, on_progress, admission)
         })();
+        let result = result.and_then(|output| {
+            transformer::check_cancel(&request.cancel)?;
+            let mut execution = gen_core_moss_image::execution::completed_identity(
+                state.report.as_ref(),
+                state.edit_report.as_ref(),
+                &self.descriptor,
+            )?;
+            gen_core_moss_image::execution::record_custom_adapter_policy(
+                &mut execution,
+                &self.sources.spec.adapters,
+                &state.apply_reports,
+            )?;
+            Ok((output, execution))
+        });
         // Edit renderers and reference K/V never survive a request. CUDA drops enqueue frees:
         // synchronize after release so the next admission sees the recovered driver budget.
         if result.is_err() || edit.is_some() {
@@ -260,6 +285,12 @@ impl MossImageGenerator {
                 state.apply_reports.clear();
             }
             sync.map_err(candle_gen::CandleError::from)?;
+        }
+        if result.is_ok() && request.cancel.is_cancelled() {
+            state.report = None;
+            state.edit_report = None;
+            state.apply_reports.clear();
+            return Err(gen_core::Error::Canceled);
         }
         result
     }
@@ -575,6 +606,32 @@ impl MossImageAdvancedGenerator for MossImageGenerator {
     }
 }
 impl Generator for MossImageGenerator {
+    fn generate_with_execution_report(
+        &self,
+        request: &GenerationRequest,
+        progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<CompletedGeneration> {
+        let (output, execution) =
+            self.run_with_execution(request, MossImageAdvancedInputs::default(), None, progress)?;
+        let MossImageAdvancedOutput::Images(images) = output else {
+            unreachable!("default image output")
+        };
+        CompletedGeneration::new(
+            GenerationReport::from_output(GenerationOutput::Images(images)),
+            execution,
+            &self.descriptor,
+        )
+    }
+    fn generate_moss_image_edit_with_execution_report(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageEditInputs<'_>,
+        progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<CompletedMossImageEdit> {
+        let (output, execution) =
+            self.run_with_execution(request, inputs.advanced, Some(inputs), progress)?;
+        CompletedMossImageEdit::new(output, execution, &self.descriptor)
+    }
     fn generate_moss_image_edit(
         &self,
         request: &GenerationRequest,

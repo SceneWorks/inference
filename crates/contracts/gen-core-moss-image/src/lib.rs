@@ -7,6 +7,7 @@
 //! [`gen_core::Generator`] MOSS entry points carry stays in `gen_core::moss_image` /
 //! `gen_core::moss_image_edit` and is re-exported from the matching modules here.
 
+pub mod execution;
 pub mod moss_image;
 pub mod moss_image_edit;
 pub mod moss_image_training;

@@ -400,6 +400,19 @@ impl MossImage {
         progress: &mut dyn FnMut(Progress),
         edit: Option<MossImageEditInputs<'_>>,
     ) -> Result<MossImageAdvancedOutput> {
+        self.execute_with_execution(request, inputs, progress, edit)
+            .map(|(output, _)| output)
+    }
+    fn execute_with_execution(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageAdvancedInputs<'_>,
+        progress: &mut dyn FnMut(Progress),
+        edit: Option<MossImageEditInputs<'_>>,
+    ) -> Result<(
+        MossImageAdvancedOutput,
+        gen_core::generator::ExecutionIdentity,
+    )> {
         let mut state = self
             .state
             .lock()
@@ -417,12 +430,35 @@ impl MossImage {
             progress,
             edit,
         );
+        let result = result.and_then(|output| {
+            check(&request.cancel)?;
+            let mut execution = gen_core_moss_image::execution::completed_identity(
+                state.report.as_ref(),
+                edit_report.as_ref(),
+                &self.descriptor,
+            )?;
+            gen_core_moss_image::execution::record_custom_adapter_policy(
+                &mut execution,
+                &self.spec.adapters,
+                &state.apply_reports,
+            )?;
+            Ok((output, execution))
+        });
         if result.is_err() {
             *edit_report = None;
             state.failed();
         }
         if result.is_err() || edit.is_some() {
-            self.sources.drain_cache()?;
+            if let Err(error) = self.sources.drain_cache() {
+                *edit_report = None;
+                state.failed();
+                return Err(error);
+            }
+        }
+        if result.is_ok() && request.cancel.is_cancelled() {
+            *edit_report = None;
+            state.failed();
+            return Err(Error::Canceled);
         }
         result
     }
@@ -949,12 +985,41 @@ impl MossImageAdvancedGenerator for MossImage {
     }
 }
 impl Generator for MossImage {
+    fn generate_with_execution_report(
+        &self,
+        request: &GenerationRequest,
+        progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        let (output, execution) = self.execute_with_execution(
+            request,
+            MossImageAdvancedInputs::default(),
+            progress,
+            None,
+        )?;
+        let MossImageAdvancedOutput::Images(images) = output else {
+            unreachable!("default image output")
+        };
+        gen_core::generator::CompletedGeneration::new(
+            gen_core::GenerationReport::from_output(GenerationOutput::Images(images)),
+            execution,
+            &self.descriptor,
+        )
+    }
     fn generate_moss_image_edit(
         &self,
         request: &GenerationRequest,
         inputs: MossImageEditInputs<'_>,
         progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<MossImageAdvancedOutput> {
+        self.generate_moss_image_edit_with_execution_report(request, inputs, progress)
+            .map(|completed| completed.output)
+    }
+    fn generate_moss_image_edit_with_execution_report(
+        &self,
+        request: &GenerationRequest,
+        inputs: MossImageEditInputs<'_>,
+        progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedMossImageEdit> {
         // Clear both receipts even if edit validation rejects before execution starts.
         {
             let mut state = self
@@ -970,8 +1035,9 @@ impl Generator for MossImage {
         }
         inputs.validate()?;
         let request = edit_request(request)?;
-        self.execute(&request, inputs.advanced, progress, Some(inputs))
-            .map_err(Into::into)
+        let (output, execution) =
+            self.execute_with_execution(&request, inputs.advanced, progress, Some(inputs))?;
+        gen_core::generator::CompletedMossImageEdit::new(output, execution, &self.descriptor)
     }
     fn moss_image_edit_request_peak(
         &self,
