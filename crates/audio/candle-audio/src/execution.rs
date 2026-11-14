@@ -4,7 +4,7 @@
 //!
 //! Generators expose these observations through `generate_with_execution_report` and the matching
 //! streaming method. Native pipelines expose additive completed-report methods backed by
-//! [`capture_native`], retaining their original outputs; external sinks use [`callback`].
+//! `capture_native`, retaining their original outputs; external sinks use `callback`.
 //! An intermediate token API is not a completed audio generation. Opaque caller RNGs, legacy
 //! resumed stages, device-global entropy and sessions without a frozen warm-cache identity
 //! explicitly report unavailability instead of claiming deterministic regeneration.
