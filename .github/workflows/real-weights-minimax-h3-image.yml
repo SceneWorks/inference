@@ -355,3 +355,128 @@ jobs:
           path: ${{ runner.temp }}/minimax-h3-image-candle-trained-lora
       - name: Load the Candle-trained adapter on the real image DiT
         run: source scripts/ci/real-weights/mlx-minimax-h3-image-train-load/load-the-candle-trained-adapter.sh
+
+  # SW-7104 (requirement E28): convert the DiT and PE q8/q4 tiers at this commit and publish them to
+  # the SceneWorks Hugging Face repositories the SceneWorks manifest names, after Michael's go-ahead
+  # (2026-11-14). Dispatch-only profiles, never `all`: `minimax-h3-image-publish` runs both jobs,
+  # `-mlx` / `-candle` re-run one side. `scripts/ci/publish_hf_tiers.py` uploads only what the repo
+  # does not already hold, verifies every file against the hub's metadata, and writes a report.
+  # Uploads use the runner's own Hugging Face login, as the Chroma publication does. Each job
+  # removes only its own run-scoped scratch.
+  #
+  # * macOS: the DiT tiers (mlx-gen-minimax-h3's converter; the MLX affine pack both backends load)
+  #   to SceneWorks/minimax-h3-image-mlx `q8/`, `q4/`, and the PE MLX affine tiers to
+  #   SceneWorks/minimax-h3-image-pe `q8/`, `q4/`.
+  # * Windows: the PE Candle GGML tiers to SceneWorks/minimax-h3-image-pe `candle-q8/`, `candle-q4/`.
+  #   Candle's qwen3_5 loader reads GGML block storage and MLX reads affine packs, so the PE tiers
+  #   differ per backend. Conversion is CPU-only here.
+  mlx-minimax-h3-image-publish:
+    name: Publish the H3-Image DiT and PE MLX tiers
+    if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'minimax-h3-image-publish' || inputs.profile == 'minimax-h3-image-publish-mlx')
+    runs-on: [self-hosted, macOS, ARM64, rw-mage]
+    timeout-minutes: 720
+    env:
+      MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
+      MINIMAX_PE_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--MiniMaxAI--MiniMax-H3-Image-PE/snapshots/35603d4b63949afa12cb098227fffefedf081afa
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Resolve runner-local snapshot paths
+        run: python3.12 scripts/release/resolve_snapshot_paths.py MLX_GEN_MODELS_ROOT MINIMAX_PE_SNAPSHOT
+      - name: Report runner disk headroom
+        continue-on-error: true
+        run: scripts/ci/report_runner_disk_headroom.sh MLX_GEN_MODELS_ROOT MINIMAX_PE_SNAPSHOT
+      - name: Prepare the publication
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/prepare-the-publication.sh
+      - name: Set up the MLX build environment
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/set-up-the-mlx-build-environment.sh
+      - name: Build the converters
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/build-the-converters.sh
+      - name: Materialize the image DiT
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/materialize-the-image-dit.sh
+      - name: Require disk headroom for the DiT tiers
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/require-disk-headroom-for-the-dit-tiers.sh
+      - name: Convert the DiT q8 and q4 tiers
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/convert-the-dit-tiers.sh
+      - name: Publish the DiT tiers
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/publish-the-dit-tiers.sh
+      - name: Materialize the PE snapshot
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/materialize-the-pe-snapshot.sh
+      - name: Require disk headroom for the PE tiers
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/require-disk-headroom-for-the-pe-tiers.sh
+      - name: Convert the PE bf16 intermediate
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/convert-the-pe-bf16-intermediate.sh
+      - name: Convert the PE MLX q8 and q4 tiers
+        shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/convert-the-pe-mlx-tiers.sh
+      - name: Publish the PE MLX tiers
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/publish-the-pe-mlx-tiers.sh
+      - name: Keep the publication reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: minimax-h3-image-publication-mlx
+          path: ${{ runner.temp }}/sw-7104-publication-reports
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Remove this run's scratch
+        if: always()
+        run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/remove-this-runs-scratch.sh
+
+  candle-minimax-h3-image-pe-publish:
+    name: Publish the H3-Image PE Candle tiers
+    if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'minimax-h3-image-publish' || inputs.profile == 'minimax-h3-image-publish-candle')
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 720
+    env:
+      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      MINIMAX_PE_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--MiniMaxAI--MiniMax-H3-Image-PE\snapshots\35603d4b63949afa12cb098227fffefedf081afa
+      PUBLISH_SCRATCH: D:\sceneworks-terminal\weights\sw-7104-publish-${{ github.run_id }}-${{ github.run_attempt }}
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe-publish\install-reviewed-cpython-3-12.cmd
+      - name: Select Git Bash
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe-publish\select-git-bash.cmd
+      - name: Prepare the publication
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe-publish\prepare-the-publication.cmd
+      - name: Materialize and verify immutable snapshots
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe-publish\materialize-and-verify-immutable-snapshots.cmd
+      - uses: ./.github/actions/setup-rust
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Convert the PE Candle q8 and q4 tiers
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe-publish\convert-the-pe-candle-tiers.cmd
+      - name: Publish the PE Candle tiers
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe-publish\publish-the-pe-candle-tiers.cmd
+      - name: Keep the publication reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: minimax-h3-image-publication-candle
+          path: ${{ runner.temp }}\sw-7104-publication-reports
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Remove this run's scratch
+        if: always()
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-minimax-h3-image-pe-publish\remove-this-runs-scratch.cmd
