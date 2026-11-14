@@ -188,9 +188,15 @@ fn cache_bytes(facts_text_width: u64, run: &TrainingRunShape) -> Result<u64> {
 }
 
 /// The estimate of `run` against `facts` on `contract` — see the module docs.
+///
+/// `facts` prices the generator's own phases (conditioning, previews) at the load's precision;
+/// `train_facts` prices the training DiT's weights at the run's compute dtype — a float32 run casts
+/// every dense weight the DiT loads to float32 (packed q4/q8 bases stay packed), so its facts are
+/// the same headers resolved at [`mlx_gen::Precision::Fp32`].
 pub fn estimate_training(
     contract: &MemoryProviderContract,
     facts: &ImageMemoryFacts,
+    train_facts: &ImageMemoryFacts,
     tier: MemoryNumericTier,
     run: &TrainingRunShape,
 ) -> Result<TrainingEstimate> {
@@ -201,9 +207,9 @@ pub fn estimate_training(
     let edit = run.items.iter().any(|i| !i.references.is_empty());
     let a = run.width;
     let weights = DitWeightBytes {
-        trunk: facts.dit_trunk_bytes,
-        block_body: facts.dit_body_bytes.clone(),
-        block_adaln: facts.dit_adaln_bytes.clone(),
+        trunk: train_facts.dit_trunk_bytes,
+        block_body: train_facts.dit_body_bytes.clone(),
+        block_adaln: train_facts.dit_adaln_bytes.clone(),
         modulation_tables: modulation_table_bytes(edit, a),
     };
     let encoder = crate::config::MiniMaxH3VaeConfig::image();
@@ -259,14 +265,26 @@ pub fn estimate_training(
     let conditioning = conditioning.saturating_add(cache);
     let latents = latents.saturating_add(cache);
     let train = train.saturating_add(cache);
-    // Previews run the generator with the training DiT's trunk and tables still mapped and the
-    // adapter state live.
+    // Previews run the generator while the training DiT stays loaded and the adapter state live:
+    // its trunk and tables when streamed (no block is held between steps), or the whole resident
+    // DiT — every block body, and every installed LoKr delta — when not.
+    let retained = if run.checkpointed {
+        weights.trunk + weights.modulation_tables
+    } else {
+        weights
+            .block_body
+            .iter()
+            .fold(weights.trunk + weights.modulation_tables, |t, b| {
+                t.saturating_add(*b)
+            })
+            .saturating_add(2 * run.lokr_delta_total)
+    };
     let preview = match &run.preview {
         Some(item) => estimate(contract, facts, &request_shape(item), &selection)?
             .peak_bytes()
             .saturating_add(cache)
             .saturating_add(step.adapter_state)
-            .saturating_add(weights.trunk + weights.modulation_tables),
+            .saturating_add(retained),
         None => 0,
     };
     Ok(TrainingEstimate {
@@ -403,7 +421,7 @@ mod tests {
         let facts = ImageMemoryFacts::derived(Some(4));
         let t = tier(Some(Quant::Q4));
         let r = run(true);
-        let est = estimate_training(&c, &facts, t, &r).unwrap();
+        let est = estimate_training(&c, &facts, &facts, t, &r).unwrap();
         let sel = streamed_selection(&c, t).unwrap();
         let inference = estimate(&c, &facts, &request_shape(&r.items[0]), &sel).unwrap();
         let cache = cache_bytes(5120, &r).unwrap();
@@ -428,7 +446,7 @@ mod tests {
         let c = contract();
         let facts = ImageMemoryFacts::derived(Some(4));
         let t = tier(Some(Quant::Q4));
-        let streamed = estimate_training(&c, &facts, t, &run(true)).unwrap();
+        let streamed = estimate_training(&c, &facts, &facts, t, &run(true)).unwrap();
         assert!(
             streamed.step.weights < facts.dit_bytes() / 4,
             "{} vs {}",
@@ -436,7 +454,7 @@ mod tests {
             facts.dit_bytes()
         );
         admit_training(&streamed, budget_of(128 * GB), &run(true), 2048).unwrap();
-        let resident = estimate_training(&c, &facts, t, &run(false)).unwrap();
+        let resident = estimate_training(&c, &facts, &facts, t, &run(false)).unwrap();
         assert!(resident.train > streamed.train);
         let err = admit_training(&resident, budget_of(128 * GB), &run(false), 2048)
             .unwrap_err()
@@ -455,10 +473,10 @@ mod tests {
         let c = contract();
         let facts = ImageMemoryFacts::derived(Some(4));
         let t = tier(Some(Quant::Q4));
-        let t2i = estimate_training(&c, &facts, t, &run(true)).unwrap();
+        let t2i = estimate_training(&c, &facts, &facts, t, &run(true)).unwrap();
         let mut edit = run(true);
         edit.items = vec![item(vec![(1024, 1024); 2]); 8];
-        let edit = estimate_training(&c, &facts, t, &edit).unwrap();
+        let edit = estimate_training(&c, &facts, &facts, t, &edit).unwrap();
         assert!(edit.train > t2i.train);
         assert!(edit.conditioning > t2i.conditioning);
     }
@@ -478,13 +496,13 @@ mod tests {
         let seq = text + reference + image;
         assert!(seq > 8_000, "{text} + {reference} + {image}");
         assert!(training_attention_heads_per_chunk(seq) < 56);
-        let chunked = estimate_training(&c, &facts, t, &edit).unwrap();
+        let chunked = estimate_training(&c, &facts, &facts, t, &edit).unwrap();
         admit_training(&chunked, budget_of(128 * GB), &edit, 2048).unwrap();
         let unchunked_run = TrainingRunShape {
             chunked_attention: false,
             ..edit.clone()
         };
-        let unchunked = estimate_training(&c, &facts, t, &unchunked_run).unwrap();
+        let unchunked = estimate_training(&c, &facts, &facts, t, &unchunked_run).unwrap();
         let full_scores = 6 * 56 * seq * seq * 2;
         assert!(unchunked.step.block_backward >= full_scores);
         // Chunked: one head's 6 + 11 arrays in place of 56 heads' 6.
@@ -495,6 +513,38 @@ mod tests {
         assert!(unchunked.train > chunked.train + full_scores / 2);
         admit_training(&chunked, budget_of(80 * GB), &edit, 2048).unwrap();
         assert!(admit_training(&unchunked, budget_of(80 * GB), &unchunked_run, 2048).is_err());
+    }
+
+    /// Previews render while the training DiT stays loaded: a resident (non-checkpointed) run
+    /// keeps every block body, so its preview phase is priced above the streamed run's by them.
+    #[test]
+    fn a_resident_runs_preview_keeps_the_whole_training_dit() {
+        let c = contract();
+        let facts = ImageMemoryFacts::derived(Some(4));
+        let t = tier(Some(Quant::Q4));
+        let preview = |checkpointed: bool| TrainingRunShape {
+            preview: Some(item(vec![])),
+            ..run(checkpointed)
+        };
+        let streamed = estimate_training(&c, &facts, &facts, t, &preview(true)).unwrap();
+        let resident = estimate_training(&c, &facts, &facts, t, &preview(false)).unwrap();
+        let bodies: u64 = facts.dit_body_bytes.iter().sum();
+        assert!(resident.preview >= streamed.preview + bodies);
+    }
+
+    /// The training DiT's weights come from `train_facts` (the run's compute dtype), the
+    /// generator's phases from `facts`: wider training weights raise the train phase only.
+    #[test]
+    fn training_weights_are_priced_at_the_compute_dtype() {
+        let c = contract();
+        let facts = ImageMemoryFacts::derived(Some(4));
+        let mut wide = facts.clone();
+        wide.dit_body_bytes.iter_mut().for_each(|b| *b *= 2);
+        let t = tier(Some(Quant::Q4));
+        let narrow = estimate_training(&c, &facts, &facts, t, &run(true)).unwrap();
+        let widened = estimate_training(&c, &facts, &wide, t, &run(true)).unwrap();
+        assert!(widened.train > narrow.train);
+        assert_eq!(widened.conditioning, narrow.conditioning);
     }
 
     #[test]

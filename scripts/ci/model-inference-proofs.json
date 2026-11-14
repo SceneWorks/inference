@@ -313013,7 +313013,7 @@
     "required_environment": [
       "MINIMAX_H3_IMAGE_SNAPSHOT",
       "MINIMAX_H3_IMAGE_TIERS_ROOT",
-      "MINIMAX_H3_SNAPSHOT"
+      "MINIMAX_H3_TIER_SNAPSHOT"
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -313091,7 +313091,7 @@
     "required_environment": [
       "MINIMAX_H3_IMAGE_SNAPSHOT",
       "MINIMAX_H3_IMAGE_TIERS_ROOT",
-      "MINIMAX_H3_SNAPSHOT"
+      "MINIMAX_H3_TIER_SNAPSHOT"
     ],
     "device_witness": "Source-owned successful learned Tensor boundary (not factory/host-readback metadata); final source controls and original fixture preserved",
     "output_contract": "Exactly one successful libtest summary, exactly one late static actual-FQN BODY, exact actual learned DEVICE kind set; source-required missing-work event invalidates proof",
@@ -313664,7 +313664,7 @@
     "required_environment": [
       "MINIMAX_H3_IMAGE_SNAPSHOT",
       "MINIMAX_H3_IMAGE_TIERS_ROOT",
-      "MINIMAX_H3_SNAPSHOT"
+      "MINIMAX_H3_TIER_SNAPSHOT"
     ],
     "route_metadata": {
       "ignore_reason": "needs the converted q8 tier, MINIMAX_H3_IMAGE_SNAPSHOT and MiniMax-H3's q8 text encoder (MINIMAX_H3_TIER_SNAPSHOT); full 2048\u00b2 render",
@@ -313699,7 +313699,7 @@
     "required_environment": [
       "MINIMAX_H3_IMAGE_SNAPSHOT",
       "MINIMAX_H3_IMAGE_TIERS_ROOT",
-      "MINIMAX_H3_SNAPSHOT"
+      "MINIMAX_H3_TIER_SNAPSHOT"
     ],
     "route_metadata": {
       "ignore_reason": "needs the converted q4 tier, MINIMAX_H3_IMAGE_SNAPSHOT and MiniMax-H3's q4 text encoder (MINIMAX_H3_TIER_SNAPSHOT); full 2048\u00b2 render",
@@ -313767,7 +313767,7 @@
     "required_environment": [
       "MINIMAX_H3_IMAGE_SNAPSHOT",
       "MINIMAX_H3_IMAGE_TIERS_ROOT",
-      "MINIMAX_H3_SNAPSHOT"
+      "MINIMAX_H3_TIER_SNAPSHOT"
     ],
     "route_metadata": {
       "ignore_reason": "needs the converted q4 tier, MINIMAX_H3_IMAGE_SNAPSHOT and MiniMax-H3's q4 text encoder (MINIMAX_H3_TIER_SNAPSHOT); 16 MP streamed render",
