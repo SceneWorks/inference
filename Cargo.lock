@@ -2532,6 +2532,7 @@ dependencies = [
  "image",
  "libc",
  "memmap2",
+ "mlx-gen",
  "mlx-llm",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",

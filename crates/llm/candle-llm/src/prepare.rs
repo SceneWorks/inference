@@ -74,16 +74,16 @@ fn backend() -> &'static str {
 }
 
 /// Weightless probe: can the candle backend prepare `spec.source`? A `*.gguf` container is accepted;
-/// an HF source must be a directory holding `config.json` and must not be a multimodal snapshot (a
-/// `vision_config` block belongs to the vision provider's preparer). Reads only `config.json`, never a
-/// weight shard — mirrors [`provider::can_load`](crate::provider::can_load).
+/// an HF source must be a directory holding `config.json` and be text-only or a `qwen3_5` VLM
+/// (`prepares_multimodal_or_text`; every other `vision_config` snapshot is declined). Reads only
+/// `config.json`, never a weight shard — mirrors [`provider::can_load`](crate::provider::can_load).
 pub fn can_prepare(spec: &PrepareSpec) -> bool {
     match detect_format(&spec.source) {
         Ok(ModelFormat::Gguf) => true,
         Ok(ModelFormat::Safetensors) => {
             spec.source.is_dir()
                 && spec.source.join("config.json").is_file()
-                && !has_vision_config(&spec.source.join("config.json"))
+                && prepares_multimodal_or_text(&spec.source.join("config.json"))
         }
         Err(_) => false,
     }
@@ -150,6 +150,10 @@ fn prepare_hf(spec: &PrepareSpec) -> Result<PrepareReport> {
     std::fs::copy(&tokenizer_path, spec.out_dir.join("tokenizer.json"))?;
     copy_optional(src, &spec.out_dir, "tokenizer_config.json")?;
     copy_optional(src, &spec.out_dir, "special_tokens_map.json")?;
+    // A snapshot whose chat template or sampling defaults live beside the weights (Qwen3.8) keeps
+    // them, so the tier is self-contained.
+    copy_optional(src, &spec.out_dir, "chat_template.jinja")?;
+    copy_optional(src, &spec.out_dir, "generation_config.json")?;
 
     Ok(PrepareReport {
         input_format: ModelFormat::Safetensors,
@@ -388,14 +392,21 @@ fn resolve_gguf_path(source: &Path) -> Result<PathBuf> {
         .ok_or_else(|| Error::Unsupported(format!("prepare: no *.gguf in {}", source.display())))
 }
 
-/// Whether a `config.json` declares a `vision_config` (a multimodal snapshot the text preparer
-/// declines). Any read/parse failure ⇒ `false` (the format probe handles non-snapshots).
-fn has_vision_config(config_json: &Path) -> bool {
-    std::fs::read_to_string(config_json)
+/// Whether this preparer takes the snapshot `config_json` describes: every text-only snapshot, and
+/// the one multimodal family whose loader reads a prepared tier, `qwen3_5` (Qwen3.5/3.6/3.8-VL).
+/// Its decoder and MTP projections are the tensors [`QuantizedTensors`] selects; the vision tower
+/// (`model.visual.*`) is not among them, so it is written exactly as read and the prepared tier
+/// still takes image input. Every other multimodal snapshot (a `vision_config` block) is declined.
+/// Any read/parse failure ⇒ text (the format probe handles non-snapshots).
+fn prepares_multimodal_or_text(config_json: &Path) -> bool {
+    let Some(config) = std::fs::read_to_string(config_json)
         .ok()
         .and_then(|t| serde_json::from_str::<Json>(&t).ok())
-        .map(|v| v.get("vision_config").is_some())
-        .unwrap_or(false)
+    else {
+        return true;
+    };
+    config.get("vision_config").is_none()
+        || config.get("model_type").and_then(Json::as_str) == Some("qwen3_5")
 }
 
 /// Count weight tensors across every `*.safetensors` shard in `dir` by reading only the headers (no
@@ -494,6 +505,49 @@ mod tests {
         bytes.extend_from_slice(&[0; 4]);
         std::fs::write(&shard, &bytes).unwrap();
         assert_eq!(count_safetensors_tensors(dir.path()).unwrap(), 1);
+    }
+
+    /// A quantized tier of a `qwen3_5` VLM keeps its whole vision tower as read: over the real
+    /// Qwen3.8-27B config and tensor list, the selection the preparer quantizes holds decoder and
+    /// MTP projections only, never a `model.visual.*` tensor. This is what lets the preparer claim
+    /// that family (`prepares_multimodal_or_text`) while declining every other VLM.
+    #[test]
+    fn a_qwen3_5_vlm_tier_never_quantizes_the_vision_tower() {
+        let fixture: Json = serde_json::from_str(include_str!(
+            "../../testdata/load_admission/qwen3.8-27b.json"
+        ))
+        .unwrap();
+        let config = &fixture["config"];
+        let tensors = fixture["tensors"].as_object().unwrap();
+        assert!(
+            config.get("vision_config").is_some(),
+            "the fixture is a VLM"
+        );
+        let selection =
+            QuantizedTensors::from_config(config, |key| tensors.contains_key(key)).unwrap();
+
+        let vision: Vec<&String> = tensors
+            .keys()
+            .filter(|key| key.starts_with("model.visual."))
+            .collect();
+        assert!(!vision.is_empty(), "the fixture carries a vision tower");
+        for key in vision {
+            assert!(!selection.contains(key), "{key} must be written as read");
+        }
+        let selected: Vec<&String> = tensors
+            .keys()
+            .filter(|key| selection.contains(key))
+            .collect();
+        assert!(
+            !selected.is_empty(),
+            "the decoder projections are quantized"
+        );
+        for key in selected {
+            assert!(
+                key.starts_with("model.language_model.layers.") || key.starts_with("mtp."),
+                "{key} is not a decoder or MTP projection"
+            );
+        }
     }
 
     /// sc-19375: the preparer stores blocks for exactly the tensors the loader quantizes and load

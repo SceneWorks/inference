@@ -528,6 +528,36 @@ fn vlm_source_is_declined() {
     }
 }
 
+/// The one multimodal family this preparer takes is `qwen3_5` (Qwen3.5/3.6/3.8-VL): its loader
+/// reads a prepared tier and its vision tower is not among the quantized tensors. A `qwen3_5`
+/// snapshot carrying a `vision_config` is therefore claimed, where every other VLM (above) is
+/// declined. The fixture has no usable weights, so the claim shows as the preparer's own error
+/// about the weights rather than the registry's "no linked backend".
+#[test]
+fn qwen3_5_vlm_source_is_claimed() {
+    let dir = unique_dir("qwen35-vlm");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5",
+            "text_config":{"model_type":"qwen3_5_text"},"vision_config":{"model_type":"qwen3_5"}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("tokenizer.json"), tokenizer_json()).unwrap();
+    std::fs::write(dir.join("model.safetensors"), b"\x00").unwrap();
+
+    let out = unique_dir("qwen35-vlm-out");
+    let error = prepare_snapshot(&PrepareSpec::quantized(
+        dir.to_path_buf(),
+        out.to_path_buf(),
+        Quantize::Q4,
+    ))
+    .expect_err("a fixture without weights cannot be prepared");
+    assert!(
+        !error.to_string().contains("no linked backend can prepare"),
+        "the candle preparer must claim a qwen3_5 VLM, got: {error}"
+    );
+}
+
 // --- gated real-model conformance: prepare a real snapshot, run the helper, and generate ---
 
 fn real_check(source: PathBuf, quant: Option<Quantize>, tag: &str) {
