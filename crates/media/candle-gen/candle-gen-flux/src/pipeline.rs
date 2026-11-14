@@ -1586,7 +1586,15 @@ fn bounded_host_latent_transfer(
         start += length;
     }
     let refs = chunks.iter().collect::<Vec<_>>();
-    Ok(Tensor::cat(&refs, 2)?)
+    let host_latents = Tensor::cat(&refs, 2)?;
+    // Both sequential and reference routes decode these tensors with the CPU F32 VAE.
+    // Record the actual decode boundary, not the loaded DiT's device/precision.
+    candle_gen::execution::runtime(host_latents.device(), host_latents.dtype());
+    candle_gen::execution::policy(
+        "flux/pipeline/vae_decode",
+        "bounded_whole_frame_host".into(),
+    );
+    Ok(host_latents)
 }
 
 fn to_image(decoded: &Tensor) -> Result<Image> {
@@ -2096,5 +2104,77 @@ mod execution_policy_tests {
             make(vec![adapter]),
             gen_core::generator::ExecutionIdentity::Unavailable { .. }
         ));
+    }
+
+    #[test]
+    fn execution_bounded_vae_records_cpu_f32_after_bf16_denoise() -> Result<()> {
+        use gen_core::generator::{ExecutionFact, ExecutionIdentity};
+        let tokens = Tensor::zeros((1, 1, 64), DType::BF16, &Device::Cpu)?;
+        let capture = |bounded| {
+            let cancel = gen_core::CancelFlag::default();
+            candle_gen::execution::capture_direct(&crate::descriptor_dev(), &cancel, || {
+                candle_gen::execution::runtime(tokens.device(), tokens.dtype());
+                candle_gen::execution::policy("fixture_denoise", true.into());
+                candle_gen::execution::draw("fixture", 7, 0);
+                candle_gen::execution::rng_scheme("fixture-metadata-v1");
+                candle_gen::execution::schedule("fixture", &[1.0, 0.0], "fixture");
+                if bounded {
+                    let host = bounded_host_latent_transfer(&tokens, 16, 16, &cancel, 512, 128)
+                        .map_err(gen_core::Error::from)?;
+                    assert!(host.device().is_cpu());
+                    assert_eq!(host.dtype(), DType::F32);
+                }
+                Ok(gen_core::GenerationOutput::Images(vec![Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 3],
+                }]))
+            })
+            .unwrap()
+            .execution
+        };
+        let clean = capture(false);
+        let bounded = capture(true);
+        assert_ne!(clean, bounded);
+        let ExecutionIdentity::Resolved { identity } = bounded else {
+            panic!("complete fixture")
+        };
+        let ExecutionFact::Resolved { value } = &identity.quality_policy else {
+            panic!("quality policy")
+        };
+        assert_eq!(
+            value["compute"],
+            serde_json::json!([
+                {"device": "Cpu", "dtype": "BF16"}, {"device": "Cpu", "dtype": "F32"}
+            ])
+        );
+        assert_eq!(
+            value["operations"]["flux/pipeline/vae_decode"],
+            serde_json::json!([{ "value": "bounded_whole_frame_host", "repetitions": 1 }])
+        );
+        assert_eq!(
+            capture(false),
+            clean,
+            "a later resident attempt must not inherit the host decoder"
+        );
+        let cancel = gen_core::CancelFlag::default();
+        let canceled =
+            candle_gen::execution::capture_direct(&crate::descriptor_dev(), &cancel, || {
+                bounded_host_latent_transfer(&tokens, 16, 16, &cancel, 512, 128)
+                    .map_err(gen_core::Error::from)?;
+                cancel.cancel();
+                Ok(gen_core::GenerationOutput::Images(vec![Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 3],
+                }]))
+            });
+        assert!(matches!(canceled, Err(gen_core::Error::Canceled)));
+        assert_eq!(
+            capture(false),
+            clean,
+            "canceled host facts must not leak into a retry"
+        );
+        Ok(())
     }
 }
