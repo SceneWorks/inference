@@ -480,6 +480,11 @@ impl ChatterboxGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<(Vec<u32>, Vec<u32>)> {
         let defaults = GenerationDefaults::default();
+        candle_audio::execution::sampling(
+            "chatterbox-t3",
+            serde_json::json!(format!("{defaults:?}")),
+        );
+        candle_audio::execution::policy("t3", serde_json::json!(format!("{:?}", self.t3_config)));
 
         // 1. Conditioning → the T3 speaker vector, plus the s3tokenizer prompt tokens when a
         //    reference clip is present (sc-13235). A VoiceEmbedding-only request has no clip to
@@ -506,7 +511,11 @@ impl ChatterboxGenerator {
         // 3. T3 autoregressive decode (real weights) → speech tokens.
         self.ensure_t3()?;
         let seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let mut rng = StdRng::seed_from_u64(seed);
+        let mut rng = StdRng::seed_from_u64(candle_audio::execution::seed(
+            "chatterbox/model.rs",
+            "rand-0.9-StdRng",
+            seed,
+        ));
         let max_new = self.t3_config.max_speech_tokens;
         let cancel = req.cancel.clone();
         let cancel_fn = move || cancel.is_cancelled();
@@ -547,6 +556,23 @@ impl ChatterboxGenerator {
 }
 
 impl Generator for ChatterboxGenerator {
+    fn generate_streaming_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_chunk: &mut dyn FnMut(gen_core::AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_audio::execution::capture_terminal_streaming(self, req, on_chunk, on_progress)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_audio::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -606,6 +632,7 @@ impl Generator for ChatterboxGenerator {
 
         // Provenance watermark — always applied (the reference behavior; no disable flag).
         let samples = self.watermark(&samples)?;
+        candle_audio::execution::policy("watermark", serde_json::json!({"perth":"mandatory"}));
 
         Ok(GenerationOutput::Audio(AudioTrack {
             samples,

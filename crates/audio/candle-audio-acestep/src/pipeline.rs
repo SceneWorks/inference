@@ -342,7 +342,12 @@ impl AceStepPipeline {
     fn seeded_noise_with(&self, latent_len: usize, seed: u64) -> Result<Tensor> {
         let acoustic = self.config.transformer.audio_acoustic_hidden_dim;
         let n = latent_len * acoustic;
-        let mut rng = StdRng::seed_from_u64(seed);
+        candle_audio::execution::runtime(&self.device, DType::F32);
+        let mut rng = StdRng::seed_from_u64(candle_audio::execution::seed(
+            "acestep/pipeline.rs",
+            "rand-0.9-StdRng",
+            seed,
+        ));
         let noise: Vec<f32> = (0..n).map(|_| rng.sample(StandardNormal)).collect();
         Ok(Tensor::from_vec(
             noise,
@@ -434,6 +439,21 @@ impl AceStepPipeline {
         };
         let schedule = FlowMatchSchedule::new(params.steps, shift);
         let mut latents = self.seeded_noise_with(latent_len, params.seed)?;
+        candle_audio::execution::schedule(
+            "flow-match-euler",
+            &(0..=schedule.num_steps())
+                .map(|k| schedule.sigma(k))
+                .collect::<Vec<_>>(),
+            "velocity",
+        );
+        candle_audio::execution::sampling(
+            "flow-match-euler",
+            serde_json::json!({"steps":schedule.num_steps()}),
+        );
+        candle_audio::execution::policy(
+            "synthesis",
+            serde_json::json!({"seconds_bits":params.seconds.to_bits(),"latent_length":latent_len,"shift_bits":shift.to_bits()}),
+        );
         for k in 0..schedule.num_steps() {
             if cancel() {
                 return Ok(None);
@@ -511,6 +531,10 @@ impl AceStepPipeline {
 
         // 2. Target latent length + generate window [w0, w1) in latent frames.
         let (target_len, w0, w1) = self.edit_window(params, src_frames, l_src)?;
+        candle_audio::execution::policy(
+            "acestep-edit",
+            serde_json::json!({"task":format!("{:?}",params.task),"target_latents":target_len,"window_start":w0,"window_end":w1,"preserve_outside_window":true,"crossfade":"equal-power-inside-window"}),
+        );
 
         // 3. src_latents: original source outside the window, silence inside; silence tail past the
         //    source length (extend). Mirrors the reference `torch.where(chunk_mask>0.5, silence, src)`.
@@ -684,6 +708,10 @@ impl AceStepPipeline {
         // 5. Denoise through the non-distilled sft cover DiT (guidance 1, multi-step — the reference's
         //    actual cover model, which preserves the source's melodic content the distilled 8-step
         //    turbo DiT cannot). The turbo-tuned request `steps` is overridden to the sft cover regime.
+        candle_audio::execution::policy(
+            "acestep-cover",
+            serde_json::json!({"dit":"sft","steps":COVER_SFT_STEPS,"guidance":1,"whole_clip":true}),
+        );
         let cover_params = SynthesisParams {
             steps: COVER_SFT_STEPS,
             ..params.clone()

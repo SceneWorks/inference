@@ -35,3 +35,36 @@ pub const DEFAULT_PARAMS: SamplingParams = SamplingParams {
     repetition_penalty: REPETITION_PENALTY,
     repetition_window: REPETITION_WINDOW,
 };
+
+#[cfg(test)]
+mod execution_identity_tests {
+    use super::*;
+    #[test]
+    fn decoder_defaults_are_reported_by_exact_bits() {
+        use candle_audio::{
+            candle_core::{DType, Device},
+            execution, gen_core,
+        };
+        let attempt = execution::Attempt::begin();
+        DEFAULT_PARAMS.observe_execution("defaults");
+        execution::runtime(&Device::Cpu, DType::F32);
+        execution::policy("test", serde_json::json!({"native_defaults":true}));
+        let _rng = Rng::seed(0);
+        let result = attempt.finish(
+            &crate::model::descriptor(),
+            Some(&gen_core::AudioTrack::default()),
+        );
+        let gen_core::generator::ExecutionFact::Resolved { value } =
+            &result.resolved().unwrap().sampling
+        else {
+            panic!("sampling")
+        };
+        assert_eq!(value[0]["settings"]["temperature_bits"], 0.9f32.to_bits());
+        assert_eq!(value[0]["settings"]["top_p_bits"], 0.95f32.to_bits());
+        assert_eq!(value[0]["settings"]["top_k"], TOP_K);
+        assert_eq!(
+            value[0]["settings"]["repetition_penalty_bits"],
+            1.0f32.to_bits()
+        );
+    }
+}

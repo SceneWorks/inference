@@ -1173,6 +1173,8 @@ pub struct StableAudio3Pipeline {
     same: SameAutoencoder,
     device: Device,
     dtypes: ComputeDTypes,
+    execution_adapters: serde_json::Value,
+    execution_chunked: bool,
 }
 
 impl StableAudio3Pipeline {
@@ -1258,6 +1260,8 @@ impl StableAudio3Pipeline {
             same,
             device: device.clone(),
             dtypes,
+            execution_chunked: diffusion.pretransform.chunked,
+            execution_adapters: serde_json::json!(adapters.targets().map(|target| serde_json::json!({"target":target,"ops":adapters.ops_for(target).unwrap_or_default().iter().map(|op|serde_json::json!({"kind":format!("{:?}",op.kind),"scale_bits":op.effective_scale.to_bits(),"rank":op.rank,"index":op.adapter_index})).collect::<Vec<_>>()})).collect::<Vec<_>>()),
         })
     }
 
@@ -1429,6 +1433,12 @@ impl StableAudio3Pipeline {
         on_encoding: &mut dyn FnMut(candle_audio::gen_core::Progress),
     ) -> Result<(Vec<f32>, Option<ReferenceDrawOrder>)> {
         let parameters = request.parameters;
+        candle_audio::execution::runtime(&self.device, self.dtypes.root);
+        candle_audio::execution::runtime(&self.device, self.dtypes.text);
+        candle_audio::execution::policy(
+            "sa3",
+            serde_json::json!({"parameters":format!("{parameters:?}"),"chunked":self.execution_chunked,"chunk_parameters":format!("{:?}",SameChunkingParameters::default()),"adapters":self.execution_adapters}),
+        );
         let is_canceled = hooks.is_canceled;
         canceled(is_canceled)?;
         if reference.is_some() && edit.is_some() {
@@ -1507,6 +1517,10 @@ impl StableAudio3Pipeline {
                 draws_after_source_encode: noise.draws(),
             });
             let resolved = edit_geometry(&edit, &geometry, parameters.duration_secs)?;
+            candle_audio::execution::policy(
+                "sa3-edit",
+                serde_json::json!({"region":format!("{resolved:?}"),"preserve_outside_region":true}),
+            );
             // The `duration_secs` argument one line up is weights-only and sets the padding
             // boundary; this compares the result against the sampling geometry's own,
             // independently-derived effective span. See `edit_geometry_matches_request`.
@@ -1638,6 +1652,12 @@ impl StableAudio3Pipeline {
         mut hooks: SynthesisHooks<'_>,
     ) -> Result<(Tensor, Vec<f32>)> {
         let parameters = request.parameters;
+        candle_audio::execution::runtime(&self.device, self.dtypes.root);
+        candle_audio::execution::runtime(&self.device, self.dtypes.text);
+        candle_audio::execution::policy(
+            "sa3",
+            serde_json::json!({"parameters":format!("{parameters:?}"),"chunked":self.execution_chunked,"chunk_parameters":format!("{:?}",SameChunkingParameters::default()),"adapters":self.execution_adapters}),
+        );
         let is_canceled = hooks.is_canceled;
         canceled(is_canceled)?;
         let geometry = self.geometry(parameters.duration_secs)?;
@@ -1651,6 +1671,9 @@ impl StableAudio3Pipeline {
         let initial = initial
             .to_device(&self.device)?
             .to_dtype(self.dtypes.root)?;
+        candle_audio::execution::unavailable(
+            "SA3 controlled caller noise tensors are not bound to a completed replay identity",
+        );
         let mut noise = InjectedNoise::new(pingpong_noises);
         // The replay path is text-only: no reference, no edit, so the local conditioning is zero.
         let local = Tensor::zeros(

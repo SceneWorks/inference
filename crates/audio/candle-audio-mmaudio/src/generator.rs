@@ -456,6 +456,22 @@ impl MmAudioPipeline {
             .empty_conditions_with_text(1, neg_text_feat)
             .map_err(AudioError::from)?;
 
+        candle_audio::execution::runtime(x0.device(), x0.dtype());
+        candle_audio::execution::sampling(
+            "mmaudio-euler",
+            candle_audio::execution::json!({"cfg_bits":cfg.to_bits(),"steps":steps}),
+        );
+        candle_audio::execution::schedule(
+            "mmaudio-euler",
+            &(0..=steps)
+                .map(|i| i as f64 / steps as f64)
+                .collect::<Vec<_>>(),
+            "velocity",
+        );
+        candle_audio::execution::policy(
+            "conditioning",
+            candle_audio::execution::json!({"latent_shape":x0.dims(),"clip_shape":clip_feat.dims(),"sync_shape":sync_feat.dims(),"text_shape":text_feat.dims()}),
+        );
         let mut x = x0.clone();
         for i in 0..steps {
             if probe() {
@@ -534,7 +550,11 @@ pub(crate) fn seeded_prior(
     latent_dim: usize,
     dev: &Device,
 ) -> CResult<Tensor> {
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_audio::execution::seed(
+        "mmaudio/generator.rs",
+        "rand-0.9-StdRng",
+        seed,
+    ));
     let n = latent_seq_len * latent_dim;
     let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
     Tensor::from_vec(data, (1, latent_seq_len, latent_dim), dev)
@@ -631,6 +651,23 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 impl Generator for MmAudioGenerator {
+    fn generate_streaming_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_chunk: &mut dyn FnMut(gen_core::AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_audio::execution::capture_terminal_streaming(self, req, on_chunk, on_progress)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_audio::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }

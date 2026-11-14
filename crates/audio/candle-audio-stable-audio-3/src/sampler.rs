@@ -555,7 +555,11 @@ pub struct SeededNoise {
 impl SeededNoise {
     pub fn new(seed: u64) -> Self {
         Self {
-            rng: StdRng::seed_from_u64(seed),
+            rng: StdRng::seed_from_u64(candle_audio::execution::seed(
+                "stable-audio-3/sampler.rs",
+                "rand-0.9-StdRng",
+                seed,
+            )),
             draws: 0,
         }
     }
@@ -1136,6 +1140,21 @@ pub fn sample_dit<N: NoiseSource>(
         record_trajectory,
         is_canceled,
     } = args;
+    candle_audio::execution::runtime(initial.device(), initial.dtype());
+    candle_audio::execution::sampling(
+        "sa3",
+        serde_json::json!({"kind":format!("{kind:?}"),"guidance":format!("{guidance:?}"),"guidance_interval":format!("{guidance_interval:?}")}),
+    );
+    match schedule {
+        Schedule::Shared(values) => {
+            candle_audio::execution::schedule_f32("sa3", values, "rectified-flow")
+        }
+        Schedule::PerExample(rows) => {
+            for values in rows {
+                candle_audio::execution::schedule_f32("sa3", values, "rectified-flow");
+            }
+        }
+    }
     let started;
     let initial = match init {
         Some(InitMix {
@@ -1144,6 +1163,10 @@ pub fn sample_dit<N: NoiseSource>(
         }) => {
             started = initialized_start(initial, init_latents, strength, schedule)?;
             if started.skip_model {
+                candle_audio::execution::policy(
+                    "sa3-execution",
+                    serde_json::json!({"skip_model":true,"reason":"zero init noise strength"}),
+                );
                 return Ok(SampleOutput {
                     latents: started.latents,
                     trajectory: Vec::new(),

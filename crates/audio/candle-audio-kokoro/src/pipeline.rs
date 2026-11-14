@@ -146,7 +146,20 @@ impl KokoroPipeline {
                 "kokoro: speed {speed} out of range"
             )));
         }
-        let mut rng = StdRng::seed_from_u64(seed);
+        candle_audio::execution::runtime(&self.device, DType::F32);
+        candle_audio::execution::sampling(
+            "kokoro-feed-forward",
+            serde_json::json!({"speed_bits":speed.to_bits()}),
+        );
+        candle_audio::execution::policy(
+            "duration",
+            serde_json::json!({"tokens":tokens.len(),"style_dimensions":ref_s.len(),"speed_bits":speed.to_bits()}),
+        );
+        let mut rng = StdRng::seed_from_u64(candle_audio::execution::seed(
+            "kokoro/pipeline.rs",
+            "rand-0.9-StdRng",
+            seed,
+        ));
         let (style_decoder, style_prosody) = split_ref_s(ref_s, &self.device)?;
 
         // Stage 1: PLBERT + projection. Boundary sentinels (id 0) wrap the tokens.

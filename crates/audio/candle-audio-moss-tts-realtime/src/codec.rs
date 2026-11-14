@@ -1177,6 +1177,11 @@ impl MossAudioCodec {
         }
         let debug = std::env::var_os("MOSS_CODEC_DEBUG").is_some();
         let mut x = self.quantizer.decode(&rows, &self.device)?;
+        candle_audio::execution::runtime(&self.device, x.dtype());
+        candle_audio::execution::policy(
+            "moss-realtime-codec",
+            serde_json::json!({"block_frames":frames.len(),"prior_frames":state.decoded_frames,"quantizers":nq,"context_duration":self.config.context_duration}),
+        );
         if debug {
             eprintln!(
                 "[codec] incremental block at frame {} after quantizer: {:?} rms={:.5}",

@@ -295,6 +295,13 @@ pub fn decode_latents(
     on_progress: &mut dyn FnMut(usize, usize),
 ) -> Result<DecodedAudio, VaeError> {
     latents.verify()?;
+    candle_audio::execution::runtime(vae.device(), vae.dtype());
+    candle_audio::execution::sampling(
+        "yue2-vae",
+        serde_json::json!({"mode":"deterministic-latent-decode"}),
+    );
+    candle_audio::execution::no_draws("VAE decodes fixed latents without sampling");
+    candle_audio::execution::policy("yue2-decode", serde_json::json!(format!("{options:?}")));
     // Refuse a changed CUDA BF16 handle before staging decoder input on that device.
     vae.check_cuda_bf16_math()?;
     let z = latents

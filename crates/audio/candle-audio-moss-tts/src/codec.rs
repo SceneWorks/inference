@@ -573,7 +573,12 @@ impl XyTokenizerCodec {
             }
         }
         let debug = std::env::var_os("MOSS_TTSD_CODEC_DEBUG").is_some();
-        let mut x = self.rvq.decode(&rows, &self.device)?; // [1, CODE_DIM, T]
+        let mut x = self.rvq.decode(&rows, &self.device)?;
+        candle_audio::execution::runtime(&self.device, x.dtype());
+        candle_audio::execution::policy(
+            "xy-tokenizer",
+            serde_json::json!({"frames":t,"quantizers":nq,"mode":"full-decode"}),
+        ); // [1, CODE_DIM, T]
         if debug {
             eprintln!("[xytok] rvq: {:?} rms={:.5}", x.dims(), rms(&x));
         }

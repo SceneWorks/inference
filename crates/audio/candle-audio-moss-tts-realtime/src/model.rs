@@ -406,6 +406,10 @@ impl MossTtsRealtimeGenerator {
         let base_seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let budget = frame_budget(req);
         let decode_schedule = crate::codec::decode_partition_schedule(budget);
+        candle_audio::execution::policy(
+            "realtime-codec-partition",
+            serde_json::json!(format!("{decode_schedule:?}")),
+        );
         let synth_turns = turns
             .iter()
             .filter(|t| t.role == Role::Assistant && t.audio_codes.is_none())
@@ -601,6 +605,10 @@ impl MossTtsRealtimeGenerator {
         // so the gen-core reproducibility law holds and generate/generate_streaming agree.
         let seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let decode_schedule = crate::codec::decode_partition_schedule(budget);
+        candle_audio::execution::policy(
+            "realtime-codec-partition",
+            serde_json::json!(format!("{decode_schedule:?}")),
+        );
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
 
@@ -649,6 +657,23 @@ impl MossTtsRealtimeGenerator {
 }
 
 impl Generator for MossTtsRealtimeGenerator {
+    fn generate_streaming_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_chunk: &mut dyn FnMut(AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_audio::execution::capture_streaming(self, req, on_chunk, on_progress)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_audio::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -700,6 +725,10 @@ impl Generator for MossTtsRealtimeGenerator {
         let base_seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let budget = frame_budget(req);
         let decode_schedule = crate::codec::decode_partition_schedule(budget);
+        candle_audio::execution::policy(
+            "realtime-codec-partition",
+            serde_json::json!(format!("{decode_schedule:?}")),
+        );
         let state = ConvState::new(&pipeline.decoder);
         Ok(Box::new(MossConversationSession {
             loaded: pipeline,
@@ -732,6 +761,27 @@ struct MossConversationSession {
 }
 
 impl ConversationSession for MossConversationSession {
+    fn step_with_execution_report(
+        &mut self,
+        turn: &ConversationTurn,
+        on_chunk: &mut dyn FnMut(AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedAudioTurn> {
+        let attempt = candle_audio::execution::Attempt::begin();
+        candle_audio::execution::unavailable("MOSS realtime session turn depends on mutable warm KV cache and prior turns; this API does not export a frozen session-state identity");
+        let audio = self.step(
+            turn,
+            &mut |v| candle_audio::execution::callback(|| on_chunk(v)),
+            &mut |v| candle_audio::execution::callback(|| on_progress(v)),
+        )?;
+        if self.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        let descriptor = descriptor();
+        let execution = attempt.finish(&descriptor, Some(&audio));
+        gen_core::generator::CompletedAudioTurn::new(audio, execution, &descriptor)
+    }
+
     fn step(
         &mut self,
         turn: &ConversationTurn,

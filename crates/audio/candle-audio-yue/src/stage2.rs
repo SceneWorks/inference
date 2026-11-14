@@ -165,6 +165,15 @@ impl CandleStage2Lm {
 
 impl Stage2Lm for CandleStage2Lm {
     fn begin(&mut self, batch: usize, capacity: usize) -> gen_core::Result<()> {
+        candle_audio::execution::runtime(self.model.device(), self.model.compute_dtype());
+        candle_audio::execution::sampling(
+            "yue-stage2",
+            candle_audio::execution::json!({"sampler":"greedy","batch":batch}),
+        );
+        candle_audio::execution::policy(
+            "stage2-kv",
+            candle_audio::execution::json!({"capacity":capacity}),
+        );
         self.cache = None; // release the previous group's buffers before allocating
         let model = &self.model;
         let max = usize::try_from(model.config().max_position_embeddings).unwrap_or(0);

@@ -1276,12 +1276,28 @@ impl Yue2Engine {
         hooks.check_cancel()?;
         hooks.observer.on_stage(Stage::Plan, StageEvent::Started);
         let plan = match SymbolicPlan::prepare(request.clone(), &self.tokenizer).map_err(msg)? {
-            PlanStep::Ready(plan) => plan,
+            PlanStep::Ready(plan) => {
+                candle_audio::execution::sampling(
+                    "yue2-plan",
+                    serde_json::json!({"mode":"precomputed-symbolic-plan"}),
+                );
+                candle_audio::execution::no_draws("precomputed symbolic plan performs no sampling");
+                candle_audio::execution::host_runtime("yue2-symbolic-plan");
+                candle_audio::execution::policy(
+                    "plan",
+                    serde_json::json!({"model_executed":false}),
+                );
+                plan
+            }
             PlanStep::GenerateAbc(planning) => {
                 check_generation_budget(planning.prefix().len(), None, generation.abc(), 1.0)
                     .map_err(msg)?;
                 let nar = self.lock_nar_for_ar()?;
-                let mut rng = stage_rng(request.seed());
+                let seed = request.seed();
+                if generation.abc().temperature() != 0.0 {
+                    candle_audio::execution::seed("yue2-abc", "splitmix64", seed);
+                }
+                let mut rng = stage_rng(seed);
                 let mut forward = TokenForward {
                     stage: Stage::Plan,
                     observer: &mut *hooks.observer,
@@ -1322,7 +1338,11 @@ impl Yue2Engine {
             .semantic_conditioning(&self.tokenizer, generation.semantic())
             .map_err(msg)?;
         let nar = self.lock_nar_for_ar()?;
-        let mut rng = stage_rng(plan.request().seed());
+        let seed = plan.request().seed();
+        if generation.semantic().temperature() != 0.0 {
+            candle_audio::execution::seed("yue2-semantic", "splitmix64", seed);
+        }
+        let mut rng = stage_rng(seed);
         let mut forward = TokenForward {
             stage: Stage::Semantic,
             observer: &mut *hooks.observer,

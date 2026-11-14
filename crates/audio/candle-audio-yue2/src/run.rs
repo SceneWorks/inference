@@ -976,6 +976,7 @@ fn observe(
 ) {
     stages.insert(stage, event);
     if event == StageEvent::Reused {
+        candle_audio::execution::unavailable(&format!("YuE2 reused {stage:?} from a persisted stage without a versioned completed execution identity; this attempt cannot attest the original execution"));
         hooks.observer.on_stage(stage, event);
     }
 }
@@ -1391,6 +1392,7 @@ impl Yue2Engine {
                     result.get("plan_identity"),
                 )?;
                 let plan = restore_plan(self, &output.dir, &recorded)?;
+                candle_audio::execution::unavailable("YuE2 restored a persisted plan without its original versioned completed execution identity");
                 hooks.observer.on_stage(Stage::Plan, StageEvent::Reused);
                 let id = plan.identity();
                 return Ok((plan, id, output.dir.clone()));
@@ -1675,3 +1677,30 @@ fn cached_decode_current_config(source: &Value, current: &Value) -> Map<String, 
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod execution_identity_tests {
+    use super::*;
+    #[test]
+    fn resumed_stage_cannot_masquerade_as_current_execution() {
+        let attempt = candle_audio::execution::Attempt::begin();
+        let mut stages = BTreeMap::new();
+        let mut observer = ();
+        let mut hooks = EngineHooks {
+            cancelled: &|| false,
+            observer: &mut observer,
+        };
+        observe(
+            &mut stages,
+            &mut hooks,
+            Stage::Synthesis,
+            StageEvent::Reused,
+        );
+        let identity = attempt.finish(&crate::provider::descriptor(), None);
+        let gen_core::generator::ExecutionIdentity::Unavailable { reason } = identity else {
+            panic!("reused identity must be unavailable")
+        };
+        assert!(reason.detail.contains("persisted stage"));
+        assert_eq!(stages.get(&Stage::Synthesis), Some(&StageEvent::Reused));
+    }
+}
