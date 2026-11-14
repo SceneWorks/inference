@@ -1174,6 +1174,32 @@ mod execution_receipt_tests {
         assert!(serde_json::to_value(nonfinite).is_err());
     }
     #[test]
+    fn slg_serde_retains_frozen_invalid_text_and_serializer_order() {
+        for invalid in [
+            serde_json::json!({"layers":[42],"scale":1,"start":0,"stop":1}),
+            serde_json::json!({"layers":[1],"scale":-1,"start":0,"stop":1}),
+            serde_json::json!({"layers":[1],"scale":1,"start":0.8,"stop":0.2}),
+        ] {
+            let error = serde_json::from_value::<MossSkipLayerGuidance>(invalid).unwrap_err();
+            assert_eq!(error.to_string(), "invalid MOSS SLG controls");
+        }
+        let slg = MossSkipLayerGuidance {
+            layers: vec![42],
+            scale: f32::NAN,
+            start: 0.0,
+            stop: 1.0,
+        };
+        assert_eq!(
+            serde_json::to_value(&slg).unwrap_err().to_string(),
+            "MOSS-Image: nonfinite MOSS control"
+        );
+        let slg = MossSkipLayerGuidance { scale: -1.0, ..slg };
+        assert_eq!(
+            serde_json::to_value(slg).unwrap_err().to_string(),
+            "MOSS-Image: skip layers must be zero-based indices in 0..42"
+        );
+    }
+    #[test]
     fn receipt_round_trips_all_policies_and_refuses_crossed_execution_facts() {
         for mode in [
             MossImageAcceleration::Off,

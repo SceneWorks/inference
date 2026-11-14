@@ -4,6 +4,13 @@ use gen_core_moss_image_policy::{
 };
 use serde_json::{json, Value};
 
+mod support;
+
+#[test]
+fn published_native_and_wasm_corpus() {
+    assert_eq!(support::run(), 21);
+}
+
 // These cases preserve gen-core's existing MOSS resolver and edit_request behavior. The same
 // serde-only policy crate is compiled for native and wasm consumers.
 #[test]

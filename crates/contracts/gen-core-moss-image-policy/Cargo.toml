@@ -14,3 +14,7 @@ serde = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+
+[[example]]
+name = "wasm_corpus"
+crate-type = ["cdylib"]

@@ -107,7 +107,19 @@ impl Serialize for MossSkipLayerGuidance {
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        self.validate().map_err(serde::ser::Error::custom)?;
+        // Preserve the native serializer's resolver order: nonfinite MOSS controls precede
+        // invalid skip layers, then SLG range checks.
+        MossImageResolved::resolve(
+            MossImageVariant::Sft,
+            &MossPolicyRequest {
+                moss_image: Some(MossImageOptions {
+                    slg: Some(self.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .map_err(serde::ser::Error::custom)?;
         #[derive(Serialize)]
         struct Wire<'a> {
             layers: &'a [u32],
@@ -143,7 +155,9 @@ impl<'de> Deserialize<'de> for MossSkipLayerGuidance {
             start: wire.start,
             stop: wire.stop,
         };
-        value.validate().map_err(serde::de::Error::custom)?;
+        value
+            .validate()
+            .map_err(|_| serde::de::Error::custom("invalid MOSS SLG controls"))?;
         Ok(value)
     }
 }
