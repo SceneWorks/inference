@@ -413,6 +413,12 @@ impl PulidFlux {
             image.width as usize,
             &req.cancel,
         )?;
+        observe_identity_route(
+            (image.width, image.height),
+            id_embedding.shape(),
+            id_embedding.dtype(),
+            req.memory.is_some_and(|memory| memory.chunk_attention),
+        );
         let mk_ca = |emb: Array| {
             PulidCa::from_weights(
                 &self.pulid,
@@ -453,6 +459,7 @@ impl PulidFlux {
                 .timestep_to_start_cfg
                 .map(|v| v as usize)
                 .unwrap_or(DEFAULT_TIMESTEP_TO_START_CFG);
+            observe_cfg_branch(Some(start_cfg));
             self.flux.generate_with_injector_cfg(
                 &flux_req,
                 &pos,
@@ -464,6 +471,7 @@ impl PulidFlux {
             )
         } else {
             // Fake-CFG (true_cfg = 1.0): single forward (sc-3074), bit-identical to that path.
+            observe_cfg_branch(None);
             self.flux
                 .generate_with_injector(&flux_req, Some(&mk_ca(id_embedding)?), on_progress)
         };
@@ -478,6 +486,23 @@ impl PulidFlux {
                 inventory.ensure_unchanged().map_err(Into::into)
             })
     }
+}
+
+fn observe_identity_route(
+    reference_size: (u32, u32),
+    embedding_shape: &[i32],
+    embedding_dtype: Dtype,
+    bounded_attention: bool,
+) {
+    mlx_gen::image_execution::policy_debug("pulid.reference_size", &reference_size);
+    mlx_gen::image_execution::policy_debug("pulid.embedding_shape", &embedding_shape);
+    mlx_gen::image_execution::policy_debug("pulid.embedding_dtype", &embedding_dtype);
+    mlx_gen::image_execution::policy_debug("pulid.ca_bounded_attention", &bounded_attention);
+}
+
+fn observe_cfg_branch(start_step: Option<usize>) {
+    mlx_gen::image_execution::policy_debug("pulid.cfg_start_step", &start_step);
+    mlx_gen::image_execution::policy_debug("pulid.real_cfg", &start_step.is_some());
 }
 
 // ---- registration -------------------------------------------------------------------------------
@@ -628,6 +653,47 @@ pub(crate) const MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
 mod tests {
     use super::*;
     use mlx_gen::{IdentityWeights, LoadShape, OffloadPolicy, Quant};
+
+    #[test]
+    fn completed_policy_distinguishes_ca_budget_and_cfg_start() {
+        let capture = |bounded, start| {
+            mlx_gen::image_execution::complete_image_attempt(
+                &descriptor(),
+                &CancelFlag::new(),
+                || {
+                    observe_identity_route((512, 512), &[1, 32, 2048], Dtype::Float32, bounded);
+                    observe_cfg_branch(start);
+                    mlx_gen::image_execution::sampled_native(
+                        "flow_match",
+                        "sigma",
+                        Dtype::Float32,
+                        &[1.0, 0.0],
+                        42,
+                    );
+                    Ok(GenerationOutput::Images(vec![Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0, 0, 0],
+                    }]))
+                },
+            )
+            .unwrap()
+            .execution
+        };
+        let ordinary = capture(false, None);
+        let bounded = capture(true, None);
+        let real_early = capture(false, Some(1));
+        let real_late = capture(false, Some(4));
+        for identity in [&ordinary, &bounded, &real_early, &real_late] {
+            assert!(identity.resolved().is_some());
+        }
+        let quality = |identity: &gen_core::generator::ExecutionIdentity| {
+            identity.resolved().unwrap().quality_policy.clone()
+        };
+        assert_ne!(quality(&ordinary), quality(&bounded));
+        assert_ne!(quality(&ordinary), quality(&real_early));
+        assert_ne!(quality(&real_early), quality(&real_late));
+    }
 
     /// The load error string, matched (not `unwrap_err` — `Box<dyn Generator>` isn't `Debug`).
     fn load_err(spec: &LoadSpec) -> String {
