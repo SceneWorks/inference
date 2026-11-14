@@ -691,6 +691,55 @@ mod tests {
         assert!(compile_control(&spec, &req).is_err());
     }
 
+    /// Zero steps, an off-grid width and a below-minimum size are refused by the pre-load compiler
+    /// (direct and through the registry) at a missing snapshot, so no weight is ever opened.
+    #[test]
+    fn control_plan_refuses_zero_steps_and_invalid_sizes_before_load() {
+        let registry = crate::provider_registry().unwrap();
+        let spec = missing_snapshot_spec(OffloadPolicy::Sequential);
+        let valid = GenerationRequest {
+            prompt: "a fox".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            conditioning: vec![Conditioning::Control {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![7; 64 * 64 * 3],
+                },
+                kind: ControlKind::Pose,
+                scale: None,
+            }],
+            ..Default::default()
+        };
+        compile_control(&spec, &valid).unwrap();
+        for (width, height, steps, expected) in [
+            (512, 512, Some(0), "steps must be >= 1"),
+            (321, 512, Some(4), "multiples of 16"),
+            (512, 321, Some(4), "multiples of 16"),
+            (128, 512, Some(4), "outside supported range"),
+            (512, 240, Some(4), "outside supported range"),
+        ] {
+            let req = GenerationRequest {
+                width,
+                height,
+                steps,
+                ..valid.clone()
+            };
+            let direct = compile_control(&spec, &req).unwrap_err().to_string();
+            assert!(direct.contains(expected), "{width}x{height}: {direct}");
+            let registered = registry
+                .compile_render_plan(FLUX1_DEV_CONTROL_ID, &spec, &req)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                registered.contains(expected),
+                "{width}x{height}: {registered}"
+            );
+        }
+    }
+
     #[test]
     fn loaded_control_generator_exposes_and_executes_its_registered_scope() {
         let spec = missing_snapshot_spec(OffloadPolicy::Sequential);

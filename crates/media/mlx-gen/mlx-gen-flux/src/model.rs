@@ -1863,6 +1863,47 @@ mod tests {
             .is_err());
     }
 
+    /// The complete XLabs IP route refuses zero steps and an off-range size in the pre-load
+    /// compiler at a missing snapshot and adapter, so no weight is ever opened.
+    #[test]
+    fn xlabs_ip_plan_refuses_zero_steps_and_invalid_sizes_before_load() {
+        let registry = crate::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/missing/flux".into()))
+            .with_ip_adapter(WeightsSource::Dir("/missing/ip".into()));
+        let valid = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            conditioning: vec![reference(Some(0.5))],
+            ..Default::default()
+        };
+        registry
+            .compile_render_plan(FluxVariant::Dev.id(), &spec, &valid)
+            .unwrap()
+            .expect("XLabs reference route needs a pre-load plan");
+        for (width, steps, expected) in [
+            (512, Some(0), "steps must be >= 1"),
+            (321, Some(4), "multiples of 16"),
+            (128, Some(4), "outside supported range"),
+        ] {
+            let req = GenerationRequest {
+                width,
+                steps,
+                ..valid.clone()
+            };
+            let direct = compile_base(FluxVariant::Dev, &spec, &req)
+                .unwrap_err()
+                .to_string();
+            assert!(direct.contains(expected), "{width}: {direct}");
+            let registered = registry
+                .compile_render_plan(FluxVariant::Dev.id(), &spec, &req)
+                .unwrap_err()
+                .to_string();
+            assert!(registered.contains(expected), "{width}: {registered}");
+        }
+    }
+
     #[test]
     fn generate_reference_without_ip_adapter_errors() {
         // No `LoadSpec::ip_adapter` → a reference request errors loudly before touching the (absent)
