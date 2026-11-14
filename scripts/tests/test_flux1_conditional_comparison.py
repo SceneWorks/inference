@@ -37,8 +37,9 @@ class ConditionalComparison(unittest.TestCase):
     def test_child_caps_are_explicit_per_case(self):
         from types import SimpleNamespace
         gib = 1024**3
-        policy = lambda host, gpu, deadline=600: SimpleNamespace(
-            deadline_seconds=deadline, child_footprint_cap_bytes=host, child_gpu_cap_bytes=gpu)
+        policy = lambda host, gpu, deadline=600, poll=250: SimpleNamespace(
+            deadline_seconds=deadline, child_footprint_cap_bytes=host, child_gpu_cap_bytes=gpu,
+            poll_millis=poll)
         for case in conditional.CASES:
             caps = comparison.case_caps("candle-cuda", case, policy(24 * gib, 18 * gib))
             expected_host = 48 * gib if case == "pulid-pid" else 24 * gib
@@ -60,9 +61,14 @@ class ConditionalComparison(unittest.TestCase):
         self.assertGreater(48 * gib, 32.3e9 * 1.5)
         # MLX unified memory: one footprint cap, no CUDA cap to record.
         mlx = comparison.case_caps("mlx", "pulid-pid", policy(48 * gib, None))
-        self.assertEqual(mlx, {"child_footprint_cap_bytes": 48 * gib, "child_gpu_cap_bytes": None})
-        self.assertEqual(comparison.case_caps("mlx", "control-pose", policy(24 * gib, None)),
-                         {"child_footprint_cap_bytes": 24 * gib, "child_gpu_cap_bytes": None})
+        self.assertEqual(mlx, {"poll_millis": 250, "child_footprint_cap_bytes": 48 * gib,
+                               "child_gpu_cap_bytes": None})
+        self.assertEqual(comparison.case_caps("mlx", "control-pose", policy(24 * gib, None, poll=100)),
+                         {"poll_millis": 100, "child_footprint_cap_bytes": 24 * gib,
+                          "child_gpu_cap_bytes": None})
+        # A 1 s poll can miss an ~11 s arm's final peak (run 43569270221): refused.
+        with self.assertRaisesRegex(ValueError, "every 250 ms"):
+            comparison.case_caps("mlx", "pulid-real", policy(24 * gib, None, poll=1000))
 
     def test_candle_pulid_probes_freeze_the_comparison_sampler(self):
         for case in conditional.CASES:

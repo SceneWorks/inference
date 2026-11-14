@@ -52,6 +52,10 @@ MAX_DEADLINE_SECONDS = 1200
 # (`physical_memory_bytes` 137438953472 in run 43558295383's receipt).
 DEFAULT_CAPS = {"child_footprint_cap_bytes": 24 * GIB, "child_gpu_cap_bytes": 18 * GIB}
 CASE_CAPS = {"pulid-pid": {"child_footprint_cap_bytes": 48 * GIB, "child_gpu_cap_bytes": 40 * GIB}}
+# The watchdog samples the child's instantaneous footprint once per poll; arms run ~11 s, so a 1 s
+# poll can miss the final denoise/decode peak (run 43569270221). The supervisor now also records
+# each process's kernel lifetime peak, and conditional proofs poll at least every 250 ms.
+MAX_POLL_MILLIS = 250
 # Physical memory each conditional runner reports; a host cap must stay below it.
 RUNNER_HOST_BYTES = {"mlx": 137_438_953_472, "candle-cuda": 516_136_534_016}
 
@@ -61,13 +65,16 @@ def case_caps(backend, case, policy):
     caps = CASE_CAPS.get(case, DEFAULT_CAPS)
     if policy.deadline_seconds > MAX_DEADLINE_SECONDS:
         raise ValueError("conditional child exceeds frozen 20 minute budget")
+    if policy.poll_millis > MAX_POLL_MILLIS:
+        raise ValueError(f"conditional proof must poll at least every {MAX_POLL_MILLIS} ms")
     if policy.child_footprint_cap_bytes > caps["child_footprint_cap_bytes"]:
         raise ValueError(f"conditional child exceeds {case} host cap of "
                          f"{caps['child_footprint_cap_bytes'] // GIB} GiB")
     if backend == "candle-cuda" and policy.child_gpu_cap_bytes > caps["child_gpu_cap_bytes"]:
         raise ValueError(f"conditional CUDA child exceeds {case} GPU cap of "
                          f"{caps['child_gpu_cap_bytes'] // GIB} GiB")
-    return {"child_footprint_cap_bytes": caps["child_footprint_cap_bytes"],
+    return {"poll_millis": policy.poll_millis,
+            "child_footprint_cap_bytes": caps["child_footprint_cap_bytes"],
             "child_gpu_cap_bytes": caps["child_gpu_cap_bytes"] if backend == "candle-cuda" else None}
 
 

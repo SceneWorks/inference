@@ -27,7 +27,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -339,18 +339,28 @@ def darwin_phys_footprint(pid: int, *, read: Callable[[int], tuple[int, int]] = 
     A failed read is retried immediately, FOOTPRINT_READS_PER_TICK reads in all; the
     probe-failure detail keeps the last errno and its message.
     """
+    footprints = darwin_footprints(pid, read=read)
+    return None if footprints is None else footprints[0]
+
+
+def darwin_footprints(pid: int, *, read: Callable[[int], tuple[int, int]] = proc_pid_rusage_footprint) -> tuple[int, int] | None:
+    """(phys_footprint, lifetime peak phys_footprint) for pid, or None when it is gone (ESRCH).
+
+    The kernel keeps the lifetime peak across the process's whole life, so it catches a peak
+    that falls between two watchdog ticks; it stays readable while the exited child is a zombie.
+    """
     last = OSError("no read attempted")
     for _ in range(FOOTPRINT_READS_PER_TICK):
         try:
-            footprint = read(pid)[0]
+            footprint, lifetime = read(pid)
         except ProcessLookupError:
             return None
         except OSError as error:
             last = error
             continue
-        if footprint < 0 or footprint >= 2**63:
+        if not 0 <= footprint < 2**63 or not 0 <= lifetime < 2**63:
             raise SupervisionError("probe-failure", f"process {pid} footprint {footprint} is invalid")
-        return footprint
+        return footprint, max(footprint, lifetime)
     raise SupervisionError(
         "probe-failure",
         f"proc_pid_rusage({pid}) failed {FOOTPRINT_READS_PER_TICK} reads: "
@@ -523,6 +533,9 @@ class SystemProbe:
         self.policy = policy
         # {pid: bytes} behind the most recent tree_footprint total (POSIX backends only).
         self.last_tree_breakdown: dict[int, int] = {}
+        # {pid: lifetime peak bytes} from the kernel's own per-process high-water mark: macOS
+        # ri_lifetime_max_phys_footprint, Linux VmHWM. Windows has no per-process ledger here.
+        self.lifetime_peaks: dict[int, int] = {}
         actual = {"Darwin": "darwin-mlx", "Linux": "linux-cpu" if policy.backend == "linux-cpu" else "linux-cuda",
                   "Windows": "windows-cpu" if policy.backend == "windows-cpu" else "windows-cuda"}.get(platform.system(), "unsupported")
         if actual != policy.backend:
@@ -575,9 +588,11 @@ class SystemProbe:
         sampled = False
         for pid in pids:
             if self.policy.backend == "darwin-mlx":
-                footprint = darwin_phys_footprint(pid)
-                if footprint is None:
+                footprints = darwin_footprints(pid)
+                if footprints is None:
                     continue  # exited after the process-table snapshot
+                footprint, lifetime = footprints
+                self.lifetime_peaks[pid] = max(self.lifetime_peaks.get(pid, 0), lifetime)
                 total += footprint
                 self.last_tree_breakdown[pid] = footprint
                 sampled = True
@@ -591,8 +606,30 @@ class SystemProbe:
                     raise SupervisionError("probe-failure", f"process {pid} RSS malformed")
                 total += int(match.group(1)) * 1024
                 self.last_tree_breakdown[pid] = int(match.group(1)) * 1024
+                high_water = re.search(r"^VmHWM:\s*(\d+) kB$", output, re.MULTILINE)
+                if high_water:
+                    self.lifetime_peaks[pid] = max(self.lifetime_peaks.get(pid, 0),
+                                                   int(high_water.group(1)) * 1024)
                 sampled = True
         return total if sampled else None
+
+    def record_exit_lifetime_peak(self, pid: int) -> None:
+        """Read the root's lifetime peak before it is reaped (live or zombie); macOS only.
+
+        Measurement only: a failed read keeps the per-tick values and never stops the row.
+        """
+        if self.policy.backend != "darwin-mlx":
+            return
+        try:
+            footprints = darwin_footprints(pid)
+        except SupervisionError:
+            return
+        if footprints is not None:
+            self.lifetime_peaks[pid] = max(self.lifetime_peaks.get(pid, 0), footprints[1])
+
+    def lifetime_peak_bytes(self) -> int | None:
+        """Sum of each owned process's lifetime peak (an upper bound on the tree's peak)."""
+        return sum(self.lifetime_peaks.values()) if self.lifetime_peaks else None
 
     def gpu_free_and_tree_bytes(self, owner: PosixTree | windows.WindowsJob) -> tuple[int, int]:
         free = self.gpu_free()
@@ -1071,6 +1108,11 @@ class RunResult:
     elapsed_seconds: float
     samples: tuple[dict[str, object], ...]
     admission: dict[str, object]
+    # `peak_host_bytes` is the larger of these two. The watchdog samples the instantaneous
+    # footprint each poll and can miss a peak between ticks; the kernel's lifetime high-water mark
+    # cannot (None where the platform has no such ledger). Caps stay enforced on the samples.
+    sampled_peak_host_bytes: int | None = field(default=None, kw_only=True)
+    lifetime_peak_host_bytes: int | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1363,14 +1405,17 @@ def _run_admitted(
             observed_gpu_peak = peak_gpu if gpu_free is not None else None
             if not require_gpu_sample and observed_gpu_peak == 0:
                 observed_gpu_peak = None
-            fields = (child.pid, status, peak_host, observed_gpu_peak,
+            lifetime_peak = getattr(probe, "lifetime_peak_bytes", lambda: None)()
+            peaks = {"sampled_peak_host_bytes": peak_host,
+                     "lifetime_peak_host_bytes": lifetime_peak}
+            fields = (child.pid, status, max(peak_host, lifetime_peak or 0), observed_gpu_peak,
                       host_free, gpu_free, clock() - started, tuple(samples), admission)
             if multi_cuda:
-                return MultiCudaRunResult(*fields, tuple(state.evidence() for state in devices))
+                return MultiCudaRunResult(*fields, tuple(state.evidence() for state in devices), **peaks)
             if retain_owned_completion:
                 # Source observations survived the existing Job/stdio cleanup before return.
-                return OwnedCudaRunResult(*fields, completion)
-            return RunResult(*fields)
+                return OwnedCudaRunResult(*fields, completion, **peaks)
+            return RunResult(*fields, **peaks)
 
         primary_fault = None
         try:
@@ -1380,6 +1425,10 @@ def _run_admitted(
                 if deadline_reached():
                     raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
                 check_artifact_caps()
+                # Read the root's lifetime peak while it is still live or a zombie: `poll` reaps it.
+                record_exit_peak = getattr(probe, "record_exit_lifetime_peak", None)
+                if record_exit_peak is not None:
+                    record_exit_peak(child.pid)
                 status = child.poll()
                 try:
                     pids, owned = owned_processes()
@@ -1429,6 +1478,8 @@ def _run_admitted(
                         # A short-lived child may exit after the ownership
                         # snapshot and before its footprint is read.
                         try:
+                            if record_exit_peak is not None:
+                                record_exit_peak(child.pid)
                             finished = finished_result(child.poll(), *owned_processes())
                         except SupervisionError as recheck:
                             if recheck.reason != "probe-failure":
