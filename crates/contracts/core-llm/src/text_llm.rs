@@ -1,8 +1,9 @@
 //! The provider trait — the heart of the contract.
 
 use crate::capabilities::TextLlmDescriptor;
-use crate::error::Result;
-use crate::output::{StreamEvent, TextLlmOutput};
+use crate::error::{Error, Result};
+use crate::execution_identity::ExecutionIdentity;
+use crate::output::{FinishReason, StreamEvent, TextLlmOutput};
 use crate::request::TextLlmRequest;
 
 /// Bounded execution-ordering state for a provider with a load stream and one
@@ -14,6 +15,36 @@ use crate::request::TextLlmRequest;
 pub struct OwnedExecutionFence<S: PartialEq> {
     load: S,
     execution: std::cell::RefCell<S>,
+}
+
+/// One completed text generation and the provider-resolved facts from that same attempt.
+/// A cancelled/partial output may be returned for compatibility but cannot claim a replayable
+/// identity. Existing `TextLlmOutput` and `TextLlm::generate` remain unchanged.
+#[derive(Clone, Debug)]
+pub struct CompletedTextLlm {
+    pub output: TextLlmOutput,
+    pub execution: ExecutionIdentity,
+}
+
+impl CompletedTextLlm {
+    pub fn new(
+        output: TextLlmOutput,
+        execution: ExecutionIdentity,
+        descriptor: &TextLlmDescriptor,
+    ) -> Result<Self> {
+        execution.validate(&descriptor.id, &descriptor.backend, 1)?;
+        if execution.resolved().is_some()
+            && !matches!(
+                output.finish_reason,
+                Some(FinishReason::Stop | FinishReason::Length)
+            )
+        {
+            return Err(Error::InvalidRequest(
+                "incomplete text output cannot publish a resolved execution identity".into(),
+            ));
+        }
+        Ok(Self { output, execution })
+    }
 }
 
 impl<S: PartialEq> OwnedExecutionFence<S> {
@@ -59,9 +90,9 @@ impl<S: PartialEq> OwnedExecutionFence<S> {
 /// [`crate::registry`]. `&self`: a loaded provider is immutable and shareable.
 ///
 /// Cancellation rides on [`TextLlmRequest::cancel`]: an already-cancelled request must return
-/// [`Error::Canceled`](crate::Error::Canceled) before any inference; a mid-stream cancel stops
+/// [`Error::Canceled`] before any inference; a mid-stream cancel stops
 /// promptly and may return a partial output marked
-/// [`FinishReason::Cancelled`](crate::FinishReason::Cancelled).
+/// [`FinishReason::Cancelled`].
 pub trait TextLlm {
     /// The provider's identity + declared capabilities (constructible without running inference).
     fn descriptor(&self) -> &TextLlmDescriptor;
@@ -101,6 +132,12 @@ pub trait TextLlm {
     /// reject (not silently ignore) anything outside the declared surface.
     fn validate(&self, req: &TextLlmRequest) -> Result<()>;
 
+    /// Resolve the provider's actual pre-execution choices for strict replay admission. The
+    /// default reports missing facts; it never promotes submitted sampling values into evidence.
+    fn plan_execution(&self, _req: &TextLlmRequest) -> Result<ExecutionIdentity> {
+        Ok(ExecutionIdentity::provider_default())
+    }
+
     /// Generate, streaming a [`StreamEvent`] per token through `on_event`, and returning the final
     /// [`TextLlmOutput`]. The terminal [`StreamEvent::Done`] carries the same finish reason + usage
     /// as the returned output.
@@ -116,6 +153,21 @@ pub trait TextLlm {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> Result<TextLlmOutput>;
+
+    /// Return the output and attempt-local resolved execution facts together. Existing providers
+    /// inherit an explicit unavailable result until they override this method at their actual
+    /// sampler/decode seam. A provider must not publish a resolved identity for partial output.
+    fn generate_with_execution_report(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) -> Result<CompletedTextLlm> {
+        CompletedTextLlm::new(
+            self.generate(req, on_event)?,
+            ExecutionIdentity::provider_default(),
+            self.descriptor(),
+        )
+    }
 
     /// Convenience: generate without observing the stream (collect the final output only).
     fn complete(&self, req: &TextLlmRequest) -> Result<TextLlmOutput> {
@@ -135,6 +187,22 @@ pub trait TextLlm {
         reqs.iter()
             .enumerate()
             .map(|(i, req)| self.generate(req, &mut |event| on_event(i, event)))
+            .collect()
+    }
+
+    /// Batch variant of [`Self::generate_with_execution_report`]. The additive default runs each
+    /// request independently; a continuous-batching provider overrides this to preserve its
+    /// batching policy and publish each request's own completed identity.
+    fn generate_batch_with_execution_report(
+        &self,
+        reqs: &[TextLlmRequest],
+        on_event: &mut dyn FnMut(usize, StreamEvent),
+    ) -> Vec<Result<CompletedTextLlm>> {
+        reqs.iter()
+            .enumerate()
+            .map(|(i, req)| {
+                self.generate_with_execution_report(req, &mut |event| on_event(i, event))
+            })
             .collect()
     }
 }

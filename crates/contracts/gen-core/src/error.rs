@@ -83,6 +83,16 @@ impl From<&str> for Error {
     }
 }
 
+impl From<core_llm::Error> for Error {
+    fn from(error: core_llm::Error) -> Self {
+        match error {
+            core_llm::Error::Canceled => Self::Canceled,
+            core_llm::Error::Unsupported(reason) => Self::Unsupported(reason),
+            other => Self::Msg(other.to_string()),
+        }
+    }
+}
+
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;
 

@@ -5,7 +5,7 @@
 //! This module adds only SVG-specific metadata and the byte/token/time boundary that MLX and Candle
 //! apply before any source is published.
 
-use crate::{Error, Result, TextLlm, TextLlmRequest};
+use crate::{Error, ExecutionIdentity, Result, TextLlm, TextLlmRequest};
 use std::time::Duration;
 
 /// The checkpoint quality tier a StarVector descriptor represents.
@@ -311,6 +311,36 @@ pub struct StarVectorOutput {
     /// family, so always dense with the request's reason
     /// ([`KvCacheReport::without_table_family`](crate::KvCacheReport::without_table_family)).
     pub kv_cache: Option<crate::KvCacheReport>,
+}
+
+/// One completed SVG result and the resolved execution identity from the same provider attempt.
+/// An incomplete or cancelled SVG cannot carry a replayable identity.
+#[derive(Clone, Debug)]
+pub struct CompletedStarVector {
+    pub output: StarVectorOutput,
+    pub execution: ExecutionIdentity,
+}
+
+impl CompletedStarVector {
+    pub fn new(
+        output: StarVectorOutput,
+        execution: ExecutionIdentity,
+        descriptor: &crate::TextLlmDescriptor,
+    ) -> Result<Self> {
+        execution.validate(&descriptor.id, &descriptor.backend, 1)?;
+        if execution.resolved().is_some()
+            && (output.svg.is_none()
+                || !matches!(
+                    output.finish_reason,
+                    StarVectorFinishReason::CompleteRoot | StarVectorFinishReason::Eos
+                ))
+        {
+            return Err(Error::InvalidRequest(
+                "incomplete SVG cannot publish a resolved execution identity".into(),
+            ));
+        }
+        Ok(Self { output, execution })
+    }
 }
 
 /// Reusable host-side stop guard for provider decoding loops.
@@ -763,12 +793,32 @@ pub trait StarVectorProvider: TextLlm {
         request.validate_bounds(self.starvector_descriptor())
     }
 
+    /// Provider-resolved SVG choices for strict pre-execution replay admission. The default
+    /// reports missing evidence rather than interpreting client request fields as facts.
+    fn plan_svg_execution(&self, _request: &StarVectorRequest) -> Result<ExecutionIdentity> {
+        Ok(ExecutionIdentity::provider_default())
+    }
+
     /// Generate one bounded SVG source document while reporting source stream events.
     fn generate_svg(
         &self,
         request: &StarVectorRequest,
         on_event: &mut dyn FnMut(StarVectorStreamEvent),
     ) -> Result<StarVectorOutput>;
+
+    /// SVG generation with an attempt-local execution report. Existing providers retain their
+    /// output behavior and explicitly lack replay facts until they adopt this method.
+    fn generate_svg_with_execution_report(
+        &self,
+        request: &StarVectorRequest,
+        on_event: &mut dyn FnMut(StarVectorStreamEvent),
+    ) -> Result<CompletedStarVector> {
+        CompletedStarVector::new(
+            self.generate_svg(request, on_event)?,
+            ExecutionIdentity::provider_default(),
+            self.descriptor(),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
