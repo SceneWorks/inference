@@ -3,8 +3,8 @@
 //! are isolated, and errors/panics discard their frame rather than leaving a last-report slot.
 //!
 //! Generators expose these observations through `generate_with_execution_report` and the matching
-//! streaming method. Native pipeline callers can wrap their final audio operation in
-//! [`capture_direct`]; invoke external sinks through [`callback`] to exclude consumer work.
+//! streaming method. Native pipelines expose additive completed-report methods backed by
+//! [`capture_native`], retaining their original outputs; external sinks use [`callback`].
 //! An intermediate token API is not a completed audio generation. Opaque caller RNGs, legacy
 //! resumed stages, device-global entropy and sessions without a frozen warm-cache identity
 //! explicitly report unavailability instead of claiming deterministic regeneration.
@@ -68,6 +68,16 @@ impl Attempt {
         descriptor: &ModelDescriptor,
         audio: Option<&AudioTrack>,
     ) -> ExecutionIdentity {
+        let output = audio
+            .map(NativeOutput::track)
+            .unwrap_or_else(|| NativeOutput::artifact("symbolic_plan"));
+        self.finish_native(descriptor, output)
+    }
+    fn finish_native(
+        self,
+        descriptor: &ModelDescriptor,
+        output: NativeOutput,
+    ) -> ExecutionIdentity {
         let facts = STACK.with_borrow_mut(|s| {
             let i = s
                 .iter()
@@ -75,7 +85,7 @@ impl Attempt {
                 .expect("active audio attempt");
             s.remove(i).1
         });
-        facts.identity(descriptor, audio)
+        facts.identity(descriptor, output.policy)
     }
 }
 impl Drop for Attempt {
@@ -171,7 +181,7 @@ pub fn nondeterministic(reason: &str) {
     observe(|f| f.nondeterministic = Some(reason.into()));
 }
 impl Facts {
-    fn identity(mut self, d: &ModelDescriptor, audio: Option<&AudioTrack>) -> ExecutionIdentity {
+    fn identity(mut self, d: &ModelDescriptor, output: Value) -> ExecutionIdentity {
         if self.sampling.is_empty() {
             self.missing
                 .push("executed audio sampler or deterministic transform was not observed".into());
@@ -212,12 +222,6 @@ impl Facts {
                 draws: self.draws,
             }
         };
-        let output = match audio {
-            Some(a) => {
-                json!({"sample_rate":a.sample_rate,"channels":a.channels,"samples":a.samples.len(),"stems":a.stems.iter().map(|s|json!({"name":s.name,"samples":s.samples.len()})).collect::<Vec<_>>(),"format":"f32_pcm"})
-            }
-            None => json!({"artifact":"symbolic_plan","audio_rendered":false}),
-        };
         let estimator = if self.schedules.is_empty() {
             ExecutionFact::not_applicable("no diffusion estimator on the executed audio path")
         } else {
@@ -225,8 +229,8 @@ impl Facts {
         };
         let deterministic_replay = match self.nondeterministic {
             Some(reason) => ExecutionReplaySupport::NonDeterministic { reason },
-            None => ExecutionReplaySupport::Deterministic {
-                scope: "same inference revision, component bytes, frozen conditioning, ordered RNG streams, device and dtype".into(),
+            None => ExecutionReplaySupport::NonDeterministic {
+                reason: "bitwise replay has not been attested for this audio provider, device and precision; observed settings and seeded randomness alone do not establish it".into(),
             },
         };
         let identity = ResolvedExecutionIdentity {
@@ -368,6 +372,76 @@ pub fn capture_direct(
     capture_report(d, cancel, || body().map(GenerationReport::from_output))
 }
 
+/// An additive native result: the original value and the identity of that same successful call.
+/// Unlike conversion through `GenerationOutput`, this retains native traces, latents and artifacts
+/// without copying PCM or discarding native metadata.
+#[derive(Debug)]
+pub struct CompletedNative<T> {
+    pub output: T,
+    pub execution: ExecutionIdentity,
+}
+
+/// Metadata read from a successfully returned native value. No samples or model tensors are copied.
+pub struct NativeOutput {
+    policy: Value,
+}
+impl NativeOutput {
+    pub fn pcm(samples: &[f32], sample_rate: u32, channels: u16) -> Self {
+        Self {
+            policy: json!({"sample_rate":sample_rate,"channels":channels,"samples":samples.len(),"stems":[],"format":"f32_pcm"}),
+        }
+    }
+    pub fn track(track: &AudioTrack) -> Self {
+        let mut out = Self::pcm(&track.samples, track.sample_rate, track.channels);
+        out.policy["stems"] = json!(track
+            .stems
+            .iter()
+            .map(|s| json!({"name":s.name,"samples":s.samples.len()}))
+            .collect::<Vec<_>>());
+        out
+    }
+    pub fn with_stems(mut self, stems: impl IntoIterator<Item = (&'static str, usize)>) -> Self {
+        self.policy["stems"] = json!(stems
+            .into_iter()
+            .map(|(name, samples)| json!({"name":name,"samples":samples}))
+            .collect::<Vec<_>>());
+        self
+    }
+    pub fn artifact(kind: &str) -> Self {
+        Self {
+            policy: json!({"artifact":kind,"audio_rendered":false}),
+        }
+    }
+}
+
+/// The completion boundary used by native methods. Errors, `None` cancellation results and a final
+/// cancellation probe never return a receipt. Native callbacks must use [`callback`].
+pub fn capture_native<T, E: From<gen_core::Error>>(
+    descriptor: &ModelDescriptor,
+    canceled: &dyn Fn() -> bool,
+    body: impl FnOnce() -> std::result::Result<T, E>,
+    output: impl FnOnce(&T) -> Option<NativeOutput>,
+) -> std::result::Result<CompletedNative<T>, E> {
+    if callback(canceled) {
+        return Err(gen_core::Error::Canceled.into());
+    }
+    let attempt = Attempt::begin();
+    let value = body()?;
+    if callback(canceled) {
+        return Err(gen_core::Error::Canceled.into());
+    }
+    let output = output(&value).ok_or_else(|| E::from(gen_core::Error::Canceled))?;
+    let execution = attempt.finish_native(descriptor, output);
+    execution
+        .validate(descriptor.id, descriptor.backend, 1)
+        .map_err(gen_core::Error::from)
+        .map_err(E::from)?;
+    Ok(CompletedNative {
+        output: value,
+        execution,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +524,86 @@ mod tests {
             )
         );
     }
+    #[test]
+    fn complete_observations_do_not_attest_bitwise_replay() {
+        let generated = capture(&Mock, &GenerationRequest::default(), &mut |_| {}).unwrap();
+        let replay = &generated.execution.resolved().unwrap().deterministic_replay;
+        assert!(
+            matches!(replay, ExecutionReplaySupport::NonDeterministic { reason }
+            if reason.contains("not been attested"))
+        );
+
+        let attempt = Attempt::begin();
+        host_runtime("symbolic-plan");
+        sampling("plan", json!({"external_score":true}));
+        no_draws("external score");
+        policy("plan", json!({"model_executed":false}));
+        let plan = attempt.finish(&descriptor(), None);
+        assert!(matches!(
+            &plan.resolved().unwrap().deterministic_replay,
+            ExecutionReplaySupport::NonDeterministic { .. }
+        ));
+
+        let attempt = Attempt::begin();
+        facts(9);
+        nondeterministic("provider-specific unqualified reduction order");
+        let identity = attempt.finish(&descriptor(), Some(&track()));
+        assert!(matches!(&identity.resolved().unwrap().deterministic_replay,
+            ExecutionReplaySupport::NonDeterministic { reason }
+                if reason == "provider-specific unqualified reduction order"));
+    }
+
+    #[test]
+    fn native_result_retains_artifacts_and_binds_cancel_retry_and_output() {
+        let canceled = Cell::new(false);
+        let first: gen_core::Result<CompletedNative<(AudioTrack, String)>> = capture_native(
+            &descriptor(),
+            &|| canceled.get(),
+            || {
+                facts(100);
+                canceled.set(true);
+                Ok((track(), "discarded artifact".into()))
+            },
+            |value| Some(NativeOutput::track(&value.0)),
+        );
+        assert!(matches!(first, Err(gen_core::Error::Canceled)));
+        canceled.set(false);
+        let retry: gen_core::Result<CompletedNative<(AudioTrack, String)>> = capture_native(
+            &descriptor(),
+            &|| {
+                seed("probe", "unrelated", 999);
+                canceled.get()
+            },
+            || {
+                facts(2);
+                Ok((track(), "retained artifact".into()))
+            },
+            |value| Some(NativeOutput::track(&value.0)),
+        );
+        let retry = retry.unwrap();
+        assert_eq!(retry.output.1, "retained artifact");
+        assert_eq!(retry.output.0.samples, track().samples);
+        let resolved = retry.execution.resolved().unwrap();
+        let ExecutionRandomness::Draws { draws, .. } = &resolved.randomness else {
+            panic!("draws")
+        };
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].seed, Some(2));
+        assert_eq!(
+            resolved.output_policy,
+            ExecutionFact::resolved(
+                json!({"sample_rate":24000,"channels":1,"samples":2,"stems":[],"format":"f32_pcm"})
+            )
+        );
+        let none: gen_core::Result<CompletedNative<Option<Vec<f32>>>> = capture_native(
+            &descriptor(),
+            &|| false,
+            || Ok(None::<Vec<f32>>),
+            |v| v.as_ref().map(|v| NativeOutput::pcm(v, 24000, 1)),
+        );
+        assert!(matches!(none, Err(gen_core::Error::Canceled)));
+    }
+
     #[test]
     fn nested_callbacks_and_other_threads_cannot_pollute_an_attempt() {
         let result = capture(&Mock, &GenerationRequest::default(), &mut |_| {

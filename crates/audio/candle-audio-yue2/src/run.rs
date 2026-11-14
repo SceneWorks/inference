@@ -1340,6 +1340,27 @@ impl Yue2Engine {
         })
     }
 
+    /// Complete this native route with its original result and same-attempt execution metadata.
+    pub fn generate_to_with_execution_report(
+        &self,
+        input: &SongInput,
+        settings: &SongSettings,
+        output: &RunOutput,
+        hooks: &mut EngineHooks<'_>,
+    ) -> Result<candle_audio::execution::CompletedNative<RunOutcome>, RunError> {
+        crate::engine::capture_native_call(
+            hooks,
+            |hooks| self.generate_to(input, settings, output, hooks),
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    &value.samples,
+                    SAMPLE_RATE,
+                    AUDIO_CHANNELS as u16,
+                ))
+            },
+        )
+    }
+
     /// Reuse a complete published run after verifying it against `identity`.
     fn reuse_complete(
         &self,
@@ -1431,6 +1452,28 @@ impl Yue2Engine {
         Ok((plan, plan_id, dir))
     }
 
+    /// Complete this native route with its original result and same-attempt execution metadata.
+    pub fn plan_to_with_execution_report(
+        &self,
+        request: &SongRequest,
+        generation: &GenerationConfig,
+        output: &RunOutput,
+        hooks: &mut EngineHooks<'_>,
+    ) -> Result<
+        candle_audio::execution::CompletedNative<(SymbolicPlan, PlanIdentity, PathBuf)>,
+        RunError,
+    > {
+        crate::engine::capture_native_call(
+            hooks,
+            |hooks| self.plan_to(request, generation, output, hooks),
+            |_value| {
+                Some(candle_audio::execution::NativeOutput::artifact(
+                    "symbolic_plan",
+                ))
+            },
+        )
+    }
+
     /// Decode the cached latents of the complete run in `source` with `decoder` (the skill's
     /// `run_yue2.py decode`): the source is verified and never written; its plan is restored with
     /// its recorded identity and its latents with theirs; the MoT identity must be the source's.
@@ -1445,6 +1488,27 @@ impl Yue2Engine {
         hooks: &mut EngineHooks<'_>,
     ) -> Result<RunOutcome, RunError> {
         self.decode_cached_with(source, decoder, &self.options().decode, output, hooks)
+    }
+
+    /// Complete this native route with its original result and same-attempt execution metadata.
+    pub fn decode_cached_with_execution_report(
+        &self,
+        source: &Path,
+        decoder: VaeVariant,
+        output: Option<&RunOutput>,
+        hooks: &mut EngineHooks<'_>,
+    ) -> Result<candle_audio::execution::CompletedNative<RunOutcome>, RunError> {
+        crate::engine::capture_native_call(
+            hooks,
+            |hooks| self.decode_cached(source, decoder, output, hooks),
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    &value.samples,
+                    SAMPLE_RATE,
+                    AUDIO_CHANNELS as u16,
+                ))
+            },
+        )
     }
 
     /// [`Yue2Engine::decode_cached`] with explicit decode tiling (a request's own). The tiling
@@ -1644,6 +1708,28 @@ impl Yue2Engine {
             samples: audio.samples().to_vec(),
             stages,
         })
+    }
+
+    /// Complete this native route with its original result and same-attempt execution metadata.
+    pub fn decode_cached_with_with_execution_report(
+        &self,
+        source: &Path,
+        decoder: VaeVariant,
+        decode: &DecodeOptions,
+        output: Option<&RunOutput>,
+        hooks: &mut EngineHooks<'_>,
+    ) -> Result<candle_audio::execution::CompletedNative<RunOutcome>, RunError> {
+        crate::engine::capture_native_call(
+            hooks,
+            |hooks| self.decode_cached_with(source, decoder, decode, output, hooks),
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    &value.samples,
+                    SAMPLE_RATE,
+                    AUDIO_CHANNELS as u16,
+                ))
+            },
+        )
     }
 }
 

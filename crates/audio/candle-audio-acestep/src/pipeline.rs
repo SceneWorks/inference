@@ -416,6 +416,36 @@ impl AceStepPipeline {
         Ok(out)
     }
 
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_with_execution_report(
+        &self,
+        prompt: &str,
+        params: &SynthesisParams,
+        on_progress: &mut dyn FnMut(PipelineProgress),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            cancel,
+            || {
+                self.synthesize(
+                    prompt,
+                    params,
+                    &mut |value| candle_audio::execution::callback(|| on_progress(value)),
+                    &|| candle_audio::execution::callback(cancel),
+                )
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    crate::model::SAMPLE_RATE,
+                    crate::model::CHANNELS,
+                ))
+            },
+        )
+    }
+
     /// The shared flow-matching denoise loop: seeded noise → `steps` Euler updates driven by
     /// `context_latents` (`[1, T, 2·acoustic]`) → final latents `[1, T, acoustic]`. Returns `None`
     /// on cancellation (checked before generate, at every step, and between DiT blocks). Both the
@@ -613,6 +643,40 @@ impl AceStepPipeline {
         ))
     }
 
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_with_execution_report(
+        &self,
+        prompt: &str,
+        source: &[f32],
+        source_channels: usize,
+        params: &EditParams,
+        on_progress: &mut dyn FnMut(PipelineProgress),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            cancel,
+            || {
+                self.edit(
+                    prompt,
+                    source,
+                    source_channels,
+                    params,
+                    &mut |value| candle_audio::execution::callback(|| on_progress(value)),
+                    &|| candle_audio::execution::callback(cancel),
+                )
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    crate::model::SAMPLE_RATE,
+                    crate::model::CHANNELS,
+                ))
+            },
+        )
+    }
+
     /// Prompted-audio **Cover** (sc-13251): restyle a whole source clip from a NEW prompt while
     /// preserving its musical structure — the ACE-Step `cover` task. Faithful to the diffusers
     /// v0.39.0 `prepare_src_latents(task_type="cover")` recipe:
@@ -738,6 +802,44 @@ impl AceStepPipeline {
         let out_frames = src_frames.min(gen_frames);
         generated.truncate(out_frames * gen_ch);
         Ok(generated)
+    }
+
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cover_with_execution_report(
+        &self,
+        prompt: &str,
+        source: &[f32],
+        source_channels: usize,
+        params: &SynthesisParams,
+        cover: &CoverModules,
+        cover_dit: &DiT,
+        on_progress: &mut dyn FnMut(PipelineProgress),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            cancel,
+            || {
+                self.cover(
+                    prompt,
+                    source,
+                    source_channels,
+                    params,
+                    cover,
+                    cover_dit,
+                    &mut |value| candle_audio::execution::callback(|| on_progress(value)),
+                    &|| candle_audio::execution::callback(cancel),
+                )
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    crate::model::SAMPLE_RATE,
+                    crate::model::CHANNELS,
+                ))
+            },
+        )
     }
 
     /// Source interleaved PCM → planar `[1, out_channels, N_pad]`, padded up to a whole hop so the

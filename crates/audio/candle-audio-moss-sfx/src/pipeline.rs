@@ -364,6 +364,36 @@ impl MossSfxPipeline {
         let full: Vec<f32> = audio.flatten_all()?.to_vec1::<f32>()?;
         Ok(crop_decoded_audio(full, geometry.requested_samples))
     }
+
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_with_execution_report(
+        &self,
+        prompt: &str,
+        params: &SynthesisParams,
+        on_progress: &mut dyn FnMut(PipelineProgress),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            cancel,
+            || {
+                self.synthesize(
+                    prompt,
+                    params,
+                    &mut |value| candle_audio::execution::callback(|| on_progress(value)),
+                    &|| candle_audio::execution::callback(cancel),
+                )
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    self.config.index.sample_rate,
+                    1,
+                ))
+            },
+        )
+    }
 }
 
 #[cfg(test)]

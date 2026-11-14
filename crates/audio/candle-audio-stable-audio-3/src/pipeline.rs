@@ -1175,9 +1175,44 @@ pub struct StableAudio3Pipeline {
     dtypes: ComputeDTypes,
     execution_adapters: serde_json::Value,
     execution_chunked: bool,
+    execution_variant: Option<crate::model::Variant>,
 }
 
 impl StableAudio3Pipeline {
+    fn native_descriptor(&self) -> candle_audio::gen_core::ModelDescriptor {
+        self.execution_variant
+            .map(crate::model::Variant::descriptor)
+            .unwrap_or_else(crate::model::descriptor)
+    }
+    fn capture_native<T>(
+        &self,
+        hooks: SynthesisHooks<'_>,
+        operation: impl FnOnce(SynthesisHooks<'_>) -> Result<T>,
+        output: impl FnOnce(&T) -> Option<candle_audio::execution::NativeOutput>,
+    ) -> Result<candle_audio::execution::CompletedNative<T>> {
+        let descriptor = self.native_descriptor();
+        candle_audio::execution::capture_native(
+            &descriptor,
+            hooks.is_canceled,
+            || {
+                if self.execution_variant.is_none() {
+                    candle_audio::execution::unavailable("native SA3 custom geometry does not identify a registered provider variant");
+                }
+                let mut progress = |step, total| {
+                    candle_audio::execution::callback(|| (hooks.on_progress)(step, total))
+                };
+                let mut decoding = || candle_audio::execution::callback(|| (hooks.on_decoding)());
+                let canceled = || candle_audio::execution::callback(hooks.is_canceled);
+                operation(SynthesisHooks {
+                    on_progress: &mut progress,
+                    on_decoding: &mut decoding,
+                    is_canceled: &canceled,
+                })
+            },
+            output,
+        )
+    }
+
     /// Build the connected graph, refusing any snapshot that is not `geometry`'s exact checkpoint.
     pub fn from_layout(
         layout: &SnapshotLayout,
@@ -1261,6 +1296,7 @@ impl StableAudio3Pipeline {
             device: device.clone(),
             dtypes,
             execution_chunked: diffusion.pretransform.chunked,
+            execution_variant: crate::model::Variant::ALL.into_iter().find(|variant| variant.geometry()==geometry),
             execution_adapters: serde_json::json!(adapters.targets().map(|target| serde_json::json!({"target":target,"ops":adapters.ops_for(target).unwrap_or_default().iter().map(|op|serde_json::json!({"kind":format!("{:?}",op.kind),"scale_bits":op.effective_scale.to_bits(),"rank":op.rank,"index":op.adapter_index})).collect::<Vec<_>>()})).collect::<Vec<_>>()),
         })
     }
@@ -1286,6 +1322,26 @@ impl StableAudio3Pipeline {
                 &mut |_| {},
             )?
             .0)
+    }
+
+    /// Complete this native route with its original output and attempt-local report.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_with_execution_report(
+        &self,
+        request: SynthesisRequest<'_>,
+        hooks: SynthesisHooks<'_>,
+    ) -> Result<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        self.capture_native(
+            hooks,
+            |hooks| self.synthesize(request, hooks),
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    SAMPLE_RATE,
+                    CHANNELS as u16,
+                ))
+            },
+        )
     }
 
     /// Synthesize from a caller-supplied source clip (sc-14547), plus the request stream's
@@ -1315,6 +1371,28 @@ impl StableAudio3Pipeline {
             ReferenceInputValidation::Required,
             hooks,
             &mut |_| {},
+        )
+    }
+
+    /// Complete this native route with its original output and attempt-local report.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_with_reference_traced_with_execution_report(
+        &self,
+        request: SynthesisRequest<'_>,
+        reference: Option<ReferenceAudio<'_>>,
+        hooks: SynthesisHooks<'_>,
+    ) -> Result<candle_audio::execution::CompletedNative<(Vec<f32>, Option<ReferenceDrawOrder>)>>
+    {
+        self.capture_native(
+            hooks,
+            |hooks| self.synthesize_with_reference_traced(request, reference, hooks),
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    &value.0,
+                    SAMPLE_RATE,
+                    CHANNELS as u16,
+                ))
+            },
         )
     }
 
@@ -1354,6 +1432,27 @@ impl StableAudio3Pipeline {
             ReferenceInputValidation::Required,
             hooks,
             &mut |_| {},
+        )
+    }
+
+    /// Complete this native route with its original output and attempt-local report.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_conditioned_with_execution_report(
+        &self,
+        request: SynthesisRequest<'_>,
+        conditioning: ForwardedConditioning<'_>,
+        hooks: SynthesisHooks<'_>,
+    ) -> Result<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        self.capture_native(
+            hooks,
+            |hooks| self.synthesize_conditioned(request, conditioning, hooks),
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    SAMPLE_RATE,
+                    CHANNELS as u16,
+                ))
+            },
         )
     }
 
@@ -1415,6 +1514,28 @@ impl StableAudio3Pipeline {
             ReferenceInputValidation::Required,
             hooks,
             &mut |_| {},
+        )
+    }
+
+    /// Complete this native route with its original output and attempt-local report.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_with_edit_traced_with_execution_report(
+        &self,
+        request: SynthesisRequest<'_>,
+        edit: AudioEdit<'_>,
+        hooks: SynthesisHooks<'_>,
+    ) -> Result<candle_audio::execution::CompletedNative<(Vec<f32>, Option<ReferenceDrawOrder>)>>
+    {
+        self.capture_native(
+            hooks,
+            |hooks| self.synthesize_with_edit_traced(request, edit, hooks),
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    &value.0,
+                    SAMPLE_RATE,
+                    CHANNELS as u16,
+                ))
+            },
         )
     }
 
@@ -1719,6 +1840,31 @@ impl StableAudio3Pipeline {
         Ok((sampled, audio))
     }
 
+    /// Complete this native route with its original output and attempt-local report.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_controlled_with_execution_report(
+        &self,
+        request: SynthesisRequest<'_>,
+        initial: &Tensor,
+        pingpong_noises: Vec<Tensor>,
+        decode_noises: &[SameDecodeChunkNoise],
+        hooks: SynthesisHooks<'_>,
+    ) -> Result<candle_audio::execution::CompletedNative<(Tensor, Vec<f32>)>> {
+        self.capture_native(
+            hooks,
+            |hooks| {
+                self.synthesize_controlled(request, initial, pingpong_noises, decode_noises, hooks)
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    &value.1,
+                    SAMPLE_RATE,
+                    CHANNELS as u16,
+                ))
+            },
+        )
+    }
+
     /// Replay only the decode boundary with explicit latents and SAME noise.
     #[doc(hidden)]
     pub fn decode_controlled(
@@ -1755,6 +1901,31 @@ impl StableAudio3Pipeline {
         self.finish(decoded, &padding, duration_secs, &|| false)
     }
 
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_controlled_with_execution_report(
+        &self,
+        latents: &Tensor,
+        duration_secs: f32,
+        decode_noises: &[SameDecodeChunkNoise],
+    ) -> Result<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &self.native_descriptor(),
+            &|| false,
+            || {
+                candle_audio::execution::unavailable("native SA3 controlled decoder uses caller-provided noise without a frozen noise identity");
+                self.decode_controlled(latents, duration_secs, decode_noises)
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    SAMPLE_RATE,
+                    CHANNELS as u16,
+                ))
+            },
+        )
+    }
+
     /// Replay one unchunked SAME dispatch for oracle boundary diagnosis.
     #[doc(hidden)]
     pub fn decode_chunk_controlled(
@@ -1770,6 +1941,28 @@ impl StableAudio3Pipeline {
             noise.regularization_noise.as_ref(),
             Some(&noise.mask_noises),
         )?)
+    }
+
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_chunk_controlled_with_execution_report(
+        &self,
+        latents: &Tensor,
+        noise: &SameDecodeChunkNoise,
+    ) -> Result<candle_audio::execution::CompletedNative<Tensor>> {
+        candle_audio::execution::capture_native(
+            &self.native_descriptor(),
+            &|| false,
+            || {
+                candle_audio::execution::unavailable("native SA3 controlled chunk returns a raw tensor with caller-provided noise, without a complete PCM output/noise identity");
+                self.decode_chunk_controlled(latents, noise)
+            },
+            |_value| {
+                Some(candle_audio::execution::NativeOutput::artifact(
+                    "raw_pcm_tensor",
+                ))
+            },
+        )
     }
 
     /// `source.reference` is the request's reference itself rather than a pre-computed `strength`,

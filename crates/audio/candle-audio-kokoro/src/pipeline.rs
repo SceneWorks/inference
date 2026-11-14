@@ -118,6 +118,40 @@ impl KokoroPipeline {
         self.synthesize_with_prompt_progress(tokens, ref_s, speed, seed, stage, cancel, &mut |_| {})
     }
 
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_with_execution_report(
+        &self,
+        tokens: &[u32],
+        ref_s: &[f32],
+        speed: f32,
+        seed: u64,
+        stage: StageSink<'_>,
+        cancel: crate::decoder::CancelProbe<'_>,
+    ) -> Result<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            cancel,
+            || {
+                self.synthesize(
+                    tokens,
+                    ref_s,
+                    speed,
+                    seed,
+                    &mut |value| candle_audio::execution::callback(|| stage(value)),
+                    &|| candle_audio::execution::callback(cancel),
+                )
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    crate::decoder::SAMPLE_RATE,
+                    1,
+                ))
+            },
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn synthesize_with_prompt_progress(
         &self,
@@ -227,6 +261,42 @@ impl KokoroPipeline {
         }
         stage(5)?;
         Ok(samples)
+    }
+
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_with_prompt_progress_with_execution_report(
+        &self,
+        tokens: &[u32],
+        ref_s: &[f32],
+        speed: f32,
+        seed: u64,
+        stage: StageSink<'_>,
+        cancel: crate::decoder::CancelProbe<'_>,
+        on_prompt_progress: &mut dyn FnMut(candle_audio::gen_core::Progress),
+    ) -> Result<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            cancel,
+            || {
+                self.synthesize_with_prompt_progress(
+                    tokens,
+                    ref_s,
+                    speed,
+                    seed,
+                    &mut |value| candle_audio::execution::callback(|| stage(value)),
+                    &|| candle_audio::execution::callback(cancel),
+                    &mut |value| candle_audio::execution::callback(|| on_prompt_progress(value)),
+                )
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    crate::decoder::SAMPLE_RATE,
+                    1,
+                ))
+            },
+        )
     }
 
     /// Natural (speed-1) duration estimate in seconds for `tokens` — the duration head only,

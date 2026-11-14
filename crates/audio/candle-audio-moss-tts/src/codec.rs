@@ -603,6 +603,30 @@ impl XyTokenizerCodec {
         let wav = self.vocos.forward(&mel)?;
         Ok(Some(wav))
     }
+
+    /// Complete native PCM decoding while preserving the legacy optional waveform result.
+    pub fn decode_frames_with_execution_report(
+        &self,
+        frames: &[Vec<u32>],
+        cancel: &dyn Fn() -> bool,
+    ) -> candle_audio::Result<candle_audio::execution::CompletedNative<Option<Vec<f32>>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            cancel,
+            || {
+                candle_audio::execution::unavailable(
+                    "native codec input frames have no bound originating generation receipt",
+                );
+                self.decode_frames(frames, &|| candle_audio::execution::callback(cancel))
+                    .map_err(candle_audio::AudioError::from)
+            },
+            |value| {
+                value.as_ref().map(|pcm| {
+                    candle_audio::execution::NativeOutput::pcm(pcm, self.sample_rate(), 1)
+                })
+            },
+        )
+    }
 }
 
 /// Root-mean-square of all elements (debug instrumentation only).

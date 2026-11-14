@@ -355,6 +355,40 @@ pub fn decode_latents(
     })
 }
 
+/// Decode native latents with the original waveform/metadata and a same-attempt execution report.
+/// The legacy decoder remains available with its original `VaeError` return type.
+pub fn decode_latents_with_execution_report(
+    vae: &Yue2Vae,
+    latents: &AcousticLatents,
+    options: &DecodeOptions,
+    cancel: &dyn Fn() -> bool,
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> candle_audio::gen_core::Result<candle_audio::execution::CompletedNative<DecodedAudio>> {
+    candle_audio::execution::capture_native(
+        &crate::provider::descriptor(),
+        cancel,
+        || {
+            decode_latents(
+                vae,
+                latents,
+                options,
+                &|| candle_audio::execution::callback(cancel),
+                &mut |completed, total| {
+                    candle_audio::execution::callback(|| on_progress(completed, total))
+                },
+            )
+            .map_err(crate::engine::vae_error)
+        },
+        |value| {
+            Some(candle_audio::execution::NativeOutput::pcm(
+                value.samples(),
+                SAMPLE_RATE,
+                AUDIO_CHANNELS as u16,
+            ))
+        },
+    )
+}
+
 /// Planar `[2, S]` raw decoder output → interleaved, clamped samples plus the clamped count.
 /// Any non-finite sample is an error (checked before clamping, which would hide `±inf`).
 fn interleave_clamped(planar: &[f32], samples: usize) -> Result<(Vec<f32>, usize), VaeError> {

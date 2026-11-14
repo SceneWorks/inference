@@ -230,6 +230,48 @@ impl MmAudio44kPipeline {
         )
     }
 
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_with_execution_report(
+        &self,
+        frames: &[Image],
+        src_fps: f32,
+        duration: f32,
+        prompt: &str,
+        negative_prompt: &str,
+        steps: usize,
+        cfg: f64,
+        seed: u64,
+        progress: &mut dyn FnMut(PipelineProgress),
+        probe: &dyn Fn() -> bool,
+    ) -> AudioResult<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &descriptor(),
+            probe,
+            || {
+                self.synthesize(
+                    frames,
+                    src_fps,
+                    duration,
+                    prompt,
+                    negative_prompt,
+                    steps,
+                    cfg,
+                    seed,
+                    &mut |value| candle_audio::execution::callback(|| progress(value)),
+                    &|| candle_audio::execution::callback(probe),
+                )
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    SAMPLE_RATE,
+                    1,
+                ))
+            },
+        )
+    }
+
     /// The **injectable assembly core** — from already-encoded conditioning features + a prior `x0`,
     /// reconfigure the DiT, run the Euler / CFG flow-matching sampler, and decode latent → mel →
     /// 44.1 kHz waveform. Split out so the end-to-end reference-parity harness can inject the
@@ -304,6 +346,47 @@ impl MmAudio44kPipeline {
             .map_err(AudioError::from)?; // (1, 1, S)
         let samples: Vec<f32> = wav.flatten_all()?.to_vec1()?;
         Ok(samples)
+    }
+
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_from_features_with_execution_report(
+        &self,
+        clip_feat: &Tensor,     // (1, clip_seq_len, 1024)
+        sync_feat: &Tensor,     // (1, sync_seq_len, 768)
+        text_feat: &Tensor,     // (1, 77, 1024)
+        neg_text_feat: &Tensor, // (1, 77, 1024)
+        x0: &Tensor,            // (1, latent_seq_len, 40)
+        cfg: f64,
+        steps: usize,
+        progress: &mut dyn FnMut(PipelineProgress),
+        probe: &dyn Fn() -> bool,
+    ) -> AudioResult<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &descriptor(),
+            probe,
+            || {
+                candle_audio::execution::unavailable("native MMAudio feature route consumes caller-supplied initial noise without a frozen noise identity");
+                self.synthesize_from_features(
+                    clip_feat,
+                    sync_feat,
+                    text_feat,
+                    neg_text_feat,
+                    x0,
+                    cfg,
+                    steps,
+                    &mut |value| candle_audio::execution::callback(|| progress(value)),
+                    &|| candle_audio::execution::callback(probe),
+                )
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    SAMPLE_RATE,
+                    1,
+                ))
+            },
+        )
     }
 
     fn encode_clip_visual(&self, frames: &[FrameView<'_>]) -> AudioResult<Tensor> {

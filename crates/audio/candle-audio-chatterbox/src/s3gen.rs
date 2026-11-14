@@ -181,6 +181,40 @@ impl S3Gen {
             },
         )
     }
+
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_execution_report(
+        &self,
+        speech_tokens: &[u32],
+        reference: &AudioTrack,
+        seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<candle_audio::execution::CompletedNative<Option<Vec<f32>>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            should_cancel,
+            || {
+                candle_audio::execution::policy(
+                    "direct-s3gen-output",
+                    candle_audio::execution::json!({"token_input":true,"watermark_applied":false}),
+                );
+                self.render(
+                    speech_tokens,
+                    reference,
+                    seed,
+                    &mut |value| candle_audio::execution::callback(|| on_progress(value)),
+                    &|| candle_audio::execution::callback(should_cancel),
+                )
+            },
+            |value| {
+                value
+                    .as_ref()
+                    .map(|pcm| candle_audio::execution::NativeOutput::pcm(pcm, S3GEN_SR, 1))
+            },
+        )
+    }
 }
 
 #[cfg(test)]
