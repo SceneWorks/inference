@@ -25,9 +25,9 @@
 //! 4. **Train** — the DiT loads **deferred**: only its trunk (I/O projections, the six heads, the
 //!    token refiner) is mapped; the 50 blocks stream from the staged tier — dense bf16 or packed
 //!    q4/q8, used in its published form — one at a time, forward and again in reverse for the
-//!    backward ([`step`]). The AdaLN modulation of the six published timesteps is projected once,
-//!    a projection at a time. Gradient checkpointing is therefore structural: each block's input is
-//!    all the forward keeps. `gradient_checkpointing = false` is honored as the resident
+//!    backward (the private `step` module). The AdaLN modulation of the six published timesteps
+//!    is projected once, a projection at a time. Gradient checkpointing is therefore structural:
+//!    each block's input is all the forward keeps. `gradient_checkpointing = false` is honored as the resident
 //!    alternative (whole DiT mapped, every activation retained), and the preflight refuses it
 //!    unless the device holds it.
 //!
