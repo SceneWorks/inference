@@ -26,6 +26,21 @@ use crate::video::{self, Chunk, ChunkPlan};
 use crate::weights::Weights;
 use crate::{color, convert};
 
+/// Clamp an explicit chunk to the live memory plan. A request cannot bypass a fallback.
+fn resolve_chunk_plan(plan: ChunkPlan, chunk_override: Option<i32>) -> ChunkPlan {
+    let selected = match (plan, chunk_override) {
+        (ChunkPlan::Chunked(safe), Some(requested)) => {
+            ChunkPlan::Chunked(video::pad_to_valid_chunk(requested).min(safe))
+        }
+        (plan, _) => plan,
+    };
+    candle_gen::execution::policy(
+        "seedvr2_budget_route",
+        serde_json::json!(format!("{selected:?}")),
+    );
+    selected
+}
+
 /// Post-decode color-correction luminance weight (the reference `apply_color_correction` default).
 const LUMINANCE_WEIGHT: f32 = 0.8;
 
@@ -72,6 +87,12 @@ fn seeded_normal5(
     dt: DType,
     dev: &Device,
 ) -> CResult<Tensor> {
+    candle_gen::execution::stream("seedvr2_chunk_or_tile_noise", seed);
+    candle_gen::execution::runtime(dev, dt);
+    candle_gen::execution::policy(
+        "seedvr2_noise_shape",
+        serde_json::json!([shape.0, shape.1, shape.2, shape.3, shape.4]),
+    );
     let (a, b, c, d, e) = shape;
     let mut rng = StdRng::seed_from_u64(seed);
     let data = candle_gen::seeded_normal_vec(&mut rng, a * b * c * d * e);
@@ -191,6 +212,11 @@ impl Seedvr2Pipeline {
 
     /// One denoise step: `vid = [noise, condition]` → DiT → `noise − DiT_out`.
     fn denoise(&self, noise: &Tensor, condition: &Tensor) -> Result<Tensor> {
+        candle_gen::execution::schedule_f64(
+            "seedvr2_one_step_euler_v1",
+            &[TIMESTEP, 0.0],
+            "noise_minus_dit_output",
+        );
         let model_input = Tensor::cat(&[noise, condition], 1)?; // (B,33,T',h,w)
         let dit_out = self
             .transformer
@@ -280,6 +306,13 @@ impl Seedvr2Pipeline {
             ChunkPlan::OverBudget { .. }
         );
         let over_vae_cap = width.max(height) as i32 > video::VAE_SAFE_DECODE_EDGE_PX;
+        candle_gen::execution::policy(
+            "seedvr2_still_route",
+            serde_json::json!({
+                "tiled": over_budget || over_vae_cap, "memory_fallback": over_budget,
+                "decoder_cap_fallback": over_vae_cap
+            }),
+        );
         if over_budget || over_vae_cap {
             return self.generate_tiled(image, width, height, seed, softness, safe_gib, cancel);
         }
@@ -337,6 +370,13 @@ impl Seedvr2Pipeline {
         height: usize,
         softness: f32,
     ) -> CResult<Tensor> {
+        candle_gen::execution::policy(
+            "seedvr2_preprocess",
+            serde_json::json!({
+                "softness_bits": softness.clamp(0.0, 1.0).to_bits(),
+                "luminance_weight_bits": LUMINANCE_WEIGHT.to_bits(), "resize": "bicubic-u8-v1"
+            }),
+        );
         let (ih, iw) = (image.height as usize, image.width as usize);
         let resized: Vec<f32> = if softness > 0.0 {
             let factor = 1.0 + softness.clamp(0.0, 1.0) * 7.0;
@@ -465,6 +505,13 @@ impl Seedvr2Pipeline {
         cancel: Option<&CancelFlag>,
         mut progress: Option<&mut dyn FnMut(usize, usize)>,
     ) -> CResult<Vec<Image>> {
+        candle_gen::execution::policy(
+            "seedvr2_video_processing",
+            serde_json::json!({
+                "softness_bits": softness.to_bits(), "luminance_weight_bits": LUMINANCE_WEIGHT.to_bits(),
+                "frame_count": frames.len(), "size": [width, height]
+            }),
+        );
         let n = frames.len() as i32;
         if n == 0 {
             return Ok(Vec::new());
@@ -476,29 +523,31 @@ impl Seedvr2Pipeline {
             return self
                 .generate_video_tiled(frames, width, height, seed, softness, cancel, progress);
         }
-        let chunk = match (
-            chunk_override,
+        let selected = resolve_chunk_plan(
             video::plan_chunk_size(self.weights_bytes, height as i32, width as i32),
-        ) {
-            // Clamp an override DOWN to the budget-safe chunk so it can't bypass the planner and OOM;
-            // a smaller-than-safe override is honored as-is. PerFrame/OverBudget route to the safe
-            // paths regardless of the override, since forcing a chunk there would OOM.
-            (Some(c), ChunkPlan::Chunked(safe)) => video::pad_to_valid_chunk(c).min(safe),
-            (_, ChunkPlan::Chunked(c)) => c,
-            (_, ChunkPlan::PerFrame) => {
+            chunk_override,
+        );
+        let chunk = match selected {
+            ChunkPlan::Chunked(c) => c,
+            ChunkPlan::PerFrame => {
                 return self.generate_video_per_frame(
                     frames, width, height, seed, softness, cancel, progress,
                 )
             }
-            // Even one full-resolution frame exceeds the budget → spatially tile each frame
-            // (per-frame T=1 + overlap feather blend). Bounds peak at any resolution (sc-5201).
-            (_, ChunkPlan::OverBudget { .. }) => {
+            ChunkPlan::OverBudget { .. } => {
                 return self
                     .generate_video_tiled(frames, width, height, seed, softness, cancel, progress)
             }
         };
 
         let plan = video::plan_chunks(n, chunk, video::DEFAULT_OVERLAP);
+        candle_gen::execution::policy(
+            "seedvr2_temporal_chunks",
+            serde_json::json!({
+                "chunk": chunk, "overlap": video::DEFAULT_OVERLAP,
+                "units": plan.iter().map(|c| (c.start, c.len)).collect::<Vec<_>>()
+            }),
+        );
         let total = plan.len();
         // Assemble incrementally: cross-fade each chunk into `out` as it is produced and drop the
         // chunk, so host RAM stays at one full video plus the one chunk in flight — the batch path
@@ -541,6 +590,7 @@ impl Seedvr2Pipeline {
         cancel: Option<&CancelFlag>,
         mut progress: Option<&mut dyn FnMut(usize, usize)>,
     ) -> CResult<Vec<Image>> {
+        candle_gen::execution::policy("seedvr2_video_route", serde_json::json!("per_frame"));
         let total = frames.len();
         let mut out = Vec::with_capacity(total);
         for (i, f) in frames.iter().enumerate() {
@@ -605,6 +655,13 @@ impl Seedvr2Pipeline {
         let (_b, _c, _t, height, width) = processed.dims5()?; // (1,3,1,H,W)
         let (h_i, w_i) = (height as i32, width as i32);
         let plan = video::plan_spatial_tiles(h_i, w_i, tile, overlap);
+        candle_gen::execution::policy(
+            "seedvr2_spatial_tiles",
+            serde_json::json!({
+                "tile": tile, "overlap": overlap, "height": height, "width": width,
+                "plan": format!("{plan:?}")
+            }),
+        );
         let mut acc: Option<Tensor> = None; // (1,3,1,H,W)
         let mut wsum: Option<Tensor> = None; // (1,1,1,H,W)
                                              // `for_each_tile` checks the cancel flag before each (seconds-to-minutes) tile.
@@ -759,5 +816,103 @@ mod tests {
                 "strictly increasing (monotonic real progress, not a fixed placeholder): {seen:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod execution_identity_tests {
+    use super::*;
+
+    fn report(
+        plan: ChunkPlan,
+        requested: Option<i32>,
+    ) -> candle_gen::gen_core::generator::ExecutionIdentity {
+        let attempt = candle_gen::execution::Attempt::begin();
+        let _selected = resolve_chunk_plan(plan, requested);
+        let _noise = seeded_normal5(5, (1, 1, 1, 1, 1), DType::F32, &Device::Cpu).unwrap();
+        candle_gen::execution::schedule_f64(
+            "seedvr2_one_step_euler_v1",
+            &[TIMESTEP, 0.0],
+            "noise_minus_dit_output",
+        );
+        let output = candle_gen::gen_core::GenerationOutput::Video {
+            frames: vec![Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            }],
+            fps: 24,
+            audio: None,
+        };
+        attempt.finish_image(&crate::descriptor(), &output)
+    }
+
+    #[test]
+    fn report_binds_effective_budget_fallback_and_clamped_chunk() {
+        let safe = report(ChunkPlan::Chunked(8), None);
+        assert!(safe.resolved().is_some());
+        assert_eq!(safe, report(ChunkPlan::Chunked(8), Some(128)));
+        assert_ne!(safe, report(ChunkPlan::Chunked(16), None));
+        let per_frame = report(ChunkPlan::PerFrame, Some(128));
+        assert_ne!(safe, per_frame);
+        assert_eq!(per_frame, report(ChunkPlan::PerFrame, None));
+        assert_ne!(
+            per_frame,
+            report(
+                ChunkPlan::OverBudget {
+                    needed_gib: 20.0,
+                    safe_gib: 2.0
+                },
+                Some(128)
+            )
+        );
+    }
+
+    #[test]
+    fn repeated_tile_streams_keep_the_active_still_output_index() {
+        let attempt = candle_gen::execution::Attempt::begin();
+        for output in 0..2 {
+            candle_gen::execution::draw("image_initial_noise", 9 + output as u64, output);
+            for _tile in 0..2 {
+                let _noise =
+                    seeded_normal5(9 + output as u64, (1, 1, 1, 1, 1), DType::F32, &Device::Cpu)
+                        .unwrap();
+            }
+        }
+        candle_gen::execution::schedule_f64(
+            "seedvr2_one_step_euler_v1",
+            &[TIMESTEP, 0.0],
+            "noise_minus_dit_output",
+        );
+        let output = candle_gen::gen_core::GenerationOutput::Images(vec![
+            Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            },
+            Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            },
+        ]);
+        let identity = attempt.finish_image(&crate::descriptor(), &output);
+        let resolved = identity.resolved().unwrap();
+        resolved
+            .validate(crate::descriptor().id, "candle", 2)
+            .unwrap();
+        let candle_gen::gen_core::generator::ExecutionRandomness::Draws { draws, .. } =
+            &resolved.randomness
+        else {
+            panic!("draws")
+        };
+        assert_eq!(
+            draws.iter().map(|d| d.output_index).collect::<Vec<_>>(),
+            [0, 0, 0, 1, 1, 1]
+        );
+        assert_eq!(
+            draws.iter().map(|d| d.seed.unwrap()).collect::<Vec<_>>(),
+            [9, 9, 9, 10, 10, 10]
+        );
     }
 }

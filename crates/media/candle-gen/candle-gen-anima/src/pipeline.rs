@@ -45,7 +45,7 @@ fn create_noise(seed: u64, width: u32, height: u32, device: &Device) -> Result<T
     let lat_h = (height / VAE_COMPRESSION) as usize;
     let lat_w = (width / VAE_COMPRESSION) as usize;
     let n = VAE_CHANNELS * lat_h * lat_w;
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("anima/pipeline", seed));
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(
         Tensor::from_vec(data, (1, VAE_CHANNELS, 1, lat_h, lat_w), &Device::Cpu)?
@@ -75,8 +75,21 @@ pub struct GenOptions {
 
 /// The assembled Anima pipeline.
 pub struct AnimaPipeline {
+    unobserved_adapter_count: usize,
     components: AnimaComponents,
     device: Device,
+    variant: Variant,
+}
+
+fn checked_variant(loaded: Variant, requested: Variant) -> Result<Variant> {
+    if loaded != requested {
+        return Err(CandleError::Msg(format!(
+            "anima pipeline loaded {} weights but generation requested {}",
+            loaded.id(),
+            requested.id()
+        )));
+    }
+    Ok(loaded)
 }
 
 impl AnimaPipeline {
@@ -87,8 +100,10 @@ impl AnimaPipeline {
         adapters: &[candle_gen::gen_core::AdapterSpec],
     ) -> Result<Self> {
         Ok(Self {
+            unobserved_adapter_count: adapters.len(),
             components: AnimaComponents::load(source, variant, device, adapters)?,
             device: device.clone(),
+            variant,
         })
     }
 
@@ -128,6 +143,41 @@ impl AnimaPipeline {
 
     /// Generate one image. `negative` is used only when `variant.uses_cfg()`.
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        prompt: &str,
+        negative: &str,
+        variant: Variant,
+        opts: &GenOptions,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let variant =
+            checked_variant(self.variant, variant).map_err(candle_gen::gen_core::Error::from)?;
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor_for(variant), cancel, || {
+            candle_gen::execution::unobserved_adapters(
+                self.unobserved_adapter_count,
+                "AnimaPipeline",
+            );
+            candle_gen::execution::policy("direct_route", "anima/pipeline/generate".into());
+            let image = self
+                .generate(
+                    prompt,
+                    negative,
+                    variant,
+                    opts,
+                    cancel,
+                    &mut report_progress,
+                )
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate(
         &self,
         prompt: &str,
@@ -137,6 +187,7 @@ impl AnimaPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        let variant = checked_variant(self.variant, variant)?;
         let cond = self.encode_prompt(prompt)?;
         let uncond = if variant.uses_cfg() {
             Some(self.encode_prompt(negative)?)
@@ -153,6 +204,22 @@ impl AnimaPipeline {
             cancel,
             on_progress,
         )
+    }
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::{checked_variant, Variant};
+
+    #[test]
+    fn loaded_weights_cannot_be_reported_or_run_as_another_variant() {
+        assert_eq!(
+            checked_variant(Variant::Base, Variant::Base).unwrap(),
+            Variant::Base
+        );
+        let error = checked_variant(Variant::Base, Variant::Turbo).unwrap_err();
+        assert!(error.to_string().contains("anima_base"));
+        assert!(error.to_string().contains("anima_turbo"));
     }
 }
 
@@ -223,6 +290,19 @@ impl ConditioningComponents for AnimaConditioningComponents {
     }
 }
 
+/// Observe the loaded component's compute dtype at the operation that consumes it. The flow
+/// sampler integrates f32 latents, which cannot attest the text encoder, conditioner, or DiT math.
+fn observe_component_compute(component: &str, device: &Device, dtype: DType) {
+    candle_gen::execution::runtime(device, dtype);
+    candle_gen::execution::policy(
+        &format!("anima/{component}_compute"),
+        serde_json::json!({
+            "device": format!("{:?}", device.location()),
+            "dtype": format!("{dtype:?}"),
+        }),
+    );
+}
+
 fn encode_prompt_components(
     c: &impl ConditioningComponents,
     device: &Device,
@@ -233,6 +313,7 @@ fn encode_prompt_components(
     let s = qwen_ids.len();
     let ids_u32: Vec<u32> = qwen_ids.iter().map(|&i| i as u32).collect();
     let input_ids = Tensor::from_vec(ids_u32, (1, s), device)?;
+    observe_component_compute("text_encoder", device, dtype);
     let source = c.text_encoder().forward(&input_ids, dtype)?; // [1, S, 1024]
 
     // Multiply the Qwen states by the attention mask BEFORE the conditioner (zeros padded/uncond
@@ -246,6 +327,7 @@ fn encode_prompt_components(
     let st = t5_ids.len();
     let t5_u32: Vec<u32> = t5_ids.iter().map(|&i| i as u32).collect();
     let target_ids = Tensor::from_vec(t5_u32, (1, st), device)?;
+    observe_component_compute("conditioner", device, dtype);
     c.conditioner().forward(&source, &target_ids, dtype)
 }
 
@@ -276,6 +358,7 @@ fn render_encoded_components(
     // (sc-10625). Latents stay f32 end-to-end; only the DiT forward runs in `dtype`.
     let noise = create_noise(opts.seed, opts.width, opts.height, device)?;
     let guidance = opts.guidance as f64;
+    candle_gen::execution::policy("anima/pipeline/guidance", format!("{guidance:?}").into());
     let sampler = opts.sampler.as_deref().or(Some(DEFAULT_SAMPLER));
 
     let dit = render.dit();
@@ -286,6 +369,7 @@ fn render_encoded_components(
     // integrating `x + (σ_next − σ)·v`) consumes the DiT output directly — no negation, no `1 − σ`.
     let predict = |x: &Tensor, sigma: f32| -> Result<Tensor> {
         let s = Tensor::from_vec(vec![sigma], (1,), device)?;
+        observe_component_compute("dit", device, dtype);
         let v_cond = dit.forward_prepared(x, &s, &cond, dtype, &prepared_rope)?;
         let v = match &uncond {
             // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
@@ -352,6 +436,47 @@ fn to_image(decoded: &candle_gen::candle_core::Tensor) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn component_compute_observations_distinguish_model_dtype_from_f32_latents() {
+        fn observed_policy(component_dtype: DType) -> serde_json::Value {
+            let attempt = candle_gen::execution::Attempt::begin();
+            candle_gen::execution::rng_scheme("anima-test-seeded-noise");
+            candle_gen::execution::draw("anima/pipeline", 9, 0);
+            candle_gen::execution::schedule("euler", &[1.0, 0.0], "Flow");
+            candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+            for component in ["text_encoder", "conditioner", "dit"] {
+                observe_component_compute(component, &Device::Cpu, component_dtype);
+            }
+            let output = candle_gen::gen_core::GenerationOutput::Images(vec![Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            }]);
+            let candle_gen::gen_core::generator::ExecutionIdentity::Resolved { identity } =
+                attempt.finish_image(&crate::descriptor_base(), &output)
+            else {
+                panic!("component observations should complete the weights-free report");
+            };
+            let candle_gen::gen_core::generator::ExecutionFact::Resolved { value } =
+                identity.quality_policy
+            else {
+                panic!("quality policy should be resolved");
+            };
+            value
+        }
+
+        let f32 = observed_policy(DType::F32);
+        let bf16 = observed_policy(DType::BF16);
+        for component in ["text_encoder", "conditioner", "dit"] {
+            let key = format!("anima/{component}_compute");
+            assert_eq!(f32["operations"][&key][0]["value"]["dtype"], "F32");
+            assert_eq!(bf16["operations"][&key][0]["value"]["dtype"], "BF16");
+        }
+        assert_eq!(bf16["compute"][0]["dtype"], "F32");
+        assert_eq!(bf16["compute"][1]["dtype"], "BF16");
+        assert_ne!(f32, bf16);
+    }
 
     #[test]
     fn sigma_schedule_linspace_shift3() {

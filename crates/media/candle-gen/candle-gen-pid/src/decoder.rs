@@ -97,6 +97,16 @@ impl PidDecoder {
     /// the whole-image `PidNet::forward` VRAM peak never materializes. `tile`/`overlap` are output-pixel
     /// units. Used above the budget threshold at the decode seam, and by the A/B harness.
     pub fn decode_tiled(&self, latents: &Tensor, tile: i32, overlap: i32) -> Result<Tensor> {
+        candle_gen::execution::policy(
+            "pid_degrade",
+            format!(
+                "sigma_bits={};scale={};vae_compression={}",
+                self.sigma.to_bits(),
+                self.scale,
+                self.vae_compression
+            )
+            .into(),
+        );
         let b = latents.dim(0)?;
         let (th, tw) = self.target_hw(latents)?;
         let latents = latents.to_dtype(DType::F32)?;
@@ -125,6 +135,16 @@ impl LatentDecoder for PidDecoder {
     /// `latents`: the normalized VAE latent `[B, C, zH, zW]`. Returns super-resolved pixels
     /// `[B, 3, zH·vae_compression·scale, zW·vae_compression·scale]` in `[-1, 1]` (f32).
     fn decode(&self, latents: &Tensor) -> Result<Tensor> {
+        candle_gen::execution::policy(
+            "pid_degrade",
+            format!(
+                "sigma_bits={};scale={};vae_compression={}",
+                self.sigma.to_bits(),
+                self.scale,
+                self.vae_compression
+            )
+            .into(),
+        );
         let b = latents.dim(0)?;
         let (th, tw) = self.target_hw(latents)?;
         // The PiD net runs f32; an engine may hand an f16/bf16 sampler latent, so cast here (a no-op

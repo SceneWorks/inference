@@ -384,7 +384,12 @@ fn generate_base_images(
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let steps = req.steps.map(|s| s as usize);
     let guidance_scale = req.true_cfg.or(req.guidance);
+    candle_gen::execution::policy(
+        "sana/model/guidance_scale",
+        format!("{guidance_scale:?}").into(),
+    );
     let guidance = guidance_scale.unwrap_or(crate::pipeline::DEFAULT_GUIDANCE);
+    candle_gen::execution::policy("sana/model/guidance", format!("{guidance:?}").into());
     let conditioning = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
         pipeline
             .encode_batch(
@@ -457,6 +462,14 @@ fn generate_base_images(
 }
 
 impl Generator for SanaGenerator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -770,6 +783,14 @@ pub fn load_sprint(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 }
 
 impl Generator for SanaSprintGenerator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }

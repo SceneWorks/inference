@@ -19,6 +19,12 @@ use rand::{rngs::StdRng, SeedableRng};
 use crate::preview::{PreviewCounter, PreviewHook};
 use crate::{CandleError, Result};
 
+/// The actual shared-driver name/default/fallback resolution; pure metadata, no denoise.
+pub(crate) fn resolved_solver(name: Option<&str>) -> gen_core::sampling::Solver {
+    name.and_then(gen_core::sampling::Solver::from_name)
+        .unwrap_or(gen_core::sampling::Solver::Euler)
+}
+
 /// Lift a `candle_core::Result` into the backend-neutral `gen_core::Result` (the `LatentOps` trait is
 /// declared in gen-core, so its methods return `gen_core::Result`). Routes through the existing
 /// candle-gen bridge: `candle_core::Error -> CandleError -> gen_core::Error::Backend`.
@@ -64,6 +70,7 @@ impl LatentOps for CandleLatentOps {
         // off the raw init-noise seed). Seeded CPU StdRng draw -> launch-portable, then matched to the
         // latent's shape/device/dtype.
         let sub = seed.wrapping_add(0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(step as u64 + 1));
+        crate::execution::stream("curated_step_noise", sub);
         let mut rng = StdRng::seed_from_u64(sub);
         let data = crate::seeded_normal_vec(&mut rng, x.elem_count());
         let noise = ge(Tensor::from_vec(data, x.shape().clone(), x.device()))?;
@@ -196,14 +203,16 @@ pub fn run_curated_sampler(
     preview: Option<&PreviewHook<'_>>,
     mut predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
 ) -> Result<Tensor> {
-    use gen_core::sampling::{denoise as gc_denoise, sampler_by_name, Euler, Sampler};
+    use gen_core::sampling::denoise as gc_denoise;
 
     let ops = CandleLatentOps;
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
     // N3: a curated name routes to its solver; an unknown name / non-solver alias falls back to Euler.
-    let sampler: Box<dyn Sampler<CandleLatentOps>> = sampler_name
-        .and_then(sampler_by_name::<CandleLatentOps>)
-        .unwrap_or_else(|| Box::new(Euler));
+    let solver = resolved_solver(sampler_name);
+    let sampler = solver.boxed::<CandleLatentOps>();
+    crate::execution::runtime(latents.device(), latents.dtype());
+    crate::execution::schedule(solver.name(), sigmas, &format!("{:?}", ms.prediction()));
+
     // Built HERE, not by the family, so frame numbering can only ever key off the schedule this
     // driver actually integrates. `None` allocates nothing and adds no per-eval work.
     let previews = preview.map(|hook| (hook, PreviewCounter::new(sigmas)));
@@ -255,6 +264,7 @@ pub fn run_flow_sampler(
     preview: Option<&PreviewHook<'_>>,
     predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
 ) -> Result<Tensor> {
+    crate::execution::policy("flow_timestep_convention", format!("{conv:?}").into());
     let ms = gen_core::sampling::FlowModelSampling::new(conv);
     run_curated_sampler(
         sampler_name,
@@ -451,16 +461,16 @@ pub fn run_av_curated_sampler(
     on_progress: &mut dyn FnMut(Progress),
     mut predict: impl FnMut(&AvLatents, f32) -> Result<AvLatents>,
 ) -> Result<AvLatents> {
-    use gen_core::sampling::{
-        denoise as gc_denoise, sampler_by_name, Euler, FlowModelSampling, Sampler,
-    };
+    use gen_core::sampling::{denoise as gc_denoise, FlowModelSampling};
 
     let ops = CandleAvLatentOps;
     let ms = FlowModelSampling::new(TimestepConvention::Sigma);
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
-    let sampler: Box<dyn Sampler<CandleAvLatentOps>> = sampler_name
-        .and_then(sampler_by_name::<CandleAvLatentOps>)
-        .unwrap_or_else(|| Box::new(Euler));
+    let solver = resolved_solver(sampler_name);
+    let sampler = solver.boxed::<CandleAvLatentOps>();
+    crate::execution::runtime(latents.video.device(), latents.video.dtype());
+    crate::execution::runtime(latents.audio.device(), latents.audio.dtype());
+    crate::execution::schedule(solver.name(), sigmas, "Flow/Sigma/audio-video");
 
     let mut denoise_fn = |x: &AvLatents, sigma: f32| -> gen_core::Result<AvLatents> {
         if cancel.is_cancelled() {
@@ -675,6 +685,12 @@ pub fn run_scm_sampler_from(
     let start = start_step.min(n);
     let total = (n - start).max(1) as u32;
     let single_step = scheduler.is_single_step();
+    crate::execution::runtime(latents.device(), latents.dtype());
+    crate::execution::schedule("scm", &scheduler.timesteps[start..], "TrigFlow");
+    crate::execution::policy(
+        "scm",
+        serde_json::json!({"sigma_data_bits":scheduler.sigma_data.to_bits(),"single_step":single_step}),
+    );
     // Step-index keyed: this loop has no σ schedule for the sigma-keyed counter to search.
     let previews = preview.map(|hook| (hook, PreviewCounter::with_steps(n - start)));
     let mut latents = latents;

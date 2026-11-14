@@ -359,7 +359,7 @@ impl QwenVae {
         }
         let (_, _, lh, lw) = latents.dims4()?;
         let mid = self.decode_mid(latents)?;
-        if should_tile_tail((lh * 8).max(lw * 8), tile.is_some()) {
+        let decoded = if should_tile_tail((lh * 8).max(lw * 8), tile.is_some()) {
             // Keep the pre-ladder high-resolution correctness fallback byte-for-byte compatible.
             // The calibrated 64 px overlap applies only to an explicit memory-ladder selection;
             // legacy automatic tiling above the im2col threshold remains 512/128.
@@ -367,7 +367,9 @@ impl QwenVae {
             self.tile_blend_tail(&mid, edge, overlap, cancel)
         } else {
             Ok(self.decode_tail(&mid)?)
-        }
+        }?;
+        crate::observe_component_precision("vae", decoded.device(), decoded.dtype());
+        Ok(decoded)
     }
 
     /// The **global-context head**: de-normalize → post_quant_conv → conv_in → mid block (resnet, GLOBAL
@@ -648,7 +650,9 @@ impl QwenVaeEncoder {
         let h = self.conv_out.forward(&h)?; // [1, 32, H/8, W/8]
         let e = self.quant_conv.forward(&h)?; // [1, 32, H/8, W/8]
         let e16 = e.narrow(1, 0, 16)?; // keep the mean (first 16 of 32)
-        e16.broadcast_sub(&self.mean)?.broadcast_div(&self.std)
+        let encoded = e16.broadcast_sub(&self.mean)?.broadcast_div(&self.std)?;
+        crate::observe_component_precision("vae_encoder", encoded.device(), encoded.dtype());
+        Ok(encoded)
     }
 }
 

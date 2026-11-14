@@ -788,6 +788,7 @@ impl Module for SparseMoe {
             xs.dtype()
         };
         let xc = xs.to_dtype(compute_dtype)?;
+        candle_gen::execution::component_runtime("lens/experts", xc.device(), xc.dtype());
         let mut ys = xc.zeros_like()?;
         for (e, expert) in self.experts.iter().enumerate() {
             if top_x[e].is_empty() {
@@ -1008,6 +1009,7 @@ impl GptOssTextEncoder {
     ) -> candle_gen::Result<EncoderOutput> {
         let (_b, seq_len) = input_ids.dims2()?;
         let mut xs = __model_proof_output!(self.embed_tokens.forward(input_ids))?;
+        candle_gen::execution::component_runtime("lens/text_encoder", xs.device(), xs.dtype());
         // Full-causal mask for full-attention layers, sliding-window mask for the alternating sliding
         // layers; selected per layer.
         let full = causal_mask(seq_len, None, &self.device, self.dtype)?;

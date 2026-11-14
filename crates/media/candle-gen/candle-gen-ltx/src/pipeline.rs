@@ -213,6 +213,8 @@ pub fn create_noise(
     device: &Device,
 ) -> Result<Tensor> {
     let n = LATENT_CHANNELS * t_lat * h_lat * w_lat;
+    candle_gen::execution::draw("ltx_video_stage_latents", seed, 0);
+    candle_gen::execution::runtime(device, candle_gen::candle_core::DType::F32);
     let mut rng = StdRng::seed_from_u64(seed);
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(data, (1, LATENT_CHANNELS, t_lat, h_lat, w_lat), device)
@@ -244,6 +246,7 @@ pub fn create_audio_noise(seed: u64, audio_frames: usize, device: &Device) -> Re
     let ch = AUDIO_LATENT_CHANNELS as usize;
     let mel = AUDIO_MEL_BINS as usize;
     let n = ch * audio_frames * mel;
+    candle_gen::execution::draw("ltx_audio_stage_latents", seed, 0);
     let mut rng = StdRng::seed_from_u64(seed);
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(data, (1, ch, audio_frames, mel), device)
@@ -338,6 +341,7 @@ pub fn denoise_av_conditioned(
     on_model_forward: &mut dyn FnMut() -> Result<()>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> candle_gen::Result<(conditioning::VideoTokenState, Tensor)> {
+    candle_gen::execution::schedule("ltx_conditioned_euler_v1", sigmas, "flow_velocity");
     let mut state = video.clone();
     let mut alat = audio.clone();
     // The conditioned state owns its final geometry (including appended clip tokens), so prepare
@@ -410,6 +414,11 @@ pub fn denoise_video_dev_conditioned(
     on_model_forward: &mut dyn FnMut() -> Result<()>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> candle_gen::Result<conditioning::VideoTokenState> {
+    candle_gen::execution::schedule("ltx_dev_euler_v1", sigmas, "flow_velocity");
+    candle_gen::execution::policy(
+        "ltx_dev_guidance",
+        serde_json::json!({"video": format!("{video_guider:?}"), "stg_blocks": stg_blocks}),
+    );
     let mut state = video.clone();
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
     if stg_blocks.is_empty() || stg_blocks.len() > 8 || stg_blocks.iter().any(|&block| block >= 48)
@@ -500,6 +509,11 @@ pub fn denoise_av_dev_conditioned(
     on_model_forward: &mut dyn FnMut() -> Result<()>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> candle_gen::Result<(conditioning::VideoTokenState, Tensor)> {
+    candle_gen::execution::schedule("ltx_dev_euler_v1", sigmas, "flow_velocity");
+    candle_gen::execution::policy(
+        "ltx_dev_guidance",
+        serde_json::json!({"video": format!("{video_guider:?}"), "stg_blocks": stg_blocks, "audio": format!("{audio_guider:?}")}),
+    );
     let mut state = video.clone();
     let mut alat = audio.clone();
     let audio_request = flatten_audio_latent(&alat)?;
@@ -643,15 +657,23 @@ pub fn denoise_tokens_rf_ancestral(
     on_progress: &mut dyn FnMut(Progress),
 ) -> candle_gen::Result<(conditioning::VideoTokenState, Option<Tensor>)> {
     let mut state = video.clone();
+    candle_gen::execution::schedule("ltx_dfr_rf_ancestral_v1", sigmas, "flow_velocity");
+    candle_gen::execution::policy(
+        "ltx_rf_ancestral",
+        serde_json::json!({"eta_bits": eta.to_bits(), "noise_bits": s_noise.to_bits()}),
+    );
     let mut alat = audio.as_ref().map(|a| a.latent.clone());
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
     let device = state.latent.device().clone();
     let seeded_normal = |shape: &[usize], step: usize, modality: u64| -> Result<Tensor> {
-        let mut rng = StdRng::seed_from_u64(
-            noise_seed
-                .wrapping_add(2 * step as u64)
-                .wrapping_add(modality),
+        let effective_seed = noise_seed
+            .wrapping_add(2 * step as u64)
+            .wrapping_add(modality);
+        candle_gen::execution::stream(
+            &format!("ltx_ancestral_step_{step}_modality_{modality}"),
+            effective_seed,
         );
+        let mut rng = StdRng::seed_from_u64(effective_seed);
         let n: usize = shape.iter().product();
         let data = candle_gen::seeded_normal_vec(&mut rng, n);
         Tensor::from_vec(data, shape, &device)?.to_dtype(DType::F32)
@@ -982,6 +1004,57 @@ mod tests {
                 StageOperation::Stage2Forward,
                 StageOperation::Stage2Forward,
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod execution_identity_tests {
+    use super::*;
+    fn output() -> candle_gen::gen_core::GenerationOutput {
+        candle_gen::gen_core::GenerationOutput::Video {
+            frames: vec![candle_gen::gen_core::Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            }],
+            fps: 24,
+            audio: None,
+        }
+    }
+
+    #[test]
+    fn reports_all_stage_and_modality_draws_without_collapsing_equal_shapes() {
+        let attempt = candle_gen::execution::Attempt::begin();
+        let device = Device::Cpu;
+        let _ = create_noise(40, 1, 1, 1, &device).unwrap();
+        let _ = create_audio_noise(42, 1, &device).unwrap();
+        let _ = create_noise(41, 1, 1, 1, &device).unwrap();
+        let _ = create_audio_noise(43, 1, &device).unwrap();
+        candle_gen::execution::schedule("stage_one_fixture", &[1.0, 0.0], "flow");
+        candle_gen::execution::schedule("stage_two_fixture", &[0.5, 0.0], "flow");
+        candle_gen::execution::policy("fixture", serde_json::json!("no_model"));
+        let identity = attempt.finish_image(&crate::descriptor(), &output());
+        let resolved = identity.resolved().unwrap();
+        let candle_gen::gen_core::generator::ExecutionRandomness::Draws { draws, .. } =
+            &resolved.randomness
+        else {
+            panic!("draws")
+        };
+        assert_eq!(
+            draws.iter().map(|d| d.seed.unwrap()).collect::<Vec<_>>(),
+            [40, 42, 41, 43]
+        );
+        assert_eq!(draws[0].purpose, "ltx_video_stage_latents");
+        assert_eq!(draws[1].purpose, "ltx_audio_stage_latents");
+        let candle_gen::gen_core::generator::ExecutionFact::Resolved { value } = &resolved.schedule
+        else {
+            panic!("schedule")
+        };
+        assert_eq!(value.as_array().unwrap().len(), 2);
+        assert_ne!(
+            value[0]["schedule"]["sha256"],
+            value[1]["schedule"]["sha256"]
         );
     }
 }

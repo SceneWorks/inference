@@ -31,6 +31,10 @@ pub fn sample(
     mut on_step: impl FnMut(usize, &Tensor),
 ) -> Result<Tensor> {
     let mut x = z.to_dtype(DType::F32)?;
+    let times: Vec<f64> = plan.iter().flat_map(|step| [step.s, step.t]).collect();
+    candle_gen::execution::schedule_f64("iris-flow-dpm", &times, &format!("{prediction:?}"));
+    candle_gen::execution::runtime(x.device(), x.dtype());
+    candle_gen::execution::policy("iris_solver_coefficients", format!("{plan:?}").into());
     let mut prev_x0: Option<Tensor> = None;
     for (i, step) in plan.iter().enumerate() {
         if cancel.is_cancelled() {

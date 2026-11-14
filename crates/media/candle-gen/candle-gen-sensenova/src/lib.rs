@@ -222,6 +222,7 @@ impl SenseNovaGenerator {
             memory_strategy::validate_artifact_tier(&self.loaded_spec)
                 .map_err(CandleError::from)?;
             let cfg = NeoChatConfig::from_dir(&self.root)?;
+
             let vb = backbone_vb(&self.root, &self.device)?;
             let mut model =
                 if memory_strategy::streamable_spec(self.descriptor.id, &self.loaded_spec) {
@@ -358,6 +359,14 @@ fn decode_generated_image(
 }
 
 impl Generator for SenseNovaGenerator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -628,6 +637,7 @@ pub(crate) fn snapshot_store_dtype(root: &Path) -> Option<DType> {
 #[doc(hidden)]
 pub fn load_understanding_for_diagnostics(root: &Path) -> Result<(T2iModel, SenseNovaTokenizer)> {
     let cfg = NeoChatConfig::from_dir(root)?;
+
     let device = candle_gen::default_device()?;
     let vb = backbone_vb(root, &device)?;
     let model = T2iModel::from_weights(&vb, &cfg)?;
@@ -714,6 +724,7 @@ impl SenseNovaUnderstanding {
 
     fn apply_request_memory(request: &GenerationRequest, options: &mut T2iOptions) {
         let memory = request.memory;
+        candle_gen::execution::policy("sensenova/lib/memory", format!("{memory:?}").into());
         options.attention_score_budget = memory
             .filter(|memory| memory.chunk_attention)
             .and_then(|memory| memory.attention_chunk_size)
@@ -927,6 +938,7 @@ pub fn load_understanding_with_spec(spec: &LoadSpec) -> Result<SenseNovaUndersta
         .validate_numeric_tier(spec)
         .map_err(CandleError::from)?;
     let cfg = NeoChatConfig::from_dir(root)?;
+
     let device = candle_gen::default_device()?;
     let vb = backbone_vb(root, &device)?;
     let model = if memory_strategy::streamable_spec(MODEL_ID, spec) {

@@ -351,6 +351,16 @@ impl DiffLossFm {
         let mut samples = Tensor::cat(&refs, 0)?.to_dtype(dtype)?;
 
         let timesteps: Vec<f32> = self.scheduler.timesteps().to_vec();
+        let mut sigmas = self.scheduler.sigmas.clone();
+        sigmas.push(0.0);
+        candle_gen::execution::schedule("bernini_planner_flow_euler_v1", &sigmas, "flow_velocity");
+        candle_gen::execution::runtime(z.device(), dtype);
+        candle_gen::execution::policy(
+            "bernini_planner_guidance",
+            serde_json::json!({
+                "cfg_bits": cfg.to_bits(), "img_cfg_bits": img_cfg.map(f32::to_bits), "batch_tiles": tiles
+            }),
+        );
         for (i, &ts) in timesteps.iter().enumerate() {
             let t = Tensor::from_vec(vec![ts], (1,), z.device())?.to_dtype(dtype)?;
             let pred = match (img_cfg, cfg > 1.0) {

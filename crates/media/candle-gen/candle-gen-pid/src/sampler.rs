@@ -77,6 +77,7 @@ impl Sampler {
         sigma: &Tensor,
         cancel: Option<&CancelFlag>,
     ) -> Result<Tensor> {
+        candle_gen::execution::policy("pid_decode", "whole_image".into());
         self.run_inner(noise, eps, cancel, |x, t_scaled| {
             net.forward(x, t_scaled, caption, lq_latent, sigma)
         })
@@ -100,6 +101,10 @@ impl Sampler {
         overlap: i32,
         cancel: Option<&CancelFlag>,
     ) -> Result<Tensor> {
+        candle_gen::execution::policy(
+            "pid_decode",
+            format!("tiled;edge={tile};overlap={overlap}").into(),
+        );
         self.run_inner(noise, eps, cancel, |x, t_scaled| {
             forward_tiled(net, x, t_scaled, caption, lq_latent, sigma, tile, overlap)
         })
@@ -114,6 +119,23 @@ impl Sampler {
         cancel: Option<&CancelFlag>,
         forward: impl Fn(&Tensor, &Tensor) -> Result<Tensor>,
     ) -> Result<Tensor> {
+        candle_gen::execution::runtime(noise.device(), noise.dtype());
+        candle_gen::execution::schedule(
+            if self.sde { "pid-sde" } else { "pid-ode" },
+            &self.t_list,
+            "pixel-velocity",
+        );
+        candle_gen::execution::policy(
+            "pid_sampler",
+            format!(
+                "sde={};timescale_bits={};epsilon_count={};noise_shape={:?}",
+                self.sde,
+                self.timescale.to_bits(),
+                eps.len(),
+                noise.dims()
+            )
+            .into(),
+        );
         let b = noise.dim(0)?;
         let device = noise.device();
         let mut x = noise.clone();
@@ -159,6 +181,7 @@ impl Sampler {
         cancel: Option<&CancelFlag>,
     ) -> Result<Tensor> {
         let device = lq_latent.device();
+        candle_gen::execution::stream("pid_initial_then_epsilon_continuing_stream", seed);
         let mut rng = StdRng::seed_from_u64(seed);
         let mut draw = || -> Result<Tensor> {
             let v = seeded_normal_vec(&mut rng, b * 3 * h * w);
@@ -192,6 +215,7 @@ impl Sampler {
         cancel: Option<&CancelFlag>,
     ) -> Result<Tensor> {
         let device = lq_latent.device();
+        candle_gen::execution::stream("pid_initial_then_epsilon_continuing_stream", seed);
         let mut rng = StdRng::seed_from_u64(seed);
         let mut draw = || -> Result<Tensor> {
             let v = seeded_normal_vec(&mut rng, b * 3 * h * w);

@@ -166,6 +166,7 @@ pub fn run_windowed<V, S>(
     open: impl FnMut() -> Result<V>,
     apply: impl FnMut(S, &mut V, Range<usize>) -> Result<S>,
 ) -> Result<S> {
+    crate::execution::policy("transformer_block_plan", format!("{plan:?}").into());
     run_windowed_with_sync(
         plan,
         cancel,

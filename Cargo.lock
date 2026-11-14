@@ -1146,6 +1146,7 @@ dependencies = [
  "rayon",
  "sceneworks-gen-core-family",
  "sceneworks-gen-core-testkit",
+ "serde_json",
 ]
 
 [[package]]

@@ -131,6 +131,12 @@ pub struct Flux2Control {
     prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
+fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
+    let mut descriptor = crate::descriptor_dev();
+    descriptor.id = crate::config::FLUX2_DEV_CONTROL_ID;
+    descriptor
+}
+
 impl Flux2Control {
     /// Load the dev base (CPU-stage → quantize-onto-GPU when `quant` is set; dense otherwise — fixture
     /// only, the 32B does not fit dense), the Fun-Controlnet-Union control overlay (dense on the device
@@ -359,6 +365,24 @@ impl Flux2Control {
 
     /// Generate one strict-pose-conditioned image. `control_image` is the pose/union skeleton (the
     /// worker pre-fits it to the render size; this re-resizes defensively).
+    /// Bind a completed image to observations from this same control attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &Flux2ControlRequest,
+        control_image: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        crate::complete_bespoke_image(
+            &control_report_descriptor(),
+            &req.cancel,
+            "flux2/control_provider/generate",
+            "candle-gen-flux2/src/control_provider.rs: loaded control overlay and decoder choices have no complete execution receipt",
+            || self.generate(req, control_image, &mut report_progress),
+        )
+    }
+
     pub fn generate(
         &self,
         req: &Flux2ControlRequest,
@@ -387,6 +411,25 @@ impl Flux2Control {
 
     /// Execute the exact control request admitted at load. Context identity, geometry, PiD, and the
     /// certified overlay binding are rechecked immediately before the serialized request.
+    /// Bind an admitted control render's output to observations from that same attempt.
+    pub fn generate_with_memory_context_with_execution_report(
+        &self,
+        context: &MemoryRunContext,
+        req: &Flux2ControlRequest,
+        control_image: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        crate::complete_bespoke_image(
+            &control_report_descriptor(),
+            &req.cancel,
+            "flux2/control_provider/generate_with_memory_context",
+            "candle-gen-flux2/src/control_provider.rs: loaded control overlay and decoder choices have no complete execution receipt",
+            || self.generate_with_memory_context(context, req, control_image, &mut report_progress),
+        )
+    }
+
     pub fn generate_with_memory_context(
         &self,
         context: &MemoryRunContext,
@@ -847,6 +890,13 @@ fn control_var_builder(path: &Path, dtype: DType, device: &Device) -> Result<Var
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_report_identifies_the_control_route() {
+        let descriptor = control_report_descriptor();
+        assert_eq!(descriptor.id, "flux2_dev_control");
+        assert_eq!(descriptor.backend, "candle");
+    }
 
     fn admitted_control_context() -> MemoryRunContext {
         let mut spec = candle_gen::gen_core::LoadSpec::new(

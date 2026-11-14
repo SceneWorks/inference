@@ -163,6 +163,7 @@ impl Components {
 
 fn load_text_components(root: &Path, device: &Device) -> CResult<TextComponents> {
     let cfg = Ideogram4TextEncoderConfig::qwen3_vl_8b();
+
     Ok(TextComponents {
         te: Ideogram4TextEncoder::new(
             &cfg,
@@ -483,6 +484,7 @@ fn prepare_edit_with_vae(
     let grid_w = (width / PATCH_AE) as usize;
     let pre = preprocess_source_image(source, width, height, device)?;
     let enc = vae.encode(&pre)?;
+    crate::observe_component_precision("vae_encoder", enc.device(), enc.dtype());
     let packed = enc
         .reshape((1, 32, grid_h, 2, grid_w, 2))?
         .permute((0, 2, 4, 3, 5, 1))?
@@ -516,6 +518,7 @@ pub fn render(
         .map(|s| s as usize)
         .unwrap_or(default_steps as usize);
     let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+    candle_gen::execution::policy("ideogram/pipeline/guidance", format!("{guidance:?}").into());
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
     let ids = comps.tokenize(&req.prompt)?;
@@ -605,6 +608,7 @@ pub fn render_staged(
         .map(|steps| steps as usize)
         .unwrap_or(default_steps as usize);
     let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+    candle_gen::execution::policy("ideogram/pipeline/guidance", format!("{guidance:?}").into());
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
     let text = SynchronizedPhase::new(
@@ -665,6 +669,7 @@ pub fn render_staged(
     for index in 0..req.count {
         candle_gen::check_cancel(&req.cancel)?;
         let seed = base_seed.wrapping_add(u64::from(index));
+        candle_gen::execution::draw("image_initial_noise", seed, index as usize);
         latents.push(denoise(
             &denoise_components.cond,
             denoise_components.uncond.as_ref(),
@@ -722,7 +727,8 @@ pub fn render_staged(
     }
     let preview_stats = preview_stats.expect("decode statistics established above");
     let mut images = Vec::with_capacity(latents.len());
-    for latent in &latents {
+    for (output_index, latent) in latents.iter().enumerate() {
+        candle_gen::execution::output_index(output_index);
         candle_gen::check_cancel(&req.cancel)?;
         on_progress(Progress::Decoding);
         images.push(decode_with_vae_and_stats(
@@ -893,6 +899,7 @@ fn denoise(
     // strength-0.5 img2img genuinely runs (and previews) half as many.
     let preview_counter = candle_gen::preview::PreviewCounter::with_steps(num_run);
     let memory = req.memory.unwrap_or_default();
+    candle_gen::execution::policy("ideogram/pipeline/memory", format!("{memory:?}").into());
     let attention_budget = if memory.chunk_attention {
         memory
             .attention_chunk_size
@@ -901,6 +908,16 @@ fn denoise(
         candle_gen::ATTN_SCORES_BUDGET
     };
 
+    candle_gen::execution::schedule_f64(
+        "ideogram-euler-logit-normal",
+        &(0..=num_run)
+            .rev()
+            .map(|i| schedule.eval(si[i]))
+            .collect::<Vec<_>>(),
+        "clean-fraction-velocity",
+    );
+    candle_gen::execution::runtime(z.device(), z.dtype());
+    candle_gen::execution::policy("ideogram_attention_budget", attention_budget.into());
     for i in (0..num_run).rev() {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
@@ -1052,6 +1069,11 @@ fn decode_with_vae_and_stats(
             }
         }
     };
+    crate::observe_component_precision(
+        if pid.is_some() { "pid_decoder" } else { "vae" },
+        decoded.device(),
+        decoded.dtype(),
+    );
     to_image(&decoded)
 }
 
@@ -1129,7 +1151,7 @@ fn to_image(decoded: &Tensor) -> CResult<Image> {
 /// Deterministic CPU-seeded standard-normal noise `[1, num_img, ch]` (f32). (RNG differs from MLX's,
 /// so renders are deterministic but not bit-identical to the MLX reference — functional parity.)
 fn create_noise(seed: u64, num_img: usize, ch: usize, device: &Device) -> CResult<Tensor> {
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("ideogram/pipeline", seed));
     let n = num_img * ch;
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(Tensor::from_vec(data, (1, num_img, ch), device)?)

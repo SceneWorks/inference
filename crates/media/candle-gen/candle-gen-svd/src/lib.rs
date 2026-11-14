@@ -510,6 +510,14 @@ impl Generator for SvdGenerator {
         Ok(())
     }
 
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn generate(
         &self,
         req: &GenerationRequest,
@@ -544,6 +552,17 @@ impl Generator for SvdGenerator {
         if let Some(c) = req.decode_chunk_size {
             params.decode_chunk_size = c as usize;
         }
+        candle_gen::execution::policy(
+            "svd_resolved",
+            serde_json::json!({
+                "decode_chunk_size": params.decode_chunk_size.max(1),
+                "conditioning_fps": params.fps, "motion_bucket_id": params.motion_bucket_id,
+                "noise_aug_strength_bits": params.noise_aug_strength.to_bits(),
+                "min_guidance_bits": params.min_guidance_scale.to_bits(),
+                "max_guidance_bits": params.max_guidance_scale.to_bits(),
+                "offload": format!("{:?}", self.offload)
+            }),
+        );
         let seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
         // Opt-in tensor diagnostics (`SVD_DEBUG=1`) — localizes any degeneracy (NaN / all-constant)

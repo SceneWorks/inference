@@ -171,6 +171,21 @@ fn release_warm_after_synchronize<T>(device: &Device, component: T) -> gen_core:
 }
 
 impl Generator for Sd3Generator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::unobserved_adapters(
+                self.adapters.len(),
+                "candle-gen-sd3/src/lib.rs",
+            );
+            candle_gen::execution::policy("loaded/dtype", format!("{:?}", self.dtype).into());
+            candle_gen::execution::policy("loaded/quant", format!("{:?}", self.quant).into());
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }

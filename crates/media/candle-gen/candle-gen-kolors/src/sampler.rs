@@ -119,6 +119,13 @@ impl KolorsEulerSampler {
 
     /// The leading float timestep fed to the UNet time embedding at step `i`.
     pub fn timestep(&self, i: usize) -> f32 {
+        if i == 0 {
+            candle_gen::execution::schedule("kolors-euler", &self.sigmas, "epsilon");
+            candle_gen::execution::policy(
+                "kolors_timesteps",
+                format!("{:?}", self.timesteps).into(),
+            );
+        }
         self.timesteps[i]
     }
 
@@ -133,6 +140,14 @@ impl KolorsEulerSampler {
         x0: &Tensor,
         noise: &Tensor,
     ) -> candle_gen::candle_core::Result<Tensor> {
+        if self.timesteps.is_empty() {
+            candle_gen::execution::without_schedule(
+                "source_roundtrip",
+                "strength selected zero denoise steps",
+                "no denoiser evaluation",
+            );
+            candle_gen::execution::runtime(x0.device(), x0.dtype());
+        }
         x0 + (noise * self.start_sigma as f64)?
     }
 

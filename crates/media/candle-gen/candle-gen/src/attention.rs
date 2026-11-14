@@ -202,6 +202,7 @@ pub fn sdpa_planned_bhsd(
     softmax: impl Fn(&Tensor) -> Result<Tensor>,
     plan: AttentionPlan<'_>,
 ) -> crate::Result<Tensor> {
+    crate::execution::policy("attention_budget", format!("{:?}", plan.budget).into());
     sdpa_bhsd_impl(q, k, v, scale, mask, softmax, plan.budget, || {
         if plan.is_cancelled() {
             Err(crate::CandleError::Canceled)

@@ -511,6 +511,8 @@ impl MiniMaxH3Dit {
         // 1. Per-modality input projections. The two patch projections are float32 in the published
         //    checkpoint; the text stream sets the packed sequence's dtype, as in the reference.
         let stream = packed.text_rows.dtype();
+        candle_gen::execution::runtime(&self.device, self.dtype);
+        candle_gen::execution::runtime(packed.text_rows.device(), stream);
         let video = self
             .projections
             .proj_in

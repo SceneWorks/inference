@@ -215,6 +215,7 @@ struct Krea2ControlHeavy {
 /// retain only the heavy phase and its encoded prompt between poses. Sequential still bounds peak at
 /// `max(Qwen3-VL, DiT + branch + VAE)` and drops the heavy phase before encoding a different prompt.
 pub struct Krea2Control {
+    unobserved_adapter_count: usize,
     pub(crate) device: Device,
     residency: candle_gen::Residency<Krea2ControlText, Rc<Krea2ControlHeavy>>,
     staged_cache: StagedPoseCache<Krea2ControlHeavy>,
@@ -237,6 +238,7 @@ struct PosePromptKey {
 impl PosePromptKey {
     fn new(req: &Krea2ControlRequest) -> Self {
         let cfg = req.guidance.unwrap_or(0.0) != 0.0;
+
         Self {
             prompt: req.prompt.clone(),
             negative_prompt: cfg.then(|| req.negative_prompt.clone().unwrap_or_default()),
@@ -285,6 +287,8 @@ impl<Heavy> StagedPoseCache<Heavy> {
                     (*previous == key).then(|| (heavy.clone(), context.clone()))
                 });
             if let Some((heavy, context)) = cached {
+                // The cache key proved these settings produced the retained positive context.
+                crate::pipeline::effective_style_gain(req.text_style_gain);
                 let result = render(&heavy, context, progress);
                 if result.is_err() {
                     self.clear();
@@ -383,6 +387,7 @@ impl Krea2Control {
             },
         );
         Ok(Self {
+            unobserved_adapter_count: paths.adapters.len(),
             device,
             residency,
             staged_cache: StagedPoseCache::default(),
@@ -433,12 +438,43 @@ impl Krea2Control {
 
     /// Generate one strict-pose-conditioned image from a rendered OpenPose skeleton. The control image
     /// must already match the request dimensions; the worker renders it at those exact dimensions.
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &Krea2ControlRequest,
+        control_image: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(
+            &crate::control_registry::descriptor(),
+            &req.cancel,
+            || {
+                candle_gen::execution::policy(
+                    "direct_route",
+                    "krea/control_provider/generate".into(),
+                );
+                let image = self
+                    .generate(req, control_image, &mut report_progress)
+                    .map_err(candle_gen::gen_core::Error::from)?;
+                Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            },
+        )
+    }
+
     pub fn generate(
         &self,
         req: &Krea2ControlRequest,
         control_image: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        candle_gen::execution::unobserved_adapters(
+            self.unobserved_adapter_count,
+            "Krea control loaded adapters",
+        );
+        candle_gen::execution::policy("krea/control_decode_tiled", req.tile_vae_decode.into());
         validate_request(req)?;
         read_with_prepared_spec(self.prepared_spec.as_ref(), || {
             self.staged_cache.run(
@@ -581,6 +617,7 @@ fn load_control_heavy(
     device: &Device,
 ) -> Result<Krea2ControlHeavy> {
     let cfg = Krea2Config::from_snapshot(root)?;
+
     let mut branch_tier = branch_tier;
     let mut dit = match control_dit_source(convrot_dit, native_dit)? {
         ControlDitSource::Snapshot => {
@@ -724,6 +761,11 @@ impl Krea2ControlHeavy {
         candle_gen::check_cancel(&req.cancel)?;
         let ctrl_nchw = control_image_to_nchw(control_image, req.width, req.height, device)?;
         let ctrl_latent = self.vae_encoder.encode(&ctrl_nchw)?;
+        candle_gen::execution::component_runtime(
+            "krea/control_vae_encoder",
+            ctrl_latent.device(),
+            ctrl_latent.dtype(),
+        );
         let (positive, negative) = context;
         let prepared = self
             .dit
@@ -732,13 +774,18 @@ impl Krea2ControlHeavy {
             .as_ref()
             .map(|context| self.dit.prepare_control_conditioning(context, &ctrl_latent))
             .transpose()?;
-        let scale = req.control_scale as f64;
+        let scale =
+            candle_gen::execution::f64_policy("krea/control_scale", req.control_scale as f64);
+        candle_gen::execution::f32_policy("krea/control_guidance", req.guidance.unwrap_or(0.0));
 
         let (lat_h, lat_w) = (
             (req.height / SPATIAL_SCALE) as usize,
             (req.width / SPATIAL_SCALE) as usize,
         );
-        let mut rng = StdRng::seed_from_u64(req.seed);
+        let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed(
+            "krea/control_provider",
+            req.seed,
+        ));
         let noise = candle_gen::seeded_normal_vec(&mut rng, LATENT_CHANNELS * lat_h * lat_w);
         let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
             .to_device(device)?;
@@ -775,6 +822,11 @@ impl Krea2ControlHeavy {
                     &prepared,
                     scale,
                 )?;
+                candle_gen::execution::component_runtime(
+                    "krea/control_transformer",
+                    v.device(),
+                    v.dtype(),
+                );
                 let positive = v.to_dtype(DType::F32)?;
                 match &negative {
                     Some(negative) => {
@@ -785,8 +837,13 @@ impl Krea2ControlHeavy {
                             &t,
                             negative,
                             scale,
-                        )?
-                        .to_dtype(DType::F32)?;
+                        )?;
+                        candle_gen::execution::component_runtime(
+                            "krea/control_transformer",
+                            negative.device(),
+                            negative.dtype(),
+                        );
+                        let negative = negative.to_dtype(DType::F32)?;
                         Ok((&positive
                             + ((&positive - negative)? * req.guidance.unwrap_or(0.0) as f64)?)?)
                     }
@@ -796,10 +853,13 @@ impl Krea2ControlHeavy {
         )?;
 
         on_progress(Progress::Decoding);
-        let decoded = self
-            .vae
-            .decode_with(&latent, req.tile_vae_decode)?
-            .to_dtype(DType::F32)?;
+        let decoded = self.vae.decode_with(&latent, req.tile_vae_decode)?;
+        candle_gen::execution::component_runtime(
+            "krea/control_vae",
+            decoded.device(),
+            decoded.dtype(),
+        );
+        let decoded = decoded.to_dtype(DType::F32)?;
         to_image(&decoded)
     }
 }
@@ -887,6 +947,97 @@ fn control_image_to_nchw(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_control_report_binds_component_precision_before_f32_promotion() {
+        use super::*;
+        use candle_gen::gen_core::generator::{ExecutionFact, ExecutionIdentity};
+
+        // This direct-route fixture exercises the same capture contract with no model forward.
+        let bf16 = Tensor::zeros((1,), DType::BF16, &Device::Cpu).unwrap();
+        let f32 = Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap();
+        let completed = candle_gen::execution::capture_direct(
+            &crate::control_registry::descriptor(),
+            &candle_gen::gen_core::CancelFlag::default(),
+            || {
+                candle_gen::execution::rng_scheme("control-fixture");
+                candle_gen::execution::draw("initial_noise", 7, 0);
+                candle_gen::execution::schedule("euler", &[1.0, 0.0], "flow");
+                candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+                for (component, tensor) in [
+                    ("krea/control_vae_encoder", &bf16),
+                    ("krea/control_transformer", &bf16),
+                    ("krea/control_vae", &f32),
+                ] {
+                    candle_gen::execution::component_runtime(
+                        component,
+                        tensor.device(),
+                        tensor.dtype(),
+                    );
+                }
+                Ok(candle_gen::gen_core::GenerationOutput::Images(vec![
+                    Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0; 3],
+                    },
+                ]))
+            },
+        )
+        .unwrap();
+        let ExecutionIdentity::Resolved { identity } = completed.execution else {
+            panic!("control fixture should resolve")
+        };
+        let ExecutionFact::Resolved { value } = identity.quality_policy else {
+            panic!("quality policy")
+        };
+        let operations = &value["operations"];
+        for (component, dtype) in [
+            ("krea/control_vae_encoder", "BF16"),
+            ("krea/control_transformer", "BF16"),
+            ("krea/control_vae", "F32"),
+        ] {
+            assert_eq!(
+                operations[format!("compute_component/{component}")][0]["value"]["dtype"],
+                dtype
+            );
+        }
+
+        // Keep the three direct render calls wired to the tested observation seam.
+        let source = include_str!("control_provider.rs");
+        let render = source
+            .split("impl Krea2ControlHeavy {")
+            .nth(1)
+            .unwrap()
+            .split("/// Validate the seed-independent")
+            .next()
+            .unwrap();
+        for (call, component, promotion) in [
+            (
+                "self.vae_encoder.encode",
+                "krea/control_vae_encoder",
+                "let positive = v.to_dtype(DType::F32)",
+            ),
+            (
+                "let v = forward_with_prepared_control",
+                "krea/control_transformer",
+                "let positive = v.to_dtype(DType::F32)",
+            ),
+            (
+                "self.vae.decode_with",
+                "krea/control_vae",
+                "let decoded = decoded.to_dtype(DType::F32)",
+            ),
+        ] {
+            let call_at = render.find(call).expect("direct component call");
+            let marker = format!("\"{component}\"");
+            let observed_at = render
+                .find(marker.as_str())
+                .expect("component runtime observation");
+            let promoted_at = render.find(promotion).expect("later f32 promotion");
+            assert!(call_at < observed_at && observed_at < promoted_at);
+        }
+    }
+
     #[test]
     fn staged_pose_cache_reuses_both_models_until_text_or_policy_changes() {
         use super::*;

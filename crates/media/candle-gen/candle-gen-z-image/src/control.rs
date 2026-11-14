@@ -70,6 +70,20 @@ use crate::pipeline::{DiT, Pipeline, TextEnc};
 /// runs f32 (the encode path's dtype) and its output is cast to bf16 for the control context.
 const DTYPE: DType = DType::BF16;
 
+fn control_report_descriptor(base: bool) -> candle_gen::gen_core::ModelDescriptor {
+    let mut descriptor = if base {
+        crate::base::descriptor()
+    } else {
+        crate::descriptor()
+    };
+    descriptor.id = if base {
+        "z_image_control"
+    } else {
+        "z_image_turbo_control"
+    };
+    descriptor
+}
+
 /// Channel count of the VAE-encoded control context: 16 control latent + 1 zero mask + 16 zero inpaint
 /// (the Fun-Controlnet-Union `control_all_x_embedder`'s 33ch input). Pure-pose control zeroes the mask +
 /// inpaint groups.
@@ -610,13 +624,15 @@ impl ZImageControlTransformer {
         // 11. Head: image tokens → final AdaLN layer → unpatchify to the raw velocity.
         let x_out = unified.narrow(1, 0, prepared.img_seq_len)?;
         let x_out = base.control_finish(&x_out, &adaln)?;
-        Ok(unpatchify(
+        let velocity = unpatchify(
             &x_out,
             prepared.orig_size,
             patch_size,
             f_patch_size,
             cfg.in_channels,
-        )?)
+        )?;
+        common::observe_component_output("dit", &velocity);
+        Ok(velocity)
     }
 
     #[cfg(test)]
@@ -960,6 +976,12 @@ impl ZImageControl {
         // iteration, on the latent ENTERING step `step_i`, which is exactly where the shared drivers
         // emit (`candle-gen/src/sampler.rs`).
         let preview_counter = crate::preview::bespoke_counter(steps);
+        candle_gen::execution::schedule_f64(
+            "z-image-turbo-euler",
+            &scheduler.sigmas,
+            "flow-velocity",
+        );
+        candle_gen::execution::runtime(latents.device(), latents.dtype());
         for step_i in 0..steps {
             candle_gen::check_cancel(&req.cancel)?;
             candle_gen::preview::emit_preview_at(&req.preview, &preview_counter, step_i, || {
@@ -975,7 +997,10 @@ impl ZImageControl {
                     &latents,
                     &t,
                     &dit_prepared,
-                    req.control_scale as f64,
+                    candle_gen::execution::f64_policy(
+                        "z-image/control_scale",
+                        req.control_scale as f64,
+                    ),
                     req.memory,
                     &req.cancel,
                 )?
@@ -1046,7 +1071,10 @@ impl ZImageControl {
             )?),
             None => None,
         };
-        let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+        let guidance = candle_gen::execution::f32_policy(
+            "z-image/control_guidance",
+            req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE),
+        );
         // Per-step latent preview (epic 16948, sc-16957). The CFG blend and the constant control
         // context both live inside the predict closure below, so the hook only ever sees the single
         // conditional target trajectory.
@@ -1067,7 +1095,10 @@ impl ZImageControl {
                         latents,
                         &t,
                         &dit_prepared,
-                        req.control_scale as f64,
+                        candle_gen::execution::f64_policy(
+                            "z-image/control_scale",
+                            req.control_scale as f64,
+                        ),
                         req.memory,
                         &req.cancel,
                     )?
@@ -1079,7 +1110,10 @@ impl ZImageControl {
                                 latents,
                                 &t,
                                 uncond_prepared,
-                                req.control_scale as f64,
+                                candle_gen::execution::f64_policy(
+                                    "z-image/control_scale",
+                                    req.control_scale as f64,
+                                ),
                                 req.memory,
                                 &req.cancel,
                             )?
@@ -1189,6 +1223,30 @@ impl ZImageControl {
     ///   CFG — byte-unchanged from the original path.
     /// * **Base** (`generate_base`): undistilled shift-6.0 ~50-step schedule with
     ///   real classifier-free guidance (the candle sibling of `mlx-gen-z-image::model_base_control`).
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &ZImageControlRequest,
+        skeleton: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(
+            &control_report_descriptor(self.base),
+            &req.cancel,
+            || {
+                self.pipeline.observe_adapter_provenance();
+                candle_gen::execution::policy("direct_route", "z-image/control/generate".into());
+                let image = self
+                    .generate(req, skeleton, &mut report_progress)
+                    .map_err(candle_gen::gen_core::Error::from)?;
+                Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            },
+        )
+    }
+
     pub fn generate(
         &self,
         req: &ZImageControlRequest,
@@ -1276,7 +1334,8 @@ impl ZImageControl {
         let cap_feats = prepared.cap_feats;
         let cap_mask = prepared.cap_mask;
         let mut latents = prepared.latents;
-        let scale = req.control_scale as f64;
+        let scale =
+            candle_gen::execution::f64_policy("z-image/control_scale", req.control_scale as f64);
         let transformer = self.resident_transformer()?;
         let dit_prepared = transformer.prepare_control_conditioning(
             &latents,
@@ -1293,6 +1352,12 @@ impl ZImageControl {
         // is where the shared drivers emit (`candle-gen/src/sampler.rs`). The 33-channel control
         // context is a closure capture inside `forward_control_prepared`, never part of `latents`.
         let preview_counter = crate::preview::bespoke_counter(steps);
+        candle_gen::execution::schedule_f64(
+            "z-image-turbo-euler",
+            &scheduler.sigmas,
+            "flow-velocity",
+        );
+        candle_gen::execution::runtime(latents.device(), latents.dtype());
         for step_i in 0..steps {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
@@ -1356,10 +1421,14 @@ impl ZImageControl {
         };
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
         let lat_w = (req.width / SPATIAL_SCALE) as usize;
-        let scale = req.control_scale as f64;
+        let scale =
+            candle_gen::execution::f64_policy("z-image/control_scale", req.control_scale as f64);
 
         // Real CFG: default 4.0 (the base card); 1.0 turns CFG off (single cond forward).
-        let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+        let guidance = candle_gen::execution::f32_policy(
+            "z-image/control_guidance",
+            req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE),
+        );
         let cfg_on = guidance != 1.0;
 
         // Text embeddings (bf16). The uncond branch (negative prompt, empty when unset — the
@@ -1704,6 +1773,15 @@ fn control_file_score(path: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_control_reports_name_base_and_turbo_engines() {
+        for (base, expected) in [(true, "z_image_control"), (false, "z_image_turbo_control")] {
+            let descriptor = control_report_descriptor(base);
+            assert_eq!(descriptor.id, expected);
+            assert_eq!(descriptor.backend, "candle");
+        }
+    }
 
     #[test]
     #[ignore = "model inference; explicit model workflow only"]

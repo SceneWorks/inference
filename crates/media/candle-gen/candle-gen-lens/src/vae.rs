@@ -46,10 +46,12 @@ pub fn decode_with_tiling(
         .reshape((b, latent_h, latent_w, c))?
         .permute((0, 3, 1, 2))? // [B, h, w, 128] → [B, 128, h, w] (NCHW)
         .contiguous()?;
-    match tile {
+    let decoded = match tile {
         Some((edge, overlap)) => vae.decode_packed_tiled(&packed, edge, overlap),
         None => vae.decode_packed(&packed),
-    }
+    }?;
+    candle_gen::execution::component_runtime("lens/vae", decoded.device(), decoded.dtype());
+    Ok(decoded)
 }
 
 /// Convert a decoded image `[B, 3, H, W]` in `[−1, 1]` to `u8` `[0, 255]` (`(x.clamp(−1,1)+1)·127.5`),

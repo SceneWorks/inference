@@ -167,17 +167,19 @@ impl DiT {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
     ) -> candle_gen::Result<Tensor> {
-        match (self, prepared) {
-            (Self::Dense(m), PreparedDiT::Dense(prepared)) => {
-                Ok(m.forward_prepared(x, t, prepared)?)
-            }
+        let velocity = match (self, prepared) {
+            (Self::Dense(m), PreparedDiT::Dense(prepared)) => m.forward_prepared(x, t, prepared)?,
             (Self::Packed(m), PreparedDiT::Packed(prepared)) => {
-                m.forward_prepared_with_memory(x, t, prepared, attention_plan, transformer_window)
+                m.forward_prepared_with_memory(x, t, prepared, attention_plan, transformer_window)?
             }
-            _ => Err(candle_gen::CandleError::Msg(
-                "z-image: prepared conditioning belongs to another DiT variant".into(),
-            )),
-        }
+            _ => {
+                return Err(candle_gen::CandleError::Msg(
+                    "z-image: prepared conditioning belongs to another DiT variant".into(),
+                ))
+            }
+        };
+        common::observe_component_output("dit", &velocity);
+        Ok(velocity)
     }
     #[cfg(test)]
     pub(crate) fn forward_with_attention_plan(
@@ -486,6 +488,10 @@ fn bounded_host_latent_transfer(
 }
 
 impl Pipeline {
+    pub(crate) fn observe_adapter_provenance(&self) {
+        candle_gen::execution::unobserved_adapters(self.adapters.len(), "Z-Image loaded pipeline");
+    }
+
     /// Build the (light) pipeline handle for the Z-Image snapshot `root` at the given device/dtype,
     /// with `adapters` to merge into the DiT. Does **no** weight I/O — components load lazily via
     /// [`load_components`](Self::load_components).
@@ -1113,6 +1119,7 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         let memory = req.memory.unwrap_or_default();
+        candle_gen::execution::policy("z-image/pipeline/memory", format!("{memory:?}").into());
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let reference = resolve_reference(req)?;
         let start_step = match &reference {
@@ -1172,7 +1179,9 @@ impl Pipeline {
             |vae, latents, on_progress| {
                 latents
                     .iter()
-                    .map(|latent| {
+                    .enumerate()
+                    .map(|(output_index, latent)| {
+                        candle_gen::execution::output_index(output_index);
                         candle_gen::check_cancel(&req.cancel)?;
                         on_progress(Progress::Decoding);
                         if memory.tile_vae_decode {
@@ -1205,6 +1214,7 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         let memory = req.memory.unwrap_or_default();
+        candle_gen::execution::policy("z-image/pipeline/memory", format!("{memory:?}").into());
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
         let reference = resolve_reference(req)?;
         let start_step = match &reference {
@@ -1237,6 +1247,10 @@ impl Pipeline {
             |text| {
                 let cap = self.text_embeddings(&text.text_encoder, &text.tokenizer, &req.prompt)?;
                 let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+                candle_gen::execution::policy(
+                    "z-image/pipeline/guidance",
+                    format!("{guidance:?}").into(),
+                );
                 let neg_cap = if guidance != 1.0 {
                     Some(self.uncond_embeddings(
                         &text.text_encoder,
@@ -1276,7 +1290,9 @@ impl Pipeline {
             |vae, latents, on_progress| {
                 latents
                     .iter()
-                    .map(|latent| {
+                    .enumerate()
+                    .map(|(output_index, latent)| {
+                        candle_gen::execution::output_index(output_index);
                         candle_gen::check_cancel(&req.cancel)?;
                         on_progress(Progress::Decoding);
                         if memory.tile_vae_decode {
@@ -1312,15 +1328,24 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Tensor>> {
         let memory = req.memory.unwrap_or_default();
+        candle_gen::execution::policy("z-image/pipeline/memory", format!("{memory:?}").into());
         let attention_budget = if memory.chunk_attention {
             CONSTRAINED_ATTN_SCORES_BUDGET
         } else {
             candle_gen::ATTN_SCORES_BUDGET
         };
+        candle_gen::execution::policy(
+            "z-image/pipeline/attention_budget",
+            format!("{attention_budget:?}").into(),
+        );
         let transformer_window = memory
             .transformer_window_size
             .map(|value| value as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
+        candle_gen::execution::policy(
+            "z-image/pipeline/transformer_window",
+            format!("{transformer_window:?}").into(),
+        );
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
@@ -1408,18 +1433,28 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Tensor>> {
         let memory = req.memory.unwrap_or_default();
+        candle_gen::execution::policy("z-image/pipeline/memory", format!("{memory:?}").into());
         let attention_budget = if memory.chunk_attention {
             CONSTRAINED_ATTN_SCORES_BUDGET
         } else {
             candle_gen::ATTN_SCORES_BUDGET
         };
+        candle_gen::execution::policy(
+            "z-image/pipeline/attention_budget",
+            format!("{attention_budget:?}").into(),
+        );
         let transformer_window = memory
             .transformer_window_size
             .map(|value| value as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
+        candle_gen::execution::policy(
+            "z-image/pipeline/transformer_window",
+            format!("{transformer_window:?}").into(),
+        );
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+        candle_gen::execution::policy("z-image/pipeline/guidance", format!("{guidance:?}").into());
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
         let lat_w = (req.width / SPATIAL_SCALE) as usize;
 
@@ -1541,15 +1576,24 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         let memory = req.memory.unwrap_or_default();
+        candle_gen::execution::policy("z-image/pipeline/memory", format!("{memory:?}").into());
         let attention_budget = if memory.chunk_attention {
             CONSTRAINED_ATTN_SCORES_BUDGET
         } else {
             candle_gen::ATTN_SCORES_BUDGET
         };
+        candle_gen::execution::policy(
+            "z-image/pipeline/attention_budget",
+            format!("{attention_budget:?}").into(),
+        );
         let transformer_window = memory
             .transformer_window_size
             .map(|value| value as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
+        candle_gen::execution::policy(
+            "z-image/pipeline/transformer_window",
+            format!("{transformer_window:?}").into(),
+        );
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
@@ -1715,15 +1759,24 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         let memory = req.memory.unwrap_or_default();
+        candle_gen::execution::policy("z-image/pipeline/memory", format!("{memory:?}").into());
         let attention_budget = if memory.chunk_attention {
             CONSTRAINED_ATTN_SCORES_BUDGET
         } else {
             candle_gen::ATTN_SCORES_BUDGET
         };
+        candle_gen::execution::policy(
+            "z-image/pipeline/attention_budget",
+            format!("{attention_budget:?}").into(),
+        );
         let transformer_window = memory
             .transformer_window_size
             .map(|value| value as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
+        candle_gen::execution::policy(
+            "z-image/pipeline/transformer_window",
+            format!("{transformer_window:?}").into(),
+        );
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
@@ -1732,6 +1785,7 @@ impl Pipeline {
         // Real CFG: `req.guidance` is the classifier-free guidance scale (default 4.0). A value of 1.0
         // turns CFG off (single cond forward, Turbo-equivalent cost).
         let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+        candle_gen::execution::policy("z-image/pipeline/guidance", format!("{guidance:?}").into());
         let cfg_on = guidance != 1.0;
 
         // Text embeddings are seed- and image-independent: encode once for the whole batch. The uncond

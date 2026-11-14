@@ -1097,6 +1097,15 @@ impl Pipeline {
         comps: &Components,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32, Option<AudioTrack>)> {
+        candle_gen::execution::policy(
+            "ltx_pipeline",
+            serde_json::json!({
+                "transformer": format!("{:?}", self.transformer_variant),
+                "diffusion_decoder": comps.diffusion_decoder.is_some(),
+                "attention_budget": comps.avdit.attention_budget(),
+                "block_plan": format!("{:?}", comps.avdit.block_plan())
+            }),
+        );
         let fps = req.fps.unwrap_or(DEFAULT_FPS);
         let seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let mut orchestration = pipeline::TwoStageOrchestration::new(seed);
@@ -1544,6 +1553,22 @@ pub struct LtxGenerator {
     components: Mutex<Option<Components>>,
 }
 
+fn capture_ltx_execution<G: Generator + ?Sized>(
+    generator: &G,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+    selected_adapter_count: usize,
+) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+    candle_gen::execution::capture_with(generator, req, on_progress, || {
+        // The lazy component installers do not retain a byte-bound record of the applied
+        // targets and per-pass strengths. A selected stack alone cannot prove what ran.
+        candle_gen::execution::unobserved_adapters(
+            selected_adapter_count,
+            "candle-gen-ltx/src/lib.rs",
+        );
+    })
+}
+
 impl LtxGenerator {
     #[allow(clippy::unnecessary_map_or)] // `Option::is_none_or` is newer than the repository MSRV.
     fn components(&self, pipe: &Pipeline, with_vae_encoder: bool) -> gen_core::Result<Components> {
@@ -1794,6 +1819,14 @@ impl Generator for LtxGenerator {
         // exactly how the two lanes drifted: candle refused `steps: 30` while mlx never read the
         // field (sc-19502). One declaration, one enforcement site, both lanes.
         Ok(())
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        capture_ltx_execution(self, req, on_progress, self.adapters.len())
     }
 
     fn generate(
@@ -2522,6 +2555,14 @@ impl Generator for Ltx25Generator {
         Ok(())
     }
 
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        capture_ltx_execution(self, req, on_progress, self.adapters.len())
+    }
+
     fn generate(
         &self,
         req: &GenerationRequest,
@@ -2714,6 +2755,69 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use candle_gen::gen_core::generator::ExecutionIdentity;
+
+    struct ReportFixture(ModelDescriptor);
+
+    impl Generator for ReportFixture {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.0
+        }
+
+        fn validate(&self, _req: &GenerationRequest) -> gen_core::Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _req: &GenerationRequest,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> gen_core::Result<GenerationOutput> {
+            // A completed video-shaped output with observations, without model execution.
+            candle_gen::execution::rng_scheme("ltx-report-fixture");
+            candle_gen::execution::draw("initial_noise", 7, 0);
+            candle_gen::execution::without_schedule("distilled", "single-step", "flow");
+            candle_gen::execution::policy("decoder", serde_json::json!("mock"));
+            candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+            Ok(GenerationOutput::Video {
+                frames: vec![Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 3],
+                }],
+                fps: 1,
+                audio: None,
+            })
+        }
+    }
+
+    #[test]
+    fn both_ltx_report_routes_refuse_unobserved_adapters_but_allow_clean_attempts() {
+        for descriptor in [descriptor(), descriptor_25()] {
+            let fixture = ReportFixture(descriptor);
+            let request = GenerationRequest::default();
+            let clean = capture_ltx_execution(&fixture, &request, &mut |_| {}, 0).unwrap();
+            assert!(matches!(
+                clean.execution,
+                ExecutionIdentity::Resolved { .. }
+            ));
+            for count in [1, 2] {
+                let adapted =
+                    capture_ltx_execution(&fixture, &request, &mut |_| {}, count).unwrap();
+                let ExecutionIdentity::Unavailable { reason } = adapted.execution else {
+                    panic!("selected adapters must refuse a completed resolved identity")
+                };
+                assert_eq!(reason.code, "candle_execution_observation_incomplete");
+                assert!(reason
+                    .missing_facts
+                    .iter()
+                    .any(|fact| fact.contains(&format!(
+                        "selected adapter count {count} cannot attest the applied stack"
+                    ))));
+            }
+        }
+    }
 
     fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
         let start = source

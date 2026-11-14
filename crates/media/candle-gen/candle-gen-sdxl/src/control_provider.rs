@@ -35,6 +35,14 @@ const DEFAULT_GUIDANCE: f64 = 7.0;
 const LIGHTNING_DEFAULT_STEPS: usize = 4;
 const DEFAULT_CONTROL_SCALE: f32 = 1.0;
 
+fn observe_component_compute(component: &str, device: &Device, dtype: DType) {
+    candle_gen::execution::runtime(device, dtype);
+    candle_gen::execution::policy(
+        &format!("sdxl/control/{component}_compute"),
+        serde_json::json!({"device": format!("{:?}", device.location()), "dtype": format!("{dtype:?}")}),
+    );
+}
+
 /// Resolve the guidance actually used by the selected denoise loop. Lightning is trained and run
 /// CFG-free, so an omitted value means `1.0`; ordinary SDXL retains its production default `7.0`.
 fn effective_guidance(req: &GenerationRequest) -> f64 {
@@ -194,7 +202,12 @@ impl SdxlControlGenerator {
     ) -> Result<Vec<Tensor>> {
         let lightning = req.sampler.as_deref() == Some("lightning");
         let guidance = effective_guidance(req);
+        candle_gen::execution::policy(
+            "sdxl/control_provider/guidance",
+            format!("{guidance:?}").into(),
+        );
         let cfg_on = !lightning && guidance > 1.0;
+        candle_gen::execution::policy("sdxl/control_provider/cfg_on", format!("{cfg_on:?}").into());
         let steps = req.steps.unwrap_or(if lightning {
             LIGHTNING_DEFAULT_STEPS as u32
         } else {
@@ -202,6 +215,8 @@ impl SdxlControlGenerator {
         }) as usize;
         let controls = self.control_requests(req).map_err(CandleError::from)?;
         let time_ids = text_time_ids(if cfg_on { 2 } else { 1 }, &self.device, DTYPE)?;
+        observe_component_compute("controlnet", &self.device, DTYPE);
+        observe_component_compute("unet", &self.device, DTYPE);
         let contexts = controls
             .iter()
             .zip(components.controls.iter())
@@ -298,6 +313,7 @@ impl SdxlControlGenerator {
         vae: &SdxlVaeDecoder,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<gen_core::Image>> {
+        observe_component_compute("vae", &self.device, DTYPE);
         latents
             .iter()
             .map(|latent| {
@@ -339,6 +355,19 @@ impl SdxlControlGenerator {
 }
 
 impl Generator for SdxlControlGenerator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::unobserved_adapters(
+                self.adapters.len(),
+                "SDXL control loaded adapters",
+            );
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -450,6 +479,7 @@ impl Generator for SdxlControlGenerator {
         let req = &effective_req;
         candle_gen::residency::check_cancel(&req.cancel)?;
         let cfg_on = req.sampler.as_deref() != Some("lightning") && effective_guidance(req) > 1.0;
+        candle_gen::execution::policy("sdxl/control_provider/cfg_on", format!("{cfg_on:?}").into());
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         if staged {
             crate::clear_resident_caches(&self.components, &self.conditioner, || {
@@ -463,6 +493,7 @@ impl Generator for SdxlControlGenerator {
                 |_| self.load_conditioner(),
                 |conditioner, state| {
                     candle_gen::residency::check_cancel(&req.cancel)?;
+                    observe_component_compute("text_conditioner", &self.device, DTYPE);
                     state.0 = Some(candle_gen::gen_core::with_prompt_encoding(state.2, || {
                         conditioner.encode(&req.prompt, negative, cfg_on)
                     })?);
@@ -492,6 +523,7 @@ impl Generator for SdxlControlGenerator {
             let conditioner = candle_gen::cached(&self.conditioner, || self.load_conditioner())?;
             let components = self.components()?;
             let result = (|| -> Result<_> {
+                observe_component_compute("text_conditioner", &self.device, DTYPE);
                 let (conditioning, pooled) =
                     candle_gen::gen_core::with_prompt_encoding(on_progress, || {
                         conditioner.encode(&req.prompt, negative, cfg_on)
@@ -578,6 +610,14 @@ fn denoise_lightning_control(
     let policy = lightning_policy(steps)?;
     let mut latents = seeded_sigma_prior(seed, width, height, policy.init_noise_scale(), device)?;
     let preview_counter = candle_gen::preview::PreviewCounter::with_steps(policy.num_steps());
+    candle_gen::execution::schedule(
+        "sdxl-lightning-euler",
+        &(0..=policy.num_steps())
+            .filter_map(|i| policy.sigma(i))
+            .collect::<Vec<_>>(),
+        "epsilon",
+    );
+    candle_gen::execution::runtime(latents.device(), latents.dtype());
     for index in 0..policy.num_steps() {
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
@@ -632,6 +672,37 @@ fn denoise_lightning_control(
 mod tests {
     use super::*;
     use candle_gen::gen_core::{ControlKind, Image, Quant};
+
+    #[test]
+    fn component_precision_report_control_records_f16_models_beside_f32_sampler() {
+        let attempt = candle_gen::execution::Attempt::begin();
+        candle_gen::execution::rng_scheme("sdxl-control-test-noise");
+        candle_gen::execution::draw("initial_noise", 3, 0);
+        candle_gen::execution::schedule("ddim", &[1.0, 0.0], "epsilon");
+        candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+        for component in ["text_conditioner", "controlnet", "unet", "vae"] {
+            observe_component_compute(component, &Device::Cpu, DTYPE);
+        }
+        let output = GenerationOutput::Images(vec![Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 3],
+        }]);
+        let gen_core::generator::ExecutionIdentity::Resolved { identity } =
+            attempt.finish_image(&control_descriptor(), &output)
+        else {
+            panic!("complete weights-free component observations should resolve");
+        };
+        let gen_core::generator::ExecutionFact::Resolved { value } = identity.quality_policy else {
+            panic!("quality policy should be resolved");
+        };
+        for component in ["text_conditioner", "controlnet", "unet", "vae"] {
+            let key = format!("sdxl/control/{component}_compute");
+            assert_eq!(value["operations"][&key][0]["value"]["dtype"], "F16");
+        }
+        assert_eq!(value["compute"][0]["dtype"], "F32");
+        assert_eq!(value["compute"][1]["dtype"], "F16");
+    }
 
     fn spec() -> LoadSpec {
         LoadSpec::new(WeightsSource::Dir("/nonexistent/sdxl".into()))

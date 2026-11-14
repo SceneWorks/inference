@@ -61,6 +61,7 @@ pub const STEP_RNG_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
 /// seeded-noise draw shares.
 #[inline]
 pub fn seeded_normal_vec(rng: &mut StdRng, n: usize) -> Vec<f32> {
+    crate::execution::rng_scheme("rand-0.9-StdRng-rand_distr-StandardNormal-f32");
     (0..n).map(|_| StandardNormal.sample(rng)).collect()
 }
 
@@ -105,7 +106,9 @@ pub fn for_each_image_seed<I, E>(
 ) -> Result<Vec<I>, E> {
     let mut out = Vec::with_capacity(count as usize);
     for index in 0..count {
-        out.push(body(image_seed(base_seed, index))?);
+        let seed = image_seed(base_seed, index);
+        crate::execution::draw("image_initial_noise", seed, index as usize);
+        out.push(body(seed)?);
     }
     Ok(out)
 }
