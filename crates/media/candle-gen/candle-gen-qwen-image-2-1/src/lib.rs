@@ -538,6 +538,34 @@ fn observe_component_compute(component: &str, device: &Device, dtype: candle_cor
     );
 }
 
+/// Use the completed denoise loop's path and live footprint, including the reason a priced cache
+/// was shed. The requested mode cannot attest whether the loop actually cached its prefix.
+fn observe_prefix_kv_cache(
+    denoise: &DenoiseReport,
+    overflow: Option<gen_core::PrefixKvCacheOverflow>,
+) -> gen_core::PrefixKvCacheReport {
+    let report = gen_core::PrefixKvCacheReport {
+        path: match denoise.kv_cache {
+            KvCachePath::Cached => gen_core::PrefixKvCacheMode::Cached,
+            KvCachePath::Prefill => gen_core::PrefixKvCacheMode::Prefill,
+        },
+        cache_bytes: denoise.kv_cache_bytes as u64,
+        overflow,
+    };
+    candle_gen::execution::policy(
+        "qwen21/prefix_kv_cache",
+        serde_json::json!({
+            "path": report.path.label(),
+            "cache_bytes": report.cache_bytes,
+            "overflow": report.overflow.map(|overflow| serde_json::json!({
+                "actual_bytes": overflow.actual_bytes,
+                "priced_bytes": overflow.priced_bytes,
+            })),
+        }),
+    );
+    report
+}
+
 impl Generator for QwenImage21 {
     fn generate_with_execution_report(
         &self,
@@ -850,14 +878,7 @@ impl QwenImage21 {
                         &mut report,
                         on_progress,
                     )?;
-                    ran = Some(gen_core::PrefixKvCacheReport {
-                        path: match report.kv_cache {
-                            KvCachePath::Cached => gen_core::PrefixKvCacheMode::Cached,
-                            KvCachePath::Prefill => gen_core::PrefixKvCacheMode::Prefill,
-                        },
-                        cache_bytes: report.kv_cache_bytes as u64,
-                        overflow,
-                    });
+                    ran = Some(observe_prefix_kv_cache(&report, overflow));
                     on_progress(Progress::Decoding);
                     if req.cancel.is_cancelled() {
                         return Err(Error::Canceled);
@@ -1074,6 +1095,77 @@ mod tests {
         assert_eq!(bf16["compute"][0]["dtype"], "F32");
         assert_eq!(bf16["compute"][1]["dtype"], "BF16");
         assert_ne!(f32, bf16);
+    }
+
+    #[test]
+    fn completed_prefix_cache_observation_distinguishes_prefill_cached_and_overflow() {
+        fn captured(
+            path: KvCachePath,
+            bytes: usize,
+            overflow: Option<gen_core::PrefixKvCacheOverflow>,
+        ) -> (gen_core::PrefixKvCacheReport, serde_json::Value) {
+            let attempt = candle_gen::execution::Attempt::begin();
+            candle_gen::execution::rng_scheme("qwen21-test-seeded-noise");
+            candle_gen::execution::draw("image_initial_noise", 7, 0);
+            candle_gen::execution::schedule("euler", &[1.0, 0.0], "Flow");
+            candle_gen::execution::runtime(&Device::Cpu, candle_core::DType::F32);
+            let report = observe_prefix_kv_cache(
+                &DenoiseReport {
+                    kv_cache: path,
+                    kv_cache_bytes: bytes,
+                    ..DenoiseReport::default()
+                },
+                overflow,
+            );
+            let output = GenerationOutput::Images(vec![gen_core::Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            }]);
+            let gen_core::generator::ExecutionIdentity::Resolved { identity } =
+                attempt.finish_image(&descriptor(), &output)
+            else {
+                panic!("completed cache facts should resolve the weights-free report");
+            };
+            let gen_core::generator::ExecutionFact::Resolved { value } = identity.quality_policy
+            else {
+                panic!("quality policy should be resolved");
+            };
+            (
+                report,
+                value["operations"]["qwen21/prefix_kv_cache"][0]["value"].clone(),
+            )
+        }
+
+        let (prefill, prefill_fact) = captured(KvCachePath::Prefill, 0, None);
+        let (cached, cached_fact) = captured(KvCachePath::Cached, 4096, None);
+        let overflow = gen_core::PrefixKvCacheOverflow {
+            actual_bytes: 8192,
+            priced_bytes: 4096,
+        };
+        let (fallback, fallback_fact) = captured(KvCachePath::Prefill, 0, Some(overflow));
+
+        assert_eq!(prefill.path, gen_core::PrefixKvCacheMode::Prefill);
+        assert_eq!(
+            prefill_fact,
+            serde_json::json!({"path":"prefill","cache_bytes":0,"overflow":null})
+        );
+        assert_eq!(cached.path, gen_core::PrefixKvCacheMode::Cached);
+        assert_eq!(
+            cached_fact,
+            serde_json::json!({"path":"cached","cache_bytes":4096,"overflow":null})
+        );
+        assert_eq!(fallback.path, gen_core::PrefixKvCacheMode::Prefill);
+        assert_eq!(fallback.overflow, Some(overflow));
+        assert_eq!(
+            fallback_fact,
+            serde_json::json!({
+                "path":"prefill","cache_bytes":0,
+                "overflow":{"actual_bytes":8192,"priced_bytes":4096}
+            })
+        );
+        assert_ne!(prefill_fact, cached_fact);
+        assert_ne!(prefill_fact, fallback_fact);
     }
 
     fn req(width: u32, height: u32) -> GenerationRequest {

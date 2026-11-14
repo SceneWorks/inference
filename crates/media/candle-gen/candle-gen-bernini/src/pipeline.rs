@@ -497,7 +497,7 @@ impl Generator for BerniniRenderer {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture(self, req, on_progress)
+        crate::components::capture_renderer_execution(self, req, on_progress, self.adapters.len())
     }
 
     fn generate(

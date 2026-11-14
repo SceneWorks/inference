@@ -552,6 +552,21 @@ impl WanVaceFunGenerator {
     }
 }
 
+/// The two expert loaders merge selected adapters but retain no byte-bound installation receipt.
+fn capture_vace_fun_execution<G: Generator + ?Sized>(
+    generator: &G,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+    selected_adapter_count: usize,
+) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+    candle_gen::execution::capture_with(generator, req, on_progress, || {
+        candle_gen::execution::unobserved_adapters(
+            selected_adapter_count,
+            "candle-gen-wan VACE-Fun",
+        );
+    })
+}
+
 impl Generator for WanVaceFunGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -566,7 +581,7 @@ impl Generator for WanVaceFunGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture(self, req, on_progress)
+        capture_vace_fun_execution(self, req, on_progress, self.adapters.len())
     }
 
     fn generate(
@@ -871,9 +886,61 @@ candle_gen::register_generators! {
 mod tests {
     use super::*;
     use crate::vace::weighted_control_scale;
+    use candle_gen::gen_core::generator::ExecutionIdentity;
     use candle_gen::gen_core::Quant;
     use candle_gen::gen_core::{AdapterKind, ReplacementMode};
     use std::cell::{Cell, RefCell};
+
+    struct ReportFixture(ModelDescriptor);
+
+    impl Generator for ReportFixture {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.0
+        }
+        fn validate(&self, _req: &GenerationRequest) -> gen_core::Result<()> {
+            Ok(())
+        }
+        fn generate(
+            &self,
+            _req: &GenerationRequest,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> gen_core::Result<GenerationOutput> {
+            candle_gen::execution::rng_scheme("vace-fun-report-fixture");
+            candle_gen::execution::draw("initial_noise", 7, 0);
+            candle_gen::execution::without_schedule("fixture", "single-step", "flow");
+            candle_gen::execution::policy("decoder", serde_json::json!("mock"));
+            candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+            Ok(GenerationOutput::Video {
+                frames: vec![Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 3],
+                }],
+                fps: 1,
+                audio: None,
+            })
+        }
+    }
+
+    #[test]
+    fn completed_vace_fun_report_refuses_unobserved_adapters() {
+        let fixture = ReportFixture(descriptor());
+        let req = GenerationRequest::default();
+        let clean = capture_vace_fun_execution(&fixture, &req, &mut |_| {}, 0).unwrap();
+        assert!(matches!(
+            clean.execution,
+            ExecutionIdentity::Resolved { .. }
+        ));
+        let adapted = capture_vace_fun_execution(&fixture, &req, &mut |_| {}, 1).unwrap();
+        let ExecutionIdentity::Unavailable { reason } = adapted.execution else {
+            panic!("an adapted VACE-Fun render needs an installation receipt")
+        };
+        assert_eq!(reason.code, "candle_execution_observation_incomplete");
+        assert!(reason
+            .missing_facts
+            .iter()
+            .any(|fact| fact.contains("selected adapter count 1")));
+    }
 
     fn request() -> GenerationRequest {
         let image = Image {

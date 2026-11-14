@@ -652,6 +652,21 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 candle_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
+fn capture_scail2_execution<G: Generator + ?Sized>(
+    generator: &G,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+    loaded_adapter_count: usize,
+) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+    candle_gen::execution::capture_with(generator, req, on_progress, || {
+        // Dense DiT merging discards its install report; a retained spec is not an applied receipt.
+        candle_gen::execution::unobserved_adapters(
+            loaded_adapter_count,
+            "candle-gen-scail2/src/pipeline.rs",
+        );
+    })
+}
+
 impl Generator for Scail2 {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -696,7 +711,7 @@ impl Generator for Scail2 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture(self, req, on_progress)
+        capture_scail2_execution(self, req, on_progress, self.adapters.len())
     }
 
     fn generate(
@@ -1132,6 +1147,60 @@ fn replace_flag_for_request(req: &GenerationRequest) -> bool {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    struct AdapterReportFixture(ModelDescriptor);
+
+    impl Generator for AdapterReportFixture {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.0
+        }
+
+        fn validate(&self, _req: &GenerationRequest) -> gen_core::Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _req: &GenerationRequest,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> gen_core::Result<GenerationOutput> {
+            candle_gen::execution::rng_scheme("adapter-report-fixture");
+            candle_gen::execution::draw("initial_noise", 7, 0);
+            candle_gen::execution::without_schedule("fixture", "single-step", "flow");
+            candle_gen::execution::policy("decoder", serde_json::json!("fixture"));
+            candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+            Ok(GenerationOutput::Video {
+                frames: vec![Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 3],
+                }],
+                fps: 1,
+                audio: None,
+            })
+        }
+    }
+
+    #[test]
+    fn scail2_report_refuses_loaded_adapters_without_receipt_but_allows_clean_attempt() {
+        use candle_gen::gen_core::generator::ExecutionIdentity;
+
+        let fixture = AdapterReportFixture(descriptor());
+        let req = GenerationRequest::default();
+        let clean = capture_scail2_execution(&fixture, &req, &mut |_| {}, 0).unwrap();
+        assert!(matches!(
+            clean.execution,
+            ExecutionIdentity::Resolved { .. }
+        ));
+        let adapted = capture_scail2_execution(&fixture, &req, &mut |_| {}, 1).unwrap();
+        let ExecutionIdentity::Unavailable { reason } = adapted.execution else {
+            panic!("loaded adapters need an applied-stack receipt")
+        };
+        assert!(reason
+            .missing_facts
+            .iter()
+            .any(|fact| fact.contains("selected adapter count 1")));
+    }
 
     #[test]
     fn provider_mode_selects_the_exact_engine_replace_flag() {

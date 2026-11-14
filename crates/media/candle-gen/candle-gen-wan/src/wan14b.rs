@@ -1172,7 +1172,7 @@ impl Generator for Wan14bGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
-        candle_gen::execution::capture(self, req, on_progress)
+        crate::capture_wan_execution(self, req, on_progress, self.adapters.len())
     }
 
     fn generate(
