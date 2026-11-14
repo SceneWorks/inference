@@ -112,6 +112,7 @@ pub mod transform {
 // ([`tiling::TilePlan`]); this carries the tensor loop.
 pub mod memory_probe;
 pub mod vae_tiling;
+pub mod video_execution;
 
 pub use attention::{
     sdpa_budgeted_bhsd, AttentionBudget, AttentionPlan, CONSTRAINED_ATTN_SCORES_BUDGET,

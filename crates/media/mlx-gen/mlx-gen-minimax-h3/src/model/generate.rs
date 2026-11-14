@@ -37,6 +37,14 @@ impl MiniMaxH3 {
         // shifts".
         let video_shift = req.scheduler_shift.unwrap_or(VIDEO_SIGMA_SHIFT);
         let schedule = JointSchedule::with_shifts(evaluations + 1, video_shift, AUDIO_SIGMA_SHIFT)?;
+        mlx_gen::video_execution::sampling(
+            "h3_joint",
+            "flow_euler",
+            "velocity",
+            serde_json::json!({"video_shift_bits":video_shift.to_bits(),"audio_shift_bits":AUDIO_SIGMA_SHIFT.to_bits()}),
+        );
+        mlx_gen::video_execution::schedule("h3_video", schedule.video().sigmas());
+        mlx_gen::video_execution::schedule("h3_audio", schedule.audio().sigmas());
         if schedule.num_evals() == 0 {
             return Err(Error::Msg(format!(
                 "{MODEL_ID}: a {evaluations}-step schedule collapsed to no model evaluations \
@@ -61,6 +69,10 @@ impl MiniMaxH3 {
         // conditioning and denoise residency must agree, or half the request streams while the
         // other half quietly holds a resident stack.
         let window = self.requested_transformer_window(req)?;
+        mlx_gen::video_execution::policy(
+            "h3_residency",
+            serde_json::json!({"transformer_window":window,"dtype":format!("{:?}",self.dtype),"task":format!("{task:?}")}),
+        );
         if let Some(refs) = &references {
             return self.generate_ref2va(
                 req,
@@ -301,6 +313,15 @@ impl MiniMaxH3 {
             return crate::veda_fixture::decode_video(req, latents);
         }
         let tiling = crate::pipeline::decode_tiling_for(req)?;
+        mlx_gen::video_execution::policy(
+            "h3_decode",
+            serde_json::json!({"tiling":format!("{tiling:?}"),"veda":{
+                "kernel":self.veda_report.borrow().kernel, "predictor":self.veda_report.borrow().predictor,
+                "plan":self.veda_report.borrow().plan, "exact_plan":self.veda_report.borrow().exact_plan,
+                "sparse_calls":self.veda_report.borrow().sparse_calls, "dense_calls":self.veda_report.borrow().dense_calls,
+                "dense_fallback":self.veda_report.borrow().fallback_reason.is_some()
+            }}),
+        );
         let vae = MiniMaxH3VideoVae::load(&self.root, self.dtype)?.with_tiling(tiling);
         let decoded = vae.decode(latents)?;
         let pixels = revert_pixel_normalization(&decoded)?;

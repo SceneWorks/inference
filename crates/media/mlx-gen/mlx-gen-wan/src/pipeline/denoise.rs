@@ -229,6 +229,13 @@ pub fn denoise_approx(
 ) -> Result<Array> {
     let mut sched = make_scheduler(kind, num_train_timesteps);
     sched.set_timesteps(steps, shift);
+    mlx_gen::video_execution::sampling(
+        "wan",
+        &format!("{kind:?}"),
+        "flow_velocity",
+        serde_json::json!({"guidance_bits":guidance.to_bits(),"shift_bits":shift.to_bits()}),
+    );
+    mlx_gen::video_execution::schedule("wan", sched.sigmas());
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
     // sc-2957: run the DiT's fusable elementwise glue (adaLN affine, gated residual, gated-GELU FFN,
@@ -319,6 +326,13 @@ pub fn denoise_curated(
     let grid = transformer.patch_grid(init_noise);
     let cache = build_cache(transformer, ctx_cond, ctx_uncond, grid)?;
     let sigmas = compute_sigmas(steps, shift, num_train_timesteps);
+    mlx_gen::video_execution::curated_sampling(
+        "wan_curated",
+        sampler_name,
+        "flow_velocity",
+        serde_json::json!({"guidance_bits":guidance.to_bits()}),
+    );
+    mlx_gen::video_execution::schedule("wan_curated", &sigmas);
     let nt = num_train_timesteps as f32;
     mlx_gen::run_flow_sampler(
         mlx_gen::SamplerRun {
@@ -396,6 +410,13 @@ pub fn denoise_ti2v(
 ) -> Result<Array> {
     let mut sched = make_scheduler(kind, num_train_timesteps);
     sched.set_timesteps(steps, shift);
+    mlx_gen::video_execution::sampling(
+        "wan",
+        &format!("{kind:?}"),
+        "flow_velocity",
+        serde_json::json!({"guidance_bits":guidance.to_bits(),"shift_bits":shift.to_bits()}),
+    );
+    mlx_gen::video_execution::schedule("wan", sched.sigmas());
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
     // sc-2957: compile the DiT's fusable elementwise glue (bit-exact, ~14% faster/step). The per-token

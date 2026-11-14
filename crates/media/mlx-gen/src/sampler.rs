@@ -115,10 +115,15 @@ impl StepRng {
     /// Unit-normal noise for step `step`, drawn from a distinct subkey. The multiplier de-correlates
     /// consecutive steps; the `+1` keeps step 0 off the raw seed used for the init-noise prior.
     fn normal(&self, shape: &[i32], step: usize) -> Result<Array> {
+        self.normal_reported(shape, step, "curated_solver_step_normal")
+    }
+
+    fn normal_reported(&self, shape: &[i32], step: usize, purpose: &str) -> Result<Array> {
         let sub = self
             .seed
             .wrapping_add(0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(step as u64 + 1));
         let key = random::key(sub)?;
+        crate::video_execution::draw_current(purpose, sub);
         Ok(random::normal::<f32>(shape, None, None, Some(&key))?)
     }
 }
@@ -857,8 +862,16 @@ impl LatentOps for MlxAvLatentOps {
         // Distinct subkeys per stream (the audio seed is XOR-shifted) so the two streams' stochastic
         // noise is decorrelated; each reuses the per-step `StepRng` derivation.
         Ok(AvLatents {
-            video: MlxLatentOps.randn_like(&x.video, seed, step)?,
-            audio: MlxLatentOps.randn_like(&x.audio, seed ^ 0xA5A5_5A5A_C3C3_3C3C, step)?,
+            video: StepRng::new(seed).normal_reported(
+                x.video.shape(),
+                step,
+                "curated_video_step_normal",
+            )?,
+            audio: StepRng::new(seed ^ 0xA5A5_5A5A_C3C3_3C3C).normal_reported(
+                x.audio.shape(),
+                step,
+                "curated_audio_xor_step_normal",
+            )?,
         })
     }
 }

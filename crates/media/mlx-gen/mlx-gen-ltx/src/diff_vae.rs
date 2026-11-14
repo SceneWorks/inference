@@ -1887,6 +1887,15 @@ impl NaDiffusionDecoder {
         let context = self.stage_4(feature, is_origin, pad_trailing)?;
         context.eval()?;
         let schedule = self.timesteps();
+        mlx_gen::video_execution::sampling(
+            "ltx_diffusion_decoder",
+            "euler",
+            &format!("{:?}", self.cfg.model_output_type),
+            serde_json::json!({}),
+        );
+        let mut execution_schedule = schedule.clone();
+        execution_schedule.push(0.0);
+        mlx_gen::video_execution::schedule("ltx_diffusion_decoder", &execution_schedule);
         let mut x_t = x_t_init.clone();
         for i in 0..schedule.len() - 1 {
             let out = self.diff_step(&context, &x_t, schedule[i])?;

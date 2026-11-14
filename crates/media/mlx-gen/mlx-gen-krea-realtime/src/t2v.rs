@@ -663,6 +663,7 @@ pub fn generate_v2v_from_components(
     let height = (params.latent_height * SPATIAL_STRIDE) as u32;
     // Stage 1: VAE-encode the source clip → clean source latent (deterministic eps from the seed).
     let key = random::key(params.seed)?;
+    mlx_gen::video_execution::draw(0, "krea_v2v_source_posterior_normal", params.seed);
     // The encoder's buffers (and the full-resolution source clip) must not persist into
     // generation: W2 run 36832899832 carried 43 GB of cached encode buffers into v2v generation.
     let source_latents = materialize_and_release_phase(|| {
@@ -817,7 +818,12 @@ fn load_transformer(
     // Reconcile the requested tier against the one actually on disk, then quantize a dense base if the
     // caller asked for it (a no-op over an already-packed base — hence the reconciliation, which turns
     // a width mismatch into a loud error instead of silently serving the stored tier).
-    if let Some(q) = resolve_load_time_quant(MODEL_ID, packed, quant)? {
+    let applied_quant = resolve_load_time_quant(MODEL_ID, packed, quant)?;
+    mlx_gen::video_execution::policy(
+        "krea_weight_tier",
+        serde_json::json!({"stored":format!("{packed:?}"),"applied":format!("{applied_quant:?}")}),
+    );
+    if let Some(q) = applied_quant {
         dit.quantize(q.bits(), None)?;
     }
     let mut transformer = CausalKreaTransformer::new(dit, cfg);
@@ -919,6 +925,10 @@ pub(crate) fn generate_t2v_reported(
         )));
     }
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent_frames)?;
+    mlx_gen::video_execution::policy(
+        "krea_resolved_config",
+        serde_json::json!({"config":format!("{cfg:?}")}),
+    );
 
     // Stage the reused components (UMT5 prompt encode + Krea DiT + z16 Wan VAE); any inference LoRA(s)
     // are installed onto the DiT inside `stage_components` (sc-15015, S14). The Conditioning
@@ -1116,6 +1126,10 @@ pub(crate) fn generate_i2v_reported(
             )
         })?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, total_latent)?;
+    mlx_gen::video_execution::policy(
+        "krea_resolved_config",
+        serde_json::json!({"config":format!("{cfg:?}")}),
+    );
     // The Conditioning calibration boundary lives INSIDE `stage_components`, between the prompt
     // encode and the DiT load — see its doc comment.
     let (context, transformer, vae, adapter_reports) = stage_components(
@@ -1209,6 +1223,10 @@ pub(crate) fn generate_v2v_reported(
     }
     let (latent_h, latent_w) = resolve_latent_size(root, job, "v2v")?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent)?;
+    mlx_gen::video_execution::policy(
+        "krea_resolved_config",
+        serde_json::json!({"config":format!("{cfg:?}")}),
+    );
     // The Conditioning calibration boundary lives INSIDE `stage_components`, between the prompt
     // encode and the DiT load — see its doc comment.
     let (context, transformer, vae, adapter_reports) = stage_components(
@@ -1618,6 +1636,10 @@ mod tests {
         let base = KreaRealtimeConfig::krea_realtime_14b();
         // 32×32 latent under patch 2×2 → (16·16) = 256 tokens/frame.
         let cfg = resolve_request_config(&base, 32, 32, 4).unwrap();
+        mlx_gen::video_execution::policy(
+            "krea_resolved_config",
+            serde_json::json!({"config":format!("{cfg:?}")}),
+        );
         assert_eq!(cfg.ar.frame_seq_length, 256);
         assert_eq!(cfg.ar.seq_length, 4 * 256);
         // Mac streaming bound retained; the read window rides the derived frame_seq_length.

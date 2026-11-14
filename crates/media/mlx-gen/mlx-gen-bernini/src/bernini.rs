@@ -635,7 +635,30 @@ mlx_gen::register_generators! {
 // generator. Audited independently of the renderer rather than inherited — the two variants differ in
 // modality, in conditioning footprint, and in which snapshot files they load — and the audit found
 // the same three hooks missing on both.
+impl Bernini {
+    fn generate_execution_attempt(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
 impl Generator for Bernini {
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            self.generate_execution_attempt(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })
+            .map(mlx_gen::gen_core::GenerationReport::from_output)
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -649,7 +672,9 @@ impl Generator for Bernini {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -729,6 +754,7 @@ impl Bernini {
 
         // --- Stage 3: load both experts, ViT-conditioned APG denoise ---
         let key = random::key(full.seed)?;
+        mlx_gen::video_execution::draw(0, "bernini_full_renderer_normal", full.seed);
         let lat = latent_shape(
             full.frames,
             full.height,
@@ -907,6 +933,11 @@ impl Bernini {
             let vit_frames = sample_vit_frames(&rgb);
             let (vit_feat, vit_grid) = vit_encode_video(planner, &vit_frames)?;
             let key = random::key(seed.wrapping_add(0x51d_u64).wrapping_add(vi as u64))?;
+            mlx_gen::video_execution::draw(
+                0,
+                "bernini_planner_or_conditioning_normal",
+                seed.wrapping_add(0x51d_u64).wrapping_add(vi as u64),
+            );
             let vae_latent = vae_encode_video(&vae, &rgb, self.config.vae_z_dim, &key)?;
             let hw = (rgb[0].height() as i64, rgb[0].width() as i64);
             videos.push(SourceVisual {
@@ -992,6 +1023,10 @@ impl Bernini {
         // experts are deferred here, so the bound is over the full 80-block trunk, not one expert.
         let window = crate::memory_strategy::transformer_window_size(req)?;
         let attn_budget = crate::memory_strategy::attention_budget(req);
+        mlx_gen::video_execution::policy(
+            "bernini_experts",
+            serde_json::json!({"window":window,"attention_budget":format!("{attn_budget:?}")}),
+        );
         let plan = window
             .map(|size| BlockPlan::new(cfg.num_layers, size))
             .transpose()?;
@@ -1442,6 +1477,11 @@ fn sample_vit_frames(frames: &[RgbImage]) -> Vec<RgbImage> {
 /// host — bit-stable, and injectable in tests for torch parity).
 fn seeded_permutation(n: i32, seed: u64) -> Result<Vec<i32>> {
     let key = random::key(seed.wrapping_add(0x4d_a4))?;
+    mlx_gen::video_execution::draw(
+        0,
+        "bernini_planner_or_conditioning_normal",
+        seed.wrapping_add(0x4d_a4),
+    );
     let noise = random::normal::<f32>(&[n], None, None, Some(&key))?;
     let vals = noise.as_slice::<f32>().to_vec();
     let mut idx: Vec<i32> = (0..n).collect();
@@ -1465,6 +1505,11 @@ fn seeded_step_noise(
     for (s, revealed) in schedule.iter().enumerate() {
         let np = (revealed.len() as i32).max(1);
         let key = random::key(seed.wrapping_add(0x9e_37).wrapping_add(s as u64))?;
+        mlx_gen::video_execution::draw(
+            0,
+            "bernini_planner_or_conditioning_normal",
+            seed.wrapping_add(0x9e_37).wrapping_add(s as u64),
+        );
         out.push(random::normal::<f32>(
             &[np, in_channels],
             None,

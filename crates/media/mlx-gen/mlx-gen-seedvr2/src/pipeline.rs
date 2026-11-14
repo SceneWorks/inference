@@ -33,6 +33,7 @@ pub struct Seedvr2Pipeline {
     pub transformer: Seedvr2Transformer,
     neg_embed: Option<Array>,
     dtype: Dtype,
+    quant_bits: Option<i32>,
     /// Resident weight bytes (VAE + DiT at `dtype`) — drives the video memory-budget chunk sizer.
     weights_bytes: usize,
 }
@@ -104,6 +105,7 @@ impl Seedvr2Pipeline {
             transformer: Seedvr2Transformer::from_weights(dit_w, cfg)?,
             neg_embed: None,
             dtype: Dtype::Float32,
+            quant_bits: None,
             weights_bytes: 0,
         })
     }
@@ -151,7 +153,9 @@ impl Seedvr2Pipeline {
     /// is intentionally **not** reduced — keeping the dense estimate makes the video chunk-size budget
     /// conservative (quant shrinks weights, not activations, so the headroom is safe).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.transformer.quantize(bits)
+        self.transformer.quantize(bits)?;
+        self.quant_bits = Some(bits);
+        Ok(())
     }
 
     /// Encode the preprocessed image to the conditioning latent `(B,16,T',h,w)` (scaled mean).
@@ -308,6 +312,10 @@ impl Seedvr2Pipeline {
             ChunkPlan::OverBudget { .. }
         );
         let over_vae_cap = width.max(height) > video::VAE_SAFE_DECODE_EDGE_PX;
+        mlx_gen::video_execution::policy(
+            "seedvr2_image_route",
+            serde_json::json!({"over_budget":over_budget,"over_vae_cap":over_vae_cap,"dtype":format!("{:?}",self.dtype),"quant_bits":self.quant_bits,"softness_bits":softness.to_bits()}),
+        );
         if over_budget || over_vae_cap {
             return self.generate_tiled(
                 image, width, height, seed, softness, safe_gib, cancel, on_step,
@@ -330,6 +338,14 @@ impl Seedvr2Pipeline {
         let latent = self.encode(&processed)?;
         let sh = latent.shape();
         let key = random::key(seed)?;
+        mlx_gen::video_execution::draw_current("seedvr2_same_seed_per_chunk_or_tile", seed);
+        mlx_gen::video_execution::sampling(
+            "seedvr2",
+            "one_step_euler",
+            "flow_velocity",
+            serde_json::json!({"timestep_bits":TIMESTEP.to_bits()}),
+        );
+        mlx_gen::video_execution::schedule("seedvr2", &[1.0, 0.0]);
         let noise = random::normal::<f32>(&[1, 16, sh[2], sh[3], sh[4]], None, None, Some(&key))?
             .as_dtype(self.dtype)?;
         let cond = Self::condition(&latent)?;
@@ -406,6 +422,13 @@ impl Seedvr2Pipeline {
     /// LR `Image` → `(1,3,height,width)` in `[-1,1]` at the model dtype. PIL-exact bicubic resize to
     /// the target; optional `softness` pre-blur via a smaller round-trip.
     fn preprocess(&self, image: &Image, width: i32, height: i32, softness: f32) -> Result<Array> {
+        mlx_gen::video_execution::policy(
+            "seedvr2_preprocess",
+            serde_json::json!({
+                "softness_bits":softness.clamp(0.0,1.0).to_bits(),"target":[width,height],
+                "luminance_weight_bits":LUMINANCE_WEIGHT.to_bits()
+            }),
+        );
         let (ih, iw) = (image.height as usize, image.width as usize);
         let (oh, ow) = (height as usize, width as usize);
         let resized: Vec<f32> = if softness > 0.0 {
@@ -593,6 +616,10 @@ impl Seedvr2Pipeline {
         };
 
         let plan = video::plan_chunks(n, chunk, video::DEFAULT_OVERLAP);
+        mlx_gen::video_execution::policy(
+            "seedvr2_video_chunks",
+            serde_json::json!({"chunk":chunk,"overlap":video::DEFAULT_OVERLAP,"plan":format!("{plan:?}"),"dtype":format!("{:?}",self.dtype),"quant_bits":self.quant_bits,"softness_bits":softness.to_bits()}),
+        );
         let neg = self
             .neg_embed
             .as_ref()
@@ -622,6 +649,14 @@ impl Seedvr2Pipeline {
             let sh = latent.shape();
             // Same noise key for every chunk (the reference chunk-overlap test) → deterministic blend.
             let key = random::key(seed)?;
+            mlx_gen::video_execution::draw_current("seedvr2_same_seed_per_chunk_or_tile", seed);
+            mlx_gen::video_execution::sampling(
+                "seedvr2",
+                "one_step_euler",
+                "flow_velocity",
+                serde_json::json!({"timestep_bits":TIMESTEP.to_bits()}),
+            );
+            mlx_gen::video_execution::schedule("seedvr2", &[1.0, 0.0]);
             let noise =
                 random::normal::<f32>(&[1, 16, sh[2], sh[3], sh[4]], None, None, Some(&key))?
                     .as_dtype(self.dtype)?;
@@ -784,6 +819,10 @@ impl Seedvr2Pipeline {
                     return Err(Error::Canceled);
                 }
                 let (th, tw) = (t.y1 - t.y0, t.x1 - t.x0);
+                mlx_gen::video_execution::policy(
+                    "seedvr2_spatial_tile",
+                    serde_json::json!({"rect":[t.x0,t.y0,t.x1,t.y1],"overlap":overlap,"dtype":format!("{:?}",self.dtype),"quant_bits":self.quant_bits}),
+                );
                 let y_idx = Array::from_slice(&(t.y0..t.y1).collect::<Vec<i32>>(), &[th]);
                 let x_idx = Array::from_slice(&(t.x0..t.x1).collect::<Vec<i32>>(), &[tw]);
                 let tile_clip = processed.take_axis(y_idx, 3)?.take_axis(x_idx, 4)?; // (1,3,1,th,tw)
@@ -792,6 +831,14 @@ impl Seedvr2Pipeline {
                 let latent = self.encode(&tile_clip)?;
                 let sh = latent.shape();
                 let key = random::key(seed)?;
+                mlx_gen::video_execution::draw_current("seedvr2_same_seed_per_chunk_or_tile", seed);
+                mlx_gen::video_execution::sampling(
+                    "seedvr2",
+                    "one_step_euler",
+                    "flow_velocity",
+                    serde_json::json!({"timestep_bits":TIMESTEP.to_bits()}),
+                );
+                mlx_gen::video_execution::schedule("seedvr2", &[1.0, 0.0]);
                 let noise =
                     random::normal::<f32>(&[1, 16, sh[2], sh[3], sh[4]], None, None, Some(&key))?
                         .as_dtype(self.dtype)?;
