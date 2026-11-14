@@ -316,6 +316,11 @@ impl IrisTextEncoder {
         self.lm.compute_dtype()
     }
 
+    /// The device holding the loaded language tower.
+    pub(crate) fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// Tokenize and assemble one prompt's window.
     pub fn window(&self, prompt: &str) -> Result<TextWindow> {
         let caption = self
