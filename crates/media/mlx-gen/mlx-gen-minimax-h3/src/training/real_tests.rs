@@ -403,6 +403,24 @@ fn tier_walk(
             let wmax = |a: &Array| a.abs().unwrap().max(None).unwrap().item::<f32>();
             println!("[sw-7097 mlx] tier {label}: block {layer} max |score| {max_abs:.4e}, mean max-probability {maxp:.4}, max |norm_q| {:.4e}, max |norm_k| {:.4e}", wmax(nq), wmax(nk));
             if layer == 49 {
+                // The same scores on the CPU stream (IEEE float32): the GPU's error in the logits.
+                mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+                let sc_cpu = block
+                    .attention_scores(&h, m, &parts.adaln_indices[step], dit.rope(), &parts.tables)
+                    .unwrap();
+                mlx_rs::transforms::eval([&sc_cpu]).unwrap();
+                mlx_rs::Device::set_default(&mlx_rs::Device::gpu());
+                let err = sc
+                    .subtract(&sc_cpu)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max(None)
+                    .unwrap()
+                    .item::<f32>();
+                println!("[sw-7097 mlx] tier {label}: block 49 scores, default stream vs CPU stream: rel L2 {:.3e}, max |Δlogit| {err:.3e}", rel_l2(&sc, &sc_cpu));
+            }
+            if layer == 49 {
                 let input = block
                     .attention_input(&h, m, &parts.adaln_indices[step])
                     .unwrap();
@@ -526,6 +544,25 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         println!(
             "[sw-7097 mlx] compiled vs eager SwiGLU forward (untraced): rel L2 {:.3e}",
             rel_l2(&fused, &eager)
+        );
+    }
+    // Precondition: IEEE float32 GEMMs (see the GEMM probe below for why). On NAX MLX runs float32
+    // GEMMs as TF32 unless MLX_ENABLE_TF32=0 (v0.32.0 backend/metal/matmul.cpp:915-917).
+    {
+        let a = normal(&[272, 5376], 71, 1.0);
+        let b = normal(&[5376, 7168], 72, 0.02);
+        let rel = rel_l2(
+            &a.matmul(&b).unwrap(),
+            &a.matmul_device(&b, mlx_rs::StreamOrDevice::cpu()).unwrap(),
+        );
+        println!(
+            "[sw-7097 mlx] MLX_ENABLE_TF32={}; float32 GEMM default stream vs CPU stream rel L2 {rel:.3e}",
+            std::env::var("MLX_ENABLE_TF32").unwrap_or_else(|_| "<unset: MLX default 1>".into())
+        );
+        assert!(
+            rel <= 1e-5,
+            "float32 GEMMs here are not IEEE single precision (rel L2 {rel:.3e} against the CPU \
+             stream): run this gate with MLX_ENABLE_TF32=0"
         );
     }
     // Every block forward below — the trainer's and the test's own — runs the eager SwiGLU.
@@ -1052,6 +1089,11 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         let gpu = a.matmul(&b).unwrap();
         let cpu = a.matmul_device(&b, mlx_rs::StreamOrDevice::cpu()).unwrap();
         gemm_rel = rel_l2(&gpu, &cpu);
+        // MLX runs float32 GEMMs on NAX as TF32 unless MLX_ENABLE_TF32=0 (v0.32.0
+        // backend/metal/matmul.cpp:915-917). Block 49's logits reach ~5e3 (max |norm_k| 55.5), so a
+        // TF32 GEMM's ~5e-4 relative error is O(1) in the logits there and the loss jitters by
+        // ~1e-3 — no gradient-scale finite difference resolves. The gate measures the IEEE float32
+        // function, so it requires IEEE float32 GEMMs (the CPU stream's to within 1e-5).
         println!(
             "[sw-7097 mlx] GPU float32 GEMM precision (evidence): [272,5376]x[5376,7168] default (GPU) stream vs CPU stream rel L2 {gemm_rel:.3e} — IEEE float32 accumulation gives ~1e-6; TF32-class is ~5e-4"
         );
