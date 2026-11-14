@@ -807,7 +807,10 @@ class RunGraph:
             # SW-F329 appends source/byte/lifecycle arithmetic and frozen-cache ownership
             # controls. Their reviewed bodies execute no learned forward or inference kernel.
             # SW-6933 adds fixed-plan mocks, pre-load validation and CPU-stream sigma arithmetic.
-            controls_sha = '476d2a5e052af23829e4f7d4fad67bb121da89e3306a5b634c6b0f59e716809f'
+            # SW-6936 adds FLUX.1 conditional pre-load plan/refusal checks (gen-core multi-pass,
+            # MLX ControlNet/XLabs IP/PuLID, Candle ControlNet/IP/PuLID) and the preview
+            # source scans; none constructs a generator or runs learned compute.
+            controls_sha = '31b81ee7290677f9ccd81fe38e7a0df89e221b20920c48685dc389e64465245c'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha
