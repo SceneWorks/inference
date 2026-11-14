@@ -718,7 +718,7 @@ mod document_tests {
         assert!(matches!(
             token_replay_support(&decode, &[svg_policy_fixture()]),
             ExecutionReplaySupport::NonDeterministic { reason }
-                if reason.contains("wall time")
+                if reason.contains("different token on replay")
         ));
     }
 
