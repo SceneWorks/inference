@@ -626,7 +626,21 @@ impl Generator for Sana {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_impl(req, on_progress).map_err(Into::into)
+        })
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_attempt(&self.descriptor, &req.cancel, || {
+            let mut progress =
+                |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+            self.generate_impl(req, &mut progress).map_err(Into::into)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -747,6 +761,10 @@ impl Sana {
             crate::pipeline::resolve_decode_tiling(req.memory, self.residency.is_sequential());
         // img2img's bounded DC-AE encode: iOS, or a request whose bounded-VAE rung asks for it.
         let encode_tile = crate::pipeline::resolved_encode_tile(req.memory);
+        mlx_gen::image_execution::policy_debug("stage_residency", &self.residency.is_sequential());
+        mlx_gen::image_execution::policy_debug("decode_tiling", &tiling);
+        mlx_gen::image_execution::policy_debug("encode_tile", &encode_tile);
+        mlx_gen::image_execution::scalar("guidance", guidance);
 
         // ── Phase A: Gemma CHI conditioning. Seed-independent (no RNG) — encodes cond (+ uncond for
         // base SANA with CFG active; Sprint is CFG-free). Under `Sequential` the Gemma encoder is
@@ -785,6 +803,7 @@ impl Sana {
          -> Result<Vec<mlx_rs::Array>> {
             // Rungs 3 and 4, resolved against the trunk that will actually run them.
             let plan = crate::pipeline::resolved_rung_plan(req.memory, heavy.transformer_blocks())?;
+            mlx_gen::image_execution::policy_debug("transformer_plan", &plan);
             let prepare_req =
                 base_sana_request(req, base_seed, init_image, strength, guidance_scale);
             let latents = render_batch_with_prepared_reference(

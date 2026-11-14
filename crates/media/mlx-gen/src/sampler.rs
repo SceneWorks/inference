@@ -768,7 +768,10 @@ pub fn run_flow_sampler_with_latent_hook(
     predict: impl FnMut(&Array, f32) -> Result<Array>,
 ) -> Result<Array> {
     let ms = gen_core::sampling::FlowModelSampling::new(conv);
-    run_curated_sampler_with_latent_hook(run, &ms, latents, on_latent, predict)
+    let (sampler, sigmas, seed, dtype) = (run.sampler_name, run.sigmas, run.seed, latents.dtype());
+    let output = run_curated_sampler_with_latent_hook(run, &ms, latents, on_latent, predict)?;
+    crate::image_execution::sampled_flow(sampler, conv, dtype, sigmas, seed);
+    Ok(output)
 }
 
 // =================================================================================================

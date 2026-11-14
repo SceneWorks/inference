@@ -563,15 +563,32 @@ mod tests {
     }
 
     #[test]
-    fn cfg_free_recipe_is_not_reinterpreted_as_sana_default_guidance() {
+    fn cfg_free_legacy_recipe_is_not_reinterpreted_as_guidance_defaults() {
         let turbo = resolve(
             crate::zimage::Z_IMAGE_TURBO_ID,
             &GenerationRequest::default(),
         )
         .unwrap();
-        assert!(from_token("sana_1600m", turbo.token()).is_err());
-        let sana = resolve("sana_1600m", &GenerationRequest::default()).unwrap();
-        assert!(from_token(crate::zimage::Z_IMAGE_TURBO_ID, sana.token()).is_err());
+        // SW-6929 made Turbo CFG-capable with an explicit zero-offset default. A current
+        // Turbo token is no longer a CFG-free fixture; preserve the legacy null semantics
+        // explicitly so this regression still exercises default-substitution refusal.
+        assert_eq!(turbo.provenance()["guidance"], 0.0);
+        let mut legacy = turbo.provenance().clone();
+        legacy["guidance"] = Value::Null;
+        let legacy: FlowSamplingRecipe = serde_json::from_value(legacy).unwrap();
+        for provider in ["sana_1600m", crate::zimage::Z_IMAGE_TURBO_ID] {
+            assert!(from_token(provider, &legacy.canonical_token()).is_err());
+            let current = resolve(provider, &GenerationRequest::default()).unwrap();
+            let replay = from_token(provider, current.token()).unwrap();
+            assert_eq!(replay.provenance(), current.provenance());
+        }
+        // Explicit controls stay explicit when interpreted by another CFG-capable provider.
+        assert_eq!(
+            from_token("sana_1600m", turbo.token())
+                .unwrap()
+                .provenance()["guidance"],
+            0.0
+        );
         assert!(resolve("unknown_generation_provider", &GenerationRequest::default()).is_err());
     }
 }

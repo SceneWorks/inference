@@ -198,6 +198,9 @@ pub fn forward_tiled(
     // integer and each tile's patch grid matches its LQ projection.
     let f = (h / z_h).max(1);
     let (ys, xs) = plan_axes(h, w, tile, overlap, f);
+    mlx_gen::image_execution::policy_debug("pid_forward_tiled", &(ys.len() > 1 || xs.len() > 1));
+    mlx_gen::image_execution::policy_debug("pid_tile_axes", &(&ys, &xs));
+    mlx_gen::image_execution::policy_debug("pid_feather_overlap", &overlap);
 
     // Whole-image single tile → just the plain forward (no blend overhead, exact).
     if ys.len() == 1 && xs.len() == 1 {
