@@ -19,6 +19,10 @@ on:
         description: 'JSON with registered selection and explicit supervisor policy; optional runner="nax" for provisioned assets'
         type: string
         required: true
+      stage_xlabs_ip_adapter:
+        description: 'Asset inventory only: first fetch the product-pinned XLabs-AI/flux-ip-adapter ip_adapter.safetensors into the runner Hub cache (setup, no model load)'
+        type: boolean
+        default: false
 
 env:
   FLUX1_PAIR_TIER: ${{ inputs.flux1_pair }}
@@ -278,6 +282,20 @@ jobs:
         if: runner.os == 'Windows'
         shell: cmd
         run: call scripts\ci\real-weights\moss-edit-cuda\locate-existing-reviewed-python-without-installation.cmd
+      # Opt-in setup, not model execution: fetch exactly the pinned XLabs adapter file through
+      # huggingface_hub into this runner's Hub cache and record its SHA-256 in a receipt.
+      - name: Stage pinned XLabs IP adapter on macOS (opt-in, no model load)
+        if: runner.os == 'macOS' && inputs.stage_xlabs_ip_adapter
+        shell: bash
+        env:
+          STAGING_OUTPUT: ${{ runner.temp }}/flux1-xlabs-ip-adapter-staging.json
+        run: python3.12 -u -I scripts/ci/flux1_conditional_asset_inventory.py --stage-xlabs-ip-adapter --backend mlx --request-env MODEL_PROOF_REQUEST --expected-sha "$GITHUB_SHA" --output "$STAGING_OUTPUT"
+      - name: Stage pinned XLabs IP adapter on Windows (opt-in, no model load)
+        if: runner.os == 'Windows' && inputs.stage_xlabs_ip_adapter
+        shell: cmd
+        env:
+          STAGING_OUTPUT: ${{ runner.temp }}/flux1-xlabs-ip-adapter-staging.json
+        run: '"%REVIEWED_PYTHON%" -u -I scripts\ci\flux1_conditional_asset_inventory.py --stage-xlabs-ip-adapter --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%STAGING_OUTPUT%"'
       - name: Inventory installed assets on macOS (no model load)
         if: runner.os == 'macOS'
         shell: bash
@@ -294,5 +312,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: flux1-conditional-asset-inventory-${{ inputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/flux1-conditional-asset-inventory.json
+          path: |
+            ${{ runner.temp }}/flux1-conditional-asset-inventory.json
+            ${{ runner.temp }}/flux1-xlabs-ip-adapter-staging.json
           if-no-files-found: error
