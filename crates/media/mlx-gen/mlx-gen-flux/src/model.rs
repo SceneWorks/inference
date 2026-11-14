@@ -131,6 +131,17 @@ impl FluxTextOwned {
         let (clip_ids, _) = mlx_gen::tokenizer::to_arrays(&self.clip_tokenizer.tokenize(prompt)?);
         self.text_encoders.encode(&t5_ids, &clip_ids)
     }
+
+    /// [`encode`](Self::encode), then evaluate both embeddings before returning. Every render route
+    /// calls this inside its Conditioning phase, so the T5/CLIP forward (its allocations and any
+    /// failure) belongs to Conditioning under both `Sequential` and `Resident` offload rather than
+    /// running later in the staged-residency materialization or the first denoise step. Evaluating
+    /// earlier copies nothing and leaves the values unchanged.
+    pub(crate) fn encode_materialized(&self, prompt: &str) -> Result<(Array, Array)> {
+        let (prompt_embeds, pooled_prompt_embeds) = self.encode(prompt)?;
+        mlx_rs::transforms::eval([&prompt_embeds, &pooled_prompt_embeds])?;
+        Ok((prompt_embeds, pooled_prompt_embeds))
+    }
 }
 
 /// The heavy render-phase components (the DiT transformer, the VAE, and the optional PiD decoder) —
@@ -703,9 +714,9 @@ impl Flux1 {
             on_progress,
             |text: &FluxTextOwned| {
                 if conditioning_started {
-                    text.encode(&req.prompt)
+                    text.encode_materialized(&req.prompt)
                 } else {
-                    run.encode(|| text.encode(&req.prompt))
+                    run.encode(|| text.encode_materialized(&req.prompt))
                 }
             },
             // Materialize the embeds while the encoders are still alive (Sequential only) — MLX is lazy,
@@ -909,8 +920,8 @@ impl Flux1 {
             on_progress,
             |text: &FluxTextOwned| {
                 let encode_text = || {
-                    let (pos_embeds, pos_pooled) = text.encode(&req.prompt)?;
-                    let (neg_embeds, neg_pooled) = text.encode(neg_prompt)?;
+                    let (pos_embeds, pos_pooled) = text.encode_materialized(&req.prompt)?;
+                    let (neg_embeds, neg_pooled) = text.encode_materialized(neg_prompt)?;
                     Ok((pos_embeds, pos_pooled, neg_embeds, neg_pooled))
                 };
                 if conditioning_started {
@@ -1808,6 +1819,46 @@ mod tests {
                     .unwrap();
             }
         });
+    }
+
+    /// Every FLUX.1 render route (base txt2img and Hires.fix passes, XLabs IP with and without
+    /// real CFG, PuLID through the prepared-injector entry points, and the ControlNet route)
+    /// encodes text through `encode_materialized`, which evaluates the T5/CLIP embeddings before
+    /// returning, so the encode runs inside the Conditioning phase under both offload policies.
+    /// A lazy `text.encode(` at a route would let the encoder run after Conditioning closes.
+    /// Pinned against the shipped sources; nothing executes.
+    #[test]
+    fn every_route_evaluates_text_embeddings_inside_conditioning() {
+        let code = |source: &str| -> String {
+            let shipped = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            shipped
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let model = code(include_str!("model.rs"));
+        let control = code(include_str!("model_control.rs"));
+        for (file, source, routes) in [("model.rs", &model, 4), ("model_control.rs", &control, 1)] {
+            assert!(
+                !source.contains("text.encode("),
+                "{file}: a route encodes text lazily; use encode_materialized inside Conditioning"
+            );
+            assert_eq!(
+                source.matches("text.encode_materialized(").count(),
+                routes,
+                "{file}: every residency encode closure must materialize its embeddings"
+            );
+        }
+        // The non-started routes open and close Conditioning around the materializing encode.
+        assert!(model.contains("run.encode(|| text.encode_materialized(&req.prompt))"));
+        assert!(model.contains("run.encode(encode_text)"));
+        let helper = &model[model.find("fn encode_materialized(").unwrap()..];
+        let helper = &helper[..helper.find("\n    }").unwrap()];
+        assert!(
+            helper.contains("mlx_rs::transforms::eval([&prompt_embeds, &pooled_prompt_embeds])"),
+            "encode_materialized must evaluate both embeddings before returning: {helper}"
+        );
     }
 
     #[test]
