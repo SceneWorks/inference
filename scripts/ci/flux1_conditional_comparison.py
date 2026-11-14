@@ -26,18 +26,34 @@ LANES = base.LANES
 PHASES = ("preflight", "base-run", "head-run")
 GIB = 1024**3
 MAX_DEADLINE_SECONDS = 1200
-# Explicit per-case child caps. Every case shares the frozen 24 GiB host / 18 GiB CUDA budget except
-# pulid-pid, whose PiD decoder loads both of its checkpoints at f32 (candle-gen-pid
-# `engine::LOAD_DTYPE`): the 2k->4k student (2.72 GB BF16 -> 5.45 GB) and the Gemma 2 2B caption
-# encoder (5.23 GB BF16 -> 10.46 GB), with a further 4.99 GB BF16 + 9.98 GB f32 transient while its
-# first shard is coerced on the device. Its 1024-pixel probe decodes to 4096x4096, whose untiled
-# decode (`budget::estimated_decode_peak_gib`, patch 16, hidden 1536) adds 4.69 GiB. That puts PiD
-# alone at ~19.5 GiB over the PuLID stack, matching run 43553801528's 23.1 GB above baseline in the
-# base arm. 40 GiB keeps ~18 GiB headroom on the 96 GB RTX PRO 6000. Host use does not grow the same
-# way: Candle loads every PiD/Gemma tensor straight to the device and maps one source file (at most
-# 4.99 GB) at a time, so the 24 GiB host cap stays.
+# Explicit per-case child caps. Every case shares the frozen 24 GiB host-footprint / 18 GiB CUDA
+# budget except pulid-pid, which adds the PiD 2k->4k decoder and its Gemma 2 2B caption encoder.
+#
+# Candle CUDA GPU: PidEngine::load materializes both checkpoints at f32 (candle-gen-pid
+# `engine::LOAD_DTYPE`): the student (2.72 GB BF16 -> 5.45 GB) and Gemma (5.23 GB BF16 -> 10.46 GB),
+# with a 4.99 GB BF16 + 9.98 GB f32 device transient while the first Gemma shard is coerced. The
+# 1024-pixel probe decodes to 4096x4096 (`budget::estimated_decode_peak_gib`, patch 16, hidden 1536:
+# 4.69 GiB untiled). PiD alone is ~19.5 GiB, matching run 43553801528's 23.1 GB above baseline;
+# 40 GiB keeps ~18 GiB headroom on the 96 GB RTX PRO 6000.
+#
+# Candle host: the weights do NOT go straight to the device. `candle_core::safetensors::load` reads
+# each whole file into a host Vec (`safetensors_progress::read_file`) before uploading its tensors,
+# so the student (2.72 GB) and each Gemma shard (4.99 GB, 0.24 GB) pass through host memory one
+# file at a time, plus the 4096x4096 f32 output (0.2 GB). Run 43560615425 plateaued at ~24.1 GB
+# through denoise and reached 28.87 GB at PiD start while still climbing. If the allocator retains
+# every freed file buffer, the peak is ~24.1 + 2.72 + 4.99 + 0.24 + 0.2 = 32.3 GB; 48 GiB (51.5 GB)
+# keeps ~19 GB headroom and stays far below the Windows runner's ~516 GB available host memory.
+# The pre-migration base arm hit the same climb, so this is existing loader behaviour.
+#
+# MLX on nax-macos-2 is unified memory: the one footprint cap covers weights, activations and the
+# Metal allocator together, and there is no separate GPU cap. mlx-gen-pid keeps PiD and Gemma in
+# BF16 (~8 GB) but the PuLID stack, the 4096x4096 decode and the allocator cache share the same
+# pool, so pulid-pid gets the same 48 GiB footprint cap, well below the runner's 128 GiB
+# (`physical_memory_bytes` 137438953472 in run 43558295383's receipt).
 DEFAULT_CAPS = {"child_footprint_cap_bytes": 24 * GIB, "child_gpu_cap_bytes": 18 * GIB}
-CASE_CAPS = {"pulid-pid": {"child_footprint_cap_bytes": 24 * GIB, "child_gpu_cap_bytes": 40 * GIB}}
+CASE_CAPS = {"pulid-pid": {"child_footprint_cap_bytes": 48 * GIB, "child_gpu_cap_bytes": 40 * GIB}}
+# Physical memory each conditional runner reports; a host cap must stay below it.
+RUNNER_HOST_BYTES = {"mlx": 137_438_953_472, "candle-cuda": 516_136_534_016}
 
 
 def case_caps(backend, case, policy):
