@@ -761,6 +761,11 @@ impl Krea2ControlHeavy {
         candle_gen::check_cancel(&req.cancel)?;
         let ctrl_nchw = control_image_to_nchw(control_image, req.width, req.height, device)?;
         let ctrl_latent = self.vae_encoder.encode(&ctrl_nchw)?;
+        candle_gen::execution::component_runtime(
+            "krea/control_vae_encoder",
+            ctrl_latent.device(),
+            ctrl_latent.dtype(),
+        );
         let (positive, negative) = context;
         let prepared = self
             .dit
@@ -817,6 +822,11 @@ impl Krea2ControlHeavy {
                     &prepared,
                     scale,
                 )?;
+                candle_gen::execution::component_runtime(
+                    "krea/control_transformer",
+                    v.device(),
+                    v.dtype(),
+                );
                 let positive = v.to_dtype(DType::F32)?;
                 match &negative {
                     Some(negative) => {
@@ -827,8 +837,13 @@ impl Krea2ControlHeavy {
                             &t,
                             negative,
                             scale,
-                        )?
-                        .to_dtype(DType::F32)?;
+                        )?;
+                        candle_gen::execution::component_runtime(
+                            "krea/control_transformer",
+                            negative.device(),
+                            negative.dtype(),
+                        );
+                        let negative = negative.to_dtype(DType::F32)?;
                         Ok((&positive
                             + ((&positive - negative)? * req.guidance.unwrap_or(0.0) as f64)?)?)
                     }
@@ -838,10 +853,13 @@ impl Krea2ControlHeavy {
         )?;
 
         on_progress(Progress::Decoding);
-        let decoded = self
-            .vae
-            .decode_with(&latent, req.tile_vae_decode)?
-            .to_dtype(DType::F32)?;
+        let decoded = self.vae.decode_with(&latent, req.tile_vae_decode)?;
+        candle_gen::execution::component_runtime(
+            "krea/control_vae",
+            decoded.device(),
+            decoded.dtype(),
+        );
+        let decoded = decoded.to_dtype(DType::F32)?;
         to_image(&decoded)
     }
 }
@@ -929,6 +947,97 @@ fn control_image_to_nchw(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_control_report_binds_component_precision_before_f32_promotion() {
+        use super::*;
+        use candle_gen::gen_core::generator::{ExecutionFact, ExecutionIdentity};
+
+        // This direct-route fixture exercises the same capture contract with no model forward.
+        let bf16 = Tensor::zeros((1,), DType::BF16, &Device::Cpu).unwrap();
+        let f32 = Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap();
+        let completed = candle_gen::execution::capture_direct(
+            &crate::control_registry::descriptor(),
+            &candle_gen::gen_core::CancelFlag::default(),
+            || {
+                candle_gen::execution::rng_scheme("control-fixture");
+                candle_gen::execution::draw("initial_noise", 7, 0);
+                candle_gen::execution::schedule("euler", &[1.0, 0.0], "flow");
+                candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+                for (component, tensor) in [
+                    ("krea/control_vae_encoder", &bf16),
+                    ("krea/control_transformer", &bf16),
+                    ("krea/control_vae", &f32),
+                ] {
+                    candle_gen::execution::component_runtime(
+                        component,
+                        tensor.device(),
+                        tensor.dtype(),
+                    );
+                }
+                Ok(candle_gen::gen_core::GenerationOutput::Images(vec![
+                    Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0; 3],
+                    },
+                ]))
+            },
+        )
+        .unwrap();
+        let ExecutionIdentity::Resolved { identity } = completed.execution else {
+            panic!("control fixture should resolve")
+        };
+        let ExecutionFact::Resolved { value } = identity.quality_policy else {
+            panic!("quality policy")
+        };
+        let operations = &value["operations"];
+        for (component, dtype) in [
+            ("krea/control_vae_encoder", "BF16"),
+            ("krea/control_transformer", "BF16"),
+            ("krea/control_vae", "F32"),
+        ] {
+            assert_eq!(
+                operations[format!("compute_component/{component}")][0]["value"]["dtype"],
+                dtype
+            );
+        }
+
+        // Keep the three direct render calls wired to the tested observation seam.
+        let source = include_str!("control_provider.rs");
+        let render = source
+            .split("impl Krea2ControlHeavy {")
+            .nth(1)
+            .unwrap()
+            .split("/// Validate the seed-independent")
+            .next()
+            .unwrap();
+        for (call, component, promotion) in [
+            (
+                "self.vae_encoder.encode",
+                "krea/control_vae_encoder",
+                "let positive = v.to_dtype(DType::F32)",
+            ),
+            (
+                "let v = forward_with_prepared_control",
+                "krea/control_transformer",
+                "let positive = v.to_dtype(DType::F32)",
+            ),
+            (
+                "self.vae.decode_with",
+                "krea/control_vae",
+                "let decoded = decoded.to_dtype(DType::F32)",
+            ),
+        ] {
+            let call_at = render.find(call).expect("direct component call");
+            let marker = format!("\"{component}\"");
+            let observed_at = render
+                .find(marker.as_str())
+                .expect("component runtime observation");
+            let promoted_at = render.find(promotion).expect("later f32 promotion");
+            assert!(call_at < observed_at && observed_at < promoted_at);
+        }
+    }
+
     #[test]
     fn staged_pose_cache_reuses_both_models_until_text_or_policy_changes() {
         use super::*;
