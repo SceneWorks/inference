@@ -131,6 +131,12 @@ pub struct Flux2Control {
     prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
+fn control_report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
+    let mut descriptor = crate::descriptor_dev();
+    descriptor.id = crate::config::FLUX2_DEV_CONTROL_ID;
+    descriptor
+}
+
 impl Flux2Control {
     /// Load the dev base (CPU-stage → quantize-onto-GPU when `quant` is set; dense otherwise — fixture
     /// only, the 32B does not fit dense), the Fun-Controlnet-Union control overlay (dense on the device
@@ -369,7 +375,7 @@ impl Flux2Control {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         crate::complete_bespoke_image(
-            &crate::descriptor_dev(),
+            &control_report_descriptor(),
             &req.cancel,
             "flux2/control_provider/generate",
             "candle-gen-flux2/src/control_provider.rs: loaded control overlay and decoder choices have no complete execution receipt",
@@ -416,7 +422,7 @@ impl Flux2Control {
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         crate::complete_bespoke_image(
-            &crate::descriptor_dev(),
+            &control_report_descriptor(),
             &req.cancel,
             "flux2/control_provider/generate_with_memory_context",
             "candle-gen-flux2/src/control_provider.rs: loaded control overlay and decoder choices have no complete execution receipt",
@@ -884,6 +890,13 @@ fn control_var_builder(path: &Path, dtype: DType, device: &Device) -> Result<Var
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_report_identifies_the_control_route() {
+        let descriptor = control_report_descriptor();
+        assert_eq!(descriptor.id, "flux2_dev_control");
+        assert_eq!(descriptor.backend, "candle");
+    }
 
     fn admitted_control_context() -> MemoryRunContext {
         let mut spec = candle_gen::gen_core::LoadSpec::new(

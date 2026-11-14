@@ -143,12 +143,21 @@ pub struct Flux2Edit {
     prepared_spec: Option<candle_gen::gen_core::LoadSpec>,
 }
 
+fn edit_report_descriptor(variant: Flux2Variant) -> candle_gen::gen_core::ModelDescriptor {
+    let mut descriptor = match variant {
+        Flux2Variant::Klein9b => crate::descriptor_klein(),
+        Flux2Variant::Dev => crate::descriptor_dev(),
+    };
+    descriptor.id = match variant {
+        Flux2Variant::Klein9b => crate::sc20686_observer::PRODUCT_ROUTE_ID,
+        Flux2Variant::Dev => crate::config::FLUX2_DEV_EDIT_ID,
+    };
+    descriptor
+}
+
 impl Flux2Edit {
     fn variant_descriptor(&self) -> candle_gen::gen_core::ModelDescriptor {
-        match self.variant {
-            Flux2Variant::Klein9b => crate::descriptor_klein(),
-            Flux2Variant::Dev => crate::descriptor_dev(),
-        }
+        edit_report_descriptor(self.variant)
     }
 
     /// Load the **klein** edit backbone (dense) with the VAE encoder enabled (the reference encode);
@@ -1190,6 +1199,21 @@ pub(crate) fn preprocess_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_report_identifies_the_edit_route() {
+        assert_eq!(
+            edit_report_descriptor(Flux2Variant::Klein9b).id,
+            "flux2_klein_9b_edit"
+        );
+        assert_eq!(
+            edit_report_descriptor(Flux2Variant::Dev).id,
+            "flux2_dev_edit"
+        );
+        for variant in [Flux2Variant::Klein9b, Flux2Variant::Dev] {
+            assert_eq!(edit_report_descriptor(variant).backend, "candle");
+        }
+    }
 
     fn admitted_edit_context(reference_count: u32) -> MemoryRunContext {
         let mut spec = candle_gen::gen_core::LoadSpec::new(
