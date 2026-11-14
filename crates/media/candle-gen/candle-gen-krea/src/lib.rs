@@ -9,7 +9,7 @@
 //!   128, SwiGLU 16384, 3-axis interleaved RoPE `[32,48,48]`, `DoubleSharedModulation`, and a
 //!   `text_fusion` front-end that aggregates the 12 selected Qwen3-VL hidden layers) driven by a
 //!   Qwen3-VL-4B condition encoder and the Qwen-Image VAE. TDM-distilled few-step (8 steps),
-//!   **CFG-free** (guidance inert), up to 2048².
+//!   **CFG-free** (guidance inert), up to 4096 pixels per side, including img2img refinement.
 //! * **`krea_2_raw`** (sc-9994 / epic 9992) — the undistilled 12B base run as a **full classifier-free
 //!   guidance** generator: a real guidance scale + optional user negative prompt, 52 steps, resolution-
 //!   dynamic mu ([`pipeline::render_base`]). The SAME id is also the Krea LoRA *training* base (Path 1:
@@ -86,6 +86,7 @@ mod control_trainer;
 // control-branch overlay on the frozen Turbo base and renders a pose-conditioned image. The
 // deployable form of the sc-8460 spike inference harness; the worker `KreaControl` route calls it.
 pub mod control_provider;
+mod control_registry;
 
 // Shared test-only tiny-DiT fixture (training + control tests).
 #[cfg(test)]
@@ -301,9 +302,10 @@ pub const CONTROL_MEMORY_CALIBRATION_FINGERPRINT: &str = "sc-16013-krea-control-
 /// `wan::config::SIZE_MULTIPLE_14B`; the control provider imports this same crate-root const so no copy
 /// can drift from the check.
 pub const SIZE_MULTIPLE: u32 = 16;
-/// Resolution bounds (W/H). Turbo renders up to 2048²; the catalog/worker gate the UI options tighter.
+/// Resolution bounds (W/H), including the img2img second pass used by Hires.fix. The preset
+/// ladder stops at 2048, but the dynamically shaped DiT and tiled Qwen VAE also serve 4K refinement.
 const RES_MIN: u32 = 256;
-const RES_MAX: u32 = 2048;
+const RES_MAX: u32 = 4096;
 /// Max images per request (the image-model standard, shared with the other families).
 const MAX_COUNT: u32 = 8;
 
@@ -448,7 +450,24 @@ impl KreaMemoryScope {
 impl gen_core::MemoryRequestScope for KreaMemoryScope {
     fn configure_request(&mut self, request: &mut GenerationRequest) -> gen_core::Result<()> {
         self.ensure_active()?;
-        let reference_count =
+        // The pose-control route is admitted as exactly one pose control image (reference count
+        // 1 in the registered behavior routes); every other route counts only image references and
+        // must never accept a control image in their place.
+        let reference_count = if self.provider_id == KREA_2_TURBO_CONTROL_ID {
+            match request.conditioning.as_slice() {
+                [Conditioning::Control {
+                    kind: gen_core::ControlKind::Pose,
+                    ..
+                }] => 1,
+                _ => {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{}: request conditioning does not match the admitted pose-control \
+                         memory route (exactly one pose control image)",
+                        self.provider_id
+                    )))
+                }
+            }
+        } else {
             request.conditioning.iter().try_fold(0_u32, |count, item| {
                 let additional =
                     match item {
@@ -470,7 +489,8 @@ impl gen_core::MemoryRequestScope for KreaMemoryScope {
                         "krea: reference count exceeds the typed memory-route domain".to_owned(),
                     )
                 })
-            })?;
+            })?
+        };
         if reference_count != self.reference_count
             || request.phases.is_some() != self.has_phases
             || request.use_pid != self.use_pid
@@ -2970,6 +2990,21 @@ fn registered_krea_valid_fixture(
             let context =
                 gen_core::standard_memory_behavior_context(contract, strategy, tier, route)?;
             let mut fixture = gen_core::MemoryBehaviorFixture::new(context);
+            if contract.provider_id == KREA_2_TURBO_CONTROL_ID {
+                // The pose-control route's one admitted image is its pose control at the render
+                // size (what `control_registry::control_input` and its geometry check require),
+                // not the generic placeholder reference.
+                let (width, height) = (fixture.request.width, fixture.request.height);
+                fixture.request.conditioning = vec![Conditioning::Control {
+                    image: gen_core::Image {
+                        width,
+                        height,
+                        pixels: vec![0; width as usize * height as usize * 3],
+                    },
+                    kind: gen_core::ControlKind::Pose,
+                    scale: None,
+                }];
+            }
             if edit {
                 for conditioning in &mut fixture.request.conditioning {
                     if let Conditioning::Reference { strength, .. } = conditioning {
@@ -3293,6 +3328,18 @@ mod weights_free_behavior_tests {
                 fixture.request.memory,
                 contract.generation_memory(&fixture.context.selection)
             );
+            if contract.provider_id == KREA_2_TURBO_CONTROL_ID {
+                // The registered control fixture is a valid pose request for the generator too.
+                assert!(matches!(
+                    fixture.request.conditioning.as_slice(),
+                    [Conditioning::Control {
+                        kind: gen_core::ControlKind::Pose,
+                        image,
+                        ..
+                    }] if (image.width, image.height)
+                        == (fixture.request.width, fixture.request.height)
+                ));
+            }
             scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
         }
     }
@@ -3401,15 +3448,17 @@ fn build_krea_control_memory_strategy_contract(
     // probe alike, and both used to publish `MemoryAssetFacts::default()` on a fully materialized
     // control load. The weights-free surface keeps the zero facts by calling `_for_tier` directly.
     contract.asset_facts = control_asset_facts(spec)?;
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        contract.calibration = None;
+    }
     Ok(contract)
 }
 
 /// Load-exact per-component asset facts for a materialized **control** load (SC-22667 review).
 ///
 /// The control route validates its own spec shape (`control_provider::load_with_spec`): the base is
-/// the runtime snapshot **directory** (a `File` base is rejected there), the ConvRot DiT arrives as
-/// `KREA_CONVROT_DIT_COMPONENT`, a native DiT only through runtime paths the spec cannot carry, and
-/// `spec.control` names the pose branch — an auxiliary overlay outside these base fields. The
+/// a runtime snapshot directory or an imported `File` with a `base_snapshot` companion. The ConvRot
+/// DiT arrives as `KREA_CONVROT_DIT_COMPONENT`, and `spec.control` names the pose branch. The
 /// components it then materializes differ from the generation routes in two widths, both read off
 /// `control_provider.rs`: the text encoder opens f32 (`load_control_text`) and the autoencoder is
 /// built encoder-and-decoder (`load_control_heavy`: `load_vae` + `QwenVaeEncoder::new`).
@@ -3417,22 +3466,22 @@ fn build_krea_control_memory_strategy_contract(
 /// A spec whose snapshot is not on disk — the registry's sentinel surface, a fixture — publishes
 /// the zero facts, exactly as the generation routes' weights-free builders do.
 fn control_asset_facts(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryAssetFacts> {
-    let WeightsSource::Dir(root) = &spec.weights else {
-        return Ok(gen_core::MemoryAssetFacts::default());
-    };
+    let (root, native_dit) = resolved_base_and_native(spec, KREA_2_TURBO_CONTROL_ID)?;
     if !root.is_dir() {
         return Ok(gen_core::MemoryAssetFacts::default());
     }
     let convrot_dit = convrot_selector(spec, KREA_2_TURBO_CONTROL_ID)?;
     // The same encoder-contract resolution `resolve_control_text_encoder_source` performs; a source
     // that does not validate is a load `Krea2Control::load` refuses, and contributes no signal here.
-    let Ok(encoder_source) = ENCODER_CONTRACT.source_for_load(spec, root) else {
+    let Ok(encoder_source) = ENCODER_CONTRACT.source_for_load(spec, &root) else {
         return Ok(gen_core::MemoryAssetFacts::default());
     };
     loaded_asset_facts(
         KREA_2_TURBO_CONTROL_ID,
-        root,
-        None,
+        &root,
+        native_dit
+            .as_ref()
+            .map(gen_core::PinnedWeightsFile::loader_path),
         convrot_dit.as_deref(),
         &encoder_source,
     )
@@ -3586,10 +3635,7 @@ pub fn register_providers(
         .register_generator(RAW_REGISTRATION)
         .register_generator(EDIT_REGISTRATION)
         .register_generator(TURBO_EDIT_REGISTRATION)
-        .register_encoder_contract_route(gen_core::EncoderContractRouteRegistration {
-            route_id: "krea_2_turbo_control",
-            provider_id: KREA_2_TURBO_ID,
-        });
+        .register_generator(control_registry::REGISTRATION);
     #[cfg(feature = "cuda")]
     let registry = register_memory_contract_surfaces(registry)
         .register_memory_behavior(TURBO_MEMORY_BEHAVIOR)
@@ -3600,6 +3646,14 @@ pub fn register_providers(
     registry
         .register_checkpoint_adapter(gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[
+                gen_core::CheckpointBackendBindingRegistration {
+                    backend: gen_core::CheckpointBackend::Candle,
+                    source: gen_core::ImportedModelSource::TransformerFile,
+                    operation: gen_core::ImportedModelOperation::Pose,
+                    provider_id: KREA_2_TURBO_CONTROL_ID,
+                    required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+                    inherit_adapters: true,
+                },
                 gen_core::CheckpointBackendBindingRegistration {
                     backend: gen_core::CheckpointBackend::Candle,
                     source: gen_core::ImportedModelSource::TransformerFile,
@@ -3695,7 +3749,7 @@ pub fn register_memory_contract_surfaces(
         )
         // The direct CUDA control runtime composes the registered Krea base with a native control
         // overlay in SceneWorks; it is a real route, but not a standalone gen-core Generator.
-        .register_composed_memory_strategy(CONTROL_MEMORY_REGISTRATION)
+        .register_memory_strategy(CONTROL_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(gen_core::MemoryContractFixtureRegistration {
             surface_specs: gen_core::candle_nvfp4_memory_contract_surface_specs,
             provider_id: "krea_2_turbo_control",
@@ -4166,7 +4220,8 @@ mod explicit_registry_tests {
                 "krea_2_turbo",
                 "krea_2_raw",
                 "krea_2_edit",
-                "krea_2_turbo_edit"
+                "krea_2_turbo_edit",
+                "krea_2_turbo_control"
             ]
         );
         assert_eq!(explicit_trainers, ["krea_2_raw", "krea_2_control"]);
@@ -6009,6 +6064,118 @@ mod tests {
             .unwrap();
     }
 
+    /// The pose-control route's request scope accepts exactly one pose control image (the
+    /// conditioning `control_registry::control_input` requires) and rejects references, other
+    /// control kinds and extra images; every reference route still rejects a control image.
+    /// Pure request validation on a CPU device: no model loads or runs.
+    #[test]
+    fn request_scope_conditioning_is_route_aware_for_pose_control() {
+        use gen_core::MemoryRequestScope;
+        let image = || Image {
+            width: 16,
+            height: 16,
+            pixels: vec![0; 16 * 16 * 3],
+        };
+        let pose = |kind: gen_core::ControlKind| Conditioning::Control {
+            image: image(),
+            kind,
+            scale: Some(0.8),
+        };
+        let reference = || Conditioning::Reference {
+            image: image(),
+            strength: None,
+        };
+        let scope = |provider_id: &str, mode, reference_count| KreaMemoryScope {
+            device: Device::Cpu,
+            memory: Some(gen_core::GenerationMemory::default()),
+            provider_id: provider_id.to_owned(),
+            mode,
+            reference_count,
+            use_pid: false,
+            has_phases: false,
+            finished: false,
+        };
+        let request = |conditioning| GenerationRequest {
+            prompt: "a dancer".to_owned(),
+            conditioning,
+            ..Default::default()
+        };
+
+        let mut control = scope(
+            KREA_2_TURBO_CONTROL_ID,
+            gen_core::MemoryMode::ImageToImage,
+            1,
+        );
+        let mut valid = request(vec![pose(gen_core::ControlKind::Pose)]);
+        control.configure_request(&mut valid).unwrap();
+        assert_eq!(valid.memory, Some(gen_core::GenerationMemory::default()));
+        for mismatched in [
+            vec![reference()],
+            vec![pose(gen_core::ControlKind::Canny)],
+            vec![
+                pose(gen_core::ControlKind::Pose),
+                pose(gen_core::ControlKind::Pose),
+            ],
+            vec![pose(gen_core::ControlKind::Pose), reference()],
+            Vec::new(),
+        ] {
+            let error = control
+                .configure_request(&mut request(mismatched))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("pose-control memory route"), "{error}");
+        }
+        control
+            .finish(gen_core::MemoryRunOutcome::Complete)
+            .unwrap();
+
+        // Reference routes keep counting image references and never accept a control image.
+        for (provider_id, mode, references, accepted) in [
+            (
+                KREA_2_TURBO_ID,
+                gen_core::MemoryMode::TextToImage,
+                0,
+                Vec::new(),
+            ),
+            (
+                KREA_2_TURBO_ID,
+                gen_core::MemoryMode::ImageToImage,
+                1,
+                vec![reference()],
+            ),
+            (
+                KREA_2_TURBO_EDIT_ID,
+                gen_core::MemoryMode::ImageToImage,
+                1,
+                vec![reference()],
+            ),
+            (
+                KREA_2_EDIT_ID,
+                gen_core::MemoryMode::ImageToImage,
+                1,
+                vec![reference()],
+            ),
+            (
+                KREA_2_RAW_ID,
+                gen_core::MemoryMode::TextToImage,
+                0,
+                Vec::new(),
+            ),
+        ] {
+            let mut route = scope(provider_id, mode, references);
+            route.configure_request(&mut request(accepted)).unwrap();
+            let error = route
+                .configure_request(&mut request(vec![pose(gen_core::ControlKind::Pose)]))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("does not match the admitted memory route"),
+                "{provider_id}: {error}"
+            );
+            route.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+        }
+    }
+
     #[test]
     fn registers_krea_2_turbo_as_candle() {
         let fixture = tempfile::tempdir().unwrap();
@@ -6157,8 +6324,46 @@ mod tests {
             d.capabilities.supported_quants,
             &[Quant::Q4, Quant::Q8, Quant::Nvfp4]
         );
-        assert_eq!(d.capabilities.max_size, 2048);
+        assert_eq!(d.capabilities.max_size, 4096);
         assert_eq!(TURBO_STEPS, 8);
+    }
+
+    #[test]
+    fn validate_accepts_4k_hires_refinement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = valid_directory_spec(fixture.path());
+        let registry = crate::provider_registry().unwrap();
+        for id in [KREA_2_TURBO_ID, KREA_2_RAW_ID] {
+            let generator = registry.load(id, &spec).unwrap();
+            for (width, height) in [(4096, 2816), (2816, 4096), (4096, 4096)] {
+                let request = GenerationRequest {
+                    prompt: "a lighthouse".into(),
+                    width,
+                    height,
+                    conditioning: vec![Conditioning::Reference {
+                        image: Image {
+                            width: 16,
+                            height: 16,
+                            pixels: vec![127; 16 * 16 * 3],
+                        },
+                        strength: Some(0.3),
+                    }],
+                    ..Default::default()
+                };
+                generator.validate(&request).unwrap_or_else(|error| {
+                    panic!("{id} must accept Hires.fix at {width}x{height}: {error}")
+                });
+                for (width, height) in [(4112, height), (width, 4112), (4095, height)] {
+                    assert!(generator
+                        .validate(&GenerationRequest {
+                            width,
+                            height,
+                            ..request.clone()
+                        })
+                        .is_err());
+                }
+            }
+        }
     }
 
     #[test]

@@ -197,11 +197,12 @@ fn checkpoint_adapter_catalog_uses_shared_portable_authority_and_real_candle_bin
     assert_eq!(
         binding_operations(KREA_2_CHECKPOINT_ADAPTER.adapter_id),
         [
+            ImportedModelOperation::Pose,
             ImportedModelOperation::Generate,
             ImportedModelOperation::Edit,
             ImportedModelOperation::MultiPhase,
         ],
-        "Candle truthfully omits the MLX-only Krea pose route"
+        "Candle binds the imported Krea pose route since `krea_2_turbo_control` registers on Candle"
     );
     assert_eq!(
         binding_operations(SDXL_CHECKPOINT_ADAPTER.adapter_id),
@@ -247,6 +248,14 @@ fn checkpoint_adapter_catalog_uses_shared_portable_authority_and_real_candle_bin
             source: ImportedModelSource::TransformerFile,
             operation: ImportedModelOperation::Generate,
             provider_id: candle_gen_flux2::config::FLUX2_KLEIN_9B_ID,
+            required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
+            inherit_adapters: true,
+        },
+        ImportedModelRegistration {
+            family: "krea_2",
+            source: ImportedModelSource::TransformerFile,
+            operation: ImportedModelOperation::Pose,
+            provider_id: "krea_2_turbo_control",
             required_components: Some(&[BASE_SNAPSHOT_COMPONENT]),
             inherit_adapters: true,
         },
@@ -1196,6 +1205,7 @@ fn complete_catalog_has_stable_conforming_surface() {
             "krea_2_raw",
             "krea_2_edit",
             "krea_2_turbo_edit",
+            "krea_2_turbo_control",
             "lens_turbo",
             "lens",
             "ltx_2_3_distilled",
@@ -1286,7 +1296,7 @@ fn complete_catalog_has_stable_conforming_surface() {
     // `flux3_klein_base` trainer reuses that generator's id and row and adds no id; sc-24214
     // adds `supra2_img`, a generator with its own complete row: 70 / 60 with the MOSS pair).
     //
-    // Registration is never conditioned on the mapping: 53 < 63 because ten ids load nothing
+    // Registration is never conditioned on the mapping: 54 < 64 because ten ids load nothing
     // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
     // our metadata for CI to report, and `licenses::tests` pins which ten and why — as
     // `#[cfg(test)]` data, so no gate can read it and suppress them.
@@ -1298,8 +1308,8 @@ fn complete_catalog_has_stable_conforming_surface() {
         .chain(&text_embedders)
         .chain(&transforms)
         .collect();
-    assert_eq!(distinct.len(), 70);
-    assert_eq!(super::provider_components().len(), 60);
+    assert_eq!(distinct.len(), 71);
+    assert_eq!(super::provider_components().len(), 61);
 }
 
 /// The manifest emitter runs on **this** catalog's three slices, and its output is
