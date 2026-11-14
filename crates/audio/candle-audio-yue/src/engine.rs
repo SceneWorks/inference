@@ -294,6 +294,34 @@ impl YueEngine {
         })
     }
 
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_execution_report(
+        &self,
+        req: &YueRequest,
+        cancel: &CancelFlag,
+        on_event: &mut dyn FnMut(YueEvent),
+    ) -> gen_core::Result<candle_audio::execution::CompletedNative<YueOutput>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor_for(self.variant),
+            &|| cancel.is_cancelled(),
+            || {
+                self.render(req, cancel, &mut |value| {
+                    candle_audio::execution::callback(|| on_event(value))
+                })
+            },
+            |value| {
+                Some(
+                    candle_audio::execution::NativeOutput::pcm(&value.mix, value.sample_rate, 1)
+                        .with_stems([
+                            ("vocals", value.vocals.len()),
+                            ("instrumental", value.instrumental.len()),
+                        ]),
+                )
+            },
+        )
+    }
+
     /// The stage-1 decode loop: per segment, prefill its block, then step until `<EOA>` or the
     /// per-segment budget, checking `cancel` before every step.
     fn run_stage1(

@@ -976,6 +976,7 @@ fn observe(
 ) {
     stages.insert(stage, event);
     if event == StageEvent::Reused {
+        candle_audio::execution::unavailable(&format!("YuE2 reused {stage:?} from a persisted stage without a versioned completed execution identity; this attempt cannot attest the original execution"));
         hooks.observer.on_stage(stage, event);
     }
 }
@@ -1339,6 +1340,27 @@ impl Yue2Engine {
         })
     }
 
+    /// Complete this native route with its original result and same-attempt execution metadata.
+    pub fn generate_to_with_execution_report(
+        &self,
+        input: &SongInput,
+        settings: &SongSettings,
+        output: &RunOutput,
+        hooks: &mut EngineHooks<'_>,
+    ) -> Result<candle_audio::execution::CompletedNative<RunOutcome>, RunError> {
+        crate::engine::capture_native_call(
+            hooks,
+            |hooks| self.generate_to(input, settings, output, hooks),
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    &value.samples,
+                    SAMPLE_RATE,
+                    AUDIO_CHANNELS as u16,
+                ))
+            },
+        )
+    }
+
     /// Reuse a complete published run after verifying it against `identity`.
     fn reuse_complete(
         &self,
@@ -1391,6 +1413,7 @@ impl Yue2Engine {
                     result.get("plan_identity"),
                 )?;
                 let plan = restore_plan(self, &output.dir, &recorded)?;
+                candle_audio::execution::unavailable("YuE2 restored a persisted plan without its original versioned completed execution identity");
                 hooks.observer.on_stage(Stage::Plan, StageEvent::Reused);
                 let id = plan.identity();
                 return Ok((plan, id, output.dir.clone()));
@@ -1429,6 +1452,28 @@ impl Yue2Engine {
         Ok((plan, plan_id, dir))
     }
 
+    /// Complete this native route with its original result and same-attempt execution metadata.
+    pub fn plan_to_with_execution_report(
+        &self,
+        request: &SongRequest,
+        generation: &GenerationConfig,
+        output: &RunOutput,
+        hooks: &mut EngineHooks<'_>,
+    ) -> Result<
+        candle_audio::execution::CompletedNative<(SymbolicPlan, PlanIdentity, PathBuf)>,
+        RunError,
+    > {
+        crate::engine::capture_native_call(
+            hooks,
+            |hooks| self.plan_to(request, generation, output, hooks),
+            |_value| {
+                Some(candle_audio::execution::NativeOutput::artifact(
+                    "symbolic_plan",
+                ))
+            },
+        )
+    }
+
     /// Decode the cached latents of the complete run in `source` with `decoder` (the skill's
     /// `run_yue2.py decode`): the source is verified and never written; its plan is restored with
     /// its recorded identity and its latents with theirs; the MoT identity must be the source's.
@@ -1443,6 +1488,27 @@ impl Yue2Engine {
         hooks: &mut EngineHooks<'_>,
     ) -> Result<RunOutcome, RunError> {
         self.decode_cached_with(source, decoder, &self.options().decode, output, hooks)
+    }
+
+    /// Complete this native route with its original result and same-attempt execution metadata.
+    pub fn decode_cached_with_execution_report(
+        &self,
+        source: &Path,
+        decoder: VaeVariant,
+        output: Option<&RunOutput>,
+        hooks: &mut EngineHooks<'_>,
+    ) -> Result<candle_audio::execution::CompletedNative<RunOutcome>, RunError> {
+        crate::engine::capture_native_call(
+            hooks,
+            |hooks| self.decode_cached(source, decoder, output, hooks),
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    &value.samples,
+                    SAMPLE_RATE,
+                    AUDIO_CHANNELS as u16,
+                ))
+            },
+        )
     }
 
     /// [`Yue2Engine::decode_cached`] with explicit decode tiling (a request's own). The tiling
@@ -1643,6 +1709,28 @@ impl Yue2Engine {
             stages,
         })
     }
+
+    /// Complete this native route with its original result and same-attempt execution metadata.
+    pub fn decode_cached_with_with_execution_report(
+        &self,
+        source: &Path,
+        decoder: VaeVariant,
+        decode: &DecodeOptions,
+        output: Option<&RunOutput>,
+        hooks: &mut EngineHooks<'_>,
+    ) -> Result<candle_audio::execution::CompletedNative<RunOutcome>, RunError> {
+        crate::engine::capture_native_call(
+            hooks,
+            |hooks| self.decode_cached_with(source, decoder, decode, output, hooks),
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    &value.samples,
+                    SAMPLE_RATE,
+                    AUDIO_CHANNELS as u16,
+                ))
+            },
+        )
+    }
 }
 
 /// A cached decode executes the currently loaded VAE. Keep the source's other configuration for
@@ -1675,3 +1763,30 @@ fn cached_decode_current_config(source: &Value, current: &Value) -> Map<String, 
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod execution_identity_tests {
+    use super::*;
+    #[test]
+    fn resumed_stage_cannot_masquerade_as_current_execution() {
+        let attempt = candle_audio::execution::Attempt::begin();
+        let mut stages = BTreeMap::new();
+        let mut observer = ();
+        let mut hooks = EngineHooks {
+            cancelled: &|| false,
+            observer: &mut observer,
+        };
+        observe(
+            &mut stages,
+            &mut hooks,
+            Stage::Synthesis,
+            StageEvent::Reused,
+        );
+        let identity = attempt.finish(&crate::provider::descriptor(), None);
+        let gen_core::generator::ExecutionIdentity::Unavailable { reason } = identity else {
+            panic!("reused identity must be unavailable")
+        };
+        assert!(reason.detail.contains("persisted stage"));
+        assert_eq!(stages.get(&Stage::Synthesis), Some(&StageEvent::Reused));
+    }
+}

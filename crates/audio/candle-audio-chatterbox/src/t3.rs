@@ -383,8 +383,17 @@ impl T3 {
         on_prompt_progress: &mut dyn FnMut(candle_audio::gen_core::Progress),
     ) -> CandleResult<Option<Vec<u32>>> {
         self.reset_cache();
+        candle_audio::execution::require_seed("chatterbox/model.rs");
+        candle_audio::execution::sampling(
+            "chatterbox-t3-effective",
+            serde_json::json!({"cfg_bits":cfg_weight.to_bits(),"temperature_bits":temperature.to_bits(),"top_p_bits":top_p.to_bits(),"min_p_bits":min_p.to_bits(),"repetition_penalty_bits":repetition_penalty.to_bits(),"max_new_tokens":max_new_tokens}),
+        );
         let use_cfg = cfg_weight > 0.0;
         let batch = if use_cfg { 2 } else { 1 };
+        candle_audio::execution::policy(
+            "chatterbox-t3-batch",
+            serde_json::json!({"batch":batch,"cache":"reset-per-call"}),
+        );
 
         let mut inputs = candle_audio::gen_core::with_prompt_encoding(on_prompt_progress, || {
             // Conditioning prefix (shared across the CFG batch).
@@ -393,7 +402,8 @@ impl T3 {
             // Text embeddings + learned positions. For CFG the uncond row zeroes the text embeddings.
             let text_ids =
                 Tensor::from_vec(text_tokens.to_vec(), (1, text_tokens.len()), &self.device)?;
-            let mut text_emb = __model_proof_output!(self.text_emb.forward(&text_ids))?; // [1, T, dim]
+            let mut text_emb = __model_proof_output!(self.text_emb.forward(&text_ids))?;
+            candle_audio::execution::runtime(&self.device, text_emb.dtype()); // [1, T, dim]
             let text_pos = self
                 .text_pos_emb
                 .narrow(0, 0, text_tokens.len())?

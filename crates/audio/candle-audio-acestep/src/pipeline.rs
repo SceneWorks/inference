@@ -342,7 +342,12 @@ impl AceStepPipeline {
     fn seeded_noise_with(&self, latent_len: usize, seed: u64) -> Result<Tensor> {
         let acoustic = self.config.transformer.audio_acoustic_hidden_dim;
         let n = latent_len * acoustic;
-        let mut rng = StdRng::seed_from_u64(seed);
+        candle_audio::execution::runtime(&self.device, DType::F32);
+        let mut rng = StdRng::seed_from_u64(candle_audio::execution::seed(
+            "acestep/pipeline.rs",
+            "rand-0.9-StdRng",
+            seed,
+        ));
         let noise: Vec<f32> = (0..n).map(|_| rng.sample(StandardNormal)).collect();
         Ok(Tensor::from_vec(
             noise,
@@ -411,6 +416,36 @@ impl AceStepPipeline {
         Ok(out)
     }
 
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_with_execution_report(
+        &self,
+        prompt: &str,
+        params: &SynthesisParams,
+        on_progress: &mut dyn FnMut(PipelineProgress),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            cancel,
+            || {
+                self.synthesize(
+                    prompt,
+                    params,
+                    &mut |value| candle_audio::execution::callback(|| on_progress(value)),
+                    &|| candle_audio::execution::callback(cancel),
+                )
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    crate::model::SAMPLE_RATE,
+                    crate::model::CHANNELS,
+                ))
+            },
+        )
+    }
+
     /// The shared flow-matching denoise loop: seeded noise → `steps` Euler updates driven by
     /// `context_latents` (`[1, T, 2·acoustic]`) → final latents `[1, T, acoustic]`. Returns `None`
     /// on cancellation (checked before generate, at every step, and between DiT blocks). Both the
@@ -434,6 +469,21 @@ impl AceStepPipeline {
         };
         let schedule = FlowMatchSchedule::new(params.steps, shift);
         let mut latents = self.seeded_noise_with(latent_len, params.seed)?;
+        candle_audio::execution::schedule(
+            "flow-match-euler",
+            &(0..=schedule.num_steps())
+                .map(|k| schedule.sigma(k))
+                .collect::<Vec<_>>(),
+            "velocity",
+        );
+        candle_audio::execution::sampling(
+            "flow-match-euler",
+            serde_json::json!({"steps":schedule.num_steps()}),
+        );
+        candle_audio::execution::policy(
+            "synthesis",
+            serde_json::json!({"seconds_bits":params.seconds.to_bits(),"latent_length":latent_len,"shift_bits":shift.to_bits()}),
+        );
         for k in 0..schedule.num_steps() {
             if cancel() {
                 return Ok(None);
@@ -511,6 +561,10 @@ impl AceStepPipeline {
 
         // 2. Target latent length + generate window [w0, w1) in latent frames.
         let (target_len, w0, w1) = self.edit_window(params, src_frames, l_src)?;
+        candle_audio::execution::policy(
+            "acestep-edit",
+            serde_json::json!({"task":format!("{:?}",params.task),"target_latents":target_len,"window_start":w0,"window_end":w1,"preserve_outside_window":true,"crossfade":"equal-power-inside-window"}),
+        );
 
         // 3. src_latents: original source outside the window, silence inside; silence tail past the
         //    source length (extend). Mirrors the reference `torch.where(chunk_mask>0.5, silence, src)`.
@@ -587,6 +641,40 @@ impl AceStepPipeline {
         Ok(stitch(
             source, src_ch, &generated, gen_ch, out_frames, f0, f1, xfade,
         ))
+    }
+
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_with_execution_report(
+        &self,
+        prompt: &str,
+        source: &[f32],
+        source_channels: usize,
+        params: &EditParams,
+        on_progress: &mut dyn FnMut(PipelineProgress),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            cancel,
+            || {
+                self.edit(
+                    prompt,
+                    source,
+                    source_channels,
+                    params,
+                    &mut |value| candle_audio::execution::callback(|| on_progress(value)),
+                    &|| candle_audio::execution::callback(cancel),
+                )
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    crate::model::SAMPLE_RATE,
+                    crate::model::CHANNELS,
+                ))
+            },
+        )
     }
 
     /// Prompted-audio **Cover** (sc-13251): restyle a whole source clip from a NEW prompt while
@@ -684,6 +772,10 @@ impl AceStepPipeline {
         // 5. Denoise through the non-distilled sft cover DiT (guidance 1, multi-step — the reference's
         //    actual cover model, which preserves the source's melodic content the distilled 8-step
         //    turbo DiT cannot). The turbo-tuned request `steps` is overridden to the sft cover regime.
+        candle_audio::execution::policy(
+            "acestep-cover",
+            serde_json::json!({"dit":"sft","steps":COVER_SFT_STEPS,"guidance":1,"whole_clip":true}),
+        );
         let cover_params = SynthesisParams {
             steps: COVER_SFT_STEPS,
             ..params.clone()
@@ -710,6 +802,44 @@ impl AceStepPipeline {
         let out_frames = src_frames.min(gen_frames);
         generated.truncate(out_frames * gen_ch);
         Ok(generated)
+    }
+
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cover_with_execution_report(
+        &self,
+        prompt: &str,
+        source: &[f32],
+        source_channels: usize,
+        params: &SynthesisParams,
+        cover: &CoverModules,
+        cover_dit: &DiT,
+        on_progress: &mut dyn FnMut(PipelineProgress),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            cancel,
+            || {
+                self.cover(
+                    prompt,
+                    source,
+                    source_channels,
+                    params,
+                    cover,
+                    cover_dit,
+                    &mut |value| candle_audio::execution::callback(|| on_progress(value)),
+                    &|| candle_audio::execution::callback(cancel),
+                )
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    crate::model::SAMPLE_RATE,
+                    crate::model::CHANNELS,
+                ))
+            },
+        )
     }
 
     /// Source interleaved PCM → planar `[1, out_channels, N_pad]`, padded up to a whole hop so the

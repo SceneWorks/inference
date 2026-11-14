@@ -303,6 +303,49 @@ pub trait EngineObserver {
 /// The no-op observer.
 impl EngineObserver for () {}
 
+// Native report boundaries isolate every caller callback just like the Generator bridge.
+struct ExternalObserver<'a>(&'a mut dyn EngineObserver);
+impl EngineObserver for ExternalObserver<'_> {
+    fn on_prompt_encoding(&mut self) {
+        candle_audio::execution::callback(|| self.0.on_prompt_encoding());
+    }
+    fn on_prompt_encoding_complete(&mut self) {
+        candle_audio::execution::callback(|| self.0.on_prompt_encoding_complete());
+    }
+    fn on_stage(&mut self, stage: Stage, event: StageEvent) {
+        candle_audio::execution::callback(|| self.0.on_stage(stage, event));
+    }
+    fn on_token(&mut self, stage: Stage, token: u32) {
+        candle_audio::execution::callback(|| self.0.on_token(stage, token));
+    }
+    fn on_synthesis_progress(&mut self, completed: usize, total: usize) {
+        candle_audio::execution::callback(|| self.0.on_synthesis_progress(completed, total));
+    }
+    fn on_decode_progress(&mut self, completed: usize, total: usize) {
+        candle_audio::execution::callback(|| self.0.on_decode_progress(completed, total));
+    }
+}
+pub(crate) fn capture_native_call<T, E: From<gen_core::Error>>(
+    hooks: &mut EngineHooks<'_>,
+    operation: impl FnOnce(&mut EngineHooks<'_>) -> Result<T, E>,
+    output: impl FnOnce(&T) -> Option<candle_audio::execution::NativeOutput>,
+) -> Result<candle_audio::execution::CompletedNative<T>, E> {
+    let canceled = hooks.cancelled;
+    let mut observer = ExternalObserver(hooks.observer);
+    candle_audio::execution::capture_native(
+        &crate::provider::descriptor(),
+        canceled,
+        || {
+            let probe = || candle_audio::execution::callback(canceled);
+            operation(&mut EngineHooks {
+                cancelled: &probe,
+                observer: &mut observer,
+            })
+        },
+        output,
+    )
+}
+
 /// Cancellation and observation for an engine call.
 pub struct EngineHooks<'a> {
     /// Polled at every bounded boundary of every stage; `true` cancels.
@@ -1276,12 +1319,28 @@ impl Yue2Engine {
         hooks.check_cancel()?;
         hooks.observer.on_stage(Stage::Plan, StageEvent::Started);
         let plan = match SymbolicPlan::prepare(request.clone(), &self.tokenizer).map_err(msg)? {
-            PlanStep::Ready(plan) => plan,
+            PlanStep::Ready(plan) => {
+                candle_audio::execution::sampling(
+                    "yue2-plan",
+                    serde_json::json!({"mode":"precomputed-symbolic-plan"}),
+                );
+                candle_audio::execution::no_draws("precomputed symbolic plan performs no sampling");
+                candle_audio::execution::host_runtime("yue2-symbolic-plan");
+                candle_audio::execution::policy(
+                    "plan",
+                    serde_json::json!({"model_executed":false}),
+                );
+                plan
+            }
             PlanStep::GenerateAbc(planning) => {
                 check_generation_budget(planning.prefix().len(), None, generation.abc(), 1.0)
                     .map_err(msg)?;
                 let nar = self.lock_nar_for_ar()?;
-                let mut rng = stage_rng(request.seed());
+                let seed = request.seed();
+                if generation.abc().temperature() != 0.0 {
+                    candle_audio::execution::seed("yue2-abc", "splitmix64", seed);
+                }
+                let mut rng = stage_rng(seed);
                 let mut forward = TokenForward {
                     stage: Stage::Plan,
                     observer: &mut *hooks.observer,
@@ -1304,6 +1363,24 @@ impl Yue2Engine {
         Ok(plan)
     }
 
+    /// Complete planning with the original symbolic artifact and same-attempt execution metadata.
+    pub fn plan_with_execution_report(
+        &self,
+        request: &SongRequest,
+        generation: &GenerationConfig,
+        hooks: &mut EngineHooks<'_>,
+    ) -> gen_core::Result<candle_audio::execution::CompletedNative<SymbolicPlan>> {
+        capture_native_call(
+            hooks,
+            |hooks| self.plan(request, generation, hooks),
+            |_| {
+                Some(candle_audio::execution::NativeOutput::artifact(
+                    "symbolic_plan",
+                ))
+            },
+        )
+    }
+
     /// Generate the semantic codec tokens of `plan` (upstream `pipe.generate_semantic`). The plan is
     /// re-verified against its request first (its prefix must be the one the request and exact ABC
     /// ids produce), then guidance keeps the exact score in its negative branch (or only the
@@ -1322,7 +1399,11 @@ impl Yue2Engine {
             .semantic_conditioning(&self.tokenizer, generation.semantic())
             .map_err(msg)?;
         let nar = self.lock_nar_for_ar()?;
-        let mut rng = stage_rng(plan.request().seed());
+        let seed = plan.request().seed();
+        if generation.semantic().temperature() != 0.0 {
+            candle_audio::execution::seed("yue2-semantic", "splitmix64", seed);
+        }
+        let mut rng = stage_rng(seed);
         let mut forward = TokenForward {
             stage: Stage::Semantic,
             observer: &mut *hooks.observer,
@@ -1428,6 +1509,26 @@ impl Yue2Engine {
         self.decode_with(latents, variant, &self.options.decode, hooks)
     }
 
+    /// Complete this native route with its original result and same-attempt execution metadata.
+    pub fn decode_with_execution_report(
+        &self,
+        latents: &AcousticLatents,
+        variant: VaeVariant,
+        hooks: &mut EngineHooks<'_>,
+    ) -> gen_core::Result<candle_audio::execution::CompletedNative<DecodedAudio>> {
+        crate::engine::capture_native_call(
+            hooks,
+            |hooks| self.decode(latents, variant, hooks),
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value.samples(),
+                    crate::vae::SAMPLE_RATE,
+                    crate::vae::AUDIO_CHANNELS as u16,
+                ))
+            },
+        )
+    }
+
     /// [`Yue2Engine::decode`] with explicit decode tiling (a request's own).
     pub fn decode_with(
         &self,
@@ -1453,6 +1554,27 @@ impl Yue2Engine {
         Ok(audio)
     }
 
+    /// Complete this native route with its original result and same-attempt execution metadata.
+    pub fn decode_with_with_execution_report(
+        &self,
+        latents: &AcousticLatents,
+        variant: VaeVariant,
+        decode: &DecodeOptions,
+        hooks: &mut EngineHooks<'_>,
+    ) -> gen_core::Result<candle_audio::execution::CompletedNative<DecodedAudio>> {
+        crate::engine::capture_native_call(
+            hooks,
+            |hooks| self.decode_with(latents, variant, decode, hooks),
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value.samples(),
+                    crate::vae::SAMPLE_RATE,
+                    crate::vae::AUDIO_CHANNELS as u16,
+                ))
+            },
+        )
+    }
+
     /// One whole song in memory (upstream `pipe(...)`): plan → semantic → synthesis → decode. The
     /// artifact-backed form is [`Yue2Engine::generate_to`](crate::run).
     pub fn generate(
@@ -1467,6 +1589,26 @@ impl Yue2Engine {
         self.generate_from_plan_timed(plan, settings, hooks, start)
     }
 
+    /// Complete this native route with its original result and same-attempt execution metadata.
+    pub fn generate_with_execution_report(
+        &self,
+        request: &SongRequest,
+        settings: &SongSettings,
+        hooks: &mut EngineHooks<'_>,
+    ) -> gen_core::Result<candle_audio::execution::CompletedNative<SongResult>> {
+        crate::engine::capture_native_call(
+            hooks,
+            |hooks| self.generate(request, settings, hooks),
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value.audio.samples(),
+                    crate::vae::SAMPLE_RATE,
+                    crate::vae::AUDIO_CHANNELS as u16,
+                ))
+            },
+        )
+    }
+
     /// Semantic → synthesis → decode from an exact plan (a fresh one, or one restored with
     /// [`SymbolicPlan::restore`]); an unchanged restored plan keeps its exact token ids.
     pub fn generate_from_plan(
@@ -1477,6 +1619,26 @@ impl Yue2Engine {
     ) -> gen_core::Result<SongResult> {
         self.check_decoder_available(settings.decoder)?;
         self.generate_from_plan_timed(plan, settings, hooks, Instant::now())
+    }
+
+    /// Complete this native route with its original result and same-attempt execution metadata.
+    pub fn generate_from_plan_with_execution_report(
+        &self,
+        plan: SymbolicPlan,
+        settings: &SongSettings,
+        hooks: &mut EngineHooks<'_>,
+    ) -> gen_core::Result<candle_audio::execution::CompletedNative<SongResult>> {
+        crate::engine::capture_native_call(
+            hooks,
+            |hooks| self.generate_from_plan(plan, settings, hooks),
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value.audio.samples(),
+                    crate::vae::SAMPLE_RATE,
+                    crate::vae::AUDIO_CHANNELS as u16,
+                ))
+            },
+        )
     }
 
     fn generate_from_plan_timed(

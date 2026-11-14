@@ -87,7 +87,10 @@ impl SoftNorm {
             };
             let noise = match regularization_noise {
                 Some(n) => n.clone(),
-                None => Tensor::randn(0f32, 1f32, x.shape(), x.device())?.to_dtype(x.dtype())?,
+                None => {
+                    candle_audio::execution::unavailable("SAME softnorm device-global regularization noise is not seeded or captured");
+                    Tensor::randn(0f32, 1f32, x.shape(), x.device())?.to_dtype(x.dtype())?
+                }
             };
             let scale = if training { 5e-2 } else { 1e-3 };
             x = (&x + noise.broadcast_mul(&scaling)?.affine(scale, 0.0)?)?;
@@ -100,8 +103,13 @@ impl SoftNorm {
             }
             let noise = match augment_noise {
                 Some(n) => n.clone(),
-                None => Tensor::randn(0f32, 1f32, (batch, aug_channels, length), x.device())?
-                    .to_dtype(x.dtype())?,
+                None => {
+                    candle_audio::execution::unavailable(
+                        "SAME softnorm device-global augmentation noise is not seeded or captured",
+                    );
+                    Tensor::randn(0f32, 1f32, (batch, aug_channels, length), x.device())?
+                        .to_dtype(x.dtype())?
+                }
             };
             let augmented = noise.broadcast_mul(factor)?;
             let _ = channels;

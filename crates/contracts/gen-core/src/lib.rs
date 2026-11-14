@@ -109,7 +109,7 @@ pub use audio_dsp::{
 pub use audio_embed::{AudioEmbedder, AudioEmbedderDescriptor};
 pub use audio_transform::{
     AudioTarget, AudioTransform, AudioTransformCapabilities, AudioTransformDescriptor,
-    AudioTransformKind, AudioTransformRequest,
+    AudioTransformKind, AudioTransformRequest, CompletedAudioTransform,
 };
 pub use caption::{
     apply_caption_trigger_words, CaptionCapabilities, CaptionFinishReason, CaptionOptions,

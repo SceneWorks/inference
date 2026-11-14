@@ -238,7 +238,12 @@ impl MossSfxPipeline {
     /// Seeded standard-normal initial latents `[1, latent_dim, latent_len]`.
     fn seeded_noise(&self, latent_len: usize, seed: u64) -> Result<Tensor> {
         let n = self.config.dit.in_dim * latent_len;
-        let mut rng = StdRng::seed_from_u64(seed);
+        candle_audio::execution::runtime(&self.device, DType::F32);
+        let mut rng = StdRng::seed_from_u64(candle_audio::execution::seed(
+            "moss-sfx/pipeline.rs",
+            "rand-0.9-StdRng",
+            seed,
+        ));
         let noise: Vec<f32> = (0..n).map(|_| rng.sample(StandardNormal)).collect();
         Ok(Tensor::from_vec(
             noise,
@@ -278,6 +283,10 @@ impl MossSfxPipeline {
             )));
         }
         let geometry = synthesis_geometry(self.full_window_seconds(), sample_rate, seconds);
+        candle_audio::execution::policy(
+            "sfx-window",
+            serde_json::json!({"rounded_seconds_bits":seconds.to_bits(),"full_window_seconds":geometry.denoise_seconds,"requested_samples":geometry.requested_samples}),
+        );
         let latent_len = geometry.denoise_seconds as usize * sample_rate as usize / HOP_LENGTH;
 
         if cancel() {
@@ -306,6 +315,21 @@ impl MossSfxPipeline {
         let (cos, sin) = self.dit.rope(latent_len, &self.device)?;
         let mut latents = self.seeded_noise(latent_len, params.seed)?;
 
+        candle_audio::execution::schedule(
+            "flow-match-euler",
+            &(0..=schedule.num_steps())
+                .map(|k| schedule.sigma(k))
+                .collect::<Vec<_>>(),
+            "velocity",
+        );
+        candle_audio::execution::sampling(
+            "flow-match-euler",
+            serde_json::json!({"steps":schedule.num_steps()}),
+        );
+        candle_audio::execution::policy(
+            "synthesis",
+            serde_json::json!({"seconds_bits":params.seconds.to_bits(),"latent_length":latent_len,"cfg_bits":params.cfg_scale.to_bits(),"num_train_timesteps":self.config.scheduler.num_train_timesteps}),
+        );
         for k in 0..schedule.num_steps() {
             if cancel() {
                 return Err(AudioError::Canceled);
@@ -339,6 +363,36 @@ impl MossSfxPipeline {
             .ok_or(AudioError::Canceled)?; // [1, 1, window·sr]
         let full: Vec<f32> = audio.flatten_all()?.to_vec1::<f32>()?;
         Ok(crop_decoded_audio(full, geometry.requested_samples))
+    }
+
+    /// Complete this native call with same-attempt execution metadata, retaining its original output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_with_execution_report(
+        &self,
+        prompt: &str,
+        params: &SynthesisParams,
+        on_progress: &mut dyn FnMut(PipelineProgress),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<candle_audio::execution::CompletedNative<Vec<f32>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            cancel,
+            || {
+                self.synthesize(
+                    prompt,
+                    params,
+                    &mut |value| candle_audio::execution::callback(|| on_progress(value)),
+                    &|| candle_audio::execution::callback(cancel),
+                )
+            },
+            |value| {
+                Some(candle_audio::execution::NativeOutput::pcm(
+                    value,
+                    self.config.index.sample_rate,
+                    1,
+                ))
+            },
+        )
     }
 }
 

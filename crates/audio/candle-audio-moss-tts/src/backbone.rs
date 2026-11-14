@@ -133,6 +133,7 @@ impl Backbone {
     pub fn forward(&self, frames: &[Frame]) -> CandleResult<Tensor> {
         let t = frames.len();
         let mut h = self.embed(frames)?;
+        candle_audio::execution::runtime(&self.device, h.dtype());
         let (cos, sin) = rope_tables(&self.device, t, self.head_dim, self.rope_theta)?;
         let mask = if t > 1 {
             Some(causal_mask(&self.device, t, h.dtype())?)
@@ -205,6 +206,7 @@ impl Backbone {
     /// returning the last prompt position's hidden state `[1, 1, H]`.
     pub fn prefill(&self, frames: &[Frame], cache: &mut BackboneCache) -> CandleResult<Tensor> {
         let h = self.embed(frames)?;
+        candle_audio::execution::runtime(&self.device, h.dtype());
         self.run_cached(h, cache)
     }
 
@@ -212,6 +214,7 @@ impl Backbone {
     /// state `[1, 1, H]`.
     pub fn step(&self, frame: &Frame, cache: &mut BackboneCache) -> CandleResult<Tensor> {
         let h = self.embed(std::slice::from_ref(frame))?;
+        candle_audio::execution::runtime(&self.device, h.dtype());
         self.run_cached(h, cache)
     }
 
