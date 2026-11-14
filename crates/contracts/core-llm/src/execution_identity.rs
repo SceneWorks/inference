@@ -234,9 +234,22 @@ impl ResolvedExecutionIdentity {
             ("quality_policy", &self.quality_policy),
             ("output_policy", &self.output_policy),
         ] {
-            if matches!(fact, ExecutionFact::NotApplicable { .. }) {
+            let empty = match fact {
+                ExecutionFact::Resolved {
+                    value: Value::Object(fields),
+                } => fields.is_empty(),
+                ExecutionFact::Resolved {
+                    value: Value::Array(values),
+                } => values.is_empty(),
+                ExecutionFact::Resolved {
+                    value: Value::String(value),
+                } => value.trim().is_empty(),
+                ExecutionFact::NotApplicable { .. } => true,
+                ExecutionFact::Resolved { .. } => false,
+            };
+            if empty {
                 return Err(Error::Msg(format!(
-                    "execution fact {name} must name the effective policy"
+                    "execution fact {name} must name a nonempty effective policy"
                 )));
             }
         }
@@ -442,6 +455,25 @@ mod tests {
             ExecutionFact::f64_bits(-0.0).unwrap()
         );
         assert!(ExecutionFact::f32_bits(f32::NAN).is_err());
+    }
+
+    #[test]
+    fn empty_required_policies_cannot_claim_resolved_execution() {
+        let ExecutionIdentity::Resolved { identity } = resolved() else {
+            unreachable!()
+        };
+        for empty in [
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!(" \t "),
+        ] {
+            let mut invalid = (*identity).clone();
+            invalid.quality_policy = ExecutionFact::resolved(empty.clone());
+            assert!(invalid.validate("text-test", "mlx", 1).is_err());
+            invalid.quality_policy = identity.quality_policy.clone();
+            invalid.output_policy = ExecutionFact::resolved(empty);
+            assert!(invalid.validate("text-test", "mlx", 1).is_err());
+        }
     }
 
     #[test]

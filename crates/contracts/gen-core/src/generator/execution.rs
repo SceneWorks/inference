@@ -51,8 +51,26 @@ impl CompletedMossImageEdit {
     ) -> Result<Self> {
         let units = match &output {
             crate::moss_image::MossImageAdvancedOutput::Images(images) => images.len(),
-            crate::moss_image::MossImageAdvancedOutput::Latents { .. } => 1,
+            crate::moss_image::MossImageAdvancedOutput::Latents { values, shape } => {
+                let valid_length = shape.iter().try_fold(1usize, |elements, dimension| {
+                    elements.checked_mul(*dimension)
+                });
+                if shape[0] == 0
+                    || shape[1] != 128
+                    || shape[2] == 0
+                    || shape[3] == 0
+                    || valid_length != Some(values.len())
+                {
+                    return Err(Error::Msg(
+                        "completed MOSS latents need a nonempty [images,128,height,width] shape matching their values".into(),
+                    ));
+                }
+                shape[0]
+            }
         };
+        if units == 0 {
+            return Err(Error::Msg("completed MOSS edit has no images".into()));
+        }
         execution.validate(descriptor.id, descriptor.backend, units)?;
         Ok(Self { output, execution })
     }
@@ -200,6 +218,66 @@ mod tests {
             &descriptor()
         )
         .is_err());
+    }
+
+    #[test]
+    fn moss_latent_batch_uses_image_count_and_rejects_malformed_shape() {
+        use crate::moss_image::MossImageAdvancedOutput;
+
+        let output = || MossImageAdvancedOutput::Latents {
+            values: vec![0.0; 2 * 128],
+            shape: [2, 128, 1, 1],
+        };
+        let mut identity = resolved();
+        identity.output_units = 2;
+        if let ExecutionRandomness::Draws { draws, .. } = &mut identity.randomness {
+            draws.push(ExecutionDraw {
+                output_index: 1,
+                purpose: "tokens".into(),
+                seed: Some(8),
+                noise_sha256: None,
+            });
+        }
+        assert!(CompletedMossImageEdit::new(
+            output(),
+            ExecutionIdentity::Resolved {
+                identity: Box::new(identity.clone()),
+            },
+            &descriptor(),
+        )
+        .is_ok());
+
+        identity.output_units = 1;
+        assert!(CompletedMossImageEdit::new(
+            output(),
+            ExecutionIdentity::Resolved {
+                identity: Box::new(identity),
+            },
+            &descriptor(),
+        )
+        .is_err());
+        for output in [
+            MossImageAdvancedOutput::Images(Vec::new()),
+            MossImageAdvancedOutput::Latents {
+                values: vec![0.0; 2 * 128],
+                shape: [2, 64, 2, 1],
+            },
+            MossImageAdvancedOutput::Latents {
+                values: vec![0.0; 128],
+                shape: [2, 128, 1, 1],
+            },
+            MossImageAdvancedOutput::Latents {
+                values: vec![],
+                shape: [0, 128, 1, 1],
+            },
+        ] {
+            assert!(CompletedMossImageEdit::new(
+                output,
+                ExecutionIdentity::provider_default(),
+                &descriptor(),
+            )
+            .is_err());
+        }
     }
 
     #[test]
