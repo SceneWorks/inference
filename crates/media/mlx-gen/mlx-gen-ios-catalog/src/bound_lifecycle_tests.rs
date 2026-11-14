@@ -166,6 +166,26 @@ impl Generator for Provider {
             _ => Ok(GenerationOutput::Images(vec![])),
         }
     }
+    fn generate_with_execution_report(
+        &self,
+        request: &GenerationRequest,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedGeneration> {
+        self.generate(request, progress)?;
+        CompletedGeneration::new(
+            GenerationReport::from_output(GenerationOutput::Images(vec![Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0, 0, 0],
+            }])),
+            ExecutionIdentity::unavailable(ExecutionUnavailable {
+                code: "probe_report".into(),
+                detail: "probe provider has no sampler".into(),
+                missing_facts: vec!["sampler".into()],
+            }),
+            &self.descriptor,
+        )
+    }
 }
 fn bound(
     mode: Mode,
@@ -257,6 +277,61 @@ fn required_generation_establishes_real_scope_without_optional_begin_or_media_cl
         },
     );
 }
+
+#[test]
+fn completed_execution_report_uses_the_same_admitted_provider_attempt() {
+    cpu_test(
+        "completed_execution_report_uses_the_same_admitted_provider_attempt",
+        || {
+            let (generator, request, calls, _root) = bound(Mode::Good, true);
+            calls.borrow_mut().request_address = &request as *const GenerationRequest as usize;
+            let completed = generator
+                .generate_with_execution_report(&request, &mut |_| {})
+                .unwrap();
+            assert!(matches!(
+                completed.execution,
+                ExecutionIdentity::Unavailable { reason } if reason.code == "probe_report"
+            ));
+            let calls = calls.borrow();
+            assert_eq!((calls.begin, calls.readonly, calls.body), (1, 1, 1));
+            let (streaming, request, stream_calls, _stream_root) = bound(Mode::Good, true);
+            stream_calls.borrow_mut().request_address =
+                &request as *const GenerationRequest as usize;
+            let completed = streaming
+                .generate_streaming_with_execution_report(&request, &mut |_| {}, &mut |_| {})
+                .unwrap();
+            assert!(matches!(
+                completed.execution,
+                ExecutionIdentity::Unavailable { reason } if reason.code == "probe_report"
+            ));
+            let stream_calls = stream_calls.borrow();
+            assert_eq!(
+                (stream_calls.begin, stream_calls.readonly, stream_calls.body),
+                (1, 1, 1)
+            );
+        },
+    );
+}
+#[test]
+fn completed_execution_report_propagates_failures_and_cancellation_without_receipts() {
+    cpu_test(
+        "completed_execution_report_propagates_failures_and_cancellation_without_receipts",
+        || {
+            for mode in [Mode::BodyError, Mode::Canceled] {
+                let (generator, request, calls, _root) = bound(mode, true);
+                calls.borrow_mut().request_address = &request as *const GenerationRequest as usize;
+                for _ in 0..2 {
+                    assert!(generator
+                        .generate_with_execution_report(&request, &mut |_| {})
+                        .is_err());
+                    assert!(mlx_gen::ios_quantum::native_retirement_binding().is_none());
+                }
+                assert_eq!(calls.borrow().body, 2);
+            }
+        },
+    );
+}
+
 #[test]
 fn refused_or_default_unsupported_configuration_stops_before_body() {
     cpu_test(

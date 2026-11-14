@@ -94,10 +94,14 @@ pub fn emit_preview_with_sigma<F>(
         return;
     };
     if let Ok(image) = project(Some(sigma)) {
-        sink.emit(PreviewFrame {
-            current,
-            total: counter.total(),
-            image,
+        // Consumer callbacks may synchronously invoke other generators. Keep their work out of
+        // this provider's execution observations while retaining the provider-owned projection.
+        crate::image_execution::without_capture(|| {
+            sink.emit(PreviewFrame {
+                current,
+                total: counter.total(),
+                image,
+            });
         });
     }
 }

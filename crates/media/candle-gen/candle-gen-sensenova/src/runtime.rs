@@ -31,6 +31,7 @@ use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::attention_budget::AttentionPlan;
 use candle_gen::gen_core::CancelFlag;
 use candle_gen::{CandleError, Result};
+use candle_llm::core_llm::token_execution as execution;
 use candle_llm::decode::StreamEvent;
 use candle_llm::decode::{
     generate_with_sampler, FinishReason, GenerationConfig, LogitsScope, SpeculativePrompt,
@@ -280,6 +281,7 @@ impl Qwen3Backbone {
             candle_llm::error::Error::Candle(e) => CandleError::Candle(e),
             other => CandleError::Msg(format!("sensenova text decode: {other}")),
         })?;
+        execution::observe_decode(&run.record.report(false));
         if run.output.finish_reason == FinishReason::Cancelled {
             return Err(CandleError::Canceled);
         }

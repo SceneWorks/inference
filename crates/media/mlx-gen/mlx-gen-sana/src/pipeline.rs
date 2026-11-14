@@ -944,6 +944,16 @@ pub(crate) fn denoise_sprint_from_with_memory(
             ("final_scaling", 1),
         ],
     );
+    mlx_gen::image_execution::scalar("guidance_embeds_scale", guidance_embeds_scale);
+    mlx_gen::image_execution::scalar("scm_sigma_data", sd);
+    mlx_gen::image_execution::policy_debug("scm_start_step", &start);
+    mlx_gen::image_execution::sampled_native(
+        "scm",
+        "trigflow_angle",
+        out.dtype(),
+        preview_schedule,
+        seed,
+    );
     Ok(out)
 }
 

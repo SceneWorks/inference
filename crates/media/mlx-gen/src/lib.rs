@@ -43,6 +43,7 @@ pub mod capability;
 pub mod coherence;
 pub mod convrot_int8;
 pub mod error;
+pub mod image_execution;
 pub mod img2img;
 pub mod int8_gemm;
 pub mod ios_anchor_law;

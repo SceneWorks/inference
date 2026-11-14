@@ -113,6 +113,9 @@ impl PidDecoder {
         }
         let b = sh[0];
         let (th, tw) = self.target_hw(latents);
+        mlx_gen::image_execution::scalar("pid_degrade_sigma", self.sigma);
+        mlx_gen::image_execution::policy_debug("pid_output_geometry", &(b, th, tw));
+        mlx_gen::image_execution::policy_debug("pid_scale", &(self.scale, self.vae_compression));
         // PiD runs the released bf16 inference dtype, and the LQ-adapter convs require their input in
         // that dtype. An engine may hand us an f32 sampler latent (Qwen/Krea keep latents f32 through
         // the denoise loop), so cast here — a no-op when the latent is already bf16. Matches the

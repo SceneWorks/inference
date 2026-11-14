@@ -567,7 +567,21 @@ impl Generator for ZImageTurbo {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_impl(req, on_progress).map_err(Into::into)
+        })
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_attempt(&self.descriptor, &req.cancel, || {
+            let mut progress =
+                |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+            self.generate_impl(req, &mut progress).map_err(Into::into)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -647,6 +661,15 @@ impl ZImageTurbo {
             block_window,
             encoder_window,
         } = pipeline::resolve_request_rungs(req, &self.memory_strategy, MODEL_ID)?;
+        mlx_gen::image_execution::policy_debug("stage_residency", &stage_residency);
+        mlx_gen::image_execution::policy_debug("streamable", &streamable);
+        mlx_gen::image_execution::policy_debug("decode_tiling", &tiling);
+        mlx_gen::image_execution::policy_debug("attention_budget", &attention_budget);
+        mlx_gen::image_execution::policy_debug("transformer_window", &block_window);
+        mlx_gen::image_execution::policy_debug(
+            "encoder_window",
+            &encoder_window.map(|scope| scope.window),
+        );
         let images = self.residency.run_staged_request_scoped(
             stage_residency,
             streamable,

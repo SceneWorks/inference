@@ -41,8 +41,8 @@ use crate::decode::cancel::CancelFlag;
 use crate::decode::engine::{LogitsScope, SpeculativeRun, SpeculativeTarget};
 use crate::decode::proposers::MtpBoundary;
 use crate::decode::stream::{
-    decode_loop, default_seed, observe_cache_events, observe_packed_evidence, ConstraintMask,
-    GenerationConfig, GenerationOutput, ObservedCache, StreamEvent,
+    decode_loop, observe_cache_events, observe_packed_evidence, ConstraintMask, GenerationConfig,
+    GenerationOutput, ObservedCache, StreamEvent,
 };
 use crate::error::{Error, Result};
 use crate::models::{CausalLm, Qwen35Cache};
@@ -612,7 +612,7 @@ pub(crate) fn generate_cached_with_observer(
         ));
     }
 
-    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    let rng = SplitMix64::new(config.execution_seed());
 
     // Reuse the longest cached prefix (or start cold), then prefill only the uncached suffix.
     let (mut cache, matched_len) =
