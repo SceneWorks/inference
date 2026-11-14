@@ -77,6 +77,20 @@ pub(crate) const TOKENIZER_MAX_LEN: usize = 512;
 /// compute dtype (bf16) for the init/control latent.
 pub(crate) const ENC_DTYPE: DType = DType::F32;
 
+/// Bind a component's actual forward output to the current report. The sampler keeps f32 latent
+/// predictions on some paths, and `encode_ids` casts text features after the encoder returns;
+/// neither of those tensors describes the component's own arithmetic.
+pub(crate) fn observe_component_output(component: &str, output: &Tensor) {
+    candle_gen::execution::runtime(output.device(), output.dtype());
+    candle_gen::execution::policy(
+        &format!("z-image/{component}_compute"),
+        serde_json::json!({
+            "device": format!("{:?}", output.device().location()),
+            "dtype": format!("{:?}", output.dtype()),
+        }),
+    );
+}
+
 /// Img2img start step — the Z-Image "structure-preservation" convention (the fork's
 /// `init_time_step`, mirrored from `mlx-gen`'s shared `img2img::init_time_step`): for a reference
 /// with `strength` in `(0, 1]`, `max(1, floor(num_steps · strength))`; otherwise `0` (pure txt2img,
@@ -206,6 +220,7 @@ where
     let len = ids.len();
     let input_ids = Tensor::from_vec(ids, (1, len), device)?;
     let enc = forward(&input_ids)?; // (1, L, 2560)
+    observe_component_output("text_encoder", &enc);
     Ok(enc.squeeze(0)?.to_dtype(dtype)?) // (L, 2560)
 }
 
@@ -292,6 +307,7 @@ pub(crate) fn encode_mean(
     out_dtype: DType,
 ) -> Result<Tensor> {
     let moments = img.apply(encoder)?; // (1, 32, H/8, W/8) — [mean | logvar]
+    observe_component_output("vae_encoder", &moments);
     let mean = moments.chunk(2, 1)?[0].clone(); // (1, 16, H/8, W/8)
     let latents = ((mean - shift)? * scale)?;
     Ok(latents.to_dtype(out_dtype)?)
@@ -317,7 +333,11 @@ impl LatentDecoder for ZImageLatentDecoder<'_> {
 
     fn decode(&self, latents: &Tensor) -> Result<Tensor> {
         let decoded = candle_gen::bounded_kl_decode(&VAE_DECODER, latents, |l| {
-            __model_proof_output!(self.vae.decode(l))
+            let output = __model_proof_output!(self.vae.decode(l))?;
+            // Bounded tiling widens each tile to f32 before stitching. Observe the model's output
+            // inside the callback, while its native compute dtype is still intact.
+            observe_component_output("vae_decoder", &output);
+            Ok(output)
         })?;
         Ok(decoded.to_dtype(DType::F32)?)
     }
@@ -581,6 +601,69 @@ mod tests {
         .unwrap();
         assert_eq!(out.dims(), &[3, 4]); // batch axis squeezed → (L, hidden)
         assert_eq!(out.dtype(), DType::F32);
+    }
+
+    /// The report follows each component's returned tensor, before the consumer casts it. This
+    /// catches a text encoder or VAE encoder running in f32 while the sampler/latent is bf16.
+    #[test]
+    fn component_precision_report_uses_forward_outputs_not_consumer_casts() {
+        let attempt = candle_gen::execution::Attempt::begin();
+        candle_gen::execution::rng_scheme("z-image-test-seeded-noise");
+        candle_gen::execution::draw("image_initial_noise", 7, 0);
+        candle_gen::execution::schedule("euler", &[1.0, 0.0], "flow-velocity");
+        candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+        let text = encode_ids(&[1, 2], &Device::Cpu, DType::BF16, |ids| {
+            Tensor::ones((1, ids.dim(1)?, 4), DType::F32, ids.device())
+        })
+        .unwrap();
+        assert_eq!(
+            text.dtype(),
+            DType::BF16,
+            "the consumer casts text features"
+        );
+        let moments = Tensor::zeros((1, 32, 1, 1), DType::F32, &Device::Cpu).unwrap();
+        observe_component_output("vae_encoder", &moments);
+        let velocity = Tensor::zeros((1, 16, 1, 1), DType::BF16, &Device::Cpu).unwrap();
+        observe_component_output("dit", &velocity);
+        observe_component_output("vae_decoder", &velocity);
+        let output =
+            candle_gen::gen_core::GenerationOutput::Images(vec![candle_gen::gen_core::Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            }]);
+        let candle_gen::gen_core::generator::ExecutionIdentity::Resolved { identity } =
+            attempt.finish_image(&crate::descriptor(), &output)
+        else {
+            panic!("component observations should complete a weights-free report");
+        };
+        let candle_gen::gen_core::generator::ExecutionFact::Resolved { value } =
+            identity.quality_policy
+        else {
+            panic!("quality policy should be resolved");
+        };
+        assert_eq!(
+            value["operations"]["z-image/text_encoder_compute"][0]["value"]["dtype"],
+            "F32"
+        );
+        assert_eq!(
+            value["operations"]["z-image/text_encoder_compute"][0]["value"]["device"],
+            "Cpu"
+        );
+        assert_eq!(
+            value["operations"]["z-image/vae_encoder_compute"][0]["value"]["dtype"],
+            "F32"
+        );
+        assert_eq!(
+            value["operations"]["z-image/dit_compute"][0]["value"]["dtype"],
+            "BF16"
+        );
+        assert_eq!(
+            value["operations"]["z-image/vae_decoder_compute"][0]["value"]["dtype"],
+            "BF16"
+        );
+        assert_eq!(value["compute"][0]["dtype"], "F32");
+        assert_eq!(value["compute"][1]["dtype"], "BF16");
     }
 
     /// `seed_noise` is deterministic and launch-portable: same seed ⇒ byte-identical draw; the shape is

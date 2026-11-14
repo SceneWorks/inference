@@ -167,17 +167,19 @@ impl DiT {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
     ) -> candle_gen::Result<Tensor> {
-        match (self, prepared) {
-            (Self::Dense(m), PreparedDiT::Dense(prepared)) => {
-                Ok(m.forward_prepared(x, t, prepared)?)
-            }
+        let velocity = match (self, prepared) {
+            (Self::Dense(m), PreparedDiT::Dense(prepared)) => m.forward_prepared(x, t, prepared)?,
             (Self::Packed(m), PreparedDiT::Packed(prepared)) => {
-                m.forward_prepared_with_memory(x, t, prepared, attention_plan, transformer_window)
+                m.forward_prepared_with_memory(x, t, prepared, attention_plan, transformer_window)?
             }
-            _ => Err(candle_gen::CandleError::Msg(
-                "z-image: prepared conditioning belongs to another DiT variant".into(),
-            )),
-        }
+            _ => {
+                return Err(candle_gen::CandleError::Msg(
+                    "z-image: prepared conditioning belongs to another DiT variant".into(),
+                ))
+            }
+        };
+        common::observe_component_output("dit", &velocity);
+        Ok(velocity)
     }
     #[cfg(test)]
     pub(crate) fn forward_with_attention_plan(

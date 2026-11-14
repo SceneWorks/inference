@@ -624,13 +624,15 @@ impl ZImageControlTransformer {
         // 11. Head: image tokens → final AdaLN layer → unpatchify to the raw velocity.
         let x_out = unified.narrow(1, 0, prepared.img_seq_len)?;
         let x_out = base.control_finish(&x_out, &adaln)?;
-        Ok(unpatchify(
+        let velocity = unpatchify(
             &x_out,
             prepared.orig_size,
             patch_size,
             f_patch_size,
             cfg.in_channels,
-        )?)
+        )?;
+        common::observe_component_output("dit", &velocity);
+        Ok(velocity)
     }
 
     #[cfg(test)]

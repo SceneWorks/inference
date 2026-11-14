@@ -111,7 +111,6 @@ impl Generator for ZImageBaseGenerator {
                 self.adapters.len(),
                 "candle-gen-z-image/src/base.rs",
             );
-            candle_gen::execution::policy("loaded/dtype", format!("{:?}", self.dtype).into());
             candle_gen::execution::policy(
                 "loaded/loaded_quant",
                 format!("{:?}", self.loaded_quant).into(),

@@ -330,10 +330,11 @@ impl ZImageEdit {
             let t_norm = (1000.0 - scheduler.timesteps[step_i]) / 1000.0;
             let t = Tensor::from_vec(vec![t_norm as f32], (1,), &self.device)?;
             // The Z-Image DiT velocity is negated before the flow-match Euler step (the sign convention).
-            let velocity = self
+            let raw_velocity = self
                 .transformer
-                .forward_prepared(&latents, &t, &dit_prepared)?
-                .neg()?;
+                .forward_prepared(&latents, &t, &dit_prepared)?;
+            common::observe_component_output("dit", &raw_velocity);
+            let velocity = raw_velocity.neg()?;
             // Euler step: x_{i+1} = x_i + (σ_{i+1} − σ_i)·velocity (= scheduler.step).
             let dt = scheduler.sigmas[step_i + 1] - scheduler.sigmas[step_i];
             latents = (latents + (velocity * dt)?)?;
