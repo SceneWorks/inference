@@ -14,6 +14,28 @@ from scripts.ci.flux1_pair import conditional, conditional_evidence, conditional
 
 
 class ConditionalComparison(unittest.TestCase):
+    def test_child_caps_are_explicit_per_case(self):
+        from types import SimpleNamespace
+        gib = 1024**3
+        policy = lambda host, gpu, deadline=600: SimpleNamespace(
+            deadline_seconds=deadline, child_footprint_cap_bytes=host, child_gpu_cap_bytes=gpu)
+        for case in conditional.CASES:
+            caps = comparison.case_caps("candle-cuda", case, policy(24 * gib, 18 * gib))
+            self.assertEqual(caps["child_footprint_cap_bytes"], 24 * gib, case)
+            expected_gpu = 40 * gib if case == "pulid-pid" else 18 * gib
+            self.assertEqual(caps["child_gpu_cap_bytes"], expected_gpu, case)
+            with self.assertRaisesRegex(ValueError, "host cap"):
+                comparison.case_caps("candle-cuda", case, policy(24 * gib + 1, 18 * gib))
+            with self.assertRaisesRegex(ValueError, "GPU cap"):
+                comparison.case_caps("candle-cuda", case, policy(24 * gib, expected_gpu + 1))
+            with self.assertRaisesRegex(ValueError, "20 minute"):
+                comparison.case_caps("candle-cuda", case, policy(gib, gib, 1201))
+        # The pulid-pid cap admits run 43553801528's measured 24.79 GB whole-GPU use.
+        comparison.case_caps("candle-cuda", "pulid-pid", policy(24 * gib, 40 * gib))
+        self.assertGreater(40 * gib, 24.79e9)
+        # MLX has no CUDA cap to record.
+        self.assertIsNone(comparison.case_caps("mlx", "pulid-pid", policy(24 * gib, None))["child_gpu_cap_bytes"])
+
     def test_candle_pulid_probes_freeze_the_comparison_sampler(self):
         for case in conditional.CASES:
             if not case.startswith("pulid-") or "candle-cuda" not in conditional.CASES[case][1]:

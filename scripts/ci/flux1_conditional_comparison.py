@@ -24,6 +24,35 @@ from scripts.media_campaign_supervisor import load_policy
 BASE = overlay.BASE
 LANES = base.LANES
 PHASES = ("preflight", "base-run", "head-run")
+GIB = 1024**3
+MAX_DEADLINE_SECONDS = 1200
+# Explicit per-case child caps. Every case shares the frozen 24 GiB host / 18 GiB CUDA budget except
+# pulid-pid, whose PiD decoder loads both of its checkpoints at f32 (candle-gen-pid
+# `engine::LOAD_DTYPE`): the 2k->4k student (2.72 GB BF16 -> 5.45 GB) and the Gemma 2 2B caption
+# encoder (5.23 GB BF16 -> 10.46 GB), with a further 4.99 GB BF16 + 9.98 GB f32 transient while its
+# first shard is coerced on the device. Its 1024-pixel probe decodes to 4096x4096, whose untiled
+# decode (`budget::estimated_decode_peak_gib`, patch 16, hidden 1536) adds 4.69 GiB. That puts PiD
+# alone at ~19.5 GiB over the PuLID stack, matching run 43553801528's 23.1 GB above baseline in the
+# base arm. 40 GiB keeps ~18 GiB headroom on the 96 GB RTX PRO 6000. Host use does not grow the same
+# way: Candle loads every PiD/Gemma tensor straight to the device and maps one source file (at most
+# 4.99 GB) at a time, so the 24 GiB host cap stays.
+DEFAULT_CAPS = {"child_footprint_cap_bytes": 24 * GIB, "child_gpu_cap_bytes": 18 * GIB}
+CASE_CAPS = {"pulid-pid": {"child_footprint_cap_bytes": 24 * GIB, "child_gpu_cap_bytes": 40 * GIB}}
+
+
+def case_caps(backend, case, policy):
+    """Refuse a policy above its case's explicit caps; return the caps for the plan record."""
+    caps = CASE_CAPS.get(case, DEFAULT_CAPS)
+    if policy.deadline_seconds > MAX_DEADLINE_SECONDS:
+        raise ValueError("conditional child exceeds frozen 20 minute budget")
+    if policy.child_footprint_cap_bytes > caps["child_footprint_cap_bytes"]:
+        raise ValueError(f"conditional child exceeds {case} host cap of "
+                         f"{caps['child_footprint_cap_bytes'] // GIB} GiB")
+    if backend == "candle-cuda" and policy.child_gpu_cap_bytes > caps["child_gpu_cap_bytes"]:
+        raise ValueError(f"conditional CUDA child exceeds {case} GPU cap of "
+                         f"{caps['child_gpu_cap_bytes'] // GIB} GiB")
+    return {"child_footprint_cap_bytes": caps["child_footprint_cap_bytes"],
+            "child_gpu_cap_bytes": caps["child_gpu_cap_bytes"] if backend == "candle-cuda" else None}
 
 
 def plan(backend, value, head, tier):
@@ -41,10 +70,7 @@ def plan(backend, value, head, tier):
         path = Path(tmp) / "policy.json"
         base.write(path, value["policy"])
         policy = load_policy(path)
-        if policy.deadline_seconds > 1200 or policy.child_footprint_cap_bytes > 24 * 1024**3:
-            raise ValueError("conditional child exceeds frozen 20 minute/24 GiB budget")
-        if backend == "candle-cuda" and policy.child_gpu_cap_bytes > 18 * 1024**3:
-            raise ValueError("conditional CUDA child exceeds 18 GiB GPU cap")
+        caps = case_caps(backend, value["case"], policy)
     source = proof.repository_identity(head)
     fixture.geometry(variant)
     case = value["case"]
@@ -59,6 +85,7 @@ def plan(backend, value, head, tier):
                              guidance=3.5 if variant == "dev" else None),
             "tolerance": {"class": "AP13(a)", "states": "bit-exact", "events": "exact",
                           "rgb8": "bit-exact", "provenance": "SGA implementation plan §7.3; no adjustable limit"},
+            "child_caps": caps,
             "cuda_claim_budget_seconds": cuda_claim_budget(policy)[0] if backend == "candle-cuda" else None}
 
 
