@@ -50,6 +50,27 @@ use crate::{conditioning::SdxlConditioner, SdxlArtifactSeal, SdxlVaeDecoder, PID
 /// `madebyollin/sdxl-vae-fp16-fix`; the CLIP image encoder runs at this dtype too).
 const DTYPE: DType = DType::F16;
 
+fn observe_component_compute(component: &str, device: &Device, dtype: DType) {
+    candle_gen::execution::runtime(device, dtype);
+    candle_gen::execution::policy(
+        &format!("sdxl/ip/{component}_compute"),
+        serde_json::json!({"device": format!("{:?}", device.location()), "dtype": format!("{dtype:?}")}),
+    );
+}
+
+fn observe_decode_compute(device: &Device, pid_selected: bool) {
+    if pid_selected {
+        observe_component_compute(
+            "pid_caption_encoder",
+            device,
+            candle_gen_pid::engine::LOAD_DTYPE,
+        );
+        observe_component_compute("pid_decoder", device, candle_gen_pid::engine::LOAD_DTYPE);
+    } else {
+        observe_component_compute("vae", device, DTYPE);
+    }
+}
+
 /// Default `ip_adapter_scale` for SDXL IP-Adapter-Plus (the worker's `ipAdapterScale` default, matching
 /// the torch `SdxlDiffusersAdapter`).
 pub const DEFAULT_IP_ADAPTER_SCALE: f32 = 0.7;
@@ -338,6 +359,7 @@ impl IpAdapterSdxl {
         let (conditioning, pooled) = candle_gen::gen_core::with_prompt_encoding(
             on_progress,
             || -> std::result::Result<_, candle_gen::CandleError> {
+                observe_component_compute("text_conditioner", &self.device, DTYPE);
                 let (conditioning, pooled) =
                     self.conditioner
                         .encode(&req.prompt, &req.negative, cfg_on)?;
@@ -346,6 +368,7 @@ impl IpAdapterSdxl {
         )?;
         let batch = conditioning.dim(0)?;
         let time_ids = text_time_ids(batch, &self.device, DTYPE)?;
+        observe_component_compute("image_encoder_resampler", &self.device, DTYPE);
         let ip_tokens = self.ip_tokens(reference, cfg_on)?;
 
         // Set the IP image tokens on the UNet (constant across the denoise — phase 2c/2e design) —
@@ -368,6 +391,7 @@ impl IpAdapterSdxl {
         let sampler_curated =
             Solver::from_name(sampler_name).is_some() && sampler_name != "euler_ancestral";
 
+        observe_component_compute("unet", &self.device, DTYPE);
         let latents = if sampler_curated || scheduler_curated {
             let ms = DiscreteModelSampling::sdxl(&sdxl_alpha_schedule()?);
             let native = schedule_sigmas(Scheduler::Normal, &ms, req.steps);
@@ -429,6 +453,7 @@ impl IpAdapterSdxl {
         // generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8044).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+        observe_decode_compute(&self.device, pid_ref.is_some());
         let tiling = crate::denoise::decode_tiling(memory);
         decode_image_with_tiling(&self.vae, &latents, pid_ref, Some(&req.cancel), tiling)
     }
@@ -457,6 +482,73 @@ impl IpAdapterSdxl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn component_precision_report_ip_records_f16_models_beside_f32_sampler() {
+        let attempt = candle_gen::execution::Attempt::begin();
+        candle_gen::execution::rng_scheme("sdxl-ip-test-noise");
+        candle_gen::execution::draw("initial_noise", 3, 0);
+        candle_gen::execution::schedule("euler_ancestral", &[1.0, 0.0], "epsilon");
+        candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+        for component in ["text_conditioner", "image_encoder_resampler", "unet"] {
+            observe_component_compute(component, &Device::Cpu, DTYPE);
+        }
+        observe_decode_compute(&Device::Cpu, false);
+        let output = candle_gen::gen_core::GenerationOutput::Images(vec![Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 3],
+        }]);
+        let candle_gen::gen_core::generator::ExecutionIdentity::Resolved { identity } =
+            attempt.finish_image(&crate::descriptor(), &output)
+        else {
+            panic!("complete weights-free component observations should resolve");
+        };
+        let candle_gen::gen_core::generator::ExecutionFact::Resolved { value } =
+            identity.quality_policy
+        else {
+            panic!("quality policy should be resolved");
+        };
+        for component in ["text_conditioner", "image_encoder_resampler", "unet", "vae"] {
+            let key = format!("sdxl/ip/{component}_compute");
+            assert_eq!(value["operations"][&key][0]["value"]["dtype"], "F16");
+        }
+        assert_eq!(value["compute"][0]["dtype"], "F32");
+        assert_eq!(value["compute"][1]["dtype"], "F16");
+        assert!(value["operations"]
+            .get("sdxl/ip/pid_decoder_compute")
+            .is_none());
+    }
+
+    #[test]
+    fn component_precision_report_ip_records_pid_compute_without_claiming_vae() {
+        let attempt = candle_gen::execution::Attempt::begin();
+        candle_gen::execution::rng_scheme("sdxl-ip-test-noise");
+        candle_gen::execution::draw("initial_noise", 3, 0);
+        candle_gen::execution::schedule("euler_ancestral", &[1.0, 0.0], "epsilon");
+        candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+        observe_decode_compute(&Device::Cpu, true);
+        let output = candle_gen::gen_core::GenerationOutput::Images(vec![Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 3],
+        }]);
+        let candle_gen::gen_core::generator::ExecutionIdentity::Resolved { identity } =
+            attempt.finish_image(&crate::descriptor(), &output)
+        else {
+            panic!("source-backed PiD precision should resolve the weights-free report");
+        };
+        let candle_gen::gen_core::generator::ExecutionFact::Resolved { value } =
+            identity.quality_policy
+        else {
+            panic!("quality policy should be resolved");
+        };
+        for component in ["pid_caption_encoder", "pid_decoder"] {
+            let key = format!("sdxl/ip/{component}_compute");
+            assert_eq!(value["operations"][&key][0]["value"]["dtype"], "F32");
+        }
+        assert!(value["operations"].get("sdxl/ip/vae_compute").is_none());
+    }
 
     /// The request defaults match the SDXL IP-Adapter production knobs (1024², 30 steps, ip scale 0.7).
     #[test]

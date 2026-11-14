@@ -51,6 +51,27 @@ use crate::{SdxlArtifactSeal, SdxlVaeDecoder, PID_BACKBONE};
 /// The edit compute dtype — fp16, matching the production SDXL path (the f16-stable VAE + UNet).
 const DTYPE: DType = DType::F16;
 
+fn observe_component_compute(component: &str, device: &Device, dtype: DType) {
+    candle_gen::execution::runtime(device, dtype);
+    candle_gen::execution::policy(
+        &format!("sdxl/edit/{component}_compute"),
+        serde_json::json!({"device": format!("{:?}", device.location()), "dtype": format!("{dtype:?}")}),
+    );
+}
+
+fn observe_decode_compute(device: &Device, pid_selected: bool) {
+    if pid_selected {
+        observe_component_compute(
+            "pid_caption_encoder",
+            device,
+            candle_gen_pid::engine::LOAD_DTYPE,
+        );
+        observe_component_compute("pid_decoder", device, candle_gen_pid::engine::LOAD_DTYPE);
+    } else {
+        observe_component_compute("vae_decoder", device, DTYPE);
+    }
+}
+
 /// img2img default denoise strength — the worker's plain-edit value (the torch `SdxlDiffusersAdapter`
 /// uses ~0.6–0.8); 0.8 keeps prompt freedom while still honoring the source structure.
 pub const DEFAULT_EDIT_STRENGTH: f32 = 0.8;
@@ -350,6 +371,7 @@ impl SdxlEdit {
         candle_gen::execution::policy("sdxl/edit_provider/cfg_on", format!("{cfg_on:?}").into());
 
         // Text conditioning (uncond-first under CFG) + the SDXL micro-conditioning time_ids.
+        observe_component_compute("text_conditioner", &self.device, DTYPE);
         let (conditioning, pooled) = self
             .conditioner
             .encode(&req.prompt, &req.negative, cfg_on)?;
@@ -403,6 +425,7 @@ impl SdxlEdit {
         // (4× SR) when this generation opted in (`req.use_pid`) and `with_pid` loaded one (sc-8044).
         let pid_decoder = self.pid_decoder_for(req)?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+        observe_decode_compute(&self.device, pid_ref.is_some());
         let tiling = crate::denoise::decode_tiling(memory);
         decode_image_with_tiling(&self.vae, &latents, pid_ref, Some(&req.cancel), tiling)
     }
@@ -430,6 +453,7 @@ impl SdxlEdit {
             .unsqueeze(0)?
             .contiguous()?
             .to_dtype(DTYPE)?;
+        observe_component_compute("vae_encoder", &self.device, DTYPE);
         Ok(self.vae_encoder.encode_mean(&nchw)?)
     }
 
@@ -499,6 +523,7 @@ impl SdxlEdit {
             };
             // Plain SDXL forward (no control residuals, IP branch inert): the add_embedding
             // micro-conditioning only.
+            observe_component_compute("unet", &self.device, DTYPE);
             let eps = self.unet.forward_instantid(
                 &x_unet,
                 t,
@@ -581,6 +606,75 @@ mod tests {
     use super::*;
     use crate::unet::{BlockConfig, UNet2DConditionModelConfig};
     use candle_nn::{VarBuilder, VarMap};
+
+    #[test]
+    fn component_precision_report_edit_records_f16_models_beside_f32_sampler() {
+        let attempt = candle_gen::execution::Attempt::begin();
+        candle_gen::execution::rng_scheme("sdxl-edit-test-noise");
+        candle_gen::execution::draw("initial_noise", 3, 0);
+        candle_gen::execution::schedule("euler_ancestral", &[1.0, 0.0], "epsilon");
+        candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+        for component in ["text_conditioner", "vae_encoder", "unet"] {
+            observe_component_compute(component, &Device::Cpu, DTYPE);
+        }
+        observe_decode_compute(&Device::Cpu, false);
+        let output = candle_gen::gen_core::GenerationOutput::Images(vec![Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 3],
+        }]);
+        let candle_gen::gen_core::generator::ExecutionIdentity::Resolved { identity } =
+            attempt.finish_image(&crate::descriptor(), &output)
+        else {
+            panic!("complete weights-free component observations should resolve");
+        };
+        let candle_gen::gen_core::generator::ExecutionFact::Resolved { value } =
+            identity.quality_policy
+        else {
+            panic!("quality policy should be resolved");
+        };
+        for component in ["text_conditioner", "vae_encoder", "unet", "vae_decoder"] {
+            let key = format!("sdxl/edit/{component}_compute");
+            assert_eq!(value["operations"][&key][0]["value"]["dtype"], "F16");
+        }
+        assert_eq!(value["compute"][0]["dtype"], "F32");
+        assert_eq!(value["compute"][1]["dtype"], "F16");
+        assert!(value["operations"]
+            .get("sdxl/edit/pid_decoder_compute")
+            .is_none());
+    }
+
+    #[test]
+    fn component_precision_report_edit_records_pid_compute_without_claiming_vae() {
+        let attempt = candle_gen::execution::Attempt::begin();
+        candle_gen::execution::rng_scheme("sdxl-edit-test-noise");
+        candle_gen::execution::draw("initial_noise", 3, 0);
+        candle_gen::execution::schedule("euler_ancestral", &[1.0, 0.0], "epsilon");
+        candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+        observe_decode_compute(&Device::Cpu, true);
+        let output = candle_gen::gen_core::GenerationOutput::Images(vec![Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 3],
+        }]);
+        let candle_gen::gen_core::generator::ExecutionIdentity::Resolved { identity } =
+            attempt.finish_image(&crate::descriptor(), &output)
+        else {
+            panic!("source-backed PiD precision should resolve the weights-free report");
+        };
+        let candle_gen::gen_core::generator::ExecutionFact::Resolved { value } =
+            identity.quality_policy
+        else {
+            panic!("quality policy should be resolved");
+        };
+        for component in ["pid_caption_encoder", "pid_decoder"] {
+            let key = format!("sdxl/edit/{component}_compute");
+            assert_eq!(value["operations"][&key][0]["value"]["dtype"], "F32");
+        }
+        assert!(value["operations"]
+            .get("sdxl/edit/vae_decoder_compute")
+            .is_none());
+    }
 
     /// `steps == 0` is rejected with a fast, actionable error (never decoded as the noised source);
     /// a valid step count passes (sc-11182, F-102).
