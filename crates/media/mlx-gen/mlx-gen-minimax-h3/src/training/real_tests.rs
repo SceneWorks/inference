@@ -2,9 +2,16 @@
 //! `minimax-h3-image-train` real-weights profile — never by ordinary CI, which runs no model.
 //!
 //! The streamed, checkpointed backward (one block rebuilt at a time, one `vjp` per block) must give
-//! the gradients of the resident whole-graph `keyed_value_and_grad` over the same DiT, and both must
-//! agree with a central finite difference of the loss along a random direction. Float32 compute,
-//! so the finite difference measures the gradient rather than bf16 rounding.
+//! the gradients of the resident whole-graph `keyed_value_and_grad` over the same DiT, and the
+//! reverse-mode directional derivative `g·d` must equal the forward-mode one (a streamed `jvp`,
+//! [`super::step::streamed_jvp`]) at two points: the seeded B ~ N(0, 0.02) and B = 0 (the standard
+//! LoRA init). Float32 compute with IEEE GEMMs (`MLX_ENABLE_TF32=0`).
+//!
+//! The Richardson finite-difference arbiter runs at both points too. At B = 0 its verdict is
+//! asserted. At the seeded point it is logged only: there the finite difference's truncation error
+//! exceeds the tolerance at f32 (perturbing the early blocks propagates through block 49's
+//! near-hard attention, logits ~5e3; run 43546622241: R 0.886 with block 49's own subspaces at
+//! 0.998 / 0.9999), and forward-mode JVP — which has no step size — is the arbiter there.
 
 use mlx_rs::{random, Array, Dtype};
 
@@ -18,8 +25,8 @@ use gen_core_train::h3_image::training_step;
 use super::block_trainables;
 use super::step::{
     attention, block_vjp, install_concrete, loss_and_grads, materialize, noised_rows, parts,
-    run_block, stack_input, streamed_loss, streamed_loss_and_grads, tail_loss, BlockHost,
-    FactorGrads, LossSpec, StepInputs, LOKR_DTYPE,
+    run_block, stack_input, streamed_jvp, streamed_loss, streamed_loss_and_grads, tail_loss,
+    BlockHost, FactorGrads, LossSpec, StepInputs, LOKR_DTYPE,
 };
 use crate::h3_image::dit::MiniMaxH3ImageDit;
 use crate::h3_image::layout::ImageLayout;
@@ -103,6 +110,14 @@ fn restrict(g: &LoraParams, prefix: &str) -> LoraParams {
             };
             (k.clone(), kept)
         })
+        .collect()
+}
+
+/// `g` scaled to unit norm.
+fn unit(g: &LoraParams) -> LoraParams {
+    let s = 1.0 / dot(g, g).sqrt().max(1e-30);
+    g.iter()
+        .map(|(k, v)| (k.clone(), v.multiply(Array::from_f32(s)).unwrap()))
         .collect()
 }
 
@@ -688,12 +703,50 @@ fn streamed_backward_matches_resident_and_finite_differences_q4() {
         &mut loss_at,
     );
 
-    let seeded_rel = verdict("seeded, along g", seeded);
+    // 3. Forward mode against reverse mode, both points: the streamed jvp of the loss along the
+    //    unit direction d against g·d, for the full gradient and each factor pair's subspace. The
+    //    full-gradient comparison asserts at both points under GRAD_REL_L2_TOL.
+    let mut jvp_rel = Vec::new();
+    for (point, at, grads) in [("seeded", &params, &grads_s), ("B = 0", &zeroed, &grads_z)] {
+        let mut directions = vec![("g".to_string(), unit(grads))];
+        for prefix in [
+            "transformer_blocks.49.attn.to_q.",
+            "transformer_blocks.49.ff.net.2.",
+            "transformer_blocks.0.attn.to_q.",
+            "transformer_blocks.0.ff.net.2.",
+        ] {
+            let sub = restrict(grads, prefix);
+            if dot(&sub, &sub) > 0.0 {
+                directions.push((format!("g[{prefix}*]"), unit(&sub)));
+            }
+        }
+        for (name, d) in &directions {
+            let reverse = dot(grads, d);
+            let forward =
+                streamed_jvp(&mut streamed, &modulation_s, at, d, &spec(true), &inputs).unwrap();
+            let rel = (forward - reverse).abs() / reverse.abs().max(1e-30);
+            println!("[sw-7097 mlx] JVP {point}, along {name}: forward mode {forward:.9e}, reverse mode g·d {reverse:.9e}, rel {rel:.3e}");
+            if name == "g" {
+                jvp_rel.push((point, rel));
+            }
+        }
+    }
+
+    // Logged only at the seeded point (see the module docs); no measurable pair is logged too.
+    if seeded.is_some() {
+        let seeded_fd = verdict("seeded, along g", seeded);
+        println!("[sw-7097 mlx] FD seeded, along g: rel {seeded_fd:.3e} (logged only: the forward-mode JVP is the arbiter at the seeded point)");
+    } else {
+        println!("[sw-7097 mlx] FD seeded, along g: no measurable pair (logged only)");
+    }
     let init_rel = verdict("B = 0, along g", at_init);
-    assert!(
-        seeded_rel <= FD_REL_TOL,
-        "seeded point: Richardson finite difference rel {seeded_rel} exceeds {FD_REL_TOL}"
-    );
+    for (point, rel) in &jvp_rel {
+        assert!(
+            *rel <= GRAD_REL_L2_TOL,
+            "{point}: forward-mode JVP vs reverse-mode g·d rel {rel} exceeds {GRAD_REL_L2_TOL}"
+        );
+    }
+    assert_eq!(jvp_rel.len(), 2, "the JVP check ran at both points");
     assert!(
         init_rel <= FD_REL_TOL,
         "B = 0: Richardson finite difference rel {init_rel} exceeds {FD_REL_TOL}"

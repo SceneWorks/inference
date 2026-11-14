@@ -449,6 +449,100 @@ pub(crate) fn block_vjp(
     ))
 }
 
+/// The loss's directional derivative along `dir` by **forward mode**, streamed: block `l` rebuilt
+/// from the tier, then one `jvp` of `block(h_l, θ_l)` with tangents `(ṫ_l, dir_l)` — `ṫ_l` the
+/// tangent arriving from block `l − 1` (zero into block 0: the stack input does not depend on the
+/// factors), `dir_l` the direction's slice on block `l`'s factors — yields `(h_{l+1}, ṫ_{l+1})`;
+/// a last `jvp` of the tail turns `ṫ_L` into the loss tangent. The block function, the install and
+/// the attention plan are the trainer's ([`block_vjp`]'s twin), so this is the forward-mode
+/// derivative of the very function the streamed backward differentiates — with no step size,
+/// the gradient gate's arbiter where a finite difference's truncation error is too large.
+#[cfg(test)]
+pub(crate) fn streamed_jvp(
+    dit: &mut MiniMaxH3ImageDit,
+    modulation: &Modulation,
+    params: &LoraParams,
+    dir: &LoraParams,
+    spec: &LossSpec<'_>,
+    inputs: &StepInputs<'_>,
+) -> Result<f32> {
+    use mlx_rs::transforms::fallible_jvp;
+    let _eager = crate::dit::layers::EagerSwigluScope::enter();
+    let parts = parts(dit, inputs)?;
+    let dit: &MiniMaxH3ImageDit = dit;
+    let step = inputs.step.index;
+    let bounded = attention(spec, inputs.layout.seq_len() as u64);
+    let mut h = stack_input(dit, &parts, inputs.packed)?;
+    let mut tangent = mlx_rs::ops::zeros_like(&h)?;
+    eval([&h, &tangent])?;
+    for layer in 0..dit.num_layers() {
+        let trainables = &spec.blocks[layer];
+        let mut primals = vec![h.clone()];
+        let mut tangents = vec![tangent.clone()];
+        for key in &trainables.keys {
+            let missing = || Error::Msg(format!("LoRA param missing: {key}"));
+            primals.push(params.get(key).ok_or_else(missing)?.clone());
+            tangents.push(dir.get(key).ok_or_else(missing)?.clone());
+        }
+        let mut block = materialize(dit, layer)?;
+        let (outputs, jvps) = fallible_jvp(
+            |xs: &[Array]| -> MlxResult<Vec<Array>> {
+                if let Some(adapter) = &trainables.adapter {
+                    let traced: LoraParams = trainables
+                        .keys
+                        .iter()
+                        .cloned()
+                        .zip(xs[1..].iter().cloned())
+                        .collect();
+                    adapter.install_as(
+                        &mut BlockHost {
+                            index: layer,
+                            block: &mut block,
+                        },
+                        &traced,
+                        spec.alpha,
+                        spec.rank,
+                        spec.lora_dtype,
+                        LOKR_DTYPE,
+                    )?;
+                }
+                Ok(vec![run_block(
+                    dit, &block, layer, &xs[0], modulation, &parts, step, bounded,
+                )
+                .map_err(mlx_err)?])
+            },
+            &primals,
+            &tangents,
+        )?;
+        h = outputs.into_iter().next().ok_or_else(|| {
+            Error::Msg(format!(
+                "minimax_h3_image trainer: block {layer} jvp returned no output"
+            ))
+        })?;
+        tangent = jvps.into_iter().next().ok_or_else(|| {
+            Error::Msg(format!(
+                "minimax_h3_image trainer: block {layer} jvp returned no tangent"
+            ))
+        })?;
+        eval([&h, &tangent])?;
+        drop(block);
+    }
+    let (_, jvps) = fallible_jvp(
+        |xs: &[Array]| -> MlxResult<Vec<Array>> {
+            Ok(vec![tail_loss(
+                dit, &xs[0], modulation, &parts, inputs, spec.mae,
+            )
+            .map_err(mlx_err)?])
+        },
+        &[h],
+        &[tangent],
+    )?;
+    let loss_tangent = jvps.into_iter().next().ok_or_else(|| {
+        Error::Msg("minimax_h3_image trainer: the tail jvp returned no tangent".into())
+    })?;
+    Ok(loss_tangent.item::<f32>())
+}
+
 /// The streamed backward. `trace`, when given, receives the cotangent of every block's output
 /// `(l + 1, dL/dh_{l+1})` from the stack output down, then block 0's input `(0, dL/dh_0)` — the
 /// gradient gate's per-boundary diagnostic.
