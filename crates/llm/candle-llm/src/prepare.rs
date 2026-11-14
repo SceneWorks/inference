@@ -507,6 +507,49 @@ mod tests {
         assert_eq!(count_safetensors_tensors(dir.path()).unwrap(), 1);
     }
 
+    /// A quantized tier of a `qwen3_5` VLM keeps its whole vision tower as read: over the real
+    /// Qwen3.8-27B config and tensor list, the selection the preparer quantizes holds decoder and
+    /// MTP projections only, never a `model.visual.*` tensor. This is what lets the preparer claim
+    /// that family (`prepares_multimodal_or_text`) while declining every other VLM.
+    #[test]
+    fn a_qwen3_5_vlm_tier_never_quantizes_the_vision_tower() {
+        let fixture: Json = serde_json::from_str(include_str!(
+            "../../testdata/load_admission/qwen3.8-27b.json"
+        ))
+        .unwrap();
+        let config = &fixture["config"];
+        let tensors = fixture["tensors"].as_object().unwrap();
+        assert!(
+            config.get("vision_config").is_some(),
+            "the fixture is a VLM"
+        );
+        let selection =
+            QuantizedTensors::from_config(config, |key| tensors.contains_key(key)).unwrap();
+
+        let vision: Vec<&String> = tensors
+            .keys()
+            .filter(|key| key.starts_with("model.visual."))
+            .collect();
+        assert!(!vision.is_empty(), "the fixture carries a vision tower");
+        for key in vision {
+            assert!(!selection.contains(key), "{key} must be written as read");
+        }
+        let selected: Vec<&String> = tensors
+            .keys()
+            .filter(|key| selection.contains(key))
+            .collect();
+        assert!(
+            !selected.is_empty(),
+            "the decoder projections are quantized"
+        );
+        for key in selected {
+            assert!(
+                key.starts_with("model.language_model.layers.") || key.starts_with("mtp."),
+                "{key} is not a decoder or MTP projection"
+            );
+        }
+    }
+
     /// sc-19375: the preparer stores blocks for exactly the tensors the loader quantizes and load
     /// admission prices — the shared `loads_quantized` rule — so a projection-named tensor outside
     /// the decoder the loader builds (a layer past `num_hidden_layers`, another root) and every
