@@ -1025,16 +1025,17 @@ impl Pipeline {
         references: &[Image],
     ) -> CResult<String> {
         if !req.enhance_prompt {
-            req.prompt_enhancement
-                .emit(gen_core::PromptEnhancementReport::absent(&req.prompt));
+            candle_gen::execution::emit_prompt_enhancement(
+                &req.prompt_enhancement,
+                gen_core::PromptEnhancementReport::absent(&req.prompt),
+            );
             return Ok(req.prompt.clone());
         }
         let Some(upsampler) = upsampler else {
-            req.prompt_enhancement
-                .emit(gen_core::PromptEnhancementReport::fallback(
-                    &req.prompt,
-                    "component_unavailable",
-                ));
+            candle_gen::execution::emit_prompt_enhancement(
+                &req.prompt_enhancement,
+                gen_core::PromptEnhancementReport::fallback(&req.prompt, "component_unavailable"),
+            );
             return Ok(req.prompt.clone());
         };
         let result = upsampler.upsample_prompt(
@@ -1054,11 +1055,10 @@ impl Pipeline {
         match result {
             Ok(prompt) if !prompt.trim().is_empty() && prompt != req.prompt => {
                 eprintln!("ENHANCED_PROMPT:{}", sanitize_log_text(&prompt));
-                req.prompt_enhancement
-                    .emit(gen_core::PromptEnhancementReport::enhanced(
-                        &req.prompt,
-                        &prompt,
-                    ));
+                candle_gen::execution::emit_prompt_enhancement(
+                    &req.prompt_enhancement,
+                    gen_core::PromptEnhancementReport::enhanced(&req.prompt, &prompt),
+                );
                 Ok(prompt)
             }
             Ok(prompt) => {
@@ -1068,11 +1068,10 @@ impl Pipeline {
                     "unchanged_output"
                 };
                 eprintln!("ENHANCER_FALLBACK:{reason}");
-                req.prompt_enhancement
-                    .emit(gen_core::PromptEnhancementReport::fallback(
-                        &req.prompt,
-                        reason,
-                    ));
+                candle_gen::execution::emit_prompt_enhancement(
+                    &req.prompt_enhancement,
+                    gen_core::PromptEnhancementReport::fallback(&req.prompt, reason),
+                );
                 Ok(req.prompt.clone())
             }
             Err(CandleError::Canceled) => Err(CandleError::Canceled),
@@ -1084,11 +1083,10 @@ impl Pipeline {
                     "ENHANCER_FALLBACK:{}",
                     sanitize_log_text(&error.to_string())
                 );
-                req.prompt_enhancement
-                    .emit(gen_core::PromptEnhancementReport::fallback(
-                        &req.prompt,
-                        "enhancer_error",
-                    ));
+                candle_gen::execution::emit_prompt_enhancement(
+                    &req.prompt_enhancement,
+                    gen_core::PromptEnhancementReport::fallback(&req.prompt, "enhancer_error"),
+                );
                 Ok(req.prompt.clone())
             }
         }
@@ -1260,6 +1258,7 @@ impl Pipeline {
                             None => v,
                         }
                     };
+                    observe_consumed_guidance(guidance, embedded_guidance, negative.is_some());
                     Ok(out)
                 },
             )?;
@@ -1331,6 +1330,19 @@ pub(crate) fn run_bespoke_request<T>(
     }
 }
 
+/// Record the scalar and branch that a successful denoiser evaluation actually consumed.
+fn observe_consumed_guidance(guidance: f32, embedded: bool, negative: bool) {
+    let mode = if embedded {
+        "embedded"
+    } else if negative {
+        "classifier_free"
+    } else {
+        "classifier_free_off"
+    };
+    candle_gen::execution::policy("flux2.guidance_mode", mode.into());
+    candle_gen::execution::f32_policy("flux2.guidance", guidance);
+}
+
 /// Complete a direct FLUX.2 image only after its legacy execution and device fence succeed.
 /// `missing_fact` names a route-local observation gap rather than filling it from submitted knobs.
 pub(crate) fn complete_bespoke_image(
@@ -1351,7 +1363,7 @@ pub(crate) fn complete_bespoke_image(
 #[cfg(test)]
 mod direct_completion_tests {
     use super::*;
-    use gen_core::generator::ExecutionIdentity;
+    use gen_core::generator::{ExecutionFact, ExecutionIdentity};
 
     fn image(width: u32) -> Image {
         Image {
@@ -1359,6 +1371,56 @@ mod direct_completion_tests {
             height: 1,
             pixels: vec![0; width as usize * 3],
         }
+    }
+
+    fn guidance_policy(variant: Flux2Variant, guidance: f32, negative: bool) -> serde_json::Value {
+        let descriptor = descriptor(variant);
+        let completed = candle_gen::execution::capture_direct(
+            &descriptor,
+            &gen_core::CancelFlag::default(),
+            || {
+                candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+                candle_gen::execution::schedule("euler", &[1.0, 0.0], "flow");
+                candle_gen::execution::rng_scheme("test");
+                candle_gen::execution::draw("noise", 7, 0);
+                observe_consumed_guidance(guidance, variant.uses_embedded_guidance(), negative);
+                Ok(GenerationOutput::Images(vec![image(1)]))
+            },
+        )
+        .unwrap();
+        let ExecutionFact::Resolved { value } =
+            &completed.execution.resolved().unwrap().quality_policy
+        else {
+            panic!("expected a resolved quality policy")
+        };
+        value.clone()
+    }
+
+    #[test]
+    fn consumed_guidance_scalar_and_branch_distinguish_execution_identities() {
+        let dev_three = guidance_policy(Flux2Variant::Dev, 3.0, false);
+        let dev_four = guidance_policy(Flux2Variant::Dev, 4.0, false);
+        assert_ne!(dev_three, dev_four);
+        assert_eq!(
+            dev_three["operations"]["flux2.guidance"][0]["value"],
+            "f32:40400000"
+        );
+        assert_eq!(
+            dev_three["operations"]["flux2.guidance_mode"][0]["value"],
+            "embedded"
+        );
+
+        let klein_off = guidance_policy(Flux2Variant::Klein9b, 1.0, false);
+        let klein_cfg = guidance_policy(Flux2Variant::Klein9b, 3.0, true);
+        assert_ne!(klein_off, klein_cfg);
+        assert_eq!(
+            klein_off["operations"]["flux2.guidance_mode"][0]["value"],
+            "classifier_free_off"
+        );
+        assert_eq!(
+            klein_cfg["operations"]["flux2.guidance_mode"][0]["value"],
+            "classifier_free"
+        );
     }
 
     #[test]

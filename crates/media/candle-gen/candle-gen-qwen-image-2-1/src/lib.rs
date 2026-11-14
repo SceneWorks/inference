@@ -525,6 +525,19 @@ fn load_heavy(spec: &LoadSpec, device: &Device) -> Result<Heavy> {
     Ok(Heavy { transformer, vae })
 }
 
+/// Bind a component's loaded compute storage to the attempt that actually runs it. The sampler's
+/// f32 noise and velocity tensors do not describe the text encoder, DiT, or VAE arithmetic.
+fn observe_component_compute(component: &str, device: &Device, dtype: candle_core::DType) {
+    candle_gen::execution::runtime(device, dtype);
+    candle_gen::execution::policy(
+        &format!("qwen21/{component}_compute"),
+        serde_json::json!({
+            "device": format!("{:?}", device.location()),
+            "dtype": format!("{dtype:?}"),
+        }),
+    );
+}
+
 impl Generator for QwenImage21 {
     fn generate_with_execution_report(
         &self,
@@ -726,6 +739,7 @@ impl QwenImage21 {
             false,
             on_progress,
             |te: &QwenImage21TextEncoder| {
+                observe_component_compute("text_encoder", te.device(), te.dtype());
                 // The ordered reference list, host-preprocessed against the snapshot's own
                 // Qwen3-VL processor geometry, encoded into one joint branch per CFG side.
                 // Empty ⇒ the text-to-image route, unchanged.
@@ -733,6 +747,12 @@ impl QwenImage21 {
             },
             |_| Ok(()),
             |heavy, branches, on_progress| {
+                observe_component_compute(
+                    "dit",
+                    heavy.transformer.device(),
+                    heavy.transformer.compute_dtype(),
+                );
+                observe_component_compute("vae", heavy.vae.device(), heavy.vae.compute_dtype());
                 let ReferenceBranches {
                     pos,
                     neg,
@@ -1015,6 +1035,46 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 mod tests {
     use super::*;
     use candle_gen::gen_core::{OffloadPolicy, WeightsSource};
+
+    #[test]
+    fn component_compute_precision_is_distinct_from_f32_sampler_storage() {
+        fn captured_policy(component_dtype: candle_core::DType) -> serde_json::Value {
+            let attempt = candle_gen::execution::Attempt::begin();
+            candle_gen::execution::rng_scheme("qwen21-test-seeded-noise");
+            candle_gen::execution::draw("image_initial_noise", 7, 0);
+            candle_gen::execution::schedule("euler", &[1.0, 0.0], "Flow");
+            candle_gen::execution::runtime(&Device::Cpu, candle_core::DType::F32);
+            for component in ["text_encoder", "dit", "vae"] {
+                observe_component_compute(component, &Device::Cpu, component_dtype);
+            }
+            let output = GenerationOutput::Images(vec![gen_core::Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            }]);
+            let gen_core::generator::ExecutionIdentity::Resolved { identity } =
+                attempt.finish_image(&descriptor(), &output)
+            else {
+                panic!("component observations should complete the weights-free report");
+            };
+            let gen_core::generator::ExecutionFact::Resolved { value } = identity.quality_policy
+            else {
+                panic!("quality policy should be resolved");
+            };
+            value
+        }
+
+        let f32 = captured_policy(candle_core::DType::F32);
+        let bf16 = captured_policy(candle_core::DType::BF16);
+        for component in ["text_encoder", "dit", "vae"] {
+            let key = format!("qwen21/{component}_compute");
+            assert_eq!(f32["operations"][&key][0]["value"]["dtype"], "F32");
+            assert_eq!(bf16["operations"][&key][0]["value"]["dtype"], "BF16");
+        }
+        assert_eq!(bf16["compute"][0]["dtype"], "F32");
+        assert_eq!(bf16["compute"][1]["dtype"], "BF16");
+        assert_ne!(f32, bf16);
+    }
 
     fn req(width: u32, height: u32) -> GenerationRequest {
         GenerationRequest {

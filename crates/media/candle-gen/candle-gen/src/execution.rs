@@ -18,6 +18,7 @@ use gen_core::generator::{
     NumericScheduleDigest, ResolvedExecutionIdentity, EXECUTION_IDENTITY_VERSION,
 };
 use gen_core::Progress;
+use gen_core::{PromptEnhancementReport, PromptEnhancementSink};
 use serde_json::{json, Value};
 
 #[derive(Default)]
@@ -282,6 +283,11 @@ pub fn outside_attempt<T>(body: impl FnOnce() -> T) -> T {
     body()
 }
 
+/// Deliver a prompt fact to the consumer without recording work it runs as provider execution.
+pub fn emit_prompt_enhancement(sink: &PromptEnhancementSink, report: PromptEnhancementReport) {
+    outside_attempt(|| sink.emit(report));
+}
+
 /// Run a standalone image provider entry point with the same attempt-local contract.
 pub fn capture_direct(
     descriptor: &gen_core::ModelDescriptor,
@@ -482,6 +488,12 @@ mod tests {
             progress: &mut dyn FnMut(Progress),
         ) -> gen_core::Result<GenerationOutput> {
             // Metadata only: no Tensor, model forward, or production denoising loop.
+            if req.prompt_enhancement.is_active() {
+                emit_prompt_enhancement(
+                    &req.prompt_enhancement,
+                    PromptEnhancementReport::absent(&req.prompt),
+                );
+            }
             rng_scheme("fixture-observed-seeds-v1");
             let images = crate::for_each_image_seed(req.seed.unwrap_or(91), req.count, |_seed| {
                 policy(
@@ -614,6 +626,57 @@ mod tests {
         };
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].seed, Some(91));
+    }
+
+    #[test]
+    fn prompt_enhancement_callback_cannot_capture_ordinary_generation_or_nested_report() {
+        let sink = PromptEnhancementSink::new(|report| {
+            assert_eq!(report, PromptEnhancementReport::absent("outer"));
+            Fixture
+                .generate(
+                    &GenerationRequest {
+                        seed: Some(123),
+                        ..Default::default()
+                    },
+                    &mut |_| {},
+                )
+                .unwrap();
+            draw("foreign_callback", 456, 99);
+            let inner = resolved(
+                Fixture
+                    .generate_with_execution_report(
+                        &GenerationRequest {
+                            seed: Some(7),
+                            ..Default::default()
+                        },
+                        &mut |_| {},
+                    )
+                    .unwrap(),
+            );
+            let ExecutionRandomness::Draws { draws, .. } = inner.randomness else {
+                panic!("draws")
+            };
+            assert_eq!(draws.len(), 1);
+            assert_eq!(draws[0].seed, Some(7));
+        });
+        let outer = resolved(
+            Fixture
+                .generate_with_execution_report(
+                    &GenerationRequest {
+                        prompt: "outer".into(),
+                        prompt_enhancement: sink,
+                        ..Default::default()
+                    },
+                    &mut |_| {},
+                )
+                .unwrap(),
+        );
+        let ExecutionRandomness::Draws { draws, .. } = outer.randomness else {
+            panic!("draws")
+        };
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].seed, Some(91));
+        assert_eq!(outer.sampling, ExecutionFact::resolved(json!(["euler"])));
     }
 
     #[test]
