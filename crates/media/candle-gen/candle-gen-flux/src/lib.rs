@@ -77,7 +77,10 @@ pub mod ip_adapter;
 mod ip_dit;
 pub mod ip_image_encoder;
 pub mod ip_provider;
-pub use ip_provider::{IpAdapterFlux, IpAdapterFluxPaths, IpAdapterFluxRequest, DEFAULT_IP_SCALE};
+pub use ip_provider::{
+    compile_ip_plan, ip_load_spec, IpAdapterFlux, IpAdapterFluxPaths, IpAdapterFluxRequest,
+    DEFAULT_IP_SCALE,
+};
 
 // FLUX.1-dev Fun-Controlnet-Union (sc-8412) — strict structural conditioning (pose/canny/depth,
 // input-agnostic) via `Shakker-Labs/FLUX.1-dev-ControlNet-Union-Pro-2.0`. `control` is the diffusers
@@ -90,7 +93,8 @@ pub mod control;
 pub mod control_provider;
 pub use control::{FluxControlNet, FluxControlNetConfig, FluxControlTransformer};
 pub use control_provider::{
-    Flux1ControlPaths, Flux1ControlRequest, Flux1DevControl, DEFAULT_CONTROL_SCALE,
+    compile_control_plan, control_load_spec, Flux1ControlPaths, Flux1ControlRequest,
+    Flux1DevControl, DEFAULT_CONTROL_SCALE,
 };
 
 // The vendored FLUX DiT + its post-block image-stream injector seam, re-exported for the PuLID-FLUX

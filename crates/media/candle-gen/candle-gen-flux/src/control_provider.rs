@@ -17,7 +17,7 @@
 //! **Compose-readiness:** the denoise routes through [`crate::FluxControlTransformer::forward_composed`], which
 //! threads an optional identity injector ([`crate::ip_dit::DitImageInjector`] — PuLID / XLabs
 //! IP-Adapter) into the SAME base double-block stream as the control residuals. This provider wires the
-//! seam (and exposes [`Flux1DevControl::generate_with_injector`]); a follow-on epic stacks identity +
+//! seam (and exposes [`Flux1DevControl::generate_with_injector_planned`]); a follow-on epic stacks identity +
 //! control in one denoise step by passing `Some(injector)`.
 //!
 //! Bespoke provider (NOT gen-core-registered), worker-invoked by name — the candle pattern for
@@ -205,7 +205,6 @@ pub struct Flux1DevControl {
     memory: GenerationMemory,
     backbone: FluxRefBackbone,
     branch: FluxControlNet,
-    loaded_paths: Flux1ControlPaths,
     loaded_spec: LoadSpec,
     memory_contract: Option<MemoryProviderContract>,
     admitted_context: Option<MemoryRunContext>,
@@ -309,6 +308,19 @@ fn typed_control_request(
     })
 }
 
+/// The load contract [`Flux1DevControl::load`] / [`Flux1DevControl::load_with_memory`] bind, so a
+/// caller of those paths-only loaders can compile [`compile_control_plan`] before loading.
+pub fn control_load_spec(paths: &Flux1ControlPaths) -> LoadSpec {
+    let control = if paths.control.is_dir() {
+        WeightsSource::Dir(paths.control.clone())
+    } else {
+        WeightsSource::File(paths.control.clone())
+    };
+    LoadSpec::new(WeightsSource::Dir(paths.flux_base.clone()))
+        .with_control(control)
+        .with_adapters(paths.adapters.clone())
+}
+
 /// Resolve and bind the entire strict-control request before opening model weights.
 pub fn compile_control_plan(
     paths: &Flux1ControlPaths,
@@ -342,15 +354,7 @@ impl Flux1DevControl {
     }
 
     pub fn load_with_memory(paths: &Flux1ControlPaths, memory: GenerationMemory) -> Result<Self> {
-        let control = if paths.control.is_dir() {
-            WeightsSource::Dir(paths.control.clone())
-        } else {
-            WeightsSource::File(paths.control.clone())
-        };
-        let spec = LoadSpec::new(WeightsSource::Dir(paths.flux_base.clone()))
-            .with_control(control)
-            .with_adapters(paths.adapters.clone());
-        Self::load_with_memory_spec(paths, memory, &spec)
+        Self::load_with_memory_spec(paths, memory, &control_load_spec(paths))
     }
 
     /// The worker passes the same resolved contract used for pre-load planning.
@@ -417,7 +421,6 @@ impl Flux1DevControl {
             memory,
             backbone,
             branch,
-            loaded_paths: paths.clone(),
             loaded_spec: spec.clone(),
             memory_contract,
             admitted_context,
@@ -434,33 +437,11 @@ impl Flux1DevControl {
         self.branch.num_residuals()
     }
 
-    /// Generate one control-conditioned image. `control_image` is the preprocessed pose/canny/depth hint
-    /// (the worker pre-fits it to the render size; this re-resizes defensively). `injector = None` is the
-    /// plain control path.
-    pub fn generate(
-        &self,
-        req: &Flux1ControlRequest,
-        control_image: &Image,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
-        self.generate_with_injector(req, control_image, None, on_progress)
-    }
-
-    /// As [`generate`](Self::generate), but threading an OPTIONAL identity injector (PuLID / XLabs
-    /// IP-Adapter) into every control-denoise step — the **compose-ready** seam. With `injector = None`
-    /// this is the plain control path; `Some(..)` stacks identity + control in one denoise.
-    pub fn generate_with_injector(
-        &self,
-        req: &Flux1ControlRequest,
-        control_image: &Image,
-        injector: Option<&dyn DitImageInjector>,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
-        let plan = compile_control_plan(&self.loaded_paths, &self.loaded_spec, req, control_image)?;
-        self.generate_with_injector_planned(req, control_image, injector, &plan, on_progress)
-    }
-
-    /// Consume the previously compiled, source-bound trajectory after the worker's load.
+    /// Generate one control-conditioned image from the trajectory [`compile_control_plan`] froze
+    /// before load. `control_image` is the preprocessed pose/canny/depth hint (the worker pre-fits it
+    /// to the render size; this re-resizes defensively). `injector` optionally threads an identity
+    /// injector (PuLID / XLabs IP-Adapter) into every control-denoise step — the **compose-ready**
+    /// seam; `None` is the plain control path.
     pub fn generate_with_injector_planned(
         &self,
         req: &Flux1ControlRequest,

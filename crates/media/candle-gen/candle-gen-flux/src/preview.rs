@@ -1005,39 +1005,44 @@ mod tests {
         }
     }
 
-    /// The control provider ships **one** sampler site with **two** public entry points —
-    /// `generate` (the plain control render) and `generate_with_injector` (the compose-ready seam that
-    /// stacks PuLID / IP identity on top of control) — and `generate` is implemented as a delegation to
-    /// the other. A site-level assertion cannot see that distinction, and sc-16955's Lens finding was
-    /// exactly this shape: one site, several callers, one of which could quietly stop forwarding its
-    /// sink.
+    /// The control provider ships **one** sampler site behind its planned public entry points —
+    /// `generate_with_injector_planned` (plain control, or identity stacked on control) and the two
+    /// admitted `*_memory_context_planned` variants — and every one of them funnels into the single
+    /// private `generate_with_injector_planned_scoped` body. A site-level assertion cannot see that
+    /// distinction, and sc-16955's Lens finding was exactly this shape: one site, several callers,
+    /// one of which could quietly stop forwarding its sink.
     ///
-    /// Here the two callers cannot diverge, because there is only one body: `generate` forwards its
-    /// whole `req` — preview sink included — and adds `None` for the injector. Pinned against the
-    /// crate's own source so a future refactor that gave `generate` a body of its own would have to
-    /// come back here.
+    /// Pinned against the crate's own source so a future refactor that gave an entry point a body of
+    /// its own would have to come back here.
     #[test]
-    fn both_control_entry_points_reach_the_one_hooked_site() {
+    fn every_control_entry_point_reaches_the_one_hooked_site() {
         let source = include_str!("control_provider.rs");
         let stripped: String = source
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            stripped.contains("self.generate_with_injector(req, control_image, None, on_progress)"),
-            "`generate` must delegate its whole request to `generate_with_injector`, or the two \
-             entry points no longer share the one hooked sampler site"
-        );
         assert_eq!(
             stripped.matches("fn generate").count(),
+            4,
+            "control_provider.rs must expose exactly the three planned entry points plus the one \
+             scoped body this row reasons about"
+        );
+        assert_eq!(
+            stripped
+                .matches("self.generate_with_injector_planned_scoped(")
+                .count(),
             2,
-            "control_provider.rs must expose exactly the two entry points this row reasons about"
+            "the unscoped and admitted entry points must both delegate to the one scoped body"
+        );
+        assert!(
+            stripped.contains("self.generate_with_injector_memory_context_planned("),
+            "the plain admitted entry point must delegate to the injector-aware admitted one"
         );
         assert_eq!(
             sampler_call_sites("control_provider.rs", source).len(),
             1,
-            "both entry points must reach ONE sampler site"
+            "every entry point must reach ONE sampler site"
         );
     }
 

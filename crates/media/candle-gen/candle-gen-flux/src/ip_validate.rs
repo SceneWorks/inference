@@ -33,7 +33,9 @@ use candle_gen::weights::Weights;
 use candle_gen_sdxl::ip_adapter::preprocess_clip_image_sized;
 use candle_gen_sdxl::vision_encoder::{ClipVisionEncoder, VisionConfig};
 
-use crate::ip_provider::{IpAdapterFlux, IpAdapterFluxPaths, IpAdapterFluxRequest};
+use crate::ip_provider::{
+    compile_ip_plan, ip_load_spec, IpAdapterFlux, IpAdapterFluxPaths, IpAdapterFluxRequest,
+};
 
 /// A standalone CLIP ViT-L feature extractor for the cosine metric: preprocess → penultimate →
 /// mean-pool over tokens → L2-normalize. Returns a 1024-vec.
@@ -100,10 +102,6 @@ fn real_weight_ip_adapter() {
         reference.width, reference.height
     );
 
-    let t0 = std::time::Instant::now();
-    let model = IpAdapterFlux::load(&paths).expect("load IpAdapterFlux");
-    println!("loaded in {:?}", t0.elapsed());
-
     let base = IpAdapterFluxRequest {
         prompt: "a cinematic portrait photo, soft natural light, photorealistic, sharp focus"
             .into(),
@@ -126,10 +124,26 @@ fn real_weight_ip_adapter() {
 
     let mut noop = |_p: Progress| {};
 
+    // Compile every trajectory before any weight loads; the load binds the same spec.
+    let spec = ip_load_spec(&paths);
+    let base_plan = compile_ip_plan(&paths, &spec, &base, &reference).expect("compile ip plan");
+    // Without IP (scale 0 → forked DiT byte-identical to plain FLUX at the same seed/prompt).
+    let plain_req = IpAdapterFluxRequest {
+        ip_adapter_scale: 0.0,
+        ..base.clone()
+    };
+    let plain_plan =
+        compile_ip_plan(&paths, &spec, &plain_req, &reference).expect("compile no-ip plan");
+
+    let t0 = std::time::Instant::now();
+    let model = IpAdapterFlux::load_with_memory_spec(&paths, base.memory, &spec)
+        .expect("load IpAdapterFlux");
+    println!("loaded in {:?}", t0.elapsed());
+
     // With IP.
     let t = std::time::Instant::now();
     let out_ip = model
-        .generate(&base, &reference, &mut noop)
+        .generate_planned(&base, &reference, &base_plan, &mut noop)
         .expect("generate (ip)");
     println!("[ip] {:?}", t.elapsed());
     write_ppm(&out_dir.join("flux_ip.ppm"), &out_ip);
@@ -139,7 +153,7 @@ fn real_weight_ip_adapter() {
     // adapter explicitly for a later acceptance run.
     if let Some(adapter) = std::env::var_os("IP_FLUX_LORA") {
         drop(model);
-        let adapted = IpAdapterFlux::load(&IpAdapterFluxPaths {
+        let adapted_paths = IpAdapterFluxPaths {
             flux_base: env_path("IP_FLUX_BASE"),
             ip_adapter: env_path("IP_FLUX_ADAPTER"),
             image_encoder: image_encoder.clone(),
@@ -148,10 +162,15 @@ fn real_weight_ip_adapter() {
                 1.0,
                 candle_gen::gen_core::AdapterKind::Lora,
             )],
-        })
-        .expect("load adapter-conditioned IpAdapterFlux");
+        };
+        let adapted_spec = ip_load_spec(&adapted_paths);
+        let adapted_plan = compile_ip_plan(&adapted_paths, &adapted_spec, &base, &reference)
+            .expect("compile adapter-conditioned ip plan");
+        let adapted =
+            IpAdapterFlux::load_with_memory_spec(&adapted_paths, base.memory, &adapted_spec)
+                .expect("load adapter-conditioned IpAdapterFlux");
         let out_adapted = adapted
-            .generate(&base, &reference, &mut noop)
+            .generate_planned(&base, &reference, &adapted_plan, &mut noop)
             .expect("generate (ip + LoRA)");
         assert_eq!(
             (out_adapted.width, out_adapted.height),
@@ -165,14 +184,10 @@ fn real_weight_ip_adapter() {
         return;
     }
 
-    // Without IP (scale 0 → forked DiT byte-identical to plain FLUX at the same seed/prompt).
-    let plain_req = IpAdapterFluxRequest {
-        ip_adapter_scale: 0.0,
-        ..base.clone()
-    };
+    // Without IP.
     let t = std::time::Instant::now();
     let out_plain = model
-        .generate(&plain_req, &reference, &mut noop)
+        .generate_planned(&plain_req, &reference, &plain_plan, &mut noop)
         .expect("generate (no ip)");
     println!("[no-ip] {:?}", t.elapsed());
     write_ppm(&out_dir.join("flux_no_ip.ppm"), &out_plain);
@@ -197,7 +212,7 @@ fn real_weight_ip_adapter() {
         },
         ..base.clone()
     };
-    let pre = model.generate(&cancelled, &reference, &mut noop);
+    let pre = model.generate_planned(&cancelled, &reference, &base_plan, &mut noop);
     assert!(
         matches!(pre, Err(candle_gen::CandleError::Canceled)),
         "pre-cancel must return Canceled"
@@ -220,7 +235,7 @@ fn real_weight_ip_adapter() {
             }
         }
     };
-    let res = model.generate(&mid_req, &reference, &mut cancel_at_3);
+    let res = model.generate_planned(&mid_req, &reference, &base_plan, &mut cancel_at_3);
     assert!(
         matches!(res, Err(candle_gen::CandleError::Canceled)),
         "mid-cancel must return Canceled"

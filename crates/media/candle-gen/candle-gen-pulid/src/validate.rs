@@ -31,7 +31,9 @@ use candle_gen::gen_core::{FaceEmbedder, Image, Progress};
 use candle_gen::testkit::{cosine, env_path, read_ppm, write_ppm};
 use candle_gen::CandleError;
 
-use crate::pulid_flux::{PulidFlux, PulidFluxPaths, PulidFluxRequest};
+use crate::pulid_flux::{
+    compile_pulid_plan, pulid_load_spec, PulidFlux, PulidFluxPaths, PulidFluxRequest,
+};
 
 fn memory_strategy_from_env() -> candle_gen::gen_core::MemoryStrategy {
     use candle_gen::gen_core::MemoryStrategy;
@@ -91,7 +93,6 @@ fn real_weight_memory_rung() {
         },
     )
     .unwrap();
-    let model = PulidFlux::load_with_memory_context(&paths, context.clone()).unwrap();
     let reference = read_ppm(&env_path("PULID_REF"));
     let request = PulidFluxRequest {
         prompt: "portrait of a person, color photo, cinematic lighting, sharp focus, high detail"
@@ -103,9 +104,18 @@ fn real_weight_memory_rung() {
         seed: 12345,
         ..Default::default()
     };
+    // Compile before any weight loads; the admitted load binds the same spec.
+    let plan = compile_pulid_plan(&paths, &pulid_load_spec(&paths), &request, &reference).unwrap();
+    let model = PulidFlux::load_with_memory_context(&paths, context.clone()).unwrap();
     let started = Instant::now();
     let output = model
-        .generate_with_memory_context(&context, &request, &reference, &mut make_progress())
+        .generate_with_memory_context_planned(
+            &context,
+            &request,
+            &reference,
+            &plan,
+            &mut make_progress(),
+        )
         .unwrap();
     let name = format!("pulid_memory_{}.ppm", memory_strategy_key(strategy));
     write_ppm(&out_dir.join(name), &output);
@@ -180,29 +190,7 @@ fn real_weight_pulid() {
         adapters: Vec::new(),
     };
 
-    eprintln!("loading PulidFlux (FLUX.1-dev + PuLID + EVA-CLIP + face stack) ...");
-    let t0 = Instant::now();
-    let model = PulidFlux::load(&paths).expect("PulidFlux::load");
-    // A separate face stack for re-embedding the outputs (same weights; the model's is private).
-    let face = candle_gen_face::load_on(
-        &env_path("PULID_FACE_DIR"),
-        &candle_gen::default_device().unwrap(),
-    )
-    .expect("load face stack for re-embedding");
-    eprintln!("loaded in {:?}", t0.elapsed());
-
     let reference = read_ppm(&env_path("PULID_REF"));
-    let ref_emb = face
-        .largest_face(&reference)
-        .expect("detect a face in the reference image")
-        .embedding;
-    eprintln!(
-        "reference {}x{} — ArcFace embedding {}-d",
-        reference.width,
-        reference.height,
-        ref_emb.len()
-    );
-
     let steps: usize = std::env::var("PULID_STEPS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -227,18 +215,51 @@ fn real_weight_pulid() {
         preview: candle_gen::gen_core::PreviewSink::default(),
         cancel: CancelFlag::new(),
     };
+    // The no-id ablation (id_weight 0.0 ⇒ plain FLUX, same seed/prompt).
+    let no_id_req = PulidFluxRequest {
+        id_weight: 0.0,
+        ..base.clone()
+    };
+    // Compile every trajectory before any weight loads; the load binds the same spec.
+    let spec = pulid_load_spec(&paths);
+    let base_plan = compile_pulid_plan(&paths, &spec, &base, &reference).expect("compile id plan");
+    let no_id_plan =
+        compile_pulid_plan(&paths, &spec, &no_id_req, &reference).expect("compile no-id plan");
+
+    eprintln!("loading PulidFlux (FLUX.1-dev + PuLID + EVA-CLIP + face stack) ...");
+    let t0 = Instant::now();
+    let model = PulidFlux::load_with_memory_spec(&paths, Default::default(), &spec)
+        .expect("PulidFlux::load");
+    // A separate face stack for re-embedding the outputs (same weights; the model's is private).
+    let face = candle_gen_face::load_on(
+        &env_path("PULID_FACE_DIR"),
+        &candle_gen::default_device().unwrap(),
+    )
+    .expect("load face stack for re-embedding");
+    eprintln!("loaded in {:?}", t0.elapsed());
+
+    let ref_emb = face
+        .largest_face(&reference)
+        .expect("detect a face in the reference image")
+        .embedding;
+    eprintln!(
+        "reference {}x{} — ArcFace embedding {}-d",
+        reference.width,
+        reference.height,
+        ref_emb.len()
+    );
 
     // --- 1) id-conditioned render (id_weight 1.0) ---
     let t = Instant::now();
     let with_id = model
-        .generate(&base, &reference, &mut make_progress())
+        .generate_planned(&base, &reference, &base_plan, &mut make_progress())
         .expect("pulid generate (id_weight 1.0)");
     eprintln!("[id] {:?}", t.elapsed());
     write_ppm(&out_dir.join("pulid_id.ppm"), &with_id);
     if let Some(adapter) = std::env::var_os("PULID_LORA") {
         drop(model);
         drop(face);
-        let adapted = PulidFlux::load(&PulidFluxPaths {
+        let adapted_paths = PulidFluxPaths {
             flux_base: env_path("PULID_FLUX_BASE"),
             pulid_weights: env_path("PULID_WEIGHTS"),
             eva_weights: env_path("PULID_EVA"),
@@ -248,10 +269,15 @@ fn real_weight_pulid() {
                 1.0,
                 candle_gen::gen_core::AdapterKind::Lora,
             )],
-        })
-        .expect("load adapter-conditioned PuLID");
+        };
+        let adapted_spec = pulid_load_spec(&adapted_paths);
+        let adapted_plan = compile_pulid_plan(&adapted_paths, &adapted_spec, &base, &reference)
+            .expect("compile adapter-conditioned plan");
+        let adapted =
+            PulidFlux::load_with_memory_spec(&adapted_paths, Default::default(), &adapted_spec)
+                .expect("load adapter-conditioned PuLID");
         let with_adapter = adapted
-            .generate(&base, &reference, &mut make_progress())
+            .generate_planned(&base, &reference, &adapted_plan, &mut make_progress())
             .expect("pulid generate (identity + LoRA)");
         assert_eq!(
             (with_adapter.width, with_adapter.height),
@@ -267,13 +293,9 @@ fn real_weight_pulid() {
     let id_cos = output_cosine(&face, &ref_emb, &with_id, "id");
 
     // --- 2) no-id ablation (id_weight 0.0 ⇒ plain FLUX, same seed/prompt) ---
-    let no_id_req = PulidFluxRequest {
-        id_weight: 0.0,
-        ..base.clone()
-    };
     let t = Instant::now();
     let no_id = model
-        .generate(&no_id_req, &reference, &mut make_progress())
+        .generate_planned(&no_id_req, &reference, &no_id_plan, &mut make_progress())
         .expect("pulid generate (id_weight 0.0)");
     eprintln!("[no-id] {:?}", t.elapsed());
     write_ppm(&out_dir.join("pulid_no_id.ppm"), &no_id);
@@ -290,7 +312,7 @@ fn real_weight_pulid() {
         },
         ..base.clone()
     };
-    let r = model.generate(&pre, &reference, &mut make_progress());
+    let r = model.generate_planned(&pre, &reference, &base_plan, &mut make_progress());
     assert!(
         matches!(r, Err(CandleError::Canceled)),
         "pre-cancel must return Err(Canceled), got {r:?}"
@@ -315,7 +337,7 @@ fn real_weight_pulid() {
         cancel: cancel.clone(),
         ..base.clone()
     };
-    let r = model.generate(&mid, &reference, &mut prog);
+    let r = model.generate_planned(&mid, &reference, &base_plan, &mut prog);
     assert!(
         matches!(r, Err(CandleError::Canceled)),
         "mid-denoise cancel must return Err(Canceled), got {r:?}"

@@ -1200,7 +1200,7 @@ const BESPOKE_PROVIDER_CRATES: &[BespokeCrate] = &[
         routes: &[],
     },
     // sc-16956's inventory, and the only wired member of this table: ONE hooked
-    // `run_flow_sampler` site, in `PulidFlux::generate`'s dev flow denoise. `preview.rs` is a
+    // `run_flow_sampler` site, in `PulidFlux::generate_planned`'s dev flow denoise. `preview.rs` is a
     // `pub use` shim over `candle-gen-flux`'s projector — PuLID composes that crate's own
     // `FluxRefBackbone`, so the latent, the unpack and the VAE are literally the registered
     // `flux1_dev` route's — so it holds neither a site nor a direct emission. No dark site: this is

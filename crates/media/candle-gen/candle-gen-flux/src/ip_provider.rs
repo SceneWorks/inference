@@ -192,7 +192,6 @@ pub struct IpAdapterFlux {
     backbone: FluxRefBackbone,
     ip_encoder: FluxIpImageEncoder,
     adapter: FluxIpAdapter,
-    loaded_paths: IpAdapterFluxPaths,
     loaded_spec: LoadSpec,
     memory: GenerationMemory,
     memory_contract: Option<MemoryProviderContract>,
@@ -294,6 +293,20 @@ fn typed_ip_request(
     })
 }
 
+/// The load contract [`IpAdapterFlux::load`] / [`IpAdapterFlux::load_with_memory`] bind, so a caller
+/// of those paths-only loaders can compile [`compile_ip_plan`] before loading.
+pub fn ip_load_spec(paths: &IpAdapterFluxPaths) -> LoadSpec {
+    let encoder = if paths.image_encoder.is_dir() {
+        WeightsSource::Dir(paths.image_encoder.clone())
+    } else {
+        WeightsSource::File(paths.image_encoder.clone())
+    };
+    LoadSpec::new(WeightsSource::Dir(paths.flux_base.clone()))
+        .with_ip_adapter(WeightsSource::File(paths.ip_adapter.clone()))
+        .with_component("flux_ip_image_encoder", encoder)
+        .with_adapters(paths.adapters.clone())
+}
+
 /// Freeze the XLabs reference, encoder, adapter, variant and native trajectory before load.
 pub fn compile_ip_plan(
     paths: &IpAdapterFluxPaths,
@@ -325,16 +338,7 @@ impl IpAdapterFlux {
     }
 
     pub fn load_with_memory(paths: &IpAdapterFluxPaths, memory: GenerationMemory) -> Result<Self> {
-        let encoder = if paths.image_encoder.is_dir() {
-            WeightsSource::Dir(paths.image_encoder.clone())
-        } else {
-            WeightsSource::File(paths.image_encoder.clone())
-        };
-        let spec = LoadSpec::new(WeightsSource::Dir(paths.flux_base.clone()))
-            .with_ip_adapter(WeightsSource::File(paths.ip_adapter.clone()))
-            .with_component("flux_ip_image_encoder", encoder)
-            .with_adapters(paths.adapters.clone());
-        Self::load_with_memory_spec(paths, memory, &spec)
+        Self::load_with_memory_spec(paths, memory, &ip_load_spec(paths))
     }
 
     pub fn load_with_memory_spec(
@@ -422,7 +426,6 @@ impl IpAdapterFlux {
             backbone,
             ip_encoder,
             adapter,
-            loaded_paths: paths.clone(),
             loaded_spec: spec.clone(),
             memory,
             memory_contract,
@@ -430,18 +433,9 @@ impl IpAdapterFlux {
         })
     }
 
-    /// Reference-image T2I: condition the FLUX generation on `reference`'s CLIP-ViT-L identity tokens at
-    /// `req.ip_adapter_scale` (a single distilled forward per step — no true-CFG).
-    pub fn generate(
-        &self,
-        req: &IpAdapterFluxRequest,
-        reference: &Image,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
-        let plan = compile_ip_plan(&self.loaded_paths, &self.loaded_spec, req, reference)?;
-        self.generate_planned(req, reference, &plan, on_progress)
-    }
-
+    /// Reference-image T2I from the trajectory [`compile_ip_plan`] froze before load: condition the
+    /// FLUX generation on `reference`'s CLIP-ViT-L identity tokens at `req.ip_adapter_scale` (a single
+    /// distilled forward per step — no true-CFG).
     pub fn generate_planned(
         &self,
         req: &IpAdapterFluxRequest,

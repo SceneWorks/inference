@@ -214,14 +214,17 @@ pub struct PulidFlux {
     pid: Option<PidEngine>,
     /// Exact request-scoped contract/context selected for the bespoke route. Legacy callers that use
     /// `load`/`load_with_memory` leave these empty; the SceneWorks route uses
-    /// `load_with_memory_context` and must then call `generate_with_memory_context`.
+    /// `load_with_memory_context` and must then call `generate_with_memory_context_planned`.
     memory_contract: Option<MemoryProviderContract>,
     admitted_context: Option<MemoryRunContext>,
-    loaded_paths: PulidFluxPaths,
     loaded_spec: LoadSpec,
 }
 
-fn default_spec(paths: &PulidFluxPaths) -> LoadSpec {
+/// The load contract [`PulidFlux::load`], [`PulidFlux::load_with_memory`] and
+/// [`PulidFlux::load_with_memory_context`] bind, so a caller of those paths-only loaders can compile
+/// [`compile_pulid_plan`] before loading. A later [`PulidFlux::with_pid`] adds its overlay to this
+/// spec; plan a PiD request against the spec with that overlay set.
+pub fn pulid_load_spec(paths: &PulidFluxPaths) -> LoadSpec {
     let mut spec = LoadSpec::new(WeightsSource::Dir(paths.flux_base.clone()))
         .with_adapters(paths.adapters.clone());
     spec.identity = Some(IdentityWeights {
@@ -236,7 +239,7 @@ fn validate_pulid_spec(
     paths: &PulidFluxPaths,
     spec: &LoadSpec,
 ) -> candle_gen::gen_core::Result<()> {
-    let expected = default_spec(paths);
+    let expected = pulid_load_spec(paths);
     let slots = |identity: Option<&IdentityWeights>| {
         identity.map(|identity| {
             (
@@ -351,7 +354,7 @@ impl PulidFlux {
     /// base backbone may stage text→DiT/VAE, stream its two block stacks, and CPU-decode through the
     /// calibrated bounded-host path.
     pub fn load_with_memory(paths: &PulidFluxPaths, memory: GenerationMemory) -> Result<Self> {
-        Self::load_internal(paths, memory, None, None, &default_spec(paths))
+        Self::load_internal(paths, memory, None, None, &pulid_load_spec(paths))
     }
 
     pub fn load_with_memory_spec(
@@ -381,7 +384,7 @@ impl PulidFlux {
             memory,
             Some(contract),
             Some(context),
-            &default_spec(paths),
+            &pulid_load_spec(paths),
         )
     }
 
@@ -457,7 +460,6 @@ impl PulidFlux {
             pid: None,
             memory_contract,
             admitted_context,
-            loaded_paths: paths.clone(),
             loaded_spec: spec.clone(),
         })
     }
@@ -550,18 +552,9 @@ impl PulidFlux {
         identity_stage(cancel, || self.idformer.forward(&id_cond, &eva_out.hidden))
     }
 
-    /// Reference-image identity T2I: condition the FLUX.1-dev generation on `reference`'s PuLID
-    /// id_embedding at `req.id_weight` (a single distilled forward per step — no true-CFG).
-    pub fn generate(
-        &self,
-        req: &PulidFluxRequest,
-        reference: &Image,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
-        let plan = compile_pulid_plan(&self.loaded_paths, &self.loaded_spec, req, reference)?;
-        self.generate_planned(req, reference, &plan, on_progress)
-    }
-
+    /// Reference-image identity T2I from the trajectory [`compile_pulid_plan`] froze before load:
+    /// condition the FLUX.1-dev generation on `reference`'s PuLID id_embedding at `req.id_weight` (a
+    /// single distilled forward per step — no true-CFG).
     pub fn generate_planned(
         &self,
         req: &PulidFluxRequest,
@@ -571,7 +564,7 @@ impl PulidFlux {
     ) -> Result<Image> {
         if self.admitted_context.is_some() {
             return Err(CandleError::Msg(
-                "pulid_flux: admitted model requires generate_with_memory_context".into(),
+                "pulid_flux: admitted model requires generate_with_memory_context_planned".into(),
             ));
         }
         self.check_plan(req, reference, plan)?;
@@ -579,21 +572,10 @@ impl PulidFlux {
         self.generate_inner(req, reference, plan, &run, on_progress)
     }
 
-    /// Execute one bespoke PuLID request under the exact admission handshake retained at load. The
-    /// route and geometry are revalidated at the last responsible moment and the CUDA device is
-    /// synchronized on both success and failure so request-scoped materializations cannot leak into
-    /// the next job's budget snapshot.
-    pub fn generate_with_memory_context(
-        &self,
-        context: &MemoryRunContext,
-        req: &PulidFluxRequest,
-        reference: &Image,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
-        let plan = compile_pulid_plan(&self.loaded_paths, &self.loaded_spec, req, reference)?;
-        self.generate_with_memory_context_planned(context, req, reference, &plan, on_progress)
-    }
-
+    /// Execute one bespoke PuLID request, planned before load, under the exact admission handshake
+    /// retained at load. The route and geometry are revalidated at the last responsible moment and the
+    /// CUDA device is synchronized on both success and failure so request-scoped materializations
+    /// cannot leak into the next job's budget snapshot.
     pub fn generate_with_memory_context_planned(
         &self,
         context: &MemoryRunContext,
@@ -913,7 +895,7 @@ mod tests {
             face_dir: "/missing/face".into(),
             adapters: Vec::new(),
         };
-        let spec = default_spec(&paths);
+        let spec = pulid_load_spec(&paths);
         let req = PulidFluxRequest {
             prompt: "a portrait".into(),
             width: 512,

@@ -59,7 +59,9 @@ use candle_gen::testkit::{
     collecting_sink, correlation, downsample_nearest, downsample_nearest_raw, env_u32,
     mean_abs_delta, preview_strip_sheet, required_path,
 };
-use candle_gen_pulid::{PulidFlux, PulidFluxPaths, PulidFluxRequest};
+use candle_gen_pulid::{
+    compile_pulid_plan, pulid_load_spec, PulidFlux, PulidFluxPaths, PulidFluxRequest,
+};
 
 const PROMPT: &str =
     "portrait of a person, color photo, cinematic lighting, sharp focus, high detail";
@@ -286,21 +288,25 @@ fn assert_pulid_previews_converge(
         face_dir: required_path("PULID_PREVIEW_FACE_DIR"),
         adapters: Vec::new(),
     };
-    let model = PulidFlux::load(&paths).expect("PulidFlux::load");
     let reference = candle_gen::testkit::read_ppm(&required_path("PULID_PREVIEW_REF"));
-
-    let mut noop = |_: Progress| {};
-    let inert = model
-        .generate(
-            &base_request(steps as usize, size, sampler),
-            &reference,
-            &mut noop,
-        )
-        .unwrap_or_else(|e| panic!("{label}: inert render: {e}"));
-
+    let inert_request = base_request(steps as usize, size, sampler);
     let (sink, frames) = collecting_sink();
     let mut request = base_request(steps as usize, size, sampler);
     request.preview = sink;
+    // Compile both trajectories before any weight loads; the load binds the same spec.
+    let spec = pulid_load_spec(&paths);
+    let inert_plan = compile_pulid_plan(&paths, &spec, &inert_request, &reference)
+        .unwrap_or_else(|e| panic!("{label}: inert plan: {e}"));
+    let live_plan = compile_pulid_plan(&paths, &spec, &request, &reference)
+        .unwrap_or_else(|e| panic!("{label}: live plan: {e}"));
+    let model = PulidFlux::load_with_memory_spec(&paths, Default::default(), &spec)
+        .expect("PulidFlux::load");
+
+    let mut noop = |_: Progress| {};
+    let inert = model
+        .generate_planned(&inert_request, &reference, &inert_plan, &mut noop)
+        .unwrap_or_else(|e| panic!("{label}: inert render: {e}"));
+
     let mut events = 0usize;
     let mut count_progress = |p: Progress| {
         if matches!(p, Progress::Step { .. }) {
@@ -308,7 +314,7 @@ fn assert_pulid_previews_converge(
         }
     };
     let live = model
-        .generate(&request, &reference, &mut count_progress)
+        .generate_planned(&request, &reference, &live_plan, &mut count_progress)
         .unwrap_or_else(|e| panic!("{label}: live render: {e}"));
 
     assert_eq!(
