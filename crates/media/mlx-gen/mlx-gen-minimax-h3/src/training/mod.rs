@@ -407,7 +407,18 @@ impl MiniMaxH3ImageTrainer {
     fn preflight(&mut self, plan: &RunPlan<'_>) -> Result<()> {
         let run = self.run_shape(plan)?;
         let (contract, tier) = contract_and_tier(&self.spec)?;
-        let estimate = estimate_training(&contract, &self.facts, tier, &run)?;
+        // The training DiT's weights at the run's compute dtype: a float32 run casts every dense
+        // weight it loads to float32.
+        let fp32_facts;
+        let train_facts = if plan.compute_dtype == Dtype::Float32 {
+            let mut spec = self.spec.clone();
+            spec.precision = Precision::Fp32;
+            fp32_facts = ImageMemoryFacts::resolve(&spec)?;
+            &fp32_facts
+        } else {
+            &self.facts
+        };
+        let estimate = estimate_training(&contract, &self.facts, train_facts, tier, &run)?;
         let budget = self
             .memory_budget_override
             .map_or_else(device_budget, budget_of);
@@ -425,7 +436,9 @@ impl MiniMaxH3ImageTrainer {
         let req = plan.req;
         let cfg = &req.config;
         let patch = MiniMaxH3ImageDitConfig::default().base.patch_size;
-        let mut contexts: Vec<(Array, Vec<i32>, Vec<Image>)> = Vec::with_capacity(req.items.len());
+        // Only the encoded context and its tags cross into the latent phase: an edit's references
+        // are decoded per item here and again there, never retained for the whole dataset.
+        let mut contexts: Vec<(Array, Vec<i32>)> = Vec::with_capacity(req.items.len());
         let mut no_progress = |_: gen_core::Progress| {};
         for item in &req.items {
             if req.cancel.is_cancelled() {
@@ -441,6 +454,7 @@ impl MiniMaxH3ImageTrainer {
                     .iter()
                     .map(|r| resize_reference(r, reference_vision_size(r.width, r.height)))
                     .collect::<Result<Vec<_>>>()?;
+                drop(references);
                 let (context, tags) = self.generator.encode_edit_prompt(
                     &item.caption,
                     &vision,
@@ -448,7 +462,7 @@ impl MiniMaxH3ImageTrainer {
                     &req.cancel,
                     &mut no_progress,
                 )?;
-                contexts.push((context, tags, references));
+                contexts.push((context, tags));
             } else {
                 let context = self.generator.encode_prompt(
                     &item.caption,
@@ -457,7 +471,7 @@ impl MiniMaxH3ImageTrainer {
                     &mut no_progress,
                 )?;
                 let n = context.shape()[1] as usize;
-                contexts.push((context, vec![TEXT_TAG; n], Vec::new()));
+                contexts.push((context, vec![TEXT_TAG; n]));
             }
         }
         mlx_rs::memory::clear_cache();
@@ -466,16 +480,21 @@ impl MiniMaxH3ImageTrainer {
         let mut cache = Vec::with_capacity(req.items.len() * plan.edges.len());
         let mut contexts = contexts.into_iter();
         cache_items(req, on_progress, |item| {
-            let (context, tags, references) = contexts
+            let (context, tags) = contexts
                 .next()
                 .expect("one encoded caption per dataset item");
-            // The references' latents: the render's own resize and posterior sample.
-            let reference_latents = if references.is_empty() {
+            // The references' latents: decoded again from their paths, then the render's own
+            // resize and posterior sample.
+            let reference_latents = if item.reference_image_paths.is_empty() {
                 Vec::new()
             } else {
-                let vae_images = references
+                let vae_images = item
+                    .reference_image_paths
                     .iter()
-                    .map(|r| resize_reference(r, reference_vae_size(r.width, r.height)))
+                    .map(|p| {
+                        let r = decode_image(p)?;
+                        resize_reference(&r, reference_vae_size(r.width, r.height))
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let mut latents = Vec::with_capacity(vae_images.len());
                 for (i, image) in vae_images.iter().enumerate() {
