@@ -300,9 +300,19 @@ fn select_reference_face(conditioning: &[Conditioning]) -> Result<(&Image, f32)>
     })
 }
 
-/// Constructor-built models already own their identity stack; freeze only the request trajectory.
-fn compile_constructed_plan(req: &GenerationRequest) -> gen_core::Result<gen_core::RenderPlan> {
+/// Freeze the request trajectory for a model assembled with [`PulidFlux::new`]. Such a model owns
+/// its identity stack but no load spec, so the caller compiles this plan before loading the
+/// sub-models and executes it with [`Generator::generate_planned`]; [`Generator::generate`] refuses
+/// a constructor-built model rather than compiling after load.
+pub fn compile_constructed_plan(req: &GenerationRequest) -> gen_core::Result<gen_core::RenderPlan> {
     descriptor().capabilities.validate_request(MODEL_ID, req)?;
+    let grid = mlx_gen_flux::model::SIZE_MULTIPLE;
+    if !req.width.is_multiple_of(grid) || !req.height.is_multiple_of(grid) {
+        return Err(gen_core::Error::Msg(format!(
+            "{MODEL_ID}: width and height must be multiples of {grid}, got {}x{}",
+            req.width, req.height
+        )));
+    }
     select_reference_face(&req.conditioning)?;
     if req.cancel.is_cancelled() {
         return Err(gen_core::Error::Canceled);
@@ -335,19 +345,6 @@ pub(crate) fn compile_plan(
     Ok(Some(compile_constructed_plan(req)?.bind_load(spec)))
 }
 
-fn compile_generate_plan(
-    spec: &LoadSpec,
-    registry_loaded: bool,
-    req: &GenerationRequest,
-) -> gen_core::Result<gen_core::RenderPlan> {
-    if registry_loaded {
-        compile_plan(spec, req)?
-            .ok_or_else(|| gen_core::Error::Unsupported("PuLID plan is unavailable".into()))
-    } else {
-        compile_constructed_plan(req)
-    }
-}
-
 impl Generator for PulidFlux {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -374,8 +371,15 @@ impl Generator for PulidFlux {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        let plan =
-            compile_generate_plan(&self.loaded_spec, self.identity_inventory.is_some(), req)?;
+        if self.identity_inventory.is_none() {
+            return Err(gen_core::Error::Unsupported(
+                "pulid_flux: a constructor-built model has no load spec to plan against; compile \
+                 `compile_constructed_plan` before loading its sub-models and call `generate_planned`"
+                    .into(),
+            ));
+        }
+        let plan = compile_plan(&self.loaded_spec, req)?
+            .ok_or_else(|| gen_core::Error::Unsupported("PuLID plan is unavailable".into()))?;
         self.generate_planned(req, &plan, None, on_progress)?
             .output
             .ok_or_else(|| gen_core::Error::Msg("PuLID render produced no image".into()))
@@ -692,11 +696,11 @@ mod tests {
             }],
             ..Default::default()
         };
-        let plan = compile_generate_plan(&spec, false, &req).unwrap();
+        let plan = compile_constructed_plan(&req).unwrap();
         plan.check_request(&descriptor(), &req).unwrap();
         plan.check_load(&gen_core::RenderLoadBinding::from_spec(&spec))
             .unwrap();
-        assert!(compile_generate_plan(&spec, true, &req).is_err());
+        assert!(compile_plan(&spec, &req).is_err());
         if let Conditioning::Reference { image, .. } = &mut req.conditioning[0] {
             image.pixels[0] ^= 1;
         }
@@ -752,6 +756,83 @@ mod tests {
         req.conditioning.pop();
         spec.identity.as_mut().unwrap().face_dir = None;
         assert!(compile_plan(&spec, &req).is_err());
+    }
+
+    /// Zero steps, an off-grid size and a below-minimum size are refused by both pre-load
+    /// compilers (registry and constructed) at missing identity paths, so no weight is opened.
+    #[test]
+    fn pulid_plan_refuses_zero_steps_and_invalid_sizes_before_load() {
+        let registry = crate::provider_registry().unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/missing/flux".into()));
+        spec.identity = Some(IdentityWeights {
+            encoder: Some(WeightsSource::File("/missing/pulid".into())),
+            eva: Some(WeightsSource::File("/missing/eva".into())),
+            face_dir: Some(WeightsSource::Dir("/missing/face".into())),
+        });
+        let valid = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            conditioning: vec![Conditioning::Reference {
+                image: img(),
+                strength: Some(1.0),
+            }],
+            ..Default::default()
+        };
+        registry
+            .compile_render_plan(MODEL_ID, &spec, &valid)
+            .unwrap()
+            .expect("PuLID reference needs a pre-load trajectory");
+        for (width, height, steps, expected) in [
+            (512, 512, Some(0), "steps must be >= 1"),
+            (321, 512, Some(4), "multiples of 16"),
+            (512, 321, Some(4), "multiples of 16"),
+            (128, 512, Some(4), "outside supported range"),
+            (512, 240, Some(4), "outside supported range"),
+        ] {
+            let req = GenerationRequest {
+                width,
+                height,
+                steps,
+                ..valid.clone()
+            };
+            let registered = registry
+                .compile_render_plan(MODEL_ID, &spec, &req)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                registered.contains(expected),
+                "{width}x{height}: {registered}"
+            );
+            let constructed = compile_constructed_plan(&req).unwrap_err().to_string();
+            assert!(
+                constructed.contains(expected),
+                "{width}x{height}: {constructed}"
+            );
+        }
+    }
+
+    /// A constructor-built model has no load spec, so `generate` refuses instead of compiling
+    /// after load; the caller compiles first and uses `generate_planned`.
+    #[test]
+    fn constructed_model_generate_refuses_post_load_compile() {
+        let model = weightless_pulid();
+        let req = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::Reference {
+                image: img(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let err = Generator::generate(&model, &req, &mut |_| {}).unwrap_err();
+        assert!(
+            err.to_string().contains("compile_constructed_plan"),
+            "got: {err:?}"
+        );
     }
 
     /// The load error string, matched (not `unwrap_err` — `Box<dyn Generator>` isn't `Debug`).
@@ -1035,11 +1116,12 @@ mod tests {
     /// convention — chroma/svd/ideogram), so a caller that invokes `generate` WITHOUT a prior
     /// `validate` still gets the typed `Unsupported` for a `hyper` request instead of a silently
     /// degraded render (the FLUX-dev backbone would happily render WITHOUT the Hyper-FLUX LoRA
-    /// PuLID never loads). Driven end-to-end through `Generator::generate` on a weight-free
+    /// PuLID never loads). Driven end-to-end through `Generator::generate_planned` (with a plan
+    /// compiled before construction from the same request minus the sampler) on a weight-free
     /// instance: the capability floor rejects the request before any face/EVA/backbone work, so no
     /// weights are ever touched. Mutation-pins the regression — with the `self.validate(req)?` line
-    /// deleted, `generate` falls through into the zero-weight identity stack and fails with a
-    /// non-`Unsupported` error, so this test FAILS.
+    /// deleted, the hyper request falls through to the plan check or the zero-weight identity
+    /// stack and fails without the sampler-floor message, so this test FAILS.
     #[test]
     #[ignore = "model inference; explicit model-proof workflow"]
     fn generate_without_prior_validate_rejects_hyper_typed_unsupported() {
@@ -1058,9 +1140,14 @@ mod tests {
         // The reference-face half of `validate` accepts this request, so the sampler floor is the
         // ONLY rejection — and it must arrive through `generate` itself, typed.
         assert!(select_reference_face(&req.conditioning).is_ok());
-        let err = Generator::generate(&model, &req, &mut |_| {}).unwrap_err();
+        let plan = compile_constructed_plan(&GenerationRequest {
+            sampler: None,
+            ..req.clone()
+        })
+        .unwrap();
+        let err = Generator::generate_planned(&model, &req, &plan, None, &mut |_| {}).unwrap_err();
         assert!(
-            matches!(err, gen_core::Error::Unsupported(_)),
+            matches!(&err, gen_core::Error::Unsupported(message) if message.contains("unsupported sampler")),
             "got: {err:?}"
         );
         crate::model_inference_device::record_model_inference_device();
