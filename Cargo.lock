@@ -2951,6 +2951,7 @@ dependencies = [
  "sceneworks-gen-core-h3",
  "sceneworks-gen-core-telemetry",
  "sceneworks-gen-core-testkit",
+ "sceneworks-gen-core-train",
  "serde_json",
  "sha2",
  "tempfile",

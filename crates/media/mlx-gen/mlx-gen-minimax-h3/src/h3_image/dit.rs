@@ -194,6 +194,19 @@ impl MiniMaxH3ImageDit {
         Self::from_weights(&mut w, &cfg, dtype)
     }
 
+    /// [`Self::load_dir`], with every tensor the DiT holds forced and GPU-verified before return —
+    /// for a caller that builds one whole-graph transform over the resident DiT (the trainer's
+    /// resident backward, SW-7097), so no source tensor is first read inside that graph (the
+    /// sc-24245 class: a lazy weight read inside a large evaluation can come back silently wrong).
+    pub(crate) fn load_dir_materialized(dir: impl AsRef<Path>, dtype: Dtype) -> Result<Self> {
+        let dir = dir.as_ref();
+        let cfg = Self::read_config(dir)?;
+        let mut w = Weights::from_dir(dir)?;
+        let dit = Self::from_weights(&mut w, &cfg, dtype)?;
+        w.materialize_accessed()?;
+        Ok(dit)
+    }
+
     /// Every tensor name the image DiT consumes — the published 644 at the shipped geometry.
     pub fn names(cfg: &MiniMaxH3ImageDitConfig) -> Vec<String> {
         let mut v = ImageDitProjections::names(cfg);
@@ -229,6 +242,38 @@ impl MiniMaxH3ImageDit {
         match &self.stream {
             Some(stream) => stream.n_blocks(),
             None => self.blocks.len(),
+        }
+    }
+
+    /// H3's multimodal rotary — the trainer's per-step forward reuses it (SW-7097).
+    pub(crate) fn rope(&self) -> &MmRope {
+        &self.rope
+    }
+
+    /// The trainer's modulation (SW-7097): the published six-step schedule projected once, exactly
+    /// as [`ImageDenoiser::new`] (resident) or [`ImageDenoiser::new_windowed`] (deferred, `window`
+    /// blocks at a time) projects it for a render — with the reference row class when the run is
+    /// an edit. Every training step gathers its rows from these tables.
+    pub(crate) fn training_modulation(
+        &mut self,
+        has_references: bool,
+        window: Option<(usize, &CancelFlag)>,
+    ) -> Result<Modulation> {
+        let schedule = adaln_schedule(&SigmaSchedule::h3_image_distilled()?, has_references)?;
+        match window {
+            None => project_modulation(self, schedule, None),
+            Some((window, cancel)) => {
+                let plan = self
+                    .stream()
+                    .ok_or_else(|| {
+                        Error::Msg(
+                            "minimax-h3-image dit: a windowed modulation needs a deferred load"
+                                .into(),
+                        )
+                    })?
+                    .plan(window)?;
+                project_modulation(self, schedule, Some((&plan, cancel)))
+            }
         }
     }
 
@@ -409,17 +454,110 @@ pub struct ImageDenoiser {
     attention_axis: AttentionChunkAxis,
 }
 
-/// What [`ImageDenoiser`] shares between its resident and windowed constructors: the checks, the
-/// text rows, the rotary tables and the per-step gather indices.
-struct DenoiserParts {
-    text_rows: Array,
-    tables: MmRopeTables,
-    adaln_schedule: TimestepSchedule,
-    adaln_indices: Vec<Array>,
-    timestep_indices: Vec<Array>,
+/// What [`ImageDenoiser`] shares between its resident and windowed constructors — and the trainer
+/// (SW-7097) builds per cached item: the checks, the text rows, the rotary tables and the per-step
+/// gather indices.
+pub(crate) struct DenoiserParts {
+    pub(crate) text_rows: Array,
+    pub(crate) tables: MmRopeTables,
+    pub(crate) adaln_schedule: TimestepSchedule,
+    pub(crate) adaln_indices: Vec<Array>,
+    pub(crate) timestep_indices: Vec<Array>,
 }
 
-fn denoiser_parts(
+/// The AdaLN schedule of a run over `schedule`: per step, the step's timestep for every text and
+/// generated row and, with references, [`REFERENCE_NOISE_AUG`] for theirs
+/// (`MiniMaxH3ImageSetTimestepsStep.row_timestep_plan`).
+fn adaln_schedule(schedule: &SigmaSchedule, has_references: bool) -> Result<TimestepSchedule> {
+    TimestepSchedule::new(
+        schedule
+            .timesteps()
+            .iter()
+            .map(|&t| {
+                if has_references {
+                    vec![t, REFERENCE_NOISE_AUG]
+                } else {
+                    vec![t]
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The whole run's projected modulation: every block's tables, `norm_out`'s, the timestep
+/// embedding they came from, and the `adaln_proj` bytes a resident projection released.
+pub(crate) struct Modulation {
+    pub(crate) cache: AdaLnCache,
+    pub(crate) norm_out: NormOutModulation,
+    pub(crate) temb: Array,
+    pub(crate) released_bytes: usize,
+}
+
+/// Project `schedule`'s modulation once: resident, through H3's
+/// [`AdaLnCache::precompute_and_evict`] (which releases `adaln_proj`); deferred, through
+/// [`precompute_adaln_windowed`] at `window`. `norm_out` reads the SAME `temb` the blocks were
+/// projected from.
+fn project_modulation(
+    dit: &mut MiniMaxH3ImageDit,
+    schedule: TimestepSchedule,
+    window: Option<(&BlockPlan, &CancelFlag)>,
+) -> Result<Modulation> {
+    match (window, dit.stream.clone()) {
+        (None, None) => {
+            UnverifiedSources::verify(&mut dit.unverified.adaln)?;
+            let embedder = dit.projections.time_embedder.clone();
+            let mut captured: Option<Array> = None;
+            let (cache, released_bytes) = AdaLnCache::precompute_and_evict(
+                &mut dit.blocks,
+                schedule,
+                AdaLnResidency::PrecomputeAndEvict,
+                |ts| {
+                    let temb = embedder.forward(ts)?;
+                    captured = Some(temb.clone());
+                    Ok(temb)
+                },
+            )?;
+            let temb = captured.ok_or_else(|| {
+                Error::Msg(
+                    "minimax-h3-image dit: the AdaLN precompute did not embed the timesteps".into(),
+                )
+            })?;
+            let norm_out = dit.projections.norm_out.modulation(&temb)?;
+            mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale, &temb])?;
+            UnverifiedSources::verify(&mut dit.unverified.body)?;
+            Ok(Modulation {
+                cache,
+                norm_out,
+                temb,
+                released_bytes,
+            })
+        }
+        (Some((plan, cancel)), Some(stream)) => {
+            let temb = dit
+                .projections
+                .time_embedder
+                .forward(schedule.distinct_timesteps())?;
+            mlx_rs::transforms::eval([&temb])?;
+            let cache = precompute_adaln_windowed(&stream, plan, cancel, schedule, &temb)?;
+            let norm_out = dit.projections.norm_out.modulation(&temb)?;
+            mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale])?;
+            // Nothing was released, because nothing was ever resident.
+            Ok(Modulation {
+                cache,
+                norm_out,
+                temb,
+                released_bytes: 0,
+            })
+        }
+        _ => Err(Error::Msg(
+            "minimax-h3-image dit: the block window and the DiT's residency disagree — a window \
+             over a resident load, or a deferred load with no window"
+                .into(),
+        )),
+    }
+}
+
+pub(crate) fn denoiser_parts(
     dit: &mut MiniMaxH3ImageDit,
     layout: &ImageLayout,
     context: &Array,
@@ -453,22 +591,8 @@ fn denoiser_parts(
     let tables = dit.rope.tables(layout.position_ids())?;
 
     // Row class 0 is the step's timestep, which every text and generated row sits at; an
-    // edit's reference rows are class 1, held at `REFERENCE_NOISE_AUG` for every step
-    // (`MiniMaxH3ImageSetTimestepsStep.row_timestep_plan`).
-    let has_references = layout.num_reference_rows() > 0;
-    let adaln_schedule = TimestepSchedule::new(
-        schedule
-            .timesteps()
-            .iter()
-            .map(|&t| {
-                if has_references {
-                    vec![t, REFERENCE_NOISE_AUG]
-                } else {
-                    vec![t]
-                }
-            })
-            .collect(),
-    )?;
+    // edit's reference rows are class 1, held at `REFERENCE_NOISE_AUG` for every step.
+    let adaln_schedule = adaln_schedule(schedule, layout.num_reference_rows() > 0)?;
     let row_classes = Array::from_slice(&image_row_classes(layout), &[layout.seq_len()]);
     let mut adaln_indices = Vec::with_capacity(steps);
     let mut timestep_indices = Vec::with_capacity(steps);
@@ -508,43 +632,20 @@ impl ImageDenoiser {
             ));
         }
         let parts = denoiser_parts(&mut dit, &layout, context, &schedule)?;
-
-        // Project the whole run's modulation once, then release `adaln_proj`. `norm_out` reads the
-        // SAME `temb` the blocks were projected from.
-        UnverifiedSources::verify(&mut dit.unverified.adaln)?;
-        let embedder = dit.projections.time_embedder.clone();
-        let mut captured: Option<Array> = None;
-        let (cache, released_bytes) = AdaLnCache::precompute_and_evict(
-            &mut dit.blocks,
-            parts.adaln_schedule,
-            AdaLnResidency::PrecomputeAndEvict,
-            |ts| {
-                let temb = embedder.forward(ts)?;
-                captured = Some(temb.clone());
-                Ok(temb)
-            },
-        )?;
-        let temb = captured.ok_or_else(|| {
-            Error::Msg(
-                "minimax-h3-image dit: the AdaLN precompute did not embed the timesteps".into(),
-            )
-        })?;
-        let norm_out = dit.projections.norm_out.modulation(&temb)?;
-        mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale, &temb])?;
-        UnverifiedSources::verify(&mut dit.unverified.body)?;
-
+        // Project the whole run's modulation once, then release `adaln_proj`.
+        let modulation = project_modulation(&mut dit, parts.adaln_schedule, None)?;
         Ok(Self {
             dit,
             layout,
             tables: parts.tables,
             text_rows: parts.text_rows,
-            cache,
-            norm_out,
-            temb,
+            cache: modulation.cache,
+            norm_out: modulation.norm_out,
+            temb: modulation.temb,
             schedule,
             adaln_indices: parts.adaln_indices,
             timestep_indices: parts.timestep_indices,
-            released_bytes,
+            released_bytes: modulation.released_bytes,
             block_window: None,
             window_cancel: CancelFlag::default(),
             attention_budget: AttentionBudget::UNBOUNDED,
@@ -586,28 +687,20 @@ impl ImageDenoiser {
             .clone();
         let plan = stream.plan(window)?;
         let parts = denoiser_parts(&mut dit, &layout, context, &schedule)?;
-        let temb = dit
-            .projections
-            .time_embedder
-            .forward(parts.adaln_schedule.distinct_timesteps())?;
-        mlx_rs::transforms::eval([&temb])?;
-        let cache =
-            precompute_adaln_windowed(&stream, &plan, &cancel, parts.adaln_schedule, &temb)?;
-        let norm_out = dit.projections.norm_out.modulation(&temb)?;
-        mlx_rs::transforms::eval([&norm_out.shift, &norm_out.scale])?;
+        let modulation =
+            project_modulation(&mut dit, parts.adaln_schedule, Some((&plan, &cancel)))?;
         Ok(Self {
             dit,
             layout,
             tables: parts.tables,
             text_rows: parts.text_rows,
-            cache,
-            norm_out,
-            temb,
+            cache: modulation.cache,
+            norm_out: modulation.norm_out,
+            temb: modulation.temb,
             schedule,
             adaln_indices: parts.adaln_indices,
             timestep_indices: parts.timestep_indices,
-            // Nothing was released, because nothing was ever resident.
-            released_bytes: 0,
+            released_bytes: modulation.released_bytes,
             block_window: Some(plan),
             window_cancel: cancel,
             attention_budget: AttentionBudget::UNBOUNDED,
