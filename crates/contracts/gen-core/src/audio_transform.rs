@@ -34,9 +34,58 @@
 //! [`Generator`](crate::generator::Generator) + conditioning shape (sc-12847), exactly as prompted
 //! image editing is a `Generator`, not a `Transform`.
 
+use crate::generator::ExecutionIdentity;
 use crate::media::AudioTrack;
 use crate::runtime::{CancelFlag, Progress};
-use crate::Result;
+use crate::{Error, Result};
+
+/// The ordered tracks and execution identity returned by one successful transform attempt.
+/// An error or cancellation has no completed report to publish.
+#[derive(Debug)]
+pub struct CompletedAudioTransform {
+    pub tracks: Vec<AudioTrack>,
+    pub execution: ExecutionIdentity,
+}
+
+impl CompletedAudioTransform {
+    pub fn new(
+        tracks: Vec<AudioTrack>,
+        execution: ExecutionIdentity,
+        descriptor: &AudioTransformDescriptor,
+    ) -> Result<Self> {
+        let expected = match descriptor.capabilities.kind {
+            AudioTransformKind::StemSeparation => descriptor.capabilities.stem_count as usize,
+            AudioTransformKind::VoiceConversion | AudioTransformKind::SuperResolution => 1,
+        };
+        if tracks.is_empty() || tracks.len() != expected {
+            return Err(Error::Msg(format!(
+                "completed audio transform produced {} tracks; {} expected",
+                tracks.len(),
+                expected
+            )));
+        }
+        for (index, track) in tracks.iter().enumerate() {
+            let channels = usize::from(track.channels);
+            if track.sample_rate == 0
+                || channels == 0
+                || track.samples.is_empty()
+                || track.samples.len() % channels != 0
+                || track.samples.iter().any(|sample| !sample.is_finite())
+                || track.stems.iter().any(|stem| {
+                    stem.name.trim().is_empty()
+                        || stem.samples.len() != track.samples.len()
+                        || stem.samples.iter().any(|sample| !sample.is_finite())
+                })
+            {
+                return Err(Error::Msg(format!(
+                    "completed audio transform track {index} has invalid PCM or metadata"
+                )));
+            }
+        }
+        execution.validate(descriptor.id, descriptor.backend, tracks.len())?;
+        Ok(Self { tracks, execution })
+    }
+}
 
 /// A non-prompt audio→audio / audio→stems transform (voice conversion, stem separation,
 /// super-resolution). The audio sibling of [`Transform`](crate::transform::Transform).
@@ -54,6 +103,27 @@ pub trait AudioTransform {
         req: &AudioTransformRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<AudioTrack>>;
+
+    /// Additive completion boundary. Existing transforms return the same ordered tracks with a
+    /// typed unavailable identity until they can report facts from their own finished attempt.
+    fn apply_with_execution_report(
+        &self,
+        req: &AudioTransformRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedAudioTransform> {
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let tracks = self.apply(req, on_progress)?;
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        CompletedAudioTransform::new(
+            tracks,
+            ExecutionIdentity::provider_default(),
+            self.descriptor(),
+        )
+    }
 }
 
 /// An audio-transform request — `Default`-able like
@@ -152,6 +222,7 @@ pub struct AudioTransformCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     /// A minimal in-memory transform covering one kind. `apply` is exercised without a tensor
     /// backend: it returns `output_tracks` copies of the input clip (one for the single-output kinds,
@@ -197,6 +268,150 @@ mod tests {
             sample_rate: rate,
             channels: 1,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn completed_report_preserves_order_and_is_attempt_local() {
+        struct Ordered {
+            descriptor: AudioTransformDescriptor,
+            calls: Cell<usize>,
+        }
+        impl AudioTransform for Ordered {
+            fn descriptor(&self) -> &AudioTransformDescriptor {
+                &self.descriptor
+            }
+            fn validate(&self, _: &AudioTransformRequest) -> Result<()> {
+                Ok(())
+            }
+            fn apply(
+                &self,
+                req: &AudioTransformRequest,
+                on_progress: &mut dyn FnMut(Progress),
+            ) -> Result<Vec<AudioTrack>> {
+                let call = self.calls.get() + 1;
+                self.calls.set(call);
+                on_progress(Progress::Step {
+                    current: 1,
+                    total: 1,
+                });
+                if call == 1 {
+                    return Err(Error::Msg("first attempt failed".into()));
+                }
+                if req.cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+                Ok((0..3)
+                    .map(|index| AudioTrack {
+                        samples: vec![index as f32],
+                        sample_rate: 24_000,
+                        channels: 1,
+                        ..Default::default()
+                    })
+                    .collect())
+            }
+        }
+        let transform = Ordered {
+            descriptor: AudioTransformDescriptor {
+                id: "ordered-stub",
+                family: "test",
+                backend: "candle",
+                capabilities: AudioTransformCapabilities {
+                    kind: AudioTransformKind::StemSeparation,
+                    stem_count: 3,
+                    ..Default::default()
+                },
+            },
+            calls: Cell::new(0),
+        };
+        let req = AudioTransformRequest::default();
+        assert!(transform
+            .apply_with_execution_report(&req, &mut |_| {})
+            .is_err());
+        let completed = transform
+            .apply_with_execution_report(&req, &mut |_| {})
+            .unwrap();
+        assert_eq!(transform.calls.get(), 2);
+        assert_eq!(
+            completed
+                .tracks
+                .iter()
+                .map(|track| track.samples[0])
+                .collect::<Vec<_>>(),
+            [0.0, 1.0, 2.0]
+        );
+        assert!(matches!(
+            completed.execution,
+            ExecutionIdentity::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn canceled_attempt_has_no_report_and_invalid_output_cannot_be_bound() {
+        let transform = StubAudioTransform {
+            descriptor: AudioTransformDescriptor {
+                id: "stub_vc",
+                family: "test",
+                backend: "candle",
+                capabilities: AudioTransformCapabilities::default(),
+            },
+            output_tracks: 1,
+        };
+        let req = AudioTransformRequest {
+            audio: track(1, 24_000),
+            ..Default::default()
+        };
+        let flag = req.cancel.clone();
+        let canceled = transform.apply_with_execution_report(&req, &mut |_| flag.cancel());
+        assert!(matches!(canceled, Err(Error::Canceled)));
+        let fresh = transform
+            .apply_with_execution_report(
+                &AudioTransformRequest {
+                    audio: track(1, 24_000),
+                    ..Default::default()
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(fresh.tracks.len(), 1);
+        assert!(matches!(
+            fresh.execution,
+            ExecutionIdentity::Unavailable { .. }
+        ));
+
+        let wrong = CompletedAudioTransform::new(
+            vec![track(1, 24_000), track(1, 24_000)],
+            ExecutionIdentity::provider_default(),
+            transform.descriptor(),
+        );
+        assert!(wrong.is_err());
+
+        for invalid in [
+            AudioTrack::default(),
+            track(1, 0),
+            AudioTrack {
+                channels: 0,
+                ..track(1, 24_000)
+            },
+            AudioTrack {
+                channels: 2,
+                ..track(1, 24_000)
+            },
+            AudioTrack {
+                samples: vec![f32::NAN],
+                ..track(1, 24_000)
+            },
+            AudioTrack {
+                samples: vec![f32::INFINITY],
+                ..track(1, 24_000)
+            },
+        ] {
+            assert!(CompletedAudioTransform::new(
+                vec![invalid],
+                ExecutionIdentity::provider_default(),
+                transform.descriptor(),
+            )
+            .is_err());
         }
     }
 

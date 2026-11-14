@@ -21,20 +21,28 @@
 //! ([`AudioTransformRequest::audio`]) as the content and the **target tone-color reference**
 //! ([`AudioTransformRequest::target_reference`], the additive sc-13223 field) as the voice to
 //! transfer. Both are resampled to the model's native 22.05 kHz. `strength` overrides the
-//! posterior-sampling temperature `τ` (default [`config::DEFAULT_TAU`]); `seed` makes the Gaussian
-//! draw deterministic (same request + seed ⇒ byte-identical samples). Output is exactly **one**
+//! posterior-sampling temperature `τ` (default [`config::DEFAULT_TAU`]); `seed` fixes the
+//! SplitMix64/Box–Muller Gaussian draw. Bitwise output replay has not been attested across
+//! checkpoint bytes, devices, or precision modes. Output is exactly **one**
 //! [`AudioTrack`] at 22.05 kHz whose duration/content tracks the source and whose timbre is shifted
 //! toward the target. Cancellation is checked before any heavy work and between the flow/decoder
 //! stages, returning the typed [`gen_core::Error::Canceled`].
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use candle_audio::gen_core::generator::{
+    ExecutionDraw, ExecutionFact, ExecutionIdentity, ExecutionRandomness, ExecutionReplaySupport,
+    ResolvedExecutionIdentity, EXECUTION_IDENTITY_VERSION,
+};
 use candle_audio::gen_core::{
     self, AudioTarget, AudioTrack, AudioTransform, AudioTransformCapabilities,
-    AudioTransformDescriptor, AudioTransformKind, AudioTransformRequest, LoadSpec, Progress,
-    WeightsSource,
+    AudioTransformDescriptor, AudioTransformKind, AudioTransformRequest, CompletedAudioTransform,
+    LoadSpec, Progress, WeightsSource,
 };
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::config;
 use crate::pipeline::{OpenVoicePipeline, CHECKPOINT_FILE, CONFIG_FILE};
@@ -107,6 +115,112 @@ pub struct OpenVoiceTransform {
     pipeline: Mutex<Option<Arc<OpenVoicePipeline>>>,
 }
 
+/// Values captured by the successful conversion call, before any report is constructed.
+struct OpenVoiceObserved {
+    source_mono_sha256: String,
+    reference_mono_sha256: String,
+    source_rate: u32,
+    reference_rate: u32,
+    source_channels: u16,
+    reference_channels: u16,
+    source_mono_samples: usize,
+    reference_mono_samples: usize,
+    tau_bits: u32,
+    seed: u64,
+    noise_frames: usize,
+    device: String,
+    dtype: String,
+}
+
+fn pcm_sha256(samples: &[f32]) -> String {
+    let mut digest = Sha256::new();
+    for sample in samples {
+        digest.update(sample.to_bits().to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn completed_identity(facts: OpenVoiceObserved, tracks: &[AudioTrack]) -> ExecutionIdentity {
+    let mut provider_choices = BTreeMap::new();
+    provider_choices.insert(
+        "source".into(),
+        ExecutionFact::resolved(json!({
+            "mono_pcm_f32_sha256":facts.source_mono_sha256,
+            "sample_rate":facts.source_rate,
+            "channels":facts.source_channels,
+            "mono_samples":facts.source_mono_samples,
+        })),
+    );
+    provider_choices.insert(
+        "target_reference".into(),
+        ExecutionFact::resolved(json!({
+            "mono_pcm_f32_sha256":facts.reference_mono_sha256,
+            "sample_rate":facts.reference_rate,
+            "channels":facts.reference_channels,
+            "mono_samples":facts.reference_mono_samples,
+        })),
+    );
+    provider_choices.insert(
+        "converter".into(),
+        ExecutionFact::resolved(json!({
+            "path":"source_and_reference_tone_color_to_vits_flow",
+            "native_sample_rate":OUTPUT_SAMPLE_RATE,
+            "posterior_tau_bits":format!("f32:{:08x}",facts.tau_bits),
+            "noise_scheme":"splitmix64_box_muller",
+            "noise_shape":[1,config::INTER_CHANNELS,facts.noise_frames],
+        })),
+    );
+    let outputs = tracks
+        .iter()
+        .enumerate()
+        .map(|(index, track)| {
+            json!({
+                "index":index,
+                "pcm_f32_sha256":pcm_sha256(&track.samples),
+                "sample_rate":track.sample_rate,
+                "channels":track.channels,
+                "samples":track.samples.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    ExecutionIdentity::Resolved {
+        identity: Box::new(ResolvedExecutionIdentity {
+            version: EXECUTION_IDENTITY_VERSION,
+            provider_id: MODEL_ID.into(),
+            backend: "candle".into(),
+            runtime_id: "openvoice-v2-candle-v1".into(),
+            sampling: ExecutionFact::resolved(json!({
+                "posterior_tau_bits":format!("f32:{:08x}",facts.tau_bits),
+                "noise_scheme":"splitmix64_box_muller",
+            })),
+            schedule: ExecutionFact::not_applicable("voice conversion has no diffusion schedule"),
+            estimator: ExecutionFact::not_applicable("voice conversion has no diffusion estimator"),
+            randomness: ExecutionRandomness::Draws {
+                scheme: "splitmix64_box_muller".into(),
+                draws: vec![ExecutionDraw {
+                    output_index: 0,
+                    purpose: "posterior_gaussian_noise".into(),
+                    seed: Some(facts.seed),
+                    noise_sha256: None,
+                }],
+            },
+            deterministic_replay: ExecutionReplaySupport::NonDeterministic {
+                reason: "OpenVoice V2 checkpoint bytes and bitwise replay on this device and precision have not been attested".into(),
+            },
+            geometry: ExecutionFact::not_applicable("audio has no image geometry"),
+            quality_policy: ExecutionFact::resolved(json!({
+                "tone_color_device":facts.device,
+                "tone_color_dtype":facts.dtype,
+                "mono_downmix":"channel_mean",
+                "resample_to_hz":OUTPUT_SAMPLE_RATE,
+            })),
+            output_policy: ExecutionFact::resolved(json!({"tracks":outputs})),
+            provider_choices,
+            output_units: tracks.len(),
+        }),
+    }
+}
+
 impl OpenVoiceTransform {
     fn pipeline(&self) -> gen_core::Result<Arc<OpenVoicePipeline>> {
         let mut guard = lock_recover(&self.pipeline);
@@ -117,6 +231,95 @@ impl OpenVoiceTransform {
         let built = Arc::new(OpenVoicePipeline::from_snapshot(&self.root, &device)?);
         *guard = Some(built.clone());
         Ok(built)
+    }
+
+    fn apply_inner(
+        &self,
+        req: &AudioTransformRequest,
+        on_progress: &mut dyn FnMut(Progress),
+        capture: bool,
+    ) -> gen_core::Result<(Vec<AudioTrack>, Option<OpenVoiceObserved>)> {
+        self.validate(req)?;
+        // Preserve the legacy pre-load cancellation boundary.
+        if req.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        let reference = req
+            .target_reference
+            .as_ref()
+            .expect("validate_request guarantees Some");
+
+        let pipeline = self.pipeline()?;
+        let total = 3u32;
+        on_progress(Progress::Step { current: 1, total });
+
+        let src_mono = to_mono(&req.audio.samples, req.audio.channels);
+        let tgt_mono = to_mono(&reference.samples, reference.channels);
+        let g_src = pipeline.extract_tone_color(&src_mono, req.audio.sample_rate)?;
+        if req.cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        let g_tgt = pipeline.extract_tone_color(&tgt_mono, reference.sample_rate)?;
+        on_progress(Progress::Step { current: 2, total });
+
+        let tau = req.strength.unwrap_or(config::DEFAULT_TAU);
+        if !(tau.is_finite() && tau >= 0.0) {
+            return Err(gen_core::Error::Msg(format!(
+                "{MODEL_ID}: strength (τ) must be finite and >= 0, got {tau}"
+            )));
+        }
+        let seed = req.seed.unwrap_or_else(gen_core::default_seed);
+
+        on_progress(Progress::Decoding);
+        let cancel = req.cancel.clone();
+        let (samples, noise_frames) = pipeline
+            .convert_observed(
+                &src_mono,
+                req.audio.sample_rate,
+                &g_src,
+                &g_tgt,
+                tau,
+                seed,
+                &move || cancel.is_cancelled(),
+            )
+            .map_err(gen_core::Error::from)?;
+        on_progress(Progress::Step { current: 3, total });
+
+        if samples.is_empty() {
+            return Err(gen_core::Error::Msg(format!(
+                "{MODEL_ID}: conversion produced no samples"
+            )));
+        }
+        if let AudioTarget::SampleRate(r) = req.target {
+            return Err(gen_core::Error::Msg(format!(
+                "{MODEL_ID}: voice conversion does not resample (requested {r} Hz); the output is \
+                 the model's native {OUTPUT_SAMPLE_RATE} Hz — use AudioTarget::Preserve"
+            )));
+        }
+        let observed = capture.then(|| OpenVoiceObserved {
+            source_mono_sha256: pcm_sha256(&src_mono),
+            reference_mono_sha256: pcm_sha256(&tgt_mono),
+            source_rate: req.audio.sample_rate,
+            reference_rate: reference.sample_rate,
+            source_channels: req.audio.channels,
+            reference_channels: reference.channels,
+            source_mono_samples: src_mono.len(),
+            reference_mono_samples: tgt_mono.len(),
+            tau_bits: tau.to_bits(),
+            seed,
+            noise_frames,
+            device: format!("{:?}", g_src.device().location()),
+            dtype: format!("{:?}", g_src.dtype()),
+        });
+        Ok((
+            vec![AudioTrack {
+                samples,
+                sample_rate: OUTPUT_SAMPLE_RATE,
+                channels: 1,
+                ..Default::default()
+            }],
+            observed,
+        ))
     }
 }
 
@@ -162,73 +365,22 @@ impl AudioTransform for OpenVoiceTransform {
         req: &AudioTransformRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<Vec<AudioTrack>> {
-        self.validate(req)?;
-        // Pre-apply cancellation seam: consult the flag before ANY heavy work (weights load +
-        // synthesis all come after this).
+        self.apply_inner(req, on_progress, false)
+            .map(|(tracks, _)| tracks)
+    }
+
+    fn apply_with_execution_report(
+        &self,
+        req: &AudioTransformRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<CompletedAudioTransform> {
+        let (tracks, observed) = self.apply_inner(req, on_progress, true)?;
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
-        let reference = req
-            .target_reference
-            .as_ref()
-            .expect("validate_request guarantees Some");
-
-        let pipeline = self.pipeline()?;
-        let total = 3u32;
-        on_progress(Progress::Step { current: 1, total });
-
-        // Tone colors: the source's own (forward flow) and the target's (reverse flow).
-        let src_mono = to_mono(&req.audio.samples, req.audio.channels);
-        let tgt_mono = to_mono(&reference.samples, reference.channels);
-        let g_src = pipeline.extract_tone_color(&src_mono, req.audio.sample_rate)?;
-        if req.cancel.is_cancelled() {
-            return Err(gen_core::Error::Canceled);
-        }
-        let g_tgt = pipeline.extract_tone_color(&tgt_mono, reference.sample_rate)?;
-        on_progress(Progress::Step { current: 2, total });
-
-        let tau = req.strength.unwrap_or(config::DEFAULT_TAU);
-        if !(tau.is_finite() && tau >= 0.0) {
-            return Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID}: strength (τ) must be finite and >= 0, got {tau}"
-            )));
-        }
-        let seed = req.seed.unwrap_or_else(gen_core::default_seed);
-
-        on_progress(Progress::Decoding);
-        let cancel = req.cancel.clone();
-        let samples = pipeline
-            .convert(
-                &src_mono,
-                req.audio.sample_rate,
-                &g_src,
-                &g_tgt,
-                tau,
-                seed,
-                &move || cancel.is_cancelled(),
-            )
-            .map_err(gen_core::Error::from)?;
-        on_progress(Progress::Step { current: 3, total });
-
-        if samples.is_empty() {
-            return Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID}: conversion produced no samples"
-            )));
-        }
-        // AudioTarget::Preserve is the only supported target (this is not a resampler); a
-        // SampleRate target is refused rather than silently ignored.
-        if let AudioTarget::SampleRate(r) = req.target {
-            return Err(gen_core::Error::Msg(format!(
-                "{MODEL_ID}: voice conversion does not resample (requested {r} Hz); the output is \
-                 the model's native {OUTPUT_SAMPLE_RATE} Hz — use AudioTarget::Preserve"
-            )));
-        }
-        Ok(vec![AudioTrack {
-            samples,
-            sample_rate: OUTPUT_SAMPLE_RATE,
-            channels: 1,
-            ..Default::default()
-        }])
+        let facts = observed.expect("report path captures completed OpenVoice choices");
+        let execution = completed_identity(facts, &tracks);
+        CompletedAudioTransform::new(tracks, execution, &self.descriptor)
     }
 }
 
@@ -284,6 +436,73 @@ mod tests {
             channels: 1,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn completed_transform_identity_binds_observed_inputs_seed_runtime_and_output() {
+        let source = [0.0f32, -0.0, 1.0];
+        let reference = [1.0f32, 0.5];
+        let output = track(3, OUTPUT_SAMPLE_RATE);
+        let identity = completed_identity(
+            OpenVoiceObserved {
+                source_mono_sha256: pcm_sha256(&source),
+                reference_mono_sha256: pcm_sha256(&reference),
+                source_rate: 24_000,
+                reference_rate: 44_100,
+                source_channels: 2,
+                reference_channels: 1,
+                source_mono_samples: source.len(),
+                reference_mono_samples: reference.len(),
+                tau_bits: 0.3f32.to_bits(),
+                seed: 42,
+                noise_frames: 7,
+                device: "Cpu".into(),
+                dtype: "F32".into(),
+            },
+            &[output],
+        );
+        identity.validate(MODEL_ID, "candle", 1).unwrap();
+        let resolved = identity.resolved().unwrap();
+        assert_eq!(
+            resolved.provider_choices["source"],
+            ExecutionFact::resolved(json!({
+                "mono_pcm_f32_sha256":pcm_sha256(&source),
+                "sample_rate":24_000,"channels":2,"mono_samples":3
+            }))
+        );
+        assert_eq!(
+            resolved.provider_choices["target_reference"],
+            ExecutionFact::resolved(json!({
+                "mono_pcm_f32_sha256":pcm_sha256(&reference),
+                "sample_rate":44_100,"channels":1,"mono_samples":2
+            }))
+        );
+        assert_eq!(
+            resolved.provider_choices["converter"].clone(),
+            ExecutionFact::resolved(json!({
+                "path":"source_and_reference_tone_color_to_vits_flow",
+                "native_sample_rate":OUTPUT_SAMPLE_RATE,
+                "posterior_tau_bits":format!("f32:{:08x}",0.3f32.to_bits()),
+                "noise_scheme":"splitmix64_box_muller",
+                "noise_shape":[1,config::INTER_CHANNELS,7]
+            }))
+        );
+        let ExecutionRandomness::Draws { draws, .. } = &resolved.randomness else {
+            panic!("seeded Gaussian draw");
+        };
+        assert_eq!(draws[0].seed, Some(42));
+        assert_eq!(
+            resolved.output_policy,
+            ExecutionFact::resolved(json!({"tracks":[{
+                "index":0,"pcm_f32_sha256":pcm_sha256(&track(3,OUTPUT_SAMPLE_RATE).samples),
+                "sample_rate":OUTPUT_SAMPLE_RATE,"channels":1,"samples":3
+            }]}))
+        );
+        assert!(matches!(
+            resolved.deterministic_replay,
+            ExecutionReplaySupport::NonDeterministic { .. }
+        ));
+        assert_ne!(pcm_sha256(&[0.0]), pcm_sha256(&[-0.0]));
     }
 
     #[test]
@@ -365,6 +584,10 @@ mod tests {
         };
         let err = t.apply(&req, &mut |_| {}).unwrap_err();
         assert!(matches!(err, gen_core::Error::Canceled));
+        assert!(matches!(
+            t.apply_with_execution_report(&req, &mut |_| {}),
+            Err(gen_core::Error::Canceled)
+        ));
     }
 
     #[test]
@@ -379,5 +602,7 @@ mod tests {
         };
         let err = t.apply(&req, &mut |_| {}).unwrap_err();
         assert!(!matches!(err, gen_core::Error::Canceled));
+        assert!(t.apply_with_execution_report(&req, &mut |_| {}).is_err());
+        assert!(t.apply_with_execution_report(&req, &mut |_| {}).is_err());
     }
 }

@@ -77,6 +77,22 @@ impl OpenVoicePipeline {
         seed: u64,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Vec<f32>> {
+        self.convert_observed(source, src_rate, g_src, g_tgt, tau, seed, cancel)
+            .map(|(samples, _)| samples)
+    }
+
+    /// The same conversion, with the spectrogram frame count actually used to size its noise.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn convert_observed(
+        &self,
+        source: &[f32],
+        src_rate: u32,
+        g_src: &Tensor,
+        g_tgt: &Tensor,
+        tau: f32,
+        seed: u64,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(Vec<f32>, usize)> {
         let wav = candle_audio::dsp::resample(source, src_rate, config::SAMPLE_RATE, 1)?;
         let spec = spectrogram(&wav).ok_or_else(|| {
             AudioError::Msg("openvoice_v2: source clip too short for a spectrogram frame".into())
@@ -87,8 +103,10 @@ impl OpenVoicePipeline {
             seed,
             &self.device,
         )?;
-        self.converter
-            .voice_conversion(&spec_t, g_src, g_tgt, tau, &noise, cancel)
+        let samples = self
+            .converter
+            .voice_conversion(&spec_t, g_src, g_tgt, tau, &noise, cancel)?;
+        Ok((samples, spec.n_frames))
     }
 }
 
@@ -102,10 +120,10 @@ fn spec_to_tensor(spec: &crate::spectrogram::LinearSpectrogram, device: &Device)
     )?)
 }
 
-/// A `[…]`-shaped tensor of deterministic standard-Gaussian samples, seeded so the same request +
-/// seed reproduces byte-identical output (the sibling providers' determinism discipline). A small
-/// SplitMix64 → Box–Muller generator — the reference draws `torch.randn`; only the temperature `τ`
-/// and the posterior statistics are load-bearing for identity, not the exact draw.
+/// A `[…]`-shaped tensor of seeded standard-Gaussian samples. The SplitMix64 → Box–Muller draw
+/// is fixed for a given seed and shape on this implementation; this does not attest bitwise output
+/// replay across converter checkpoints, devices, or precision modes. The reference draws
+/// `torch.randn`, so this native draw scheme is an explicit part of the execution identity.
 fn gaussian_noise(shape: (usize, usize, usize), seed: u64, device: &Device) -> Result<Tensor> {
     let n = shape.0 * shape.1 * shape.2;
     let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
