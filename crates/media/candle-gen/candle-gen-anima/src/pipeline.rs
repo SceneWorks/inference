@@ -78,6 +78,18 @@ pub struct AnimaPipeline {
     unobserved_adapter_count: usize,
     components: AnimaComponents,
     device: Device,
+    variant: Variant,
+}
+
+fn checked_variant(loaded: Variant, requested: Variant) -> Result<Variant> {
+    if loaded != requested {
+        return Err(CandleError::Msg(format!(
+            "anima pipeline loaded {} weights but generation requested {}",
+            loaded.id(),
+            requested.id()
+        )));
+    }
+    Ok(loaded)
 }
 
 impl AnimaPipeline {
@@ -91,6 +103,7 @@ impl AnimaPipeline {
             unobserved_adapter_count: adapters.len(),
             components: AnimaComponents::load(source, variant, device, adapters)?,
             device: device.clone(),
+            variant,
         })
     }
 
@@ -141,6 +154,8 @@ impl AnimaPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let variant =
+            checked_variant(self.variant, variant).map_err(candle_gen::gen_core::Error::from)?;
         let mut report_progress =
             |event| candle_gen::execution::outside_attempt(|| on_progress(event));
         candle_gen::execution::capture_direct(&crate::descriptor_for(variant), cancel, || {
@@ -172,6 +187,7 @@ impl AnimaPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        let variant = checked_variant(self.variant, variant)?;
         let cond = self.encode_prompt(prompt)?;
         let uncond = if variant.uses_cfg() {
             Some(self.encode_prompt(negative)?)
@@ -188,6 +204,22 @@ impl AnimaPipeline {
             cancel,
             on_progress,
         )
+    }
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::{checked_variant, Variant};
+
+    #[test]
+    fn loaded_weights_cannot_be_reported_or_run_as_another_variant() {
+        assert_eq!(
+            checked_variant(Variant::Base, Variant::Base).unwrap(),
+            Variant::Base
+        );
+        let error = checked_variant(Variant::Base, Variant::Turbo).unwrap_err();
+        assert!(error.to_string().contains("anima_base"));
+        assert!(error.to_string().contains("anima_turbo"));
     }
 }
 
