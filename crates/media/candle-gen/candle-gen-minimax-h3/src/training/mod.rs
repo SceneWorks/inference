@@ -26,7 +26,7 @@
 //!    projections, the six heads, the token refiner) moves to the device. The AdaLN modulation of
 //!    the six published timesteps is projected once, one block's projection at a time, and every
 //!    projection is evicted. The 50 blocks then stream into a one-block device window, forward and
-//!    again in reverse for the backward ([`step`]), so gradient checkpointing is structural: each
+//!    again in reverse for the backward (the private `step` module), so gradient checkpointing is structural: each
 //!    block's input is all the forward keeps. `gradient_checkpointing = false` is honored as the
 //!    resident alternative (whole DiT on the device, every activation retained), and the preflight
 //!    refuses it unless the device holds it.
@@ -34,11 +34,11 @@
 //! # Where this differs from the MLX twin
 //!
 //! * The stream is host-resident runtime-format blocks copied into a device window
-//!   ([`MiniMaxH3Dit::window_block`]) rather than blocks rebuilt from the tier's shards, because
+//!   (`MiniMaxH3Dit::window_block`) rather than blocks rebuilt from the tier's shards, because
 //!   CUDA memory is separate from the host's. The memory estimate prices the host stack in its own
 //!   column.
 //! * Training attention is bounded by design through candle's shared training SDPA
-//!   ([`crate::nn::with_differentiable_attention`]): its reference owner keeps only q / k / v and the
+//!   (`nn::with_differentiable_attention`): its reference owner keeps only q / k / v and the
 //!   output, and recomputes the float32 probabilities one query tile at a time in the backward,
 //!   where MLX chunks whole heads under a checkpoint. The estimate prices one tile, rounded up to
 //!   whole heads, through the shared envelope.
@@ -230,9 +230,12 @@ fn leaf_shape(cfg: &MiniMaxH3DitConfig, path: &str) -> Result<(usize, usize)> {
     })
 }
 
-/// `(trainable elements, largest block's LoKr delta, all LoKr deltas)` for `paths` under `cfg` —
-/// exact, from the leaf shapes (LoRA `rank·(in + out)`; LoKr `w1` plus a full or low-rank `w2` by
-/// PEFT's `use_w2` rule, exactly as [`build_adapt_lokr_targets_peft`] sizes them).
+/// `(trainable elements, largest block's LoKr intermediate, all LoKr intermediates)` for `paths`
+/// under `cfg` — exact, from the leaf shapes (LoRA `rank·(in + out)`; LoKr `w1` plus a full or
+/// low-rank `w2` by PEFT's `use_w2` rule, exactly as [`build_adapt_lokr_targets_peft`] sizes them).
+/// Candle's trainable LoKr never forms the `[out, in]` delta: its residual is the Kronecker
+/// vec-trick `w1 · X · w2ᵀ`, whose one intermediate is `[S, in_a, out_b]`, so the LoKr figures are
+/// that intermediate's elements **per sequence row** (`Σ in_a · out_b`).
 fn adapter_elements(
     dit_cfg: &MiniMaxH3DitConfig,
     paths: &[String],
@@ -260,7 +263,11 @@ fn adapter_elements(
         if cfg.network_type == NetworkType::Lokr {
             *per_block
                 .entry(target_block(path).unwrap_or(0))
-                .or_default() += (out_f * in_f) as u64;
+                .or_default() += {
+                let (_, out_b) = factorization(out_f, cfg.decompose_factor);
+                let (in_a, _) = factorization(in_f, cfg.decompose_factor);
+                (in_a * out_b) as u64
+            };
         }
     }
     let block_max = per_block.values().copied().max().unwrap_or(0);
@@ -615,8 +622,10 @@ impl MiniMaxH3ImageTrainer {
             width: plan.compute_dtype.size_in_bytes() as u64,
             trainable_elements: trainable,
             optimizer_state_per_element: optimizer_state_per_element(&cfg.optimizer),
-            lokr_delta_block_max: block_max,
-            lokr_delta_total: total,
+            lokr_rows_block_max: block_max,
+            lokr_rows_total: total,
+            packed_base: crate::tier::MiniMaxH3TierPaths::staged_bits(self.generator.dit_dir())?
+                .is_some(),
             checkpointed: plan.checkpointed,
             chunked_attention: true,
             preview,
@@ -865,7 +874,9 @@ impl MiniMaxH3ImageTrainer {
             steps_run = step;
             accumulate_grads(&mut accumulated, grads, &set.vars)?;
             pending += 1;
-            if step.is_multiple_of(accum) {
+            // The last step closes its window too, so the final step's preview and the saved
+            // adapter see the same factors (a sub-`accum` tail is a true mean of what it holds).
+            if step.is_multiple_of(accum) || step == cfg.steps {
                 apply_update(
                     &mut opt,
                     &mut accumulated,
@@ -901,6 +912,7 @@ impl MiniMaxH3ImageTrainer {
                 }
             }
 
+            let mut checkpointed_here = false;
             if cfg.save_every > 0 && step % cfg.save_every == 0 && step != cfg.steps {
                 create_output_dir(&req.output_dir)?;
                 save_adapter(
@@ -908,10 +920,22 @@ impl MiniMaxH3ImageTrainer {
                     &meta,
                     &req.output_dir.join(checkpoint_filename(&stem, step)),
                 )?;
+                checkpointed_here = true;
                 resume_due = true;
                 on_progress(TrainingProgress::Checkpoint { step });
             }
             if resume_due && pending == 0 {
+                // A cadence that fell mid-window lands its resume bundle here, at a later step:
+                // save the adapter checkpoint at this step too, so a resume finds the mode stamp
+                // beside the bundle it loads.
+                if !checkpointed_here {
+                    create_output_dir(&req.output_dir)?;
+                    save_adapter(
+                        &set,
+                        &meta,
+                        &req.output_dir.join(checkpoint_filename(&stem, step)),
+                    )?;
+                }
                 save_resume(
                     &req.output_dir,
                     &stem,
@@ -931,7 +955,7 @@ impl MiniMaxH3ImageTrainer {
         if steps_run == 0 {
             return Err(Error::Canceled);
         }
-        // Flush a pending (sub-`accum`) window as a true mean of the grads it holds.
+        // A cancel mid-window: flush the pending window as a true mean of the grads it holds.
         if accumulated.is_some() {
             apply_update(
                 &mut opt,
@@ -945,6 +969,11 @@ impl MiniMaxH3ImageTrainer {
                 cfg.seed,
             )?;
             if resume_due {
+                save_adapter(
+                    &set,
+                    &meta,
+                    &req.output_dir.join(checkpoint_filename(&stem, steps_run)),
+                )?;
                 save_resume(
                     &req.output_dir,
                     &stem,

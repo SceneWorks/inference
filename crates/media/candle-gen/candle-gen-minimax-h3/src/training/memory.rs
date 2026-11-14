@@ -50,6 +50,8 @@ pub fn training_attention_heads_per_chunk(seq_len: u64) -> u64 {
         .clamp(1, heads)
 }
 
+/// The conditioner's output width (Qwen3-VL-32B's layer-50 hidden state).
+const TEXT_DIM: u64 = 5120;
 /// Headroom for the CUDA caching allocator's fragmentation around one block's backward.
 const ALLOCATOR_SLACK_BYTES: u64 = 1 << 30;
 
@@ -74,8 +76,13 @@ pub struct TrainingRunShape {
     pub width: u64,
     pub trainable_elements: u64,
     pub optimizer_state_per_element: u64,
-    pub lokr_delta_block_max: u64,
-    pub lokr_delta_total: u64,
+    /// LoKr vec-trick intermediate elements per sequence row: the largest block's (streamed) and
+    /// all blocks' (resident). Candle never forms a dense `[out, in]` delta.
+    pub lokr_rows_block_max: u64,
+    pub lokr_rows_total: u64,
+    /// The DiT tier is packed (q4 / q8): every projection dequantizes per forward, and autograd
+    /// retains each dense copy until its backward.
+    pub packed_base: bool,
     pub checkpointed: bool,
     /// Training attention through the bounded reference owner (no call holds more than one score
     /// tile; the backward recomputes it) — the trainer always runs this; `false` prices an
@@ -186,14 +193,17 @@ fn train_rows(item: &TrainingItemShape) -> (u64, u64, u64) {
     (rows.text_rows, rows.reference_rows.iter().sum(), image)
 }
 
-/// The cached dataset on the device: each item's refined text rows (activation width) and its
-/// reference latents once, its target latent once per edge (float32 packed rows).
+/// The cached dataset on the device: each item's caption rows and reference latents once, its
+/// target latent once per edge (float32 packed rows). A caption row is the larger of its two forms:
+/// the conditioner's float32 `[T, text_dim]` output, held from caption encoding through the DiT
+/// load, and the refined `[T, hidden]` rows at activation width the train phase reads.
 fn cache_bytes(hidden: u64, run: &TrainingRunShape) -> u64 {
     let per_row = DitGeometry::SHIPPED.patch_dim * 4;
+    let text_row = (TEXT_DIM * 4).max(hidden * run.width);
     run.items.iter().fold(0u64, |total, item| {
         let (text, reference, image) = train_rows(item);
         total
-            .saturating_add(text * hidden * run.width)
+            .saturating_add(text * text_row)
             .saturating_add(reference * per_row)
             .saturating_add(u64::from(run.edges.max(1)) * image * per_row)
     })
@@ -201,18 +211,35 @@ fn cache_bytes(hidden: u64, run: &TrainingRunShape) -> u64 {
 
 /// The DiT weight bytes the train phase holds, from admission's header-read facts: the trunk, each
 /// block's body (its stack bytes less its `adaln_proj`, evicted after the precompute), each block's
-/// `adaln_proj`, and the modulation tables over the run's distinct timesteps.
-fn dit_weights(facts: &ImageMemoryFacts, edit: bool) -> DitWeightBytes {
+/// `adaln_proj`, and the modulation tables over the run's distinct timesteps. Admission's figures
+/// are the bf16 store; a dense tier loaded at a float32 compute dtype widens every float weight, so
+/// it is priced at twice them (the float32 heads included, an upper bound). A packed tier keeps its
+/// packed bytes whatever the compute dtype.
+fn dit_weights(facts: &ImageMemoryFacts, edit: bool, run: &TrainingRunShape) -> DitWeightBytes {
     let stream = &facts.stream;
+    let widen = if !run.packed_base && run.width > 2 {
+        run.width / 2
+    } else {
+        1
+    };
     let blocks = stream.stacks.first().cloned().unwrap_or_default();
     let adaln = facts.task.evicted_bytes / blocks.len().max(1) as u64;
     DitWeightBytes {
-        trunk: stream.resident_bytes,
-        block_body: blocks.iter().map(|b| b.saturating_sub(adaln)).collect(),
-        block_adaln: vec![adaln; blocks.len()],
+        trunk: stream.resident_bytes * widen,
+        block_body: blocks
+            .iter()
+            .map(|b| b.saturating_sub(adaln) * widen)
+            .collect(),
+        block_adaln: vec![adaln * widen; blocks.len()],
         modulation_tables: facts.task.table_bytes_per_timestep
             * (u64::from(contract::FIXED_STEPS) + u64::from(edit)),
     }
+}
+
+/// Elements of one block body's dense projections: q / k / v and the output, the SwiGLU pair.
+fn dense_block_elements(g: &DitGeometry) -> u64 {
+    let inner = g.heads * g.head_dim;
+    4 * inner * g.hidden + 3 * g.ffn * g.hidden
 }
 
 /// The estimate of `run` against `facts` on `contract` — see the module docs.
@@ -226,7 +253,7 @@ pub fn estimate_training(
     let geometry = DitGeometry::SHIPPED;
     let cache = cache_bytes(geometry.hidden, run);
     let edit = run.items.iter().any(|i| !i.references.is_empty());
-    let weights = dit_weights(facts, edit);
+    let weights = dit_weights(facts, edit, run);
 
     let host_dit = if run.checkpointed {
         facts.dit_prepare_host.max(facts.dit_retained_host)
@@ -267,8 +294,9 @@ pub fn estimate_training(
             width: run.width,
             trainable_elements: run.trainable_elements,
             optimizer_state_per_element: run.optimizer_state_per_element,
-            lokr_delta_block_max: run.lokr_delta_block_max,
-            lokr_delta_total: run.lokr_delta_total,
+            // Candle's LoKr forms no dense delta; its intermediates are priced below.
+            lokr_delta_block_max: 0,
+            lokr_delta_total: 0,
             checkpointed: run.checkpointed,
             attention_heads_per_chunk: if run.chunked_attention {
                 training_attention_heads_per_chunk(text_rows + reference_rows + image_rows)
@@ -287,7 +315,24 @@ pub fn estimate_training(
             geometry.heads * seq * seq * 4 * F32_SCORE_BUFFERS
         };
         let live_blocks = if run.checkpointed { 1 } else { geometry.layers };
-        let total = bytes.total() + live_blocks * f32_attention + ALLOCATOR_SLACK_BYTES;
+        // A packed projection's dequantized dense weight is an operand of its matmul, which
+        // autograd retains for the input gradient: one block's (streamed) or every block's.
+        let dequantized = if run.packed_base {
+            live_blocks * dense_block_elements(&geometry) * run.width
+        } else {
+            0
+        };
+        // LoKr's `[S, in_a, out_b]` intermediates, retained for the backward.
+        let lokr_rows = if run.checkpointed {
+            run.lokr_rows_block_max
+        } else {
+            run.lokr_rows_total
+        };
+        let total = bytes.total()
+            + live_blocks * f32_attention
+            + dequantized
+            + lokr_rows * seq * run.width
+            + ALLOCATOR_SLACK_BYTES;
         if total > train.device {
             train.device = total;
             step = bytes;
@@ -303,8 +348,8 @@ pub fn estimate_training(
         device: train.device.saturating_add(cache),
         host: host_dit,
     };
-    // Previews run the generator with the training DiT's trunk and tables still on the device, the
-    // adapter state live, and (streamed) its host stack still held.
+    // Previews run the generator with the training DiT's trunk and tables still on the device — and,
+    // resident, its whole block stack — the adapter state live, and (streamed) its host stack held.
     let preview = match &run.preview {
         Some(item) => {
             let render = estimate(contract, facts, &request_shape(item), &selection)?;
@@ -313,7 +358,12 @@ pub fn estimate_training(
                     .peak_device_bytes()
                     .saturating_add(cache)
                     .saturating_add(step.adapter_state)
-                    .saturating_add(weights.trunk + weights.modulation_tables),
+                    .saturating_add(weights.trunk + weights.modulation_tables)
+                    .saturating_add(if run.checkpointed {
+                        0
+                    } else {
+                        weights.block_body.iter().sum()
+                    }),
                 host: render
                     .peak_host_bytes()
                     .saturating_add(if run.checkpointed {
@@ -448,8 +498,9 @@ mod tests {
                 * 16
                 * (3 * (5376 + 7168) + (7168 + 5376) + (5376 + 2 * 14336) + (14336 + 5376)),
             optimizer_state_per_element: 2,
-            lokr_delta_block_max: 0,
-            lokr_delta_total: 0,
+            lokr_rows_block_max: 0,
+            lokr_rows_total: 0,
+            packed_base: false,
             checkpointed,
             chunked_attention: true,
             preview: None,
@@ -594,6 +645,105 @@ mod tests {
             assert!((1..=56).contains(&heads));
             assert!(heads == 56 || heads * seq * seq >= tile, "{seq}: {heads}");
         }
+    }
+
+    /// A dense tier trained at float32 holds float32 weights; a packed tier keeps its packed bytes
+    /// and adds the dense copies autograd retains — one block streamed, every block resident.
+    #[test]
+    fn weights_follow_the_compute_dtype_and_the_retained_dequantized_copies() {
+        let c = contract();
+        let f = facts();
+        let t = tier(None);
+        let bf16 = estimate_training(&c, &f, t, &run(true)).unwrap();
+        let f32_run = TrainingRunShape {
+            width: 4,
+            ..run(true)
+        };
+        let f32_est = estimate_training(&c, &f, t, &f32_run).unwrap();
+        // The weights double; the modulation tables are projected at the cache's own dtype.
+        let tables = dit_weights(&f, false, &run(true)).modulation_tables;
+        assert_eq!(
+            f32_est.step.weights - tables,
+            2 * (bf16.step.weights - tables)
+        );
+        let packed = TrainingRunShape {
+            packed_base: true,
+            ..run(true)
+        };
+        let packed_est = estimate_training(&c, &f, t, &packed).unwrap();
+        let dense = dense_block_elements(&DitGeometry::SHIPPED) * 2;
+        assert_eq!(packed_est.train.device, bf16.train.device + dense);
+        let resident = estimate_training(
+            &c,
+            &f,
+            t,
+            &TrainingRunShape {
+                packed_base: true,
+                ..run(false)
+            },
+        )
+        .unwrap();
+        let resident_dense = estimate_training(&c, &f, t, &run(false)).unwrap();
+        assert_eq!(
+            resident.train.device,
+            resident_dense.train.device + 50 * dense
+        );
+    }
+
+    /// LoKr is priced at its vec-trick intermediates, never a dense `[out, in]` delta.
+    #[test]
+    fn lokr_prices_its_intermediates_not_dense_deltas() {
+        let c = contract();
+        let f = facts();
+        let t = tier(None);
+        let base = estimate_training(&c, &f, t, &run(true)).unwrap();
+        let lokr = TrainingRunShape {
+            lokr_rows_block_max: 1000,
+            lokr_rows_total: 50_000,
+            ..run(true)
+        };
+        let est = estimate_training(&c, &f, t, &lokr).unwrap();
+        assert_eq!(est.step.lokr_deltas, 0);
+        let (text, reference, image) = train_rows(&lokr.items[0]);
+        assert_eq!(
+            est.train.device,
+            base.train.device + 1000 * (text + reference + image) * 2
+        );
+    }
+
+    /// A resident preview keeps the training block stack on the device beside the render.
+    #[test]
+    fn a_resident_preview_includes_the_training_blocks() {
+        let c = contract();
+        let f = facts();
+        let t = tier(None);
+        let with = |checkpointed| TrainingRunShape {
+            preview: Some(item(vec![])),
+            ..run(checkpointed)
+        };
+        let streamed = estimate_training(&c, &f, t, &with(true)).unwrap();
+        let resident = estimate_training(&c, &f, t, &with(false)).unwrap();
+        let blocks: u64 = dit_weights(&f, false, &run(false)).block_body.iter().sum();
+        assert!(
+            resident.preview.device
+                >= streamed.preview.device + blocks - streamed.step.adapter_state
+        );
+    }
+
+    /// A caption row is priced at the larger of the conditioner's float32 output and the refined
+    /// activation-width rows.
+    #[test]
+    fn the_caption_cache_is_priced_at_its_larger_form() {
+        let bf16 = run(true);
+        let (text, reference, image) = train_rows(&bf16.items[0]);
+        let per_item = text * 5120 * 4 + reference * 384 + image * 384;
+        assert_eq!(cache_bytes(5376, &bf16), 8 * per_item);
+        let f32_run = TrainingRunShape {
+            width: 4,
+            ..run(true)
+        };
+        let per_item = text * 5376 * 4 + reference * 384 + image * 384;
+        assert_eq!(cache_bytes(5376, &f32_run), 8 * per_item);
     }
 
     #[test]

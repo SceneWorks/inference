@@ -104,9 +104,16 @@ fn adapter_elements_count_what_the_install_trains() {
     };
     let (n, block_max, total) = adapter_elements(&c, &paths, &lokr).unwrap();
     assert!(n > 0);
-    let dense_block: u64 = 3 * 7168 * 5376 + 5376 * 7168 + 2 * 14336 * 5376 + 5376 * 14336;
-    assert_eq!(block_max, dense_block);
-    assert_eq!(total, 50 * dense_block);
+    // Per row, each leaf's vec-trick intermediate `in_a · out_b` — never the dense `[out, in]`.
+    let row = |out_f: usize, in_f: usize| -> u64 {
+        let (_, out_b) = factorization(out_f, -1);
+        let (in_a, _) = factorization(in_f, -1);
+        (in_a * out_b) as u64
+    };
+    let block = 3 * row(7168, 5376) + row(5376, 7168) + row(2 * 14336, 5376) + row(5376, 14336);
+    assert_eq!(block_max, block);
+    assert_eq!(total, 50 * block);
+    assert!(block < 7168 * 5376);
     assert_eq!(
         leaf_shape(&c, "transformer_blocks.3.ff.net.0.proj").unwrap(),
         (2 * 14336, 5376)

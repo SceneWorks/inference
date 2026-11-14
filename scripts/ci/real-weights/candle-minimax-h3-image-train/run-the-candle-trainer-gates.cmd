@@ -38,6 +38,9 @@ set "H3T_FREE=0"
 for /f "tokens=1,2 delims=, " %%A in ('nvidia-smi --query-gpu^=index^,memory.free --format^=csv^,noheader^,nounits') do call :consider_card %%A %%B
 if not defined H3T_CARD goto :no_card
 set "CUDA_VISIBLE_DEVICES=%H3T_CARD%"
+rem The MLX-trained adapter load runs in a later step of this job: hand it the same card.
+>> "%GITHUB_ENV%" echo CUDA_DEVICE_ORDER=PCI_BUS_ID
+>> "%GITHUB_ENV%" echo CUDA_VISIBLE_DEVICES=%H3T_CARD%
 > "%H3T_LOGS%\cuda-device-selection.txt" echo CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=%H3T_CARD% free_mib=%H3T_FREE%
 type "%H3T_LOGS%\cuda-device-selection.txt"
 
