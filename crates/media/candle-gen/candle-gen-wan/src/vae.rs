@@ -921,6 +921,11 @@ impl WanVae {
         preflight_streaming_decode(cancel, || self.reset_caches())?;
         let z = self.unnormalize(z)?;
         let t_lat = z.dim(2)?;
+        candle_gen::execution::runtime(z.device(), z.dtype());
+        candle_gen::execution::policy(
+            "wan_z48_causal_decode",
+            serde_json::json!({"latent_frames": t_lat, "chunk_latent_frames": 1, "spatial_shape": [z.dim(3)?, z.dim(4)?]}),
+        );
         // Collect the per-frame decoded chunks and `cat` once (sc-9037): cat-ing onto a growing
         // accumulator each iteration re-copies every prior frame → O(T²) copy traffic and briefly
         // holds old+new. A single `Tensor::cat` at the end is O(T) and equivalent (same frames, same
@@ -1011,6 +1016,10 @@ impl WanVae {
             Some(cap) => auto_tiling_budgeted_wan22_capped(out_h, out_w, out_f, cap)?,
             None => auto_tiling_budgeted_wan22(out_h, out_w, out_f)?,
         };
+        candle_gen::execution::policy(
+            "wan_z48_decode",
+            serde_json::json!({"plan": format!("{plan:?}"), "causal_streaming": true}),
+        );
         match plan {
             Some(cfg) => self.decode_tiled_with_cancel(z, &cfg, cancel),
             None => self.decode_with_cancel(z, cancel),

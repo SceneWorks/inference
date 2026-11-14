@@ -378,6 +378,14 @@ pub fn generate(
     // conversion makes it impossible for the public job API to snap before rendering.
     let (tw, th) = validate_job_geometry(job.width, job.height)?;
     let cfg_disabled = job.guidance <= 1.0;
+    candle_gen::execution::policy(
+        "scail2_segment_policy",
+        serde_json::json!({
+            "length": job.segment_len, "overlap": job.segment_overlap,
+            "guidance_bits": job.guidance.to_bits(), "cfg_disabled": cfg_disabled,
+            "replace": job.replace_flag, "vae": "z16_causal_streaming_no_spatial_tiles"
+        }),
+    );
 
     // --- decode + resize all pixel inputs to (tw, th) ---
     let ref_chw = image_to_chw(job.reference.image, tw, th, Interp::Bicubic, dev)?; // [3,H,W]

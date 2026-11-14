@@ -2001,6 +2001,8 @@ impl AvDiT {
         a_ts: &AvTs,
         perturbation: &AvPerturbation,
     ) -> Result<(Tensor, Tensor)> {
+        candle_gen::execution::runtime(&self.device, self.video.dtype);
+        candle_gen::execution::runtime(&self.device, self.audio.dtype);
         let mut vx = self
             .video
             .patchify

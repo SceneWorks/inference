@@ -731,6 +731,14 @@ impl Generator for Bernini {
         Ok(())
     }
 
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn generate(
         &self,
         req: &GenerationRequest,
@@ -1163,6 +1171,16 @@ pub fn denoise_bernini_wvitcfg(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> CResult<Tensor> {
+    candle_gen::execution::policy(
+        "bernini_vit_guidance",
+        serde_json::json!({
+            "mode": format!("{mode:?}"), "boundary_bits": boundary_ts.to_bits(),
+            "omega_scale_bits": omega_scale.to_bits(),
+            "omega_txt_bits": base_g.omega_txt.to_bits(), "omega_img_bits": base_g.omega_img.to_bits(),
+            "omega_vid_bits": base_g.omega_vid.to_bits(), "omega_tgt_bits": base_g.omega_tgt.to_bits(),
+            "eta_bits": base_g.eta.to_bits(), "norm_threshold_bits": base_g.norm_threshold.to_bits()
+        }),
+    );
     let mut sched = FlowScheduler::new(sampler, steps, shift);
     let sigmas = flow_sigmas(steps, shift);
     let mut latent = init_noise.clone();
@@ -1327,6 +1345,12 @@ fn sample_vit_frames(frames: &[RgbImage]) -> Vec<RgbImage> {
 
 /// The reveal permutation of `[0, n)` — numpy `RandomState(seed).shuffle(arange(n))` (bit-exact).
 fn seeded_permutation(n: i32, seed: u64) -> Vec<i32> {
+    candle_gen::execution::rng_scheme("bernini_numpy_mt19937_shuffle_v1");
+    candle_gen::execution::stream("bernini_numpy_mt19937_shuffle_v1", seed as u32 as u64);
+    candle_gen::execution::policy(
+        "bernini_planner_rng",
+        serde_json::json!({"scheme": "numpy-mt19937-shuffle-v1", "query_tokens": n}),
+    );
     crate::rng::numpy_shuffle(n.max(0) as usize, seed as u32)
 }
 
@@ -1343,6 +1367,14 @@ fn seeded_step_noise(
     dev: &Device,
 ) -> CResult<Vec<Tensor>> {
     let schedule = mar_schedule(n_query, planning_step, order);
+    candle_gen::execution::rng_scheme("bernini_torch_mt19937_normal_v1");
+    candle_gen::execution::stream("bernini_torch_mt19937_normal_v1", seed as u32 as u64);
+    candle_gen::execution::policy(
+        "bernini_planner_noise",
+        serde_json::json!({
+            "scheme": "torch-mt19937-normal-v1", "schedule": schedule, "channels": in_channels
+        }),
+    );
     let per_step = crate::rng::torch_step_noise(&schedule, in_channels, seed as u32);
     let mut out = Vec::with_capacity(planning_step);
     for (revealed, data) in schedule.iter().zip(per_step) {
@@ -1845,5 +1877,41 @@ mod tests {
         println!(
             "\nMODEL_INFERENCE_BODY_COMPLETED bernini::tests::denoise_wvitcfg_runs_and_keeps_shape"
         );
+    }
+}
+
+#[cfg(test)]
+mod execution_identity_tests {
+    use super::*;
+
+    #[test]
+    fn planner_report_records_effective_low_u32_seeds_and_mixed_rngs() {
+        let attempt = candle_gen::execution::Attempt::begin();
+        let seed = (1u64 << 40) + 17;
+        let order = seeded_permutation(4, seed);
+        let _noise = seeded_step_noise(4, 2, &order, 2, seed, &Device::Cpu).unwrap();
+        candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+        candle_gen::execution::schedule("fixture", &[1.0, 0.0], "flow");
+        let output = GenerationOutput::Video {
+            frames: vec![Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            }],
+            fps: 16,
+            audio: None,
+        };
+        let identity = attempt.finish_image(&descriptor(), &output);
+        let candle_gen::gen_core::generator::ExecutionRandomness::Draws { draws, scheme } =
+            &identity.resolved().unwrap().randomness
+        else {
+            panic!("draws")
+        };
+        assert_eq!(draws.len(), 2);
+        assert_eq!(draws[0].seed, Some(17));
+        assert_eq!(draws[1].seed, Some(17));
+        assert_ne!(draws[0].purpose, draws[1].purpose);
+        assert!(scheme.contains("numpy_mt19937"));
+        assert!(scheme.contains("torch_mt19937"));
     }
 }

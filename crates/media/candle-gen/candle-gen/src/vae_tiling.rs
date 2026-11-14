@@ -73,7 +73,15 @@ where
     E: From<Error>,
 {
     let (_b, _c, f, h, w) = latent.dims5()?;
-    if !cfg.needs_tiling(vae, f as i32, h as i32, w as i32) {
+    let tiled = cfg.needs_tiling(vae, f as i32, h as i32, w as i32);
+    crate::execution::policy(
+        "video_vae_tiling",
+        serde_json::json!({
+            "decoder": label, "tiled": tiled, "config": format!("{cfg:?}"),
+            "latent_shape": latent.dims(), "geometry": format!("{vae:?}")
+        }),
+    );
+    if !tiled {
         return decode_fn(latent);
     }
     let plan = cfg.plan(vae, f as i32, h as i32, w as i32);

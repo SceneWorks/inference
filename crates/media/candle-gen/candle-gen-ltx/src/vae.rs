@@ -636,7 +636,12 @@ impl LtxVideoVae {
         let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale; // causal ×8
         let out_h = h as i32 * Self::VAE_TILING.spatial_scale; // ×32
         let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
-        match auto_tiling_budgeted_ltx(out_h, out_w, out_f)? {
+        let plan = auto_tiling_budgeted_ltx(out_h, out_w, out_f)?;
+        candle_gen::execution::policy(
+            "ltx_conv_decode",
+            serde_json::json!({"plan": format!("{plan:?}")}),
+        );
+        match plan {
             Some(cfg) => self.decode_tiled(latent, &cfg),
             None => self.decode(latent),
         }

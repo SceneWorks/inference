@@ -803,6 +803,7 @@ impl WanTransformer {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        candle_gen::execution::runtime(latents.device(), self.dtype);
         let (tokens, grid) = self.patch_embed_tokens(latents)?;
         let out = self.forward_packed_prepared(&tokens, t, cross_kv, cos, sin)?;
         self.unpatchify_tokens(&out, grid)
@@ -864,6 +865,7 @@ impl WanTransformer {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        candle_gen::execution::runtime(tokens.device(), self.dtype);
         let (b, _l, _dim) = tokens.dims3()?;
         if cross_kv.blocks.len() != self.blocks.len() {
             return Err(candle_gen::candle_core::Error::Msg(format!(
@@ -934,6 +936,7 @@ impl WanTransformer {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        candle_gen::execution::runtime(latents.device(), self.dtype);
         let (tokens, grid) = self.patch_embed_tokens(latents)?;
         let (b, l, _dim) = tokens.dims3()?;
         if cross_kv.blocks.len() != self.blocks.len() {

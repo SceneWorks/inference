@@ -553,6 +553,12 @@ impl Pipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<()> {
+        candle_gen::execution::policy(
+            "wan14b_expert_range",
+            serde_json::json!({
+                "start": range.start, "end": range.end, "guidance_bits": guidance.to_bits(), "image_conditioning": y.is_some()
+            }),
+        );
         crate::sc20686_observer::observe("generation-start", 0, 0, 0);
         // One cache per projected conditioning payload for this expert's request-scoped denoise range.
         // A staged high/low render builds it after loading each expert, so no K/V survives an expert drop.
@@ -1159,6 +1165,14 @@ impl Generator for Wan14bGenerator {
             )));
         }
         Ok(())
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
     }
 
     fn generate(

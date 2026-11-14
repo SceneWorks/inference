@@ -1133,6 +1133,12 @@ impl MiniMaxH3 {
         // wrong 66 GB. See [`MiniMaxH3Task`] and `tests/ref2va_checkpoint.rs`.
         let (task, references) = self.resolve_task(req)?;
         let patch = self.task_dit_config(task)?.patch_size;
+        candle_gen::execution::policy(
+            "h3_task",
+            serde_json::json!({
+                "task": format!("{task:?}"), "patch": patch, "guidance": "distilled_no_cfg"
+            }),
+        );
         if let Some(refs) = &references {
             return self.generate_ref2va(req, refs, task, &geometry, &schedule, seed, on_progress);
         }
@@ -2238,12 +2244,31 @@ impl Generator for MiniMaxH3 {
         crate::memory_strategy::begin_request(&self.contract, self.device.clone(), context)
     }
 
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn generate(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<GenerationOutput> {
-        Ok(self.generate_impl(req, on_progress)?)
+        let output = self.generate_impl(req, on_progress)?;
+        let report = self.veda_report.borrow();
+        candle_gen::execution::policy(
+            "h3_veda_completed",
+            serde_json::json!({
+                "kernel": report.kernel, "predictor": report.predictor, "plan": report.plan,
+                "exact_plan": report.exact_plan, "execution_grid": report.execution_grid,
+                "plan_grid": report.plan_grid, "sparse_calls": report.sparse_calls,
+                "dense_calls": report.dense_calls, "dense_fallback": report.fallback_reason.is_some()
+            }),
+        );
+        Ok(output)
     }
 }
 

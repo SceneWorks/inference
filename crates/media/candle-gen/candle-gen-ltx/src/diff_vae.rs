@@ -2067,6 +2067,16 @@ impl NaDiffusionDecoder {
     ) -> Result<Tensor> {
         let context = self.stage_4(feature, is_origin, pad_trailing)?;
         let schedule = self.timesteps();
+        let mut consumed = schedule.clone();
+        consumed.push(0.0);
+        candle_gen::execution::schedule_f64(
+            "ltx_diffvae_euler_v1",
+            &consumed,
+            match self.cfg.model_output_type {
+                ModelOutputType::X0 => "x0",
+                ModelOutputType::Velocity => "velocity",
+            },
+        );
         let mut x_t = x_t_init.clone();
         for i in 0..schedule.len() - 1 {
             let out = self.diff_step(&context, &x_t, schedule[i])?;
@@ -2371,6 +2381,8 @@ impl NaDiffusionDecoder {
             shape5[2],
         );
         let n = shape.0 * shape.1 * shape.2 * shape.3 * shape.4;
+        candle_gen::execution::stream("ltx_diffvae_stage5_noise", seed);
+        candle_gen::execution::runtime(&self.device, latent.dtype());
         let mut rng = StdRng::seed_from_u64(seed);
         let values = candle_gen::seed::seeded_normal_vec(&mut rng, n);
         Tensor::from_vec(values, shape, &self.device)
@@ -2413,6 +2425,10 @@ impl NaDiffusionDecoder {
             sh[4],
             mode,
         )?;
+        candle_gen::execution::policy(
+            "ltx_diffvae_decode",
+            serde_json::json!({"plan": format!("{selected:?}"), "mode": format!("{mode:?}")}),
+        );
         match selected {
             Some(tiling) => self.decode_tiled(latent, noise, &tiling),
             None => self.decode(latent, noise),

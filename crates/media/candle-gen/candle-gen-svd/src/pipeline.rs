@@ -58,6 +58,8 @@ pub fn create_noise(
     device: &Device,
 ) -> CResult<Tensor> {
     let n = num_frames * 4 * h * w;
+    candle_gen::execution::draw("svd_video_latents", seed, 0);
+    candle_gen::execution::runtime(device, candle_gen::candle_core::DType::F32);
     let mut rng = StdRng::seed_from_u64(seed);
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(Tensor::from_vec(data, (1, num_frames, 4, h, w), device)?)
@@ -70,6 +72,7 @@ pub fn seeded_normal(
     device: &Device,
 ) -> CResult<Tensor> {
     let (a, b, c, d) = shape;
+    candle_gen::execution::draw("svd_image_augmentation", seed, 0);
     let mut rng = StdRng::seed_from_u64(seed);
     let data = candle_gen::seeded_normal_vec(&mut rng, a * b * c * d);
     Ok(Tensor::from_vec(data, shape, device)?)

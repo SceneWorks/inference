@@ -1097,6 +1097,15 @@ impl Pipeline {
         comps: &Components,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32, Option<AudioTrack>)> {
+        candle_gen::execution::policy(
+            "ltx_pipeline",
+            serde_json::json!({
+                "transformer": format!("{:?}", self.transformer_variant),
+                "diffusion_decoder": comps.diffusion_decoder.is_some(),
+                "attention_budget": comps.avdit.attention_budget(),
+                "block_plan": format!("{:?}", comps.avdit.block_plan())
+            }),
+        );
         let fps = req.fps.unwrap_or(DEFAULT_FPS);
         let seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let mut orchestration = pipeline::TwoStageOrchestration::new(seed);
@@ -1794,6 +1803,14 @@ impl Generator for LtxGenerator {
         // exactly how the two lanes drifted: candle refused `steps: 30` while mlx never read the
         // field (sc-19502). One declaration, one enforcement site, both lanes.
         Ok(())
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
     }
 
     fn generate(
@@ -2520,6 +2537,14 @@ impl Generator for Ltx25Generator {
             self.use_diffusion_decoder,
         )?;
         Ok(())
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
     }
 
     fn generate(

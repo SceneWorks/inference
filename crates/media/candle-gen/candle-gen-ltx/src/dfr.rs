@@ -444,6 +444,7 @@ pub fn noise_slot_tokens(state: &VideoTokenState, sigma: f32, seed: u64) -> Resu
     };
     let dims = state.latent.dims();
     let n: usize = dims.iter().product();
+    candle_gen::execution::stream("ltx_dfr_slot_noise", seed);
     let mut rng = StdRng::seed_from_u64(seed);
     let noise = Tensor::from_vec(
         candle_gen::seeded_normal_vec(&mut rng, n),
@@ -477,6 +478,7 @@ pub fn denoise_dfr_tile(
     // Tile-entry re-noise: noise·σ₀ + latent·(1 − σ₀), seeded per tile.
     let dims = job.tile_video.dims();
     let n: usize = dims.iter().product();
+    candle_gen::execution::stream("ltx_dfr_tile_noise", job.noise_seed);
     let mut rng = StdRng::seed_from_u64(job.noise_seed);
     let noise = Tensor::from_vec(
         candle_gen::seeded_normal_vec(&mut rng, n),

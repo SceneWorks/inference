@@ -120,6 +120,15 @@ impl FlowScheduler {
 
     /// Advance one step given the model velocity `v` and current `sample` → next sample.
     pub fn step(&mut self, v: &Tensor, sample: &Tensor) -> Result<Tensor> {
+        if self.step_index == 0 {
+            let sampler = match self.sampler {
+                Sampler::Euler => "wan_flow_euler_v1",
+                Sampler::UniPC => "wan_flow_unipc_bh2_order2_v1",
+                Sampler::Dpmpp2m => "wan_flow_dpmpp_2m_v1",
+            };
+            candle_gen::execution::schedule_f64(sampler, &self.sigmas, "flow_velocity");
+            candle_gen::execution::runtime(sample.device(), sample.dtype());
+        }
         match self.sampler {
             Sampler::Euler => {
                 let dt = self.sigmas[self.step_index + 1] - self.sigmas[self.step_index];
@@ -327,5 +336,75 @@ mod tests {
         assert_eq!(Sampler::parse(None), Sampler::UniPC);
         assert_eq!(Sampler::parse(Some("euler")), Sampler::Euler);
         assert_eq!(Sampler::parse(Some("something_else")), Sampler::UniPC);
+    }
+}
+
+#[cfg(test)]
+mod execution_identity_tests {
+    use super::*;
+    fn output() -> candle_gen::gen_core::GenerationOutput {
+        candle_gen::gen_core::GenerationOutput::Video {
+            frames: vec![candle_gen::gen_core::Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            }],
+            fps: 24,
+            audio: None,
+        }
+    }
+
+    fn report(
+        name: Option<&str>,
+        shift: f64,
+    ) -> candle_gen::gen_core::generator::ExecutionIdentity {
+        let attempt = candle_gen::execution::Attempt::begin();
+        let device = candle_gen::candle_core::Device::Cpu;
+        let noise = crate::pipeline::create_noise(71, 1, 1, 1, 1, &device).unwrap();
+        let mut scheduler = FlowScheduler::new(Sampler::parse(name), 3, shift);
+        let velocity = noise.zeros_like().unwrap();
+        // Raw scheduler arithmetic only: no learned model is constructed or executed.
+        let _ = scheduler.step(&velocity, &noise).unwrap();
+        candle_gen::execution::policy("test_decode", serde_json::json!("no_model_fixture"));
+        attempt.finish_image(&crate::descriptor(), &output())
+    }
+
+    #[test]
+    fn resolved_report_uses_native_fallback_and_exact_schedule() {
+        let default = report(None, 5.0);
+        assert_eq!(default, report(Some("unknown"), 5.0));
+        assert_eq!(default, report(Some("unipc"), 5.0));
+        assert_ne!(default, report(Some("euler"), 5.0));
+        assert_ne!(default, report(None, 3.0));
+        let resolved = default.resolved().expect("observed native scheduler");
+        resolved.validate(crate::MODEL_ID, "candle", 1).unwrap();
+        let candle_gen::gen_core::generator::ExecutionFact::Resolved { value } = &resolved.schedule
+        else {
+            panic!("missing schedule")
+        };
+        assert_eq!(value[0]["schedule"]["element"], "f64_le_bits");
+        assert_eq!(value[0]["schedule"]["count"], 4);
+    }
+
+    #[test]
+    fn scheduler_construction_and_failed_attempt_do_not_publish_stale_facts() {
+        let _completed = report(None, 5.0);
+        let attempt = candle_gen::execution::Attempt::begin();
+        let _unused = FlowScheduler::new(Sampler::Euler, 5, 7.0);
+        assert!(matches!(
+            attempt.finish_image(&crate::descriptor(), &output()),
+            candle_gen::gen_core::generator::ExecutionIdentity::Unavailable { .. }
+        ));
+        {
+            let _failed = candle_gen::execution::Attempt::begin();
+            candle_gen::execution::draw("abandoned", 99, 0);
+        }
+        let retry = report(None, 5.0);
+        let candle_gen::gen_core::generator::ExecutionRandomness::Draws { draws, .. } =
+            &retry.resolved().unwrap().randomness
+        else {
+            panic!("draws")
+        };
+        assert!(draws.iter().all(|draw| draw.seed == Some(71)));
     }
 }

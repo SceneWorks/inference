@@ -577,6 +577,12 @@ impl Pipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<Tensor> {
+        candle_gen::execution::policy(
+            "wan_denoise",
+            serde_json::json!({
+                "guidance_bits": guidance.to_bits(), "i2v_mask": ti2v.is_some()
+            }),
+        );
         let steps = knobs.steps;
         let shift = knobs.shift;
         // Text K/V is invariant for the full request. Keep the cache local to this denoise call so it
@@ -1155,6 +1161,14 @@ impl Generator for WanGenerator {
         Ok(())
     }
 
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn generate(
         &self,
         req: &GenerationRequest,
@@ -1190,6 +1204,10 @@ impl Generator for WanGenerator {
             // cache warmed by an earlier Resident request; otherwise it would load TE/DiT/VAE beside
             // the still-resident aggregate and invalidate the published phase envelope.
             let effective_offload = self.request_offload(req);
+            candle_gen::execution::policy(
+                "wan_offload",
+                serde_json::json!(format!("{effective_offload:?}")),
+            );
             let (frames, fps) = match effective_offload {
                 OffloadPolicy::Sequential => {
                     release_warm_cache_for_staged(&self.components, || {

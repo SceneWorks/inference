@@ -158,6 +158,13 @@ impl Pipeline {
         // Chunked decode: an untiled decode holds the 128-channel `block_out` stage at full output
         // resolution for the whole clip, so its peak grows with clip length (sc-12291). Chunking is
         // exact here — not a blended tiling — so the decoded video is unchanged.
+        candle_gen::execution::policy(
+            "mochi_vae_decode",
+            serde_json::json!({
+                "chunk_frames": DEFAULT_DECODE_CHUNK_FRAMES, "spatial_tiling": false,
+                "temporal_compression": t_ratio, "spatial_compression": s_ratio
+            }),
+        );
         let video = comps
             .vae
             .decode_chunked(&latents, DEFAULT_DECODE_CHUNK_FRAMES)?; // [1, 3, F, H, W], ~[-1, 1]
@@ -170,6 +177,8 @@ impl Pipeline {
 /// Deterministic N(0,1) init latent `[1, 12, F_lat, H_lat, W_lat]` (f32) — CPU `StdRng`, launch-portable.
 fn seeded_latents(seed: u64, lf: usize, lh: usize, lw: usize, device: &Device) -> CResult<Tensor> {
     let n = LATENT_CHANNELS * lf * lh * lw;
+    candle_gen::execution::draw("mochi_video_latents", seed, 0);
+    candle_gen::execution::runtime(device, candle_gen::candle_core::DType::F32);
     let mut rng = StdRng::seed_from_u64(seed);
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(Tensor::from_vec(
@@ -199,6 +208,10 @@ pub fn denoise(
     let mut sched = MochiScheduler::new();
     sched.set_timesteps(steps, shift);
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
+    candle_gen::execution::policy(
+        "mochi_guidance",
+        serde_json::json!({"f32_bits": guidance.to_bits()}),
+    );
     let device = init_latents.device();
 
     let mut latents = init_latents.clone();
