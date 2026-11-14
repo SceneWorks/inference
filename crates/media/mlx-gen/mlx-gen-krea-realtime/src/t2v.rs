@@ -831,6 +831,16 @@ fn load_transformer(
     Ok((transformer, adapter_reports))
 }
 
+fn execution_adapter_policy(
+    adapters: &[AdapterSpec],
+    reports: &[AdapterApplyReport],
+) -> serde_json::Value {
+    serde_json::json!({"mode":"diff_patch_fold_then_low_rank_residual_after_quantization", "entries":adapters.iter().zip(reports).map(|(adapter, report)| {
+        serde_json::json!({"path":report.adapter_path, "scale_bits":adapter.scale.to_bits(),
+            "applied":report.applied,"skipped":report.skipped})
+    }).collect::<Vec<_>>()})
+}
+
 /// Install the ordered Krea adapter batch and preserve each engine-owned per-file outcome for the
 /// provider contract. Public for weight-free integration tests; product callers use
 /// [`crate::KreaRealtime`].
@@ -859,6 +869,11 @@ pub fn apply_adapters_reported(
             skipped: report.diff_patch_unapplied,
         });
     }
+    mlx_gen::video_execution::adapter_stack(
+        "krea_applied_adapters",
+        execution_adapter_policy(adapters, &adapter_reports),
+        adapter_reports.iter().map(|report| report.applied).sum(),
+    );
     Ok(adapter_reports)
 }
 
@@ -1271,6 +1286,39 @@ pub(crate) fn generate_v2v_reported(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn execution_report_adapters_keep_default_and_partial_install_outcomes() {
+        let adapter = mlx_gen::AdapterSpec::new(
+            "adapter.safetensors".into(),
+            0.5,
+            mlx_gen::AdapterKind::Lora,
+        );
+        let report = mlx_gen::AdapterApplyReport {
+            adapter_path: adapter.path.clone(),
+            applied: 2,
+            skipped: vec!["unapplied_diff_patch".into()],
+        };
+        let partial = super::execution_adapter_policy(
+            std::slice::from_ref(&adapter),
+            std::slice::from_ref(&report),
+        );
+        assert_eq!(partial["entries"][0]["applied"], 2);
+        assert_eq!(partial["entries"][0]["scale_bits"], 0.5_f32.to_bits());
+        assert_eq!(
+            partial["entries"][0]["skipped"],
+            serde_json::json!(["unapplied_diff_patch"])
+        );
+        let mut changed = adapter.clone();
+        changed.scale = 1.0;
+        assert_ne!(
+            partial,
+            super::execution_adapter_policy(&[changed], &[report])
+        );
+        let empty = super::execution_adapter_policy(&[], &[]);
+        assert_eq!(empty["entries"], serde_json::json!([]));
+        assert_ne!(empty, partial);
+    }
+
     use super::*;
 
     /// sc-22738 (coordinator decision): the Conditioning fault fires at the conditioning phase's
@@ -1636,10 +1684,6 @@ mod tests {
         let base = KreaRealtimeConfig::krea_realtime_14b();
         // 32×32 latent under patch 2×2 → (16·16) = 256 tokens/frame.
         let cfg = resolve_request_config(&base, 32, 32, 4).unwrap();
-        mlx_gen::video_execution::policy(
-            "krea_resolved_config",
-            serde_json::json!({"config":format!("{cfg:?}")}),
-        );
         assert_eq!(cfg.ar.frame_seq_length, 256);
         assert_eq!(cfg.ar.seq_length, 4 * 256);
         // Mac streaming bound retained; the read window rides the derived frame_seq_length.

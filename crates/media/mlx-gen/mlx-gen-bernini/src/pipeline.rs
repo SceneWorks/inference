@@ -6,6 +6,21 @@
 //! the dual-expert CFG `denoise_moe` replaced by `denoise_bernini` (per-step
 //! [`crate::forward::guided_velocity`] over the resolved [`Mode`]).
 
+/// Metadata from the same stored configuration and quantizer passed to expert construction.
+pub(crate) fn expert_weight_policy(
+    config: &WanModelConfig,
+    quant: Option<Quant>,
+) -> serde_json::Value {
+    serde_json::json!({"dense_dtype":"Bfloat16", "stored":format!("{:?}",config.quantization),
+        "applied_quant_bits":quant.map(Quant::bits), "affine_group_size":mlx_gen::quant::DEFAULT_GROUP_SIZE})
+}
+
+pub(crate) fn planner_weight_policy(quant: Option<Quant>) -> serde_json::Value {
+    serde_json::json!({"llm_quant_bits":quant.map(Quant::bits),
+        "dense_components":["vision", "connector", "clip_diff"],
+        "affine_group_size":mlx_gen::quant::DEFAULT_GROUP_SIZE})
+}
+
 use std::path::PathBuf;
 
 use mlx_rs::memory::clear_cache;
@@ -659,6 +674,10 @@ impl BerniniRenderer {
         let load_expert = |name: &str| -> Result<(WanTransformer, Option<WanBlockStream>)> {
             let path = self.root.join(name);
             let w = Weights::from_file(&path)?;
+            mlx_gen::video_execution::policy(
+                "bernini_expert_weights",
+                expert_weight_policy(cfg, self.quant),
+            );
             if window.is_some() {
                 let dit = WanTransformer::from_weights_deferred(&w, cfg)?;
                 // No adapters can reach here (`supports_lora: false`), and the stream refuses an
@@ -773,6 +792,40 @@ impl BerniniRenderer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn execution_report_weight_tiers_distinguish_dense_and_affine_defaults() {
+        let cfg = tiny_cfg();
+        let dense = super::expert_weight_policy(&cfg, None);
+        let q4 = super::expert_weight_policy(&cfg, Some(mlx_gen::Quant::Q4));
+        let q8 = super::expert_weight_policy(&cfg, Some(mlx_gen::Quant::Q8));
+        assert!(dense["applied_quant_bits"].is_null());
+        assert_eq!(q4["applied_quant_bits"], 4);
+        assert_eq!(q8["applied_quant_bits"], 8);
+        assert_ne!(dense, q4);
+        assert_ne!(q4, q8);
+        let mut packed = cfg.clone();
+        packed.quantization = Some(mlx_gen_wan::config::WanQuant {
+            bits: 4,
+            group_size: 32,
+        });
+        let stored_q4 = super::expert_weight_policy(&packed, None);
+        assert_ne!(stored_q4, dense);
+        assert_ne!(stored_q4, q4);
+        assert!(stored_q4["applied_quant_bits"].is_null());
+        assert_eq!(
+            super::planner_weight_policy(None)["llm_quant_bits"],
+            serde_json::Value::Null
+        );
+        assert_ne!(
+            super::planner_weight_policy(Some(mlx_gen::Quant::Q4)),
+            super::planner_weight_policy(Some(mlx_gen::Quant::Q8))
+        );
+        assert_eq!(
+            super::planner_weight_policy(Some(mlx_gen::Quant::Q4))["dense_components"],
+            serde_json::json!(["vision", "connector", "clip_diff"])
+        );
+    }
+
     use super::*;
     use mlx_rs::ops::multiply;
 

@@ -117,6 +117,18 @@ pub fn draw(output_index: usize, purpose: &str, seed: u64) {
         })
     });
 }
+/// Bind the actual install outcome to this attempt. Current adapter loaders expose target counts
+/// but not a digest of the bytes they consumed. A path (or a later hash of that path) cannot attest
+/// those bytes, so adapter-bearing output remains explicitly unavailable for exact identity.
+pub fn adapter_stack(stage: &str, outcomes: Value, applied_targets: usize) {
+    policy(stage, outcomes);
+    if applied_targets > 0 {
+        unavailable(&format!(
+            "{stage}: consumed adapter content digest unavailable"
+        ));
+    }
+}
+
 /// Select the output of a provider-owned multi-image loop.
 pub fn output_index(index: usize) {
     observe(|state| state.output_index = index);
@@ -434,6 +446,29 @@ mod tests {
             Solver::Heun
         );
     }
+    #[test]
+    fn applied_adapter_content_is_unavailable_and_cannot_leak_to_next_attempt() {
+        for applied in [0, 2, 0] {
+            let completed = complete(&descriptor(), &CancelFlag::default(), || {
+                facts(7);
+                adapter_stack("provider_install", json!({"applied":applied}), applied);
+                Ok(output())
+            })
+            .unwrap();
+            if applied == 0 {
+                assert!(completed.execution.resolved().is_some());
+            } else {
+                let ExecutionIdentity::Unavailable { reason } = completed.execution else {
+                    panic!()
+                };
+                assert_eq!(
+                    reason.missing_facts,
+                    ["provider_install: consumed adapter content digest unavailable"]
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_video_provider_overrides_the_external_compatibility_default() {
         for (source, expected) in [

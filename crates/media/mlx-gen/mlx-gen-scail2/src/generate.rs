@@ -493,6 +493,11 @@ pub fn generate(
         if !diff_patch.is_empty() {
             let report = crate::lora::merge_diff_patch_adapters(&mut w, &diff_patch)?;
             crate::lora::report_outcome(&report, crate::pipeline::MODEL_ID)?;
+            mlx_gen::video_execution::adapter_stack(
+                "scail2_diff_patch_adapters",
+                serde_json::json!({"outcome":format!("{report:?}")}),
+                report.merged_weights + report.merged_biases,
+            );
         }
         let mut d = Scail2Dit::from_weights(&w, cfg)?;
         // f32 matmul compute (sc-5681). The bf16 path overflows to NaN at long sequences: traced to a
@@ -536,11 +541,16 @@ pub fn generate(
         // silently drops — on a format/prefix mismatch or an unmatched target. (The diff-patch
         // lightning files were already merged into the dense weights above, sc-5684.)
         if !residual.is_empty() {
-            mlx_gen::adapters::loader::apply_adapters_strict(
+            let report = mlx_gen::adapters::loader::apply_adapters_strict(
                 &mut d,
                 &residual,
                 crate::pipeline::MODEL_ID,
             )?;
+            mlx_gen::video_execution::adapter_stack(
+                "scail2_residual_adapters",
+                serde_json::json!({"outcome":format!("{report:?}")}),
+                report.applied,
+            );
         }
         d
     };

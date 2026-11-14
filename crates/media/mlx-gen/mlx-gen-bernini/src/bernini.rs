@@ -228,6 +228,10 @@ impl BerniniPlanner {
         if let Some(q) = quant {
             backbone.quantize(q.bits())?;
         }
+        mlx_gen::video_execution::policy(
+            "bernini_planner_weights",
+            crate::pipeline::planner_weight_policy(quant),
+        );
 
         let template =
             BerniniTemplate::from_tokenizer_file(root.join("mllm").join("tokenizer.json"))?;
@@ -1140,6 +1144,10 @@ impl Bernini {
         let cfg = &self.config;
         let path = self.root.join(name);
         let w = Weights::from_file(&path)?;
+        mlx_gen::video_execution::policy(
+            "bernini_expert_weights",
+            crate::pipeline::expert_weight_policy(cfg, self.quant),
+        );
         if windowed {
             let dit = WanTransformer::from_weights_deferred(&w, cfg)?;
             // No adapters can reach here (`supports_lora: false`), and the stream refuses an
