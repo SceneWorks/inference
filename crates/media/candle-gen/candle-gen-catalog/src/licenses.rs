@@ -265,7 +265,8 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     // The VAE is `Qwen/Qwen-Image` by the Krea `vae/config.json`'s own `_name_or_path`.
     // `krea_2_edit` runs the edit surface on the **Raw** checkpoint, while
     // `krea_2_turbo_edit` runs it on the distilled Turbo checkpoint. `krea_2_control` is a
-    // trainer-only id whose produced overlay applies at `krea_2_turbo` inference. The Qwen3-VL-4B
+    // trainer-only id whose produced overlay applies at `krea_2_turbo` inference; `krea_2_turbo_control`
+    // is the pose-control generator on the Turbo checkpoint. The Qwen3-VL-4B
     // tower is a pinned hole.
     ProviderComponents {
         provider_id: "krea_2_control",
@@ -281,6 +282,10 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     },
     ProviderComponents {
         provider_id: "krea_2_turbo",
+        components: &["krea_2_turbo", "qwen_image"],
+    },
+    ProviderComponents {
+        provider_id: "krea_2_turbo_control",
         components: &["krea_2_turbo", "qwen_image"],
     },
     ProviderComponents {
@@ -628,7 +633,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 60);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 61);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -660,10 +665,10 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            70,
-            "70 distinct Candle provider ids: 63 generators (qwen_image_2_1_turbo joined in \
+            71,
+            "71 distinct Candle provider ids: 64 generators (qwen_image_2_1_turbo joined in \
              sc-25901, flux3_klein in sc-26235, flux3_klein_base in sc-26239, MOSS Base/SFT in sc-26323, \
-             supra2_img in sc-24214) + 20 trainers (16 of them also \
+             supra2_img in sc-24214, krea_2_turbo_control with the Candle Krea pose route) + 20 trainers (16 of them also \
              generator ids — iris_3b joined in sc-25686, flux3_klein_base in sc-26240; iris_3b_restore, sc-25688, is the \
              transform's id; iris_3b_depth, sc-25687, is its own) + 1 captioner + 2 embedders + \
              1 transform (iris_3b_restore, sc-25683)"
@@ -755,6 +760,7 @@ mod tests {
             ("krea_2_edit", &["krea_qwen3_vl_4b"]),
             ("krea_2_raw", &["krea_qwen3_vl_4b"]),
             ("krea_2_turbo", &["krea_qwen3_vl_4b"]),
+            ("krea_2_turbo_control", &["krea_qwen3_vl_4b"]),
             ("krea_2_turbo_edit", &["krea_qwen3_vl_4b"]),
             // Convention on the two Lens ids: each names **its own** deleted upstream plus the
             // shared `lens_transformer` key, because both load an in-snapshot `transformer/`
@@ -784,7 +790,7 @@ mod tests {
             ("z_image_turbo", &["z_image_qwen3_text_encoder"]),
         ];
 
-        assert_eq!(INCOMPLETE.len(), 28);
+        assert_eq!(INCOMPLETE.len(), 29);
         let mapped: BTreeSet<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         for (id, missing) in INCOMPLETE {
             assert!(
