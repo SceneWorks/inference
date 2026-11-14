@@ -24,6 +24,7 @@ members = [
     "crates/contracts/gen-core",
     "crates/contracts/load-progress",
     "crates/contracts/gen-core-checkpoint",
+    "crates/contracts/gen-core-supra2-policy",
     "crates/contracts/gen-core-dist",
     "crates/contracts/gen-core-family",
     "crates/contracts/gen-core-flux3",
@@ -79,6 +80,7 @@ sceneworks-gen-core-telemetry = { path = "crates/contracts/gen-core-telemetry" }
 # Family- and feature-specific host code split out of gen-core so a family's change no longer
 # rebuilds the contract crate and everything above it (sc-27316).
 sceneworks-gen-core-checkpoint = { path = "crates/contracts/gen-core-checkpoint" }
+sceneworks-gen-core-supra2-policy = { path = "crates/contracts/gen-core-supra2-policy" }
 sceneworks-gen-core-family = { path = "crates/contracts/gen-core-family" }
 sceneworks-gen-core-flux3 = { path = "crates/contracts/gen-core-flux3" }
 sceneworks-gen-core-h3 = { path = "crates/contracts/gen-core-h3" }

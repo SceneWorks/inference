@@ -311,7 +311,7 @@ jobs:
           -p core-llm -p core-llm-testkit
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
           -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry
-          -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris
+          -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-supra2-policy -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris
           -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train
           --all-targets -- -D warnings
       - name: Test contracts
@@ -320,7 +320,7 @@ jobs:
           -p core-llm -p core-llm-testkit
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
           -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry
-          -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris
+          -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-supra2-policy -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris
           -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train
 
   # The NTFS half of the job above. The testkit's fixture writers size a fixture's tensor payload
@@ -442,7 +442,7 @@ jobs:
           -p core-llm -p core-llm-testkit
           -p sceneworks-gen-core -p sceneworks-gen-core-testkit
           -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry
-          -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris
+          -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-supra2-policy -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris
           -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train
           -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*'
           -p runtime-cpu -p runtime-catalog
@@ -833,7 +833,7 @@ jobs:
           python3 scripts/ci/run_ci_collection.py -- cargo clippy --locked --keep-going
           -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-cv -p sceneworks-gen-core
           -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry
-          -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris
+          -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-supra2-policy -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris
           -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train
           --features runtime-macos/cv --all-targets -- -D warnings
       # sc-27303: the measurement-campaign harness is behind mlx-llm's opt-in `campaign` feature, so
@@ -924,7 +924,7 @@ jobs:
           TEST_SUITE_DEADLINE_SECONDS: 3600
           TEST_SCOPE: ${{ needs.changes.outputs.test_scope }}
         run: |
-          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-cv -p sceneworks-gen-core -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train)
+          args=$(python3 scripts/ci/test_scope.py select --scope "$TEST_SCOPE" -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios -p sceneworks-gen-cv -p sceneworks-gen-core -p sceneworks-gen-core-dist -p sceneworks-gen-core-telemetry -p sceneworks-gen-core-checkpoint -p sceneworks-gen-core-supra2-policy -p sceneworks-gen-core-family -p sceneworks-gen-core-flux3 -p sceneworks-gen-core-h3 -p sceneworks-gen-core-image -p sceneworks-gen-core-iris -p sceneworks-gen-core-ltx -p sceneworks-gen-core-memory-wan -p sceneworks-gen-core-moss-image -p sceneworks-gen-core-tokenizer -p sceneworks-gen-core-train)
           read -r -a packages <<< "$args"
           if [[ ${#packages[@]} -eq 0 ]]; then
             echo "No package in this step's set is affected by the change; nothing to test."

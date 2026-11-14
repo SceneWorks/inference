@@ -4047,6 +4047,7 @@ version = "0.1.0"
 dependencies = [
  "safetensors 0.4.5",
  "sceneworks-gen-core",
+ "sceneworks-gen-core-supra2-policy",
  "sceneworks-load-progress",
  "serde",
  "serde_json",
@@ -4166,6 +4167,14 @@ dependencies = [
 
 [[package]]
 name = "sceneworks-gen-core-moss-image-policy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sceneworks-gen-core-supra2-policy"
 version = "0.1.0"
 dependencies = [
  "serde",
