@@ -645,9 +645,6 @@ fn real_qwen35_vlm_q4_keeps_the_vision_tower() {
             "a chat template beside the weights must travel with the tier"
         );
     }
-
-    #[cfg(feature = "model-inference-proof")]
-    println!("\nMODEL_INFERENCE_BODY_COMPLETED real_qwen35_vlm_q4_keeps_the_vision_tower");
 }
 
 // --- gated real-model conformance: prepare a real snapshot, run the helper, and generate ---

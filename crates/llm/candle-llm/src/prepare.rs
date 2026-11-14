@@ -74,10 +74,9 @@ fn backend() -> &'static str {
 }
 
 /// Weightless probe: can the candle backend prepare `spec.source`? A `*.gguf` container is accepted;
-/// an HF source must be a directory holding `config.json` and be text-only or a `qwen3_5` VLM (see
-/// [`prepares_multimodal_or_text`]; every other `vision_config` snapshot is declined). Reads only
-/// `config.json`, never a
-/// weight shard — mirrors [`provider::can_load`](crate::provider::can_load).
+/// an HF source must be a directory holding `config.json` and be text-only or a `qwen3_5` VLM
+/// (`prepares_multimodal_or_text`; every other `vision_config` snapshot is declined). Reads only
+/// `config.json`, never a weight shard — mirrors [`provider::can_load`](crate::provider::can_load).
 pub fn can_prepare(spec: &PrepareSpec) -> bool {
     match detect_format(&spec.source) {
         Ok(ModelFormat::Gguf) => true,
