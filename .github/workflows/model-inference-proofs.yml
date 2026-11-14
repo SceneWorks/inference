@@ -19,8 +19,8 @@ on:
         description: 'JSON with registered selection and explicit supervisor policy; optional runner="nax" for provisioned assets'
         type: string
         required: true
-      stage_xlabs_ip_adapter:
-        description: 'Asset inventory only: first fetch the product-pinned XLabs-AI/flux-ip-adapter ip_adapter.safetensors into the runner Hub cache (setup, no model load)'
+      stage_pinned_assets:
+        description: 'Asset inventory only: first fetch every product-pinned file the inventory reports missing, off-pin or incomplete into the runner Hub cache (stdlib HTTPS; never overwrites; setup, no model load)'
         type: boolean
         default: false
 
@@ -247,11 +247,14 @@ jobs:
     needs: plan
     if: ${{ fromJSON(inputs.request).selection == 'flux1-asset-inventory' }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # Staging pinned assets downloads up to ~15 GB before the inventory runs.
+    timeout-minutes: ${{ inputs.stage_pinned_assets && 90 || 30 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
+      # Always non-empty: an empty variable is undefined in cmd, where %STAGE_FLAG% would stay literal.
+      STAGE_FLAG: ${{ inputs.stage_pinned_assets && '--stage-pinned-assets' || '--no-stage-pinned-assets' }}
       FLUX1_HUB: ${{ inputs.backend == 'mlx' && vars.MLX_GEN_MODELS_ROOT || vars.CANDLE_GEN_MODELS_ROOT }}
       INVENTORY_RUNNER: ${{ fromJSON(inputs.request).runner }}
       MODEL_PROOF_REQUEST: ${{ inputs.request }}
@@ -282,37 +285,21 @@ jobs:
         if: runner.os == 'Windows'
         shell: cmd
         run: call scripts\ci\real-weights\moss-edit-cuda\locate-existing-reviewed-python-without-installation.cmd
-      # Opt-in setup, not model execution: fetch exactly the pinned XLabs adapter file through
-      # huggingface_hub into this runner's Hub cache and record its SHA-256 in a receipt.
-      - name: Stage pinned XLabs IP adapter on macOS (opt-in, no model load)
-        if: runner.os == 'macOS' && inputs.stage_xlabs_ip_adapter
-        shell: bash
-        env:
-          STAGING_OUTPUT: ${{ runner.temp }}/flux1-xlabs-ip-adapter-staging.json
-        run: python3.12 -u -I scripts/ci/flux1_conditional_asset_inventory.py --stage-xlabs-ip-adapter --backend mlx --request-env MODEL_PROOF_REQUEST --expected-sha "$GITHUB_SHA" --output "$STAGING_OUTPUT"
-      - name: Stage pinned XLabs IP adapter on Windows (opt-in, no model load)
-        if: runner.os == 'Windows' && inputs.stage_xlabs_ip_adapter
-        shell: cmd
-        env:
-          STAGING_OUTPUT: ${{ runner.temp }}/flux1-xlabs-ip-adapter-staging.json
-        run: '"%REVIEWED_PYTHON%" -u -I scripts\ci\flux1_conditional_asset_inventory.py --stage-xlabs-ip-adapter --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%STAGING_OUTPUT%"'
       - name: Inventory installed assets on macOS (no model load)
         if: runner.os == 'macOS'
         shell: bash
         env:
           INVENTORY_OUTPUT: ${{ runner.temp }}/flux1-conditional-asset-inventory.json
-        run: python3.12 -u -I scripts/ci/flux1_conditional_asset_inventory.py --backend mlx --request-env MODEL_PROOF_REQUEST --expected-sha "$GITHUB_SHA" --output "$INVENTORY_OUTPUT"
+        run: python3.12 -u -I scripts/ci/flux1_conditional_asset_inventory.py "$STAGE_FLAG" --backend mlx --request-env MODEL_PROOF_REQUEST --expected-sha "$GITHUB_SHA" --output "$INVENTORY_OUTPUT"
       - name: Inventory installed assets on Windows (no model load)
         if: runner.os == 'Windows'
         shell: cmd
         env:
           INVENTORY_OUTPUT: ${{ runner.temp }}/flux1-conditional-asset-inventory.json
-        run: '"%REVIEWED_PYTHON%" -u -I scripts\ci\flux1_conditional_asset_inventory.py --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%INVENTORY_OUTPUT%"'
+        run: '"%REVIEWED_PYTHON%" -u -I scripts\ci\flux1_conditional_asset_inventory.py %STAGE_FLAG% --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%INVENTORY_OUTPUT%"'
       - name: Upload candidate paths and hashes only
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: flux1-conditional-asset-inventory-${{ inputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/flux1-conditional-asset-inventory.json
-            ${{ runner.temp }}/flux1-xlabs-ip-adapter-staging.json
+          path: ${{ runner.temp }}/flux1-conditional-asset-inventory.json
           if-no-files-found: error

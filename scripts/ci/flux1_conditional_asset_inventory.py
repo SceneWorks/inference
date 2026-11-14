@@ -3,7 +3,9 @@
 
 No model load or inference takes place here. The output is a candidate manifest for operator
 review; byte digests, not cache revision labels, are authoritative. The one network action is
-the opt-in `--stage-xlabs-ip-adapter` setup, which fetches exactly one pinned file.
+the opt-in `--stage-pinned-assets` setup, which fetches exactly the product-pinned files the
+inventory reports missing, off-pin or incomplete (stdlib HTTPS, no Hub client), never replacing
+an existing file.
 
 Discovery never lists a directory. On nax-macos-2, `os.scandir` blocked forever on the Hub root
 (run 42463079723) and on `models--SceneWorks--flux1-dev-mlx/snapshots` (run 42474515680), while
@@ -23,7 +25,10 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.parse
+import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -254,28 +259,133 @@ def inventory(hub, runner, metadata_only=False):
             "roles": roles, "cases": cases}
 
 
-def stage_xlabs_ip_adapter(hub, download=None):
-    """Fetch exactly the product-pinned XLabs adapter file into the runner's Hub cache."""
-    repo, name, revision = PRODUCT_SOURCES["ip_adapter"]
+HF_RESOLVE = "https://huggingface.co/{repo}/resolve/{revision}/{name}"
+STAGE_STATUSES = {"missing", "off_pin", "incomplete"}
+# Files staged for the PiD Gemma directory role; indexed shards are read from the staged index.
+GEMMA_STAGE_FILES = ("config.json", "generation_config.json", "special_tokens_map.json",
+                     "tokenizer.json", "tokenizer.model", "tokenizer_config.json",
+                     "model.safetensors.index.json")
+STAGE_CHUNK = 8 * 1024 * 1024
+STAGE_SOCKET_TIMEOUT = 120
+MAX_STAGE_SECONDS = 3_600
+
+
+def pinned_path(hub, repo, revision, name):
+    """`models--<org>--<name>/snapshots/<revision>/<file>` under the Hub root."""
+    if not SHA.fullmatch(revision) or not name or "\\" in name or name.startswith("/") \
+            or ".." in name.split("/"):
+        raise ValueError(f"unsafe pinned asset path: {repo}@{revision}/{name}")
+    return cache_dir(hub, repo) / "snapshots" / revision / name
+
+
+class _RecordLinkedEtag(urllib.request.HTTPRedirectHandler):
+    """Remember the Hub's `X-Linked-Etag` (the LFS SHA-256) from the resolve redirect."""
+
+    def __init__(self):
+        self.linked_etag = None
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.linked_etag = self.linked_etag or headers.get("X-Linked-Etag")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_pinned(url, destination, token=None, opener=None):
+    """Stream `url` to a temporary file beside `destination`, then place it without overwriting.
+
+    Returns (bytes, sha256, linked_etag). The temporary file is this process's own; an existing
+    destination is never replaced (`os.link` on POSIX, `os.rename` on Windows both refuse it).
+    """
+    if probe(destination)["exists"]:
+        raise FileExistsError(f"refusing to overwrite existing asset {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(url, headers={"User-Agent": "flux1-asset-stager/1"})
+    if token:
+        # Unredirected: the presigned CDN URL the Hub redirects to never receives the token.
+        request.add_unredirected_header("Authorization", f"Bearer {token}")
+    recorder = _RecordLinkedEtag()
+    opener = opener or urllib.request.build_opener(recorder)
+    descriptor, temporary = tempfile.mkstemp(prefix="." + destination.name + ".",
+                                             suffix=".partial", dir=destination.parent)
+    temporary = Path(temporary)
+    digest_state, size = hashlib.sha256(), 0
+    # An HTTP request, not a file: bound by name so the text-mode file-open audit does not read it
+    # as a locale-decoded `Path.open`. The body is consumed as bytes.
+    request_url = opener.open
+    try:
+        with os.fdopen(descriptor, "wb") as sink, request_url(request, timeout=STAGE_SOCKET_TIMEOUT) as source:
+            expected = source.headers.get("Content-Length")
+            while chunk := source.read(STAGE_CHUNK):
+                sink.write(chunk)
+                digest_state.update(chunk)
+                size += len(chunk)
+            sink.flush()
+            os.fsync(sink.fileno())
+        if expected is not None and int(expected) != size:
+            raise ValueError(f"short download for {url}: {size} of {expected} bytes")
+        sha = digest_state.hexdigest()
+        etag = (getattr(opener, "linked_etag", None) or recorder.linked_etag or "").strip('"')
+        if re.fullmatch(r"[0-9a-f]{64}", etag) and etag != sha:
+            raise ValueError(f"downloaded bytes for {url} differ from the Hub's LFS SHA-256")
+        if os.name == "nt":
+            os.rename(temporary, destination)
+        else:
+            os.link(temporary, destination)
+            temporary.unlink()
+        return size, sha, etag or None
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def stage_files(role, hub):
+    """The exact files to stage for one role: its pinned file, or the PiD Gemma footprint."""
+    repo, name, revision = PRODUCT_SOURCES[role]
+    if name is not None:
+        return [(repo, revision, name)]
+    return [(repo, revision, file) for file in GEMMA_STAGE_FILES]
+
+
+def stage_pinned_assets(hub, runner, token=None, fetch=fetch_pinned):
+    """Fetch every product-pinned file the inventory reports missing, off-pin or incomplete.
+
+    Existing files are kept and reported, never replaced; `refs/main` is never written; no
+    directory is listed. Returns one receipt row per pinned file considered.
+    """
     hub = Path(hub).expanduser().resolve(strict=True)
-    expected = cache_dir(hub, repo) / "snapshots" / revision / name
-    present_before = probe(expected)["exists"]
-    if download is None:
-        from huggingface_hub import hf_hub_download
-        download = hf_hub_download
-    fetched = Path(download(repo_id=repo, filename=name, revision=revision, cache_dir=str(hub),
-                            token=False))
-    if os.path.normcase(os.path.abspath(fetched)) != os.path.normcase(str(expected)):
-        raise ValueError("Hub fetched the XLabs adapter into a different snapshot path")
-    resolved = confined(fetched.resolve(strict=True), hub, fetched)
-    sha = hashlib.sha256()
-    with resolved.open("rb") as source:
-        while chunk := source.read(8 * 1024 * 1024):
-            sha.update(chunk)
-    return {"protocol": "flux1-xlabs-ip-adapter-staging-v1", "repo": repo, "file": name,
-            "revision": revision, "path": str(fetched), "resolved": str(resolved),
-            "bytes": resolved.stat().st_size, "sha256": sha.hexdigest(),
-            "present_before": present_before}
+    before = inventory(hub, runner, metadata_only=True)
+    receipts = []
+    for role, row in sorted(before["roles"].items()):
+        if row["status"] not in STAGE_STATUSES:
+            continue
+        pending = stage_files(role, hub)
+        while pending:
+            repo, revision, file = pending.pop(0)
+            destination = pinned_path(hub, repo, revision, file)
+            url = HF_RESOLVE.format(repo=repo, revision=revision,
+                                    name=urllib.parse.quote(file))
+            receipt = {"role": role, "repo": repo, "revision": revision, "file": file,
+                       "path": str(destination)}
+            if probe(destination)["exists"]:
+                receipt["action"] = "kept-existing"
+            else:
+                progress(f"stage role={role} {repo}@{revision}/{file}")
+                size, sha, etag = fetch(url, destination, token=token)
+                receipt.update(action="fetched", bytes=size, sha256=sha,
+                               hub_lfs_sha256_verified=etag is not None)
+            receipts.append(receipt)
+            if role == "pid_gemma" and file == "model.safetensors.index.json":
+                index = probe(destination, op="read", limit=MAX_GEMMA_INDEX_BYTES)
+                try:
+                    shards = sorted(set(json.loads(index["text"])["weight_map"].values()))
+                except (ValueError, KeyError, TypeError, AttributeError) as error:
+                    raise ValueError("staged PiD Gemma shard index is invalid") from error
+                if len(shards) > MAX_GEMMA_SHARDS or not all(
+                        isinstance(shard, str)
+                        and re.fullmatch(r"model-\d{5}-of-\d{5}\.safetensors", shard)
+                        for shard in shards):
+                    raise ValueError("staged PiD Gemma shard index is invalid")
+                pending.extend((repo, revision, shard) for shard in shards)
+    return receipts
 
 
 def plan_request(backend, request, expected_sha, tier):
@@ -302,8 +412,9 @@ def plan_request(backend, request, expected_sha, tier):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", action="store_true")
-    parser.add_argument("--stage-xlabs-ip-adapter", action="store_true",
-                        help="fetch the pinned XLabs adapter into FLUX1_HUB, then write a receipt")
+    parser.add_argument("--stage-pinned-assets", action=argparse.BooleanOptionalAction, default=False,
+                        help="before the inventory, fetch every product-pinned file it reports "
+                             "missing, off-pin or incomplete into FLUX1_HUB (stdlib HTTPS only)")
     parser.add_argument("--backend", choices=("mlx", "candle-cuda"), required=True)
     parser.add_argument("--request-env", required=True)
     parser.add_argument("--expected-sha", required=True)
@@ -319,7 +430,8 @@ def main():
                 raise TimeoutError("asset inventory hard deadline reached")
             signal.signal(signal.SIGALRM, interrupt)
             mode = request.get("mode") if isinstance(request, dict) else None
-            signal.alarm((MAX_METADATA_SECONDS if mode == "metadata" else MAX_SECONDS) + 60)
+            signal.alarm((MAX_METADATA_SECONDS if mode == "metadata" else MAX_SECONDS) + 60
+                         + (MAX_STAGE_SECONDS if args.stage_pinned_assets else 0))
         plan = plan_request(args.backend, request, args.expected_sha, os.environ.get("FLUX1_PAIR_TIER", "none"))
     except (KeyError, ValueError, subprocess.CalledProcessError) as error:
         parser.error(str(error))
@@ -334,12 +446,13 @@ def main():
     if not root:
         parser.error("FLUX1_HUB is required")
     progress(f"start runner={plan['selected_runner']} mode={plan['mode']} "
-             f"stage_xlabs_ip_adapter={args.stage_xlabs_ip_adapter}")
+             f"stage_pinned_assets={args.stage_pinned_assets}")
     try:
-        if args.stage_xlabs_ip_adapter:
-            result = stage_xlabs_ip_adapter(root)
-        else:
-            result = inventory(root, plan["selected_runner"], metadata_only=plan["mode"] == "metadata")
+        staged = (stage_pinned_assets(root, plan["selected_runner"],
+                                      token=os.environ.get("HF_TOKEN") or None)
+                  if args.stage_pinned_assets else None)
+        result = inventory(root, plan["selected_runner"], metadata_only=plan["mode"] == "metadata")
+        result["staging"] = {"requested": args.stage_pinned_assets, "files": staged or []}
     finally:
         faulthandler.cancel_dump_traceback_later()
         if hasattr(signal, "SIGALRM"):

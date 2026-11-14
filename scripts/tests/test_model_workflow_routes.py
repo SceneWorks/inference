@@ -66,19 +66,19 @@ class ModelWorkflowRoutes(unittest.TestCase):
         events = proof.get('on', proof.get(True))
         self.assertEqual(set(events), {'workflow_dispatch'})
         inputs = events['workflow_dispatch']['inputs']
-        self.assertEqual(set(inputs), {'backend', 'request', 'flux1_pair', 'stage_xlabs_ip_adapter'})
+        self.assertEqual(set(inputs), {'backend', 'request', 'flux1_pair', 'stage_pinned_assets'})
         self.assertEqual(inputs['flux1_pair']['options'], ['none', 'tier1', 'tier2', 'conditional-tier1'])
         self.assertEqual(inputs['flux1_pair']['default'], 'none')
         # Opt-in asset setup for the inventory job only; never on by default.
-        self.assertEqual(inputs['stage_xlabs_ip_adapter']['type'], 'boolean')
-        self.assertIs(inputs['stage_xlabs_ip_adapter']['default'], False)
-        staging = [step for step in proof['jobs']['inventory']['steps']
-                   if 'stage_xlabs_ip_adapter' in str(step.get('if', ''))]
-        self.assertEqual(len(staging), 2)
-        self.assertTrue(all('--stage-xlabs-ip-adapter' in step['run'] for step in staging))
-        self.assertFalse(any('stage_xlabs_ip_adapter' in str(step.get('if', ''))
-                             for name, job in proof['jobs'].items() if name != 'inventory'
-                             for step in job.get('steps', [])))
+        self.assertEqual(inputs['stage_pinned_assets']['type'], 'boolean')
+        self.assertIs(inputs['stage_pinned_assets']['default'], False)
+        inventory = proof['jobs']['inventory']
+        self.assertIn('stage_pinned_assets', inventory['env']['STAGE_FLAG'])
+        runs = [step['run'] for step in inventory['steps'] if 'flux1_conditional_asset_inventory.py' in str(step.get('run', ''))]
+        self.assertEqual(len(runs), 2)
+        self.assertTrue(all('STAGE_FLAG' in run for run in runs))
+        self.assertFalse(any('stage_pinned_assets' in str(job) for name, job in proof['jobs'].items()
+                             if name != 'inventory'))
         self.assertNotIn('concurrency', proof)
         bridge = document('real-weights.yml')
         inputs = bridge.get('on', bridge.get(True))['workflow_dispatch']['inputs']

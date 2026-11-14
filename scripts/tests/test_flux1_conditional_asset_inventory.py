@@ -1,5 +1,6 @@
 """Weights-free checks for the manual conditional asset inventory protocol."""
 import hashlib
+import io
 from contextlib import redirect_stderr
 from io import StringIO
 import json
@@ -231,25 +232,126 @@ class ConditionalAssetInventory(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "budget exceeded"):
                     self.inventory(hub, metadata_only=True)
 
-    def test_stage_xlabs_ip_adapter_fetches_exactly_the_pinned_file(self):
+    def test_pinned_path_is_the_exact_hub_snapshot_file(self):
+        hub = Path("/hub")
+        repo, name, revision = assets.PRODUCT_SOURCES["control"]
+        self.assertEqual(assets.pinned_path(hub, repo, revision, name),
+                         hub / "models--Shakker-Labs--FLUX.1-dev-ControlNet-Union-Pro-2.0"
+                         / "snapshots" / revision / name)
+        self.assertEqual(assets.HF_RESOLVE.format(repo=repo, revision=revision, name=name),
+                         "https://huggingface.co/Shakker-Labs/FLUX.1-dev-ControlNet-Union-Pro-2.0"
+                         f"/resolve/{revision}/diffusion_pytorch_model.safetensors")
+        for bad in ("../escape", "/abs", "a\\b", ""):
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                assets.pinned_path(hub, repo, revision, bad)
+        with self.assertRaisesRegex(ValueError, "unsafe"):
+            assets.pinned_path(hub, repo, "main", name)
+
+    def test_fetch_streams_atomically_and_never_overwrites(self):
+        class Response:
+            def __init__(self, body, length=None):
+                self.body, self.headers = io.BytesIO(body), {"Content-Length": str(length or len(body))}
+            def read(self, size):
+                return self.body.read(size)
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                return False
+
+        class Opener:
+            def __init__(self, body, etag=None, length=None):
+                self.body, self.linked_etag, self.length, self.requests = body, etag, length, []
+            def open(self, request, timeout):
+                self.requests.append(request)
+                return Response(self.body, self.length)
+
+        with TemporaryDirectory() as tmp:
+            hub = Path(tmp).resolve() / "hub"
+            target = hub / "models--a--b/snapshots" / ("a" * 40) / "w.safetensors"
+            opener = Opener(b"weights", etag=hashlib.sha256(b"weights").hexdigest())
+            size, sha, etag = assets.fetch_pinned("https://example/w", target, token="t", opener=opener)
+            self.assertEqual((size, sha), (7, hashlib.sha256(b"weights").hexdigest()))
+            self.assertEqual(etag, sha)
+            self.assertEqual(target.read_bytes(), b"weights")
+            self.assertFalse(target.is_symlink())
+            self.assertEqual(opener.requests[0].unredirected_hdrs["Authorization"], "Bearer t")
+            self.assertEqual([p.name for p in target.parent.iterdir()], ["w.safetensors"])
+            with self.assertRaises(FileExistsError):
+                assets.fetch_pinned("https://example/w", target, opener=Opener(b"other"))
+            self.assertEqual(target.read_bytes(), b"weights")
+            other = target.with_name("x.safetensors")
+            for opener, message in ((Opener(b"bad", etag="0" * 64), "LFS SHA-256"),
+                                    (Opener(b"short", length=9), "short download")):
+                with self.assertRaisesRegex(ValueError, message):
+                    assets.fetch_pinned("https://example/x", other, opener=opener)
+                self.assertFalse(other.exists())
+            self.assertEqual([p.name for p in target.parent.iterdir()], ["w.safetensors"])
+
+    def test_stage_fetches_only_missing_pinned_files_and_records_receipts(self):
         with TemporaryDirectory() as tmp:
             hub = Path(tmp).resolve() / "hub"
             hub.mkdir()
+            install_all(hub)
+            pulid = install(hub, "pulid")
+            pulid.unlink()  # missing role
+            control_repo = assets.PRODUCT_SOURCES["control"][0]
             calls = []
 
-            def download(**kwargs):
-                calls.append(kwargs)
-                return str(install(hub, "ip_adapter", b"adapter"))
+            def fetch(url, destination, token=None):
+                calls.append((url, destination, token))
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"fetched")
+                return 7, hashlib.sha256(b"fetched").hexdigest(), None
 
-            receipt = assets.stage_xlabs_ip_adapter(hub, download=download)
-            repo, name, revision = assets.PRODUCT_SOURCES["ip_adapter"]
-            self.assertEqual(calls, [{"repo_id": repo, "filename": name, "revision": revision,
-                                      "cache_dir": str(hub.resolve()), "token": False}])
-            self.assertEqual(receipt["sha256"], hashlib.sha256(b"adapter").hexdigest())
-            self.assertEqual(receipt["revision"], "18f6940238ab5dc3744df7a8e30315892279d5f9")
-            self.assertFalse(receipt["present_before"])
-            with self.assertRaisesRegex(ValueError, "different snapshot path"):
-                assets.stage_xlabs_ip_adapter(hub, download=lambda **_: str(hub / "elsewhere"))
+            receipts = assets.stage_pinned_assets(hub, "nax-macos-2", token="t", fetch=fetch)
+            self.assertEqual([(r["role"], r["action"]) for r in receipts], [("pulid", "fetched")])
+            repo, name, revision = assets.PRODUCT_SOURCES["pulid"]
+            self.assertEqual(calls, [(f"https://huggingface.co/{repo}/resolve/{revision}/{name}",
+                                      pulid, "t")])
+            self.assertEqual(receipts[0]["sha256"], hashlib.sha256(b"fetched").hexdigest())
+            self.assertEqual(receipts[0]["bytes"], 7)
+            self.assertFalse(receipts[0]["hub_lfs_sha256_verified"])
+            self.assertEqual(self.inventory(hub)["roles"]["pulid"]["status"], "unique")
+            # An off-pin role fetches the pinned revision; refs/main and the off-pin file stay.
+            control = install(hub, "control")
+            control.unlink()
+            off_pin = install(hub, "control", b"old", revision=OTHER_REV)
+            refs = put(hub, (assets.cache_dir(hub, control_repo) / "refs/main").relative_to(hub),
+                       OTHER_REV.encode())
+            calls.clear()
+            receipts = assets.stage_pinned_assets(hub, "nax-macos-2", fetch=fetch)
+            self.assertEqual([r["role"] for r in receipts], ["control"])
+            self.assertEqual(calls[0][1], control)
+            self.assertEqual(off_pin.read_bytes(), b"old")
+            self.assertEqual(refs.read_bytes(), OTHER_REV.encode())
+            # Nothing missing: nothing fetched.
+            calls.clear()
+            self.assertEqual(assets.stage_pinned_assets(hub, "nax-macos-2", fetch=fetch), [])
+            self.assertEqual(calls, [])
+
+    def test_stage_gemma_fetches_the_index_then_its_shards_and_keeps_existing_files(self):
+        with TemporaryDirectory() as tmp:
+            hub = Path(tmp).resolve() / "hub"
+            hub.mkdir()
+            install_all(hub)
+            directory = snapshot(hub, "pid_gemma")
+            for name in ("model.safetensors.index.json", "model-00002-of-00002.safetensors"):
+                (directory / name).unlink()
+            shards = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors")
+
+            def fetch(url, destination, token=None):
+                body = (json.dumps({"weight_map": {"a": shards[0], "b": shards[1]}}).encode()
+                        if destination.name.endswith("index.json") else b"shard")
+                destination.write_bytes(body)
+                return len(body), hashlib.sha256(body).hexdigest(), None
+
+            receipts = assets.stage_pinned_assets(hub, "nax-macos-2", fetch=fetch)
+            actions = {r["file"]: r["action"] for r in receipts}
+            self.assertEqual(actions["model.safetensors.index.json"], "fetched")
+            self.assertEqual(actions[shards[1]], "fetched")
+            self.assertEqual(actions[shards[0]], "kept-existing")
+            self.assertEqual(actions["config.json"], "kept-existing")
+            self.assertEqual(self.inventory(hub)["roles"]["pid_gemma"]["status"], "unique")
 
     def test_exact_runner_cli_and_request_shape(self):
         with TemporaryDirectory() as tmp:
