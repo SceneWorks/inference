@@ -1311,6 +1311,7 @@ fn vae_encode(encoder: &Encoder, reference: &Image, device: &Device) -> Result<T
 /// ([`vae_encode`]) and the Base/Turbo img2img latent-init ([`encode_reference`]) both build on.
 fn encode_mean_latent(encoder: &Encoder, pixels: &Tensor) -> Result<Tensor> {
     let moments = __model_proof_output!(encoder.forward(pixels))?; // [1, 2C, H/8, W/8]
+    crate::observe_component_precision("vae_encoder", moments.device(), moments.dtype());
     let two_c = moments.dim(1)?;
     if two_c % 2 != 0 {
         return Err(CandleError::Msg(format!(
@@ -1476,11 +1477,15 @@ fn decode(vae: &AutoEncoderKL, pid: Option<&PidDecoder>, lat: &Tensor) -> Result
                 Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
                 pid,
             )?;
-            pid.decode(lat)?
+            let output = pid.decode(lat)?;
+            crate::observe_component_precision("pid_decoder", output.device(), output.dtype());
+            output
         }
         // [1, 3, H, W] in [-1, 1]
         None => candle_gen::bounded_kl_decode(&VAE_DECODER, lat, |l| {
-            __model_proof_output!(vae.decode(l))
+            let output = __model_proof_output!(vae.decode(l))?;
+            crate::observe_component_precision("vae", output.device(), output.dtype());
+            Ok(output)
         })?
         .to_dtype(DType::F32)?,
     };

@@ -43,7 +43,7 @@ pub mod transformer;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use candle_gen::candle_core::Device;
+use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant,
@@ -55,6 +55,18 @@ pub use adapters::TurboLoraReport;
 /// Ideogram image bucket to `candle_gen_ideogram::SIZE_MULTIPLE` (sc-12612) instead of a hand-copied
 /// literal.
 pub use config::SIZE_MULTIPLE;
+
+pub(crate) fn observe_component_precision(component: &str, device: &Device, dtype: DType) {
+    candle_gen::execution::runtime(device, dtype);
+    candle_gen::execution::policy(
+        "ideogram/component_precision",
+        serde_json::json!({
+            "component": component,
+            "device": format!("{:?}", device.location()),
+            "compute_dtype": format!("{dtype:?}"),
+        }),
+    );
+}
 
 /// Release a component only after the backend fence succeeds. On a failed fence the allocation is
 /// intentionally retained because queued device work may still reference it.
@@ -575,6 +587,62 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::Image;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn consumed_component_precision_changes_completed_identity() {
+        let report = |dit_dtype| {
+            candle_gen::execution::capture_direct(
+                &descriptor(),
+                &gen_core::CancelFlag::default(),
+                || {
+                    candle_gen::execution::rng_scheme("precision-fixture");
+                    candle_gen::execution::draw("initial_noise", 7, 0);
+                    candle_gen::execution::without_schedule("fixture", "single-step", "flow");
+                    candle_gen::execution::policy("decoder", serde_json::json!("fixture"));
+                    observe_component_precision("text_encoder", &Device::Cpu, DType::F32);
+                    observe_component_precision("dit", &Device::Cpu, dit_dtype);
+                    observe_component_precision("vae", &Device::Cpu, DType::F32);
+                    Ok(GenerationOutput::Images(vec![Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0; 3],
+                    }]))
+                },
+            )
+            .unwrap()
+            .execution
+            .resolved()
+            .unwrap()
+            .quality_policy
+            .clone()
+        };
+        let bf16 = report(DType::BF16);
+        let f32 = report(DType::F32);
+        assert_ne!(bf16, f32);
+        let gen_core::generator::ExecutionFact::Resolved { value } = bf16 else {
+            panic!("completed precision policy must resolve")
+        };
+        assert_eq!(
+            value["operations"]["ideogram/component_precision"][1]["value"]["component"],
+            "dit"
+        );
+        assert_eq!(
+            value["operations"]["ideogram/component_precision"][1]["value"]["compute_dtype"],
+            "BF16"
+        );
+        assert_eq!(
+            value["operations"]["ideogram/component_precision"][1]["value"]["device"],
+            "Cpu"
+        );
+        assert_eq!(
+            value["operations"]["ideogram/component_precision"][0]["value"]["component"],
+            "text_encoder"
+        );
+        assert_eq!(
+            value["operations"]["ideogram/component_precision"][2]["value"]["component"],
+            "vae"
+        );
+    }
 
     struct DropProbe(Arc<AtomicUsize>);
 

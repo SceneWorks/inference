@@ -484,6 +484,7 @@ fn prepare_edit_with_vae(
     let grid_w = (width / PATCH_AE) as usize;
     let pre = preprocess_source_image(source, width, height, device)?;
     let enc = vae.encode(&pre)?;
+    crate::observe_component_precision("vae_encoder", enc.device(), enc.dtype());
     let packed = enc
         .reshape((1, 32, grid_h, 2, grid_w, 2))?
         .permute((0, 2, 4, 3, 5, 1))?
@@ -1068,6 +1069,11 @@ fn decode_with_vae_and_stats(
             }
         }
     };
+    crate::observe_component_precision(
+        if pid.is_some() { "pid_decoder" } else { "vae" },
+        decoded.device(),
+        decoded.dtype(),
+    );
     to_image(&decoded)
 }
 

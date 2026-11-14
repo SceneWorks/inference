@@ -267,7 +267,9 @@ impl BooguTextEncoder {
         for layer in &self.layers {
             hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
         }
-        rmsnorm(&hidden, &self.final_norm, self.eps)
+        let output = rmsnorm(&hidden, &self.final_norm, self.eps)?;
+        crate::observe_component_precision("text_encoder", output.device(), output.dtype());
+        Ok(output)
     }
 
     /// Single-reference image-conditioned forward (Edit) — a thin wrapper over
@@ -359,7 +361,9 @@ impl BooguTextEncoder {
                 }
             }
         }
-        rmsnorm(&hidden, &self.final_norm, self.eps)
+        let output = rmsnorm(&hidden, &self.final_norm, self.eps)?;
+        crate::observe_component_precision("text_encoder", output.device(), output.dtype());
+        Ok(output)
     }
 }
 

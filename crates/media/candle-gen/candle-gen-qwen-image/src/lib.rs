@@ -259,6 +259,18 @@ use vae::QwenVae;
 const DIT_DTYPE: DType = DType::BF16;
 const ENC_DTYPE: DType = DType::F32;
 
+pub(crate) fn observe_component_precision(component: &str, device: &Device, dtype: DType) {
+    candle_gen::execution::runtime(device, dtype);
+    candle_gen::execution::policy(
+        "qwen_image/component_precision",
+        serde_json::json!({
+            "component": component,
+            "device": format!("{:?}", device.location()),
+            "compute_dtype": format!("{dtype:?}"),
+        }),
+    );
+}
+
 #[derive(Clone)]
 struct Components {
     te: Arc<QwenTextEncoder>,
@@ -861,6 +873,7 @@ fn decode_final_latents(
     if cancel.is_cancelled() {
         return Err(CandleError::Canceled);
     }
+    let selected_pid = decoder.is_some();
     let decoder = decoder.unwrap_or(native);
     candle_gen::ensure_decoder_compatible(
         Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
@@ -885,10 +898,14 @@ fn decode_final_latents(
             ))
         })
         .transpose()?;
-    match tiling.as_ref() {
+    let output = match tiling.as_ref() {
         Some(tiling) => decoder.decode_tiled(latents, tiling, Some(cancel)),
         None => decoder.decode(latents),
+    }?;
+    if selected_pid {
+        observe_component_precision("pid_decoder", output.device(), output.dtype());
     }
+    Ok(output)
 }
 
 /// The MLX packed `group_size` for the DiT, read from `transformer/config.json`'s `quantization`
@@ -2191,6 +2208,63 @@ mod tests {
 #[cfg(test)]
 mod execution_policy_tests {
     use super::*;
+
+    #[test]
+    fn consumed_component_precision_changes_completed_identity() {
+        let report = |dit_dtype| {
+            candle_gen::execution::capture_direct(
+                &descriptor(),
+                &gen_core::CancelFlag::default(),
+                || {
+                    candle_gen::execution::rng_scheme("precision-fixture");
+                    candle_gen::execution::draw("initial_noise", 7, 0);
+                    candle_gen::execution::without_schedule("fixture", "single-step", "flow");
+                    candle_gen::execution::policy("decoder", serde_json::json!("fixture"));
+                    observe_component_precision("text_encoder", &Device::Cpu, DType::F32);
+                    observe_component_precision("dit", &Device::Cpu, dit_dtype);
+                    observe_component_precision("vae", &Device::Cpu, DType::F32);
+                    Ok(GenerationOutput::Images(vec![Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0; 3],
+                    }]))
+                },
+            )
+            .unwrap()
+            .execution
+            .resolved()
+            .unwrap()
+            .quality_policy
+            .clone()
+        };
+        let bf16 = report(DType::BF16);
+        let f32 = report(DType::F32);
+        assert_ne!(bf16, f32);
+        let gen_core::generator::ExecutionFact::Resolved { value } = bf16 else {
+            panic!("completed precision policy must resolve")
+        };
+        assert_eq!(
+            value["operations"]["qwen_image/component_precision"][1]["value"]["component"],
+            "dit"
+        );
+        assert_eq!(
+            value["operations"]["qwen_image/component_precision"][1]["value"]["compute_dtype"],
+            "BF16"
+        );
+        assert_eq!(
+            value["operations"]["qwen_image/component_precision"][1]["value"]["device"],
+            "Cpu"
+        );
+        assert_eq!(
+            value["operations"]["qwen_image/component_precision"][0]["value"]["component"],
+            "text_encoder"
+        );
+        assert_eq!(
+            value["operations"]["qwen_image/component_precision"][2]["value"]["component"],
+            "vae"
+        );
+    }
+
     #[test]
     fn execution_guidance_distinguishes_default_off_and_override() {
         let report = |requested| {

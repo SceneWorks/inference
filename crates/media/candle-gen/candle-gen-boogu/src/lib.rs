@@ -52,7 +52,7 @@ mod img2img_validate;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use candle_gen::candle_core::{Device, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
     Generator, Image, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant,
@@ -91,6 +91,18 @@ const MAX_EDIT_REFERENCES: usize = 5;
 /// DMD σ grid (sc-9009); unset stays the byte-exact native DMD loop. Mirrors `mlx-gen-boogu`'s
 /// `TURBO_SAMPLERS`.
 const TURBO_SAMPLERS: &[&str] = &["lcm", "euler_ancestral", "dpmpp_sde"];
+
+pub(crate) fn observe_component_precision(component: &str, device: &Device, dtype: DType) {
+    candle_gen::execution::runtime(device, dtype);
+    candle_gen::execution::policy(
+        "boogu/component_precision",
+        serde_json::json!({
+            "component": component,
+            "device": format!("{:?}", device.location()),
+            "compute_dtype": format!("{dtype:?}"),
+        }),
+    );
+}
 
 /// Which Boogu sampler path a generator drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1038,6 +1050,62 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumed_component_precision_changes_completed_identity() {
+        let report = |dit_dtype| {
+            candle_gen::execution::capture_direct(
+                &descriptor(),
+                &gen_core::CancelFlag::default(),
+                || {
+                    candle_gen::execution::rng_scheme("precision-fixture");
+                    candle_gen::execution::draw("initial_noise", 7, 0);
+                    candle_gen::execution::without_schedule("fixture", "single-step", "flow");
+                    candle_gen::execution::policy("decoder", serde_json::json!("fixture"));
+                    observe_component_precision("text_encoder", &Device::Cpu, DType::F32);
+                    observe_component_precision("dit", &Device::Cpu, dit_dtype);
+                    observe_component_precision("vae", &Device::Cpu, DType::F32);
+                    Ok(GenerationOutput::Images(vec![Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0; 3],
+                    }]))
+                },
+            )
+            .unwrap()
+            .execution
+            .resolved()
+            .unwrap()
+            .quality_policy
+            .clone()
+        };
+        let bf16 = report(DType::BF16);
+        let f32 = report(DType::F32);
+        assert_ne!(bf16, f32);
+        let gen_core::generator::ExecutionFact::Resolved { value } = bf16 else {
+            panic!("completed precision policy must resolve")
+        };
+        assert_eq!(
+            value["operations"]["boogu/component_precision"][1]["value"]["component"],
+            "dit"
+        );
+        assert_eq!(
+            value["operations"]["boogu/component_precision"][1]["value"]["compute_dtype"],
+            "BF16"
+        );
+        assert_eq!(
+            value["operations"]["boogu/component_precision"][1]["value"]["device"],
+            "Cpu"
+        );
+        assert_eq!(
+            value["operations"]["boogu/component_precision"][0]["value"]["component"],
+            "text_encoder"
+        );
+        assert_eq!(
+            value["operations"]["boogu/component_precision"][2]["value"]["component"],
+            "vae"
+        );
+    }
 
     fn write_tiny_tokenizer(root: &std::path::Path, overlong_negative: bool) {
         let mllm = root.join("mllm");
