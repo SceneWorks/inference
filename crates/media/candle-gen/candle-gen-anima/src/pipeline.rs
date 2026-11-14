@@ -290,6 +290,19 @@ impl ConditioningComponents for AnimaConditioningComponents {
     }
 }
 
+/// Observe the loaded component's compute dtype at the operation that consumes it. The flow
+/// sampler integrates f32 latents, which cannot attest the text encoder, conditioner, or DiT math.
+fn observe_component_compute(component: &str, device: &Device, dtype: DType) {
+    candle_gen::execution::runtime(device, dtype);
+    candle_gen::execution::policy(
+        &format!("anima/{component}_compute"),
+        serde_json::json!({
+            "device": format!("{:?}", device.location()),
+            "dtype": format!("{dtype:?}"),
+        }),
+    );
+}
+
 fn encode_prompt_components(
     c: &impl ConditioningComponents,
     device: &Device,
@@ -300,6 +313,7 @@ fn encode_prompt_components(
     let s = qwen_ids.len();
     let ids_u32: Vec<u32> = qwen_ids.iter().map(|&i| i as u32).collect();
     let input_ids = Tensor::from_vec(ids_u32, (1, s), device)?;
+    observe_component_compute("text_encoder", device, dtype);
     let source = c.text_encoder().forward(&input_ids, dtype)?; // [1, S, 1024]
 
     // Multiply the Qwen states by the attention mask BEFORE the conditioner (zeros padded/uncond
@@ -313,6 +327,7 @@ fn encode_prompt_components(
     let st = t5_ids.len();
     let t5_u32: Vec<u32> = t5_ids.iter().map(|&i| i as u32).collect();
     let target_ids = Tensor::from_vec(t5_u32, (1, st), device)?;
+    observe_component_compute("conditioner", device, dtype);
     c.conditioner().forward(&source, &target_ids, dtype)
 }
 
@@ -354,6 +369,7 @@ fn render_encoded_components(
     // integrating `x + (σ_next − σ)·v`) consumes the DiT output directly — no negation, no `1 − σ`.
     let predict = |x: &Tensor, sigma: f32| -> Result<Tensor> {
         let s = Tensor::from_vec(vec![sigma], (1,), device)?;
+        observe_component_compute("dit", device, dtype);
         let v_cond = dit.forward_prepared(x, &s, &cond, dtype, &prepared_rope)?;
         let v = match &uncond {
             // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
@@ -420,6 +436,47 @@ fn to_image(decoded: &candle_gen::candle_core::Tensor) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn component_compute_observations_distinguish_model_dtype_from_f32_latents() {
+        fn observed_policy(component_dtype: DType) -> serde_json::Value {
+            let attempt = candle_gen::execution::Attempt::begin();
+            candle_gen::execution::rng_scheme("anima-test-seeded-noise");
+            candle_gen::execution::draw("anima/pipeline", 9, 0);
+            candle_gen::execution::schedule("euler", &[1.0, 0.0], "Flow");
+            candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+            for component in ["text_encoder", "conditioner", "dit"] {
+                observe_component_compute(component, &Device::Cpu, component_dtype);
+            }
+            let output = candle_gen::gen_core::GenerationOutput::Images(vec![Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            }]);
+            let candle_gen::gen_core::generator::ExecutionIdentity::Resolved { identity } =
+                attempt.finish_image(&crate::descriptor_base(), &output)
+            else {
+                panic!("component observations should complete the weights-free report");
+            };
+            let candle_gen::gen_core::generator::ExecutionFact::Resolved { value } =
+                identity.quality_policy
+            else {
+                panic!("quality policy should be resolved");
+            };
+            value
+        }
+
+        let f32 = observed_policy(DType::F32);
+        let bf16 = observed_policy(DType::BF16);
+        for component in ["text_encoder", "conditioner", "dit"] {
+            let key = format!("anima/{component}_compute");
+            assert_eq!(f32["operations"][&key][0]["value"]["dtype"], "F32");
+            assert_eq!(bf16["operations"][&key][0]["value"]["dtype"], "BF16");
+        }
+        assert_eq!(bf16["compute"][0]["dtype"], "F32");
+        assert_eq!(bf16["compute"][1]["dtype"], "BF16");
+        assert_ne!(f32, bf16);
+    }
 
     #[test]
     fn sigma_schedule_linspace_shift3() {
