@@ -11,7 +11,7 @@
 /// elements + FP8-E4M3 block scales, W4A4 regime), so auto-swapping `q4` → NVFP4 on `sm_120` would
 /// silently change a picked tier's output — the SC#5 violation Option A avoids. Adding this variant
 /// changes **no** existing tier's numerics or behavior; each of `Q4`/`Q8` maps exactly as before.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Quant {
     Q4,
     Q8,
@@ -137,7 +137,7 @@ impl Quant {
 /// through `LoadSpec` must read `Bf16` as "the provider's default dense dtype", which is not
 /// universally bf16. (A distinct `Precision::Default`/`Dense` sentinel would make this explicit but
 /// would touch every provider's match arm — deferred; this note is the documented contract.)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub enum Precision {
     /// Dense default — the provider's native dense dtype (bf16 for most, fp16 for the SDXL family).
     /// See the type-level note: this is the "no override" sentinel, not a literal bf16 request.

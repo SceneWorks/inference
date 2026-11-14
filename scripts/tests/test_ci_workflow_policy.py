@@ -1130,7 +1130,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(set(called.get("on", called.get(True))), {"workflow_call", "workflow_dispatch"})
         self.assertFalse(called.get("on", called.get(True))["workflow_call"]["inputs"]["snapshot"]["required"])
         boundary = called["jobs"]["runtime-boundary"]
-        self.assertEqual(boundary["if"], "github.event_name == 'workflow_dispatch'")
+        self.assertEqual(boundary["if"], "github.event_name == 'workflow_dispatch' && inputs.mode != 'catalog-size'")
+        size = called["jobs"]["catalog-size"]
+        self.assertEqual(size["if"], "github.event_name == 'workflow_dispatch' && inputs.mode == 'catalog-size'")
+        self.assertEqual(size["runs-on"], "macos-15")
         runs = "\n".join(step.get("run", "") for step in boundary["steps"])
         self.assertIn("--simulator-runtime-boundary --install-only", runs)
         self.assertIn("ios_simulator_sana.py", runs)

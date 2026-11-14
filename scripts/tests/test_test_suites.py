@@ -161,8 +161,25 @@ class TestSuites(unittest.TestCase):
 
     def test_safe_table_is_nonempty_and_source_bound(self):
         controls = suites.safe_controls()
+        # SW-F331 adds six runner controls and two preload controls per backend; SW-6936 adds
+        # 24 conditional pre-load plan/refusal and preview source-scan controls.
+        self.assertEqual(len(controls), 106)
+        flux_plan_sources = {
+            "crates/contracts/gen-core/src/render/tests.rs": 9,
+            "crates/media/mlx-gen/mlx-gen-flux/src/model.rs": 4,
+            "crates/media/mlx-gen/mlx-gen-flux/src/model_control.rs": 3,
+            "crates/media/mlx-gen/mlx-gen-pulid/src/pulid_flux.rs": 4,
+            "crates/media/candle-gen/candle-gen-flux/src/lib.rs": 2,
+            "crates/media/candle-gen/candle-gen-flux/src/control_provider.rs": 1,
+            "crates/media/candle-gen/candle-gen-flux/src/ip_provider.rs": 1,
+            "crates/media/candle-gen/candle-gen-flux/src/preview.rs": 2,
+            "crates/media/candle-gen/candle-gen-pulid/src/pulid_flux.rs": 1,
+            "crates/media/candle-gen/candle-gen-pulid/src/preview.rs": 1,
+            "crates/media/candle-gen/candle-gen-catalog/src/preview_advertising.rs": 6,
+        }
+        for source, count in flux_plan_sources.items():
+            self.assertEqual(sum(control["source"] == source for control in controls), count, source)
         # SW-F329 includes five exact CPU-only allocator recovery controls.
-        self.assertEqual(len(controls), 72)
         self.assertEqual(sum(control["package"] == "candle-core" for control in controls), 5)
         self.assertEqual(sum(control["package"] == "sceneworks-gen-cv" for control in controls), 26)
         self.assertTrue(all(control['protocol'] == 'libtest' for control in controls))

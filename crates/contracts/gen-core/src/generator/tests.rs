@@ -859,6 +859,41 @@ fn advertised_explicit_grid_rejects_only_off_grid_explicit_sizes() {
     assert_eq!(SizeFloor::RangeChecked.explicit_size_multiple(), None);
 }
 
+#[test]
+fn advertised_grid_area_matches_packed_image_token_arithmetic() {
+    let c = Capabilities {
+        min_size: 16,
+        max_size: u32::MAX,
+        size_floor: SizeFloor::RangeCheckedOnGridArea {
+            multiple: 16,
+            max_cells: u32::MAX,
+        },
+        ..caps()
+    };
+    // A scalar square bound would unnecessarily reject this long, thin image.
+    c.validate_request(
+        "m",
+        &GenerationRequest {
+            width: u32::MAX - 15,
+            height: 16,
+            ..base_req()
+        },
+    )
+    .unwrap();
+    let error = c
+        .validate_request(
+            "m",
+            &GenerationRequest {
+                width: 1_048_576,
+                height: 1_048_576,
+                ..base_req()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("packed image grid exceeds"), "{error}");
+}
+
 /// The default variant is unaffected — a descriptor that says nothing behaves exactly as before.
 #[test]
 fn range_checked_is_the_default_and_rejects_out_of_range_sizes() {

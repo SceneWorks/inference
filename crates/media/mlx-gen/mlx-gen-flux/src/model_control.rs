@@ -31,8 +31,8 @@ use mlx_gen::gen_core;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
-    require_control, run_flow_sampler_with_latent_hook, AcceptedControlKinds, Capabilities,
+    curated_sampler_names, curated_scheduler_names, require_base_dir, require_control,
+    run_flow_sampler_with_latent_hook_spans, AcceptedControlKinds, Capabilities, Conditioning,
     ConditioningKind, ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest,
     Generator, Image, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
     Quant, Residency, Result, SamplerRun, TimestepConvention,
@@ -219,6 +219,85 @@ fn load_control_heavy(spec: &LoadSpec) -> Result<FluxControlHeavyOwned> {
     Ok(FluxControlHeavyOwned { transformer, vae })
 }
 
+/// Compile the shipped Union-Pro control route before any model or control weights move.
+pub(crate) fn compile_control(
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> gen_core::Result<Option<gen_core::RenderPlan>> {
+    let descriptor = descriptor_dev_control();
+    descriptor
+        .capabilities
+        .validate_request(FLUX1_DEV_CONTROL_ID, req)?;
+    if req.prompt.trim().is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{FLUX1_DEV_CONTROL_ID}: prompt is required"
+        )));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "{FLUX1_DEV_CONTROL_ID}: width and height must be multiples of {SIZE_MULTIPLE}, got {}x{}",
+            req.width, req.height
+        )));
+    }
+    match req.conditioning.as_slice() {
+        [Conditioning::Control { kind, .. }] if accepted_control_kinds().accepts(kind) => {}
+        [Conditioning::Control { kind, .. }] => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{FLUX1_DEV_CONTROL_ID} supports pose/canny/depth control (Fun-Controlnet-Union), got {kind:?}"
+            )));
+        }
+        _ => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{FLUX1_DEV_CONTROL_ID} needs exactly one Control conditioning"
+            )));
+        }
+    }
+    crate::memory_strategy::validate_load_contract(FLUX1_DEV_CONTROL_ID, spec)?;
+    if req.cancel.is_cancelled() {
+        return Err(gen_core::Error::Canceled);
+    }
+    let sampler = req
+        .sampler
+        .as_deref()
+        .unwrap_or(crate::config::DEFAULT_SAMPLER);
+    let steps = req.steps.unwrap_or(if sampler == HYPER_SAMPLER {
+        8
+    } else {
+        FluxVariant::Dev.default_steps()
+    }) as usize;
+    let sigmas = build_sigmas_with(
+        steps,
+        req.width,
+        req.height,
+        FluxVariant::Dev.requires_sigma_shift(),
+        req.scheduler.as_deref(),
+    )?;
+    let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
+        req.scheduler.as_deref(),
+        req.scheduler_shift,
+        crate::pipeline::linear_sigma_mu(req.width, req.height, true),
+        steps,
+        &sigmas,
+    )?;
+    let executed_steps = sigmas.len().saturating_sub(1);
+    Ok(Some(
+        gen_core::RenderPlan::packed_image_trajectory(
+            &descriptor,
+            req,
+            gen_core::render::PackedImagePass {
+                pixel_stride: SIZE_MULTIPLE,
+                token_width: crate::pipeline::PACKED_TOKEN_WIDTH as u32,
+                sampler,
+                guidance: req.guidance.unwrap_or(DEFAULT_GUIDANCE),
+                capture_sigma: 0.0,
+                executed_steps,
+                sigmas,
+            },
+        )?
+        .bind_load(spec),
+    ))
+}
+
 impl Flux1DevControl {
     /// VAE-encode + pack the control hint into the packed control latent `[1, seq, 64]` (constant
     /// across steps + the batch). The Shakker FLUX.1 ControlNet encodes the control image with the same
@@ -246,41 +325,32 @@ impl Flux1DevControl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        // `resolve_control` resolves an unset (`None`) scale to `default_control_scale()` (the Shakker
-        // `DEFAULT_CONTROL_SCALE`); an explicit `Some(0.0)` now flows through as a deliberately inert
-        // branch (F-085 — the `Option<f32>` field distinguishes it from unset, so no 0.0 reject). It is
-        // cheap (reads `req.conditioning`), so resolve it before the residency seam runs.
+        let plan = compile_control(&self.loaded_spec, req)?
+            .ok_or_else(|| Error::Msg("control plan compiler returned no route".into()))?;
+        let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
+        self.run_planned_with_injector(req, injector, &run, on_progress)
+    }
+
+    fn run_planned_with_injector(
+        &self,
+        req: &GenerationRequest,
+        injector: Option<&dyn DitImageInjector>,
+        run: &gen_core::RenderRun<'_, '_>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
         let (control_image, control_scale) = self.resolve_control(req)?;
-
-        let base_seed = req.seed.unwrap_or_else(default_seed);
-        let sampler_name = req
-            .sampler
-            .as_deref()
-            .unwrap_or(crate::config::DEFAULT_SAMPLER);
-        let (def_steps, def_guidance) = if sampler_name == HYPER_SAMPLER {
-            (8, DEFAULT_GUIDANCE)
-        } else {
-            (FluxVariant::Dev.default_steps(), DEFAULT_GUIDANCE)
-        };
-        let steps = req.steps.unwrap_or(def_steps) as usize;
-        let guidance = req.guidance.unwrap_or(def_guidance);
-
-        let sigmas = build_sigmas_with(
-            steps,
-            req.width,
-            req.height,
-            FluxVariant::Dev.requires_sigma_shift(),
-            req.scheduler.as_deref(),
-        )?;
-        let sigmas = mlx_gen::resolve_flow_schedule_with_shift(
-            req.scheduler.as_deref(),
-            req.scheduler_shift,
-            crate::pipeline::linear_sigma_mu(req.width, req.height, true),
-            steps,
-            &sigmas,
-        )?;
-
-        self.residency.run(
+        let plan = run.plan();
+        let sigmas = plan.denoise_sigmas();
+        let spans = plan.denoise_spans();
+        let sampler_name = plan.sampler();
+        let guidance = plan.guidance();
+        // Sequential residency drops text weights before loading the VAE. Keep one Conditioning
+        // phase open across that handoff so the control-image VAE encode is included without
+        // retaining the text weights beside its large packed latent.
+        run.begin_conditioning()?;
+        self.residency.run_request_scoped(
+            matches!(self.loaded_spec.offload_policy, OffloadPolicy::Sequential),
+            false,
             &req.cancel,
             // The control variant has no PiD overlay; `use_pid` is inert for the heavy loader.
             req.use_pid,
@@ -298,57 +368,64 @@ impl Flux1DevControl {
                 // after the encoders were dropped and the VAE loaded under `Sequential`.
                 let control_latent =
                     Self::encode_control_latent(&heavy.vae, control_image, req.width, req.height)?;
+                mlx_rs::transforms::eval([&control_latent])?;
+                run.end_conditioning()?;
 
                 // Compiled elementwise glue (sc-2963), shared with the base flux1 path. Scoped +
                 // restored on drop by the RAII guard (F-007).
                 let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
-                let mut images = Vec::with_capacity(req.count as usize);
-                for i in 0..req.count {
-                    let seed = base_seed.wrapping_add(i as u64);
-                    let latents = create_noise(seed, req.width, req.height)?;
-                    let previews = mlx_gen::preview::PreviewCounter::new(&sigmas);
-                    let final_latents = run_flow_sampler_with_latent_hook(
-                        SamplerRun {
-                            sampler_name: Some(sampler_name),
-                            sigmas: &sigmas,
-                            seed,
-                            cancel: &req.cancel,
-                            on_progress,
-                        },
-                        TimestepConvention::Sigma,
-                        latents,
-                        |latents, sigma| {
-                            crate::preview::emit_preview(
-                                &req.preview,
-                                &previews,
-                                &sigmas,
-                                sigma,
-                                latents,
-                                req.width,
-                                req.height,
-                            );
-                        },
-                        |x_in, timestep| {
-                            heavy.transformer.forward_composed(
-                                x_in,
-                                &control_latent,
-                                &prompt_embeds,
-                                &pooled_prompt_embeds,
-                                timestep,
-                                guidance,
-                                req.width,
-                                req.height,
-                                control_scale,
-                                injector,
-                            )
-                        },
-                    )?;
-                    on_progress(Progress::Decoding);
-                    let unpacked = unpack_latents(&final_latents, req.width, req.height)?;
-                    let decoded = heavy.vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
-                    images.push(decoded_to_image(&decoded)?);
-                }
+                let images = run.images_with_denoise_phases(
+                    on_progress,
+                    |seed| create_noise(seed, req.width, req.height),
+                    |seed, latents, on_progress| {
+                        let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
+                        run_flow_sampler_with_latent_hook_spans(
+                            SamplerRun {
+                                sampler_name: Some(sampler_name),
+                                sigmas,
+                                seed,
+                                cancel: &req.cancel,
+                                on_progress,
+                            },
+                            TimestepConvention::Sigma,
+                            latents,
+                            &spans,
+                            Some(run),
+                            |latents, sigma| {
+                                crate::preview::emit_preview(
+                                    &req.preview,
+                                    &previews,
+                                    sigmas,
+                                    sigma,
+                                    latents,
+                                    req.width,
+                                    req.height,
+                                );
+                            },
+                            |x_in, timestep| {
+                                heavy.transformer.forward_composed(
+                                    x_in,
+                                    &control_latent,
+                                    &prompt_embeds,
+                                    &pooled_prompt_embeds,
+                                    timestep,
+                                    guidance,
+                                    req.width,
+                                    req.height,
+                                    control_scale,
+                                    injector,
+                                )
+                            },
+                        )
+                    },
+                    |_, final_latents, on_progress| {
+                        on_progress(Progress::Decoding);
+                        let unpacked = unpack_latents(&final_latents, req.width, req.height)?;
+                        let decoded = heavy.vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
+                        decoded_to_image(&decoded)
+                    },
+                )?;
                 Ok(GenerationOutput::Images(images))
             },
         )
@@ -453,6 +530,21 @@ impl Generator for Flux1DevControl {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
 
+    fn generate_planned(
+        &self,
+        req: &GenerationRequest,
+        plan: &gen_core::RenderPlan,
+        scope: Option<&mut dyn gen_core::MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
+        self.validate(req)?;
+        plan.check_request(&self.descriptor, req)?;
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
+        let output = self.run_planned_with_injector(req, None, &run, on_progress)?;
+        Ok(gen_core::GenerationReport::from_output(output))
+    }
+
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
         Some(&self.memory_strategy)
     }
@@ -512,6 +604,141 @@ pub const DEV_CONTROL_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
 mod tests {
     use super::*;
     use mlx_gen::WeightsSource;
+
+    #[test]
+    fn control_plan_freezes_native_schedule_and_source_before_load() {
+        let registry = crate::provider_registry().unwrap();
+        let spec = missing_snapshot_spec(OffloadPolicy::Sequential);
+        let mut req = GenerationRequest {
+            prompt: "a fox".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            seed: Some(11),
+            conditioning: vec![Conditioning::Control {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![7; 64 * 64 * 3],
+                },
+                kind: ControlKind::Pose,
+                scale: Some(0.0),
+            }],
+            ..Default::default()
+        };
+        let plan = registry
+            .compile_render_plan(FLUX1_DEV_CONTROL_ID, &spec, &req)
+            .unwrap()
+            .expect("control needs a pre-load trajectory");
+        let native = build_sigmas_with(4, 512, 512, true, None).unwrap();
+        assert_eq!(plan.denoise_sigmas(), native);
+        assert_eq!(plan.base_seed(), 11);
+        plan.check_request(&descriptor_dev_control(), &req).unwrap();
+        let mut restrided = req.clone();
+        restrided.steps = Some(30);
+        restrided.scheduler = Some("ddim_uniform".into());
+        let restrided_plan = registry
+            .compile_render_plan(FLUX1_DEV_CONTROL_ID, &spec, &restrided)
+            .unwrap()
+            .expect("re-strided control schedule remains valid");
+        assert_eq!(restrided_plan.denoise_sigmas().len() - 1, 31);
+        restrided_plan
+            .check_request(&descriptor_dev_control(), &restrided)
+            .unwrap();
+        if let Conditioning::Control { scale, .. } = &mut req.conditioning[0] {
+            *scale = None;
+        }
+        assert!(plan.check_request(&descriptor_dev_control(), &req).is_err());
+        let mut changed_spec = spec.clone();
+        changed_spec.control = Some(WeightsSource::File("/different/control".into()));
+        assert!(plan
+            .check_load(&gen_core::RenderLoadBinding::from_spec(&changed_spec))
+            .is_err());
+    }
+
+    #[test]
+    fn control_plan_refuses_missing_overlay_and_mixed_modes_before_load() {
+        let mut spec = missing_snapshot_spec(OffloadPolicy::Sequential);
+        let mut req = GenerationRequest {
+            prompt: "a fox".into(),
+            conditioning: vec![Conditioning::Control {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![0; 64 * 64 * 3],
+                },
+                kind: ControlKind::Pose,
+                scale: None,
+            }],
+            ..Default::default()
+        };
+        spec.control = None;
+        assert!(compile_control(&spec, &req).is_err());
+        spec = missing_snapshot_spec(OffloadPolicy::Sequential);
+        req.conditioning.push(Conditioning::Reference {
+            image: Image {
+                width: 64,
+                height: 64,
+                pixels: vec![0; 64 * 64 * 3],
+            },
+            strength: None,
+        });
+        assert!(compile_control(&spec, &req).is_err());
+        req.conditioning.pop();
+        if let Conditioning::Control { kind, .. } = &mut req.conditioning[0] {
+            *kind = ControlKind::Other("unsupported".into());
+        }
+        assert!(compile_control(&spec, &req).is_err());
+    }
+
+    /// Zero steps, an off-grid width and a below-minimum size are refused by the pre-load compiler
+    /// (direct and through the registry) at a missing snapshot, so no weight is ever opened.
+    #[test]
+    fn control_plan_refuses_zero_steps_and_invalid_sizes_before_load() {
+        let registry = crate::provider_registry().unwrap();
+        let spec = missing_snapshot_spec(OffloadPolicy::Sequential);
+        let valid = GenerationRequest {
+            prompt: "a fox".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            conditioning: vec![Conditioning::Control {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![7; 64 * 64 * 3],
+                },
+                kind: ControlKind::Pose,
+                scale: None,
+            }],
+            ..Default::default()
+        };
+        compile_control(&spec, &valid).unwrap();
+        for (width, height, steps, expected) in [
+            (512, 512, Some(0), "steps must be >= 1"),
+            (321, 512, Some(4), "multiples of 16"),
+            (512, 321, Some(4), "multiples of 16"),
+            (128, 512, Some(4), "outside supported range"),
+            (512, 240, Some(4), "outside supported range"),
+        ] {
+            let req = GenerationRequest {
+                width,
+                height,
+                steps,
+                ..valid.clone()
+            };
+            let direct = compile_control(&spec, &req).unwrap_err().to_string();
+            assert!(direct.contains(expected), "{width}x{height}: {direct}");
+            let registered = registry
+                .compile_render_plan(FLUX1_DEV_CONTROL_ID, &spec, &req)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                registered.contains(expected),
+                "{width}x{height}: {registered}"
+            );
+        }
+    }
 
     #[test]
     fn loaded_control_generator_exposes_and_executes_its_registered_scope() {

@@ -17,7 +17,7 @@
 //! **Compose-readiness:** the denoise routes through [`crate::FluxControlTransformer::forward_composed`], which
 //! threads an optional identity injector ([`crate::ip_dit::DitImageInjector`] — PuLID / XLabs
 //! IP-Adapter) into the SAME base double-block stream as the control residuals. This provider wires the
-//! seam (and exposes [`Flux1DevControl::generate_with_injector`]); a follow-on epic stacks identity +
+//! seam (and exposes [`Flux1DevControl::generate_with_injector_planned`]); a follow-on epic stacks identity +
 //! control in one denoise step by passing `Some(injector)`.
 //!
 //! Bespoke provider (NOT gen-core-registered), worker-invoked by name — the candle pattern for
@@ -31,21 +31,26 @@
 use crate::vae::native::{DiagonalGaussian, Encoder};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::flux::sampling::{get_schedule, State};
+use candle_transformers::models::flux::sampling::State;
 use std::path::{Path, PathBuf};
 
 use candle_gen::gen_core::attention_budget::{AttentionBudget, AttentionPlan};
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{AdapterSpec, GenerationMemory, Image, PreviewSink, Progress};
+use candle_gen::gen_core::{
+    AdapterSpec, Conditioning, ControlKind, GenerationMemory, GenerationRequest, Image, LoadSpec,
+    MemoryGeometry, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    ModelDescriptor, PreviewSink, Progress, RenderLoadBinding, RenderPlan, RenderRun,
+    WeightsSource,
+};
 use candle_gen::preview::PreviewHook;
 use candle_gen::{CandleError, Result};
 
 use crate::control::{accepts_control_kind, FluxControlNet, FluxControlNetConfig};
 use crate::flux1_load;
 use crate::ip_dit::{control_residual_interval, DitImageInjector};
-use crate::pipeline::{flow_mu, flux_config, BASE_SHIFT, MAX_SHIFT};
+use crate::pipeline::flux_config;
 use crate::ref_backbone::{FluxRefBackbone, FluxRefHeavy};
 use crate::Variant;
 
@@ -66,6 +71,7 @@ pub const DEFAULT_CONTROL_SCALE: f32 = 0.7;
 
 /// Paths to the FLUX.1-dev control checkpoints: the dev snapshot dir + the Shakker Fun-Controlnet-Union
 /// overlay.
+#[derive(Clone)]
 pub struct Flux1ControlPaths {
     /// The black-forest-labs FLUX.1-dev snapshot dir (`flux1-dev.safetensors`, `ae.safetensors`,
     /// `text_encoder/`, `text_encoder_2/`, `tokenizer_2/`).
@@ -199,6 +205,144 @@ pub struct Flux1DevControl {
     memory: GenerationMemory,
     backbone: FluxRefBackbone,
     branch: FluxControlNet,
+    loaded_spec: LoadSpec,
+    memory_contract: Option<MemoryProviderContract>,
+    admitted_context: Option<MemoryRunContext>,
+}
+
+fn validate_control_memory_context(context: &MemoryRunContext) -> Result<()> {
+    if !crate::memory_strategy::accepts_control_public_mode(&context.mode)
+        || context.overlay.as_deref() != Some("control")
+        || !context.has_reference
+        || context.use_pid
+        || context.has_phases
+        || context.geometry.batch != 1
+        || context.geometry.frames != 1
+        || context.geometry.reference_count != 1
+    {
+        return Err(CandleError::Msg(
+            "FLUX.1 ControlNet memory context is not one supported public control request".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_control_spec(
+    paths: &Flux1ControlPaths,
+    spec: &LoadSpec,
+) -> candle_gen::gen_core::Result<()> {
+    if spec.weights != WeightsSource::Dir(paths.flux_base.clone())
+        || !matches!(&spec.control, Some(WeightsSource::File(path) | WeightsSource::Dir(path)) if *path == paths.control)
+        || spec.adapters != paths.adapters
+        || !spec.extra_controls.is_empty()
+        || spec.ip_adapter.is_some()
+        || spec.identity.is_some()
+        || spec.pid.is_some()
+        || spec.text_encoder.is_some()
+        || !spec.components.is_empty()
+        || spec.quantize.is_some()
+        || spec.precision != candle_gen::gen_core::Precision::Bf16
+    {
+        return Err(candle_gen::gen_core::Error::Unsupported(
+            "FLUX.1 ControlNet load contract differs from resolved paths".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn control_descriptor() -> ModelDescriptor {
+    let mut descriptor = crate::descriptor_dev();
+    crate::add_conditioned_native_aliases(&mut descriptor);
+    descriptor.id = "flux1_dev_control";
+    // The bespoke ControlNet route accepts any positive on-stride geometry; the
+    // registered base txt2img route's 256..=2048 range does not apply here.
+    descriptor.capabilities.min_size = SIZE_MULTIPLE;
+    descriptor.capabilities.max_size = u32::MAX;
+    descriptor.capabilities.size_floor = candle_gen::gen_core::SizeFloor::RangeCheckedOnGridArea {
+        multiple: SIZE_MULTIPLE,
+        max_cells: u32::MAX,
+    };
+    descriptor.control_kinds = Some(candle_gen::gen_core::AcceptedControlKinds::Only(vec![
+        ControlKind::Pose,
+        ControlKind::Canny,
+        ControlKind::Depth,
+    ]));
+    descriptor.capabilities.conditioning = vec![candle_gen::gen_core::ConditioningKind::Control];
+    descriptor.capabilities.max_count = 1;
+    descriptor
+}
+
+fn typed_control_request(
+    req: &Flux1ControlRequest,
+    image: &Image,
+) -> candle_gen::gen_core::Result<GenerationRequest> {
+    let steps = u32::try_from(req.steps).map_err(|_| {
+        candle_gen::gen_core::Error::Unsupported("FLUX.1 ControlNet step count exceeds u32".into())
+    })?;
+    let kind = match req.control_kind.as_str() {
+        "pose" => ControlKind::Pose,
+        "canny" => ControlKind::Canny,
+        "depth" => ControlKind::Depth,
+        other => ControlKind::Other(other.to_owned()),
+    };
+    Ok(GenerationRequest {
+        prompt: req.prompt.clone(),
+        width: req.width,
+        height: req.height,
+        count: 1,
+        steps: Some(steps),
+        seed: Some(req.seed),
+        guidance: Some(req.guidance),
+        sampler: req.sampler.clone(),
+        scheduler: req.scheduler.clone(),
+        scheduler_shift: req.scheduler_shift,
+        conditioning: vec![Conditioning::Control {
+            image: image.clone(),
+            kind,
+            scale: req.control_scale,
+        }],
+        memory: Some(req.memory),
+        preview: req.preview.clone(),
+        cancel: req.cancel.clone(),
+        ..Default::default()
+    })
+}
+
+/// The load contract [`Flux1DevControl::load`] / [`Flux1DevControl::load_with_memory`] bind, so a
+/// caller of those paths-only loaders can compile [`compile_control_plan`] before loading.
+pub fn control_load_spec(paths: &Flux1ControlPaths) -> LoadSpec {
+    let control = if paths.control.is_dir() {
+        WeightsSource::Dir(paths.control.clone())
+    } else {
+        WeightsSource::File(paths.control.clone())
+    };
+    LoadSpec::new(WeightsSource::Dir(paths.flux_base.clone()))
+        .with_control(control)
+        .with_adapters(paths.adapters.clone())
+}
+
+/// Resolve and bind the entire strict-control request before opening model weights.
+pub fn compile_control_plan(
+    paths: &Flux1ControlPaths,
+    spec: &LoadSpec,
+    req: &Flux1ControlRequest,
+    image: &Image,
+) -> candle_gen::gen_core::Result<RenderPlan> {
+    validate_control_spec(paths, spec)?;
+    let typed = typed_control_request(req, image)?;
+    let descriptor = control_descriptor();
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, &typed)?;
+    if req.prompt.trim().is_empty() || req.steps == 0 || !accepts_control_kind(&req.control_kind) {
+        return Err(candle_gen::gen_core::Error::Unsupported(
+            "FLUX.1 ControlNet needs a prompt, positive steps and pose/canny/depth control".into(),
+        ));
+    }
+    if req.cancel.is_cancelled() {
+        return Err(candle_gen::gen_core::Error::Canceled);
+    }
+    crate::compile_conditioned_plan(Variant::Dev, &descriptor, spec, &typed)
 }
 
 impl Flux1DevControl {
@@ -210,6 +354,45 @@ impl Flux1DevControl {
     }
 
     pub fn load_with_memory(paths: &Flux1ControlPaths, memory: GenerationMemory) -> Result<Self> {
+        Self::load_with_memory_spec(paths, memory, &control_load_spec(paths))
+    }
+
+    /// The worker passes the same resolved contract used for pre-load planning.
+    pub fn load_with_memory_spec(
+        paths: &Flux1ControlPaths,
+        memory: GenerationMemory,
+        spec: &LoadSpec,
+    ) -> Result<Self> {
+        Self::load_internal(paths, memory, None, None, spec)
+    }
+
+    pub fn load_with_memory_context_spec(
+        paths: &Flux1ControlPaths,
+        context: MemoryRunContext,
+        spec: &LoadSpec,
+    ) -> Result<Self> {
+        validate_control_spec(paths, spec).map_err(|error| CandleError::Msg(error.to_string()))?;
+        validate_control_memory_context(&context)?;
+        let contract = crate::memory_strategy::provider_contract("flux1_dev", spec)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let tier = crate::memory_strategy::resolved_numeric_tier(spec, "flux1_dev")
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        crate::memory_strategy::validate_context(&contract, &context, tier.quant)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let memory = contract
+            .generation_memory(&context.selection)
+            .unwrap_or_default();
+        Self::load_internal(paths, memory, Some(contract), Some(context), spec)
+    }
+
+    fn load_internal(
+        paths: &Flux1ControlPaths,
+        memory: GenerationMemory,
+        memory_contract: Option<MemoryProviderContract>,
+        admitted_context: Option<MemoryRunContext>,
+        spec: &LoadSpec,
+    ) -> Result<Self> {
+        validate_control_spec(paths, spec).map_err(|error| CandleError::Msg(error.to_string()))?;
         let device = candle_gen::default_device()?;
         let dtype = DTYPE;
         let root = paths.flux_base.clone();
@@ -238,6 +421,9 @@ impl Flux1DevControl {
             memory,
             backbone,
             branch,
+            loaded_spec: spec.clone(),
+            memory_contract,
+            admitted_context,
         })
     }
 
@@ -251,28 +437,132 @@ impl Flux1DevControl {
         self.branch.num_residuals()
     }
 
-    /// Generate one control-conditioned image. `control_image` is the preprocessed pose/canny/depth hint
-    /// (the worker pre-fits it to the render size; this re-resizes defensively). `injector = None` is the
-    /// plain control path.
-    pub fn generate(
-        &self,
-        req: &Flux1ControlRequest,
-        control_image: &Image,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
-        self.generate_with_injector(req, control_image, None, on_progress)
-    }
-
-    /// As [`generate`](Self::generate), but threading an OPTIONAL identity injector (PuLID / XLabs
-    /// IP-Adapter) into every control-denoise step — the **compose-ready** seam. With `injector = None`
-    /// this is the plain control path; `Some(..)` stacks identity + control in one denoise.
-    pub fn generate_with_injector(
+    /// Generate one control-conditioned image from the trajectory [`compile_control_plan`] froze
+    /// before load. `control_image` is the preprocessed pose/canny/depth hint (the worker pre-fits it
+    /// to the render size; this re-resizes defensively). `injector` optionally threads an identity
+    /// injector (PuLID / XLabs IP-Adapter) into every control-denoise step — the **compose-ready**
+    /// seam; `None` is the plain control path.
+    pub fn generate_with_injector_planned(
         &self,
         req: &Flux1ControlRequest,
         control_image: &Image,
         injector: Option<&dyn DitImageInjector>,
+        plan: &RenderPlan,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        if self.admitted_context.is_some() {
+            return Err(CandleError::Msg(
+                "FLUX.1 ControlNet admitted model requires a memory context".into(),
+            ));
+        }
+        self.generate_with_injector_planned_scoped(
+            req,
+            control_image,
+            injector,
+            plan,
+            None,
+            on_progress,
+        )
+    }
+
+    pub fn generate_with_memory_context_planned(
+        &self,
+        context: &MemoryRunContext,
+        req: &Flux1ControlRequest,
+        control_image: &Image,
+        plan: &RenderPlan,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        self.generate_with_injector_memory_context_planned(
+            context,
+            req,
+            control_image,
+            None,
+            plan,
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_injector_memory_context_planned(
+        &self,
+        context: &MemoryRunContext,
+        req: &Flux1ControlRequest,
+        control_image: &Image,
+        injector: Option<&dyn DitImageInjector>,
+        plan: &RenderPlan,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let admitted = self.admitted_context.as_ref().ok_or_else(|| {
+            CandleError::Msg("FLUX.1 ControlNet model has no admitted memory context".into())
+        })?;
+        let contract = self.memory_contract.as_ref().ok_or_else(|| {
+            CandleError::Msg("FLUX.1 ControlNet model lost its memory contract".into())
+        })?;
+        validate_control_memory_context(context)?;
+        if admitted != context
+            || context.geometry
+                != (MemoryGeometry {
+                    width: req.width,
+                    height: req.height,
+                    batch: 1,
+                    frames: 1,
+                    reference_count: 1,
+                })
+            || req.memory != self.memory
+        {
+            return Err(CandleError::Msg(
+                "FLUX.1 ControlNet request changed after memory admission".into(),
+            ));
+        }
+        contract
+            .validate_selection(&context.selection)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        let mut scope = crate::memory_strategy::FluxMemoryScope::new(
+            "flux1_dev_control",
+            self.device.clone(),
+            contract,
+            context,
+        );
+        let result = self.generate_with_injector_planned_scoped(
+            req,
+            control_image,
+            injector,
+            plan,
+            Some(&mut scope),
+            on_progress,
+        );
+        let outcome = match &result {
+            Ok(_) => MemoryRunOutcome::Complete,
+            Err(CandleError::Canceled) => MemoryRunOutcome::Canceled,
+            Err(error) => MemoryRunOutcome::Error {
+                message: error.to_string(),
+            },
+        };
+        let cleanup = scope
+            .finish(outcome)
+            .map_err(|error| CandleError::Msg(error.to_string()));
+        match (result, cleanup) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(image), Ok(())) => Ok(image),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_with_injector_planned_scoped(
+        &self,
+        req: &Flux1ControlRequest,
+        control_image: &Image,
+        injector: Option<&dyn DitImageInjector>,
+        plan: &RenderPlan,
+        scope: Option<&mut dyn MemoryRequestScope>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let typed = typed_control_request(req, control_image)?;
+        plan.check_request(&control_descriptor(), &typed)?;
+        plan.check_load(&RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        let run = RenderRun::new(plan, &req.cancel, scope);
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -304,66 +594,79 @@ impl Flux1DevControl {
         // Conditioning (seed-independent): text (T5 seq + CLIP pooled) + the packed control latent.
         self.backbone
             .validate_native_vae_request(false, &req.cancel)?;
-        let (t5_emb, clip_emb) = self.backbone.encode_text_with_memory_and_progress(
-            &req.prompt,
-            &req.cancel,
-            on_progress,
-        )?;
-        let heavy = self.backbone.load_heavy(&req.cancel)?;
-        let control_latent = self.encode_control_latent(
-            heavy.as_ref(),
-            control_image,
-            req.width,
-            req.height,
-            &req.cancel,
-        )?;
+        let (t5_emb, clip_emb, heavy, control_latent) = run.encode(|| {
+            let (t5, clip) = self.backbone.encode_text_with_memory_and_progress(
+                &req.prompt,
+                &req.cancel,
+                on_progress,
+            )?;
+            let heavy = self.backbone.load_heavy(&req.cancel)?;
+            let control_latent = self.encode_control_latent(
+                heavy.as_ref(),
+                control_image,
+                req.width,
+                req.height,
+                &req.cancel,
+            )?;
+            Ok::<_, CandleError>((t5, clip, heavy, control_latent))
+        })?;
 
         // candle's get_noise geometry: latent is /8 of a multiple-of-16 request. sc-3673 parity:
         // deterministic, launch-portable CPU-seeded initial noise (shared FLUX.1 helper, sc-9003).
         let lat_h = (req.height as usize).div_ceil(16) * 2;
         let lat_w = (req.width as usize).div_ceil(16) * 2;
-        let noise = flux1_load::seeded_noise(
-            req.seed,
-            LATENT_CHANNELS,
-            lat_h,
-            lat_w,
-            &self.device,
-            self.dtype,
-        )?;
-
-        let state = State::new(&t5_emb, &clip_emb, &noise)?;
-        let timesteps = get_schedule(req.steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)));
-        let guidance = req.guidance as f64;
-
-        // Per-step latent preview (epic 16948, sc-16956), bound to the SAME `(width, height)` the
-        // decode below is given. Both public entry points reach this one body, so `generate` and
-        // `generate_with_injector` cannot diverge on whether the sink is forwarded.
-        let preview = crate::preview::hook(&req.preview, req.width, req.height);
-        let latents = self.denoise(
-            req,
-            &state,
-            &control_latent,
-            &timesteps,
-            guidance,
-            control_scale,
-            injector,
-            heavy.as_ref(),
-            req.seed,
-            &preview,
-            &req.cancel,
+        let images = run.images_with_denoise_phases(
             on_progress,
+            |seed| {
+                flux1_load::seeded_noise(
+                    seed,
+                    LATENT_CHANNELS,
+                    lat_h,
+                    lat_w,
+                    &self.device,
+                    self.dtype,
+                )
+            },
+            |seed, noise, on_progress| {
+                run.begin_denoise_phase(0)?;
+                let state = State::new(&t5_emb, &clip_emb, &noise)?;
+                if state.img.dim(1)? != plan.packed_tokens() {
+                    return Err(CandleError::Msg(
+                        "FLUX.1 ControlNet packed geometry changed after planning".into(),
+                    ));
+                }
+                let preview = crate::preview::hook(&req.preview, req.width, req.height);
+                self.denoise(
+                    req,
+                    &state,
+                    &control_latent,
+                    plan,
+                    &run,
+                    control_scale,
+                    injector,
+                    heavy.as_ref(),
+                    seed,
+                    &preview,
+                    &req.cancel,
+                    on_progress,
+                )
+            },
+            |_, latents, on_progress| {
+                on_progress(Progress::Decoding);
+                self.backbone.decode_with_memory(
+                    heavy.as_ref(),
+                    &latents,
+                    req.height as usize,
+                    req.width as usize,
+                    None,
+                    &req.cancel,
+                )
+            },
         )?;
-        on_progress(Progress::Decoding);
-        // Control lane does not carry a PiD decoder (base txt2img is the shipping PiD path, epic 7840 /
-        // sc-7853); native FLUX VAE decode.
-        self.backbone.decode_with_memory(
-            heavy.as_ref(),
-            &latents,
-            req.height as usize,
-            req.width as usize,
-            None,
-            &req.cancel,
-        )
+        images
+            .into_iter()
+            .next()
+            .ok_or_else(|| CandleError::Msg("FLUX.1 ControlNet plan produced no image".into()))
     }
 
     /// VAE-encode + 2×2-pack the control hint into the packed control latent `[1, seq, 64]` (constant
@@ -402,11 +705,11 @@ impl Flux1DevControl {
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
-        req: &Flux1ControlRequest,
+        _req: &Flux1ControlRequest,
         state: &State,
         control_latent: &Tensor,
-        timesteps: &[f64],
-        guidance: f64,
+        render_plan: &RenderPlan,
+        run: &RenderRun<'_, '_>,
         control_scale: f64,
         injector: Option<&dyn DitImageInjector>,
         heavy: Option<&FluxRefHeavy>,
@@ -417,17 +720,7 @@ impl Flux1DevControl {
     ) -> Result<Tensor> {
         candle_gen::check_cancel(cancel)?;
         let b_sz = state.img.dim(0)?;
-        let guidance_t = Tensor::full(guidance as f32, b_sz, &self.device)?;
-        let native: Vec<f32> = timesteps.iter().map(|&t| t as f32).collect();
-        let mu = flow_mu(Variant::Dev, state.img.dim(1)?);
-        let steps = native.len().saturating_sub(1);
-        let sigmas = candle_gen::resolve_flow_schedule_with_shift(
-            req.scheduler.as_deref(),
-            req.scheduler_shift,
-            mu,
-            steps,
-            &native,
-        )?;
+        let guidance_t = Tensor::full(render_plan.guidance(), b_sz, &self.device)?;
         let prepared = self.backbone.prepare_conditioning(
             heavy,
             &state.img,
@@ -435,10 +728,13 @@ impl Flux1DevControl {
             &state.txt,
             &state.txt_ids,
         )?;
-        candle_gen::run_flow_sampler(
-            req.sampler.as_deref(),
+        candle_gen::run_flow_sampler_spans(
+            Some(render_plan.sampler()),
             TimestepConvention::Sigma,
-            &sigmas,
+            render_plan.denoise_sigmas(),
+            &render_plan.denoise_spans(),
+            Some(run),
+            true,
             state.img.clone(),
             seed,
             cancel,
@@ -493,6 +789,103 @@ impl Flux1DevControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_plan_freezes_source_schedule_and_overlay_without_weights() {
+        let paths = Flux1ControlPaths {
+            flux_base: "/missing/flux-dev".into(),
+            control: "/missing/control.safetensors".into(),
+            adapters: Vec::new(),
+        };
+        let spec = LoadSpec::new(WeightsSource::Dir(paths.flux_base.clone()))
+            .with_control(WeightsSource::File(paths.control.clone()));
+        let req = Flux1ControlRequest {
+            prompt: "a fox".into(),
+            width: 512,
+            height: 512,
+            steps: 4,
+            seed: 11,
+            ..Default::default()
+        };
+        let mut image = Image {
+            width: 16,
+            height: 16,
+            pixels: vec![7; 16 * 16 * 3],
+        };
+        let plan = compile_control_plan(&paths, &spec, &req, &image).unwrap();
+        assert_eq!(plan.denoise_sigmas().len(), 5);
+        assert_eq!(plan.base_seed(), 11);
+        let large = Flux1ControlRequest {
+            width: 2304,
+            height: 1024,
+            ..req.clone()
+        };
+        compile_control_plan(&paths, &spec, &large, &image).unwrap();
+        let overflowing_grid = Flux1ControlRequest {
+            width: 1_048_576,
+            height: 1_048_576,
+            ..req.clone()
+        };
+        let error = compile_control_plan(&paths, &spec, &overflowing_grid, &image)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("packed image grid exceeds"), "{error}");
+        for name in ["flow_match", "flow_match_euler"] {
+            let mut alias = req.clone();
+            alias.sampler = Some(name.into());
+            assert_eq!(
+                compile_control_plan(&paths, &spec, &alias, &image)
+                    .unwrap()
+                    .sampler(),
+                name
+            );
+        }
+        for name in ["native", "flow_match", "flow_match_euler"] {
+            let mut alias = req.clone();
+            alias.scheduler = Some(name.into());
+            assert_eq!(
+                compile_control_plan(&paths, &spec, &alias, &image)
+                    .unwrap()
+                    .denoise_sigmas(),
+                plan.denoise_sigmas()
+            );
+        }
+        for (sampler, scheduler) in [(Some("unknown"), None), (None, Some("unknown"))] {
+            let mut invalid = req.clone();
+            invalid.sampler = sampler.map(str::to_owned);
+            invalid.scheduler = scheduler.map(str::to_owned);
+            assert!(compile_control_plan(&paths, &spec, &invalid, &image).is_err());
+        }
+        crate::memory_strategy::assert_conditioned_plan_trace(&plan, &req.cancel);
+        plan.check_load(&RenderLoadBinding::from_spec(&spec))
+            .unwrap();
+        image.pixels[0] ^= 1;
+        assert!(plan
+            .check_request(
+                &control_descriptor(),
+                &typed_control_request(&req, &image).unwrap()
+            )
+            .is_err());
+        let mut changed = spec.clone();
+        changed.control = Some(WeightsSource::File("/different/control".into()));
+        assert!(plan
+            .check_load(&RenderLoadBinding::from_spec(&changed))
+            .is_err());
+        let bad = Flux1ControlRequest {
+            control_kind: "other".into(),
+            ..req.clone()
+        };
+        assert!(compile_control_plan(&paths, &spec, &bad, &image).is_err());
+        let mut missing_overlay = spec.clone();
+        missing_overlay.control = None;
+        assert!(compile_control_plan(&paths, &missing_overlay, &req, &image).is_err());
+        let mut invalid = req.clone();
+        invalid.steps = 0;
+        assert!(compile_control_plan(&paths, &spec, &invalid, &image).is_err());
+        invalid.steps = req.steps;
+        invalid.width = 513;
+        assert!(compile_control_plan(&paths, &spec, &invalid, &image).is_err());
+    }
 
     /// The request defaults match the dev control production knobs (1024², 25 steps, guidance 3.5, pose).
     /// `control_scale` defaults to `None` (absent) — resolved to [`DEFAULT_CONTROL_SCALE`] at generate

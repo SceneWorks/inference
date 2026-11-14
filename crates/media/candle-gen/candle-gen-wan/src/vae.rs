@@ -73,6 +73,9 @@ pub(crate) fn candle_error(error: CandleError) -> candle_gen::candle_core::Error
         }
         // Compatibility wrappers use a fresh, never-cancelled flag, so this arm is defensive only.
         CandleError::Canceled => candle_gen::candle_core::Error::Msg("cancelled".into()),
+        // This legacy Candle-result API cannot represent typed process poison. Stop before any
+        // GPU stack unwinds instead of erasing the fatal signal into a recoverable message.
+        CandleError::ProcessPoisoned(_) => std::process::abort(),
     }
 }
 
@@ -1373,6 +1376,33 @@ mod budget_tests {
         assert!(message.contains("requested geometry is not feasible"));
         assert!(message.contains("1536x1024"));
         assert!(message.contains("verified alternative: None"));
+    }
+
+    #[test]
+    fn compatibility_error_bridge_aborts_on_process_poison() {
+        const CHILD: &str = "SCENEWORKS_WAN_POISON_BRIDGE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let _ = candle_error(CandleError::ProcessPoisoned("device context lost".into()));
+            std::process::exit(101);
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "vae::budget_tests::compatibility_error_bridge_aborts_on_process_poison",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(6), "expected SIGABRT, got {status}");
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(!status.success());
+            assert_ne!(status.code(), Some(101), "the bridge returned or panicked");
+        }
     }
 
     #[test]

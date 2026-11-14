@@ -5,6 +5,7 @@ use super::*;
 /// An immutable, explicit catalog of generative-media providers.
 pub struct ProviderRegistry {
     pub(super) generators: Box<[ModelRegistration]>,
+    pub(super) render_plans: Box<[crate::RenderPlanRegistration]>,
     pub(super) checkpoint_adapters: Box<[CheckpointAdapterRegistration]>,
     pub(super) checkpoint_codecs: CheckpointCodecRegistry,
     pub(super) imported_models: Box<[ImportedModelRegistration]>,
@@ -56,6 +57,39 @@ macro_rules! explicit_registry_kind {
 }
 
 impl ProviderRegistry {
+    /// Compile before calling the provider factory. Unmigrated routes have no plan.
+    pub fn compile_render_plan(
+        &self,
+        id: &str,
+        spec: &LoadSpec,
+        request: &crate::GenerationRequest,
+    ) -> Result<Option<crate::RenderPlan>> {
+        let Some(planner) = self
+            .render_plans
+            .iter()
+            .find(|entry| entry.provider_id == id)
+        else {
+            return Ok(None);
+        };
+        self.ensure_quant_supported(id, spec, "generator")?;
+        Ok((planner.compile)(spec, request)?.map(|plan| plan.bind_load(spec)))
+    }
+
+    /// Compile an ordered multi-pass request (Hires.fix: a base pass, then a pass whose reference
+    /// is the base output resized to its declared size) before calling the provider factory. Each
+    /// pass goes through the provider's own single-pass compiler, so every pass is refused or
+    /// accepted before load exactly as a single-pass request would be.
+    pub fn compile_multi_pass_render_plan(
+        &self,
+        id: &str,
+        spec: &LoadSpec,
+        passes: &[crate::PlannedPassRequest<'_>],
+    ) -> Result<Option<crate::MultiPassRenderPlan>> {
+        crate::MultiPassRenderPlan::compile(passes, |request| {
+            self.compile_render_plan(id, spec, request)
+        })
+    }
+
     /// Every validated portable family checkpoint adapter in this platform catalog.
     pub fn checkpoint_adapters(
         &self,

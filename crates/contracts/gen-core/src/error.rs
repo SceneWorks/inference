@@ -33,6 +33,13 @@ pub enum Error {
     #[error("cancelled")]
     Canceled,
 
+    /// The provider has identified an unrecoverable process-local backend state. The worker must
+    /// retire its generator owner after this request; ordinary backend failures must not use it.
+    /// A provider emitting this must contain or forget its own GPU-backed locals before return:
+    /// the shared residency owner can protect only components it still owns at that boundary.
+    #[error("process poisoned: {0}")]
+    ProcessPoisoned(String),
+
     /// The requested output geometry was measured infeasible before render. `alternative` is present
     /// only when a current evidence record verifies that exact geometry; callers must never populate
     /// it from an estimate or tier heuristic.
@@ -110,6 +117,10 @@ mod tests {
         .to_string()
         .contains("requested 1024x768"));
         assert_eq!(Error::Msg("boom".into()).to_string(), "boom");
+        assert_eq!(
+            Error::ProcessPoisoned("device context lost".into()).to_string(),
+            "process poisoned: device context lost"
+        );
     }
 
     #[test]

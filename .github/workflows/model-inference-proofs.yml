@@ -10,10 +10,23 @@ on:
         required: true
         default: mlx
         options: [mlx, candle-cpu, candle-metal, candle-cuda]
+      flux1_pair:
+        description: Compare the FLUX.1 batch against its pre-migration source in this same job
+        type: choice
+        options: [none, tier1, tier2, conditional-tier1]
+        default: none
       request:
         description: 'JSON with registered selection and explicit supervisor policy; optional runner="nax" for provisioned assets'
         type: string
         required: true
+      stage_pinned_assets:
+        description: 'Asset inventory only: first fetch every product-pinned file the inventory reports missing, off-pin or incomplete into the runner Hub cache (stdlib HTTPS; never overwrites; setup, no model load)'
+        type: boolean
+        default: false
+
+env:
+  FLUX1_PAIR_TIER: ${{ inputs.flux1_pair }}
+  MODEL_PROOF_SCRIPT: ${{ inputs.flux1_pair == 'none' && fromJSON(inputs.request).selection == 'flux1-asset-inventory' && 'flux1_conditional_asset_inventory.py' || inputs.flux1_pair == 'conditional-tier1' && 'flux1_conditional_comparison.py' || (inputs.flux1_pair == 'tier1' || inputs.flux1_pair == 'tier2') && 'flux1_comparison.py' || 'model_inference_proofs.py' }}
 
 permissions:
   contents: read
@@ -51,7 +64,7 @@ jobs:
           MODEL_PROOF_BACKEND: ${{ inputs.backend }}
           MODEL_PROOF_REQUEST: ${{ inputs.request }}
         run: |
-          "$REVIEWED_PYTHON" -I scripts/ci/model_inference_proofs.py --plan \
+          "$REVIEWED_PYTHON" -I "scripts/ci/$MODEL_PROOF_SCRIPT" --plan \
             --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
             --expected-sha "$GITHUB_SHA" > "$RUNNER_TEMP/model-proof-plan.json"
           "$REVIEWED_PYTHON" -I -c 'import json,os; p=json.load(open(os.path.join(os.environ["RUNNER_TEMP"],"model-proof-plan.json"),encoding="utf-8")); matrix={"include":[{"runner":p["runner"],"asset_setup":p["asset_setup"]}]}; open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8").write("matrix="+json.dumps(matrix,separators=(",",":"))+"\n")'
@@ -59,6 +72,7 @@ jobs:
   prove:
     name: Explicit ${{ inputs.backend }} model tests
     needs: plan
+    if: ${{ fromJSON(inputs.request).selection != 'flux1-asset-inventory' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     strategy:
@@ -66,6 +80,7 @@ jobs:
       max-parallel: 1
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
+      FLUX1_HUB: ${{ inputs.backend == 'mlx' && vars.MLX_GEN_MODELS_ROOT || vars.CANDLE_GEN_MODELS_ROOT }}
       MODEL_PROOF_BACKEND: ${{ inputs.backend }}
       MODEL_PROOF_REQUEST: ${{ inputs.request }}
       MACOSX_DEPLOYMENT_TARGET: '15.0'
@@ -82,6 +97,13 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check out the exact pre-migration engine for the paired proof
+        if: matrix.asset_setup == 'flux1-comparison'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: 2b09938e33370915d4f853389961709b8bbf8bf9
+          path: flux1-baseline
           persist-credentials: false
       - name: Select Git Bash on Windows
         if: runner.os == 'Windows'
@@ -204,7 +226,7 @@ jobs:
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; else PYTHON="$REVIEWED_PYTHON"; fi
-          "$PYTHON" -I scripts/ci/model_inference_proofs.py \
+          "$PYTHON" -I "scripts/ci/$MODEL_PROOF_SCRIPT" \
             --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
             --expected-sha "$GITHUB_SHA" --output "$MODEL_PROOF_EVIDENCE"
       - name: Run exact registered model tests under external guards (Windows CUDA)
@@ -218,14 +240,14 @@ jobs:
             exit /b 1
           )
           set "RUSTC_WRAPPER="
-          "%REVIEWED_PYTHON%" -I scripts\ci\model_inference_proofs.py --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%MODEL_PROOF_EVIDENCE%"
+          "%REVIEWED_PYTHON%" -I "scripts\ci\%MODEL_PROOF_SCRIPT%" --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%MODEL_PROOF_EVIDENCE%"
       - name: Validate owned evidence tree before any upload
         id: evidence
         if: always()
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == macOS ]]; then PYTHON=python3.12; elif [[ "$RUNNER_OS" == Windows ]]; then PYTHON="$REVIEWED_PYTHON"; else PYTHON="$REVIEWED_PYTHON"; fi
-          "$PYTHON" -I scripts/ci/model_inference_proofs.py --verify-artifacts \
+          "$PYTHON" -I "scripts/ci/$MODEL_PROOF_SCRIPT" --verify-artifacts \
             --backend "$MODEL_PROOF_BACKEND" --request-env MODEL_PROOF_REQUEST \
             --expected-sha "$GITHUB_SHA" --output "$MODEL_PROOF_EVIDENCE"
       - name: Upload exact case evidence, safe generated outputs, logs and summary
@@ -234,4 +256,66 @@ jobs:
         with:
           name: model-proof-${{ github.sha }}-${{ inputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.MODEL_PROOF_EVIDENCE }}
+          if-no-files-found: error
+
+  inventory:
+    name: Manual CPU-only FLUX.1 asset inventory
+    needs: plan
+    if: ${{ fromJSON(inputs.request).selection == 'flux1-asset-inventory' }}
+    runs-on: ${{ matrix.runner }}
+    # Staging pinned assets downloads up to ~15 GB before the inventory runs.
+    timeout-minutes: ${{ inputs.stage_pinned_assets && 90 || 30 }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      # Always non-empty: an empty variable is undefined in cmd, where %STAGE_FLAG% would stay literal.
+      STAGE_FLAG: ${{ inputs.stage_pinned_assets && '--stage-pinned-assets' || '--no-stage-pinned-assets' }}
+      FLUX1_HUB: ${{ inputs.backend == 'mlx' && vars.MLX_GEN_MODELS_ROOT || vars.CANDLE_GEN_MODELS_ROOT }}
+      INVENTORY_RUNNER: ${{ fromJSON(inputs.request).runner }}
+      MODEL_PROOF_REQUEST: ${{ inputs.request }}
+      FLUX1_PAIR_TIER: ${{ inputs.flux1_pair }}
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Require exact selected macOS runner before scanning
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [[ "$RUNNER_NAME" != "$INVENTORY_RUNNER" ]]; then
+            echo "::error::Selected runner differs from actual runner"
+            exit 1
+          fi
+      - name: Require exact selected Windows runner before scanning
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          if not "%RUNNER_NAME%"=="%INVENTORY_RUNNER%" (
+            echo ::error::Selected runner differs from actual runner
+            exit /b 1
+          )
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require existing reviewed CPython 3.12 on Windows (no provisioning)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: call scripts\ci\real-weights\moss-edit-cuda\locate-existing-reviewed-python-without-installation.cmd
+      - name: Inventory installed assets on macOS (no model load)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          INVENTORY_OUTPUT: ${{ runner.temp }}/flux1-conditional-asset-inventory.json
+        run: python3.12 -u -I scripts/ci/flux1_conditional_asset_inventory.py "$STAGE_FLAG" --backend mlx --request-env MODEL_PROOF_REQUEST --expected-sha "$GITHUB_SHA" --output "$INVENTORY_OUTPUT"
+      - name: Inventory installed assets on Windows (no model load)
+        if: runner.os == 'Windows'
+        shell: cmd
+        env:
+          INVENTORY_OUTPUT: ${{ runner.temp }}/flux1-conditional-asset-inventory.json
+        run: '"%REVIEWED_PYTHON%" -u -I scripts\ci\flux1_conditional_asset_inventory.py %STAGE_FLAG% --backend candle-cuda --request-env MODEL_PROOF_REQUEST --expected-sha "%GITHUB_SHA%" --output "%INVENTORY_OUTPUT%"'
+      - name: Upload candidate paths and hashes only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flux1-conditional-asset-inventory-${{ inputs.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/flux1-conditional-asset-inventory.json
           if-no-files-found: error
