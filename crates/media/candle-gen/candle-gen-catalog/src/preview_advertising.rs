@@ -189,6 +189,7 @@ const PREVIEW_ROUTE_IDS: &[&str] = &[
     "krea_2_raw",
     "krea_2_edit",
     "krea_2_turbo_edit",
+    "krea_2_turbo_control",
     "qwen_image",
     "anima_base",
     "anima_aesthetic",

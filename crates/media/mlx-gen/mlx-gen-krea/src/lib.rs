@@ -3,7 +3,7 @@
 //! The **Krea 2** provider crate for [`mlx-gen`](mlx_gen). Krea 2 is Krea AI's first from-scratch
 //! foundation image model (released 2026-06-22). Two surfaces share **one architecture**:
 //! - **Krea 2 Turbo** (`krea_2_turbo`) — the user-facing text-to-image model (TDM-distilled few-step,
-//!   CFG-free, 8 steps, up to 2048²),
+//!   CFG-free, 8 steps, up to 4096 pixels per side including img2img refinement),
 //! - **Krea 2 Raw** (`krea_2_raw`) — the undistilled base. Both a **generation model** (full-CFG
 //!   text-to-image: real guidance + a user negative prompt, 52 steps, resolution-dynamic mu — epic
 //!   9992) AND the **LoRA-training base** (LoRAs train on Raw and apply at Turbo inference, the Lens /

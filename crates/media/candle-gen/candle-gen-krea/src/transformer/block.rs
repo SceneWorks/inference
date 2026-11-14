@@ -416,7 +416,7 @@ impl SwiGlu {
         Ok(())
     }
 
-    fn quantize_onto(
+    pub(crate) fn quantize_onto(
         &mut self,
         quant: candle_gen::gen_core::Quant,
         device: &candle_gen::candle_core::Device,

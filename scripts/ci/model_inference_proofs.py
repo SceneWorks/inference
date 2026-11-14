@@ -1739,6 +1739,10 @@ def main() -> int:
                 asset_setup = 'cohort-training'
             if bespoke_training_bindings(rows, args.backend) is not None:
                 asset_setup = 'bespoke-training'
+            if (args.backend == 'candle-cuda' and len(rows) == 1
+                    and rows[0]['package'] == 'candle-gen-krea'
+                    and rows[0]['fqn'] == 'imported_cuda_smoke::imported_native_nvfp4_krea_renders_strict_pose'):
+                asset_setup = 'krea-native-nvfp4-pose'
             plan = {'runner': runner, 'asset_setup': asset_setup, 'backend': args.backend, 'request': value, 'selected': len(rows),
                     'bindings': [identity(row) for row in rows]}
             configured = {identity(row): row['selected_configuration'] for row in rows if 'selected_configuration' in row}

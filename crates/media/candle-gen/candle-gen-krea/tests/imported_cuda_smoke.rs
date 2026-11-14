@@ -164,3 +164,69 @@ fn imported_native_krea_adapter_renders_strict_pose() {
     #[cfg(feature = "model-inference-proof")]
     println!("\nMODEL_INFERENCE_BODY_COMPLETED imported_cuda_smoke::imported_native_krea_adapter_renders_strict_pose");
 }
+
+/// Native NVFP4 must stay on its actual packed execution path while the pose branch changes output.
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn imported_native_nvfp4_krea_renders_strict_pose() {
+    let pose = read_image(&env_path("KREA_IMPORTED_POSE_IMAGE"));
+    let native = env_path("KREA_IMPORTED_DIT");
+    let base = env_path("KREA_BASE_SNAPSHOT");
+    let control = env_path("KREA_CONTROL_BRANCH");
+    let output = env_path("MODEL_PROOF_OUTPUT_DIR");
+    std::fs::create_dir_all(&output).unwrap();
+    let model = candle_gen_krea::load_control_from_native_dit_file(&native, &base, &control, &[])
+        .expect("native NVFP4 strict-pose model loads");
+    let mut request = Krea2ControlRequest {
+        prompt: "full body photograph of a dancer in a red jacket, studio lighting".into(),
+        width: pose.width,
+        height: pose.height,
+        steps: 8,
+        seed: 11,
+        control_scale: 0.0,
+        ..Default::default()
+    };
+    let uncontrolled = model
+        .generate(&request, &pose, &mut |_| {})
+        .expect("uncontrolled native render");
+    let report = model
+        .nvfp4_report()
+        .unwrap()
+        .expect("resident projection report");
+    assert!(
+        report.n_quantized > 0 && report.fp4_lit > 0,
+        "native FP4 execution is required: {report:?}"
+    );
+    request.control_scale = 0.6;
+    let controlled = model
+        .generate(&request, &pose, &mut |_| {})
+        .expect("pose-controlled native render");
+    assert_eq!(
+        (controlled.width, controlled.height),
+        (pose.width, pose.height)
+    );
+    assert_eq!(
+        controlled.pixels.len(),
+        (pose.width * pose.height * 3) as usize
+    );
+    assert_ne!(
+        uncontrolled.pixels, controlled.pixels,
+        "the control branch must affect native NVFP4 output"
+    );
+    for (name, image) in [
+        ("without-control.png", uncontrolled),
+        ("pose-control.png", controlled),
+    ] {
+        image::save_buffer(
+            output.join(name),
+            &image.pixels,
+            image.width,
+            image.height,
+            image::ColorType::Rgb8,
+        )
+        .unwrap();
+    }
+    println!("NATIVE_NVFP4_POSE_REPORT {report:?}");
+    #[cfg(feature = "model-inference-proof")]
+    println!("MODEL_INFERENCE_BODY_COMPLETED imported_cuda_smoke::imported_native_nvfp4_krea_renders_strict_pose");
+}

@@ -166,6 +166,95 @@ fn render(width: u32, height: u32) {
     );
 }
 
+/// Reproduce the Hires.fix request that previously failed at the provider's 2048px ceiling.
+/// KREA_IMPORTED_DIT optionally selects a caller-owned transformer with KREA_TURBO_DIR as its
+/// companion snapshot; otherwise exercise the same provider with the turnkey weights.
+#[test]
+#[ignore = "model inference; explicit model-proof workflow"]
+fn turbo_hires_fix_renders_4096x2816() {
+    use candle_gen::gen_core::Conditioning;
+
+    let root = snapshot().expect("set KREA_TURBO_DIR");
+    let generator = if let Some(native) = std::env::var_os("KREA_IMPORTED_DIT") {
+        candle_gen_krea::load_from_native_dit_file(
+            std::path::PathBuf::from(native),
+            &root,
+            &[],
+            candle_gen_krea::descriptor(),
+        )
+        .expect("load imported Krea transformer")
+    } else {
+        candle_gen_krea::provider_registry()
+            .unwrap()
+            .load("krea_2_turbo", &LoadSpec::new(WeightsSource::Dir(root)))
+            .expect("load Krea Turbo")
+    };
+    let base_request = GenerationRequest {
+        prompt: PROMPT.into(),
+        width: 2048,
+        height: 1408,
+        seed: Some(42),
+        steps: Some(8),
+        ..Default::default()
+    };
+    let GenerationOutput::Images(mut base) = generator
+        .generate(&base_request, &mut |progress| {
+            eprintln!("base: {progress:?}")
+        })
+        .expect("generate the first pass")
+    else {
+        panic!("expected first-pass image")
+    };
+    assert_eq!(base.len(), 1);
+    let base = base.pop().unwrap();
+    assert_eq!((base.width, base.height), (2048, 1408));
+    save(&base, "hires_base_2048x1408");
+    let rgb = image::RgbImage::from_raw(base.width, base.height, base.pixels).unwrap();
+    let reference =
+        image::imageops::resize(&rgb, 4096, 2816, image::imageops::FilterType::Lanczos3);
+    let request = GenerationRequest {
+        width: 4096,
+        height: 2816,
+        conditioning: vec![Conditioning::Reference {
+            image: Image {
+                width: 4096,
+                height: 2816,
+                pixels: reference.into_raw(),
+            },
+            strength: Some(0.3),
+        }],
+        ..base_request
+    };
+    let GenerationOutput::Images(images) = generator
+        .generate(&request, &mut |progress| eprintln!("hires: {progress:?}"))
+        .expect("generate the 4K img2img refinement")
+    else {
+        panic!("expected refined image")
+    };
+    assert_eq!(images.len(), 1);
+    let image = &images[0];
+    assert_eq!((image.width, image.height), (4096, 2816));
+    assert_eq!(image.pixels.len(), 4096 * 2816 * 3);
+    let Conditioning::Reference { image: source, .. } = &request.conditioning[0] else {
+        unreachable!()
+    };
+    assert!(
+        image.pixels != source.pixels,
+        "the second pass must refine the upscaled image"
+    );
+    save(image, "hires_final_4096x2816");
+    assert!(
+        is_coherent(image),
+        "refinement must produce a coherent image"
+    );
+    assert!(longest_flat_row_run(&image.pixels, image.width, image.height) < 128);
+
+    #[cfg(feature = "model-inference-proof")]
+    println!(
+        "\nMODEL_INFERENCE_BODY_COMPLETED e2e_real_weights::turbo_hires_fix_renders_4096x2816"
+    );
+}
+
 #[test]
 #[ignore = "needs the real Krea 2 Turbo snapshot (set KREA_TURBO_DIR)"]
 fn turbo_engine_renders_coherent_1024() {
