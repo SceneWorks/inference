@@ -326,7 +326,7 @@ impl Generator for PulidFlux {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -345,6 +345,41 @@ impl Generator for PulidFlux {
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
         crate::memory_strategy::begin_request(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "PulidFlux.load_precision_policy",
+                    &self.loaded_spec.precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "PulidFlux.load_quantization_policy",
+                    &self.loaded_spec.quantize,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl PulidFlux {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
 
@@ -371,6 +406,7 @@ impl PulidFlux {
             return Err(Error::Canceled);
         }
         let (image, id_weight) = self.reference_face(req)?;
+        mlx_gen::image_execution::scalar("pulid.identity_weight", id_weight);
         let id_embedding = self.compute_id_embedding(
             &image.pixels,
             image.height as usize,
@@ -407,6 +443,7 @@ impl PulidFlux {
             return Err(Error::Canceled);
         }
         let true_cfg = req.true_cfg.unwrap_or(1.0);
+        mlx_gen::image_execution::scalar("pulid.true_cfg", true_cfg);
         let result = if true_cfg > 1.0 + 1e-3 {
             // Real-CFG (sc-3075): positive (id) + negative (uncond id) branches + a negative prompt.
             let pos = mk_ca(id_embedding)?;

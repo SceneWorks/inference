@@ -623,6 +623,36 @@ impl Ideogram4Heavy {
             });
         }
 
+        mlx_gen::image_execution::sampled_native_with_rng(
+            "ideogram-euler-v4",
+            "clean-fraction",
+            z.dtype(),
+            &preview_sigmas,
+            seed,
+            "mlx-keyed-normal-f32-v1;initial=output-seed;no-step-draws",
+        );
+        let consumed_f64: Vec<_> = (run_from..=num_run)
+            .rev()
+            .map(|step| schedule.eval(si[step]))
+            .collect();
+        mlx_gen::image_execution::choice(
+            "ideogram.f64_schedule",
+            mlx_gen::gen_core::generator::ExecutionFact::resolved(
+                serde_json::to_value(
+                    mlx_gen::gen_core::generator::NumericScheduleDigest::f64_values(&consumed_f64)
+                        .map_err(|error| Error::Msg(error.to_string()))?,
+                )
+                .map_err(|error| Error::Msg(error.to_string()))?,
+            ),
+        );
+        mlx_gen::image_execution::scalar("ideogram.guidance", guidance);
+        mlx_gen::image_execution::policy_debug("ideogram.cfg_active", &neg.is_some());
+        mlx_gen::image_execution::policy_debug("ideogram.polish_steps", &POLISH_STEPS);
+        mlx_gen::image_execution::scalar("ideogram.polish_guidance", POLISH_GUIDANCE);
+        mlx_gen::image_execution::policy_debug(
+            "ideogram.mask_blend",
+            &edit.is_some_and(|edit| edit.mask.is_some()),
+        );
         on_progress(Progress::Decoding);
         self.decode(&z, grid_h, grid_w, pid)
     }

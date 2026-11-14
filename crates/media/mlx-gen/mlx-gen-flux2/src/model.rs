@@ -986,19 +986,7 @@ impl Generator for Flux2 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
-        let snapshot_root = match &self.loaded_spec.weights {
-            WeightsSource::Dir(root) | WeightsSource::File(root) => root.as_path(),
-        };
-        mlx_gen::sc20686::observe_generation(
-            snapshot_root,
-            &req.cancel,
-            self.descriptor.id,
-            || mlx_gen::sc20686::RequestFacts::from_request(req),
-            on_progress,
-            |on_progress| self.generate_impl(req, on_progress),
-        )
-        .map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -1062,6 +1050,61 @@ impl Generator for Flux2 {
             return crate::memory_strategy::begin_dev_request(contract, context, expected_tier);
         }
         crate::memory_strategy::begin_klein_request(&self.loaded_spec, contract, context)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "Flux2.memory_numeric_tier",
+                    &self.memory_numeric_tier,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux2.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux2.load_precision_policy",
+                    &self.loaded_spec.precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux2.load_quantization_policy",
+                    &self.loaded_spec.quantize,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl Flux2 {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
+        let snapshot_root = match &self.loaded_spec.weights {
+            WeightsSource::Dir(root) | WeightsSource::File(root) => root.as_path(),
+        };
+        mlx_gen::sc20686::observe_generation(
+            snapshot_root,
+            &req.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(req),
+            on_progress,
+            |on_progress| self.generate_impl(req, on_progress),
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -1147,6 +1190,7 @@ impl Flux2 {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let transformer_window = request_transformer_window(self.variant, &self.loaded_spec, req)?;
+        mlx_gen::image_execution::policy_debug("flux2.transformer_window", &transformer_window);
         // Resolve an omitted seed exactly once, then share it with both the autoregressive caption
         // sampler and diffusion. Calling `default_seed` independently in those phases makes a
         // request irreproducible and lets its provenance name only one of two actual seeds.
@@ -1165,6 +1209,7 @@ impl Flux2 {
         }
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
         let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
+        mlx_gen::image_execution::scalar("flux2.guidance", guidance);
 
         // Request-selected staging (or the Sequential load default) loads the text encoder
         // (+ dev vision tower/projector), runs any caption upsample + the prompt encode, materializes,
@@ -1251,6 +1296,7 @@ impl Flux2 {
         let vae = &heavy.vae;
         let cond = self.prepare_conditioning(vae, req, request.steps)?;
         let mem = self.memory_config(&prompt_embeds, &cond, req);
+        mlx_gen::image_execution::policy_debug("flux2.resolved_memory", &mem);
         let render = Flux2Render {
             model: self,
             transformer: &heavy.transformer,
@@ -1294,6 +1340,9 @@ impl Flux2 {
             capture_sigma,
         )?;
         let img_guidance = image_guidance(req, cond.reference.is_some());
+        if let Some(scale) = img_guidance {
+            mlx_gen::image_execution::scalar("flux2.image_guidance", scale);
+        }
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {

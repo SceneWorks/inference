@@ -489,58 +489,7 @@ impl Generator for Flux1 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        // Validate up front so an invalid request (bad dims/steps) fails fast, before the reference
-        // image (and the black-image CFG branch) is encoded — the deeper `run_denoise` validation
-        // would otherwise reject only after that work (L-validate-first).
-        self.validate(req)?;
-        // F-108: cheap pre-check so an already-cancelled request bails before the IP-adapter
-        // reference encode + the T5-XXL/CLIP prompt encodes (all pre-denoise, uncancellable today).
-        if req.cancel.is_cancelled() {
-            return Err(Error::Canceled.into());
-        }
-        // Reference-image (XLabs IP-Adapter) path, epic 3621. `validate` has confirmed at most one
-        // `Reference`; extract it here.
-        if let Some((image, strength)) = single_reference(req)? {
-            let (encoder, adapter) = self.ip_adapter.as_ref().ok_or_else(|| {
-                Error::Msg(format!(
-                    "{}: a reference image needs an IP-adapter — load it via LoadSpec::with_ip_adapter",
-                    self.descriptor.id
-                ))
-            })?;
-            let embeds = encoder.encode(image)?;
-            let scale = strength.unwrap_or(DEFAULT_IP_SCALE).clamp(0.0, 1.0);
-            let pos = FluxIpInjector::new(adapter, &embeds, scale)?;
-            // dev + an explicit `true_cfg` → real CFG against `negative_prompt`, image prompt only on
-            // the positive branch (diffusers' Flux IP `true_cfg_scale`). Otherwise the single distilled
-            // forward (schnell always; dev without true_cfg).
-            return match req.true_cfg {
-                Some(cfg) if self.variant.supports_guidance() => {
-                    // Match diffusers' Flux true-CFG IP: the negative branch conditions on a BLACK
-                    // image (zeros), NOT "no IP" — `FluxPipeline` sets `negative_ip_adapter_image =
-                    // np.zeros(...)` when unset. CFG then amplifies the reference-specific signal
-                    // (ref − blank), sharpening resemblance instead of the whole IP term. The size is
-                    // arbitrary (CLIP resizes to 224²), so `encode_black` names the zeros contract.
-                    let black_embeds = encoder.encode_black()?;
-                    let neg = FluxIpInjector::new(adapter, &black_embeds, scale)?;
-                    let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
-                    self.generate_with_injector_cfg(
-                        req,
-                        &pos,
-                        &neg,
-                        neg_prompt,
-                        cfg.clamp(TRUE_CFG_MIN, TRUE_CFG_MAX),
-                        0,
-                        on_progress,
-                    )
-                    .map_err(Into::into)
-                }
-                _ => self
-                    .generate_with_injector(req, Some(&pos), on_progress)
-                    .map_err(Into::into),
-            };
-        }
-        self.generate_with_injector(req, None, on_progress)
-            .map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -579,6 +528,97 @@ impl Generator for Flux1 {
             context,
         )
     }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "Flux1.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux1.load_precision_policy",
+                    &self.loaded_spec.precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux1.load_quantization_policy",
+                    &self.loaded_spec.quantize,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl Flux1 {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        // Validate up front so an invalid request (bad dims/steps) fails fast, before the reference
+        // image (and the black-image CFG branch) is encoded — the deeper `run_denoise` validation
+        // would otherwise reject only after that work (L-validate-first).
+        self.validate(req)?;
+        // F-108: cheap pre-check so an already-cancelled request bails before the IP-adapter
+        // reference encode + the T5-XXL/CLIP prompt encodes (all pre-denoise, uncancellable today).
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled.into());
+        }
+        // Reference-image (XLabs IP-Adapter) path, epic 3621. `validate` has confirmed at most one
+        // `Reference`; extract it here.
+        if let Some((image, strength)) = single_reference(req)? {
+            let (encoder, adapter) = self.ip_adapter.as_ref().ok_or_else(|| {
+                Error::Msg(format!(
+                    "{}: a reference image needs an IP-adapter — load it via LoadSpec::with_ip_adapter",
+                    self.descriptor.id
+                ))
+            })?;
+            let embeds = encoder.encode(image)?;
+            let scale = strength.unwrap_or(DEFAULT_IP_SCALE).clamp(0.0, 1.0);
+            mlx_gen::image_execution::scalar("flux.ip_scale", scale);
+            let pos = FluxIpInjector::new(adapter, &embeds, scale)?;
+            // dev + an explicit `true_cfg` → real CFG against `negative_prompt`, image prompt only on
+            // the positive branch (diffusers' Flux IP `true_cfg_scale`). Otherwise the single distilled
+            // forward (schnell always; dev without true_cfg).
+            return match req.true_cfg {
+                Some(cfg) if self.variant.supports_guidance() => {
+                    // Match diffusers' Flux true-CFG IP: the negative branch conditions on a BLACK
+                    // image (zeros), NOT "no IP" — `FluxPipeline` sets `negative_ip_adapter_image =
+                    // np.zeros(...)` when unset. CFG then amplifies the reference-specific signal
+                    // (ref − blank), sharpening resemblance instead of the whole IP term. The size is
+                    // arbitrary (CLIP resizes to 224²), so `encode_black` names the zeros contract.
+                    let black_embeds = encoder.encode_black()?;
+                    let neg = FluxIpInjector::new(adapter, &black_embeds, scale)?;
+                    let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
+                    self.generate_with_injector_cfg(
+                        req,
+                        &pos,
+                        &neg,
+                        neg_prompt,
+                        cfg.clamp(TRUE_CFG_MIN, TRUE_CFG_MAX),
+                        0,
+                        on_progress,
+                    )
+                    .map_err(Into::into)
+                }
+                _ => self
+                    .generate_with_injector(req, Some(&pos), on_progress)
+                    .map_err(Into::into),
+            };
+        }
+        self.generate_with_injector(req, None, on_progress)
+            .map_err(Into::into)
+    }
 }
 
 /// Extract the single reference image + its optional `strength` (`ip_adapter_scale`) from a request,
@@ -606,8 +646,10 @@ impl Flux1 {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let transformer_window = self.requested_transformer_window(req, injector)?;
+        mlx_gen::image_execution::policy_debug("flux.transformer_window", &transformer_window);
         let streamable = transformer_window.is_some();
         let stage_residency = matches!(self.loaded_spec.offload_policy, OffloadPolicy::Sequential);
+        mlx_gen::image_execution::policy_debug("flux.stage_residency", &stage_residency);
         // Staged residency lifecycle (sc-10840): under `Sequential` the seam loads the T5 + CLIP
         // encoders, encodes the prompt, materializes, then DROPS them + `clear_cache()` before the
         // DiT/VAE load — the peak-bounding win. Under `Resident` it borrows the warm encoders and runs
@@ -690,6 +732,9 @@ impl Flux1 {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let transformer_window = self.requested_transformer_window(req, Some(pos_injector))?;
+        mlx_gen::image_execution::scalar("flux.true_cfg", true_cfg);
+        mlx_gen::image_execution::policy_debug("flux.true_cfg_start", &timestep_to_start_cfg);
+        mlx_gen::image_execution::policy_debug("flux.transformer_window", &transformer_window);
         let streamable = transformer_window.is_some();
         // Staged residency lifecycle (sc-10840): the phase-A encode covers BOTH the positive and
         // negative prompts, so both text encoders drop together before the DiT load under `Sequential`.
@@ -806,6 +851,7 @@ impl Flux1 {
         } else {
             0.0
         };
+        mlx_gen::image_execution::scalar("flux.embedded_guidance", guidance);
         // The FLUX diffusion path is MIXED precision, matching the mflux reference (sc-2787): the
         // latents (`create_noise` → f32) and the main residual stream stay f32; only the CLIP pooled
         // embedding + the time/text/guidance conditioning run bf16 (in the encoders / `TimeTextEmbed`).
@@ -937,6 +983,8 @@ fn decode_latents_via_seam(
     native_tiling: Option<&mlx_gen::TilingConfig>,
     cancel: &mlx_gen::CancelFlag,
 ) -> Result<Array> {
+    mlx_gen::image_execution::policy_debug("flux.native_decode_tiling", &native_tiling);
+    mlx_gen::image_execution::policy_debug("flux.decode_override", &decoder_override.is_some());
     let decoder = decoder_override.unwrap_or(native);
     mlx_gen::ensure_decoder_compatible(expected_latent_space, decoder)?;
     let decoded = match native_tiling {

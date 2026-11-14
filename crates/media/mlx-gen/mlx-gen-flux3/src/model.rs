@@ -813,13 +813,60 @@ impl Generator for Flux3Klein {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_with_report_observed(req, on_progress)
+        })
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "Flux3Klein.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux3Klein.load_precision_policy",
+                    &self.spec.precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux3Klein.load_quantization_policy",
+                    &self.spec.quantize,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_with_report_observed(req, &mut progress)
+            },
+        )
+    }
+}
+
+impl Flux3Klein {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
         let report = self.generate_impl(req, on_progress)?;
         report
             .output
             .ok_or_else(|| gen_core::Error::Msg("flux3: the render produced no output".into()))
     }
-
-    fn generate_with_report(
+    fn generate_with_report_observed(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),

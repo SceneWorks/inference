@@ -614,6 +614,57 @@ impl Generator for QwenImage21 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
+    }
+
+    /// The render plus which prefix-KV-cache path it ran and the bytes its caches held
+    /// (`GenerationReport::prefix_kv_cache`, sc-25905) — the primary implementation;
+    /// [`Self::generate`] is this without the report.
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_with_report_observed(req, on_progress)
+        })
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "QwenImage21.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "QwenImage21.load_precision_policy",
+                    &self.spec.precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "QwenImage21.load_quantization_policy",
+                    &self.spec.quantize,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_with_report_observed(req, &mut progress)
+            },
+        )
+    }
+}
+
+impl QwenImage21 {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
         let report = self
             .generate_impl(req, on_progress)
             .map_err(|error| labelled(self.variant.id(), error))?;
@@ -624,11 +675,7 @@ impl Generator for QwenImage21 {
             ))
         })
     }
-
-    /// The render plus which prefix-KV-cache path it ran and the bytes its caches held
-    /// (`GenerationReport::prefix_kv_cache`, sc-25905) — the primary implementation;
-    /// [`Self::generate`] is this without the report.
-    fn generate_with_report(
+    fn generate_with_report_observed(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -662,6 +709,7 @@ pub(crate) fn resolve_run_params(
     // `true_cfg_scale`: honour a caller-supplied `true_cfg`, then `guidance`, then the upstream
     // default (off). Guidance engages only with a negative prompt, as upstream's `do_true_cfg`.
     let true_cfg = req.true_cfg.or(req.guidance).unwrap_or(DEFAULT_TRUE_CFG);
+    mlx_gen::image_execution::scalar("qwen-image-2-1.true_cfg", true_cfg);
     let has_negative = req
         .negative_prompt
         .as_deref()
@@ -683,6 +731,7 @@ impl QwenImage21 {
         self.validate(req)?;
         let params = resolve_run_params(&self.schedule, req)?;
         let tiling = crate::pipeline::decode_tiling(req);
+        mlx_gen::image_execution::policy_debug("qwen-image-2-1.tiling", &tiling);
         // sc-24114: request-scoped allocator bounds — cache limit = the derived transient budget
         // (freed buffers above it go back to the OS instead of pooling to the device's working-set
         // line, which is what let the footprint reach 110 GB), memory limit = resident + budget
@@ -743,6 +792,7 @@ impl QwenImage21 {
         // the two are OR'd — a request can stage a warm-loaded generator, never un-stage a
         // sequential one.
         let stage_residency = stage_residency_for(&self.spec, req);
+        mlx_gen::image_execution::policy_debug("qwen-image-2-1.stage_residency", &stage_residency);
         // What the denoise loops did, written as they run (one report per image; they agree).
         let mut ran: Option<PrefixKvCacheReport> = None;
         let mut warnings = Vec::new();

@@ -148,11 +148,47 @@ pub fn denoise_in(
     noise: &Array,
     params: &GenerationParams,
     cancel: &CancelFlag,
+    on_step: impl FnMut(usize),
+    preview: &PreviewSink,
+    budget: mlx_gen::AttentionBudget,
+    window: Option<usize>,
+    pixel_rows: bool,
+) -> Result<Array> {
+    mlx_gen::image_execution::unavailable(
+        "iris_external_noise",
+        "direct denoise received caller-owned noise without an observed seed binding",
+        "initial_noise",
+    );
+    denoise_in_with_seeds(
+        dit,
+        flow,
+        conditioning,
+        noise,
+        params,
+        cancel,
+        on_step,
+        preview,
+        budget,
+        window,
+        pixel_rows,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_in_with_seeds(
+    dit: &IrisDiT,
+    flow: &FlowConfig,
+    conditioning: &Conditioning,
+    noise: &Array,
+    params: &GenerationParams,
+    cancel: &CancelFlag,
     mut on_step: impl FnMut(usize),
     preview: &PreviewSink,
     budget: mlx_gen::AttentionBudget,
     window: Option<usize>,
     pixel_rows: bool,
+    seeds: &[u64],
 ) -> Result<Array> {
     let plan_metadata = params.plan_metadata()?;
     mlx_gen::ios_quantum::before(crate::solver::PLAN_QUANTUM, plan_metadata.host_bytes()?)?;
@@ -281,6 +317,21 @@ pub fn denoise_in(
         "solve_complete",
         &[("evaluations", evaluations), ("steps", plan.len() as u64)],
     );
+    mlx_gen::image_execution::policy_debug("iris.attention_budget", &budget);
+    mlx_gen::image_execution::policy_debug("iris.dit_window", &window);
+    mlx_gen::image_execution::policy_debug("iris.pixel_rows", &pixel_rows);
+    mlx_gen::image_execution::policy_debug("iris.solver_coefficients", &plan);
+    mlx_gen::image_execution::policy_debug("iris.flow_prediction", &flow.prediction);
+    for &seed in seeds {
+        mlx_gen::image_execution::sampled_native_with_rng(
+            "iris-flow-dpm-solver++-v1",
+            "noise-fraction",
+            solved.dtype(),
+            &sigmas,
+            seed,
+            "mlx-keyed-normal-f32-v1;initial=output-seed;no-step-draws",
+        );
+    }
     Ok(solved)
 }
 

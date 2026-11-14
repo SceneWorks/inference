@@ -477,6 +477,7 @@ impl Iris3b {
     ) -> Result<GenerationReport> {
         self.validate_impl(req)?;
         let rungs = request_rungs(req, self.streamed)?;
+        mlx_gen::image_execution::policy_debug("iris.resolved_rungs", &rungs);
         let _quantum_scope = mlx_gen::ios_quantum::Scope::try_new()?;
         let params = GenerationParams::resolve(req, default_seed(), &self.config)?;
         let rows = params.prompts.len() as u32;
@@ -535,7 +536,7 @@ impl Iris3b {
                         .collect();
                     let z = noise_batch(&seeds, channels, params.width, params.height)?;
                     let done = c.saturating_mul(params.steps as u32);
-                    let x = crate::pipeline::denoise_in(
+                    let x = crate::pipeline::denoise_in_with_seeds(
                         &heavy.dit,
                         &flow,
                         &conditioning,
@@ -552,6 +553,7 @@ impl Iris3b {
                         rungs.budget,
                         rungs.dit_window,
                         rungs.pixel_rows,
+                        &seeds,
                     )?;
                     images.push(x);
                 }
@@ -631,6 +633,7 @@ pub(crate) fn memory_rungs(
         });
     };
     let pixel_rows = memory.chunk_attention;
+    mlx_gen::image_execution::policy_debug("iris.pixel_rows", &pixel_rows);
     if !memory.stream_transformer_blocks {
         if memory.transformer_window_size.is_some() || memory.transformer_window_component.is_some()
         {
@@ -768,13 +771,61 @@ impl Generator for Iris3b {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
+    }
+
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_with_report_observed(req, on_progress)
+        })
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug("Iris3b.streamed", &self.streamed);
+                mlx_gen::image_execution::policy_debug(
+                    "Iris3b.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Iris3b.load_precision_policy",
+                    &self.spec.precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Iris3b.load_quantization_policy",
+                    &self.spec.quantize,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_with_report_observed(req, &mut progress)
+            },
+        )
+    }
+}
+
+impl Iris3b {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
         let report = self.generate_impl(req, on_progress)?;
         report
             .output
             .ok_or_else(|| gen_core::Error::Msg("iris: the render produced no output".into()))
     }
-
-    fn generate_with_report(
+    fn generate_with_report_observed(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),

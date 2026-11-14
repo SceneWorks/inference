@@ -53,11 +53,13 @@ pub fn run_output<S: FamilyStages + ?Sized>(
     on_progress: &mut dyn FnMut(Progress),
     emit: impl FnOnce(Array, &mut dyn FnMut(Progress)) -> Result<()>,
 ) -> Result<()> {
-    let (start, retained) = stages.build_init(seed)?;
-    let latent = stages.denoise(start, &retained, seed, on_progress)?;
-    emit(latent, on_progress)?;
-    drop(retained);
-    Ok(())
+    mlx_gen::image_execution::with_primary_seed(seed, || {
+        let (start, retained) = stages.build_init(seed)?;
+        let latent = stages.denoise(start, &retained, seed, on_progress)?;
+        emit(latent, on_progress)?;
+        drop(retained);
+        Ok(())
+    })
 }
 
 /// Map a captured raw variance-exploding latent (`x0 + σ·ε`) into the PiD student's

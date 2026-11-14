@@ -677,6 +677,7 @@ impl KreaHeavy {
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
         let attention = opts.attention_plan(cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
@@ -855,6 +856,7 @@ impl KreaHeavy {
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
         let attention = opts.attention_plan(cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         let previews = KreaPreview::new(preview, &sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
@@ -1017,6 +1019,7 @@ impl KreaHeavy {
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
         let attention = opts.attention_plan(cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
@@ -1111,6 +1114,7 @@ impl KreaHeavy {
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
         let attention = opts.attention_plan(cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
@@ -1279,6 +1283,7 @@ impl KreaHeavy {
         let mut latent = init_noise(opts.height, opts.width, opts.seed)?;
         let previews = KreaPreview::new(preview, full);
         let attention = opts.attention_plan(cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         for mp in plans {
             let end = mp.slice.end.min(full.len().saturating_sub(1));
             let start = mp.slice.start.min(end);
@@ -1378,6 +1383,7 @@ impl KreaHeavy {
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
         let attention = opts.attention_plan(cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
 
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
@@ -1536,6 +1542,7 @@ impl KreaHeavy {
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
         let attention = opts.attention_plan(cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),

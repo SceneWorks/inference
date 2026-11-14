@@ -398,6 +398,7 @@ impl Flux2DevControl {
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let steps = req.steps.unwrap_or(self.config_default_steps()) as usize;
         let guidance = req.guidance.unwrap_or(crate::config::DEFAULT_GUIDANCE_DEV);
+        mlx_gen::image_execution::scalar("flux2.guidance", guidance);
         // dev is guidance-distilled: the scale is an embedded scalar (single forward), never true-CFG.
         let embedded_guidance = Some(guidance);
 
@@ -581,7 +582,7 @@ impl Generator for Flux2DevControl {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -608,6 +609,41 @@ impl Generator for Flux2DevControl {
             context,
             self.memory_numeric_tier,
         )
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "Flux2DevControl.memory_numeric_tier",
+                    &self.memory_numeric_tier,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux2DevControl.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl Flux2DevControl {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
 
