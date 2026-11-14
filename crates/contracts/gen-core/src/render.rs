@@ -1,6 +1,9 @@
 //! Weight-free execution contract and owner-local lifecycle for fixed image passes.
 
 pub mod conditional;
+mod passes;
+
+pub use passes::{MultiPassRenderPlan, PlannedPassRequest, ProducedReference};
 
 use crate::{
     default_seed, CancelFlag, Conditioning, ControlKind, Error, GenerationRequest, Image, LoadSpec,
@@ -100,6 +103,14 @@ enum PackedImageConditioning {
         pixels_sha256: [u8; 32],
         kind: String,
         scale_bits: Option<u32>,
+    },
+    /// A reference an earlier pass of the same multi-pass plan produces. Its pixels do not exist
+    /// before load, so the plan binds the declared geometry and strength instead of a digest.
+    ProducedReference {
+        from_pass: usize,
+        width: u32,
+        height: u32,
+        strength_bits: Option<u32>,
     },
 }
 
@@ -262,6 +273,13 @@ pub struct RenderPlan {
     preparation: Option<RenderLoadBinding>,
     count: CountPlan,
     pass: ImagePass,
+    /// Position inside a [`MultiPassRenderPlan`]; 0 for a single-pass plan.
+    #[serde(skip_serializing_if = "is_first_pass")]
+    pass_index: usize,
+}
+
+fn is_first_pass(index: &usize) -> bool {
+    *index == 0
 }
 
 impl RenderPlan {
@@ -360,6 +378,7 @@ impl RenderPlan {
                 },
                 inert_splits: Vec::new(),
             },
+            pass_index: 0,
         })
     }
 
@@ -370,15 +389,109 @@ impl RenderPlan {
         descriptor: &ModelDescriptor,
         req: &GenerationRequest,
     ) -> Result<()> {
+        let mut live = ImageInputs::try_from(req)?;
+        if let PackedImageConditioning::ProducedReference {
+            from_pass,
+            width,
+            height,
+            strength_bits,
+        } = &self.inputs.conditioning
+        {
+            // The produced image is bound by shape and strength: its bytes come from the earlier
+            // pass and cannot be digested before load.
+            match &live.conditioning {
+                PackedImageConditioning::Reference {
+                    width: live_width,
+                    height: live_height,
+                    strength_bits: live_strength,
+                    ..
+                } if (live_width, live_height, live_strength) == (width, height, strength_bits) => {
+                    live.conditioning = self.inputs.conditioning.clone();
+                }
+                _ => {
+                    return Err(Error::Unsupported(format!(
+                        "pass {} reference must be the {width}x{height} output of pass {from_pass} \
+                         at its declared strength",
+                        self.pass_index
+                    )))
+                }
+            }
+        }
         if descriptor.id != self.provider
             || descriptor.backend != self.backend
-            || self.inputs != ImageInputs::try_from(req)?
+            || self.inputs != live
         {
             return Err(Error::Unsupported(
                 "compiled render plan does not match this request/provider".into(),
             ));
         }
         Ok(())
+    }
+
+    /// The pass position inside a [`MultiPassRenderPlan`] (0 for a single-pass plan).
+    pub fn pass_index(&self) -> usize {
+        self.pass_index
+    }
+
+    /// The earlier-pass output this pass consumes as its reference, when it declares one.
+    pub fn produced_reference(&self) -> Option<ProducedReference> {
+        match self.inputs.conditioning {
+            PackedImageConditioning::ProducedReference {
+                from_pass,
+                width,
+                height,
+                strength_bits,
+            } => Some(ProducedReference {
+                from_pass,
+                width,
+                height,
+                strength: strength_bits.map(f32::from_bits),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Requests per image (the plan's sequential count).
+    pub fn image_count(&self) -> u32 {
+        let CountPlan::SequentialWrappingSeeds { count, .. } = self.count;
+        count
+    }
+
+    /// Executed denoise steps of this pass (the progress total its sampler reports).
+    pub fn executed_steps(&self) -> usize {
+        self.pass.phase.end_step - self.pass.phase.first_step
+    }
+
+    /// The (width, height) of this pass's output image.
+    pub fn output_size(&self) -> (u32, u32) {
+        (self.pass.phase.stream.width, self.pass.phase.stream.height)
+    }
+
+    /// Replace a compiled single-reference input with a declaration that pass `from_pass`
+    /// produces it, keeping the compiled geometry and strength.
+    fn into_produced_reference(mut self, from_pass: usize) -> Result<Self> {
+        let PackedImageConditioning::Reference {
+            width,
+            height,
+            strength_bits,
+            ..
+        } = self.inputs.conditioning
+        else {
+            return Err(Error::Unsupported(
+                "a produced reference needs a single-reference pass".into(),
+            ));
+        };
+        self.inputs.conditioning = PackedImageConditioning::ProducedReference {
+            from_pass,
+            width,
+            height,
+            strength_bits,
+        };
+        Ok(self)
+    }
+
+    fn preparation(&self) -> Option<&RenderLoadBinding> {
+        self.preparation.as_ref()
     }
     /// Freeze the exact load contract for a direct provider that is not registry loaded.
     pub fn bind_load(mut self, spec: &LoadSpec) -> Self {
@@ -502,7 +615,7 @@ impl<'p, 's> RenderRun<'p, 's> {
     fn phase_identity(&self, phase: usize) -> RenderPhaseIdentity {
         let stream = &self.plan.pass.phase.stream;
         RenderPhaseIdentity {
-            pass: 0,
+            pass: self.plan.pass_index,
             phase,
             geometry: crate::MemoryGeometry {
                 width: stream.width,

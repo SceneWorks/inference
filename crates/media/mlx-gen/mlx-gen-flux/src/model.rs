@@ -1904,6 +1904,153 @@ mod tests {
         }
     }
 
+    /// Hires.fix with the XLabs IP route: pass 1 renders at the base size, pass 2 renders from
+    /// noise at the upscaled size conditioned on pass 1's stretched output at strength
+    /// 1 − denoise. Both passes compile before load; pass 2's reference is bound by its declared
+    /// size and strength because its pixels exist only after pass 1.
+    #[test]
+    fn xlabs_ip_hires_fix_compiles_two_passes_before_load() {
+        let registry = crate::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/missing/flux".into()))
+            .with_ip_adapter(WeightsSource::Dir("/missing/ip".into()));
+        let first = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            seed: Some(7),
+            ..Default::default()
+        };
+        let refine = GenerationRequest {
+            width: 768,
+            height: 768,
+            steps: Some(3),
+            ..first.clone()
+        };
+        let hires = gen_core::ProducedReference {
+            from_pass: 0,
+            width: 768,
+            height: 768,
+            strength: Some(1.0 - 0.45),
+        };
+        let compile = |refine: &GenerationRequest, produced| {
+            registry.compile_multi_pass_render_plan(
+                FluxVariant::Dev.id(),
+                &spec,
+                &[
+                    gen_core::PlannedPassRequest {
+                        request: &first,
+                        produced_reference: None,
+                    },
+                    gen_core::PlannedPassRequest {
+                        request: refine,
+                        produced_reference: Some(produced),
+                    },
+                ],
+            )
+        };
+        let plan = compile(&refine, hires)
+            .unwrap()
+            .expect("the XLabs Hires.fix route needs a pre-load plan");
+        let [base, refined] = plan.passes() else {
+            panic!("two passes");
+        };
+        base.check_request(&descriptor_for(FluxVariant::Dev), &first)
+            .unwrap();
+        assert_eq!(base.output_size(), (512, 512));
+        assert_eq!(refined.output_size(), (768, 768));
+        assert_eq!(refined.base_seed(), 7);
+        assert_eq!(plan.total_executed_steps(), 7);
+        let native = build_sigmas_with(3, 768, 768, true, None).unwrap();
+        assert_eq!(refined.denoise_sigmas(), native);
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&spec))
+            .unwrap();
+
+        // The stretched pass-1 output (any pixels) of the declared size binds; others refuse.
+        let with_reference = |size: u32, strength: Option<f32>| GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: size,
+                    height: size,
+                    pixels: vec![17; (size * size * 3) as usize],
+                },
+                strength,
+            }],
+            ..refine.clone()
+        };
+        refined
+            .check_request(
+                &descriptor_for(FluxVariant::Dev),
+                &with_reference(768, hires.strength),
+            )
+            .unwrap();
+        for wrong in [
+            with_reference(512, hires.strength),
+            with_reference(768, Some(0.45)),
+            refine.clone(),
+        ] {
+            assert!(refined
+                .check_request(&descriptor_for(FluxVariant::Dev), &wrong)
+                .is_err());
+        }
+
+        // Pass-2 refusals happen before load: off-grid, below-minimum and zero steps.
+        for (width, steps, expected) in [
+            (770, Some(3), "multiples of 16"),
+            (128, Some(3), "outside supported range"),
+            (768, Some(0), "steps must be >= 1"),
+        ] {
+            let bad = GenerationRequest {
+                width,
+                steps,
+                ..refine.clone()
+            };
+            let error = compile(&bad, gen_core::ProducedReference { width, ..hires })
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{width}: {error}");
+        }
+        // The IP pass needs its adapter in the shared load contract.
+        let no_adapter = LoadSpec::new(WeightsSource::Dir("/missing/flux".into()));
+        let error = registry
+            .compile_multi_pass_render_plan(
+                FluxVariant::Dev.id(),
+                &no_adapter,
+                &[
+                    gen_core::PlannedPassRequest {
+                        request: &first,
+                        produced_reference: None,
+                    },
+                    gen_core::PlannedPassRequest {
+                        request: &refine,
+                        produced_reference: Some(hires),
+                    },
+                ],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("IP-adapter"), "{error}");
+
+        // Single-pass plans are unchanged: pass 0, digest-bound reference.
+        let single = registry
+            .compile_render_plan(
+                FluxVariant::Dev.id(),
+                &spec,
+                &with_reference(768, hires.strength),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(single.pass_index(), 0);
+        assert_eq!(single.produced_reference(), None);
+        let mut changed = with_reference(768, hires.strength);
+        if let Conditioning::Reference { image, .. } = &mut changed.conditioning[0] {
+            image.pixels[0] ^= 1;
+        }
+        assert!(single
+            .check_request(&descriptor_for(FluxVariant::Dev), &changed)
+            .is_err());
+    }
+
     #[test]
     fn generate_reference_without_ip_adapter_errors() {
         // No `LoadSpec::ip_adapter` → a reference request errors loudly before touching the (absent)
