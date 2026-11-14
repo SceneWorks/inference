@@ -574,6 +574,19 @@ def cargo_test_compilation(command):
     return options if operation == 'test' and '--no-run' in options and '--message-format=json' in options else None
 
 
+def is_file(path):
+    """`Path.is_file` that reports any `OSError` as not-a-file, as Python 3.14 does.
+
+    An unexpanded `${{ … }}` expression substituted into a script path can exceed the
+    filesystem's name limit; Python 3.12's `is_file` raises ENAMETOOLONG for it instead of
+    returning False, so the tracer would crash rather than report an unresolved script.
+    """
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
 class RunGraph:
     """Resolve repository script/driver edges, without importing or executing the scripts.
 
@@ -772,7 +785,7 @@ class RunGraph:
             self.shell(self.generated[name], (*chain, 'generated ' + name), base, args)
             return
         path = self.root / name
-        if not path.is_file() and base is not None:
+        if not is_file(path) and base is not None:
             path = base / name
         try:
             path = path.resolve()
@@ -780,7 +793,7 @@ class RunGraph:
         except ValueError:
             self.finding('unknown', chain, 'script outside source root: ' + name)
             return
-        if not path.is_file():
+        if not is_file(path):
             self.finding('unknown', chain, 'unresolved script: ' + name)
             return
         # The exact reviewed suite runner may execute only literal audited-safe mode in
