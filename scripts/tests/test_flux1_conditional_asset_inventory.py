@@ -14,6 +14,8 @@ from unittest.mock import patch
 from scripts.ci import flux1_conditional_asset_inventory as assets
 from scripts.ci.flux1_pair import conditional
 
+OTHER_REV = "c" * 40
+
 
 def put(root, relative, content=b"fixed"):
     path = root / relative
@@ -22,269 +24,262 @@ def put(root, relative, content=b"fixed"):
     return path
 
 
+def snapshot(hub, role, revision=None):
+    repo, _, pinned = assets.PRODUCT_SOURCES[role]
+    return assets.cache_dir(hub, repo) / "snapshots" / (revision or pinned)
+
+
+def install(hub, role, content=None, revision=None):
+    """Place the product file for `role` at its pinned (or the given) snapshot revision."""
+    name = assets.PRODUCT_SOURCES[role][1]
+    return put(hub, (snapshot(hub, role, revision) / name).relative_to(hub),
+               content if content is not None else role.encode())
+
+
+def install_gemma(hub, revision=None, extra=()):
+    directory = snapshot(hub, "pid_gemma", revision)
+    for name in ("config.json", "tokenizer.json", "LICENSE", *extra):
+        put(hub, (directory / name).relative_to(hub), name.encode())
+    shards = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors")
+    for name in shards:
+        put(hub, (directory / name).relative_to(hub), name.encode())
+    put(hub, (directory / "model.safetensors.index.json").relative_to(hub),
+        json.dumps({"weight_map": {"a": shards[0], "b": shards[1]}}).encode())
+    return directory
+
+
+def install_all(hub):
+    for role in assets.PRODUCT_SOURCES:
+        if role != "pid_gemma":
+            install(hub, role)
+    return install_gemma(hub)
+
+
+def no_listing():
+    """Fail on any directory listing in this process (the child only stats and reads)."""
+    def refuse(*args, **kwargs):
+        raise AssertionError(f"directory listed: {args!r}")
+    return (patch.object(assets.os, "scandir", side_effect=refuse),
+            patch.object(assets.os, "listdir", side_effect=refuse),
+            patch.object(assets.os, "walk", side_effect=refuse),
+            patch.object(Path, "iterdir", refuse),
+            patch.object(Path, "glob", refuse),
+            patch.object(Path, "rglob", refuse))
+
+
 class ConditionalAssetInventory(unittest.TestCase):
-    def test_generic_hub_root_control_and_ip_do_not_claim_flux_roles(self):
+    def inventory(self, hub, runner="nax-macos-2", **kwargs):
+        guards = no_listing()
+        for guard in guards:
+            guard.start()
+        try:
+            return assets.inventory(hub, runner, **kwargs)
+        finally:
+            for guard in guards:
+                guard.stop()
+
+    def test_every_case_role_has_one_product_source(self):
+        roles = {role for _, _, required in conditional.CASES.values() for role in required}
+        self.assertEqual(set(assets.PRODUCT_SOURCES), roles)
+        for repo, _, revision in assets.PRODUCT_SOURCES.values():
+            self.assertNotIn(repo, {"SceneWorks/flux1-dev-mlx", "SceneWorks/flux1-schnell-mlx",
+                                    "black-forest-labs/FLUX.1-dev"})
+            self.assertRegex(revision, r"^[0-9a-f]{40}$")
+        self.assertEqual(assets.PRODUCT_SOURCES["pid_decoder"][:2],
+                         ("SceneWorks/pid-flux", "pid_flux_2kto4k.safetensors"))
+
+    def test_pinned_product_files_are_selected_without_listing_any_directory(self):
         with TemporaryDirectory() as tmp:
-            hub = Path(tmp) / "hub"
+            hub = Path(tmp).resolve() / "hub"
             hub.mkdir()
-            put(hub, "control.safetensors", b"unattributed control")
-            put(hub, "ip_adapter.safetensors", b"unattributed adapter")
-            result = assets.inventory(hub, "nax-macos-2", metadata_only=True)
-            self.assertEqual(result["roles"]["control"]["status"], "missing")
-            self.assertEqual(result["roles"]["ip_adapter"]["status"], "missing")
-            self.assertEqual(result["roles"]["control"]["candidates"], [])
-            self.assertEqual(result["roles"]["ip_adapter"]["candidates"], [])
-
-    def test_discovery_never_enumerates_hub_root(self):
-        with TemporaryDirectory() as tmp:
-            hub = Path(tmp) / "hub"
-            hub.mkdir()
-            target = put(hub, "models--guozinan--PuLID/snapshots/" + "a" * 40 +
-                         "/pulid_flux_v0.9.1.safetensors", b"identity")
-            actual_scandir = os.scandir
-
-            def guarded_scandir(path):
-                if Path(path) == hub:
-                    raise AssertionError("Hub root enumerated")
-                return actual_scandir(path)
-
-            with patch.object(assets.os, "scandir", side_effect=guarded_scandir):
-                result = assets.inventory(hub, "nax-macos-2", metadata_only=True)
-            self.assertEqual(result["roles"]["pulid"]["candidates"][0]["path"], str(target.resolve()))
-
-    def test_explicit_host_specific_root_and_invalid_roots(self):
-        with TemporaryDirectory() as tmp:
-            hub = Path(tmp) / "hub"
-            hub.mkdir()
-            target = put(hub, "models--custom--face-conversion/snapshots/" + "a" * 40 +
-                         "/scrfd_10g.safetensors", b"face")
-            self.assertEqual(assets.inventory(hub, "nax-macos-2")["roles"]["scrfd"]["status"], "missing")
-            result = assets.inventory(hub, "nax-macos-2", extra_roots=("models--custom--face-conversion",))
-            self.assertEqual(result["roles"]["scrfd"]["candidates"][0]["path"], str(target.resolve()))
-            self.assertEqual(result["requested_extra_roots"], ["models--custom--face-conversion"])
-            for bad in (["../escape"], ["face/subdir"], ["."], ["face", "face"], [{}]):
-                with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "single-segment"):
-                    assets.inventory(hub, "nax-macos-2", extra_roots=bad)
-            outside = Path(tmp) / "outside"
-            outside.mkdir()
-            (hub / "custom-face").symlink_to(outside, target_is_directory=True)
-            with self.assertRaisesRegex(ValueError, "selected loose asset directory is a symlink"):
-                assets.inventory(hub, "nax-macos-2", extra_roots=("custom-face",))
-
-    def test_documented_scene_works_pulid_snapshot_and_root_alias(self):
-        with TemporaryDirectory() as tmp:
-            hub = Path(tmp) / "hub"
-            hub.mkdir()
-            eva = put(hub, "models--SceneWorks--pulid-flux-mlx/snapshots/" + "a" * 40 +
-                      "/eva02_clip_l_336.safetensors", b"eva")
-            decoder = put(hub, "pid_decoder.safetensors", b"decoder")
-            result = assets.inventory(hub, "nax-macos-2", metadata_only=True)
-            self.assertEqual(result["roles"]["eva"]["candidates"][0]["path"], str(eva.resolve()))
-            self.assertEqual(result["roles"]["pid_decoder"]["candidates"][0]["path"],
-                             str(decoder.resolve()))
-
-    def test_nvidia_pid_snapshot_decoder_is_discovered(self):
-        with TemporaryDirectory() as tmp:
-            hub = Path(tmp) / "hub"
-            hub.mkdir()
-            decoder = put(hub, "models--nvidia--PiD/snapshots/" + "a" * 40 +
-                          "/flux_2k.safetensors", b"decoder")
-            result = assets.inventory(hub, "nax-macos-2")
-            row = result["roles"]["pid_decoder"]["candidates"][0]
-            self.assertEqual(result["roles"]["pid_decoder"]["status"], "unique")
-            self.assertEqual(row["path"], str(decoder.resolve()))
-            self.assertEqual(row["sha256"], hashlib.sha256(b"decoder").hexdigest())
-            self.assertEqual(row["revision"], "a" * 40)
-            self.assertEqual(result["search_roots"], ["models--nvidia--PiD/snapshots"])
-
-    def test_unrelated_hub_tree_is_skipped_and_scan_reports_progress(self):
-        with TemporaryDirectory() as tmp:
-            hub = Path(tmp) / "hub"
-            hub.mkdir()
-            unrelated = hub / "models--other--ordinary/snapshots" / ("a" * 40)
-            for index in range(100):
-                put(hub, unrelated.relative_to(hub) / f"deep/{index}/model.safetensors")
-            target = put(hub, "models--guozinan--PuLID/snapshots/" + "b" * 40 +
-                         "/pulid_flux_v0.9.1.safetensors", b"pulid")
+            control = install(hub, "control", b"control")
+            gemma = install_all(hub)
             log = StringIO()
-            with patch.object(assets, "MAX_ENTRIES", 20), redirect_stderr(log):
-                result = assets.inventory(hub, "nax-macos-2")
-            self.assertEqual(result["roles"]["pulid"]["candidates"][0]["path"], str(target.resolve()))
-            self.assertLess(result["entries_scanned"], 20)
-            self.assertNotIn("models--other--ordinary", " ".join(result["search_roots"]))
-            self.assertIn("selected_roots=1", log.getvalue())
-            self.assertIn("role=pulid", log.getvalue())
-
-    def test_expired_budget_and_selected_cache_symlink_fail_fast(self):
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            hub = root / "hub"
-            hub.mkdir()
-            put(hub, "models--guozinan--PuLID/snapshots/" + "a" * 40 +
-                "/pulid_flux_v0.9.1.safetensors")
-            with patch.object(assets, "MAX_SECONDS", -1):
-                with self.assertRaisesRegex(ValueError, "budget exceeded"):
-                    assets.inventory(hub, "nax-macos-2")
-            with patch.object(assets, "MAX_METADATA_SECONDS", -1):
-                with self.assertRaisesRegex(ValueError, "budget exceeded"):
-                    assets.inventory(hub, "nax-macos-2", metadata_only=True)
-            external = root / "external"
-            external.mkdir()
-            (hub / "models--guozinan--PuLID").rename(external / "pulid")
-            (hub / "models--guozinan--PuLID").symlink_to(external / "pulid", target_is_directory=True)
-            with self.assertRaisesRegex(ValueError, "selected model cache directory is a symlink"):
-                assets.inventory(hub, "nax-macos-2")
-
-    def test_huggingface_gemma_snapshot_links_stage_from_confined_blobs(self):
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            hub = root / "hub"
-            snapshot = hub / "models--Efficient-Large-Model--gemma-2-2b-it/snapshots" / ("b" * 40)
-            snapshot.mkdir(parents=True)
-            for name, content in (("config.json", b"config"), ("tokenizer.json", b"tokenizer"),
-                                  ("gemma-2-2b-it.safetensors", b"weights")):
-                blob = put(hub, "models--Efficient-Large-Model--gemma-2-2b-it/blobs/" + name, content)
-                (snapshot / name).symlink_to(blob)
-            result = assets.inventory(hub, "nax-macos-2")
-            row = result["roles"]["pid_gemma"]["candidates"][0]
-            self.assertEqual(result["roles"]["pid_gemma"]["status"], "unique")
-            work = root / "proof"
-            work.mkdir()
-            with patch.dict(os.environ, FLUX1_HUB=str(hub)):
-                _, staged = conditional.prepare_assets(work, assets.ROOT,
-                                                       {"pid_gemma": {"path": row["path"],
-                                                                      "files": row["files"],
-                                                                      "revision": row["revision"]}})
-            self.assertEqual((Path(staged["pid_gemma"]["staged"]) / "gemma-2-2b-it.safetensors").read_bytes(),
-                             b"weights")
-            external = put(root, "external.safetensors", b"other")
-            (snapshot / "gemma-2-2b-it.safetensors").unlink()
-            (snapshot / "gemma-2-2b-it.safetensors").symlink_to(external)
-            with self.assertRaisesRegex(ValueError, "escapes configured model hub"):
-                assets.inventory(hub, "nax-macos-2")
-
-    def test_config_only_gemma_is_incomplete_and_cannot_stage(self):
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            hub = root / "hub"
-            snapshot = hub / "models--google--gemma-2-2b-it/snapshots" / ("a" * 40)
-            put(hub, snapshot.relative_to(hub) / "config.json", b"config")
-            result = assets.inventory(hub, "nax-macos-2")
-            self.assertEqual(result["roles"]["pid_gemma"]["status"], "incomplete")
-            self.assertIn("pid_gemma", result["incomplete_roles"])
-            self.assertFalse(result["cases"]["pulid-pid"]["ready"])
-            work = root / "proof"
-            work.mkdir()
-            with patch.dict(os.environ, FLUX1_HUB=str(hub)):
-                with self.assertRaisesRegex(ValueError, "PiD Gemma needs"):
-                    conditional.prepare_assets(work, assets.ROOT,
-                                               {"pid_gemma": {"path": str(snapshot),
-                                                              "files": {"config.json": hashlib.sha256(b"config").hexdigest()},
-                                                              "revision": "cache-snapshot"}})
-
-    def test_indexed_gemma_requires_every_declared_shard(self):
-        with TemporaryDirectory() as tmp:
-            directory = Path(tmp)
-            put(directory, "config.json", b"config")
-            put(directory, "tokenizer.json", b"tokenizer")
-            shards = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors")
-            put(directory, shards[0], b"first")
-            put(directory, "model.safetensors.index.json",
-                json.dumps({"weight_map": {"a": shards[0], "b": shards[1]}}).encode())
-            with self.assertRaisesRegex(ValueError, "incomplete"):
-                conditional.require_pid_gemma_footprint(directory, {
-                    "config.json", "tokenizer.json", "model.safetensors.index.json", shards[0]})
-            put(directory, shards[1], b"second")
-            conditional.require_pid_gemma_footprint(directory, {
-                "config.json", "tokenizer.json", "model.safetensors.index.json", *shards})
-            put(directory, "model.safetensors.index.json",
-                b" " * (conditional.MAX_PID_GEMMA_INDEX_BYTES + 1))
-            with self.assertRaisesRegex(ValueError, "exceeds byte limit"):
-                conditional.require_pid_gemma_footprint(directory, {
-                    "config.json", "tokenizer.json", "model.safetensors.index.json", *shards})
-
-    def test_fixed_roles_and_complete_gemma_map_from_confined_snapshot(self):
-        with TemporaryDirectory() as tmp:
-            hub = Path(tmp) / "hub"
-            hub.mkdir()
-            rev = "a" * 40
-            snapshot = Path("models--Shakker-Labs--FLUX.1-dev-ControlNet-Union-Pro-2.0/snapshots") / rev
-            control = put(hub, snapshot / "diffusion_pytorch_model.safetensors", b"control")
-            put(hub, "models--XLabs-AI--flux-ip-adapter/snapshots/" + rev + "/ip_adapter.safetensors")
-            put(hub, "models--openai--clip-vit-large-patch14/snapshots/" + rev + "/model.safetensors")
-            put(hub, "models--guozinan--PuLID/snapshots/" + rev + "/pulid_flux_v0.9.1.safetensors")
-            put(hub, "converted/eva02_clip_l_14_336.safetensors")
-            for name in ("scrfd_10g", "arcface_iresnet100", "bisenet_parsing"):
-                put(hub, "face/" + name + ".safetensors")
-            put(hub, "pid/flux_2k.safetensors")
-            gemma = "models--google--gemma-2-2b-it/snapshots/" + rev
-            put(hub, gemma + "/config.json", b"config")
-            put(hub, gemma + "/tokenizer.json", b"tokenizer")
-            put(hub, gemma + "/gemma-2-2b-it.safetensors", b"gemma")
-            result = assets.inventory(hub, "nax-macos-2")
-            self.assertEqual(result["missing_roles"], [])
-            self.assertEqual(result["ambiguous_roles"], [])
-            self.assertTrue(all(row["status"] == "unique" for row in result["roles"].values()))
+            with redirect_stderr(log):
+                result = self.inventory(hub)
+            self.assertEqual(result["protocol"], "flux1-conditional-asset-inventory-v2")
+            for key in ("missing_roles", "off_pin_roles", "unreachable_roles", "incomplete_roles"):
+                self.assertEqual(result[key], [], key)
             self.assertTrue(all(row["ready"] for row in result["cases"].values()))
-            control_row = result["roles"]["control"]["candidates"][0]
-            self.assertEqual(control_row["path"], str(control.resolve()))
-            self.assertEqual(control_row["sha256"], hashlib.sha256(b"control").hexdigest())
-            self.assertEqual(control_row["revision"], rev)
-            self.assertEqual(control_row["revision_provenance"], "huggingface-cache-snapshot-path")
+            row = result["roles"]["control"]["candidates"][0]
+            self.assertEqual(row["path"], str(control.resolve()))
+            self.assertEqual(row["sha256"], hashlib.sha256(b"control").hexdigest())
+            self.assertEqual(row["revision"], assets.PRODUCT_SOURCES["control"][2])
+            self.assertEqual(row["revision_provenance"], "product-manifest-pin")
             files = result["roles"]["pid_gemma"]["candidates"][0]["files"]
-            self.assertEqual(files, {"config.json": hashlib.sha256(b"config").hexdigest(),
-                                     "tokenizer.json": hashlib.sha256(b"tokenizer").hexdigest(),
-                                     "gemma-2-2b-it.safetensors": hashlib.sha256(b"gemma").hexdigest()})
-            self.assertNotIn("pulid-real", assets.inventory(hub, "cuda-windows")["cases"])
+            self.assertEqual(set(files), {"config.json", "tokenizer.json", "LICENSE",
+                                          "model.safetensors.index.json",
+                                          "model-00001-of-00002.safetensors",
+                                          "model-00002-of-00002.safetensors"})
+            self.assertEqual(files["config.json"], hashlib.sha256(b"config.json").hexdigest())
+            self.assertEqual(result["roles"]["pid_gemma"]["candidates"][0]["path"], str(gemma))
+            self.assertIn("role=control repo=Shakker-Labs", log.getvalue())
+            self.assertNotIn("pulid-real", self.inventory(hub, "cuda-windows")["cases"])
 
-    def test_missing_ambiguous_and_symlink_escape(self):
+    def test_other_repositories_with_the_same_file_names_are_ignored(self):
         with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            hub = root / "hub"
+            hub = Path(tmp).resolve() / "hub"
             hub.mkdir()
-            put(hub, "flux1-a/control.safetensors")
-            put(hub, "flux1-b/control.safetensors")
-            result = assets.inventory(hub, "nax-macos-2", extra_roots=("flux1-a", "flux1-b"))
-            self.assertEqual(result["roles"]["control"]["status"], "ambiguous")
-            self.assertEqual(result["roles"]["pulid"]["status"], "missing")
-            self.assertIn("control", result["ambiguous_roles"])
-            self.assertIn("pulid", result["missing_roles"])
+            control = install(hub, "control")
+            decoder = install(hub, "pid_decoder", b"2kto4k")
+            # The Windows inventory found these as rival `control` / `pid_decoder` candidates.
+            for repo, name in (("InstantX--InstantID", "ControlNetModel/diffusion_pytorch_model.safetensors"),
+                               ("SceneWorks--qwen-image-2512-fun-controlnet-union", "diffusion_pytorch_model.safetensors"),
+                               ("nvidia--PiD", "flux_2k.safetensors"),
+                               ("SceneWorks--flux1-dev-mlx", "q4/transformer/diffusion_pytorch_model.safetensors")):
+                put(hub, f"models--{repo}/snapshots/{'a' * 40}/{name}")
+            put(hub, (snapshot(hub, "pid_decoder") / "pid_flux_2k.safetensors").relative_to(hub))
+            result = self.inventory(hub, "cuda-windows", metadata_only=True)
+            self.assertEqual(result["roles"]["control"]["status"], "unique")
+            self.assertEqual([row["path"] for row in result["roles"]["control"]["candidates"]],
+                             [str(control.resolve())])
+            self.assertEqual(result["roles"]["pid_decoder"]["status"], "unique")
+            self.assertEqual([row["path"] for row in result["roles"]["pid_decoder"]["candidates"]],
+                             [str(decoder.resolve())])
+            self.assertNotIn("ambiguous_roles", result)
+
+    def test_refs_main_off_pin_and_missing_are_distinct_and_never_ready(self):
+        with TemporaryDirectory() as tmp:
+            hub = Path(tmp).resolve() / "hub"
+            hub.mkdir()
+            install(hub, "control", revision=OTHER_REV)
+            repo = assets.PRODUCT_SOURCES["control"][0]
+            put(hub, (assets.cache_dir(hub, repo) / "refs/main").relative_to(hub),
+                (OTHER_REV + "\n").encode())
+            result = self.inventory(hub)
+            control = result["roles"]["control"]
+            self.assertEqual(control["status"], "off_pin")
+            self.assertEqual(control["candidates"][0]["revision"], OTHER_REV)
+            self.assertEqual(control["candidates"][0]["revision_provenance"], "huggingface-refs-main")
+            self.assertIn("control", result["off_pin_roles"])
             self.assertFalse(result["cases"]["control-pose"]["ready"])
-            external = put(root, "external.safetensors")
-            (hub / "flux1-a/ip_adapter.safetensors").symlink_to(external)
-            with self.assertRaisesRegex(ValueError, "escapes configured model hub"):
-                assets.inventory(hub, "nax-macos-2", extra_roots=("flux1-a", "flux1-b"))
+            self.assertEqual(result["roles"]["pulid"]["status"], "missing")
+            self.assertIn("pulid", result["missing_roles"])
+            # A repository without a pin follows refs/main.
+            pinless = dict(assets.PRODUCT_SOURCES, control=(repo, "diffusion_pytorch_model.safetensors", None))
+            with patch.object(assets, "PRODUCT_SOURCES", pinless):
+                self.assertEqual(self.inventory(hub)["roles"]["control"]["status"], "unique")
 
-    def test_hash_budget_and_exact_runner_cli(self):
+    def test_probe_timeout_is_unreachable_not_absent(self):
         with TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            hub = Path(tmp).resolve() / "hub"
+            hub.mkdir()
+            with self.assertRaises(assets.Unreachable):
+                assets.probe(hub, timeout=0.0001)
+            install_all(hub)
+            actual = assets.probe
+            blocked = assets.cache_dir(hub, assets.PRODUCT_SOURCES["pulid"][0])
+
+            def hanging(path, *args, **kwargs):
+                if Path(path).is_relative_to(blocked):
+                    raise assets.Unreachable(f"stat {path} did not return within 10 s")
+                return actual(path, *args, **kwargs)
+
+            with patch.object(assets, "probe", side_effect=hanging):
+                result = self.inventory(hub)
+            self.assertEqual(result["roles"]["pulid"]["status"], "unreachable")
+            self.assertEqual(result["unreachable_roles"], ["pulid"])
+            self.assertNotIn("pulid", result["missing_roles"])
+            self.assertFalse(result["cases"]["pulid-fake"]["ready"])
+            self.assertTrue(result["cases"]["control-pose"]["ready"])
+
+    def test_incomplete_gemma_and_invalid_index(self):
+        with TemporaryDirectory() as tmp:
+            hub = Path(tmp).resolve() / "hub"
+            hub.mkdir()
+            directory = snapshot(hub, "pid_gemma")
+            put(hub, (directory / "config.json").relative_to(hub))
+            result = self.inventory(hub)
+            self.assertEqual(result["roles"]["pid_gemma"]["status"], "incomplete")
+            self.assertFalse(result["cases"]["pulid-pid"]["ready"])
+            put(hub, (directory / "model.safetensors.index.json").relative_to(hub),
+                json.dumps({"weight_map": {"a": "../escape.safetensors"}}).encode())
+            with self.assertRaisesRegex(ValueError, "shard index is invalid"):
+                self.inventory(hub)
+
+    def test_symlink_escape_and_non_file_fail_fast(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
             hub = root / "hub"
             hub.mkdir()
-            put(hub, "flux1/control.safetensors", b"control")
+            external = put(root, "external.safetensors")
+            path = snapshot(hub, "control") / assets.PRODUCT_SOURCES["control"][1]
+            path.parent.mkdir(parents=True)
+            path.symlink_to(external)
+            with self.assertRaisesRegex(ValueError, "escapes configured model hub"):
+                self.inventory(hub)
+            path.unlink()
+            path.mkdir()
+            with self.assertRaisesRegex(ValueError, "not a file"):
+                self.inventory(hub)
+
+    def test_metadata_mode_reads_no_weight_bytes_and_budgets_hold(self):
+        with TemporaryDirectory() as tmp:
+            hub = Path(tmp).resolve() / "hub"
+            hub.mkdir()
+            install_all(hub)
+            with patch.object(assets, "digest", side_effect=AssertionError("metadata read weight bytes")):
+                metadata = self.inventory(hub, metadata_only=True)
+            self.assertFalse(metadata["hashes_complete"])
+            self.assertNotIn("sha256", metadata["roles"]["control"]["candidates"][0])
+            self.assertIn("file_bytes", metadata["roles"]["pid_gemma"]["candidates"][0])
+            self.assertFalse(metadata["cases"]["control-pose"]["ready"])
             with patch.object(assets, "MAX_HASH_BYTES", 2):
                 with self.assertRaisesRegex(ValueError, "budget exceeded"):
-                    assets.inventory(hub, "nax-macos-2")
+                    self.inventory(hub)
+            with patch.object(assets, "MAX_METADATA_SECONDS", -1):
+                with self.assertRaisesRegex(ValueError, "budget exceeded"):
+                    self.inventory(hub, metadata_only=True)
+
+    def test_stage_xlabs_ip_adapter_fetches_exactly_the_pinned_file(self):
+        with TemporaryDirectory() as tmp:
+            hub = Path(tmp).resolve() / "hub"
+            hub.mkdir()
+            calls = []
+
+            def download(**kwargs):
+                calls.append(kwargs)
+                return str(install(hub, "ip_adapter", b"adapter"))
+
+            receipt = assets.stage_xlabs_ip_adapter(hub, download=download)
+            repo, name, revision = assets.PRODUCT_SOURCES["ip_adapter"]
+            self.assertEqual(calls, [{"repo_id": repo, "filename": name, "revision": revision,
+                                      "cache_dir": str(hub.resolve()), "token": False}])
+            self.assertEqual(receipt["sha256"], hashlib.sha256(b"adapter").hexdigest())
+            self.assertEqual(receipt["revision"], "18f6940238ab5dc3744df7a8e30315892279d5f9")
+            self.assertFalse(receipt["present_before"])
+            with self.assertRaisesRegex(ValueError, "different snapshot path"):
+                assets.stage_xlabs_ip_adapter(hub, download=lambda **_: str(hub / "elsewhere"))
+
+    def test_exact_runner_cli_and_request_shape(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            hub = root / "hub"
+            hub.mkdir()
+            install(hub, "control", b"control")
             output = root / "inventory.json"
-            sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=assets.ROOT, text=True, encoding="utf-8").strip()
+            sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=assets.ROOT, text=True,
+                                          encoding="utf-8").strip()
             command = [sys.executable, "-I", str(Path(assets.__file__)), "--backend", "mlx",
                        "--request-env", "MODEL_PROOF_REQUEST", "--expected-sha", sha, "--output", str(output)]
             env = dict(os.environ, RUNNER_NAME="nax-macos-2", FLUX1_HUB=str(hub), FLUX1_PAIR_TIER="none",
                        MODEL_PROOF_REQUEST=json.dumps({"selection": "flux1-asset-inventory",
                                                        "runner": "nax-macos-2"}))
-            plan = subprocess.run(command[:-2] + ["--plan"], env=env, capture_output=True, text=True, encoding="utf-8", check=True)
+            plan = subprocess.run(command[:-2] + ["--plan"], env=env, capture_output=True, text=True,
+                                  encoding="utf-8", check=True)
             self.assertEqual(json.loads(plan.stdout)["selected_runner"], "nax-macos-2")
             metadata_request = {"selection": "flux1-asset-inventory", "runner": "nax-macos-2",
                                 "mode": "metadata"}
             self.assertEqual(assets.plan_request("mlx", metadata_request, sha, "none")["mode"], "metadata")
-            with patch.object(assets, "digest", side_effect=AssertionError("metadata read weight bytes")):
-                metadata = assets.inventory(hub, "nax-macos-2", metadata_only=True)
-            self.assertFalse(metadata["hashes_complete"])
-            self.assertNotIn("sha256", metadata["roles"]["control"]["candidates"][0])
-            self.assertFalse(metadata["cases"]["control-pose"]["ready"])
-            subprocess.run(command, env=env, check=True)
-            self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["runner"], "nax-macos-2")
+            with self.assertRaisesRegex(ValueError, "exact selection"):
+                assets.plan_request("mlx", {**metadata_request, "roots": ["flux1"]}, sha, "none")
+            subprocess.run(command, env=env, check=True, capture_output=True)
+            written = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(written["runner"], "nax-macos-2")
+            self.assertEqual(written["roles"]["control"]["status"], "unique")
             env["RUNNER_NAME"] = "nax-macos"
-            self.assertNotEqual(subprocess.run(command, env=env, capture_output=True, encoding="utf-8").returncode, 0)
+            self.assertNotEqual(subprocess.run(command, env=env, capture_output=True,
+                                               encoding="utf-8").returncode, 0)
             with self.assertRaisesRegex(ValueError, "backend and selected runner differ"):
                 assets.plan_request("candle-cuda", {"selection": "flux1-asset-inventory",
                                                      "runner": "nax-macos-2"}, sha, "none")
@@ -295,6 +290,23 @@ class ConditionalAssetInventory(unittest.TestCase):
                                                          "runner": "cuda-windows-2"}, sha, "none")
             self.assertIn("cuda-windows-2", windows["runner"])
             self.assertIn("real-weights", windows["runner"])
+
+    def test_inventoried_gemma_stages_through_the_proof_helper(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            hub = root / "hub"
+            hub.mkdir()
+            install_gemma(hub)
+            row = self.inventory(hub)["roles"]["pid_gemma"]["candidates"][0]
+            work = root / "proof"
+            work.mkdir()
+            with patch.dict(os.environ, FLUX1_HUB=str(hub)):
+                _, staged = conditional.prepare_assets(work, assets.ROOT,
+                                                       {"pid_gemma": {"path": row["path"],
+                                                                      "files": row["files"],
+                                                                      "revision": row["revision"]}})
+            self.assertEqual((Path(staged["pid_gemma"]["staged"]) / "config.json").read_bytes(),
+                             b"config.json")
 
 
 if __name__ == "__main__":

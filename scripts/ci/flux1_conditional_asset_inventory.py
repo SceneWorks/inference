@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """Manual, CPU-only inventory of installed FLUX.1 conditional proof assets.
 
-No download, model load, or inference takes place here. The output is a candidate
-manifest for operator review; byte digests, not cache revision labels, are authoritative.
+No model load or inference takes place here. The output is a candidate manifest for operator
+review; byte digests, not cache revision labels, are authoritative. The one network action is
+the opt-in `--stage-xlabs-ip-adapter` setup, which fetches exactly one pinned file.
+
+Discovery never lists a directory. On nax-macos-2, `os.scandir` blocked forever on the Hub root
+(run 42463079723) and on `models--SceneWorks--flux1-dev-mlx/snapshots` (run 42474515680), while
+`stat` probes returned in milliseconds. Each role therefore names the exact repository, file and
+revision the SceneWorks product ships for that FLUX.1 route; the inventory builds the
+`snapshots/<revision>/<file>` path and stats it in a child process with a per-call timeout. A
+timeout is reported as `unreachable`, never as absent. Other repositories that hold a file of
+the same name are ignored, so a role cannot be ambiguous.
 """
 import argparse
 import faulthandler
@@ -24,91 +33,95 @@ RUNNERS = {"nax-macos-2", "cuda-windows", "cuda-windows-2"}
 LANES = {"nax-macos-2": ["self-hosted", "macOS", "ARM64", "rw-llm"],
          "cuda-windows": ["self-hosted", "Windows", "X64", "cuda", "real-weights", "cuda-windows"],
          "cuda-windows-2": ["self-hosted", "Windows", "X64", "cuda", "real-weights", "cuda-windows-2"]}
-MAX_ENTRIES = 250_000
-MAX_CANDIDATES_PER_ROLE = 16
-MAX_GEMMA_FILES = 5_000
 MAX_HASH_BYTES = 120 * 1024**3
 MAX_SECONDS = 1_200
 MAX_METADATA_SECONDS = 300
+PROBE_TIMEOUT_SECONDS = 10.0
+MAX_REF_BYTES = 256
 SHA = re.compile(r"[0-9a-f]{40}")
-# Probe these documented cache repositories by exact name. Listing the Hub root can block on a
-# large shared cache before the normal time budget gets a chance to run.
-SOURCE_REPOS = (
-    "models--Shakker-Labs--FLUX.1-dev-ControlNet-Union-Pro-2.0",
-    "models--XLabs-AI--flux-ip-adapter",
-    "models--openai--clip-vit-large-patch14",
-    "models--guozinan--PuLID",
-    "models--QuanSun--EVA-CLIP",
-    "models--nvidia--PiD",
-    "models--google--gemma-2-2b-it",
-    "models--Efficient-Large-Model--gemma-2-2b-it",
-    "models--SceneWorks--gemma-2-2b-it",
-    "models--SceneWorks--flux1-dev-mlx",
-    "models--SceneWorks--flux1-schnell-mlx",
-    "models--black-forest-labs--FLUX.1-dev",
-    "models--SceneWorks--pid-flux",
-    "models--SceneWorks--pulid-flux-mlx",
-    "models--SceneWorks--instantid-mlx",
-)
-LOOSE_ROOTS = {"flux1", "flux.1", "pulid", "pid", "face", "converted", "conditional-assets"}
-ROOT_FILES = (("pulid", "pulid_flux_v0.9.1.safetensors"), ("pulid", "pulid.safetensors"),
-              ("eva", "eva02_clip_l_336.safetensors"), ("eva", "eva02_clip_l_14_336.safetensors"),
-              ("eva", "eva02_clip_l336.safetensors"), ("eva", "eva.safetensors"),
-              ("scrfd", "scrfd_10g.safetensors"), ("arcface", "arcface_iresnet100.safetensors"),
-              ("bisenet", "bisenet_parsing.safetensors"),
-              ("pid_decoder", "flux_2k.safetensors"), ("pid_decoder", "pid_decoder.safetensors"))
-GEMMA_REPOS = ("models--google--gemma-2-2b-it", "models--efficient-large-model--gemma-2-2b-it",
-               "models--sceneworks--gemma-2-2b-it")
+
+# The exact artifact the SceneWorks product ships for each FLUX.1 conditional role, at its pinned
+# revision: SceneWorks `crates/sceneworks-core/src/control_weights.rs` (SHIPPED_CONTROL_WEIGHTS
+# `flux1_dev_control`; SHIPPED_AUXILIARY_SOURCES flux_ip_adapter, flux_ip_encoder, pulid_adapter,
+# pulid_eva, pulid_bisenet, pulid_scrfd, pulid_arcface) and `config/manifests/registry/specs.json`
+# (`pid_flux` downloads and resources.pidDecoders.flux). The base FLUX.1 weights are not inventoried:
+# the comparison harness uses the frozen synthetic base fixture.
+PRODUCT_SOURCES = {
+    "control": ("Shakker-Labs/FLUX.1-dev-ControlNet-Union-Pro-2.0",
+                "diffusion_pytorch_model.safetensors", "5d700aaad96c5ddcdf8a38ef9b22a82aac2c38e5"),
+    "ip_adapter": ("XLabs-AI/flux-ip-adapter", "ip_adapter.safetensors",
+                   "18f6940238ab5dc3744df7a8e30315892279d5f9"),
+    "image_encoder": ("openai/clip-vit-large-patch14", "model.safetensors",
+                      "32bd64288804d66eefd0ccbe215aa642df71cc41"),
+    "pulid": ("guozinan/PuLID", "pulid_flux_v0.9.1.safetensors",
+              "492b1451255dc9d9bc3c857259690b5f8b998d4a"),
+    "eva": ("SceneWorks/pulid-flux-mlx", "eva02_clip_l_336.safetensors",
+            "78ef91f977eae16d66fb191caf003154b7a0a0b8"),
+    "bisenet": ("SceneWorks/pulid-flux-mlx", "bisenet_parsing.safetensors",
+                "78ef91f977eae16d66fb191caf003154b7a0a0b8"),
+    "scrfd": ("SceneWorks/instantid-mlx", "scrfd_10g.safetensors",
+              "bca0cacf8e5e04529bb2b326a521361b02be84fd"),
+    "arcface": ("SceneWorks/instantid-mlx", "arcface_iresnet100.safetensors",
+                "bca0cacf8e5e04529bb2b326a521361b02be84fd"),
+    "pid_decoder": ("SceneWorks/pid-flux", "pid_flux_2kto4k.safetensors",
+                    "6d5c1f1049e863f1757f68fd81c6bc850a95609d"),
+    # A directory role: its files are probed by the exact names below, never listed.
+    "pid_gemma": ("SceneWorks/gemma-2-2b-it", None, "684c553b5b41a1c835989d89f62f585e6269a7de"),
+}
+# Every file name a Gemma 2 2B snapshot may carry; indexed shards come from the index itself.
+GEMMA_FILES = (".gitattributes", "LICENSE", "NOTICE", "PROHIBITED_USE_POLICY.md", "README.md",
+               "config.json", "generation_config.json", "special_tokens_map.json",
+               "tokenizer.json", "tokenizer.model", "tokenizer_config.json",
+               "gemma-2-2b-it.safetensors", "model.safetensors", "model.safetensors.index.json")
+MAX_GEMMA_INDEX_BYTES = 4 * 1024 * 1024
+MAX_GEMMA_SHARDS = 64
+
+# The child stats or reads one path and prints a JSON line; a blocked filesystem call stays in it.
+PROBE_CHILD = r"""
+import json, os, sys
+op, path, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+row = {"exists": False}
+try:
+    info = os.stat(path)
+    row = {"exists": True, "is_file": os.path.isfile(path), "is_dir": os.path.isdir(path),
+           "size": info.st_size, "resolved": os.path.realpath(path)}
+    if op == "read" and row["is_file"]:
+        with open(path, "rb") as source:
+            row["text"] = source.read(limit + 1).decode("utf-8")
+except FileNotFoundError:
+    pass
+except NotADirectoryError:
+    pass
+sys.stdout.write(json.dumps(row))
+"""
 
 
-def validate_extra_roots(roots):
-    if (type(roots) is not list or len(roots) > 16
-            or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name)
-                   or name in {".", ".."} for name in roots)
-            or len(set(roots)) != len(roots)):
-        raise ValueError("inventory roots must be distinct single-segment cache names")
-    return roots
+class Unreachable(Exception):
+    """A filesystem probe did not return within its timeout."""
 
 
 def progress(message):
     print("FLUX1_ASSET_INVENTORY " + message, file=sys.stderr, flush=True)
 
 
-def role_for(path):
-    name = path.name.lower()
-    parts = [p.lower() for p in path.parts]
-    if name == "diffusion_pytorch_model.safetensors" and any("controlnet" in p for p in parts):
-        return "control"
-    if name == "control.safetensors" and any("flux" in p or "shakker" in p for p in parts):
-        return "control"
-    if name == "ip_adapter.safetensors" and any("flux" in p or "xlabs" in p for p in parts):
-        return "ip_adapter"
-    if name == "model.safetensors" and any("clip-vit-large-patch14" in p for p in parts):
-        return "image_encoder"
-    if name == "model.safetensors" and "image_encoder" in parts and any(
-            "flux-ip-adapter" in p or "xlabs" in p for p in parts):
-        return "image_encoder"
-    if name in {"pulid_flux_v0.9.1.safetensors", "pulid.safetensors"}:
-        return "pulid"
-    if name.endswith(".safetensors") and name.startswith("eva"):
-        return "eva"
-    if name == "scrfd_10g.safetensors":
-        return "scrfd"
-    if name == "arcface_iresnet100.safetensors":
-        return "arcface"
-    if name == "bisenet_parsing.safetensors":
-        return "bisenet"
-    if name in {"flux_2k.safetensors", "pid_decoder.safetensors"}:
-        return "pid_decoder"
-    return None
-
-
-def revision(path):
-    parts = path.parts
-    for index, part in enumerate(parts[:-2]):
-        if part.startswith("models--") and parts[index + 1] == "snapshots" and SHA.fullmatch(parts[index + 2]):
-            return parts[index + 2], "huggingface-cache-snapshot-path"
-    return "local-unpinned", "local-path-label-only"
+def probe(path, op="stat", limit=0, timeout=None):
+    """Stat (or read up to `limit` bytes of) one exact path in a child process."""
+    timeout = PROBE_TIMEOUT_SECONDS if timeout is None else timeout
+    child = subprocess.Popen([sys.executable, "-I", "-c", PROBE_CHILD, op, str(path), str(limit)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             stdin=subprocess.DEVNULL)
+    try:
+        out, err = child.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        try:
+            child.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass  # A child stuck in the kernel cannot be reaped; never block on it.
+        raise Unreachable(f"{op} {path} did not return within {timeout:g} s")
+    if child.returncode != 0:
+        raise ValueError(f"{op} probe failed for {path}: {err.decode('utf-8', 'replace').strip()}")
+    return json.loads(out.decode("utf-8"))
 
 
 class Budget:
@@ -129,153 +142,130 @@ class Budget:
             self.last_report = now
 
 
-def confined(path, hub):
-    resolved = path.resolve(strict=True)
+def cache_dir(hub, repo):
+    return hub / ("models--" + repo.replace("/", "--"))
+
+
+def confined(resolved, hub, path):
+    resolved = Path(resolved)
     if not resolved.is_relative_to(hub):
         raise ValueError("asset candidate escapes configured model hub: " + str(path))
     return resolved
 
 
-def digest(path, hub, budget):
+def digest(path, resolved, hub, budget, size):
     budget.stage = "hash " + str(path.relative_to(hub))
-    budget.check()
-    resolved = confined(path, hub)
-    if not resolved.is_file():
-        raise ValueError("asset candidate is not a file: " + str(path))
-    before = resolved.stat()
-    budget.check(before.st_size)
+    budget.check(size)
     sha = hashlib.sha256()
-    with resolved.open("rb") as source:
+    with Path(resolved).open("rb") as source:
         while chunk := source.read(8 * 1024 * 1024):
             budget.check(len(chunk))
             sha.update(chunk)
             budget.bytes += len(chunk)
-    after = resolved.stat()
-    if confined(path, hub) != resolved or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+    if budget.bytes and Path(resolved).stat().st_size != size:
         raise ValueError("asset candidate changed during inventory: " + str(path))
-    return sha.hexdigest(), before.st_size
+    return sha.hexdigest()
 
 
-def gemma_files(directory, hub, budget):
-    resolved = confined(directory, hub)
-    if not resolved.is_dir():
+def stat_file(path, hub, budget):
+    budget.check()
+    row = probe(path)
+    if not row["exists"]:
+        return None
+    if not row["is_file"]:
+        raise ValueError("asset candidate is not a file: " + str(path))
+    return confined(row["resolved"], hub, path), row["size"]
+
+
+def file_row(path, hub, budget, metadata_only, revision, provenance):
+    found = stat_file(path, hub, budget)
+    if found is None:
+        return None
+    resolved, size = found
+    row = {"path": str(path), "resolved": str(resolved), "revision": revision,
+           "revision_provenance": provenance, "bytes": size}
+    if not metadata_only:
+        row["sha256"] = digest(path, resolved, hub, budget, size)
+    return row
+
+
+def gemma_row(snapshot, hub, budget, metadata_only, revision, provenance):
+    budget.check()
+    directory = probe(snapshot)
+    if not directory["exists"]:
+        return None
+    if not directory["is_dir"]:
         raise ValueError("PiD Gemma candidate is not a directory")
+    names = list(GEMMA_FILES)
+    index = probe(snapshot / "model.safetensors.index.json", op="read", limit=MAX_GEMMA_INDEX_BYTES)
+    if index["exists"] and index.get("is_file"):
+        if len(index["text"].encode("utf-8")) > MAX_GEMMA_INDEX_BYTES:
+            raise ValueError("PiD Gemma shard index exceeds byte limit")
+        try:
+            shards = sorted(set(json.loads(index["text"])["weight_map"].values()))
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
+            raise ValueError("PiD Gemma shard index is invalid") from error
+        if len(shards) > MAX_GEMMA_SHARDS or not all(
+                isinstance(name, str) and re.fullmatch(r"model-\d{5}-of-\d{5}\.safetensors", name)
+                for name in shards):
+            raise ValueError("PiD Gemma shard index is invalid")
+        names += shards
     files = {}
-    def fail_walk(error):
-        raise error
-
-    for base, dirs, names in os.walk(directory, followlinks=False, onerror=fail_walk):
-        dirs.sort()
-        names.sort()
-        for name in dirs[:]:
-            if (Path(base) / name).is_symlink():
-                raise ValueError("PiD Gemma has a symlink directory")
-        for name in names:
-            path = Path(base) / name
-            relative = path.relative_to(directory).as_posix()
-            if len(files) >= MAX_GEMMA_FILES:
-                raise ValueError("PiD Gemma file budget exceeded")
-            files[relative] = digest(path, hub, budget)[0]
-    return files
-
-
-def gemma_metadata(directory, hub, budget):
-    """List confined Gemma file names and sizes without reading model bytes."""
-    resolved = confined(directory, hub)
-    if not resolved.is_dir():
-        raise ValueError("PiD Gemma candidate is not a directory")
-    files = {}
-    def fail_walk(error):
-        raise error
-    for base, dirs, names in os.walk(directory, followlinks=False, onerror=fail_walk):
-        dirs.sort()
-        names.sort()
-        for name in dirs:
-            if (Path(base) / name).is_symlink():
-                raise ValueError("PiD Gemma has a symlink directory")
-        for name in names:
-            budget.check()
-            if len(files) >= MAX_GEMMA_FILES:
-                raise ValueError("PiD Gemma file budget exceeded")
-            path = Path(base) / name
-            target = confined(path, hub)
-            if not target.is_file():
-                raise ValueError("PiD Gemma entry is not a file")
-            files[path.relative_to(directory).as_posix()] = target.stat().st_size
-    return files
-
-
-def search_roots(hub, budget, extra_roots=()):
-    """Inspect only FLUX.1-related HF snapshots and named loose asset directories.
-
-    A Hub cache stores payloads under opaque `blobs/` names. Snapshot symlinks expose the
-    candidate filenames, so walking every blob and unrelated model tree adds no discovery.
-    """
-    roots = []
-    names = sorted(set(SOURCE_REPOS) | LOOSE_ROOTS | set(validate_extra_roots(list(extra_roots))))
-    progress(f"probing_explicit_roots={len(names)}")
     for name in names:
-        budget.check()
-        child = hub / name
-        if name.lower().startswith("models--"):
-            if child.is_symlink():
-                raise ValueError("selected model cache directory is a symlink: " + str(child))
-            snapshots = child / "snapshots"
-            if snapshots.is_symlink():
-                raise ValueError("selected snapshot directory is a symlink: " + str(snapshots))
-            if snapshots.is_dir():
-                roots.append(snapshots)
+        found = stat_file(snapshot / name, hub, budget)
+        if found is None:
+            continue
+        resolved, size = found
+        files[name] = size if metadata_only else digest(snapshot / name, resolved, hub, budget, size)
+    row = {"path": str(snapshot), "resolved": str(confined(directory["resolved"], hub, snapshot)),
+           "revision": revision, "revision_provenance": provenance,
+           "file_bytes" if metadata_only else "files": files}
+    try:
+        require_pid_gemma_footprint(snapshot, files)
+        row["complete"] = True
+    except ValueError as error:
+        row["complete"] = False
+        row["incomplete_reason"] = str(error)
+    return row
+
+
+def role_inventory(role, hub, budget, metadata_only):
+    """Select the product-pinned artifact; report refs/main only as an off-pin diagnostic."""
+    repo, name, pinned = PRODUCT_SOURCES[role]
+    progress(f"role={role} repo={repo}")
+    entry = {"repo": repo, "file": name, "pinned_revision": pinned}
+    base = cache_dir(hub, repo)
+    collect = gemma_row if name is None else file_row
+
+    def candidate(revision, provenance):
+        target = base / "snapshots" / revision
+        return collect(target if name is None else target / name, hub, budget, metadata_only,
+                       revision, provenance)
+
+    try:
+        if pinned is not None:
+            row = candidate(pinned, "product-manifest-pin")
+            if row is not None:
+                status = "incomplete" if name is None and not row["complete"] else "unique"
+                return {**entry, "status": status, "candidates": [row]}
+        ref = probe(base / "refs" / "main", op="read", limit=MAX_REF_BYTES)
+        revision = ref.get("text", "").strip() if ref["exists"] and ref.get("is_file") else ""
+        if not SHA.fullmatch(revision) or revision == pinned:
+            return {**entry, "status": "missing", "candidates": []}
+        row = candidate(revision, "huggingface-refs-main")
+        if row is None:
+            return {**entry, "status": "missing", "candidates": []}
+        if pinned is None:
+            status = "incomplete" if name is None and not row["complete"] else "unique"
         else:
-            if child.is_symlink():
-                raise ValueError("selected loose asset directory is a symlink: " + str(child))
-            if child.is_dir():
-                roots.append(child)
-    files = [(role, hub / name) for role, name in ROOT_FILES if (hub / name).is_file()]
-    progress(f"selected_roots={len(roots)} root_files={len(files)}")
-    return roots, files
+            status = "off_pin"
+        return {**entry, "status": status, "candidates": [row]}
+    except Unreachable as error:
+        progress(f"role={role} unreachable: {error}")
+        return {**entry, "status": "unreachable", "candidates": [], "unreachable": str(error)}
 
 
-def candidates(hub, budget, extra_roots=()):
-    found = {role: [] for _, _, roles in CASES.values() for role in roles}
-    roots, root_files = search_roots(hub, budget, extra_roots)
-    entries = len(roots) + len(root_files)
-    def fail_walk(error):
-        raise error
-
-    for role, path in root_files:
-        found[role].append(path)
-    for root in roots:
-        budget.stage = "scan " + str(root.relative_to(hub))
-        progress(f"scanning={root.relative_to(hub)}")
-        if root.name == "snapshots" and root.parent.name.lower() in GEMMA_REPOS:
-            for snapshot in sorted(root.iterdir()):
-                budget.check()
-                if snapshot.is_dir() and SHA.fullmatch(snapshot.name):
-                    found["pid_gemma"].append(snapshot)
-        for base, dirs, names in os.walk(root, followlinks=False, onerror=fail_walk):
-            dirs.sort()
-            names.sort()
-            for name in dirs[:]:
-                if (Path(base) / name).is_symlink():
-                    dirs.remove(name)
-            entries += len(dirs) + len(names)
-            if entries > MAX_ENTRIES:
-                raise ValueError("asset inventory entry budget exceeded")
-            budget.check()
-            for name in names:
-                path = Path(base) / name
-                role = role_for(path)
-                if role:
-                    found[role].append(path)
-                    if len(found[role]) > MAX_CANDIDATES_PER_ROLE:
-                        raise ValueError("too many candidates for role: " + role)
-    if len(found["pid_gemma"]) > MAX_CANDIDATES_PER_ROLE:
-        raise ValueError("too many candidates for role: pid_gemma")
-    progress(f"discovered_entries={entries} candidates={sum(len(paths) for paths in found.values())}")
-    return found, entries, roots
-
-
-def inventory(hub, runner, metadata_only=False, extra_roots=()):
+def inventory(hub, runner, metadata_only=False):
     if runner not in RUNNERS:
         raise ValueError("runner is not an approved conditional proof host")
     progress(f"resolve_hub mode={'metadata' if metadata_only else 'hash'}")
@@ -283,82 +273,81 @@ def inventory(hub, runner, metadata_only=False, extra_roots=()):
     if not hub.is_dir():
         raise ValueError("configured model hub is not a directory")
     budget = Budget(MAX_METADATA_SECONDS if metadata_only else None)
-    found, entries, roots = candidates(hub, budget, extra_roots)
-    roles = {}
-    for role, paths in sorted(found.items()):
-        rows = []
-        for path in paths:
-            progress(f"role={role} candidate={path.relative_to(hub)}")
-            resolved = confined(path, hub)
-            rev, provenance = revision(path)
-            row = {"path": str(path), "resolved": str(resolved), "revision": rev,
-                   "revision_provenance": provenance}
-            if role == "pid_gemma":
-                if metadata_only:
-                    row["file_bytes"] = gemma_metadata(path, hub, budget)
-                    footprint = row["file_bytes"]
-                else:
-                    row["files"] = gemma_files(path, hub, budget)
-                    footprint = row["files"]
-                try:
-                    require_pid_gemma_footprint(path, footprint)
-                    row["complete"] = True
-                except ValueError as error:
-                    row["complete"] = False
-                    row["incomplete_reason"] = str(error)
-            else:
-                if metadata_only:
-                    if not resolved.is_file():
-                        raise ValueError("asset candidate is not a file: " + str(path))
-                    row["bytes"] = resolved.stat().st_size
-                else:
-                    row["sha256"], row["bytes"] = digest(path, hub, budget)
-            rows.append(row)
-        roles[role] = {"status": "missing" if not rows else "ambiguous" if len(rows) > 1 else
-                       "incomplete" if role == "pid_gemma" and not rows[0]["complete"] else "unique",
-                       "candidates": rows}
-    cases = {}
     backend = "mlx" if runner == "nax-macos-2" else "candle-cuda"
+    needed = sorted({role for _, backends, roles in CASES.values() if backend in backends
+                     for role in roles})
+    roles = {role: role_inventory(role, hub, budget, metadata_only) for role in needed}
+    cases = {}
     for case, (_, backends, required) in CASES.items():
         if backend in backends:
-            cases[case] = {"ready": not metadata_only and all(roles[role]["status"] == "unique" for role in required),
+            cases[case] = {"ready": not metadata_only and all(roles[role]["status"] == "unique"
+                                                              for role in required),
                            "roles": list(required)}
-    return {"schema": 1, "protocol": "flux1-conditional-asset-inventory-v1", "runner": runner,
+
+    def with_status(status):
+        return sorted(role for role, row in roles.items() if row["status"] == status)
+
+    return {"schema": 2, "protocol": "flux1-conditional-asset-inventory-v2", "runner": runner,
             "backend": backend, "hub": str(hub), "mode": "metadata" if metadata_only else "hash",
-            "hashes_complete": not metadata_only, "entries_scanned": entries,
-            "search_roots": [str(root.relative_to(hub)) for root in roots],
-            "requested_extra_roots": list(extra_roots),
-            "hash_bytes": budget.bytes, "revision_note": "snapshot path is a provenance label; SHA-256 is authoritative",
-            "missing_roles": sorted(role for role, row in roles.items() if row["status"] == "missing"),
-            "ambiguous_roles": sorted(role for role, row in roles.items() if row["status"] == "ambiguous"),
-            "incomplete_roles": sorted(role for role, row in roles.items() if row["status"] == "incomplete"),
+            "hashes_complete": not metadata_only, "hash_bytes": budget.bytes,
+            "selection_rule": "product-manifest repository/file/revision only; other repositories ignored",
+            "revision_note": "snapshot path is a provenance label; SHA-256 is authoritative",
+            "missing_roles": with_status("missing"), "off_pin_roles": with_status("off_pin"),
+            "unreachable_roles": with_status("unreachable"),
+            "incomplete_roles": with_status("incomplete"),
             "roles": roles, "cases": cases}
+
+
+def stage_xlabs_ip_adapter(hub, download=None):
+    """Fetch exactly the product-pinned XLabs adapter file into the runner's Hub cache."""
+    repo, name, revision = PRODUCT_SOURCES["ip_adapter"]
+    hub = Path(hub).expanduser().resolve(strict=True)
+    expected = cache_dir(hub, repo) / "snapshots" / revision / name
+    present_before = probe(expected)["exists"]
+    if download is None:
+        from huggingface_hub import hf_hub_download
+        download = hf_hub_download
+    fetched = Path(download(repo_id=repo, filename=name, revision=revision, cache_dir=str(hub),
+                            token=False))
+    if os.path.normcase(os.path.abspath(fetched)) != os.path.normcase(str(expected)):
+        raise ValueError("Hub fetched the XLabs adapter into a different snapshot path")
+    resolved = confined(fetched.resolve(strict=True), hub, fetched)
+    sha = hashlib.sha256()
+    with resolved.open("rb") as source:
+        while chunk := source.read(8 * 1024 * 1024):
+            sha.update(chunk)
+    return {"protocol": "flux1-xlabs-ip-adapter-staging-v1", "repo": repo, "file": name,
+            "revision": revision, "path": str(fetched), "resolved": str(resolved),
+            "bytes": resolved.stat().st_size, "sha256": sha.hexdigest(),
+            "present_before": present_before}
 
 
 def plan_request(backend, request, expected_sha, tier):
     if (type(request) is not dict or not {"selection", "runner"} <= set(request)
-            or set(request) - {"selection", "runner", "mode", "roots"}
+            or set(request) - {"selection", "runner", "mode"}
             or request["selection"] != "flux1-asset-inventory"):
         raise ValueError("inventory needs exact selection, runner and optional mode")
     mode = request.get("mode", "hash")
     if mode not in {"hash", "metadata"}:
         raise ValueError("inventory mode must be hash or metadata")
-    roots = validate_extra_roots(request.get("roots", []))
     runner = request["runner"]
     if runner not in RUNNERS or backend != ("mlx" if runner == "nax-macos-2" else "candle-cuda"):
         raise ValueError("inventory backend and selected runner differ")
     if tier != "none":
         raise ValueError("asset inventory requires flux1_pair=none")
-    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
+                                   encoding="utf-8").strip()
     if expected_sha != head:
         raise ValueError("inventory source SHA differs from checked-out branch")
     return {"runner": LANES[runner], "asset_setup": "flux1-asset-inventory", "selected_runner": runner,
-            "backend": backend, "source_sha": head, "mode": mode, "roots": roots}
+            "backend": backend, "source_sha": head, "mode": mode}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", action="store_true")
+    parser.add_argument("--stage-xlabs-ip-adapter", action="store_true",
+                        help="fetch the pinned XLabs adapter into FLUX1_HUB, then write a receipt")
     parser.add_argument("--backend", choices=("mlx", "candle-cuda"), required=True)
     parser.add_argument("--request-env", required=True)
     parser.add_argument("--expected-sha", required=True)
@@ -388,15 +377,19 @@ def main():
     root = os.environ.get("FLUX1_HUB")
     if not root:
         parser.error("FLUX1_HUB is required")
-    progress(f"start runner={plan['selected_runner']} mode={plan['mode']}")
+    progress(f"start runner={plan['selected_runner']} mode={plan['mode']} "
+             f"stage_xlabs_ip_adapter={args.stage_xlabs_ip_adapter}")
     try:
-        result = inventory(root, plan["selected_runner"], metadata_only=plan["mode"] == "metadata",
-                           extra_roots=plan["roots"])
+        if args.stage_xlabs_ip_adapter:
+            result = stage_xlabs_ip_adapter(root)
+        else:
+            result = inventory(root, plan["selected_runner"], metadata_only=plan["mode"] == "metadata")
     finally:
         faulthandler.cancel_dump_traceback_later()
         if hasattr(signal, "SIGALRM"):
             signal.alarm(0)
     result["source_sha"] = plan["source_sha"]
+    result["runner"] = plan["selected_runner"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
