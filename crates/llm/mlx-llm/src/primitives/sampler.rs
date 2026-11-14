@@ -236,9 +236,23 @@ impl Default for SamplingParams {
 }
 
 impl SamplingParams {
+    /// Exact backend-neutral controls consumed by this sampler.
+    pub fn to_core(&self) -> core_llm::Sampling {
+        core_llm::Sampling {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            presence_penalty: self.presence_penalty,
+            presence_penalty_generated_only: self.presence_penalty_generated_only,
+            repetition_penalty: self.repetition_penalty,
+            repetition_context: self.repetition_context,
+        }
+    }
+
     /// Reset the generated-only presence boundary for an independently admitted batch lane.
     pub fn for_prompt(mut self, prompt_len: usize) -> Self {
         self.presence_penalty_prompt_len = prompt_len;
+        core_llm::token_execution::observe_token_prompt_boundary(prompt_len);
         self
     }
 

@@ -88,6 +88,22 @@ pub struct GenerationConfig {
     pub stop_tokens: Vec<i32>,
 }
 
+impl GenerationConfig {
+    /// Resolve and observe the seed where the actual decoder creates its RNG.
+    pub(crate) fn execution_seed(&self) -> u64 {
+        let seed = core_llm::token_execution::observe_token_seed(
+            self.sampling.to_core(),
+            self.seed.unwrap_or_else(default_seed),
+            self.max_new_tokens,
+            &self.stop_tokens,
+        );
+        core_llm::token_execution::observe_token_prompt_boundary(
+            self.sampling.presence_penalty_prompt_len,
+        );
+        seed
+    }
+}
+
 impl Default for GenerationConfig {
     fn default() -> Self {
         Self {
@@ -238,7 +254,7 @@ pub(crate) fn generate_with_observer(
         return Err(Error::Msg("generate: empty prompt".into()));
     }
 
-    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    let rng = SplitMix64::new(config.execution_seed());
     let output = {
         let mut cache = decoder.make_cache();
         // Ownership events are recorded only for an attached campaign observer.
@@ -435,7 +451,7 @@ pub fn generate_with_cache(
         )));
     }
 
-    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    let rng = SplitMix64::new(config.execution_seed());
     let suffix = input_ids(&prompt_ids[offset..]);
     core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
     let logits = decoder.step(&suffix, cache, offset as i32)?;
@@ -483,7 +499,7 @@ pub fn generate_from_prefill(
     if cancel.is_cancelled() {
         return Err(Error::Canceled); // typed pre-inference cancel
     }
-    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    let rng = SplitMix64::new(config.execution_seed());
     decode_loop(
         decoder,
         cache,
@@ -518,7 +534,7 @@ pub(crate) fn generate_with_cache_observed(
             "generate_with_cache_observed requires a prompt and an empty cache".into(),
         ));
     }
-    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    let rng = SplitMix64::new(config.execution_seed());
     core_llm::report_generation_phase(core_llm::GenerationPhase::Prefilling);
     let logits = decoder.step(&input_ids(prompt_ids), cache, 0)?;
     decode_loop(
@@ -553,7 +569,7 @@ pub(crate) fn generate_from_prefill_observed(
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
-    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    let rng = SplitMix64::new(config.execution_seed());
     decode_loop(
         decoder,
         cache,
@@ -1462,5 +1478,47 @@ mod timing_tests {
         assert!(completed.prefill.is_some());
         assert!(completed.decode_started.is_some());
         let _measured = completed.finish();
+    }
+}
+
+#[cfg(test)]
+mod execution_seed_tests {
+    use super::*;
+
+    #[test]
+    fn actual_config_seed_and_fallback_are_observed_without_model_execution() {
+        for seed in [Some(71), None] {
+            let scope = core_llm::token_execution::TokenExecutionScope::new();
+            let config = GenerationConfig {
+                seed,
+                sampling: SamplingParams {
+                    temperature: 1.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let resolved = config.execution_seed();
+            if let Some(seed) = seed {
+                assert_eq!(resolved, seed);
+            }
+            let output = core_llm::TextLlmOutput {
+                finish_reason: Some(core_llm::FinishReason::Stop),
+                decode: Some(core_llm::DecodeReport::default()),
+                ..Default::default()
+            };
+            let descriptor = core_llm::TextLlmDescriptor {
+                id: "seed-test".into(),
+                backend: "test".into(),
+                family: "test".into(),
+                capabilities: Default::default(),
+            };
+            let completed = scope.finish_text(output, &descriptor).unwrap();
+            let core_llm::ExecutionRandomness::Draws { draws, .. } =
+                &completed.execution.resolved().unwrap().randomness
+            else {
+                panic!("seed mapping expected")
+            };
+            assert_eq!(draws[0].seed, Some(resolved));
+        }
     }
 }

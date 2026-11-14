@@ -58,7 +58,7 @@ use crate::decode::record::{DecodePath, DecodeRecord, RequestSpan};
 use crate::decode::speculative::SpeculativeStats;
 use crate::decode::step::{LogitsScope, StepModel, StepRequest, StepTokens};
 use crate::decode::stream::{
-    default_seed, ConstraintMask, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
+    ConstraintMask, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
 };
 use crate::error::{Error, Result};
 use crate::primitives::decode_cache::{CacheMemory, DecodeCache};
@@ -618,7 +618,7 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
         core_llm::report_generation_phase(core_llm::GenerationPhase::Generating);
     }
 
-    let mut rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    let mut rng = SplitMix64::new(config.execution_seed());
     let greedy = config.sampling.temperature <= 0.0;
     let plain_greedy = config.sampling.is_plain_greedy();
     let mut generated: Vec<i32> = Vec::new();

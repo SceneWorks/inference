@@ -35,9 +35,7 @@ use core_llm::{PrefixAdmission, PrefixReuse, PrefixStore};
 use crate::decode::cancel::CancelFlag;
 use crate::decode::proposers::MtpBoundary;
 use crate::decode::step::{StepModel, StepRequest};
-use crate::decode::stream::{
-    decode_loop, default_seed, GenerationConfig, GenerationOutput, StreamEvent,
-};
+use crate::decode::stream::{decode_loop, GenerationConfig, GenerationOutput, StreamEvent};
 use crate::error::{Error, Result};
 use crate::models::{CausalLm, Qwen35Cache, Qwen35PrefixState};
 use crate::primitives::decode_cache::{tensor_bytes, DecodeCache};
@@ -514,7 +512,7 @@ pub fn generate_cached(
         return Err(Error::Msg("generate_cached: empty prompt".into()));
     }
 
-    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    let rng = SplitMix64::new(config.execution_seed());
     let mut cache = model.new_cache();
     let matched_len = prefix_cache
         .restore_into(&mut cache, prompt_ids, false)?
