@@ -108,7 +108,7 @@ impl TokenExecutionScope {
                     else { ExecutionFact::resolved(json!(observed.image_schedules)) },
                 estimator:if image_count > 0 {ExecutionFact::resolved("flow_velocity_from_predicted_pixels")} else {ExecutionFact::not_applicable("autoregressive token decode")},
                 randomness:if observed.document_draws.is_empty() {
-                    ExecutionRandomness::NoDraws {reason:"Greedy token decoding; no image noise was consumed".into()}
+                    ExecutionRandomness::NoDraws {reason:"Token segments used greedy sampling or performed no token draw; no image noise was consumed".into()}
                 } else {ExecutionRandomness::Draws {scheme:format!("splitmix64-token-stream-v1; images:{:?}",observed.image_schemes),draws:observed.document_draws.clone()}},
                 deterministic_replay:ExecutionReplaySupport::Deterministic {scope:"Same pinned model/tokenizer bytes, inference revision, device, dtype and effective memory/attention policy; identical conditioning and recorded noise streams".into()},
                 geometry:ExecutionFact::resolved(output_policy.clone()),
@@ -255,6 +255,15 @@ pub fn observe_decode(decode: &DecodeReport) {
             .last_mut()
             .filter(|frame| !frame.suspended)
         {
+            if decode.sampler == "none" {
+                // Construction records a possible RNG stream, not proof that it drew. A
+                // zero-budget segment can complete before sampling even at positive temperature.
+                // Reconcile this segment alone, preserving the order of later token/image draws.
+                let purpose = format!("text_segment_{}", attempt.decodes.len());
+                attempt
+                    .document_draws
+                    .retain(|draw| draw.purpose != purpose);
+            }
             attempt.decodes.push(format!("{decode:?}"));
         }
     });
@@ -548,6 +557,57 @@ mod document_tests {
         assert!(draws[1].seed.is_none());
         assert_eq!(draws[1].noise_sha256.as_ref().unwrap().len(), 64);
         assert!(format!("{:?}", identity.schedule).contains("f32_le_bits"));
+    }
+
+    #[test]
+    fn positive_temperature_zero_budget_vqa_has_no_random_draws() {
+        let scope = TokenExecutionScope::new();
+        observe_token_seed(Sampling::default(), 42, 0, &[]);
+        observe_decode(&DecodeReport {
+            sampler: "none".into(),
+            ..Default::default()
+        });
+        let execution = scope.finish_document("vqa", "candle", json!({"format":"text"}));
+        execution.validate("vqa", "candle", 1).unwrap();
+        assert!(matches!(
+            execution.resolved().unwrap().randomness,
+            ExecutionRandomness::NoDraws { .. }
+        ));
+    }
+
+    #[test]
+    fn zero_budget_segment_preserves_subsequent_image_and_token_draws() {
+        let scope = TokenExecutionScope::new();
+        observe_token_seed(Sampling::default(), 42, 0, &[]);
+        observe_decode(&DecodeReport {
+            sampler: "none".into(),
+            ..Default::default()
+        });
+        observe_document_image(0, "splitmix64-box-muller-v1", Some(42), None);
+        observe_image_schedule(&[0.0, 1.0]);
+        observe_token_seed(Sampling::default(), 42, 8, &[]);
+        observe_decode(&DecodeReport {
+            sampler: "host:reference".into(),
+            ..Default::default()
+        });
+        let execution = scope.finish_document(
+            "interleave",
+            "mlx",
+            json!({"format":"interleaved_document", "image_count":1}),
+        );
+        execution.validate("interleave", "mlx", 1).unwrap();
+        let ExecutionRandomness::Draws { draws, .. } = &execution.resolved().unwrap().randomness
+        else {
+            panic!("image and sampled token draws expected");
+        };
+        assert_eq!(
+            draws
+                .iter()
+                .map(|draw| draw.purpose.as_str())
+                .collect::<Vec<_>>(),
+            ["image_0", "text_segment_1"]
+        );
+        assert!(draws.iter().all(|draw| draw.seed == Some(42)));
     }
 
     #[test]
