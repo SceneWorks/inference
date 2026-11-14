@@ -1125,6 +1125,324 @@
         "win32"
       ],
       "reason": "Only descriptor, load metadata, scalar schedule nodes and request identity are inspected. No generator or device is loaded."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "render::tests::multi_pass_plan_compiles_before_load_and_binds_produced_reference_by_shape",
+      "source": "crates/contracts/gen-core/src/render/tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Tensor-free multi-pass compiler over a mock descriptor: scalar schedules, placeholder reference bytes and memory-scope identity records only. No model, tensor or device work executes."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "render::tests::multi_pass_plan_refuses_invalid_pass_shapes_before_load",
+      "source": "crates/contracts/gen-core/src/render/tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Tensor-free multi-pass compiler over a mock descriptor: scalar schedules, placeholder reference bytes and memory-scope identity records only. No model, tensor or device work executes."
+    },
+    {
+      "package": "sceneworks-gen-core",
+      "kind": "lib",
+      "target": "gen_core",
+      "test": "render::tests::single_pass_plans_keep_pass_zero_and_digest_binding",
+      "source": "crates/contracts/gen-core/src/render/tests.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Tensor-free multi-pass compiler over a mock descriptor: scalar schedules, placeholder reference bytes and memory-scope identity records only. No model, tensor or device work executes."
+    },
+    {
+      "package": "mlx-gen-flux",
+      "kind": "lib",
+      "target": "mlx_gen_flux",
+      "test": "model::tests::xlabs_ip_plan_refuses_zero_steps_and_invalid_sizes_before_load",
+      "source": "crates/media/mlx-gen/mlx-gen-flux/src/model.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Only registration, request/load metadata validation and scalar schedule arithmetic (linspace on a CPU stream) execute against nonexistent weight paths. No model is loaded and no learned or Metal compute runs."
+    },
+    {
+      "package": "mlx-gen-flux",
+      "kind": "lib",
+      "target": "mlx_gen_flux",
+      "test": "model::tests::xlabs_ip_hires_fix_compiles_two_passes_before_load",
+      "source": "crates/media/mlx-gen/mlx-gen-flux/src/model.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Only registration, request/load metadata validation and scalar schedule arithmetic (linspace on a CPU stream) execute against nonexistent weight paths. No model is loaded and no learned or Metal compute runs."
+    },
+    {
+      "package": "mlx-gen-flux",
+      "kind": "lib",
+      "target": "mlx_gen_flux",
+      "test": "model_control::tests::control_plan_freezes_native_schedule_and_source_before_load",
+      "source": "crates/media/mlx-gen/mlx-gen-flux/src/model_control.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Only registration, request/load metadata validation and scalar schedule arithmetic (linspace on a CPU stream) execute against nonexistent weight paths. No model is loaded and no learned or Metal compute runs."
+    },
+    {
+      "package": "mlx-gen-flux",
+      "kind": "lib",
+      "target": "mlx_gen_flux",
+      "test": "model_control::tests::control_plan_refuses_missing_overlay_and_mixed_modes_before_load",
+      "source": "crates/media/mlx-gen/mlx-gen-flux/src/model_control.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Only registration, request/load metadata validation and scalar schedule arithmetic (linspace on a CPU stream) execute against nonexistent weight paths. No model is loaded and no learned or Metal compute runs."
+    },
+    {
+      "package": "mlx-gen-flux",
+      "kind": "lib",
+      "target": "mlx_gen_flux",
+      "test": "model_control::tests::control_plan_refuses_zero_steps_and_invalid_sizes_before_load",
+      "source": "crates/media/mlx-gen/mlx-gen-flux/src/model_control.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Only registration, request/load metadata validation and scalar schedule arithmetic (linspace on a CPU stream) execute against nonexistent weight paths. No model is loaded and no learned or Metal compute runs."
+    },
+    {
+      "package": "mlx-gen-pulid",
+      "kind": "lib",
+      "target": "mlx_gen_pulid",
+      "test": "pulid_flux::tests::constructed_model_plans_without_identity_paths_but_keeps_request_binding",
+      "source": "crates/media/mlx-gen/mlx-gen-pulid/src/pulid_flux.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Only registration, request/load metadata validation and scalar schedule arithmetic (linspace on a CPU stream) execute against nonexistent weight paths. No model is loaded and no learned or Metal compute runs."
+    },
+    {
+      "package": "mlx-gen-pulid",
+      "kind": "lib",
+      "target": "mlx_gen_pulid",
+      "test": "pulid_flux::tests::pulid_plan_binds_face_and_identity_slots_before_load",
+      "source": "crates/media/mlx-gen/mlx-gen-pulid/src/pulid_flux.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Only registration, request/load metadata validation and scalar schedule arithmetic (linspace on a CPU stream) execute against nonexistent weight paths. No model is loaded and no learned or Metal compute runs."
+    },
+    {
+      "package": "mlx-gen-pulid",
+      "kind": "lib",
+      "target": "mlx_gen_pulid",
+      "test": "pulid_flux::tests::pulid_plan_refuses_zero_steps_and_invalid_sizes_before_load",
+      "source": "crates/media/mlx-gen/mlx-gen-pulid/src/pulid_flux.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Only registration, request/load metadata validation and scalar schedule arithmetic (linspace on a CPU stream) execute against nonexistent weight paths. No model is loaded and no learned or Metal compute runs."
+    },
+    {
+      "package": "mlx-gen-pulid",
+      "kind": "lib",
+      "target": "mlx_gen_pulid",
+      "test": "pulid_flux::tests::constructed_model_generate_refuses_post_load_compile",
+      "source": "crates/media/mlx-gen/mlx-gen-pulid/src/pulid_flux.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin"
+      ],
+      "reason": "Builds the weight-free PuLID fixture (scalar zero arrays, no forward) and asserts generate refuses before any plan, encode or denoise. No learned or Metal compute runs."
+    },
+    {
+      "package": "candle-gen-flux",
+      "kind": "lib",
+      "target": "candle_gen_flux",
+      "test": "control_provider::tests::control_plan_freezes_source_schedule_and_overlay_without_weights",
+      "source": "crates/media/candle-gen/candle-gen-flux/src/control_provider.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Pre-load plan compile and refusal checks over nonexistent or empty fixture paths: descriptor, load metadata, scalar schedule nodes and request identity only. No generator, tensor or device is loaded."
+    },
+    {
+      "package": "candle-gen-flux",
+      "kind": "lib",
+      "target": "candle_gen_flux",
+      "test": "ip_provider::tests::ip_plan_binds_reference_and_encoder_before_loading_weights",
+      "source": "crates/media/candle-gen/candle-gen-flux/src/ip_provider.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Pre-load plan compile and refusal checks over nonexistent or empty fixture paths: descriptor, load metadata, scalar schedule nodes and request identity only. No generator, tensor or device is loaded."
+    },
+    {
+      "package": "candle-gen-pulid",
+      "kind": "lib",
+      "target": "candle_gen_pulid",
+      "test": "pulid_flux::tests::pulid_plan_binds_face_identity_and_pid_before_weights",
+      "source": "crates/media/candle-gen/candle-gen-pulid/src/pulid_flux.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Pre-load plan compile and refusal checks over nonexistent or empty fixture paths: descriptor, load metadata, scalar schedule nodes and request identity only. No generator, tensor or device is loaded."
+    },
+    {
+      "package": "candle-gen-flux",
+      "kind": "lib",
+      "target": "candle_gen_flux",
+      "test": "preview::tests::every_flux1_render_route_passes_a_preview_hook",
+      "source": "crates/media/candle-gen/candle-gen-flux/src/preview.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Source-text scan of the crate's own shipped files (include_str!) for the planned span-sampler call shape. No generator is constructed and nothing executes."
+    },
+    {
+      "package": "candle-gen-flux",
+      "kind": "lib",
+      "target": "candle_gen_flux",
+      "test": "preview::tests::every_control_entry_point_reaches_the_one_hooked_site",
+      "source": "crates/media/candle-gen/candle-gen-flux/src/preview.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Source-text scan of the crate's own shipped files (include_str!) for the planned span-sampler call shape. No generator is constructed and nothing executes."
+    },
+    {
+      "package": "candle-gen-pulid",
+      "kind": "lib",
+      "target": "candle_gen_pulid",
+      "test": "preview::tests::the_single_pulid_render_route_passes_a_preview_hook",
+      "source": "crates/media/candle-gen/candle-gen-pulid/src/preview.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Source-text scan of the crate's own shipped files (include_str!) for the planned span-sampler call shape. No generator is constructed and nothing executes."
+    },
+    {
+      "package": "candle-gen-catalog",
+      "kind": "lib",
+      "target": "candle_gen_catalog",
+      "test": "preview_advertising::the_sampler_driver_signatures_pin_the_preview_argument_position",
+      "source": "crates/media/candle-gen/candle-gen-catalog/src/preview_advertising.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Source-text scan of provider crates plus constructor registration only; no provider load, tensor or inference executes."
+    },
+    {
+      "package": "candle-gen-catalog",
+      "kind": "lib",
+      "target": "candle_gen_catalog",
+      "test": "preview_advertising::source_level_wiring_and_advertised_capability_agree_for_every_provider_crate",
+      "source": "crates/media/candle-gen/candle-gen-catalog/src/preview_advertising.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Source-text scan of provider crates plus constructor registration only; no provider load, tensor or inference executes."
+    },
+    {
+      "package": "candle-gen-catalog",
+      "kind": "lib",
+      "target": "candle_gen_catalog",
+      "test": "preview_advertising::the_wiring_table_pins_how_each_crate_denoises",
+      "source": "crates/media/candle-gen/candle-gen-catalog/src/preview_advertising.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Source-text scan of provider crates plus constructor registration only; no provider load, tensor or inference executes."
+    },
+    {
+      "package": "candle-gen-catalog",
+      "kind": "lib",
+      "target": "candle_gen_catalog",
+      "test": "preview_advertising::every_wired_crate_pins_its_exact_route_inventory",
+      "source": "crates/media/candle-gen/candle-gen-catalog/src/preview_advertising.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Source-text scan of provider crates plus constructor registration only; no provider load, tensor or inference executes."
+    },
+    {
+      "package": "candle-gen-catalog",
+      "kind": "lib",
+      "target": "candle_gen_catalog",
+      "test": "preview_advertising::every_bespoke_utility_crate_is_covered_by_the_bespoke_table",
+      "source": "crates/media/candle-gen/candle-gen-catalog/src/preview_advertising.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Source-text scan of provider crates plus constructor registration only; no provider load, tensor or inference executes."
+    },
+    {
+      "package": "candle-gen-catalog",
+      "kind": "lib",
+      "target": "candle_gen_catalog",
+      "test": "preview_advertising::every_descriptorless_memory_route_has_one_machine_readable_waiver",
+      "source": "crates/media/candle-gen/candle-gen-catalog/src/preview_advertising.rs",
+      "protocol": "libtest",
+      "platforms": [
+        "darwin",
+        "linux",
+        "win32"
+      ],
+      "reason": "Source-text scan of provider crates plus constructor registration only; no provider load, tensor or inference executes."
     }
   ]
 }

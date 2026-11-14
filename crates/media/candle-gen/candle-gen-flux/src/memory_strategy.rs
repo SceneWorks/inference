@@ -9,7 +9,7 @@ use candle_gen::gen_core::{
     self, GenerationMemory, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts,
     MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
     MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
-    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
     MemoryPrerequisiteScope, MemoryProfileGates, MemoryProfileTier, MemoryProviderContract,
     MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategyPrerequisite,
@@ -29,6 +29,19 @@ pub const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
 pub const TRANSFORMER_BLOCKS: u32 = 57;
 pub const CALIBRATION_FINGERPRINT: &str =
     "flux1-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v1";
+
+/// The XLabs reference route is the public character-image path plus the ordinary text route.
+/// Keep the admitted mode identity intact for evidence and scope keying.
+pub(crate) fn accepts_ip_public_mode(mode: &MemoryMode) -> bool {
+    matches!(mode, MemoryMode::TextToImage)
+        || matches!(mode, MemoryMode::Other(name) if name == "character_image")
+}
+
+/// Strict ControlNet also serves public style variations over a pose/canny/depth control source.
+pub(crate) fn accepts_control_public_mode(mode: &MemoryMode) -> bool {
+    accepts_ip_public_mode(mode)
+        || matches!(mode, MemoryMode::Other(name) if name == "style_variations")
+}
 
 fn streamable(spec: &LoadSpec) -> bool {
     matches!(spec.load_shape, LoadShape::DeferredMaterialization)
@@ -841,6 +854,17 @@ impl Drop for FluxMemoryScope {
     }
 }
 
+/// Request scope for bespoke FLUX-backed routes that retain an exact admitted context.
+/// The owned scope carries the same rung parameters and geometry as registered FLUX renders.
+pub fn reference_backbone_request_scope(
+    provider_id: &'static str,
+    device: Device,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> Box<dyn MemoryRequestScope> {
+    Box::new(FluxMemoryScope::new(provider_id, device, contract, context))
+}
+
 pub(crate) fn registered_safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -874,8 +898,117 @@ pub(crate) fn registered_begin_request(
 }
 
 #[cfg(test)]
+#[allow(clippy::drop_non_drop)]
+pub(crate) fn assert_conditioned_plan_trace(
+    plan: &gen_core::RenderPlan,
+    cancel: &gen_core::runtime::CancelFlag,
+) {
+    use gen_core::render::RenderPhaseIdentity;
+
+    #[derive(Default)]
+    struct Trace(Vec<(bool, MemoryPhase, MemoryGeometry)>);
+
+    impl MemoryRequestScope for Trace {
+        fn configure_request(&mut self, _: &mut GenerationRequest) -> gen_core::Result<()> {
+            unreachable!()
+        }
+        fn enter_phase(&mut self, _: MemoryPhase) -> gen_core::Result<()> {
+            unreachable!()
+        }
+        fn enter_render_phase(
+            &mut self,
+            phase: MemoryPhase,
+            identity: &RenderPhaseIdentity,
+        ) -> gen_core::Result<()> {
+            assert_eq!((identity.pass, identity.phase), (0, 0));
+            self.0.push((true, phase, identity.geometry));
+            Ok(())
+        }
+        fn leave_phase(&mut self, phase: MemoryPhase) -> gen_core::Result<()> {
+            let geometry = self.0.last().unwrap().2;
+            self.0.push((false, phase, geometry));
+            Ok(())
+        }
+        fn configure_decode(&mut self, _: u32, _: u32, _: MemoryGeometry) -> gen_core::Result<()> {
+            unreachable!()
+        }
+        fn configure_attention(&mut self, _: u32) -> gen_core::Result<()> {
+            unreachable!()
+        }
+        fn materialize_transformer_window(&mut self, _: u32, _: u32) -> gen_core::Result<()> {
+            unreachable!()
+        }
+        fn finish(&mut self, _: MemoryRunOutcome) -> gen_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut trace = Trace::default();
+    let run = gen_core::RenderRun::new(plan, cancel, Some(&mut trace));
+    run.encode(|| Ok::<_, gen_core::Error>(())).unwrap();
+    run.images_with_denoise_phases(
+        &mut |_| {},
+        |_| Ok::<_, gen_core::Error>(()),
+        |_, _, _| {
+            run.begin_denoise_phase(0)?;
+            run.end_denoise_phase(0)?;
+            Ok::<_, gen_core::Error>(())
+        },
+        |_, _, _| Ok::<_, gen_core::Error>(()),
+    )
+    .unwrap();
+    drop(run);
+    let geometry = trace.0[0].2;
+    assert_eq!(
+        (geometry.batch, geometry.frames, geometry.reference_count),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        trace
+            .0
+            .iter()
+            .map(|(enter, phase, _)| (*enter, *phase))
+            .collect::<Vec<_>>(),
+        vec![
+            (true, MemoryPhase::Conditioning),
+            (false, MemoryPhase::Conditioning),
+            (true, MemoryPhase::Denoise),
+            (false, MemoryPhase::Denoise),
+            (true, MemoryPhase::Decode),
+            (false, MemoryPhase::Decode),
+        ]
+    );
+    assert!(trace.0.iter().all(|(_, _, actual)| *actual == geometry));
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conditioned_public_modes_are_provider_specific() {
+        for mode in [
+            MemoryMode::TextToImage,
+            MemoryMode::Other("character_image".into()),
+        ] {
+            assert!(accepts_ip_public_mode(&mode), "IP {mode:?}");
+            assert!(accepts_control_public_mode(&mode), "Control {mode:?}");
+        }
+        let style = MemoryMode::Other("style_variations".into());
+        assert!(
+            !accepts_ip_public_mode(&style),
+            "IP style is not a public route"
+        );
+        assert!(accepts_control_public_mode(&style), "Control style route");
+        for mode in [
+            MemoryMode::ImageToImage,
+            MemoryMode::Edit,
+            MemoryMode::Other("unregistered_mode".into()),
+        ] {
+            assert!(!accepts_ip_public_mode(&mode), "IP {mode:?}");
+            assert!(!accepts_control_public_mode(&mode), "Control {mode:?}");
+        }
+    }
     use gen_core::{MemorySelection, MemoryStrategyParameters};
 
     /// AC (epic SC-22657, E2): the FLUX.1 contract publishes the geometry the loader actually

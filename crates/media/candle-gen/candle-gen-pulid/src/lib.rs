@@ -38,7 +38,8 @@ pub mod preview;
 pub mod pulid_flux;
 
 pub use pulid_flux::{
-    PulidFlux, PulidFluxPaths, PulidFluxRequest, DEFAULT_ID_WEIGHT, SIZE_MULTIPLE,
+    compile_pulid_plan, pulid_load_spec, PulidFlux, PulidFluxPaths, PulidFluxRequest,
+    DEFAULT_ID_WEIGHT, SIZE_MULTIPLE,
 };
 
 /// PuLID-FLUX real-weight GPU validation (sc-5492) — env-driven, `#[ignore]`d integration test (the

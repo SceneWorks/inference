@@ -1,10 +1,13 @@
 //! Weight-free execution contract and owner-local lifecycle for fixed image passes.
 
 pub mod conditional;
+mod passes;
+
+pub use passes::{MultiPassRenderPlan, PlannedPassRequest, ProducedReference};
 
 use crate::{
-    default_seed, CancelFlag, Error, GenerationRequest, LoadSpec, MemoryPhase, MemoryRequestScope,
-    ModelDescriptor, Progress, Result,
+    default_seed, CancelFlag, Conditioning, ControlKind, Error, GenerationRequest, Image, LoadSpec,
+    MemoryPhase, MemoryRequestScope, ModelDescriptor, Progress, Result,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -70,18 +73,91 @@ struct ImageInputs {
     requested_seed: Option<u64>,
     frames: u32,
     references: u32,
+    conditioning: PackedImageConditioning,
     steps: Option<u32>,
     sampler: Option<String>,
     scheduler: Option<String>,
     scheduler_shift: Option<f32>,
     guidance: Option<f32>,
+    guidance_method: Option<String>,
+    true_cfg_bits: Option<u32>,
+    timestep_to_start_cfg: Option<u32>,
     use_pid: bool,
     pid_capture_sigma: Option<f32>,
 }
 
-impl From<&GenerationRequest> for ImageInputs {
-    fn from(req: &GenerationRequest) -> Self {
-        Self {
+/// Only the FLUX.1 image routes adopted by the first runner wave can enter a packed pass.
+/// Bind the actual bytes and controls before load so a queued request cannot swap its source.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+enum PackedImageConditioning {
+    None,
+    Reference {
+        width: u32,
+        height: u32,
+        pixels_sha256: [u8; 32],
+        strength_bits: Option<u32>,
+    },
+    Control {
+        width: u32,
+        height: u32,
+        pixels_sha256: [u8; 32],
+        kind: String,
+        scale_bits: Option<u32>,
+    },
+    /// A reference an earlier pass of the same multi-pass plan produces. Its pixels do not exist
+    /// before load, so the plan binds the declared geometry and strength instead of a digest.
+    ProducedReference {
+        from_pass: usize,
+        width: u32,
+        height: u32,
+        strength_bits: Option<u32>,
+    },
+}
+
+fn image_digest(image: &Image) -> Result<[u8; 32]> {
+    let expected = u64::from(image.width)
+        .checked_mul(u64::from(image.height))
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| Error::Unsupported("conditioning image geometry overflows".into()))?;
+    if image.width == 0 || image.height == 0 || expected != image.pixels.len() as u64 {
+        return Err(Error::Unsupported(
+            "conditioning image needs width × height × 3 RGB bytes".into(),
+        ));
+    }
+    Ok(Sha256::digest(&image.pixels).into())
+}
+
+impl TryFrom<&GenerationRequest> for ImageInputs {
+    type Error = Error;
+
+    fn try_from(req: &GenerationRequest) -> Result<Self> {
+        let conditioning = match req.conditioning.as_slice() {
+            [] => PackedImageConditioning::None,
+            [Conditioning::Reference { image, strength }] => PackedImageConditioning::Reference {
+                width: image.width,
+                height: image.height,
+                pixels_sha256: image_digest(image)?,
+                strength_bits: strength.map(f32::to_bits),
+            },
+            [Conditioning::Control { image, kind, scale }] => PackedImageConditioning::Control {
+                width: image.width,
+                height: image.height,
+                pixels_sha256: image_digest(image)?,
+                kind: match kind {
+                    ControlKind::Pose => "pose".to_owned(),
+                    ControlKind::Canny => "canny".to_owned(),
+                    ControlKind::Depth => "depth".to_owned(),
+                    ControlKind::Other(value) => format!("other:{value}"),
+                },
+                scale_bits: scale.map(f32::to_bits),
+            },
+            _ => {
+                return Err(Error::Unsupported(
+                    "packed image plan needs one supported image conditioning input".into(),
+                ))
+            }
+        };
+        Ok(Self {
             prompt_sha256: Sha256::digest(req.prompt.as_bytes()).into(),
             negative_prompt: req.negative_prompt.clone(),
             width: req.width,
@@ -90,14 +166,18 @@ impl From<&GenerationRequest> for ImageInputs {
             requested_seed: req.seed,
             frames: req.frames.unwrap_or(1),
             references: req.memory_reference_count(),
+            conditioning,
             steps: req.steps,
             sampler: req.sampler.clone(),
             scheduler: req.scheduler.clone(),
             scheduler_shift: req.scheduler_shift,
             guidance: req.guidance,
+            guidance_method: req.guidance_method.clone(),
+            true_cfg_bits: req.true_cfg.map(f32::to_bits),
+            timestep_to_start_cfg: req.timestep_to_start_cfg,
             use_pid: req.use_pid,
             pid_capture_sigma: req.pid_capture_sigma,
-        }
+        })
     }
 }
 
@@ -109,8 +189,16 @@ pub struct RenderLoadBinding {
     resolved_route: Option<String>,
     quant: Option<crate::Quant>,
     precision: crate::Precision,
+    sequential_offload: bool,
+    deferred_materialization: bool,
+    load_shape_declaration: String,
     adapters: Vec<crate::AdapterSpec>,
+    control: Option<crate::WeightsSource>,
+    extra_controls: Vec<crate::WeightsSource>,
     ip_adapter: Option<crate::WeightsSource>,
+    identity: Option<[Option<crate::WeightsSource>; 3]>,
+    text_encoder: Option<crate::WeightsSource>,
+    components: std::collections::BTreeMap<String, crate::WeightsSource>,
     pid: Option<crate::PidWeights>,
 }
 
@@ -121,8 +209,25 @@ impl RenderLoadBinding {
             resolved_route: spec.resolved_route.clone(),
             quant: spec.quantize,
             precision: spec.precision,
+            sequential_offload: matches!(spec.offload_policy, crate::OffloadPolicy::Sequential),
+            deferred_materialization: matches!(
+                spec.load_shape,
+                crate::LoadShape::DeferredMaterialization
+            ),
+            load_shape_declaration: format!("{:?}", spec.load_shape_declaration_result),
             adapters: spec.adapters.clone(),
+            control: spec.control.clone(),
+            extra_controls: spec.extra_controls.clone(),
             ip_adapter: spec.ip_adapter.clone(),
+            identity: spec.identity.as_ref().map(|identity| {
+                [
+                    identity.encoder.clone(),
+                    identity.eva.clone(),
+                    identity.face_dir.clone(),
+                ]
+            }),
+            text_encoder: spec.text_encoder.clone(),
+            components: spec.components.clone(),
             pid: spec.pid.clone(),
         }
     }
@@ -168,6 +273,13 @@ pub struct RenderPlan {
     preparation: Option<RenderLoadBinding>,
     count: CountPlan,
     pass: ImagePass,
+    /// Position inside a [`MultiPassRenderPlan`]; 0 for a single-pass plan.
+    #[serde(skip_serializing_if = "is_first_pass")]
+    pass_index: usize,
+}
+
+fn is_first_pass(index: &usize) -> bool {
+    *index == 0
 }
 
 impl RenderPlan {
@@ -230,7 +342,7 @@ impl RenderPlan {
         Ok(Self {
             backend: descriptor.backend.to_owned(),
             provider: descriptor.id.to_owned(),
-            inputs: ImageInputs::from(req),
+            inputs: ImageInputs::try_from(req)?,
             preparation: None,
             count: CountPlan::SequentialWrappingSeeds {
                 count: req.count,
@@ -266,6 +378,7 @@ impl RenderPlan {
                 },
                 inert_splits: Vec::new(),
             },
+            pass_index: 0,
         })
     }
 
@@ -276,10 +389,37 @@ impl RenderPlan {
         descriptor: &ModelDescriptor,
         req: &GenerationRequest,
     ) -> Result<()> {
+        let mut live = ImageInputs::try_from(req)?;
+        if let PackedImageConditioning::ProducedReference {
+            from_pass,
+            width,
+            height,
+            strength_bits,
+        } = &self.inputs.conditioning
+        {
+            // The produced image is bound by shape and strength: its bytes come from the earlier
+            // pass and cannot be digested before load.
+            match &live.conditioning {
+                PackedImageConditioning::Reference {
+                    width: live_width,
+                    height: live_height,
+                    strength_bits: live_strength,
+                    ..
+                } if (live_width, live_height, live_strength) == (width, height, strength_bits) => {
+                    live.conditioning = self.inputs.conditioning.clone();
+                }
+                _ => {
+                    return Err(Error::Unsupported(format!(
+                        "pass {} reference must be the {width}x{height} output of pass {from_pass} \
+                         at its declared strength",
+                        self.pass_index
+                    )))
+                }
+            }
+        }
         if descriptor.id != self.provider
             || descriptor.backend != self.backend
-            || !req.conditioning.is_empty()
-            || self.inputs != ImageInputs::from(req)
+            || self.inputs != live
         {
             return Err(Error::Unsupported(
                 "compiled render plan does not match this request/provider".into(),
@@ -287,7 +427,74 @@ impl RenderPlan {
         }
         Ok(())
     }
-    pub(crate) fn bind_load(mut self, spec: &LoadSpec) -> Self {
+
+    /// The pass position inside a [`MultiPassRenderPlan`] (0 for a single-pass plan).
+    pub fn pass_index(&self) -> usize {
+        self.pass_index
+    }
+
+    /// The earlier-pass output this pass consumes as its reference, when it declares one.
+    pub fn produced_reference(&self) -> Option<ProducedReference> {
+        match self.inputs.conditioning {
+            PackedImageConditioning::ProducedReference {
+                from_pass,
+                width,
+                height,
+                strength_bits,
+            } => Some(ProducedReference {
+                from_pass,
+                width,
+                height,
+                strength: strength_bits.map(f32::from_bits),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Requests per image (the plan's sequential count).
+    pub fn image_count(&self) -> u32 {
+        let CountPlan::SequentialWrappingSeeds { count, .. } = self.count;
+        count
+    }
+
+    /// Executed denoise steps of this pass (the progress total its sampler reports).
+    pub fn executed_steps(&self) -> usize {
+        self.pass.phase.end_step - self.pass.phase.first_step
+    }
+
+    /// The (width, height) of this pass's output image.
+    pub fn output_size(&self) -> (u32, u32) {
+        (self.pass.phase.stream.width, self.pass.phase.stream.height)
+    }
+
+    /// Replace a compiled single-reference input with a declaration that pass `from_pass`
+    /// produces it, keeping the compiled geometry and strength.
+    fn into_produced_reference(mut self, from_pass: usize) -> Result<Self> {
+        let PackedImageConditioning::Reference {
+            width,
+            height,
+            strength_bits,
+            ..
+        } = self.inputs.conditioning
+        else {
+            return Err(Error::Unsupported(
+                "a produced reference needs a single-reference pass".into(),
+            ));
+        };
+        self.inputs.conditioning = PackedImageConditioning::ProducedReference {
+            from_pass,
+            width,
+            height,
+            strength_bits,
+        };
+        Ok(self)
+    }
+
+    fn preparation(&self) -> Option<&RenderLoadBinding> {
+        self.preparation.as_ref()
+    }
+    /// Freeze the exact load contract for a direct provider that is not registry loaded.
+    pub fn bind_load(mut self, spec: &LoadSpec) -> Self {
         self.preparation = Some(RenderLoadBinding::from_spec(spec));
         self
     }
@@ -408,7 +615,7 @@ impl<'p, 's> RenderRun<'p, 's> {
     fn phase_identity(&self, phase: usize) -> RenderPhaseIdentity {
         let stream = &self.plan.pass.phase.stream;
         RenderPhaseIdentity {
-            pass: 0,
+            pass: self.plan.pass_index,
             phase,
             geometry: crate::MemoryGeometry {
                 width: stream.width,
@@ -495,14 +702,48 @@ impl<'p, 's> RenderRun<'p, 's> {
         &self,
         body: impl FnOnce() -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
+        self.begin_conditioning()?;
+        let result = body();
+        match result {
+            Ok(value) => {
+                self.end_conditioning()?;
+                Ok(value)
+            }
+            Err(error) => {
+                // As with `phase`, the request-scope owner tears down a failed stage.
+                self.state.set(RunState::Finished);
+                Err(error)
+            }
+        }
+    }
+
+    /// Open Conditioning across a staged residency handoff. The owner can encode text, shed its
+    /// weights, load the VAE/identity stack, then close this same phase after source preparation.
+    pub fn begin_conditioning(&self) -> Result<()> {
         self.begin(RunState::BeforeEncode, RunState::Encoding)?;
-        let result = self.phase(MemoryPhase::Conditioning, body);
-        self.state.set(if result.is_ok() {
-            RunState::Encoded
-        } else {
-            RunState::Finished
-        });
-        result
+        if self.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        if let Some(scope) = self.scope.borrow_mut().as_deref_mut() {
+            scope.enter_render_phase(MemoryPhase::Conditioning, &self.phase_identity(0))?;
+        }
+        Ok(())
+    }
+
+    pub fn end_conditioning(&self) -> Result<()> {
+        if self.state.get() != RunState::Encoding {
+            return Err(Error::Unsupported(
+                "conditioning phase is not active".into(),
+            ));
+        }
+        if self.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        if let Some(scope) = self.scope.borrow_mut().as_deref_mut() {
+            scope.leave_phase(MemoryPhase::Conditioning)?;
+        }
+        self.state.set(RunState::Encoded);
+        Ok(())
     }
 
     pub fn images<I, D, O, E: From<Error>>(

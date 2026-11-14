@@ -116,6 +116,12 @@ pub enum SizeFloor {
     /// advertised here, rather than hidden in provider code, so a weights-free consumer can predict
     /// whether the engine will render the exact geometry it was asked for.
     RangeCheckedOnGrid { multiple: u32 },
+    /// The range and grid checks plus a cap on the number of grid cells.
+    ///
+    /// A per-axis `max_size` cannot describe a packed-image token limit without
+    /// rejecting valid long, narrow images. This variant advertises the area
+    /// constraint explicitly so pre-load validation and the render plan agree.
+    RangeCheckedOnGridArea { multiple: u32, max_cells: u32 },
     /// `width`/`height == 0` is a "resolve from the driving media" sentinel, and the shared range
     /// check does not apply **to that pair of values** (F-158). Any other size — including a
     /// half-sentinel like `0x512` — is still range-checked normally.
@@ -158,6 +164,7 @@ impl SizeFloor {
         match self {
             Self::RangeChecked | Self::ResolvedDownstream => None,
             Self::RangeCheckedOnGrid { multiple }
+            | Self::RangeCheckedOnGridArea { multiple, .. }
             | Self::ResolvedDownstreamExplicitGrid { multiple } => Some(multiple),
         }
     }

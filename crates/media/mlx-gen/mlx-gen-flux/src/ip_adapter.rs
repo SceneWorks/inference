@@ -179,6 +179,12 @@ impl<'a> FluxIpInjector<'a> {
         })
     }
 
+    /// Retire the lazy CLIP-to-IP projection while Conditioning is still active.
+    pub(crate) fn materialize_tokens(&self) -> Result<()> {
+        mlx_rs::transforms::eval([&self.tokens])?;
+        Ok(())
+    }
+
     /// A zero-strength injector (the CFG uncond row / "no image prompt"): byte-identical to plain
     /// txt2img because `double_block_ip` short-circuits on `scale == 0` and draws no RNG.
     pub fn disabled(adapter: &'a FluxIpAdapter, image_embeds: &Array) -> Result<Self> {

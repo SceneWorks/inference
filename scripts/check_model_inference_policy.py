@@ -574,6 +574,19 @@ def cargo_test_compilation(command):
     return options if operation == 'test' and '--no-run' in options and '--message-format=json' in options else None
 
 
+def is_file(path):
+    """`Path.is_file` that reports any `OSError` as not-a-file, as Python 3.14 does.
+
+    An unexpanded `${{ … }}` expression substituted into a script path can exceed the
+    filesystem's name limit; Python 3.12's `is_file` raises ENAMETOOLONG for it instead of
+    returning False, so the tracer would crash rather than report an unresolved script.
+    """
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
 class RunGraph:
     """Resolve repository script/driver edges, without importing or executing the scripts.
 
@@ -772,7 +785,7 @@ class RunGraph:
             self.shell(self.generated[name], (*chain, 'generated ' + name), base, args)
             return
         path = self.root / name
-        if not path.is_file() and base is not None:
+        if not is_file(path) and base is not None:
             path = base / name
         try:
             path = path.resolve()
@@ -780,7 +793,7 @@ class RunGraph:
         except ValueError:
             self.finding('unknown', chain, 'script outside source root: ' + name)
             return
-        if not path.is_file():
+        if not is_file(path):
             self.finding('unknown', chain, 'unresolved script: ' + name)
             return
         # The exact reviewed suite runner may execute only literal audited-safe mode in
@@ -794,7 +807,10 @@ class RunGraph:
             # SW-F329 appends source/byte/lifecycle arithmetic and frozen-cache ownership
             # controls. Their reviewed bodies execute no learned forward or inference kernel.
             # SW-6933 adds fixed-plan mocks, pre-load validation and CPU-stream sigma arithmetic.
-            controls_sha = '476d2a5e052af23829e4f7d4fad67bb121da89e3306a5b634c6b0f59e716809f'
+            # SW-6936 adds FLUX.1 conditional pre-load plan/refusal checks (gen-core multi-pass,
+            # MLX ControlNet/XLabs IP/PuLID, Candle ControlNet/IP/PuLID) and the preview
+            # source scans; none constructs a generator or runs learned compute.
+            controls_sha = '31b81ee7290677f9ccd81fe38e7a0df89e221b20920c48685dc389e64465245c'
             command_at = args.index('--') if '--' in args else -1
             command = args[command_at + 1:] if command_at >= 0 else []
             if (hashlib.sha256(path.read_bytes()).hexdigest() != reviewed_sha

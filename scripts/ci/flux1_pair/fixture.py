@@ -83,7 +83,8 @@ def make_snapshot(root, variant):
         directory = root / component
         directory.mkdir(parents=True)
         write_component(directory / "model.safetensors", tensors)
-        config = {"num_layers": 1, "num_single_layers": 1} if component == "transformer" else {}
+        config = ({"num_layers": 1, "num_single_layers": 1,
+                   "guidance_embeds": variant == "dev"} if component == "transformer" else {})
         (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
     directory = root / "tokenizer_2"
     directory.mkdir()

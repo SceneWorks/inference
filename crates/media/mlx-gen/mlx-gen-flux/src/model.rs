@@ -488,58 +488,11 @@ impl Generator for Flux1 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        // Validate up front so an invalid request (bad dims/steps) fails fast, before the reference
-        // image (and the black-image CFG branch) is encoded — the deeper `run_denoise` validation
-        // would otherwise reject only after that work (L-validate-first).
         self.validate(req)?;
-        // F-108: cheap pre-check so an already-cancelled request bails before the IP-adapter
-        // reference encode + the T5-XXL/CLIP prompt encodes (all pre-denoise, uncancellable today).
-        if req.cancel.is_cancelled() {
-            return Err(Error::Canceled.into());
-        }
-        // Reference-image (XLabs IP-Adapter) path, epic 3621. `validate` has confirmed at most one
-        // `Reference`; extract it here.
-        if let Some((image, strength)) = single_reference(req)? {
-            let (encoder, adapter) = self.ip_adapter.as_ref().ok_or_else(|| {
-                Error::Msg(format!(
-                    "{}: a reference image needs an IP-adapter — load it via LoadSpec::with_ip_adapter",
-                    self.descriptor.id
-                ))
-            })?;
-            let embeds = encoder.encode(image)?;
-            let scale = strength.unwrap_or(DEFAULT_IP_SCALE).clamp(0.0, 1.0);
-            let pos = FluxIpInjector::new(adapter, &embeds, scale)?;
-            // dev + an explicit `true_cfg` → real CFG against `negative_prompt`, image prompt only on
-            // the positive branch (diffusers' Flux IP `true_cfg_scale`). Otherwise the single distilled
-            // forward (schnell always; dev without true_cfg).
-            return match req.true_cfg {
-                Some(cfg) if self.variant.supports_guidance() => {
-                    // Match diffusers' Flux true-CFG IP: the negative branch conditions on a BLACK
-                    // image (zeros), NOT "no IP" — `FluxPipeline` sets `negative_ip_adapter_image =
-                    // np.zeros(...)` when unset. CFG then amplifies the reference-specific signal
-                    // (ref − blank), sharpening resemblance instead of the whole IP term. The size is
-                    // arbitrary (CLIP resizes to 224²), so `encode_black` names the zeros contract.
-                    let black_embeds = encoder.encode_black()?;
-                    let neg = FluxIpInjector::new(adapter, &black_embeds, scale)?;
-                    let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
-                    self.generate_with_injector_cfg(
-                        req,
-                        &pos,
-                        &neg,
-                        neg_prompt,
-                        cfg.clamp(TRUE_CFG_MIN, TRUE_CFG_MAX),
-                        0,
-                        on_progress,
-                    )
-                    .map_err(Into::into)
-                }
-                _ => self
-                    .generate_with_injector(req, Some(&pos), on_progress)
-                    .map_err(Into::into),
-            };
-        }
-        self.generate_with_injector(req, None, on_progress)
-            .map_err(Into::into)
+        let plan = compile_trajectory(self.variant, req)?.bind_load(&self.loaded_spec);
+        self.generate_planned(req, &plan, None, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("FLUX.1 render produced no images".into()))
     }
 
     fn generate_planned(
@@ -552,10 +505,59 @@ impl Generator for Flux1 {
         self.validate(req)?;
         plan.check_request(&self.descriptor, req)?;
         plan.check_load(&gen_core::RenderLoadBinding::from_spec(&self.loaded_spec))?;
+        // Refusal precedes the XLabs reference encode and either prompt encode.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled.into());
+        }
         let run = gen_core::RenderRun::new(plan, &req.cancel, scope);
-        Ok(gen_core::GenerationReport::from_output(
-            self.run_with_injector(req, None, &run, on_progress)?,
-        ))
+        let output = if let Some((image, strength)) = single_reference(req)? {
+            let (encoder, adapter) = self.ip_adapter.as_ref().ok_or_else(|| {
+                Error::Msg(format!(
+                    "{}: a reference image needs an IP-adapter — load it via LoadSpec::with_ip_adapter",
+                    self.descriptor.id
+                ))
+            })?;
+            let scale = strength.unwrap_or(DEFAULT_IP_SCALE).clamp(0.0, 1.0);
+            match req.true_cfg {
+                Some(cfg) if self.variant.supports_guidance() => {
+                    // The negative IP branch uses a black image, not a missing injector.
+                    let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
+                    self.generate_with_prepared_injector_cfg_planned(
+                        req,
+                        neg_prompt,
+                        cfg.clamp(TRUE_CFG_MIN, TRUE_CFG_MAX),
+                        0,
+                        &run,
+                        || {
+                            let embeds = encoder.encode(image)?;
+                            let black_embeds = encoder.encode_black()?;
+                            mlx_rs::transforms::eval([&embeds, &black_embeds])?;
+                            let pos = FluxIpInjector::new(adapter, &embeds, scale)?;
+                            let neg = FluxIpInjector::new(adapter, &black_embeds, scale)?;
+                            pos.materialize_tokens()?;
+                            neg.materialize_tokens()?;
+                            Ok((pos, neg))
+                        },
+                        on_progress,
+                    )?
+                }
+                _ => self.generate_with_prepared_injector_planned(
+                    req,
+                    &run,
+                    || {
+                        let embeds = encoder.encode(image)?;
+                        mlx_rs::transforms::eval([&embeds])?;
+                        let injector = FluxIpInjector::new(adapter, &embeds, scale)?;
+                        injector.materialize_tokens()?;
+                        Ok(injector)
+                    },
+                    on_progress,
+                )?,
+            }
+        } else {
+            self.run_with_injector(req, None, &run, false, on_progress)?
+        };
+        Ok(gen_core::GenerationReport::from_output(output))
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -620,9 +622,22 @@ impl Flux1 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        let plan = compile_trajectory(self.variant, req)?;
+        let plan = compile_trajectory(self.variant, req)?.bind_load(&self.loaded_spec);
         let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
-        self.run_with_injector(req, injector, &run, on_progress)
+        self.run_with_injector(req, injector, &run, false, on_progress)
+    }
+
+    /// PuLID validates its own descriptor and source-bound plan, then delegates the same FLUX
+    /// trajectory to this backbone with its reference consumed into an injector.
+    pub fn generate_with_injector_planned(
+        &self,
+        req: &GenerationRequest,
+        injector: &dyn crate::transformer::DitImageInjector,
+        run: &gen_core::RenderRun<'_, '_>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.validate(req)?;
+        self.run_with_injector(req, Some(injector), run, false, on_progress)
     }
 
     fn run_with_injector(
@@ -630,9 +645,50 @@ impl Flux1 {
         req: &GenerationRequest,
         injector: Option<&dyn crate::transformer::DitImageInjector>,
         run: &gen_core::RenderRun<'_, '_>,
+        conditioning_started: bool,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        let transformer_window = self.requested_transformer_window(req, injector)?;
+        self.run_with_prepared_injector(
+            req,
+            run,
+            conditioning_started,
+            || Ok(injector),
+            |prepared| *prepared,
+            on_progress,
+        )
+    }
+
+    /// PuLID prepares its owned identity injector only after staged text weights have dropped.
+    /// The same Conditioning phase remains open across that residency handoff.
+    pub fn generate_with_prepared_injector_planned<I: crate::transformer::DitImageInjector>(
+        &self,
+        req: &GenerationRequest,
+        run: &gen_core::RenderRun<'_, '_>,
+        prepare: impl FnOnce() -> Result<I>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.validate(req)?;
+        run.begin_conditioning()?;
+        self.run_with_prepared_injector(
+            req,
+            run,
+            true,
+            prepare,
+            |prepared| Some(prepared),
+            on_progress,
+        )
+    }
+
+    fn run_with_prepared_injector<I>(
+        &self,
+        req: &GenerationRequest,
+        run: &gen_core::RenderRun<'_, '_>,
+        conditioning_started: bool,
+        prepare: impl FnOnce() -> Result<I>,
+        borrow: impl for<'a> Fn(&'a I) -> Option<&'a dyn crate::transformer::DitImageInjector>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let transformer_window = self.requested_transformer_window(req, None)?;
         let streamable = transformer_window.is_some();
         let stage_residency = matches!(self.loaded_spec.offload_policy, OffloadPolicy::Sequential);
         // Staged residency lifecycle (sc-10840): under `Sequential` the seam loads the T5 + CLIP
@@ -645,7 +701,13 @@ impl Flux1 {
             &req.cancel,
             req.use_pid,
             on_progress,
-            |text: &FluxTextOwned| run.encode(|| text.encode(&req.prompt)),
+            |text: &FluxTextOwned| {
+                if conditioning_started {
+                    text.encode(&req.prompt)
+                } else {
+                    run.encode(|| text.encode(&req.prompt))
+                }
+            },
             // Materialize the embeds while the encoders are still alive (Sequential only) — MLX is lazy,
             // so an un-evaluated embed keeps the encoders referenced and the drop would free nothing.
             |encoded| {
@@ -656,6 +718,11 @@ impl Flux1 {
                 Ok(())
             },
             |heavy, (prompt_embeds, pooled_prompt_embeds), on_progress| {
+                let prepared = prepare()?;
+                if conditioning_started {
+                    run.end_conditioning()?;
+                }
+                let injector = borrow(&prepared);
                 let transformer = &heavy.transformer;
                 let block_window = transformer.block_window(
                     transformer_window,
@@ -717,9 +784,120 @@ impl Flux1 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        let plan = compile_trajectory(self.variant, req)?;
+        let plan = compile_trajectory(self.variant, req)?.bind_load(&self.loaded_spec);
         let run = gen_core::RenderRun::new(&plan, &req.cancel, None);
-        let transformer_window = self.requested_transformer_window(req, Some(pos_injector))?;
+        self.run_with_injector_cfg(
+            req,
+            pos_injector,
+            neg_injector,
+            neg_prompt,
+            true_cfg,
+            timestep_to_start_cfg,
+            &run,
+            false,
+            on_progress,
+        )
+    }
+
+    /// PuLID's real-CFG variant of [`Self::generate_with_injector_planned`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_injector_cfg_planned(
+        &self,
+        req: &GenerationRequest,
+        pos_injector: &dyn crate::transformer::DitImageInjector,
+        neg_injector: &dyn crate::transformer::DitImageInjector,
+        neg_prompt: &str,
+        true_cfg: f32,
+        timestep_to_start_cfg: usize,
+        run: &gen_core::RenderRun<'_, '_>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.validate(req)?;
+        self.run_with_injector_cfg(
+            req,
+            pos_injector,
+            neg_injector,
+            neg_prompt,
+            true_cfg,
+            timestep_to_start_cfg,
+            run,
+            false,
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_with_injector_cfg(
+        &self,
+        req: &GenerationRequest,
+        pos_injector: &dyn crate::transformer::DitImageInjector,
+        neg_injector: &dyn crate::transformer::DitImageInjector,
+        neg_prompt: &str,
+        true_cfg: f32,
+        timestep_to_start_cfg: usize,
+        run: &gen_core::RenderRun<'_, '_>,
+        conditioning_started: bool,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.run_with_prepared_injector_cfg(
+            req,
+            neg_prompt,
+            true_cfg,
+            timestep_to_start_cfg,
+            run,
+            conditioning_started,
+            || Ok((pos_injector, neg_injector)),
+            |prepared| (prepared.0, prepared.1),
+            on_progress,
+        )
+    }
+
+    /// PuLID builds both positive and unconditional identity branches after text weights drop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_prepared_injector_cfg_planned<I: crate::transformer::DitImageInjector>(
+        &self,
+        req: &GenerationRequest,
+        neg_prompt: &str,
+        true_cfg: f32,
+        timestep_to_start_cfg: usize,
+        run: &gen_core::RenderRun<'_, '_>,
+        prepare: impl FnOnce() -> Result<(I, I)>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        self.validate(req)?;
+        run.begin_conditioning()?;
+        self.run_with_prepared_injector_cfg(
+            req,
+            neg_prompt,
+            true_cfg,
+            timestep_to_start_cfg,
+            run,
+            true,
+            prepare,
+            |prepared| (&prepared.0, &prepared.1),
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_with_prepared_injector_cfg<I>(
+        &self,
+        req: &GenerationRequest,
+        neg_prompt: &str,
+        true_cfg: f32,
+        timestep_to_start_cfg: usize,
+        run: &gen_core::RenderRun<'_, '_>,
+        conditioning_started: bool,
+        prepare: impl FnOnce() -> Result<I>,
+        borrow: impl for<'a> Fn(
+            &'a I,
+        ) -> (
+            &'a dyn crate::transformer::DitImageInjector,
+            &'a dyn crate::transformer::DitImageInjector,
+        ),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let transformer_window = self.requested_transformer_window(req, None)?;
         let streamable = transformer_window.is_some();
         // Staged residency lifecycle (sc-10840): the phase-A encode covers BOTH the positive and
         // negative prompts, so both text encoders drop together before the DiT load under `Sequential`.
@@ -730,11 +908,16 @@ impl Flux1 {
             req.use_pid,
             on_progress,
             |text: &FluxTextOwned| {
-                run.encode(|| {
+                let encode_text = || {
                     let (pos_embeds, pos_pooled) = text.encode(&req.prompt)?;
                     let (neg_embeds, neg_pooled) = text.encode(neg_prompt)?;
                     Ok((pos_embeds, pos_pooled, neg_embeds, neg_pooled))
-                })
+                };
+                if conditioning_started {
+                    encode_text()
+                } else {
+                    run.encode(encode_text)
+                }
             },
             |encoded| {
                 let Some((pos_embeds, pos_pooled, neg_embeds, neg_pooled)) = encoded else {
@@ -744,6 +927,11 @@ impl Flux1 {
                 Ok(())
             },
             |heavy, (pos_embeds, pos_pooled, neg_embeds, neg_pooled), on_progress| {
+                let prepared = prepare()?;
+                if conditioning_started {
+                    run.end_conditioning()?;
+                }
+                let (pos_injector, neg_injector) = borrow(&prepared);
                 let transformer = &heavy.transformer;
                 let block_window = transformer.block_window(
                     transformer_window,
@@ -760,7 +948,7 @@ impl Flux1 {
                     mlx_gen::attention::AttentionPlan::UNBOUNDED
                 };
                 self.run_denoise_with(
-                    &run,
+                    run,
                     req,
                     &heavy.vae,
                     heavy.pid.as_ref(),
@@ -929,6 +1117,16 @@ fn compile_trajectory(
     variant: FluxVariant,
     req: &GenerationRequest,
 ) -> Result<gen_core::RenderPlan> {
+    compile_trajectory_for(variant, &descriptor_for(variant), req)
+}
+
+/// Compile the FLUX.1 backbone trajectory for a provider that owns its own reference injector.
+/// The enclosing descriptor and request remain in the plan so its source cannot be swapped.
+pub fn compile_trajectory_for(
+    variant: FluxVariant,
+    descriptor: &ModelDescriptor,
+    req: &GenerationRequest,
+) -> Result<gen_core::RenderPlan> {
     let sampler_name = req.sampler.as_deref().unwrap_or(DEFAULT_SAMPLER);
     let (def_steps, def_guidance) = profile_defaults(variant, sampler_name);
     let steps = req.steps.unwrap_or(def_steps) as usize;
@@ -959,7 +1157,7 @@ fn compile_trajectory(
     )?;
     let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
     Ok(gen_core::RenderPlan::packed_image_trajectory(
-        &descriptor_for(variant),
+        descriptor,
         req,
         gen_core::render::PackedImagePass {
             pixel_stride: SIZE_MULTIPLE,
@@ -980,14 +1178,11 @@ pub(crate) fn compile_base(
 ) -> gen_core::Result<Option<gen_core::RenderPlan>> {
     validate_request(&descriptor_for(variant), req)?;
     crate::memory_strategy::validate_load_contract(variant.id(), spec)?;
-    if single_reference(req)?.is_some() {
-        if spec.ip_adapter.is_none() {
-            return Err(gen_core::Error::Unsupported(format!(
-                "{}: reference image needs an IP-adapter",
-                variant.id()
-            )));
-        }
-        return Ok(None);
+    if single_reference(req)?.is_some() && spec.ip_adapter.is_none() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{}: reference image needs an IP-adapter",
+            variant.id()
+        )));
     }
     if req.cancel.is_cancelled() {
         return Err(gen_core::Error::Canceled);
@@ -998,7 +1193,7 @@ pub(crate) fn compile_base(
             variant.id()
         )));
     }
-    Ok(Some(compile_trajectory(variant, req)?))
+    Ok(Some(compile_trajectory(variant, req)?.bind_load(spec)))
 }
 
 /// Decode the final unpacked FLUX latent through the native VAE or a request-selected PiD
@@ -1648,12 +1843,212 @@ mod tests {
             .compile_render_plan(FluxVariant::Dev.id(), &spec, &req)
             .unwrap_err();
         assert!(error.to_string().contains("IP-adapter"), "{error}");
-        // The shipped MLX XLabs entry remains outside the base plan.
+        // A complete XLabs route now compiles before load and freezes its reference bytes.
         let spec = spec.with_ip_adapter(WeightsSource::Dir("/missing/ip".into()));
-        assert!(registry
+        let plan = registry
             .compile_render_plan(FluxVariant::Dev.id(), &spec, &req)
             .unwrap()
-            .is_none());
+            .expect("XLabs reference route needs a pre-load plan");
+        plan.check_request(&descriptor_for(FluxVariant::Dev), &req)
+            .unwrap();
+        if let Conditioning::Reference { image, .. } = &mut req.conditioning[0] {
+            image.pixels[0] ^= 1;
+        }
+        assert!(plan
+            .check_request(&descriptor_for(FluxVariant::Dev), &req)
+            .is_err());
+        req.conditioning.push(reference(None));
+        assert!(registry
+            .compile_render_plan(FluxVariant::Dev.id(), &spec, &req)
+            .is_err());
+    }
+
+    /// The complete XLabs IP route refuses zero steps and an off-range size in the pre-load
+    /// compiler at a missing snapshot and adapter, so no weight is ever opened.
+    #[test]
+    fn xlabs_ip_plan_refuses_zero_steps_and_invalid_sizes_before_load() {
+        let registry = crate::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/missing/flux".into()))
+            .with_ip_adapter(WeightsSource::Dir("/missing/ip".into()));
+        let valid = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            conditioning: vec![reference(Some(0.5))],
+            ..Default::default()
+        };
+        registry
+            .compile_render_plan(FluxVariant::Dev.id(), &spec, &valid)
+            .unwrap()
+            .expect("XLabs reference route needs a pre-load plan");
+        for (width, steps, expected) in [
+            (512, Some(0), "steps must be >= 1"),
+            (321, Some(4), "multiples of 16"),
+            (128, Some(4), "outside supported range"),
+        ] {
+            let req = GenerationRequest {
+                width,
+                steps,
+                ..valid.clone()
+            };
+            let direct = compile_base(FluxVariant::Dev, &spec, &req)
+                .unwrap_err()
+                .to_string();
+            assert!(direct.contains(expected), "{width}: {direct}");
+            let registered = registry
+                .compile_render_plan(FluxVariant::Dev.id(), &spec, &req)
+                .unwrap_err()
+                .to_string();
+            assert!(registered.contains(expected), "{width}: {registered}");
+        }
+    }
+
+    /// Hires.fix with the XLabs IP route: pass 1 renders at the base size, pass 2 renders from
+    /// noise at the upscaled size conditioned on pass 1's stretched output at strength
+    /// 1 − denoise. Both passes compile before load; pass 2's reference is bound by its declared
+    /// size and strength because its pixels exist only after pass 1.
+    #[test]
+    fn xlabs_ip_hires_fix_compiles_two_passes_before_load() {
+        let registry = crate::provider_registry().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir("/missing/flux".into()))
+            .with_ip_adapter(WeightsSource::Dir("/missing/ip".into()));
+        let first = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 512,
+            height: 512,
+            steps: Some(4),
+            seed: Some(7),
+            ..Default::default()
+        };
+        let refine = GenerationRequest {
+            width: 768,
+            height: 768,
+            steps: Some(3),
+            ..first.clone()
+        };
+        let hires = gen_core::ProducedReference {
+            from_pass: 0,
+            width: 768,
+            height: 768,
+            strength: Some(1.0 - 0.45),
+        };
+        let compile = |refine: &GenerationRequest, produced| {
+            registry.compile_multi_pass_render_plan(
+                FluxVariant::Dev.id(),
+                &spec,
+                &[
+                    gen_core::PlannedPassRequest {
+                        request: &first,
+                        produced_reference: None,
+                    },
+                    gen_core::PlannedPassRequest {
+                        request: refine,
+                        produced_reference: Some(produced),
+                    },
+                ],
+            )
+        };
+        let plan = compile(&refine, hires)
+            .unwrap()
+            .expect("the XLabs Hires.fix route needs a pre-load plan");
+        let [base, refined] = plan.passes() else {
+            panic!("two passes");
+        };
+        base.check_request(&descriptor_for(FluxVariant::Dev), &first)
+            .unwrap();
+        assert_eq!(base.output_size(), (512, 512));
+        assert_eq!(refined.output_size(), (768, 768));
+        assert_eq!(refined.base_seed(), 7);
+        assert_eq!(plan.total_executed_steps(), 7);
+        let native = build_sigmas_with(3, 768, 768, true, None).unwrap();
+        assert_eq!(refined.denoise_sigmas(), native);
+        plan.check_load(&gen_core::RenderLoadBinding::from_spec(&spec))
+            .unwrap();
+
+        // The stretched pass-1 output (any pixels) of the declared size binds; others refuse.
+        let with_reference = |size: u32, strength: Option<f32>| GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: Image {
+                    width: size,
+                    height: size,
+                    pixels: vec![17; (size * size * 3) as usize],
+                },
+                strength,
+            }],
+            ..refine.clone()
+        };
+        refined
+            .check_request(
+                &descriptor_for(FluxVariant::Dev),
+                &with_reference(768, hires.strength),
+            )
+            .unwrap();
+        for wrong in [
+            with_reference(512, hires.strength),
+            with_reference(768, Some(0.45)),
+            refine.clone(),
+        ] {
+            assert!(refined
+                .check_request(&descriptor_for(FluxVariant::Dev), &wrong)
+                .is_err());
+        }
+
+        // Pass-2 refusals happen before load: off-grid, below-minimum and zero steps.
+        for (width, steps, expected) in [
+            (770, Some(3), "multiples of 16"),
+            (128, Some(3), "outside supported range"),
+            (768, Some(0), "steps must be >= 1"),
+        ] {
+            let bad = GenerationRequest {
+                width,
+                steps,
+                ..refine.clone()
+            };
+            let error = compile(&bad, gen_core::ProducedReference { width, ..hires })
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{width}: {error}");
+        }
+        // The IP pass needs its adapter in the shared load contract.
+        let no_adapter = LoadSpec::new(WeightsSource::Dir("/missing/flux".into()));
+        let error = registry
+            .compile_multi_pass_render_plan(
+                FluxVariant::Dev.id(),
+                &no_adapter,
+                &[
+                    gen_core::PlannedPassRequest {
+                        request: &first,
+                        produced_reference: None,
+                    },
+                    gen_core::PlannedPassRequest {
+                        request: &refine,
+                        produced_reference: Some(hires),
+                    },
+                ],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("IP-adapter"), "{error}");
+
+        // Single-pass plans are unchanged: pass 0, digest-bound reference.
+        let single = registry
+            .compile_render_plan(
+                FluxVariant::Dev.id(),
+                &spec,
+                &with_reference(768, hires.strength),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(single.pass_index(), 0);
+        assert_eq!(single.produced_reference(), None);
+        let mut changed = with_reference(768, hires.strength);
+        if let Conditioning::Reference { image, .. } = &mut changed.conditioning[0] {
+            image.pixels[0] ^= 1;
+        }
+        assert!(single
+            .check_request(&descriptor_for(FluxVariant::Dev), &changed)
+            .is_err());
     }
 
     #[test]

@@ -732,8 +732,33 @@ class SupervisorTests(unittest.TestCase):
         owner = safety.PosixTree(1, set())
         with patch.object(safety.platform, "system", return_value="Darwin"), \
              patch.object(safety.PosixTree, "members", return_value={21, 22, 23}), \
-             patch.object(safety, "darwin_phys_footprint", side_effect=lambda pid: pid):
-            self.assertEqual(safety.SystemProbe(self.policy).tree_footprint(owner), 66)
+             patch.object(safety, "darwin_footprints", side_effect=lambda pid: (pid, pid * 2)):
+            probe = safety.SystemProbe(self.policy)
+            self.assertEqual(probe.tree_footprint(owner), 66)
+            # Each member's kernel lifetime peak is kept; the tree reports their sum.
+            self.assertEqual(probe.lifetime_peaks, {21: 42, 22: 44, 23: 46})
+            self.assertEqual(probe.lifetime_peak_bytes(), 132)
+
+    def test_lifetime_peak_reads_the_kernel_high_water_mark_and_survives_ticks(self):
+        reads = iter([(10, 50), (30, 50), (5, 70)])
+        self.assertEqual(safety.darwin_footprints(7, read=lambda pid: next(reads)), (10, 50))
+        self.assertEqual(safety.darwin_footprints(7, read=lambda pid: (30, 20)), (30, 30))
+        def gone(pid):
+            raise ProcessLookupError(pid)
+        self.assertIsNone(safety.darwin_footprints(7, read=gone))
+        self.assertEqual(safety.darwin_phys_footprint(7, read=lambda pid: (11, 99)), 11)
+        with patch.object(safety.platform, "system", return_value="Darwin"):
+            probe = safety.SystemProbe(self.policy)
+            self.assertIsNone(probe.lifetime_peak_bytes())
+            with patch.object(safety, "darwin_footprints", return_value=(1, 900)):
+                probe.record_exit_lifetime_peak(4)
+            with patch.object(safety, "darwin_footprints", return_value=(1, 800)):
+                probe.record_exit_lifetime_peak(4)
+            self.assertEqual(probe.lifetime_peak_bytes(), 900)
+            with patch.object(safety, "darwin_footprints",
+                              side_effect=safety.SupervisionError("probe-failure", "x")):
+                probe.record_exit_lifetime_peak(4)  # measurement only: never stops the row
+            self.assertEqual(probe.lifetime_peak_bytes(), 900)
 
     def test_ancestry_survives_reparenting_and_forgets_exited_pids(self):
         known = {10}

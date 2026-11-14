@@ -75,6 +75,21 @@ impl ProviderRegistry {
         Ok((planner.compile)(spec, request)?.map(|plan| plan.bind_load(spec)))
     }
 
+    /// Compile an ordered multi-pass request (Hires.fix: a base pass, then a pass whose reference
+    /// is the base output resized to its declared size) before calling the provider factory. Each
+    /// pass goes through the provider's own single-pass compiler, so every pass is refused or
+    /// accepted before load exactly as a single-pass request would be.
+    pub fn compile_multi_pass_render_plan(
+        &self,
+        id: &str,
+        spec: &LoadSpec,
+        passes: &[crate::PlannedPassRequest<'_>],
+    ) -> Result<Option<crate::MultiPassRenderPlan>> {
+        crate::MultiPassRenderPlan::compile(passes, |request| {
+            self.compile_render_plan(id, spec, request)
+        })
+    }
+
     /// Every validated portable family checkpoint adapter in this platform catalog.
     pub fn checkpoint_adapters(
         &self,

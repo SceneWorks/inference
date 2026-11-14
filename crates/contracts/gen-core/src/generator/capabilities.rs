@@ -575,7 +575,9 @@ impl Capabilities {
         // driving media" convention, it is a malformed request, and it must still be rejected.
         let is_sentinel = req.width == 0 && req.height == 0;
         let check_size = match self.size_floor {
-            SizeFloor::RangeChecked | SizeFloor::RangeCheckedOnGrid { .. } => true,
+            SizeFloor::RangeChecked
+            | SizeFloor::RangeCheckedOnGrid { .. }
+            | SizeFloor::RangeCheckedOnGridArea { .. } => true,
             SizeFloor::ResolvedDownstream | SizeFloor::ResolvedDownstreamExplicitGrid { .. } => {
                 !is_sentinel
             }
@@ -594,6 +596,15 @@ impl Capabilities {
                         "{id}: width/height must be multiples of {multiple} (got {}×{})",
                         req.width, req.height
                     )));
+                }
+                if let SizeFloor::RangeCheckedOnGridArea { max_cells, .. } = self.size_floor {
+                    let cells = (req.width / multiple).checked_mul(req.height / multiple);
+                    if cells.is_none_or(|cells| cells > max_cells) {
+                        return Err(Error::Msg(format!(
+                            "{id}: packed image grid exceeds {max_cells} cells (got {}×{})",
+                            req.width, req.height
+                        )));
+                    }
                 }
             }
         }

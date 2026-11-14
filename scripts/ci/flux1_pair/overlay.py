@@ -39,7 +39,14 @@ def install(root, backend, arm, tier):
     if mlx:
         start = "if step_observer.is_step_start(sigmas, sigma) {\n            on_latent(x, sigma);"
         replace_once(root, path, start, start.replace("on_latent", "pair_observe(x, sigma);\n            on_latent"))
-        end = 'which evals only inputs).\n    step_eval(&[&out])?;\n    crate::ios_quantum::diagnostic_metadata(\n        "curated",'
+        if arm == "head":
+            end = '''if phase_scope.is_none() {
+        step_eval(&[&out])?;
+    }
+    crate::ios_quantum::diagnostic_metadata(
+        "curated",'''
+        else:
+            end = 'which evals only inputs).\n    step_eval(&[&out])?;\n    crate::ios_quantum::diagnostic_metadata(\n        "curated",'
         replace_once(root, path, end, end.replace("    crate::", "    pair_observe(&out, 0.0);\n    crate::", 1))
         helper = """fn pair_observe(x: &Array, sigma: f32) {
     assert_eq!(x.shape(), &[1, 256, 64]);
@@ -52,12 +59,22 @@ def install(root, backend, arm, tier):
     else:
         start = "let mut denoise_fn = |x: &Tensor, sigma: f32| -> gen_core::Result<Tensor> {\n        if cancel.is_cancelled()"
         replace_once(root, path, start, start.replace("        if cancel.", "        pair_observe(x, sigma);\n        if cancel."))
-        end = """    sampler
+        if arm == "head":
+            end = '''    if state.next_step() != sigmas.len().saturating_sub(1) {
+        return Err(CandleError::from(gen_core::Error::Unsupported(
+            "sampler spans do not cover the executed schedule".into(),
+        )));
+    }
+    Ok(out)
+}'''
+            replace_once(root, path, end, end.replace("    Ok(out)", "    pair_observe(&out, 0.0);\n    Ok(out)"))
+        else:
+            end = """    sampler
         .sample(&ops, ms, &mut denoise_fn, latents, sigmas, seed)
         .map_err(CandleError::from)
 }"""
-        replace_once(root, path, end, end.replace("    sampler", "    let out = sampler").replace(
-            ".map_err(CandleError::from)\n}", ".map_err(CandleError::from)?;\n    pair_observe(&out, 0.0);\n    Ok(out)\n}"))
+            replace_once(root, path, end, end.replace("    sampler", "    let out = sampler").replace(
+                ".map_err(CandleError::from)\n}", ".map_err(CandleError::from)?;\n    pair_observe(&out, 0.0);\n    Ok(out)\n}"))
         helper = """fn pair_observe(x: &Tensor, sigma: f32) {
     assert_eq!(x.dims(), &[1, 256, 64]);
     assert!(x.device().is_cuda());

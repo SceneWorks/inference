@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
-    Capabilities, GenerationMemory, MemoryGeometry, MemoryRunOutcome, Modality, WeightsSource,
+    Capabilities, Conditioning, ControlKind, GenerationMemory, Image, MemoryGeometry,
+    MemoryRunOutcome, Modality, WeightsSource,
 };
 
 fn descriptor() -> ModelDescriptor {
@@ -31,6 +32,115 @@ fn pass(sigmas: Vec<f32>, executed_steps: usize, capture_sigma: f32) -> PackedIm
         executed_steps,
         capture_sigma,
     }
+}
+
+#[test]
+fn packed_image_plan_freezes_reference_and_control_content_before_load() {
+    let image = Image {
+        width: 16,
+        height: 16,
+        pixels: vec![7; 16 * 16 * 3],
+    };
+    for conditioning in [
+        Conditioning::Reference {
+            image: image.clone(),
+            strength: Some(0.5),
+        },
+        Conditioning::Control {
+            image: image.clone(),
+            kind: ControlKind::Pose,
+            scale: Some(0.7),
+        },
+    ] {
+        let mut request = GenerationRequest {
+            conditioning: vec![conditioning],
+            ..Default::default()
+        };
+        let compiled = RenderPlan::packed_image_trajectory(
+            &descriptor(),
+            &request,
+            pass(vec![1.0, 0.5, 0.0], 2, 0.0),
+        )
+        .unwrap();
+        assert!(compiled.check_request(&descriptor(), &request).is_ok());
+        match &mut request.conditioning[0] {
+            Conditioning::Reference { image, .. } | Conditioning::Control { image, .. } => {
+                image.pixels[0] ^= 1;
+            }
+            _ => unreachable!(),
+        }
+        assert!(compiled.check_request(&descriptor(), &request).is_err());
+        match &mut request.conditioning[0] {
+            Conditioning::Reference { image, strength } => {
+                image.pixels[0] ^= 1;
+                *strength = Some(0.75);
+            }
+            Conditioning::Control { image, scale, .. } => {
+                image.pixels[0] ^= 1;
+                *scale = Some(0.25);
+            }
+            _ => unreachable!(),
+        }
+        assert!(compiled.check_request(&descriptor(), &request).is_err());
+    }
+}
+
+#[test]
+fn packed_image_plan_refuses_multiple_or_unsupported_conditioning() {
+    let image = Image {
+        width: 16,
+        height: 16,
+        pixels: vec![0; 16 * 16 * 3],
+    };
+    for conditioning in [
+        vec![
+            Conditioning::Reference {
+                image: image.clone(),
+                strength: None,
+            };
+            2
+        ],
+        vec![
+            Conditioning::Reference {
+                image: image.clone(),
+                strength: None,
+            },
+            Conditioning::Control {
+                image: image.clone(),
+                kind: ControlKind::Pose,
+                scale: Some(0.7),
+            },
+        ],
+        vec![Conditioning::Depth { image }],
+    ] {
+        let request = GenerationRequest {
+            conditioning,
+            ..Default::default()
+        };
+        assert!(RenderPlan::packed_image_trajectory(
+            &descriptor(),
+            &request,
+            pass(vec![1.0, 0.5, 0.0], 2, 0.0),
+        )
+        .is_err());
+    }
+    let malformed = GenerationRequest {
+        conditioning: vec![Conditioning::Reference {
+            image: Image {
+                width: 16,
+                height: 16,
+                pixels: vec![0; 3],
+            },
+            strength: None,
+        }],
+        ..Default::default()
+    };
+    assert!(RenderPlan::packed_image_trajectory(
+        &descriptor(),
+        &malformed,
+        pass(vec![1.0, 0.5, 0.0], 2, 0.0),
+    )
+    .is_err());
 }
 
 #[derive(Default)]
@@ -74,6 +184,87 @@ impl MemoryRequestScope for Scope {
     fn materialize_transformer_window(&mut self, _: u32, _: u32) -> Result<()> {
         unreachable!()
     }
+}
+
+#[test]
+fn split_conditioning_covers_text_handoff_and_source_preparation_before_denoise() {
+    use std::{cell::RefCell, rc::Rc};
+
+    struct TraceScope(Rc<RefCell<Vec<&'static str>>>);
+    impl MemoryRequestScope for TraceScope {
+        fn configure_request(&mut self, _: &mut GenerationRequest) -> Result<()> {
+            unreachable!()
+        }
+        fn finish(&mut self, _: MemoryRunOutcome) -> Result<()> {
+            unreachable!()
+        }
+        fn enter_phase(&mut self, _: MemoryPhase) -> Result<()> {
+            unreachable!()
+        }
+        fn enter_render_phase(
+            &mut self,
+            phase: MemoryPhase,
+            _: &RenderPhaseIdentity,
+        ) -> Result<()> {
+            self.0.borrow_mut().push(match phase {
+                MemoryPhase::Conditioning => "conditioning-enter",
+                MemoryPhase::Denoise => "denoise-enter",
+                MemoryPhase::Decode => "decode-enter",
+            });
+            Ok(())
+        }
+        fn leave_phase(&mut self, phase: MemoryPhase) -> Result<()> {
+            self.0.borrow_mut().push(match phase {
+                MemoryPhase::Conditioning => "conditioning-leave",
+                MemoryPhase::Denoise => "denoise-leave",
+                MemoryPhase::Decode => "decode-leave",
+            });
+            Ok(())
+        }
+        fn configure_decode(&mut self, _: u32, _: u32, _: MemoryGeometry) -> Result<()> {
+            unreachable!()
+        }
+        fn configure_attention(&mut self, _: u32) -> Result<()> {
+            unreachable!()
+        }
+        fn materialize_transformer_window(&mut self, _: u32, _: u32) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    let request = GenerationRequest::default();
+    let plan = plan(&request).unwrap();
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let mut scope = TraceScope(Rc::clone(&trace));
+    let run = RenderRun::new(&plan, &request.cancel, Some(&mut scope));
+    run.begin_conditioning().unwrap();
+    assert!(run.begin_conditioning().is_err());
+    trace.borrow_mut().push("text-encode");
+    trace.borrow_mut().push("text-drop");
+    trace.borrow_mut().push("source-encode");
+    run.end_conditioning().unwrap();
+    assert!(run.end_conditioning().is_err());
+    run.images(
+        &mut |_| {},
+        |_| Ok::<_, Error>(()),
+        |_, _, _| Ok::<_, Error>(()),
+        |_, _, _| Ok::<_, Error>(()),
+    )
+    .unwrap();
+    assert_eq!(
+        *trace.borrow(),
+        [
+            "conditioning-enter",
+            "text-encode",
+            "text-drop",
+            "source-encode",
+            "conditioning-leave",
+            "denoise-enter",
+            "denoise-leave",
+            "decode-enter",
+            "decode-leave",
+        ]
+    );
 }
 
 #[test]
@@ -193,6 +384,29 @@ fn plan_freezes_schedule_decode_count_and_preparation_inputs() {
     let other = LoadSpec::new(WeightsSource::Dir("/fixture/other".into()));
     assert!(plan
         .check_load(&RenderLoadBinding::from_spec(&other))
+        .is_err());
+    let mut changed_control = spec.clone();
+    changed_control.control = Some(WeightsSource::File("/fixture/control".into()));
+    assert!(plan
+        .check_load(&RenderLoadBinding::from_spec(&changed_control))
+        .is_err());
+    let mut changed_policy = spec.clone();
+    changed_policy.offload_policy = crate::OffloadPolicy::Sequential;
+    assert!(plan
+        .check_load(&RenderLoadBinding::from_spec(&changed_policy))
+        .is_err());
+    let mut changed_component = spec.clone();
+    changed_component.components.insert(
+        "flux_ip_image_encoder".into(),
+        WeightsSource::Dir("/fixture/encoder".into()),
+    );
+    assert!(plan
+        .check_load(&RenderLoadBinding::from_spec(&changed_component))
+        .is_err());
+    let mut changed_shape = spec.clone();
+    changed_shape.load_shape = crate::LoadShape::DeferredMaterialization;
+    assert!(plan
+        .check_load(&RenderLoadBinding::from_spec(&changed_shape))
         .is_err());
 }
 
@@ -478,4 +692,255 @@ fn failed_init_does_not_enter_the_denoise_scope() {
             (false, MemoryPhase::Conditioning)
         ]
     );
+}
+
+fn trajectory(request: &GenerationRequest) -> Result<Option<RenderPlan>> {
+    RenderPlan::packed_image_trajectory(&descriptor(), request, pass(vec![1.0, 0.5, 0.0], 2, 0.0))
+        .map(|plan| Some(plan.bind_load(&crate::LoadSpec::new(WeightsSource::Dir("/m".into())))))
+}
+
+fn hires_requests() -> (GenerationRequest, GenerationRequest) {
+    let base = GenerationRequest {
+        prompt: "a fox".into(),
+        width: 32,
+        height: 32,
+        seed: Some(5),
+        ..Default::default()
+    };
+    let refine = GenerationRequest {
+        width: 64,
+        height: 48,
+        steps: Some(3),
+        ..base.clone()
+    };
+    (base, refine)
+}
+
+fn produced(width: u32, height: u32) -> ProducedReference {
+    ProducedReference {
+        from_pass: 0,
+        width,
+        height,
+        strength: Some(0.3),
+    }
+}
+
+fn reference(width: u32, height: u32, strength: Option<f32>) -> Conditioning {
+    Conditioning::Reference {
+        image: Image {
+            width,
+            height,
+            pixels: vec![9; (width * height * 3) as usize],
+        },
+        strength,
+    }
+}
+
+#[test]
+fn multi_pass_plan_compiles_before_load_and_binds_produced_reference_by_shape() {
+    let (base, refine) = hires_requests();
+    let plan = MultiPassRenderPlan::compile(
+        &[
+            PlannedPassRequest {
+                request: &base,
+                produced_reference: None,
+            },
+            PlannedPassRequest {
+                request: &refine,
+                produced_reference: Some(produced(64, 48)),
+            },
+        ],
+        trajectory,
+    )
+    .unwrap()
+    .expect("both passes have pre-load plans");
+    let [first, second] = plan.passes() else {
+        panic!("two passes");
+    };
+    assert_eq!((first.pass_index(), second.pass_index()), (0, 1));
+    assert_eq!(
+        (first.output_size(), second.output_size()),
+        ((32, 32), (64, 48))
+    );
+    assert_eq!(second.produced_reference(), Some(produced(64, 48)));
+    assert_eq!(first.produced_reference(), None);
+    assert_eq!(plan.total_executed_steps(), 4);
+    first.check_request(&descriptor(), &base).unwrap();
+    plan.check_load(&RenderLoadBinding::from_spec(&crate::LoadSpec::new(
+        WeightsSource::Dir("/m".into()),
+    )))
+    .unwrap();
+
+    // Any pixels of the declared size and strength stand in for the produced image.
+    let mut live = refine.clone();
+    live.conditioning = vec![reference(64, 48, Some(0.3))];
+    second.check_request(&descriptor(), &live).unwrap();
+    live.conditioning = vec![reference(64, 48, Some(0.3))];
+    if let Conditioning::Reference { image, .. } = &mut live.conditioning[0] {
+        image.pixels.fill(200);
+    }
+    second.check_request(&descriptor(), &live).unwrap();
+    for wrong in [
+        vec![reference(32, 32, Some(0.3))],
+        vec![reference(64, 48, Some(0.5))],
+        vec![reference(64, 48, None)],
+        Vec::new(),
+    ] {
+        live.conditioning = wrong;
+        assert!(second.check_request(&descriptor(), &live).is_err());
+    }
+    // Other output-affecting inputs remain exact.
+    live.conditioning = vec![reference(64, 48, Some(0.3))];
+    live.steps = Some(4);
+    assert!(second.check_request(&descriptor(), &live).is_err());
+
+    // The phase identity of the second pass names its own pass and geometry.
+    struct Identities(Vec<RenderPhaseIdentity>);
+    impl MemoryRequestScope for Identities {
+        fn configure_request(&mut self, _: &mut GenerationRequest) -> Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self, _: MemoryRunOutcome) -> Result<()> {
+            Ok(())
+        }
+        fn enter_phase(&mut self, _: MemoryPhase) -> Result<()> {
+            Ok(())
+        }
+        fn enter_render_phase(&mut self, _: MemoryPhase, id: &RenderPhaseIdentity) -> Result<()> {
+            self.0.push(*id);
+            Ok(())
+        }
+        fn leave_phase(&mut self, _: MemoryPhase) -> Result<()> {
+            Ok(())
+        }
+        fn configure_decode(&mut self, _: u32, _: u32, _: MemoryGeometry) -> Result<()> {
+            unreachable!()
+        }
+        fn configure_attention(&mut self, _: u32) -> Result<()> {
+            unreachable!()
+        }
+        fn materialize_transformer_window(&mut self, _: u32, _: u32) -> Result<()> {
+            unreachable!()
+        }
+    }
+    let mut scope = Identities(Vec::new());
+    let cancel = CancelFlag::new();
+    {
+        let run = RenderRun::new(second, &cancel, Some(&mut scope));
+        run.encode(|| Ok::<_, Error>(())).unwrap();
+    }
+    assert_eq!(scope.0[0].pass, 1);
+    assert_eq!(
+        (scope.0[0].geometry.width, scope.0[0].geometry.height),
+        (64, 48)
+    );
+    assert_eq!(scope.0[0].geometry.reference_count, 1);
+}
+
+#[test]
+fn multi_pass_plan_refuses_invalid_pass_shapes_before_load() {
+    let (base, refine) = hires_requests();
+    let compile =
+        |passes: &[PlannedPassRequest<'_>]| MultiPassRenderPlan::compile(passes, trajectory);
+    let first = PlannedPassRequest {
+        request: &base,
+        produced_reference: None,
+    };
+    // A single pass is not a multi-pass plan.
+    assert!(compile(&[first]).is_err());
+    // Pass 2 geometry is compiled and refused before load (off the 16-pixel grid).
+    let off_grid = GenerationRequest {
+        width: 65,
+        ..refine.clone()
+    };
+    assert!(compile(&[
+        first,
+        PlannedPassRequest {
+            request: &off_grid,
+            produced_reference: Some(produced(65, 48)),
+        },
+    ])
+    .is_err());
+    // A pass cannot consume itself or a later pass, nor carry its own conditioning too.
+    assert!(compile(&[
+        first,
+        PlannedPassRequest {
+            request: &refine,
+            produced_reference: Some(ProducedReference {
+                from_pass: 1,
+                ..produced(64, 48)
+            }),
+        },
+    ])
+    .is_err());
+    let conditioned = GenerationRequest {
+        conditioning: vec![reference(64, 48, Some(0.3))],
+        ..refine.clone()
+    };
+    assert!(compile(&[
+        first,
+        PlannedPassRequest {
+            request: &conditioned,
+            produced_reference: Some(produced(64, 48)),
+        },
+    ])
+    .is_err());
+    // An oversized placeholder and a prompt batch are refused.
+    assert!(compile(&[
+        first,
+        PlannedPassRequest {
+            request: &refine,
+            produced_reference: Some(produced(8192, 8192)),
+        },
+    ])
+    .is_err());
+    let batch = GenerationRequest {
+        count: 2,
+        ..base.clone()
+    };
+    assert!(compile(&[
+        PlannedPassRequest {
+            request: &batch,
+            produced_reference: None,
+        },
+        PlannedPassRequest {
+            request: &refine,
+            produced_reference: Some(produced(64, 48)),
+        },
+    ])
+    .is_err());
+    // A provider without a pre-load plan yields no plan.
+    assert_eq!(
+        MultiPassRenderPlan::compile(
+            &[
+                first,
+                PlannedPassRequest {
+                    request: &refine,
+                    produced_reference: Some(produced(64, 48)),
+                },
+            ],
+            |_| Ok(None),
+        )
+        .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn single_pass_plans_keep_pass_zero_and_digest_binding() {
+    let request = GenerationRequest {
+        conditioning: vec![reference(16, 16, Some(0.5))],
+        ..Default::default()
+    };
+    let compiled = trajectory(&request).unwrap().unwrap();
+    assert_eq!(compiled.pass_index(), 0);
+    assert_eq!(compiled.produced_reference(), None);
+    assert!(!serde_json::to_string(&compiled)
+        .unwrap()
+        .contains("pass_index"));
+    let mut changed = request.clone();
+    if let Conditioning::Reference { image, .. } = &mut changed.conditioning[0] {
+        image.pixels[0] ^= 1;
+    }
+    assert!(compiled.check_request(&descriptor(), &changed).is_err());
 }
