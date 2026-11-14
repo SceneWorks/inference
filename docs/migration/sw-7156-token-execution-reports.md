@@ -50,11 +50,11 @@ decode report. These reasons replace the compatibility-only provider default.
 
 Pre-execution plan methods explicitly report that runtime decode choices are unavailable before
 execution. They do not promise strict pre-admission replay for a path whose numerical choices
-are only observed after decoding. A completed report with live prefix reuse, a measured adaptive
-speculation monitor, or SVG wall-time bounds explicitly declines deterministic replay and names
-that dependency. Other reports scope replay to the same pinned inputs, model/tokenizer bytes,
-inference revision, device/dtype and effective execution policy; they do not promise cross-device
-or cross-revision equivalence. No learned model execution is part of ordinary tests.
+are only observed after decoding. Completed token and SenseNova document reports retain the
+observed settings and draws but classify replay as non-deterministic until a route, model, device
+and precision scope has a bitwise replay attestation. Live prefix reuse, adaptive speculation,
+and SVG wall-time bounds name their additional dynamic dependency in the refusal reason. No
+learned model execution is part of ordinary tests.
 
 ## Worker integration
 

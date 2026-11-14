@@ -110,7 +110,7 @@ impl TokenExecutionScope {
                 randomness:if observed.document_draws.is_empty() {
                     ExecutionRandomness::NoDraws {reason:"Token segments used greedy sampling or performed no token draw; no image noise was consumed".into()}
                 } else {ExecutionRandomness::Draws {scheme:format!("splitmix64-token-stream-v1; images:{:?}",observed.image_schemes),draws:observed.document_draws.clone()}},
-                deterministic_replay:ExecutionReplaySupport::Deterministic {scope:"Same pinned model/tokenizer bytes, inference revision, device, dtype and effective memory/attention policy; identical conditioning and recorded noise streams".into()},
+                deterministic_replay:ExecutionReplaySupport::NonDeterministic {reason:"SenseNova document routes have no bitwise replay attestation for the complete token/image stream on this model, device and precision".into()},
                 geometry:ExecutionFact::resolved(output_policy.clone()),
                 quality_policy:ExecutionFact::resolved(json!({"decode":observed.decodes,"execution_policies":observed.policies})),
                 output_policy:ExecutionFact::resolved(output_policy), provider_choices:Default::default(),output_units:1,
@@ -366,7 +366,7 @@ fn token_replay_support(decode: &DecodeReport, policies: &[Value]) -> ExecutionR
     };
     match reason {
         Some(reason)=>ExecutionReplaySupport::NonDeterministic {reason:reason.into()},
-        None=>ExecutionReplaySupport::Deterministic {scope:"Same pinned model/tokenizer bytes, inference revision, device, dtype and effective decode/cache policy; identical conditioning and recorded RNG stream".into()},
+        None=>ExecutionReplaySupport::NonDeterministic {reason:"Bitwise replay has not been attested for this token provider, model, device and precision; observed settings and seeded draws alone do not establish it".into()},
     }
 }
 
@@ -433,6 +433,11 @@ mod tests {
         assert!(format!("{:?}", identity.sampling).contains("577"));
         assert!(format!("{:?}", identity.quality_policy).contains("no draft loaded"));
         assert!(format!("{:?}", identity.output_policy).contains("19"));
+        assert!(matches!(
+            &identity.deterministic_replay,
+            ExecutionReplaySupport::NonDeterministic { reason }
+                if reason.contains("Bitwise replay has not been attested")
+        ));
     }
     #[test]
     fn cancellation_retry_and_missing_sampler_never_reuse_success() {
@@ -557,6 +562,11 @@ mod document_tests {
         assert!(draws[1].seed.is_none());
         assert_eq!(draws[1].noise_sha256.as_ref().unwrap().len(), 64);
         assert!(format!("{:?}", identity.schedule).contains("f32_le_bits"));
+        assert!(matches!(
+            &identity.deterministic_replay,
+            ExecutionReplaySupport::NonDeterministic { reason }
+                if reason.contains("no bitwise replay attestation")
+        ));
     }
 
     #[test]
@@ -693,10 +703,54 @@ mod document_tests {
     #[test]
     fn replay_support_names_actual_dynamic_dependency() {
         let mut decode = DecodeReport::default();
-        assert!(token_replay_support(&decode, &[]).is_deterministic());
+        assert!(matches!(
+            token_replay_support(&decode, &[]),
+            ExecutionReplaySupport::NonDeterministic { reason }
+                if reason.contains("Bitwise replay has not been attested")
+        ));
         decode.prefix_hit_tokens = 4;
-        assert!(!token_replay_support(&decode, &[]).is_deterministic());
+        assert!(matches!(
+            token_replay_support(&decode, &[]),
+            ExecutionReplaySupport::NonDeterministic { reason }
+                if reason.contains("prefix cache")
+        ));
         decode.prefix_hit_tokens = 0;
-        assert!(!token_replay_support(&decode, &[svg_policy_fixture()]).is_deterministic());
+        assert!(matches!(
+            token_replay_support(&decode, &[svg_policy_fixture()]),
+            ExecutionReplaySupport::NonDeterministic { reason }
+                if reason.contains("wall time")
+        ));
+    }
+
+    #[test]
+    fn completed_svg_keeps_observed_facts_without_claiming_bitwise_replay() {
+        let scope = TokenExecutionScope::new();
+        observe_token_seed(Sampling::default(), 41, 19, &[]);
+        let svg = StarVectorOutput {
+            svg: Some("<svg/>".into()),
+            generated_tokens: 1,
+            generated_bytes: 6,
+            finish_reason: crate::StarVectorFinishReason::CompleteRoot,
+            kv_cache: None,
+        };
+        let descriptor = TextLlmDescriptor {
+            id: "svg-test".into(),
+            backend: "candle".into(),
+            family: "test".into(),
+            capabilities: Default::default(),
+        };
+        let completed = scope
+            .finish_svg(svg, Some(&DecodeReport::default()), &descriptor)
+            .unwrap();
+        let resolved = completed.execution.resolved().unwrap();
+        assert!(matches!(
+            &resolved.deterministic_replay,
+            ExecutionReplaySupport::NonDeterministic { reason }
+                if reason.contains("Bitwise replay has not been attested")
+        ));
+        assert!(matches!(
+            &resolved.randomness,
+            ExecutionRandomness::Draws { draws, .. } if draws[0].seed == Some(41)
+        ));
     }
 }
