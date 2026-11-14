@@ -359,8 +359,9 @@ jobs:
   # SW-7104 (requirement E28): convert the DiT and PE q8/q4 tiers at this commit and publish them to
   # the SceneWorks Hugging Face repositories the SceneWorks manifest names, after Michael's go-ahead
   # (2026-11-14). Dispatch-only profiles, never `all`: `minimax-h3-image-publish` runs both jobs,
-  # `-mlx` / `-candle` re-run one side, and
-  # `-mlx-nax-macos` runs the macOS side on `nax-macos` instead of nax-macos-2. `scripts/ci/publish_hf_tiers.py` uploads only what the repo
+  # `-mlx` / `-candle` re-run one side,
+  # `-mlx-nax-macos` runs the macOS side on `nax-macos` instead of nax-macos-2, and a profile ending
+  # in `-pe` (`-mlx-pe`, `-mlx-nax-macos-pe`) publishes only the PE MLX tiers. `scripts/ci/publish_hf_tiers.py` uploads only what the repo
   # does not already hold, verifies every file against the hub's metadata, and writes a report.
   # Uploads use the runner's own Hugging Face login, as the Chroma publication does. Each job
   # removes only its own run-scoped scratch.
@@ -373,12 +374,15 @@ jobs:
   #   differ per backend. Conversion is CPU-only here.
   mlx-minimax-h3-image-publish:
     name: Publish the H3-Image DiT and PE MLX tiers
-    if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'minimax-h3-image-publish' || inputs.profile == 'minimax-h3-image-publish-mlx' || inputs.profile == 'minimax-h3-image-publish-mlx-nax-macos')
-    # nax-macos-2 (`rw-mage`) by default. `minimax-h3-image-publish-mlx-nax-macos` runs this job once on
-    # `nax-macos` (`rw-starvector`, Michael's dev Mac) as a one-time loan he approved for SW-7104.
-    runs-on: [self-hosted, macOS, ARM64, "${{ inputs.profile == 'minimax-h3-image-publish-mlx-nax-macos' && 'rw-starvector' || 'rw-mage' }}"]
+    if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'minimax-h3-image-publish' || inputs.profile == 'minimax-h3-image-publish-mlx' || inputs.profile == 'minimax-h3-image-publish-mlx-pe' || inputs.profile == 'minimax-h3-image-publish-mlx-nax-macos' || inputs.profile == 'minimax-h3-image-publish-mlx-nax-macos-pe')
+    # nax-macos-2 (`rw-mage`) by default. The `-nax-macos` profiles run this job on `nax-macos`
+    # (`rw-starvector`, Michael's dev Mac) as a one-time loan he approved for SW-7104.
+    runs-on: [self-hosted, macOS, ARM64, "${{ startsWith(inputs.profile, 'minimax-h3-image-publish-mlx-nax-macos') && 'rw-starvector' || 'rw-mage' }}"]
     timeout-minutes: 720
     env:
+      # Stage selection (real-weights.yml is at the 25-input limit, so the profile carries it): a
+      # profile ending in `-pe` publishes only the PE tiers; every other profile publishes both.
+      PUBLISH_DIT: ${{ !endsWith(inputs.profile, '-pe') }}
       MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
       MINIMAX_PE_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--MiniMaxAI--MiniMax-H3-Image-PE/snapshots/35603d4b63949afa12cb098227fffefedf081afa
     steps:
@@ -397,13 +401,17 @@ jobs:
       - name: Build the converters
         run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/build-the-converters.sh
       - name: Materialize the image DiT
+        if: env.PUBLISH_DIT == 'true'
         run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/materialize-the-image-dit.sh
       - name: Require disk headroom for the DiT tiers
+        if: env.PUBLISH_DIT == 'true'
         run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/require-disk-headroom-for-the-dit-tiers.sh
       - name: Convert the DiT q8 and q4 tiers
+        if: env.PUBLISH_DIT == 'true'
         shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 21600 -- /bin/bash -e {0}
         run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/convert-the-dit-tiers.sh
       - name: Publish the DiT tiers
+        if: env.PUBLISH_DIT == 'true'
         run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/publish-the-dit-tiers.sh
       - name: Materialize the PE snapshot
         run: source scripts/ci/real-weights/mlx-minimax-h3-image-publish/materialize-the-pe-snapshot.sh
