@@ -470,6 +470,11 @@ impl KreaTextEncoder {
         let mask = causal_mask(b, s, &self.device)?;
 
         let mut hidden = self.embed_tokens.forward(input_ids)?.to_dtype(DType::F32)?;
+        candle_gen::execution::component_runtime(
+            "krea/text_encoder",
+            hidden.device(),
+            hidden.dtype(),
+        );
         let mut saved: Vec<(usize, Tensor)> = Vec::with_capacity(self.out_layers.len());
         for (i, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
@@ -519,6 +524,11 @@ impl KreaTextEncoder {
         // Token embeddings (f32), then splice each reference's vision embeds over its block. Each
         // replacement is the same length as the block, so earlier splices don't shift later indices.
         let mut hidden = self.embed_tokens.forward(input_ids)?.to_dtype(DType::F32)?;
+        candle_gen::execution::component_runtime(
+            "krea/text_encoder",
+            hidden.device(),
+            hidden.dtype(),
+        );
         for (k, &(start, len)) in blocks.iter().enumerate() {
             if image_embeds[k].dim(0)? != len {
                 return Err(candle_gen::candle_core::Error::Msg(format!(

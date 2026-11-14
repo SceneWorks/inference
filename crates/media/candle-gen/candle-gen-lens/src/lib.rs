@@ -752,7 +752,13 @@ impl Pipeline {
                         .reshape((b, latent_h, latent_w, c))?
                         .permute((0, 3, 1, 2))?
                         .contiguous()?;
-                    pid.decode(&packed)?
+                    let decoded = pid.decode(&packed)?;
+                    candle_gen::execution::component_runtime(
+                        "lens/pid_decoder",
+                        decoded.device(),
+                        decoded.dtype(),
+                    );
+                    decoded
                 }
                 None => vae::decode_with_tiling(
                     &comps.heavy.vae,
@@ -858,7 +864,13 @@ impl Pipeline {
                         .reshape((b, latent_h, latent_w, c))?
                         .permute((0, 3, 1, 2))?
                         .contiguous()?;
-                    pid.decode(&packed)?
+                    let decoded = pid.decode(&packed)?;
+                    candle_gen::execution::component_runtime(
+                        "lens/pid_decoder",
+                        decoded.device(),
+                        decoded.dtype(),
+                    );
+                    decoded
                 }
                 None => vae::decode_with_tiling(
                     &heavy.vae,

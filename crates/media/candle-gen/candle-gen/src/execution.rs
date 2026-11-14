@@ -264,6 +264,15 @@ pub fn runtime(device: &Device, dtype: DType) {
     });
 }
 
+/// Bind a component's observed compute tensor to the attempt, distinct from sampler latents.
+pub fn component_runtime(component: &str, device: &Device, dtype: DType) {
+    runtime(device, dtype);
+    policy(
+        &format!("compute_component/{component}"),
+        json!({"device": format!("{:?}", device.location()), "dtype": format!("{dtype:?}")}),
+    );
+}
+
 /// A route with an unobservable decision must explicitly refuse exact replay.
 pub fn unavailable(detail: &str) {
     observe(|attempt| attempt.missing.push(detail.into()));
@@ -595,6 +604,52 @@ mod tests {
             panic!("draws")
         };
         assert_eq!(draws[0].seed, Some(91));
+    }
+
+    #[test]
+    fn component_runtime_keeps_model_precision_distinct_from_sampler_and_decoder() {
+        let completed = capture_direct(&DESCRIPTOR, &gen_core::CancelFlag::default(), || {
+            rng_scheme("fixture");
+            draw("noise", 7, 0);
+            schedule("euler", &[1.0, 0.0], "flow");
+            component_runtime("lens/transformer", &Device::Cpu, DType::BF16);
+            component_runtime("lens/experts", &Device::Cpu, DType::F32);
+            component_runtime("lens/vae", &Device::Cpu, DType::F32);
+            component_runtime("krea/text_encoder", &Device::Cpu, DType::F32);
+            component_runtime("krea/transformer", &Device::Cpu, DType::BF16);
+            component_runtime("chroma/t5", &Device::Cpu, DType::BF16);
+            component_runtime("chroma/transformer", &Device::Cpu, DType::F32);
+            component_runtime("chroma/vae", &Device::Cpu, DType::BF16);
+            Ok(GenerationOutput::Images(vec![Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            }]))
+        })
+        .unwrap();
+        let identity = resolved(completed);
+        let ExecutionFact::Resolved { value } = identity.quality_policy else {
+            panic!("quality policy")
+        };
+        let operations = &value["operations"];
+        for (component, dtype) in [
+            ("lens/transformer", "BF16"),
+            ("lens/experts", "F32"),
+            ("lens/vae", "F32"),
+            ("krea/text_encoder", "F32"),
+            ("krea/transformer", "BF16"),
+            ("chroma/t5", "BF16"),
+            ("chroma/transformer", "F32"),
+            ("chroma/vae", "BF16"),
+        ] {
+            assert_eq!(
+                operations[format!("compute_component/{component}")][0]["value"]["dtype"],
+                dtype
+            );
+        }
+        let compute = value["compute"].as_array().unwrap();
+        assert!(compute.iter().any(|runtime| runtime["dtype"] == "BF16"));
+        assert!(compute.iter().any(|runtime| runtime["dtype"] == "F32"));
     }
 
     #[test]

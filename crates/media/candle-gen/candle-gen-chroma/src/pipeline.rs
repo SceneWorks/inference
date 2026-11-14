@@ -527,7 +527,9 @@ impl Pipeline {
         prompt: &str,
     ) -> Result<Tensor> {
         let mut t5 = candle_gen::lock_recover(t5);
-        text::encode_prompt(tokenizer, &mut t5, prompt, &self.device)
+        let encoded = text::encode_prompt(tokenizer, &mut t5, prompt, &self.device)?;
+        candle_gen::execution::component_runtime("chroma/t5", encoded.device(), encoded.dtype());
+        Ok(encoded)
     }
 
     /// Chroma's flow-match sigma schedule (length `steps + 1`, descending to a trailing `0`). HD/Flash
@@ -625,6 +627,11 @@ impl Pipeline {
                 // pooled_temb depends only on the timestep — compute once and share across both branches.
                 let pooled = transformer.pooled_temb(&ts)?;
                 let pos = transformer.forward_prepared(latents, pos_embeds, &pooled, rope_pos)?;
+                candle_gen::execution::component_runtime(
+                    "chroma/transformer",
+                    pos.device(),
+                    pos.dtype(),
+                );
                 match (neg_embeds, rope_neg) {
                     (Some(neg), Some(rope_n)) => {
                         let neg = transformer.forward_prepared(latents, neg, &pooled, rope_n)?;
@@ -668,12 +675,25 @@ impl Pipeline {
                     Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
                     pid,
                 )?;
-                pid.decode(&latents)?
+                let decoded = pid.decode(&latents)?;
+                candle_gen::execution::component_runtime(
+                    "chroma/pid_decoder",
+                    decoded.device(),
+                    decoded.dtype(),
+                );
+                decoded
             }
-            None => vae
-                .ok_or_else(|| CandleError::Msg("chroma: native decode lacks VAE".into()))?
-                .decode(&latents)?
-                .to_dtype(DType::F32)?, // [1, 3, H, W] in [-1, 1]
+            None => {
+                let decoded = vae
+                    .ok_or_else(|| CandleError::Msg("chroma: native decode lacks VAE".into()))?
+                    .decode(&latents)?;
+                candle_gen::execution::component_runtime(
+                    "chroma/vae",
+                    decoded.device(),
+                    decoded.dtype(),
+                );
+                decoded.to_dtype(DType::F32)? // [1, 3, H, W] in [-1, 1]
+            }
         };
         let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
         let img = candle_gen::round_rgb8(&scaled)?;

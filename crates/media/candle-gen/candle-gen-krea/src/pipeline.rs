@@ -1753,7 +1753,9 @@ fn render_img2img_from_context(
     // The clean reference latent (seed-independent): LANCZOS-resize → `[-1,1]` pixels → the normalized
     // 16-ch latent (f32, the noise's dtype for the blend + sampler).
     let init_pixels = preprocess_img2img_init(reference, req.width, req.height, device)?;
-    let clean = vae_encoder.encode(&init_pixels)?.to_dtype(DType::F32)?;
+    let clean = vae_encoder.encode(&init_pixels)?;
+    candle_gen::execution::component_runtime("krea/vae_encoder", clean.device(), clean.dtype());
+    let clean = clean.to_dtype(DType::F32)?;
 
     let pid_decoder = candle_gen_pid::resolve_pid_decoder(
         comps.pid.as_deref(),
@@ -2436,7 +2438,9 @@ fn render_base_img2img_from_contexts(
     // The clean reference latent (seed-independent): LANCZOS-resize → `[-1,1]` pixels → the normalized
     // 16-ch latent (f32, the noise's dtype for the blend + sampler).
     let init_pixels = preprocess_img2img_init(reference, req.width, req.height, device)?;
-    let clean = vae_encoder.encode(&init_pixels)?.to_dtype(DType::F32)?;
+    let clean = vae_encoder.encode(&init_pixels)?;
+    candle_gen::execution::component_runtime("krea/vae_encoder", clean.device(), clean.dtype());
+    let clean = clean.to_dtype(DType::F32)?;
 
     let pid_decoder = candle_gen_pid::resolve_pid_decoder(
         comps.pid.as_deref(),
@@ -2790,7 +2794,13 @@ fn encode_references(
     let mut out = Vec::with_capacity(references.len());
     for im in references {
         let pixels = image_to_pixels(im, width, height, device)?;
-        out.push(vae_encoder.encode(&pixels)?);
+        let encoded = vae_encoder.encode(&pixels)?;
+        candle_gen::execution::component_runtime(
+            "krea/vae_encoder",
+            encoded.device(),
+            encoded.dtype(),
+        );
+        out.push(encoded);
     }
     Ok(out)
 }
@@ -2858,6 +2868,7 @@ fn encode_vision(
             im.width as usize,
             device,
         )?;
+        candle_gen::execution::component_runtime("krea/vision", embeds.device(), embeds.dtype());
         g.n_per_ref
             .push(crate::vision::merged_token_count(grid, merge));
         g.embeds.push(embeds);
@@ -3054,6 +3065,11 @@ fn decode_via_seam(
     if cancel.is_some_and(gen_core::CancelFlag::is_cancelled) {
         return Err(CandleError::Canceled);
     }
+    let component = if decoder.is_some() {
+        "krea/pid_decoder"
+    } else {
+        "krea/vae"
+    };
     let decoder: &dyn LatentDecoder = decoder.unwrap_or(native);
     candle_gen::ensure_decoder_compatible(
         Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
@@ -3073,6 +3089,7 @@ fn decode_via_seam(
         }
         None => decoder.decode(latents)?,
     };
+    candle_gen::execution::component_runtime(component, decoded.device(), decoded.dtype());
     Ok(decoded.to_dtype(DType::F32)?)
 }
 
@@ -3355,6 +3372,63 @@ mod tests {
         assert_eq!(to_image(&got).unwrap(), expected_pid);
         assert_eq!(native.calls.get(), 0);
         assert_eq!(pid.calls.get(), 1);
+    }
+
+    #[test]
+    fn decode_report_binds_selected_component_before_output_promotion() {
+        use candle_gen::gen_core::generator::{ExecutionFact, ExecutionIdentity};
+
+        let device = Device::Cpu;
+        let latents = Tensor::zeros((1, 16, 2, 3), DType::F32, &device).unwrap();
+        for (pid_selected, expected_component, dtype) in [
+            (false, "krea/vae", DType::BF16),
+            (true, "krea/pid_decoder", DType::F32),
+        ] {
+            let native = DecodeSpy::new(Tensor::zeros((1, 3, 2, 3), dtype, &device).unwrap());
+            let pid = pid_selected
+                .then(|| DecodeSpy::new(Tensor::zeros((1, 3, 2, 3), dtype, &device).unwrap()));
+            let completed = candle_gen::execution::capture_direct(
+                &crate::descriptor(),
+                &gen_core::CancelFlag::default(),
+                || {
+                    candle_gen::execution::rng_scheme("fixture");
+                    candle_gen::execution::draw("noise", 7, 0);
+                    candle_gen::execution::schedule("euler", &[1.0, 0.0], "flow");
+                    decode_via_seam(
+                        &native,
+                        pid.as_ref().map(|decoder| decoder as &dyn LatentDecoder),
+                        &latents,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    Ok(gen_core::GenerationOutput::Images(vec![Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0; 3],
+                    }]))
+                },
+            )
+            .unwrap();
+            let ExecutionIdentity::Resolved { identity } = completed.execution else {
+                panic!("completed stub report should resolve")
+            };
+            let ExecutionFact::Resolved { value } = identity.quality_policy else {
+                panic!("quality policy")
+            };
+            let operations = &value["operations"];
+            assert_eq!(
+                operations[format!("compute_component/{expected_component}")][0]["value"]["dtype"],
+                format!("{dtype:?}")
+            );
+            let other = if pid_selected {
+                "krea/vae"
+            } else {
+                "krea/pid_decoder"
+            };
+            let other_key = format!("compute_component/{other}");
+            assert!(operations.get(other_key.as_str()).is_none());
+        }
     }
 
     /// **sc-21484 follow-up: the production single-file load is what publishes the facts.**
