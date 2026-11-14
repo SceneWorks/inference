@@ -20,6 +20,23 @@ pub trait Generator {
             "provider has no native MOSS edit path".into(),
         ))
     }
+
+    /// Native edit with a completed, provider-resolved execution identity. Existing providers
+    /// retain their edit behavior and explicitly report missing replay facts until they adopt the
+    /// new contract. The identity is returned with the output, never read from stale shared state.
+    fn generate_moss_image_edit_with_execution_report(
+        &self,
+        request: &GenerationRequest,
+        inputs: crate::moss_image_edit::MossImageEditInputs<'_>,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedMossImageEdit> {
+        let output = self.generate_moss_image_edit(request, inputs, progress)?;
+        CompletedMossImageEdit::new(
+            output,
+            ExecutionIdentity::provider_default(),
+            self.descriptor(),
+        )
+    }
     /// Complete structural edit peak, including reference encoding and request-local K/V.
     fn moss_image_edit_request_peak(
         &self,
@@ -166,6 +183,13 @@ pub trait Generator {
     /// distilled model, out-of-range size/count, …) before doing expensive work.
     fn validate(&self, req: &GenerationRequest) -> Result<()>;
 
+    /// Provider-resolved facts for strict pre-execution replay admission. A provider override
+    /// reuses the very resolver that generation uses. The default never guesses from the request;
+    /// a consumer refuses exact replay when this returns `Unavailable`.
+    fn plan_execution(&self, _req: &GenerationRequest) -> Result<ExecutionIdentity> {
+        Ok(ExecutionIdentity::provider_default())
+    }
+
     /// Run generation to completion (or until `req.cancel` trips).
     fn generate(
         &self,
@@ -224,6 +248,27 @@ pub trait Generator {
         Ok(out)
     }
 
+    /// Streaming synthesis with the same completed execution identity as one-shot generation.
+    /// The default emits one terminal chunk; a genuinely incremental provider must override this
+    /// alongside `generate_streaming` to keep its low-latency behavior and capture its own facts.
+    fn generate_streaming_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_chunk: &mut dyn FnMut(AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedGeneration> {
+        let completed = self.generate_with_execution_report(req, on_progress)?;
+        if let Some(GenerationOutput::Audio(track)) = &completed.generation.output {
+            on_chunk(AudioChunk {
+                samples: track.samples.clone(),
+                sample_rate: track.sample_rate,
+                channels: track.channels,
+                index: 0,
+            });
+        }
+        Ok(completed)
+    }
+
     /// **Generate and report** (sc-22988): the render's [`GenerationReport`] — its output, the
     /// reproducibility record it published ([`AudioParams::artifacts`]) and its non-fatal
     /// warnings (e.g. a truncated autoregressive phase).
@@ -245,6 +290,23 @@ pub trait Generator {
     ) -> Result<GenerationReport> {
         self.generate(req, on_progress)
             .map(GenerationReport::from_output)
+    }
+
+    /// Generation with an attempt-local execution report. Default implementation is additive for
+    /// external implementers and never converts submitted options into claimed resolved facts.
+    /// Repository providers override this to capture their actual sampler, RNG and policy choices
+    /// and return them only after successful completion and final cancellation checks.
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedGeneration> {
+        let generation = self.generate_with_report(req, on_progress)?;
+        CompletedGeneration::new(
+            generation,
+            ExecutionIdentity::provider_default(),
+            self.descriptor(),
+        )
     }
 
     /// **Open a stateful multi-turn conversational session** (sc-14150) — the stateful counterpart
@@ -335,6 +397,19 @@ pub trait ConversationSession {
         on_chunk: &mut dyn FnMut(AudioChunk),
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<AudioTrack>;
+
+    /// One completed session turn with its own execution identity. Stateful providers override
+    /// this where a synthesized turn is replayable; the compatibility default reports that the
+    /// session state and draw scheme were not observed, while preserving the existing audio.
+    fn step_with_execution_report(
+        &mut self,
+        turn: &ConversationTurn,
+        on_chunk: &mut dyn FnMut(AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedAudioTurn> {
+        let audio = self.step(turn, on_chunk, on_progress)?;
+        Ok(CompletedAudioTurn::without_identity(audio))
+    }
 
     /// Explicitly close the session, releasing any held state. Idempotent; the default is a no-op
     /// (state is also released on drop). A provider overrides this only if closing can surface an
