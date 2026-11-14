@@ -250,6 +250,25 @@ impl IpAdapterFlux {
 
     /// Reference-image T2I: condition the FLUX generation on `reference`'s CLIP-ViT-L identity tokens at
     /// `req.ip_adapter_scale` (a single distilled forward per step — no true-CFG).
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &IpAdapterFluxRequest,
+        reference: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor_dev(), &req.cancel, || {
+            candle_gen::execution::policy("direct_route", "flux/ip_provider/generate".into());
+            let image = self
+                .generate(req, reference, &mut report_progress)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate(
         &self,
         req: &IpAdapterFluxRequest,

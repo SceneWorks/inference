@@ -960,6 +960,12 @@ impl ZImageControl {
         // iteration, on the latent ENTERING step `step_i`, which is exactly where the shared drivers
         // emit (`candle-gen/src/sampler.rs`).
         let preview_counter = crate::preview::bespoke_counter(steps);
+        candle_gen::execution::schedule_f64(
+            "z-image-turbo-euler",
+            &scheduler.sigmas,
+            "flow-velocity",
+        );
+        candle_gen::execution::runtime(latents.device(), latents.dtype());
         for step_i in 0..steps {
             candle_gen::check_cancel(&req.cancel)?;
             candle_gen::preview::emit_preview_at(&req.preview, &preview_counter, step_i, || {
@@ -1189,6 +1195,33 @@ impl ZImageControl {
     ///   CFG — byte-unchanged from the original path.
     /// * **Base** (`generate_base`): undistilled shift-6.0 ~50-step schedule with
     ///   real classifier-free guidance (the candle sibling of `mlx-gen-z-image::model_base_control`).
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &ZImageControlRequest,
+        skeleton: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(
+            &if self.base {
+                crate::base::descriptor()
+            } else {
+                crate::descriptor()
+            },
+            &req.cancel,
+            || {
+                candle_gen::execution::policy("direct_route", "z-image/control/generate".into());
+                let image = self
+                    .generate(req, skeleton, &mut report_progress)
+                    .map_err(candle_gen::gen_core::Error::from)?;
+                Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            },
+        )
+    }
+
     pub fn generate(
         &self,
         req: &ZImageControlRequest,
@@ -1293,6 +1326,12 @@ impl ZImageControl {
         // is where the shared drivers emit (`candle-gen/src/sampler.rs`). The 33-channel control
         // context is a closure capture inside `forward_control_prepared`, never part of `latents`.
         let preview_counter = crate::preview::bespoke_counter(steps);
+        candle_gen::execution::schedule_f64(
+            "z-image-turbo-euler",
+            &scheduler.sigmas,
+            "flow-velocity",
+        );
+        candle_gen::execution::runtime(latents.device(), latents.dtype());
         for step_i in 0..steps {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);

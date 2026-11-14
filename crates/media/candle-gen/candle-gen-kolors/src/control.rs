@@ -461,6 +461,25 @@ impl KolorsControl {
     /// request size) via the Kolors ControlNet, denoising with the Kolors leading-Euler sampler. The
     /// worker renders the skeleton; this embeds it once, then runs the control denoise (the control
     /// branch runs on both CFG passes).
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &KolorsControlRequest,
+        skeleton: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::policy("direct_route", "kolors/control/generate".into());
+            let image = self
+                .generate(req, skeleton, &mut report_progress)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate(
         &self,
         req: &KolorsControlRequest,
@@ -473,6 +492,29 @@ impl KolorsControl {
             ));
         }
         self.generate_inner(req, skeleton, on_progress)
+    }
+
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_memory_context_with_execution_report(
+        &self,
+        context: &candle_gen::gen_core::MemoryRunContext,
+        req: &KolorsControlRequest,
+        skeleton: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::policy(
+                "direct_route",
+                "kolors/control/generate_with_memory_context".into(),
+            );
+            let image = self
+                .generate_with_memory_context(context, req, skeleton, &mut report_progress)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
     }
 
     pub fn generate_with_memory_context(
@@ -562,6 +604,7 @@ impl KolorsControl {
         }
         common::reject_zero_steps("kolors control", req.steps)?;
         let use_guide = req.guidance > 1.0;
+        candle_gen::execution::policy("kolors/control/use_guide", format!("{use_guide:?}").into());
 
         // CFG batch is [neg, pos] = uncond-first (the Kolors txt2img convention); without guidance only
         // the positive branch is built. Shared CFG-concat (sc-9001); the ChatGLM3 encode stays local.
@@ -729,6 +772,7 @@ impl KolorsControl {
         }
         common::reject_zero_steps("kolors control", req.steps)?;
         let use_guide = req.guidance > 1.0;
+        candle_gen::execution::policy("kolors/control/use_guide", format!("{use_guide:?}").into());
 
         let conditioning = SynchronizedPhase::new(
             {

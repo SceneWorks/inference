@@ -243,6 +243,25 @@ impl SdxlEdit {
     }
 
     /// **img2img**: regenerate `source` toward `req.prompt` at `req.strength`.
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &SdxlEditRequest,
+        source: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::policy("direct_route", "sdxl/edit_provider/generate".into());
+            let image = self
+                .generate(req, source, &mut report_progress)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate(
         &self,
         req: &SdxlEditRequest,
@@ -253,6 +272,29 @@ impl SdxlEdit {
     }
 
     /// **inpaint / outpaint**: regenerate only the `mask`'s white region (black = keep `source`).
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_masked_with_execution_report(
+        &self,
+        req: &SdxlEditRequest,
+        source: &Image,
+        mask: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::policy(
+                "direct_route",
+                "sdxl/edit_provider/generate_masked".into(),
+            );
+            let image = self
+                .generate_masked(req, source, mask, &mut report_progress)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate_masked(
         &self,
         req: &SdxlEditRequest,
@@ -301,6 +343,7 @@ impl SdxlEdit {
         }
         reject_zero_steps(req.steps)?;
         let cfg_on = req.guidance > 1.0;
+        candle_gen::execution::policy("sdxl/edit_provider/cfg_on", format!("{cfg_on:?}").into());
 
         // Text conditioning (uncond-first under CFG) + the SDXL micro-conditioning time_ids.
         let (conditioning, pooled) = self
@@ -314,7 +357,8 @@ impl SdxlEdit {
         let (_, lat_c, lat_h, lat_w) = x0.dims4()?;
         let strength = req.strength.clamp(0.0, 1.0) as f64;
         let start_time = self.sampler.max_time() * strength;
-        let mut init_rng = StdRng::seed_from_u64(req.seed);
+        let mut init_rng =
+            StdRng::seed_from_u64(candle_gen::execution::seed("sdxl/edit_provider", req.seed));
         let init_noise = draw_noise(&mut init_rng, lat_c, lat_h, lat_w, &self.device)?;
         let x_t = self.sampler.add_noise(&x0, &init_noise, start_time)?;
 
@@ -328,7 +372,10 @@ impl SdxlEdit {
         let eff = (req.steps as f64 * strength).round() as usize;
         let steps = self.sampler.timesteps(eff, start_time);
 
-        let mut step_rng = StdRng::seed_from_u64(req.seed.wrapping_add(STEP_RNG_SALT));
+        let mut step_rng = StdRng::seed_from_u64(candle_gen::execution::seed(
+            "sdxl/edit_provider",
+            req.seed.wrapping_add(STEP_RNG_SALT),
+        ));
         let latents = self.denoise_edit(
             x_t,
             &x0,
@@ -403,9 +450,16 @@ impl SdxlEdit {
         // An empty schedule (img2img at strength ≤ 1/steps) is a no-op: the lightly-noised source. For
         // inpaint that leaves the source untouched (no repaint), the honest result of a zero-step edit.
         if steps.is_empty() {
+            candle_gen::execution::without_schedule(
+                "source_roundtrip",
+                "strength selected zero denoise steps",
+                "no denoiser evaluation",
+            );
+            candle_gen::execution::runtime(latents.device(), latents.dtype());
             return Ok(latents);
         }
         let cfg_on = cfg > 1.0;
+        candle_gen::execution::policy("sdxl/edit_provider/cfg_on", format!("{cfg_on:?}").into());
         let total = steps.len() as u32;
         let (_, lat_c, lat_h, lat_w) = latents.dims4()?;
         // Per-step latent preview (epic 16948, sc-16954). A bespoke ancestral loop, so it numbers its
@@ -414,6 +468,15 @@ impl SdxlEdit {
         // `latents` is already in the domain the reused fit was measured in.
         let preview_counter = candle_gen::preview::PreviewCounter::with_steps(steps.len());
 
+        candle_gen::execution::schedule_f64(
+            "sdxl-euler-ancestral",
+            &steps
+                .iter()
+                .flat_map(|&(t, next)| [t, next])
+                .collect::<Vec<_>>(),
+            "epsilon",
+        );
+        candle_gen::execution::runtime(latents.device(), latents.dtype());
         for (i, &(t, t_prev)) in steps.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(CandleError::Canceled);

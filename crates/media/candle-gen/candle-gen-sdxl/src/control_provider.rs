@@ -194,7 +194,12 @@ impl SdxlControlGenerator {
     ) -> Result<Vec<Tensor>> {
         let lightning = req.sampler.as_deref() == Some("lightning");
         let guidance = effective_guidance(req);
+        candle_gen::execution::policy(
+            "sdxl/control_provider/guidance",
+            format!("{guidance:?}").into(),
+        );
         let cfg_on = !lightning && guidance > 1.0;
+        candle_gen::execution::policy("sdxl/control_provider/cfg_on", format!("{cfg_on:?}").into());
         let steps = req.steps.unwrap_or(if lightning {
             LIGHTNING_DEFAULT_STEPS as u32
         } else {
@@ -339,6 +344,14 @@ impl SdxlControlGenerator {
 }
 
 impl Generator for SdxlControlGenerator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -450,6 +463,7 @@ impl Generator for SdxlControlGenerator {
         let req = &effective_req;
         candle_gen::residency::check_cancel(&req.cancel)?;
         let cfg_on = req.sampler.as_deref() != Some("lightning") && effective_guidance(req) > 1.0;
+        candle_gen::execution::policy("sdxl/control_provider/cfg_on", format!("{cfg_on:?}").into());
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         if staged {
             crate::clear_resident_caches(&self.components, &self.conditioner, || {
@@ -578,6 +592,14 @@ fn denoise_lightning_control(
     let policy = lightning_policy(steps)?;
     let mut latents = seeded_sigma_prior(seed, width, height, policy.init_noise_scale(), device)?;
     let preview_counter = candle_gen::preview::PreviewCounter::with_steps(policy.num_steps());
+    candle_gen::execution::schedule(
+        "sdxl-lightning-euler",
+        &(0..=policy.num_steps())
+            .filter_map(|i| policy.sigma(i))
+            .collect::<Vec<_>>(),
+        "epsilon",
+    );
+    candle_gen::execution::runtime(latents.device(), latents.dtype());
     for index in 0..policy.num_steps() {
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);

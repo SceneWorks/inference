@@ -322,6 +322,20 @@ fn verify_staged_edit_checkpoint(
 }
 
 impl Generator for MageEditGenerator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::policy("loaded/quant", format!("{:?}", self.quant).into());
+            candle_gen::execution::policy(
+                "loaded/loaded_quant",
+                format!("{:?}", self.loaded_quant).into(),
+            );
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -371,6 +385,7 @@ impl Generator for MageEditGenerator {
             .capabilities
             .validate_request(self.descriptor.id, req)?;
         let guidance = req.guidance.unwrap_or(self.variant.defaults().1);
+        candle_gen::execution::policy("mage/lib/guidance", format!("{guidance:?}").into());
         if guidance == 1.0
             && req
                 .negative_prompt
@@ -417,6 +432,10 @@ impl Generator for MageEditGenerator {
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         self.memory_admission.consume_for_generate(req)?;
         let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+        candle_gen::execution::policy(
+            "mage/lib/stage_residency",
+            format!("{stage_residency:?}").into(),
+        );
         let stream_transformer_blocks = req
             .memory
             .is_some_and(|memory| memory.stream_transformer_blocks);
@@ -437,10 +456,16 @@ impl Generator for MageEditGenerator {
         let base_seed = req.seed.unwrap_or(0);
         let steps = req.steps.map_or(default_steps, |steps| steps as usize);
         let guidance = req.guidance.unwrap_or(default_guidance);
+        candle_gen::execution::policy("mage/lib/guidance", format!("{guidance:?}").into());
         let mut render_resident = || -> gen_core::Result<Vec<gen_core::Image>> {
             let components = self.components()?;
             let mut images = Vec::with_capacity(req.count as usize);
             for index in 0..req.count {
+                candle_gen::execution::draw(
+                    "image_initial_noise",
+                    base_seed.wrapping_add(index as u64),
+                    index as usize,
+                );
                 let result = components.edit_with_memory(
                     &req.prompt,
                     req.negative_prompt.as_deref().unwrap_or(" "),
@@ -596,6 +621,20 @@ impl MageGenerator {
 }
 
 impl Generator for MageGenerator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::policy("loaded/quant", format!("{:?}", self.quant).into());
+            candle_gen::execution::policy(
+                "loaded/loaded_quant",
+                format!("{:?}", self.loaded_quant).into(),
+            );
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -645,6 +684,7 @@ impl Generator for MageGenerator {
             .capabilities
             .validate_request(self.descriptor.id, req)?;
         let guidance = req.guidance.unwrap_or(self.default_guidance);
+        candle_gen::execution::policy("mage/lib/guidance", format!("{guidance:?}").into());
         if guidance == 1.0
             && req
                 .negative_prompt
@@ -683,6 +723,10 @@ impl Generator for MageGenerator {
         let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
         self.memory_admission.consume_for_generate(req)?;
         let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+        candle_gen::execution::policy(
+            "mage/lib/stage_residency",
+            format!("{stage_residency:?}").into(),
+        );
         let stream_transformer_blocks = req
             .memory
             .is_some_and(|memory| memory.stream_transformer_blocks);
@@ -698,10 +742,16 @@ impl Generator for MageGenerator {
         let base_seed = req.seed.unwrap_or(0);
         let steps = req.steps.unwrap_or(self.default_steps) as usize;
         let guidance = req.guidance.unwrap_or(self.default_guidance);
+        candle_gen::execution::policy("mage/lib/guidance", format!("{guidance:?}").into());
         let images = if !stage_residency {
             let components = self.components()?;
             let mut images = Vec::with_capacity(req.count as usize);
             for index in 0..req.count {
+                candle_gen::execution::draw(
+                    "image_initial_noise",
+                    base_seed.wrapping_add(index as u64),
+                    index as usize,
+                );
                 if req.cancel.is_cancelled() {
                     return Err(gen_core::Error::Canceled);
                 }

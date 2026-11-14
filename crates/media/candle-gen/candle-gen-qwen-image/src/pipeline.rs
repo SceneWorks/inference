@@ -28,7 +28,7 @@ pub fn create_noise(seed: u64, width: u32, height: u32, device: &Device) -> Resu
     let seq = lat_h * lat_w;
     let feat = LATENT_CHANNELS * PATCH * PATCH; // 64
     let n = seq * feat;
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("qwen-image/pipeline", seed));
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(data, (1, seq, feat), &Device::Cpu)?.to_device(device)
 }

@@ -526,6 +526,14 @@ fn load_heavy(spec: &LoadSpec, device: &Device) -> Result<Heavy> {
 }
 
 impl Generator for QwenImage21 {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -680,6 +688,10 @@ impl QwenImage21 {
             Schedule::Shifted(scheduler) => resolve_run_params(scheduler, req)?,
             Schedule::Saved(schedule) => resolve_turbo_run_params(schedule, req)?,
         };
+        candle_gen::execution::policy(
+            "qwen21_cfg",
+            serde_json::json!({"true_cfg_bits":params.true_cfg.to_bits(),"negative":params.use_negative}),
+        );
         let tiling = crate::pipeline::decode_tiling(req);
         let drop = self.drop_count;
         let device = self.device.clone();
@@ -690,6 +702,10 @@ impl QwenImage21 {
         // the two are OR'd — a request can stage a warm-loaded generator, never un-stage a
         // sequential one.
         let stage_residency = stage_residency_for(&self.spec, req);
+        candle_gen::execution::policy(
+            "qwen-image-2-1/lib/stage_residency",
+            format!("{stage_residency:?}").into(),
+        );
         // sc-25905: the prefix KV cache is a request selection; unset is the prefill path.
         let kv_cache = memory_strategy::prefix_kv_cache_for(req);
         // What the denoise loops did, written as they run (one report per image; they agree).
@@ -778,6 +794,7 @@ impl QwenImage21 {
                     Vec::with_capacity(if rgba_out { req.count as usize } else { 0 });
                 for i in 0..req.count {
                     let seed = candle_gen::image_seed(params.base_seed, i);
+                    candle_gen::execution::draw("image_initial_noise", seed, i as usize);
                     let latents = create_noise(seed, req.width, req.height, channels, &device)?;
                     let mut report = DenoiseReport::default();
                     let latents = denoise_reported(

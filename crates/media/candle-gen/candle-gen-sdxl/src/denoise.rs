@@ -102,7 +102,7 @@ pub fn seeded_sigma_prior(
         (height / SPATIAL_SCALE) as usize,
         (width / SPATIAL_SCALE) as usize,
     );
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("sdxl/denoise", seed));
     let noise = draw_noise(&mut rng, LATENT_CHANNELS, lh, lw, device)?;
     Ok((noise * sigma_max as f64)?)
 }
@@ -272,9 +272,16 @@ pub fn denoise_ip_multi_control(
     // A zero-step schedule is a no-op (img2img at strength ≤ 1/steps) — return the init latents,
     // never invoking the σ=0 ancestral step that would NaN. (txt2img always has steps ≥ 1.)
     if steps.is_empty() {
+        candle_gen::execution::without_schedule(
+            "source_roundtrip",
+            "strength selected zero denoise steps",
+            "no denoiser evaluation",
+        );
+        candle_gen::execution::runtime(latents.device(), latents.dtype());
         return Ok(latents);
     }
     let cfg_on = cfg > 1.0;
+    candle_gen::execution::policy("sdxl/denoise/cfg_on", format!("{cfg_on:?}").into());
     let total = steps.len() as u32;
     let device = latents.device().clone();
     let (lat_c, lat_h, lat_w) = {
@@ -288,6 +295,15 @@ pub fn denoise_ip_multi_control(
     // domain the reused fit was measured in — this is the very lane it was measured on.
     let preview_counter = candle_gen::preview::PreviewCounter::with_steps(steps.len());
 
+    candle_gen::execution::schedule_f64(
+        "sdxl-euler-ancestral",
+        &steps
+            .iter()
+            .flat_map(|&(t, next)| [t, next])
+            .collect::<Vec<_>>(),
+        "epsilon",
+    );
+    candle_gen::execution::runtime(latents.device(), latents.dtype());
     for (i, &(t, t_prev)) in steps.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
@@ -446,6 +462,7 @@ pub fn denoise_curated(
     controlnet_encoder: &Tensor,
 ) -> Result<Tensor> {
     let cfg_on = cfg > 1.0;
+    candle_gen::execution::policy("sdxl/denoise/cfg_on", format!("{cfg_on:?}").into());
     let out = candle_gen::run_curated_sampler(
         sampler_name,
         ms,

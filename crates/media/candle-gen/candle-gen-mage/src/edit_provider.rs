@@ -97,6 +97,7 @@ impl MageEdit {
             )
         )?;
         let cfg = MageConfig::from_json(&cfg_text)?;
+
         let mut transformer =
             MageTransformer::load_with_quant(&dirs.transformer, &cfg, quant, device)?;
         candle_gen::quant::install_dotted_adapters("mage edit", adapters, device, |visitor| {
@@ -143,6 +144,7 @@ impl MageEdit {
     ) -> Result<MageEditHeavy> {
         let cfg_text = std::fs::read_to_string(dirs.transformer.join("config.json"))?;
         let cfg = MageConfig::from_json(&cfg_text)?;
+
         if stream_transformer_blocks && !adapters.is_empty() {
             candle_core::bail!(
                 "Mage edit adapters require resident transformer blocks; disable block streaming"
@@ -161,6 +163,45 @@ impl MageEdit {
             transformer,
             vae: MageVae::load(&dirs.vae, device)?,
             device: device.clone(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_with_execution_report(
+        &self,
+        instruction: &str,
+        negative_instruction: &str,
+        references: &[candle_gen::gen_core::Image],
+        width: u32,
+        height: u32,
+        steps: usize,
+        guidance: f32,
+        seed: u64,
+        cancel: &candle_gen::gen_core::runtime::CancelFlag,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor_edit(), cancel, || {
+            candle_gen::execution::policy("direct_route", "mage/edit_provider/edit".into());
+            let image = self
+                .edit(
+                    instruction,
+                    negative_instruction,
+                    references,
+                    width,
+                    height,
+                    steps,
+                    guidance,
+                    seed,
+                    cancel,
+                    &mut report_progress,
+                )
+                .map_err(candle_gen::CandleError::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
         })
     }
 
@@ -341,6 +382,48 @@ impl MageEdit {
     /// Run edit parity from a caller-supplied sampled posterior. The real-weight suite derives this
     /// tensor from Torch's recorded step-zero sequence, separating RNG differences from model math.
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// Complete the direct image route with its attempt-local execution identity.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_from_reference_tokens_with_execution_report(
+        &self,
+        instruction: &str,
+        negative_instruction: &str,
+        references: &[candle_gen::gen_core::Image],
+        ref_tokens: &Tensor,
+        width: u32,
+        height: u32,
+        steps: usize,
+        guidance: f32,
+        seed: u64,
+        cancel: &candle_gen::gen_core::runtime::CancelFlag,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor_edit(), cancel, || {
+            candle_gen::execution::policy("direct_route", "mage/edit_from_reference_tokens".into());
+            let image = self
+                .edit_from_reference_tokens(
+                    instruction,
+                    negative_instruction,
+                    references,
+                    ref_tokens,
+                    width,
+                    height,
+                    steps,
+                    guidance,
+                    seed,
+                    cancel,
+                    &mut report_progress,
+                )
+                .map_err(candle_gen::CandleError::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn edit_from_reference_tokens(
         &self,
         instruction: &str,
@@ -417,6 +500,7 @@ impl MageEdit {
             reference_count,
         } = encoded;
         let use_cfg = negative.is_some();
+        candle_gen::execution::policy("mage/edit_provider/use_cfg", format!("{use_cfg:?}").into());
         let gh = height as usize / 16;
         let gw = width as usize / 16;
         let shapes =
@@ -451,11 +535,21 @@ impl MageEdit {
             .and_then(|memory| memory.attention_chunk_size)
             .unwrap_or(candle_gen::ATTN_SCORES_BUDGET as u32)
             as usize;
+        candle_gen::execution::policy(
+            "mage/edit_provider/attention_budget",
+            format!("{attention_budget:?}").into(),
+        );
         let transformer_window = memory
             .filter(|memory| memory.stream_transformer_blocks)
             .and_then(|memory| memory.transformer_window_size)
             .map(|window| window as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
+        candle_gen::execution::policy(
+            "mage/edit_provider/transformer_window",
+            format!("{transformer_window:?}").into(),
+        );
+        candle_gen::execution::schedule("mage-euler", &ladder, "flow-velocity");
+        candle_gen::execution::runtime(target.device(), target.dtype());
         for (index, pair) in ladder.windows(2).enumerate() {
             if cancel.is_cancelled() {
                 candle_core::bail!("mage edit canceled");

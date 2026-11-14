@@ -766,6 +766,10 @@ impl Pipeline {
                     .and_then(|memory| memory.transformer_window_size)
                     .map(|value| value as usize)
                     .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
+                candle_gen::execution::policy(
+                    "flux/pipeline/transformer_window",
+                    format!("{transformer_window:?}").into(),
+                );
                 let out = match (dit, &prepared) {
                     // `IpFlux::forward` with `ip = None` is byte-identical to the stock
                     // `candle-transformers` `Flux::forward` (sc-9116) — plus the budgeted attention guard.
@@ -1465,6 +1469,7 @@ impl Pipeline {
             on_progress(Progress::Decoding);
             if heavy.bounded_host_decode {
                 let memory = req.memory.unwrap_or_default();
+                candle_gen::execution::policy("flux/pipeline/memory", format!("{memory:?}").into());
                 let host_latents = bounded_host_latent_transfer(
                     &latents,
                     req.height as usize,

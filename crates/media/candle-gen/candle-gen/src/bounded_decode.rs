@@ -155,6 +155,11 @@ pub fn decode_with_tiling<F>(
 where
     F: FnMut(&Tensor) -> Result<Tensor>,
 {
+    crate::execution::runtime(latent.device(), latent.dtype());
+    crate::execution::policy(
+        "bounded_kl_decode",
+        serde_json::json!({"tiling":format!("{tiling:?}"),"shape":latent.dims()}),
+    );
     let Some(tiling) = tiling else {
         return decode(latent);
     };

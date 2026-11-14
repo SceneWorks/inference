@@ -310,6 +310,10 @@ impl Iris3b {
         let flow = self.config.flow.clone();
         let device = self.device.clone();
         let attention_budget = attention_budget_for(req);
+        candle_gen::execution::policy(
+            "iris/model/attention_budget",
+            format!("{attention_budget:?}").into(),
+        );
         let (images, warnings) = self.residency.run_request_scoped(
             stage_residency_for(&self.spec, req),
             false,
@@ -326,7 +330,12 @@ impl Iris3b {
                 // `k = c·rows + j` draws its noise from `image_seed(seed, k)`.
                 for c in 0..req.count {
                     let seeds: Vec<u64> = (0..rows)
-                        .map(|j| candle_gen::image_seed(params.seed, c * rows + j))
+                        .map(|j| {
+                            let index = c * rows + j;
+                            let seed = candle_gen::image_seed(params.seed, index);
+                            candle_gen::execution::draw("pixel_noise", seed, index as usize);
+                            seed
+                        })
                         .collect();
                     let z = noise_batch(&seeds, channels, params.width, params.height, &device)?;
                     let done = c * params.steps as u32;
@@ -416,6 +425,14 @@ fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
 }
 
 impl Generator for Iris3b {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }

@@ -353,6 +353,25 @@ impl IpAdapterKolors {
 
     /// Reference-image T2I: condition the Kolors generation on `reference`'s CLIP-ViT-L/14-336 identity
     /// tokens at `req.ip_adapter_scale`, denoising with the Kolors leading-Euler sampler.
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &mut self,
+        req: &IpAdapterKolorsRequest,
+        reference: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::policy("direct_route", "kolors/ip_provider/generate".into());
+            let image = self
+                .generate(req, reference, &mut report_progress)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate(
         &mut self,
         req: &IpAdapterKolorsRequest,
@@ -365,6 +384,29 @@ impl IpAdapterKolors {
             ));
         }
         self.generate_inner(req, reference, on_progress)
+    }
+
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_memory_context_with_execution_report(
+        &mut self,
+        context: &candle_gen::gen_core::MemoryRunContext,
+        req: &IpAdapterKolorsRequest,
+        reference: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::policy(
+                "direct_route",
+                "kolors/ip_provider/generate_with_memory_context".into(),
+            );
+            let image = self
+                .generate_with_memory_context(context, req, reference, &mut report_progress)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
     }
 
     pub fn generate_with_memory_context(
@@ -454,6 +496,10 @@ impl IpAdapterKolors {
         }
         common::reject_zero_steps("kolors ip-adapter", req.steps)?;
         let use_guide = req.guidance > 1.0;
+        candle_gen::execution::policy(
+            "kolors/ip_provider/use_guide",
+            format!("{use_guide:?}").into(),
+        );
 
         // Everything that borrows `&self`, computed into owned values BEFORE the `&mut self.unet`
         // `set_ip_context` (so the disjoint-field borrows don't overlap — the SDXL/InstantID pattern).
@@ -599,6 +645,10 @@ impl IpAdapterKolors {
         }
         common::reject_zero_steps("kolors ip-adapter", req.steps)?;
         let use_guide = req.guidance > 1.0;
+        candle_gen::execution::policy(
+            "kolors/ip_provider/use_guide",
+            format!("{use_guide:?}").into(),
+        );
 
         let conditioning = SynchronizedPhase::new(
             {

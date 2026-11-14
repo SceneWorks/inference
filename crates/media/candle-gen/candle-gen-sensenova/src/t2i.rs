@@ -617,6 +617,9 @@ impl T2iModel {
 
         let steps = opts.num_steps;
         let timesteps = step_schedule(opts)?;
+        candle_gen::execution::schedule("sensenova-euler", &timesteps, "pixel-velocity");
+        candle_gen::execution::runtime(image.device(), image.dtype());
+        candle_gen::execution::policy("sensenova_denoise", format!("{opts:?}").into());
         let noise_embed = self.noise_scale_embed(noise_scale, l)?;
 
         let needs_cfg = opts.cfg_scale > 1.0 && cache_uncond.is_some();
@@ -1254,6 +1257,9 @@ impl T2iModel {
         let mut image = (base_noise * noise_scale as f64)?;
         let steps = opts.num_steps;
         let timesteps = step_schedule(opts)?;
+        candle_gen::execution::schedule("sensenova-euler", &timesteps, "pixel-velocity");
+        candle_gen::execution::runtime(image.device(), image.dtype());
+        candle_gen::execution::policy("sensenova_denoise", format!("{opts:?}").into());
         let noise_embed = self.noise_scale_embed(noise_scale, l)?;
 
         let (cfg, img_cfg) = (opts.cfg_scale, opts.img_cfg_scale);
@@ -1282,6 +1288,7 @@ impl T2iModel {
             // the reference `modeling_neo_chat.py` it2i gate (the T2I `denoise` uses the inclusive
             // form; they diverge only for a custom `cfg_interval`, F-130).
             let use_cfg = (t > i0 && t < i1) || i0 == 0.0;
+            candle_gen::execution::policy("sensenova/t2i/use_cfg", format!("{use_cfg:?}").into());
 
             let (z, cond_emb) =
                 self.step_cond_embeds(&image, grid_h, grid_w, l, t, &noise_embed)?;
@@ -1845,7 +1852,7 @@ fn cfg_blend(v_cond: &Tensor, v_uncond: &Tensor, scale: f32) -> CResult<Tensor> 
 /// reproducibility within candle is.)
 fn gaussian(shape: (usize, usize, usize, usize), seed: u64, device: &Device) -> CResult<Tensor> {
     let n = shape.0 * shape.1 * shape.2 * shape.3;
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("sensenova/t2i", seed));
     let v = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(v, shape, &Device::Cpu)?.to_device(device)
 }

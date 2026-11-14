@@ -120,6 +120,14 @@ impl Ideogram4Generator {
 }
 
 impl Generator for Ideogram4Generator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -247,6 +255,7 @@ impl Generator for Ideogram4Generator {
             receipt.ensure_unchanged()?;
         }
         let memory = req.memory.unwrap_or_default();
+        candle_gen::execution::policy("ideogram/lib/memory", format!("{memory:?}").into());
         let images = if memory.stage_residency {
             if let Some(warm) = candle_gen::lock_recover(&self.components).take() {
                 synchronized_release(warm, || self.device.synchronize())

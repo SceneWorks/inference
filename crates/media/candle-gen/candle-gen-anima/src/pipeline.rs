@@ -45,7 +45,7 @@ fn create_noise(seed: u64, width: u32, height: u32, device: &Device) -> Result<T
     let lat_h = (height / VAE_COMPRESSION) as usize;
     let lat_w = (width / VAE_COMPRESSION) as usize;
     let n = VAE_CHANNELS * lat_h * lat_w;
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("anima/pipeline", seed));
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(
         Tensor::from_vec(data, (1, VAE_CHANNELS, 1, lat_h, lat_w), &Device::Cpu)?
@@ -128,6 +128,35 @@ impl AnimaPipeline {
 
     /// Generate one image. `negative` is used only when `variant.uses_cfg()`.
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        prompt: &str,
+        negative: &str,
+        variant: Variant,
+        opts: &GenOptions,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor_for(variant), cancel, || {
+            candle_gen::execution::policy("direct_route", "anima/pipeline/generate".into());
+            let image = self
+                .generate(
+                    prompt,
+                    negative,
+                    variant,
+                    opts,
+                    cancel,
+                    &mut report_progress,
+                )
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate(
         &self,
         prompt: &str,
@@ -276,6 +305,7 @@ fn render_encoded_components(
     // (sc-10625). Latents stay f32 end-to-end; only the DiT forward runs in `dtype`.
     let noise = create_noise(opts.seed, opts.width, opts.height, device)?;
     let guidance = opts.guidance as f64;
+    candle_gen::execution::policy("anima/pipeline/guidance", format!("{guidance:?}").into());
     let sampler = opts.sampler.as_deref().or(Some(DEFAULT_SAMPLER));
 
     let dit = render.dit();

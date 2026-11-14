@@ -237,6 +237,7 @@ struct PosePromptKey {
 impl PosePromptKey {
     fn new(req: &Krea2ControlRequest) -> Self {
         let cfg = req.guidance.unwrap_or(0.0) != 0.0;
+
         Self {
             prompt: req.prompt.clone(),
             negative_prompt: cfg.then(|| req.negative_prompt.clone().unwrap_or_default()),
@@ -433,6 +434,32 @@ impl Krea2Control {
 
     /// Generate one strict-pose-conditioned image from a rendered OpenPose skeleton. The control image
     /// must already match the request dimensions; the worker renders it at those exact dimensions.
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &Krea2ControlRequest,
+        control_image: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(
+            &crate::control_registry::descriptor(),
+            &req.cancel,
+            || {
+                candle_gen::execution::policy(
+                    "direct_route",
+                    "krea/control_provider/generate".into(),
+                );
+                let image = self
+                    .generate(req, control_image, &mut report_progress)
+                    .map_err(candle_gen::gen_core::Error::from)?;
+                Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            },
+        )
+    }
+
     pub fn generate(
         &self,
         req: &Krea2ControlRequest,
@@ -581,6 +608,7 @@ fn load_control_heavy(
     device: &Device,
 ) -> Result<Krea2ControlHeavy> {
     let cfg = Krea2Config::from_snapshot(root)?;
+
     let mut branch_tier = branch_tier;
     let mut dit = match control_dit_source(convrot_dit, native_dit)? {
         ControlDitSource::Snapshot => {
@@ -738,7 +766,10 @@ impl Krea2ControlHeavy {
             (req.height / SPATIAL_SCALE) as usize,
             (req.width / SPATIAL_SCALE) as usize,
         );
-        let mut rng = StdRng::seed_from_u64(req.seed);
+        let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed(
+            "krea/control_provider",
+            req.seed,
+        ));
         let noise = candle_gen::seeded_normal_vec(&mut rng, LATENT_CHANNELS * lat_h * lat_w);
         let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
             .to_device(device)?;

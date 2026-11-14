@@ -50,6 +50,7 @@ impl MagePipeline {
             )
         )?;
         let cfg = MageConfig::from_json(&cfg_text)?;
+
         let mut transformer =
             MageTransformer::load_with_quant(&dirs.transformer, &cfg, quant, device)?;
         candle_gen::quant::install_dotted_adapters("mage", adapters, device, |visitor| {
@@ -92,6 +93,7 @@ impl MagePipeline {
             )
         )?;
         let cfg = MageConfig::from_json(&cfg_text)?;
+
         if stream_transformer_blocks && !adapters.is_empty() {
             candle_core::bail!(
                 "Mage adapters require resident transformer blocks; disable block streaming"
@@ -124,6 +126,45 @@ impl MagePipeline {
                 .then(|| text.encode(negative_prompt))
                 .transpose()?,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_execution_report(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        width: u32,
+        height: u32,
+        steps: usize,
+        guidance: f32,
+        seed: u64,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(
+            &crate::descriptor(),
+            &candle_gen::gen_core::CancelFlag::default(),
+            || {
+                candle_gen::execution::policy("direct_route", "mage/pipeline/generate".into());
+                let image = self
+                    .generate(
+                        prompt,
+                        negative_prompt,
+                        width,
+                        height,
+                        steps,
+                        guidance,
+                        seed,
+                        &mut report_progress,
+                    )
+                    .map_err(candle_gen::CandleError::from)?;
+                Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -207,6 +248,7 @@ impl MagePipeline {
         let MageEncoded { positive, negative } = encoded;
         let device = positive.device().clone();
         let use_cfg = negative.is_some();
+        candle_gen::execution::policy("mage/pipeline/use_cfg", format!("{use_cfg:?}").into());
         let base = PackLayout::generation(vec![ImgShape::latent(gh, gw)], vec![positive.dim(1)?])?;
         let (layout, text) = if let Some(negative) = &negative {
             (
@@ -236,11 +278,21 @@ impl MagePipeline {
             .and_then(|memory| memory.attention_chunk_size)
             .unwrap_or(candle_gen::ATTN_SCORES_BUDGET as u32)
             as usize;
+        candle_gen::execution::policy(
+            "mage/pipeline/attention_budget",
+            format!("{attention_budget:?}").into(),
+        );
         let transformer_window = memory
             .filter(|memory| memory.stream_transformer_blocks)
             .and_then(|memory| memory.transformer_window_size)
             .map(|window| window as usize)
             .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
+        candle_gen::execution::policy(
+            "mage/pipeline/transformer_window",
+            format!("{transformer_window:?}").into(),
+        );
+        candle_gen::execution::schedule("mage-euler", &ladder, "flow-velocity");
+        candle_gen::execution::runtime(tokens.device(), tokens.dtype());
         for (i, pair) in ladder.windows(2).enumerate() {
             if cancel.is_cancelled() {
                 candle_core::bail!("mage canceled");

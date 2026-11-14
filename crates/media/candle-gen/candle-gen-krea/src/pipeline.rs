@@ -284,6 +284,7 @@ pub(crate) fn encode_residency(
 ) -> Result<ResidencyContext> {
     if raw {
         let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
+        candle_gen::execution::policy("krea/pipeline/guidance", format!("{guidance:?}").into());
         let (context, negative) = encode_base_contexts(text, req, guidance)?;
         Ok(ResidencyContext::Raw {
             context,
@@ -1232,6 +1233,7 @@ pub(crate) fn render_three_stage_with_native(
     facts: &gen_core::CheckpointFactsSink,
 ) -> Result<Vec<Image>> {
     let memory = req.memory.unwrap_or_default();
+    candle_gen::execution::policy("krea/pipeline/memory", format!("{memory:?}").into());
     candle_gen::check_cancel(&req.cancel)?;
 
     enter_loading_boundary(
@@ -1310,6 +1312,10 @@ pub(crate) fn render_three_stage_with_native(
     } else {
         candle_gen::ATTN_SCORES_BUDGET
     };
+    candle_gen::execution::policy(
+        "krea/pipeline/attention_budget",
+        format!("{attention_budget:?}").into(),
+    );
     // SC-15510's rule: `None` means "the provider's own historical constant", so an untouched request
     // is byte-for-byte unaffected. A value only ever arrives here after the request scope re-validated
     // it against the published candidates, which for this realization is `[1]` alone — see
@@ -1320,6 +1326,10 @@ pub(crate) fn render_three_stage_with_native(
         .transformer_window_size
         .map(|w| w as usize)
         .unwrap_or(crate::transformer::DEFAULT_TRANSFORMER_WINDOW);
+    candle_gen::execution::policy(
+        "krea/pipeline/transformer_window",
+        format!("{transformer_window:?}").into(),
+    );
     let latents = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
         let preview = crate::preview::hook(&req.preview);
@@ -1367,7 +1377,9 @@ pub(crate) fn render_three_stage_with_native(
     let vae = open_decode_component(req, memory, on_progress, || load_vae(root, device))?;
     let images = latents
         .iter()
-        .map(|latent| {
+        .enumerate()
+        .map(|(output_index, latent)| {
+            candle_gen::execution::output_index(output_index);
             candle_gen::check_cancel(&req.cancel)?;
             enter_decode_boundary(req, memory, on_progress)?;
             let tile = memory.tile_vae_decode.then_some((
@@ -1823,6 +1835,7 @@ pub fn render_base(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
+    candle_gen::execution::policy("krea/pipeline/guidance", format!("{guidance:?}").into());
     let (context, neg_context) = candle_gen::gen_core::with_prompt_encoding(
         on_progress,
         || -> std::result::Result<_, candle_gen::CandleError> {
@@ -2193,6 +2206,7 @@ fn render_multiphase_driver<T>(
             let start = phase.slice.start.min(end);
             let sub = &sigmas[start..=end];
             let guidance = phase.guidance;
+            candle_gen::execution::policy("krea/pipeline/guidance", format!("{guidance:?}").into());
             latent = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::Sigma,
@@ -2342,6 +2356,7 @@ pub fn render_base_img2img(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
+    candle_gen::execution::policy("krea/pipeline/guidance", format!("{guidance:?}").into());
 
     // The conditional + unconditional condition encoding (seed-independent), identical to `render_base`
     // (the shared `encode_base_contexts` seam): img2img changes only the init latent + schedule start,
@@ -2581,6 +2596,7 @@ pub(crate) fn encode_edit_context(
     let guidance = req
         .guidance
         .unwrap_or(if distilled { 0.0 } else { RAW_GUIDANCE });
+    candle_gen::execution::policy("krea/pipeline/guidance", format!("{guidance:?}").into());
 
     // Wire (b): run the vision tower ONCE per reference (shared across the pos/neg instruction encodings).
     let vision = text.vision()?;
@@ -3012,7 +3028,7 @@ fn init_noise(height: u32, width: u32, seed: u64, device: &Device) -> Result<Ten
         (width / SPATIAL_SCALE) as usize,
     );
     let n = LATENT_CHANNELS * lat_h * lat_w;
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("krea/pipeline", seed));
     let noise = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(
         Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?

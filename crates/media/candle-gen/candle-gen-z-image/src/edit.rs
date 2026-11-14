@@ -216,6 +216,25 @@ impl ZImageEdit {
     /// img2img: regenerate `source` toward `req.prompt` at `req.strength`, denoising with the distilled
     /// flow-match Euler schedule (no CFG). VAE-encodes the source once into the clean init latent, blends
     /// it with seeded noise at the start sigma, then runs the reduced `init_time_step..steps` loop.
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &ZImageEditRequest,
+        source: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::policy("direct_route", "z-image/edit/generate".into());
+            let image = self
+                .generate(req, source, &mut report_progress)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate(
         &self,
         req: &ZImageEditRequest,
@@ -287,6 +306,16 @@ impl ZImageEdit {
         // is where the shared drivers emit (`candle-gen/src/sampler.rs`). The VAE-encoded source is
         // already folded into `x_t` before the loop, so there is one trajectory and it is the target's.
         let preview_counter = crate::preview::bespoke_counter(total as usize);
+        candle_gen::execution::schedule_f64(
+            "z-image-edit-euler",
+            &scheduler.sigmas[start..],
+            "negated-velocity/one-minus-sigma",
+        );
+        candle_gen::execution::runtime(latents.device(), latents.dtype());
+        candle_gen::execution::policy(
+            "z-image-edit",
+            format!("start={start};sigma_start_bits={}", sigma_start.to_bits()).into(),
+        );
         for step_i in start..steps {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);

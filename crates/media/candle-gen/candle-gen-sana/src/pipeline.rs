@@ -125,7 +125,8 @@ fn renoise_sprint_init(
 /// `device`. (`init_noise_sigma = 1.0` for flow-match, so the latent is the raw normal draw.)
 pub fn create_noise(device: &Device, seed: u64, width: u32, height: u32) -> Result<Tensor> {
     use rand::SeedableRng;
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut rng =
+        rand::rngs::StdRng::seed_from_u64(candle_gen::execution::seed("sana/pipeline", seed));
     let (lh, lw) = (
         (height / SPATIAL_SCALE) as usize,
         (width / SPATIAL_SCALE) as usize,
@@ -293,6 +294,10 @@ pub(crate) fn denoise_cfg_from_masked_memory(
         .filter(|memory| memory.chunk_attention)
         .and_then(|memory| memory.attention_chunk_size)
         .map(|value| value as usize);
+    candle_gen::execution::policy(
+        "sana/pipeline/attention_budget",
+        format!("{attention_budget:?}").into(),
+    );
     let predict = |x: &Tensor, timestep: f32| -> Result<Tensor> {
         // The unified flow sampler hands `timestep = σ`; the SANA trunk embeds `σ·1000`.
         let t = Tensor::from_vec(vec![timestep * NUM_TRAIN_TIMESTEPS], (1,), device)?;
@@ -488,6 +493,26 @@ impl SanaPipeline {
     /// gen-core `Generator` adapter wires into the contract). Encodes the prompt (and the negative
     /// prompt when CFG is active) ONCE, seeds the DC-AE latent, runs the flow-match Euler denoise over
     /// the SANA trunk with true CFG, then DC-AE-decodes to an RGB8 [`Image`].
+    ///
+    /// Complete the direct image route with its attempt-local execution identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_progress_and_execution_report(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        device: &Device,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::model::descriptor(), cancel, || {
+            candle_gen::execution::policy("direct_route", "sana/generate_with".into());
+            let image = self.generate_with(req, device, cancel, &mut report_progress, preview)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate_with(
         &self,
         req: &SanaGenerateRequest<'_>,
@@ -497,6 +522,7 @@ impl SanaPipeline {
         preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> Result<Image> {
         let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
+        candle_gen::execution::policy("sana/pipeline/guidance", format!("{guidance:?}").into());
         let conditioning = candle_gen::gen_core::with_prompt_encoding(on_progress, || {
             self.encode_conditioning(req, guidance)
         })?;
@@ -614,6 +640,7 @@ impl SanaPipeline {
     ) -> Result<Image> {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS);
         let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
+        candle_gen::execution::policy("sana/pipeline/guidance", format!("{guidance:?}").into());
         let seed = req.seed.unwrap_or(0);
 
         // Static shift=3.0 schedule (scheduler_config.json), resolution-independent. An unset scheduler
@@ -666,6 +693,25 @@ impl SanaPipeline {
     /// default (inert) one. That costs one `is_active()` check per evaluation and is byte-identical to
     /// a run without the seam. The **registered** `Generator` lane is [`crate::model`], which builds
     /// its hook over the request's real sink.
+    ///
+    /// Complete the direct image route with its attempt-local execution identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_execution_report(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        device: &Device,
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_direct(
+            &crate::model::descriptor(),
+            &candle_gen::gen_core::CancelFlag::default(),
+            || {
+                candle_gen::execution::policy("direct_route", "sana/generate".into());
+                let image = self.generate(req, device)?;
+                Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            },
+        )
+    }
+
     pub fn generate(&self, req: &SanaGenerateRequest<'_>, device: &Device) -> Result<Image> {
         let cancel = CancelFlag::default();
         let mut noop = |_: Progress| {};
@@ -727,6 +773,7 @@ pub(crate) fn generate_base_staged(
     revalidate_before_load(&mut check)?;
     let text = load_text_encoder(root, device)?;
     let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
+    candle_gen::execution::policy("sana/pipeline/guidance", format!("{guidance:?}").into());
     let conditioning = candle_gen::gen_core::with_prompt_encoding(
         on_progress,
         || -> std::result::Result<_, candle_gen::CandleError> {
@@ -754,6 +801,7 @@ pub(crate) fn generate_base_staged(
     }
 
     let cfg = DcAeConfig::sana_f32c32();
+
     let steps = req.steps.unwrap_or(DEFAULT_STEPS);
     let start_step = resolve_init_start(req.init_image, steps, req.strength);
     let clean = if start_step > 0 {
@@ -788,7 +836,8 @@ pub(crate) fn generate_base_staged(
     )
     .map_err(|error| CandleError::Msg(error.to_string()))?;
     let mut latents = Vec::with_capacity(seeds.len());
-    for seed in seeds {
+    for (index, seed) in seeds.iter().enumerate() {
+        candle_gen::execution::draw("image_initial_noise", *seed, index);
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -823,7 +872,8 @@ pub(crate) fn generate_base_staged(
     revalidate_before_load(&mut check)?;
     let decoder = load_vae_decoder(root, device, &cfg)?;
     let mut images = Vec::with_capacity(latents.len());
-    for latent in latents {
+    for (output_index, latent) in latents.into_iter().enumerate() {
+        candle_gen::execution::output_index(output_index);
         on_progress(Progress::Decoding);
         images.push(decode_to_image_memory(
             &decoder,
@@ -1132,6 +1182,26 @@ impl SanaSprintPipeline {
     /// CFG-free), seeds the DC-AE latent, runs [`denoise_sprint`] over an [`ScmScheduler`] (default 2
     /// steps, embedded guidance 4.5), then DC-AE-decodes. The negative prompt / curated sampler +
     /// scheduler knobs are inapplicable to the SCM loop and ignored.
+    ///
+    /// Complete the direct image route with its attempt-local execution identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_progress_and_execution_report(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        device: &Device,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::model::sprint_descriptor(), cancel, || {
+            candle_gen::execution::policy("direct_route", "sana/generate_with".into());
+            let image = self.generate_with(req, device, cancel, &mut report_progress, preview)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate_with(
         &self,
         req: &SanaGenerateRequest<'_>,
@@ -1240,6 +1310,7 @@ impl SanaSprintPipeline {
     ) -> Result<Image> {
         let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
         let guidance = req.guidance_scale.unwrap_or(SPRINT_DEFAULT_GUIDANCE);
+        candle_gen::execution::policy("sana/pipeline/guidance", format!("{guidance:?}").into());
         let seed = req.seed.unwrap_or(0);
 
         let scheduler = ScmScheduler::new(steps);
@@ -1279,6 +1350,25 @@ impl SanaSprintPipeline {
     ///
     /// Preview-inert for the same reason [`SanaPipeline::generate`] is, and over the **Sprint** hook —
     /// the two are not interchangeable, because the two routes carry different fits.
+    ///
+    /// Complete the direct image route with its attempt-local execution identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_execution_report(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        device: &Device,
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_direct(
+            &crate::model::sprint_descriptor(),
+            &candle_gen::gen_core::CancelFlag::default(),
+            || {
+                candle_gen::execution::policy("direct_route", "sana/generate".into());
+                let image = self.generate(req, device)?;
+                Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+            },
+        )
+    }
+
     pub fn generate(&self, req: &SanaGenerateRequest<'_>, device: &Device) -> Result<Image> {
         let cancel = CancelFlag::default();
         let mut noop = |_: Progress| {};
@@ -1319,6 +1409,7 @@ pub(crate) fn generate_sprint_staged(
     }
 
     let cfg = DcAeConfig::sana_f32c32();
+
     let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
     let scheduler = ScmScheduler::new(steps);
     let start_step = resolve_init_start(req.init_image, steps, req.strength);
@@ -1346,8 +1437,10 @@ pub(crate) fn generate_sprint_staged(
     let embedded_scale = trunk_cfg.guidance_embeds_scale;
     let transformer = load_staged_transformer(root, device, trunk_cfg, memory)?;
     let guidance = req.guidance_scale.unwrap_or(SPRINT_DEFAULT_GUIDANCE);
+    candle_gen::execution::policy("sana/pipeline/guidance", format!("{guidance:?}").into());
     let mut latents = Vec::with_capacity(seeds.len());
-    for seed in seeds {
+    for (index, seed) in seeds.iter().enumerate() {
+        candle_gen::execution::draw("image_initial_noise", *seed, index);
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
@@ -1380,7 +1473,8 @@ pub(crate) fn generate_sprint_staged(
     revalidate_before_load(&mut check)?;
     let decoder = load_vae_decoder(root, device, &cfg)?;
     let mut images = Vec::with_capacity(latents.len());
-    for latent in latents {
+    for (output_index, latent) in latents.into_iter().enumerate() {
+        candle_gen::execution::output_index(output_index);
         on_progress(Progress::Decoding);
         images.push(decode_to_image_memory(
             &decoder,

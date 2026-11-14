@@ -587,6 +587,10 @@ impl Pipeline {
                 false,
             )
         };
+        candle_gen::execution::policy(
+            "lens/lib/attention_budget",
+            format!("{attention_budget:?}").into(),
+        );
         let attention_plan = gen_core::attention_budget::AttentionPlan::budgeted(attention_budget)
             .with_cancel(cancel);
         // sc-17719 — an all-valid mask makes `build_joint_mask` an all-zero additive term that is then
@@ -608,6 +612,10 @@ impl Pipeline {
         } else {
             TRANSFORMER_BLOCK_COUNT as usize
         };
+        candle_gen::execution::policy(
+            "lens/lib/transformer_window",
+            format!("{transformer_window:?}").into(),
+        );
         candle_gen::run_flow_sampler(
             sampler,
             TimestepConvention::Sigma,
@@ -667,6 +675,7 @@ impl Pipeline {
             .map(|s| s as usize)
             .unwrap_or(defaults.steps as usize);
         let guidance = req.guidance.unwrap_or(defaults.guidance);
+        candle_gen::execution::policy("lens/lib/guidance", format!("{guidance:?}").into());
         // Standard CFG with the Lens `cfg_rescale`: at guidance == 1.0 the combine reduces exactly to
         // cond, so guidance is effectively off — skip the uncond encode/forward entirely (sc-8993).
         let guided = guidance != 1.0;
@@ -701,6 +710,7 @@ impl Pipeline {
         )?;
 
         let memory = req.memory.unwrap_or_default();
+        candle_gen::execution::policy("lens/lib/memory", format!("{memory:?}").into());
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let init = create_noise(seed, latent_h, latent_w, &self.device)?;
             // Per-step latent preview (epic 16948, sc-16955), bound to the same `(latent_h, latent_w)`
@@ -776,6 +786,7 @@ impl Pipeline {
             .map(|s| s as usize)
             .unwrap_or(defaults.steps as usize);
         let guidance = req.guidance.unwrap_or(defaults.guidance);
+        candle_gen::execution::policy("lens/lib/guidance", format!("{guidance:?}").into());
         let guided = guidance != 1.0;
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
@@ -806,6 +817,7 @@ impl Pipeline {
         self.device.synchronize()?;
 
         let memory = req.memory.unwrap_or_default();
+        candle_gen::execution::policy("lens/lib/memory", format!("{memory:?}").into());
         let stream_transformer_blocks = memory.stream_transformer_blocks;
         let heavy = self.load_heavy_components(stream_transformer_blocks, &req.cancel)?;
         let pid_decoder =
@@ -926,7 +938,7 @@ fn create_noise(
 ) -> candle_gen::candle_core::Result<Tensor> {
     let seq = latent_h * latent_w;
     let n = seq * 128;
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("lens/lib", seed));
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(data, (1, seq, 128), &Device::Cpu)?.to_device(device)
 }
@@ -1861,6 +1873,35 @@ impl LensGenerator {
 }
 
 impl Generator for LensGenerator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::policy(
+                "loaded/sequential",
+                format!("{:?}", self.sequential).into(),
+            );
+            candle_gen::execution::policy(
+                "loaded/stream_text",
+                format!("{:?}", self.stream_text).into(),
+            );
+            candle_gen::execution::policy(
+                "loaded/stream_dit",
+                format!("{:?}", self.stream_dit).into(),
+            );
+            candle_gen::execution::policy(
+                "loaded/loaded_precision",
+                format!("{:?}", self.loaded_precision).into(),
+            );
+            candle_gen::execution::policy(
+                "loaded/loaded_quant",
+                format!("{:?}", self.loaded_quant).into(),
+            );
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -4557,6 +4598,7 @@ mod integration_tests {
             },
         );
         let memory = lens_generation_memory(&contract, selection).unwrap();
+        candle_gen::execution::policy("lens/lib/memory", format!("{memory:?}").into());
         assert!(memory.stage_residency);
         assert!(memory.stream_transformer_blocks);
         assert_eq!(memory.decode_tile_edge, Some(DECODE_TILE_EDGE));

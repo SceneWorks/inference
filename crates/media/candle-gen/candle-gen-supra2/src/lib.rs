@@ -31,7 +31,10 @@ pub mod model;
 pub mod sampling;
 
 pub use dit::SupraDit;
-pub use model::{descriptor, encode_tokens, load, Supra2Image, Supra2Output, TextConditioning};
+pub use model::{
+    descriptor, encode_tokens, load, CompletedSupra2Output, Supra2Image, Supra2Output,
+    TextConditioning,
+};
 
 /// Compose the Supra2 generator, its memory strategy and its resident-only contract witness into
 /// an explicit registry. The loader is resident-only (no quantization, staging or deferred

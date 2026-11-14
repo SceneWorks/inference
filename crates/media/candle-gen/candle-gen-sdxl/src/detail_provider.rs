@@ -135,6 +135,26 @@ impl SdxlDetail {
     }
 
     /// Refine `source` while using `control` as the SDXL tile-ControlNet condition.
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &SdxlDetailRequest,
+        source: &Image,
+        control: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::policy("direct_route", "sdxl/detail_provider/generate".into());
+            let image = self
+                .generate(req, source, control, &mut report_progress)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate(
         &self,
         req: &SdxlDetailRequest,
@@ -163,6 +183,7 @@ impl SdxlDetail {
         let _attention = crate::enter_attention_memory(memory);
 
         let cfg_on = req.guidance > 1.0;
+        candle_gen::execution::policy("sdxl/detail_provider/cfg_on", format!("{cfg_on:?}").into());
         let (conditioning, pooled) = self
             .conditioner
             .encode(&req.prompt, &req.negative, cfg_on)?;
@@ -173,7 +194,10 @@ impl SdxlDetail {
         let (_, channels, latent_h, latent_w) = x0.dims4()?;
         let strength = req.strength as f64;
         let start_time = self.sampler.max_time() * strength;
-        let mut init_rng = StdRng::seed_from_u64(req.seed);
+        let mut init_rng = StdRng::seed_from_u64(candle_gen::execution::seed(
+            "sdxl/detail_provider",
+            req.seed,
+        ));
         let init_noise = candle_gen::seeded_noise_nchw(
             &mut init_rng,
             channels,
@@ -202,7 +226,10 @@ impl SdxlDetail {
             unet: &self.unet,
             sampler: &self.sampler,
         };
-        let mut step_rng = StdRng::seed_from_u64(req.seed.wrapping_add(STEP_RNG_SALT));
+        let mut step_rng = StdRng::seed_from_u64(candle_gen::execution::seed(
+            "sdxl/detail_provider",
+            req.seed.wrapping_add(STEP_RNG_SALT),
+        ));
         let latents = denoise_ip_control(
             &denoiser,
             x_t,

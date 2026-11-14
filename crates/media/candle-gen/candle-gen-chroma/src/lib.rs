@@ -120,6 +120,14 @@ fn release_warm_after_synchronize<T>(device: &Device, component: T) -> gen_core:
 }
 
 impl Generator for ChromaGenerator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -232,6 +240,7 @@ impl Generator for ChromaGenerator {
             receipt.ensure_unchanged()?;
         }
         let memory = req.memory.unwrap_or_default();
+        candle_gen::execution::policy("chroma/lib/memory", format!("{memory:?}").into());
         if memory.tile_vae_decode || memory.chunk_attention || memory.stream_transformer_blocks {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: bounded decode, attention, and transformer residency are Missing",

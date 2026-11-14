@@ -420,6 +420,14 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
 }
 
 impl Generator for Anima {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -476,13 +484,19 @@ impl Generator for Anima {
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
         let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
+        candle_gen::execution::policy("anima/lib/guidance", format!("{guidance:?}").into());
         let cfg_on = self.variant.uses_cfg() || guidance != 1.0;
+        candle_gen::execution::policy("anima/lib/cfg_on", format!("{cfg_on:?}").into());
         let negative = req.negative_prompt.clone().unwrap_or_default();
 
         // Shared batch frame (sc-7792): the `0..count` loop + per-image `image_seed(base_seed, n)`
         // derivation + `Vec` collect that every provider repeats. The model body stays hand-written in
         // the closure (captures `on_progress` + the borrowed pipeline).
         let stage_residency = req.memory.is_some_and(|memory| memory.stage_residency);
+        candle_gen::execution::policy(
+            "anima/lib/stage_residency",
+            format!("{stage_residency:?}").into(),
+        );
         if stage_residency && !self.adapters.is_empty() {
             return Err(gen_core::Error::Unsupported(format!(
                 "{}: staged residency refuses LoRA/LoKr overlays because their conditioner and DiT loads are one atomic artifact",

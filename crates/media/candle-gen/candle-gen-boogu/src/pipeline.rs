@@ -665,6 +665,8 @@ pub(crate) fn stage_denoise_turbo(
         let mut lat = blend_reference(clean.as_ref(), noise, 1.0 - sigmas[start])?;
         let preview_hook = crate::preview::hook(&req.preview);
         let preview_counter = crate::preview::native_counter(steps);
+        candle_gen::execution::schedule("boogu-turbo-dmd", &sigmas[start..], "clean-fraction");
+        candle_gen::execution::runtime(lat.device(), lat.dtype());
         for (current, i) in (start..steps).enumerate() {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
@@ -771,9 +773,14 @@ pub(crate) fn stage_decode(
         req.seed.unwrap_or_else(gen_core::default_seed),
         provider,
     )?;
+    if req.seed.is_none() && pid.is_some() {
+        candle_gen::execution::non_deterministic("Boogu staged PiD resolves an independent default seed; one request seed cannot reproduce both initial and decoder streams");
+    }
     latents
         .into_iter()
-        .map(|latent| {
+        .enumerate()
+        .map(|(output_index, latent)| {
+            candle_gen::execution::output_index(output_index);
             on_progress(Progress::Decoding);
             decode(&decode_components.vae, pid.as_ref(), &latent)
         })
@@ -1009,6 +1016,8 @@ pub(crate) fn render_turbo(
         let mut lat = blend_reference(clean, noise, 1.0 - sigmas[start])?;
         let preview_hook = crate::preview::hook(&req.preview);
         let preview_counter = crate::preview::native_counter(steps);
+        candle_gen::execution::schedule("boogu-turbo-dmd", &sigmas[start..], "clean-fraction");
+        candle_gen::execution::runtime(lat.device(), lat.dtype());
         for (current, i) in (start..steps).enumerate() {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
@@ -1432,7 +1441,10 @@ fn init_noise(height: u32, width: u32, seed: u64, step: u64, device: &Device) ->
         (width / SPATIAL_SCALE) as usize,
     );
     let n = LATENT_CHANNELS * lat_h * lat_w;
-    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(step));
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed(
+        "boogu/pipeline",
+        seed.wrapping_add(step),
+    ));
     let noise = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(
         Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
