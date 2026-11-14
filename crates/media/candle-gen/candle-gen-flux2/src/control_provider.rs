@@ -359,6 +359,24 @@ impl Flux2Control {
 
     /// Generate one strict-pose-conditioned image. `control_image` is the pose/union skeleton (the
     /// worker pre-fits it to the render size; this re-resizes defensively).
+    /// Bind a completed image to observations from this same control attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &Flux2ControlRequest,
+        control_image: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        crate::complete_bespoke_image(
+            &crate::descriptor_dev(),
+            &req.cancel,
+            "flux2/control_provider/generate",
+            "candle-gen-flux2/src/control_provider.rs: loaded control overlay and decoder choices have no complete execution receipt",
+            || self.generate(req, control_image, &mut report_progress),
+        )
+    }
+
     pub fn generate(
         &self,
         req: &Flux2ControlRequest,
@@ -387,6 +405,25 @@ impl Flux2Control {
 
     /// Execute the exact control request admitted at load. Context identity, geometry, PiD, and the
     /// certified overlay binding are rechecked immediately before the serialized request.
+    /// Bind an admitted control render's output to observations from that same attempt.
+    pub fn generate_with_memory_context_with_execution_report(
+        &self,
+        context: &MemoryRunContext,
+        req: &Flux2ControlRequest,
+        control_image: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        crate::complete_bespoke_image(
+            &crate::descriptor_dev(),
+            &req.cancel,
+            "flux2/control_provider/generate_with_memory_context",
+            "candle-gen-flux2/src/control_provider.rs: loaded control overlay and decoder choices have no complete execution receipt",
+            || self.generate_with_memory_context(context, req, control_image, &mut report_progress),
+        )
+    }
+
     pub fn generate_with_memory_context(
         &self,
         context: &MemoryRunContext,

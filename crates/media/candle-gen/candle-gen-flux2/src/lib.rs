@@ -195,7 +195,7 @@ impl TextEncoderSource {
                     return Err(CandleError::Msg(format!(
                         "flux2: read {}: {error}",
                         path.display()
-                    )))
+                    )));
                 }
             };
             Ok((path, text))
@@ -470,7 +470,7 @@ impl Pipeline {
                     return Err(CandleError::Msg(format!(
                         "flux2: read {}: {error}",
                         path.display()
-                    )))
+                    )));
                 }
             };
             (path, text)
@@ -1331,6 +1331,92 @@ pub(crate) fn run_bespoke_request<T>(
     }
 }
 
+/// Complete a direct FLUX.2 image only after its legacy execution and device fence succeed.
+/// `missing_fact` names a route-local observation gap rather than filling it from submitted knobs.
+pub(crate) fn complete_bespoke_image(
+    descriptor: &ModelDescriptor,
+    cancel: &gen_core::CancelFlag,
+    route: &'static str,
+    missing_fact: &'static str,
+    run: impl FnOnce() -> CResult<gen_core::Image>,
+) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+    candle_gen::execution::capture_direct(descriptor, cancel, || {
+        candle_gen::execution::policy("direct_route", route.into());
+        candle_gen::execution::unavailable(missing_fact);
+        let image = run().map_err(gen_core::Error::from)?;
+        Ok(gen_core::GenerationOutput::Images(vec![image]))
+    })
+}
+
+#[cfg(test)]
+mod direct_completion_tests {
+    use super::*;
+    use gen_core::generator::ExecutionIdentity;
+
+    fn image(width: u32) -> Image {
+        Image {
+            width,
+            height: 1,
+            pixels: vec![0; width as usize * 3],
+        }
+    }
+
+    #[test]
+    fn direct_completion_binds_success_and_drops_error_retry_and_cancellation_state() {
+        let descriptor = descriptor_dev();
+        let cancel = gen_core::CancelFlag::default();
+        let missing = "candle-gen-flux2/src/edit_provider.rs: no complete decoder receipt";
+        let first = complete_bespoke_image(
+            &descriptor,
+            &cancel,
+            "flux2/edit_provider/generate",
+            missing,
+            || Ok(image(2)),
+        )
+        .unwrap();
+        assert!(
+            matches!(first.execution, ExecutionIdentity::Unavailable { reason } if reason.missing_facts.iter().any(|fact| fact.contains(missing)))
+        );
+        assert!(
+            matches!(first.generation.output, Some(GenerationOutput::Images(images)) if images[0].width == 2)
+        );
+
+        assert!(complete_bespoke_image(
+            &descriptor,
+            &cancel,
+            "flux2/edit_provider/generate",
+            missing,
+            || { Err(CandleError::Msg("test failure".into())) }
+        )
+        .is_err());
+        let retry = complete_bespoke_image(
+            &descriptor,
+            &cancel,
+            "flux2/edit_provider/generate",
+            missing,
+            || Ok(image(4)),
+        )
+        .unwrap();
+        assert!(
+            matches!(retry.generation.output, Some(GenerationOutput::Images(images)) if images[0].width == 4)
+        );
+
+        let canceled = gen_core::CancelFlag::default();
+        let signal = canceled.clone();
+        let result = complete_bespoke_image(
+            &descriptor,
+            &canceled,
+            "flux2/control_provider/generate",
+            missing,
+            || {
+                signal.cancel();
+                Ok(image(8))
+            },
+        );
+        assert!(matches!(result, Err(gen_core::Error::Canceled)));
+    }
+}
+
 /// A loaded candle FLUX.2 generator. The shared residency owner holds either the warm phase pair or
 /// the deferred per-request loaders.
 pub struct Flux2Generator {
@@ -1346,6 +1432,28 @@ pub struct Flux2Generator {
 }
 
 impl Generator for Flux2Generator {
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::unobserved_adapters(
+                self.pipe.adapters.len(),
+                "candle-gen-flux2/src/lib.rs",
+            );
+            candle_gen::execution::policy(
+                "loaded/loaded_quant",
+                format!("{:?}", self.loaded_quant).into(),
+            );
+            if self.pipe.comfyui_dit.is_some() {
+                candle_gen::execution::unavailable(
+                    "candle-gen-flux2/src/lib.rs: imported ComfyUI DiT remapping and in-memory dequantization have no complete execution receipt",
+                );
+            }
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -3694,6 +3802,8 @@ origin = candle_gen::gen_core::model_input_proof::SourceOrigin::ExternalSelected
         }
 
         #[cfg(feature = "model-inference-proof")]
-        println!("\nMODEL_INFERENCE_BODY_COMPLETED tests::flux2_klein_reference_routes_probed_memory_ladder");
+        println!(
+            "\nMODEL_INFERENCE_BODY_COMPLETED tests::flux2_klein_reference_routes_probed_memory_ladder"
+        );
     }
 }
