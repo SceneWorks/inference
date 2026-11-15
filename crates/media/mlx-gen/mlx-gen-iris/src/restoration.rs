@@ -34,6 +34,18 @@ use crate::model::{compute_dtype, load_backbone};
 /// Registry id of the restoration transform.
 pub const MODEL_ID: &str = contract::MODEL_ID;
 
+fn selected_device_kind() -> Option<&'static str> {
+    let kind = mlx_rs::Stream::task_local_or_default()
+        .get_device()
+        .ok()?
+        .get_type()
+        .ok()?;
+    Some(match kind {
+        mlx_rs::DeviceType::Cpu => "mlx_cpu",
+        mlx_rs::DeviceType::Gpu => "mlx_metal",
+    })
+}
+
 /// Identity + capabilities, constructible without weights.
 pub fn descriptor() -> TransformDescriptor {
     TransformDescriptor {
@@ -551,7 +563,12 @@ impl Transform for IrisRestorer {
         req: &TransformRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<CompletedTransform> {
+        let device_before = selected_device_kind();
         let (image, plan) = self.apply_impl(req, on_progress)?;
+        let device_after = selected_device_kind();
+        let device = (device_before == device_after)
+            .then_some(device_after)
+            .flatten();
         if req.cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
@@ -571,7 +588,7 @@ impl Transform for IrisRestorer {
                 "precision": format!("{:?}", self.precision),
                 "packed_tier": format!("{:?}", self.tier),
                 "streamed": self.dit.is_streamed(),
-                "device_observation": {"state":"unavailable","reason":"MLX restoration does not expose the selected device"},
+                "device": device,
             }),
         )?;
         CompletedTransform::new(image, execution, self.descriptor())

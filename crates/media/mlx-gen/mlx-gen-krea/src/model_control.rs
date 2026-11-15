@@ -65,6 +65,7 @@ pub struct KreaTurboControl {
     memory_strategy: gen_core::MemoryProviderContract,
     loaded_precision: Precision,
     loaded_quant: Option<Quant>,
+    adapters: Vec<mlx_gen::AdapterSpec>,
     /// Constructor-time pins retained for every deferred imported base/control reopen.
     _native_dit: Option<mlx_gen::PinnedWeightsFile>,
     _native_control: Option<mlx_gen::PinnedWeightsFile>,
@@ -254,6 +255,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory_strategy,
         loaded_precision: spec.precision,
         loaded_quant,
+        adapters: spec.adapters.clone(),
         _native_dit: None,
         _native_control: pinned_control,
         streamable_transformer,
@@ -393,6 +395,7 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
         memory_strategy,
         loaded_precision: spec.precision,
         loaded_quant: spec.quantize,
+        adapters: spec.adapters.clone(),
         _native_dit: Some(native_dit),
         _native_control: pinned_control,
         streamable_transformer: reopenable,
@@ -859,6 +862,10 @@ impl Generator for KreaTurboControl {
                 mlx_gen::image_execution::policy_debug(
                     "KreaTurboControl.loaded_quant",
                     &self.loaded_quant,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "KreaTurboControl.applied_adapter_controls",
+                    &crate::model::applied_adapter_controls(&self.adapters),
                 );
                 mlx_gen::image_execution::policy_debug(
                     "KreaTurboControl.loaded_sequential_residency",

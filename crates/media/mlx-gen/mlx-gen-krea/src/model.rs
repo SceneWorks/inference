@@ -33,6 +33,17 @@ use crate::pipeline::{
 /// `payload.model` and the manifest `engine_id` (sc-7572).
 pub const KREA_2_TURBO_ID: &str = "krea_2_turbo";
 
+/// Strict loader application makes these loaded controls effective on every completed render.
+pub(crate) fn applied_adapter_controls(
+    adapters: &[AdapterSpec],
+) -> Vec<(usize, mlx_gen::runtime::AdapterKind, f32)> {
+    adapters
+        .iter()
+        .enumerate()
+        .map(|(index, adapter)| (index, adapter.kind, adapter.scale))
+        .collect()
+}
+
 /// Qwen3-VL-4B conditioning architecture shared by every Krea 2 route.
 pub const TOKENIZER_CONTRACT: mlx_gen::gen_core::EncoderTokenizerContract =
     mlx_gen::gen_core::EncoderTokenizerContract {
@@ -1201,6 +1212,10 @@ impl Generator for Krea {
                 mlx_gen::image_execution::policy_debug("Krea.precision", &self.precision);
                 mlx_gen::image_execution::policy_debug("Krea.quant", &self.quant);
                 mlx_gen::image_execution::policy_debug(
+                    "Krea.applied_adapter_controls",
+                    &applied_adapter_controls(&self.adapters),
+                );
+                mlx_gen::image_execution::policy_debug(
                     "Krea.loaded_sequential_residency",
                     &self.residency.is_sequential(),
                 );
@@ -2260,6 +2275,29 @@ mod tests {
     use super::*;
     use mlx_gen::{AdapterKind, AdapterSpec, OffloadPolicy};
     use std::path::PathBuf;
+
+    #[test]
+    fn applied_adapter_controls_distinguish_scale_and_order() {
+        let first = AdapterSpec::new("/fixture/one".into(), 0.5, AdapterKind::Lora);
+        let second = AdapterSpec::new("/fixture/two".into(), 1.0, AdapterKind::Lokr);
+        let source = [first.clone(), second.clone()];
+        let scaled = [
+            AdapterSpec::new(first.path, 0.75, first.kind),
+            second.clone(),
+        ];
+        let reversed = [
+            second,
+            AdapterSpec::new("/fixture/one".into(), 0.5, AdapterKind::Lora),
+        ];
+        assert_ne!(
+            applied_adapter_controls(&source),
+            applied_adapter_controls(&scaled)
+        );
+        assert_ne!(
+            applied_adapter_controls(&source),
+            applied_adapter_controls(&reversed)
+        );
+    }
 
     /// The `generate_impl` body — the base t2i/img2img/edit/multi-phase render — as source text.
     /// The calibration-fault boundaries are structural claims about *where* in this body the fault

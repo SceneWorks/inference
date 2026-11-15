@@ -22,7 +22,7 @@ use super::downstream::{TaskExport, TaskSettings};
 use super::{IrisConfig, IrisTask};
 use gen_core::generator::{
     ExecutionFact, ExecutionIdentity, ExecutionRandomness, ExecutionReplaySupport,
-    ResolvedExecutionIdentity, EXECUTION_IDENTITY_VERSION,
+    ExecutionUnavailable, ResolvedExecutionIdentity, EXECUTION_IDENTITY_VERSION,
 };
 use gen_core::media::Image;
 use gen_core::runtime::{CancelFlag, LoadSpec, Progress};
@@ -361,6 +361,17 @@ pub fn completed_execution_identity(
         return Err(Error::Msg(
             "completed restoration numeric facts are unavailable".into(),
         ));
+    }
+    if numeric_policy
+        .get("device")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Ok(ExecutionIdentity::unavailable(ExecutionUnavailable {
+            code: "restoration_device_unavailable".into(),
+            detail: "The selected execution device was not observed".into(),
+            missing_facts: vec!["selected_execution_device".into()],
+        }));
     }
     let identity = ResolvedExecutionIdentity {
         version: EXECUTION_IDENTITY_VERSION,
@@ -1476,6 +1487,17 @@ mod tests {
             ExecutionRandomness::NoDraws { .. }
         ));
         assert!(!actual.deterministic_replay.is_deterministic());
+        let unknown_device = completed_execution_identity(
+            &plan,
+            &image,
+            "mlx",
+            "mlx-iris@1:restore-v1",
+            500.0,
+            0.5,
+            json!({"compute_dtype":"Bf16","device_observation":{"state":"unavailable"}}),
+        )
+        .unwrap();
+        assert!(unknown_device.resolved().is_none());
         let mut wrong = image.clone();
         wrong.width += 1;
         assert!(completed_execution_identity(
