@@ -315,7 +315,23 @@ impl Generator for FluxGenerator {
             &req.cancel,
             req.use_pid,
             on_progress,
-            |text| run.encode(|| self.pipe.encode_residency(text, &req.prompt)),
+            // PiD's Gemma caption encode is text conditioning, and its engine arrives with the
+            // heavy bundle: a PiD request holds Conditioning open until `render_residency` has
+            // prepared the decoder.
+            |text| {
+                if req.use_pid {
+                    run.begin_conditioning()?;
+                    self.pipe.encode_residency(text, &req.prompt)
+                } else {
+                    // Synchronize before Conditioning closes so the queued T5/CLIP kernels (and
+                    // any failure they raise) stay inside it.
+                    run.encode(|| {
+                        let encoded = self.pipe.encode_residency(text, &req.prompt)?;
+                        self.pipe.device().synchronize()?;
+                        Ok::<_, candle_gen::CandleError>(encoded)
+                    })
+                }
+            },
             |_| Ok(self.pipe.device().synchronize()?),
             |heavy, encoded, on_progress| {
                 let result =

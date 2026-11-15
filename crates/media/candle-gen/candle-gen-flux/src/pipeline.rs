@@ -1429,13 +1429,19 @@ impl Pipeline {
         let lat_w = (req.width as usize).div_ceil(16) * 2;
 
         let (t5_emb, clip_emb) = encoded;
-        // Resolve the decode seam once for the whole batch.
+        // Resolve the decode seam once for the whole batch. Minting a PiD decoder runs its Gemma
+        // caption encode, which is text conditioning: the caller left Conditioning open for a PiD
+        // request, and it closes once the caption work has finished on the device.
         let pid_decoder = candle_gen_pid::resolve_pid_decoder(
             heavy.pid.as_deref(),
             req,
             plan.base_seed(),
             self.variant.model_id(),
         )?;
+        if req.use_pid {
+            self.device.synchronize()?;
+            run.end_conditioning()?;
+        }
 
         // Per-image denoise + decode.
         run.images_with_denoise_phases(
@@ -1770,6 +1776,77 @@ pub fn ae_config(variant: Variant) -> AeConfig {
 
 #[cfg(test)]
 mod tests {
+    /// Phase attribution of the Candle FLUX.1 routes, pinned against the shipped sources: every
+    /// learned conditioning forward (T5/CLIP, the XLabs CLIP image encoder and adapter tokens, the
+    /// control-latent VAE encode, and the PiD Gemma caption encode run by minting the decoder)
+    /// happens inside the Conditioning phase, and each route synchronizes the device before that
+    /// phase closes so queued kernels (and their failures) stay inside it. Nothing executes.
+    #[test]
+    fn conditioning_work_stays_inside_the_conditioning_phase() {
+        fn shipped(source: &str) -> String {
+            source
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap()
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        fn after<'a>(source: &'a str, needle: &str) -> &'a str {
+            &source[source
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?}"))..]
+        }
+        let lib = shipped(include_str!("lib.rs"));
+        let pipeline = shipped(include_str!("pipeline.rs"));
+        // Base route: a PiD request opens Conditioning for the text encode and keeps it open; the
+        // non-PiD encode synchronizes inside `run.encode`.
+        let encode = after(&lib, "|text| {");
+        let pid_branch = &encode[..encode.find("} else {").unwrap()];
+        assert!(
+            pid_branch.contains("if req.use_pid {")
+                && pid_branch.contains("run.begin_conditioning()?;")
+        );
+        let plain = &encode[encode.find("} else {").unwrap()..];
+        let plain = &plain[..plain.find("Ok::<").unwrap()];
+        assert!(
+            plain.contains("run.encode(||") && plain.contains("self.pipe.device().synchronize()?;")
+        );
+        // ...and `render_residency` mints the PiD decoder, synchronizes, then closes Conditioning
+        // before the first denoise phase.
+        let render = after(&pipeline, "pub(crate) fn render_residency(");
+        let pid = render.find("candle_gen_pid::resolve_pid_decoder(").unwrap();
+        let sync = render.find("self.device.synchronize()?;").unwrap();
+        let close = render.find("run.end_conditioning()?;").unwrap();
+        let denoise = render.find("run.images_with_denoise_phases(").unwrap();
+        assert!(pid < sync && sync < close && close < denoise);
+        // XLabs IP and ControlNet: the whole encode closure, including the learned image work,
+        // synchronizes before returning from `run.encode`.
+        for (file, source, work) in [
+            (
+                "ip_provider.rs",
+                shipped(include_str!("ip_provider.rs")),
+                "self.adapter.tokens(&embeds)?",
+            ),
+            (
+                "control_provider.rs",
+                shipped(include_str!("control_provider.rs")),
+                "self.encode_control_latent(",
+            ),
+        ] {
+            let closure = after(&source, "= run.encode(|| {");
+            let closure = &closure[..closure.find("})?;").unwrap()];
+            let work_at = closure
+                .find(work)
+                .unwrap_or_else(|| panic!("{file}: {work} outside Conditioning"));
+            let sync = closure
+                .find("self.device.synchronize()?;")
+                .unwrap_or_else(|| panic!("{file}: Conditioning closes without synchronizing"));
+            assert!(work_at < sync, "{file}");
+        }
+    }
+
     use super::*;
 
     /// F-177 (sc-12089): the PiD student is loaded only when the request will actually decode through it,
