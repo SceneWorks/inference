@@ -294,10 +294,52 @@ pub fn load_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_with(spec, descriptor_edit())
 }
 
-mlx_gen::impl_generator!(Boogu {
-    validate: |s, req| validate_request(&s.descriptor, req),
-    generate: generate_impl,
-});
+impl Generator for Boogu {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        validate_request(&self.descriptor, req).map_err(Into::into)
+    }
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "Boogu.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl Boogu {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
 
 impl Boogu {
     /// The rich-`Result` body behind [`Generator::generate`] — kept on the crate's own
@@ -337,6 +379,7 @@ impl Boogu {
         let id = self.descriptor.id;
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        mlx_gen::image_execution::scalar("boogu.guidance", guidance);
         let preflight =
             crate::pipeline::preflight_text(&self.tokenizer, &req.prompt, guidance != 1.0)?
                 .with_negative_prompt(&self.tokenizer, req.negative_prompt.as_deref())?;
@@ -438,6 +481,7 @@ impl Boogu {
         let references: Vec<Image> = resolve_edit_references(req)?.into_iter().cloned().collect();
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        mlx_gen::image_execution::scalar("boogu.guidance", guidance);
         // Host-only smart-resize/token admission runs before Residency can load or call the MLX
         // text/vision tower or VAE phase. Both CFG legs reuse the exact checked ids/counts.
         let preflight = crate::pipeline::preflight_edit(

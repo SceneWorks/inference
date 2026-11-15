@@ -583,6 +583,10 @@ pub fn denoise_vace(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> CResult<Tensor> {
+    candle_gen::execution::policy(
+        "wan_vace_denoise",
+        serde_json::json!({"guidance_bits": guidance.to_bits(), "scale_bits": scales.iter().map(|s| s.to_bits()).collect::<Vec<_>>()}),
+    );
     let (_b, _c, f, hl, wl) = init_noise.dims5()?;
     let (pt, ph, pw) = transformer.cfg.base.patch;
     debug_assert_eq!(
@@ -667,6 +671,10 @@ pub fn denoise_vace_range(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> CResult<()> {
+    candle_gen::execution::policy(
+        "wan_vace_denoise",
+        serde_json::json!({"guidance_bits": guidance.to_bits(), "scale_bits": scales.iter().map(|s| s.to_bits()).collect::<Vec<_>>()}),
+    );
     let (_b, _c, f, hl, wl) = latents.dims5()?;
     let (pt, ph, pw) = transformer.cfg.base.patch;
     let l = (f / pt) * (hl / ph) * (wl / pw);

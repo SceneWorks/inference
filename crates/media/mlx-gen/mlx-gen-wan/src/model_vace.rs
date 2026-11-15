@@ -228,6 +228,7 @@ fn vace_prep(
 
     // Seeded init noise [z16, T_lat(+num_ref), h, w].
     let key = random::key(seed)?;
+    mlx_gen::video_execution::draw(0, "wan_initial_normal", seed);
     let init_noise = random::normal::<f32>(
         &[base.vae_z_dim as i32, t_total, h_lat, w_lat],
         None,
@@ -361,6 +362,12 @@ pub struct WanVace {
     adapter_reports: std::sync::Mutex<Vec<AdapterApplyReport>>,
 }
 
+fn execution_weight_policy(quant: Option<Quant>) -> serde_json::Value {
+    serde_json::json!({"dense_dtype":"Bfloat16", "applied_quant_bits":quant.map(Quant::bits),
+        "affine_group_size":mlx_gen::quant::DEFAULT_GROUP_SIZE,
+        "adapter_order":"dense_fold_before_quantization"})
+}
+
 impl WanVace {
     /// The resolved VACE config (exposed for tests).
     pub fn config(&self) -> &WanVaceConfig {
@@ -465,7 +472,39 @@ fn preprocess_clip(frames: &[Image], width: u32, height: u32) -> Result<Array> {
 
 // F-072: `WanVace`'s validate body was byte-identical to the documented-shared `validate_vace_clip`
 // (with `id = MODEL_ID_VACE`), which the dual-expert `WanVaceFun` already uses — so point both at it.
+impl WanVace {
+    fn generate_execution_attempt(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
+        mlx_gen::sc20686::observe_generation(
+            &self.root,
+            &req.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(req),
+            on_progress,
+            |on_progress| self.generate_impl(req, on_progress),
+        )
+        .map_err(Into::into)
+    }
+}
+
 impl Generator for WanVace {
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            self.generate_execution_attempt(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })
+            .map(mlx_gen::gen_core::GenerationReport::from_output)
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -486,16 +525,9 @@ impl Generator for WanVace {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
-        mlx_gen::sc20686::observe_generation(
-            &self.root,
-            &req.cancel,
-            self.descriptor.id,
-            || mlx_gen::sc20686::RequestFacts::from_request(req),
-            on_progress,
-            |on_progress| self.generate_impl(req, on_progress),
-        )
-        .map_err(Into::into)
+        mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -589,6 +621,10 @@ impl WanVace {
             let mut dit = WanVaceTransformer::from_weights(&w, &self.config, Dtype::Bfloat16)?;
             // Q4/Q8 (sc-3440): quantize the DiT `_quantize_predicate` surface in place after the dense
             // build (the diffusers VACE snapshot ships dense bf16 — no pre-quantized VACE snapshot).
+            mlx_gen::video_execution::policy(
+                "vace_weights",
+                execution_weight_policy(self.quantize),
+            );
             if let Some(q) = self.quantize {
                 dit.quantize(q.bits(), None)?;
             }
@@ -761,6 +797,10 @@ impl WanVaceFun {
         let applied = self.merge_expert_adapters(&mut weights, expert)?;
         let mut transformer =
             WanVaceTransformer::from_weights(&weights, &self.config, Dtype::Bfloat16)?;
+        mlx_gen::video_execution::policy(
+            "vace_staged_expert_weights",
+            execution_weight_policy(self.quantize),
+        );
         if let Some(q) = self.quantize {
             // SC-20686: the dense map goes first so the materializing quantize frees each bf16
             // source as its pack evaluates, then the freed dense buffers leave MLX's pool before
@@ -792,6 +832,13 @@ impl WanVaceFun {
     ) -> Result<Array> {
         let mut sched = make_scheduler(kind, num_train_timesteps);
         sched.set_timesteps(steps, shift);
+        mlx_gen::video_execution::sampling(
+            "wan_vace",
+            &format!("{kind:?}"),
+            "flow_velocity",
+            serde_json::json!({"shift_bits":shift.to_bits()}),
+        );
+        mlx_gen::video_execution::schedule("wan_vace", sched.sigmas());
         let timesteps = sched.timesteps().to_vec();
         let k = crossing_index(&timesteps, boundary_timestep);
         if k == 0 || k == steps {
@@ -921,7 +968,39 @@ pub fn load_vace_fun(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
+impl WanVaceFun {
+    fn generate_execution_attempt(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
+        mlx_gen::sc20686::observe_generation(
+            &self.root,
+            &req.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(req),
+            on_progress,
+            |on_progress| self.generate_impl(req, on_progress),
+        )
+        .map_err(Into::into)
+    }
+}
+
 impl Generator for WanVaceFun {
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            self.generate_execution_attempt(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })
+            .map(mlx_gen::gen_core::GenerationReport::from_output)
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -946,16 +1025,9 @@ impl Generator for WanVaceFun {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
-        mlx_gen::sc20686::observe_generation(
-            &self.root,
-            &req.cancel,
-            self.descriptor.id,
-            || mlx_gen::sc20686::RequestFacts::from_request(req),
-            on_progress,
-            |on_progress| self.generate_impl(req, on_progress),
-        )
-        .map_err(Into::into)
+        mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })
     }
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
         self.i2v_memory.as_ref().map(|p| &p.contract)
@@ -1092,6 +1164,10 @@ impl WanVaceFun {
                 WanVaceTransformer::from_weights(&high_w, &self.config, Dtype::Bfloat16)?;
             let mut low_dit =
                 WanVaceTransformer::from_weights(&low_w, &self.config, Dtype::Bfloat16)?;
+            mlx_gen::video_execution::policy(
+                "vace_weights",
+                execution_weight_policy(self.quantize),
+            );
             if let Some(q) = self.quantize {
                 high_dit.quantize(q.bits(), None)?;
                 low_dit.quantize(q.bits(), None)?;
@@ -1339,6 +1415,19 @@ pub(crate) fn vace_denoise_facts(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn execution_report_vace_and_fun_weight_tiers_keep_dense_default() {
+        let dense = super::execution_weight_policy(None);
+        let q4 = super::execution_weight_policy(Some(mlx_gen::Quant::Q4));
+        let q8 = super::execution_weight_policy(Some(mlx_gen::Quant::Q8));
+        assert!(dense["applied_quant_bits"].is_null());
+        assert_eq!(q4["applied_quant_bits"], 4);
+        assert_eq!(q8["applied_quant_bits"], 8);
+        assert_ne!(dense, q4);
+        assert_ne!(q4, q8);
+        assert_eq!(q8["adapter_order"], "dense_fold_before_quantization");
+    }
+
     use super::*;
 
     /// SC-20686: VACE residency is priced at the precisions the loader holds — a mixed checkpoint's

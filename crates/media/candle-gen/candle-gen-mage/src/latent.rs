@@ -265,6 +265,8 @@ fn message() -> Vec<u8> {
 /// samples, while this stream supplies stable request-seeded production sampling.
 pub fn normal_noise(shape: &[usize], seed: u64, device: &Device) -> Result<Tensor> {
     let count = shape.iter().product();
+    candle_gen::execution::rng_scheme("mage-mt19937-u31-v1");
+    candle_gen::execution::stream("mage_effective_noise", seed & 0x7fff_ffff);
     let mut mt = Mt::new((seed & 0x7fff_ffff) as u32);
     let mut values = Vec::with_capacity(count);
     while values.len() < count {
@@ -289,10 +291,14 @@ pub fn watermarked_noise(
     device: &Device,
 ) -> Result<Tensor> {
     let n = channels * height * width;
+    candle_gen::execution::rng_scheme("mage-pcg-watermark-v1");
+    candle_gen::execution::stream("watermark_key", KEY);
     let mut pcg = Pcg::new(KEY);
     let pad: Vec<u8> = (0..n).map(|_| pcg.bounded(2) as u8).collect();
     let pos: Vec<usize> = (0..n).map(|_| pcg.bounded(BITS as u32) as usize).collect();
     let msg = message();
+    candle_gen::execution::rng_scheme("mage-mt19937-u31-v1");
+    candle_gen::execution::stream("mage_effective_noise", seed & 0x7fff_ffff);
     let mut mt = Mt::new((seed & 0x7fff_ffff) as u32);
     let values: Vec<f32> = (0..n)
         .map(|i| {
@@ -312,6 +318,8 @@ mod tests {
     fn rng_streams_match_pinned_reference_heads() {
         let mut mt = Mt::new(42);
         assert_eq!(mt.uniform(), 0.058_154_485_961_429_69);
+        candle_gen::execution::rng_scheme("mage-pcg-watermark-v1");
+        candle_gen::execution::stream("watermark_key", KEY);
         let mut pcg = Pcg::new(KEY);
         let pad: Vec<u8> = (0..32).map(|_| pcg.bounded(2) as u8).collect();
         assert_eq!(

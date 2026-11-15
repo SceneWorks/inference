@@ -21,3 +21,69 @@ pub struct UpsampleSampling {
     pub max_new_tokens: usize,
     pub seed: u64,
 }
+
+pub(super) fn observe_enhancement_execution(execution: mlx_llm::core_llm::ExecutionIdentity) {
+    use mlx_llm::core_llm::{ExecutionFact, ExecutionIdentity};
+    match execution {
+        ExecutionIdentity::Resolved { identity } => {
+            mlx_gen::image_execution::choice(
+                "flux2.prompt_enhancement_execution",
+                ExecutionFact::resolved(serde_json::json!(identity)),
+            );
+        }
+        ExecutionIdentity::Unavailable { reason } => {
+            mlx_gen::image_execution::unavailable(
+                "flux2_prompt_enhancement_unobserved",
+                &format!(
+                    "The executed caption decoder did not supply an identity: {}",
+                    reason.code
+                ),
+                "prompt_enhancement_execution",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+
+    fn capture(observe: impl FnOnce()) -> mlx_gen::gen_core::generator::ExecutionIdentity {
+        let descriptor = crate::model::descriptor_dev();
+        mlx_gen::image_execution::complete_image_attempt(
+            &descriptor,
+            &mlx_gen::CancelFlag::new(),
+            || {
+                mlx_gen::image_execution::policy_debug("test.output", &"rgb8");
+                observe();
+                mlx_gen::image_execution::sampled_native(
+                    "test-metadata",
+                    "resolved-sigmas",
+                    mlx_rs::Dtype::Float32,
+                    &[1.0, 0.5, 0.0],
+                    17,
+                );
+                Ok(mlx_gen::GenerationOutput::Images(vec![mlx_gen::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                }]))
+            },
+        )
+        .unwrap()
+        .execution
+    }
+
+    #[test]
+    fn execution_missing_auxiliary_report_is_unavailable_and_does_not_leak_to_retry() {
+        use mlx_gen::gen_core::generator::ExecutionIdentity;
+        let missing = capture(|| {
+            mlx_gen::image_execution::policy_debug("enhancement", &"executed");
+            observe_enhancement_execution(ExecutionIdentity::provider_default());
+        });
+        assert!(matches!(missing, ExecutionIdentity::Unavailable { reason }
+            if reason.code == "flux2_prompt_enhancement_unobserved"));
+        let retry = capture(|| mlx_gen::image_execution::policy_debug("enhancement", &"absent"));
+        assert!(retry.resolved().is_some());
+    }
+}

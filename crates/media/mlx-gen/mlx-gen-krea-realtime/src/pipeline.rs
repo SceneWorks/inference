@@ -405,7 +405,30 @@ pub fn load(spec: &mlx_gen::LoadSpec) -> Result<Box<dyn Generator>> {
 // the crate `Result` into backend-neutral `gen_core::Result`.
 mlx_gen::register_generators! { pub(crate) const REGISTRATION = descriptor => load }
 
+impl KreaRealtime {
+    fn generate_execution_attempt(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.run(req, on_progress).map_err(Into::into)
+    }
+}
+
 impl Generator for KreaRealtime {
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            self.generate_execution_attempt(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })
+            .map(mlx_gen::gen_core::GenerationReport::from_output)
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -444,7 +467,9 @@ impl Generator for KreaRealtime {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.run(req, on_progress).map_err(Into::into)
+        mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })
     }
 }
 

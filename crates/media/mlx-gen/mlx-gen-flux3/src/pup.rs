@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 use gen_core_flux3::{
     pup,
     pup::{
-        run_text_llm, PromptUpsampler, UpsampleMode, UpsampleOptions, UpsampleOutcome,
-        UpsamplePackage, UpsamplePlan, UpsamplerInput,
+        run_text_llm_with_execution_report, PromptUpsampler, UpsampleMode, UpsampleOptions,
+        UpsampleOutcome, UpsamplePackage, UpsamplePlan, UpsamplerInput,
     },
 };
 use mlx_gen::gen_core::core_llm::{self, ModelRequirements, TextLlm};
@@ -124,7 +124,15 @@ impl PromptUpsampler for Flux3PromptUpsampler {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<String> {
-        run_text_llm(self.llm.as_ref(), plan, options, cancel, on_progress)
+        let (text, execution) = run_text_llm_with_execution_report(
+            self.llm.as_ref(),
+            plan,
+            options,
+            cancel,
+            on_progress,
+        )?;
+        observe_enhancement_execution(execution);
+        Ok(text)
     }
 }
 
@@ -309,5 +317,83 @@ mod tests {
         );
         let err = Flux3PromptUpsampler::from_spec(&spec).unwrap_err();
         assert!(err.to_string().contains("package directory"), "{err}");
+    }
+}
+
+fn observe_enhancement_execution(execution: core_llm::ExecutionIdentity) {
+    match execution {
+        core_llm::ExecutionIdentity::Resolved { identity } => {
+            mlx_gen::image_execution::choice(
+                "flux3.prompt_enhancement_execution",
+                core_llm::ExecutionFact::resolved(serde_json::json!(identity)),
+            );
+        }
+        core_llm::ExecutionIdentity::Unavailable { reason } => {
+            mlx_gen::image_execution::unavailable(
+                "flux3_prompt_enhancement_unobserved",
+                &format!(
+                    "The executed prompt upsampler did not supply an identity: {}",
+                    reason.code
+                ),
+                "prompt_enhancement_execution",
+            );
+        }
+    }
+}
+
+pub(crate) fn observe_enhancement_outcome(outcome: &UpsampleOutcome) {
+    use sha2::{Digest, Sha256};
+    mlx_gen::image_execution::policy(
+        "flux3.prompt_enhancement_outcome",
+        serde_json::json!({
+            "outcome": format!("{:?}", outcome.report.outcome),
+            "fallback_reason": outcome.report.fallback_reason,
+            "mode": outcome.report.mode,
+            "effective_caption_sha256": format!("{:x}", Sha256::digest(outcome.caption.as_bytes())),
+        }),
+    );
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+
+    fn capture(observe: impl FnOnce()) -> mlx_gen::gen_core::generator::ExecutionIdentity {
+        let descriptor = crate::model::descriptor();
+        mlx_gen::image_execution::complete_image_attempt(
+            &descriptor,
+            &mlx_gen::CancelFlag::new(),
+            || {
+                mlx_gen::image_execution::policy_debug("test.output", &"rgb8");
+                observe();
+                mlx_gen::image_execution::sampled_native(
+                    "test-metadata",
+                    "resolved-sigmas",
+                    mlx_rs::Dtype::Float32,
+                    &[1.0, 0.5, 0.0],
+                    17,
+                );
+                Ok(mlx_gen::GenerationOutput::Images(vec![mlx_gen::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                }]))
+            },
+        )
+        .unwrap()
+        .execution
+    }
+
+    #[test]
+    fn execution_missing_auxiliary_report_is_unavailable_and_does_not_leak_to_retry() {
+        use mlx_gen::gen_core::generator::ExecutionIdentity;
+        let missing = capture(|| {
+            mlx_gen::image_execution::policy_debug("enhancement", &"executed");
+            observe_enhancement_execution(ExecutionIdentity::provider_default());
+        });
+        assert!(matches!(missing, ExecutionIdentity::Unavailable { reason }
+            if reason.code == "flux3_prompt_enhancement_unobserved"));
+        let retry = capture(|| mlx_gen::image_execution::policy_debug("enhancement", &"absent"));
+        assert!(retry.resolved().is_some());
     }
 }

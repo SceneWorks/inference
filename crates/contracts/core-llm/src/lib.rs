@@ -87,6 +87,7 @@ pub mod switch;
 pub mod template;
 pub mod text_llm;
 pub mod thinking;
+pub mod token_execution;
 pub mod tokenizer;
 pub mod tool;
 pub mod vision_preprocess;

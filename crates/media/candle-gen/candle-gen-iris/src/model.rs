@@ -297,6 +297,17 @@ pub(crate) fn attention_budget_for(req: &GenerationRequest) -> Option<usize> {
         .map(|size| size as usize)
 }
 
+/// Observe the loaded Qwen3-VL tower at the encoding operation. Its compute dtype can differ from
+/// the DiT's, especially on CPU, and both facts belong to the same completed render attempt.
+fn observe_text_encode<T>(
+    device: &Device,
+    dtype: DType,
+    body: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    candle_gen::execution::runtime(device, dtype);
+    body()
+}
+
 impl Iris3b {
     fn generate_impl(
         &self,
@@ -310,13 +321,19 @@ impl Iris3b {
         let flow = self.config.flow.clone();
         let device = self.device.clone();
         let attention_budget = attention_budget_for(req);
+        candle_gen::execution::policy(
+            "iris/model/attention_budget",
+            format!("{attention_budget:?}").into(),
+        );
         let (images, warnings) = self.residency.run_request_scoped(
             stage_residency_for(&self.spec, req),
             false,
             &req.cancel,
             false,
             on_progress,
-            |te: &IrisTextEncoder| -> Result<Conditioning> { encode(te, &params) },
+            |te: &IrisTextEncoder| -> Result<Conditioning> {
+                observe_text_encode(te.device(), te.dtype(), || encode(te, &params))
+            },
             |_| Ok(()),
             |heavy: &Heavy, conditioning: Conditioning, on_progress| {
                 let conditioning = to_device(conditioning, heavy.dit.device())?;
@@ -326,7 +343,12 @@ impl Iris3b {
                 // `k = c·rows + j` draws its noise from `image_seed(seed, k)`.
                 for c in 0..req.count {
                     let seeds: Vec<u64> = (0..rows)
-                        .map(|j| candle_gen::image_seed(params.seed, c * rows + j))
+                        .map(|j| {
+                            let index = c * rows + j;
+                            let seed = candle_gen::image_seed(params.seed, index);
+                            candle_gen::execution::draw("pixel_noise", seed, index as usize);
+                            seed
+                        })
                         .collect();
                     let z = noise_batch(&seeds, channels, params.width, params.height, &device)?;
                     let done = c * params.steps as u32;
@@ -416,6 +438,19 @@ fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
 }
 
 impl Generator for Iris3b {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::unobserved_adapters(
+                self.spec.adapters.len(),
+                "candle-gen-iris/src/model.rs",
+            );
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -480,7 +515,61 @@ candle_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_gen::gen_core::WeightsSource;
+    use candle_gen::gen_core::{generator::ExecutionIdentity, Image, WeightsSource};
+
+    struct RuntimeReportFixture(ModelDescriptor);
+
+    impl Generator for RuntimeReportFixture {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.0
+        }
+
+        fn validate(&self, _req: &GenerationRequest) -> gen_core::Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _req: &GenerationRequest,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> gen_core::Result<GenerationOutput> {
+            observe_text_encode(&Device::Cpu, DType::F32, || Ok(())).unwrap();
+            candle_gen::execution::runtime(&Device::Cpu, DType::BF16);
+            candle_gen::execution::rng_scheme("iris-runtime-fixture");
+            candle_gen::execution::draw("pixel_noise", 7, 0);
+            candle_gen::execution::without_schedule("fixture", "single-step", "flow");
+            candle_gen::execution::policy("fixture", "observed".into());
+            Ok(GenerationOutput::Images(vec![Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            }]))
+        }
+    }
+
+    #[test]
+    fn registered_report_keeps_text_tower_and_dit_runtime_facts() {
+        let fixture = RuntimeReportFixture(descriptor());
+        let report = candle_gen::execution::capture_with(
+            &fixture,
+            &GenerationRequest::default(),
+            &mut |_| {},
+            || {},
+        )
+        .unwrap();
+        let ExecutionIdentity::Resolved { identity } = report.execution else {
+            panic!("complete weights-free Iris report should resolve")
+        };
+        let candle_gen::gen_core::generator::ExecutionFact::Resolved { value } =
+            identity.quality_policy
+        else {
+            panic!("runtime quality policy should be resolved")
+        };
+        let compute = value["compute"].as_array().unwrap();
+        assert_eq!(compute.len(), 2);
+        assert_eq!(compute[0]["dtype"], "F32");
+        assert_eq!(compute[1]["dtype"], "BF16");
+    }
 
     #[test]
     fn descriptor_is_pixel_space_and_honest() {

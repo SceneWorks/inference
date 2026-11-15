@@ -43,6 +43,7 @@ pub mod capability;
 pub mod coherence;
 pub mod convrot_int8;
 pub mod error;
+pub mod image_execution;
 pub mod img2img;
 pub mod int8_gemm;
 pub mod ios_anchor_law;
@@ -111,6 +112,7 @@ pub mod transform {
 // ([`tiling::TilePlan`]); this carries the tensor loop.
 pub mod memory_probe;
 pub mod vae_tiling;
+pub mod video_execution;
 
 pub use attention::{
     sdpa_budgeted_bhsd, AttentionBudget, AttentionPlan, CONSTRAINED_ATTN_SCORES_BUDGET,

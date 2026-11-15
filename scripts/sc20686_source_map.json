@@ -19,7 +19,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-flux2/src/edit_provider.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 530
+              "line": 583
             }
           ],
           "creation": [
@@ -98,7 +98,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/lib.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1171
+              "line": 1200
             }
           ],
           "creation": [
@@ -141,7 +141,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1183
+              "line": 1197
             }
           ],
           "creation": [
@@ -184,7 +184,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 1183
+              "line": 1197
             }
           ],
           "creation": [
@@ -227,7 +227,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/model_vace.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 476
+              "line": 484
             }
           ],
           "creation": [
@@ -270,7 +270,7 @@
             {
               "path": "crates/media/candle-gen/candle-gen-wan/src/model_vace_fun.rs",
               "symbol": "sc20686_observer::activate_requested",
-              "line": 587
+              "line": 610
             }
           ],
           "creation": [
@@ -318,7 +318,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 993
+              "line": 1109
             }
           ],
           "creation": [
@@ -337,7 +337,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::reference_forward",
-              "line": 1602
+              "line": 1661
             }
           ],
           "reads": [
@@ -379,7 +379,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 993
+              "line": 1109
             }
           ],
           "creation": [
@@ -468,7 +468,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model/ti2v.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 220
+              "line": 205
             }
           ],
           "product_residency": "sequential",
@@ -517,7 +517,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model/a14b_generate.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 27
+              "line": 12
             }
           ],
           "product_residency": "sequential",
@@ -575,7 +575,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model/a14b_generate.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 27
+              "line": 12
             }
           ],
           "product_residency": "sequential",
@@ -635,7 +635,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model_vace.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 490
+              "line": 482
             }
           ],
           "product_residency": "resident",
@@ -684,7 +684,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model_vace.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 950
+              "line": 978
             }
           ],
           "product_residency": "sequential",

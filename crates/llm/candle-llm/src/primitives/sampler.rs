@@ -141,6 +141,7 @@ impl SamplingParams {
     /// Reset the generated-only presence boundary for an independently admitted batch lane.
     pub fn for_prompt(mut self, prompt_len: usize) -> Self {
         self.presence_penalty_prompt_len = prompt_len;
+        core_llm::token_execution::observe_token_prompt_boundary(prompt_len);
         self
     }
 

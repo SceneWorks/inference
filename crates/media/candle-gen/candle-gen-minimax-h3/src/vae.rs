@@ -546,6 +546,14 @@ impl MiniMaxH3VideoVae {
     /// the result is bit-identical to [`Self::decode_clip_untiled`] — which is why the sub-tile
     /// fixtures committed for sc-17154 stayed valid across this change.
     pub fn decode_clip(&self, z: &Tensor) -> Result<Tensor> {
+        candle_gen::execution::runtime(z.device(), self.dtype);
+        candle_gen::execution::policy(
+            "h3_spatial_decode",
+            serde_json::json!({
+                "enabled": self.tiling.enabled, "tile": [self.tiling.tile_height, self.tiling.tile_width],
+                "overlap": [self.tiling.overlap_height, self.tiling.overlap_width]
+            }),
+        );
         if !self.tiling.enabled {
             return self.decode_clip_untiled(z);
         }
@@ -646,6 +654,7 @@ impl MiniMaxH3VideoVae {
             ))
         })?;
         let plan = TemporalPlan::new(self.geometry, input_tokens)?;
+        candle_gen::execution::policy("h3_temporal_decode", serde_json::json!(format!("{plan:?}")));
         let z = z.to_dtype(self.dtype)?;
 
         // Pad by REPEATING the last token, not with zeros.

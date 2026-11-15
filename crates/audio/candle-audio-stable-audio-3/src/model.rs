@@ -2148,6 +2148,23 @@ pub fn medium_base_load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>>
 }
 
 impl Generator for StableAudio3Generator {
+    fn generate_streaming_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_chunk: &mut dyn FnMut(gen_core::AudioChunk),
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_audio::execution::capture_terminal_streaming(self, req, on_chunk, on_progress)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::generator::CompletedGeneration> {
+        candle_audio::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }

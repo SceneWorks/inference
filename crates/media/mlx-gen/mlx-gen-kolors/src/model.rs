@@ -899,6 +899,7 @@ impl KolorsHeavy {
         let noise = noise.as_dtype(Dtype::Float32)?;
         let (run_sigmas, init) = if let Some(x0) = init_latents {
             let strength = strength.clamp(0.0, 1.0);
+            mlx_gen::image_execution::scalar("kolors.strength", strength);
             let eff = (num_steps as f32 * strength) as usize;
             let run_start = full_sigmas.len().saturating_sub(1).saturating_sub(eff);
             let rs = full_sigmas[run_start..].to_vec();

@@ -3128,6 +3128,29 @@ impl TextLlm for LlamaProvider {
         Some(self.load_report.clone())
     }
 
+    fn plan_execution(
+        &self,
+        _request: &core_llm::TextLlmRequest,
+    ) -> core_llm::Result<core_llm::ExecutionIdentity> {
+        Ok(core_llm::token_execution::unavailable(
+            "token_runtime_plan_unavailable",
+            "Sampler fallback, prefix reuse and adaptive decode are observed only during execution",
+            "completed_decode_path",
+        ))
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        request: &core_llm::TextLlmRequest,
+        events: &mut dyn FnMut(core_llm::StreamEvent),
+    ) -> core_llm::Result<core_llm::CompletedTextLlm> {
+        let scope = core_llm::token_execution::TokenExecutionScope::new();
+        let output = self.generate(request, &mut |event| {
+            core_llm::token_execution::without_observations(|| events(event))
+        })?;
+        scope.finish_text(output, self.descriptor())
+    }
+
     fn generate(
         &self,
         req: &TextLlmRequest,

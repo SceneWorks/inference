@@ -28,7 +28,7 @@ pub fn create_noise(seed: u64, width: u32, height: u32, device: &Device) -> Resu
     let seq = lat_h * lat_w;
     let feat = LATENT_CHANNELS * PATCH * PATCH; // 64
     let n = seq * feat;
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("qwen-image/pipeline", seed));
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(data, (1, seq, feat), &Device::Cpu)?.to_device(device)
 }
@@ -189,6 +189,7 @@ pub fn euler_step(latents: &Tensor, velocity: &Tensor, sigmas: &[f32], i: usize)
 /// True-CFG combine with norm correction: `combined = neg + g·(pos − neg)`, then rescale `combined`
 /// to the per-token channel L2 norm of `pos`. Shapes `[1, seq, 64]`.
 pub fn compute_guided_noise(pos: &Tensor, neg: &Tensor, guidance: f32) -> Result<Tensor> {
+    candle_gen::execution::f32_policy("qwen/consumed_cfg", guidance);
     let combined = (neg + ((pos - neg)? * guidance as f64)?)?;
     let cond_norm = l2_over_channels(pos)?;
     let comb_norm = l2_over_channels(&combined)?;

@@ -91,6 +91,7 @@ pub fn descriptor() -> ModelDescriptor {
 /// AsymmVAE decoder, all held resident for the whole generation. (Sequential residency is a follow-on;
 /// A4 loads everything up front — the milestone is a working end-to-end path, not a memory-minimal one.)
 pub struct Mochi {
+    compute_dtype: Dtype,
     descriptor: ModelDescriptor,
     tokenizer: MochiTokenizer,
     t5: T5TextEncoder,
@@ -176,6 +177,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let vae = load_vae_decoder(&vae_root)?;
 
     Ok(Box::new(Mochi {
+        compute_dtype,
         descriptor: descriptor(),
         tokenizer,
         t5,
@@ -273,6 +275,11 @@ impl Mochi {
         // init latents instead of matching MLX's RNG).
         let seed = req.seed.unwrap_or_else(default_seed);
         let key = random::key(seed)?;
+        mlx_gen::video_execution::policy(
+            "mochi_precision",
+            serde_json::json!({"compute_dtype":format!("{:?}",self.compute_dtype)}),
+        );
+        mlx_gen::video_execution::draw(0, "mochi_initial_normal", seed);
         let init = random::normal::<f32>(
             &[1, LATENT_CHANNELS, lf as i32, lh as i32, lw as i32],
             None,
@@ -303,10 +310,47 @@ impl Mochi {
     }
 }
 
-mlx_gen::impl_generator!(Mochi {
-    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
-    generate: generate_impl,
-});
+impl Mochi {
+    fn generate_execution_attempt(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl mlx_gen::Generator for Mochi {
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            self.generate_execution_attempt(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })
+            .map(mlx_gen::gen_core::GenerationReport::from_output)
+        })
+    }
+
+    fn descriptor(&self) -> &mlx_gen::ModelDescriptor {
+        &self.descriptor
+    }
+    fn validate(&self, req: &mlx_gen::GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        let s = self;
+        validate_request(&s.descriptor.capabilities, req).map_err(Into::into)
+    }
+    fn generate(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::GenerationOutput> {
+        mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })
+    }
+}
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral `gen_core::Result`.
 mlx_gen::register_generators! {

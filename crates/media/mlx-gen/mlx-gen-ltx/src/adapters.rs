@@ -536,6 +536,11 @@ pub fn apply_ltx_adapters(
         }
         require_spec_applied(spec, applied_before, report.applied)?;
     }
+    mlx_gen::video_execution::adapter_stack(
+        "ltx_applied_adapters",
+        serde_json::json!({"applied":report.applied,"skipped":report.skipped}),
+        report.applied,
+    );
     Ok(report)
 }
 
@@ -582,6 +587,11 @@ pub fn apply_ltx25_adapters(
             )));
         }
     }
+    mlx_gen::video_execution::adapter_stack(
+        "ltx_applied_adapters",
+        serde_json::json!({"applied":report.applied,"skipped":report.skipped}),
+        report.applied,
+    );
     Ok(report)
 }
 

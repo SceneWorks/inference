@@ -278,6 +278,46 @@ impl SenseNova {
     }
 
     /// Progress-capable sibling preserving the original entry point.
+    /// Run the admitted operation and return facts captured from that same completed attempt.
+    /// Errors/cancellation drop the scope; retries cannot read a prior attempt's report.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_vqa_with_execution_report(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        request: GenerationRequest,
+        question: &str,
+        images: &[Array],
+        max_new_tokens: usize,
+        sampler: crate::runtime::Sampler,
+        options: T2iOptions,
+        cancel: Option<&gen_core::CancelFlag>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(String, mlx_llm::core_llm::ExecutionIdentity)> {
+        let scope = mlx_llm::core_llm::token_execution::TokenExecutionScope::new();
+        let output = self.run_vqa_with_progress(
+            context,
+            request,
+            question,
+            images,
+            max_new_tokens,
+            sampler,
+            options,
+            cancel,
+            &mut |event| {
+                mlx_llm::core_llm::token_execution::without_observations(|| on_progress(event))
+            },
+        )?;
+        let execution = scope.finish_document(
+            self.descriptor.id,
+            "mlx",
+            serde_json::json!({"format":"text","trim_whitespace":true,"think_mode":false}),
+        );
+        execution
+            .validate(self.descriptor.id, "mlx", 1)
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        Ok((output, execution))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn run_vqa_with_progress(
         &self,
@@ -316,6 +356,53 @@ impl SenseNova {
     }
 
     /// Run Document Studio interleave under the exact admitted request and lifecycle scope.
+    /// Run the admitted operation and return facts captured from that same completed attempt.
+    /// Errors/cancellation drop the scope; retries cannot read a prior attempt's report.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_interleave_with_execution_report(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        request: GenerationRequest,
+        prompt: &str,
+        input_images: &[Array],
+        width: i32,
+        height: i32,
+        options: T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        init_noises: Option<&[Array]>,
+        cancel: &gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(
+        crate::t2i::InterleaveOutput,
+        mlx_llm::core_llm::ExecutionIdentity,
+    )> {
+        let scope = mlx_llm::core_llm::token_execution::TokenExecutionScope::new();
+        let output = self.run_interleave(
+            context,
+            request,
+            prompt,
+            input_images,
+            width,
+            height,
+            options,
+            system_message,
+            max_new_tokens,
+            max_images,
+            init_noises,
+            cancel,
+            &mut |event| {
+                mlx_llm::core_llm::token_execution::without_observations(|| on_progress(event))
+            },
+        )?;
+        let execution = scope.finish_document(self.descriptor.id, "mlx", serde_json::json!({"format":"interleaved_document","image_encoding":"model_space_rgb_nchw","image_dtypes":output.images.iter().map(|image| format!("{:?}",image.dtype())).collect::<Vec<_>>(),"image_count":output.images.len(),"image_shapes":output.images.iter().map(|image| image.shape()).collect::<Vec<_>>()}));
+        execution
+            .validate(self.descriptor.id, "mlx", 1)
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        Ok((output, execution))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn run_interleave(
         &self,
@@ -645,10 +732,7 @@ impl Generator for SenseNova {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        guard_pinned_artifact(self.pinned_artifact.as_ref(), || {
-            self.generate_impl(req, on_progress)
-        })
-        .map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -673,6 +757,40 @@ impl Generator for SenseNova {
             context,
             mlx_gen::request_scope::MlxScopeCleanup::Device,
         )
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "SenseNova.loaded_quant",
+                    &self.loaded_quant,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl SenseNova {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        guard_pinned_artifact(self.pinned_artifact.as_ref(), || {
+            self.generate_impl(req, on_progress)
+        })
+        .map_err(Into::into)
     }
 }
 
@@ -707,28 +825,30 @@ impl SenseNova {
             let reporter = StepReporter::new(&req.cancel, on_progress)
                 .with_phase_bounds(opens_denoise, opens_decode)
                 .with_prompt_encoding();
-            let out = if references.is_empty() {
-                self.model.generate(
-                    &self.tokenizer,
-                    &req.prompt,
-                    w,
-                    h,
-                    &opts,
-                    None,
-                    Some(reporter),
-                )?
-            } else {
-                self.model.it2i_generate(
-                    &self.tokenizer,
-                    &req.prompt,
-                    &references,
-                    w,
-                    h,
-                    &opts,
-                    None,
-                    Some(reporter),
-                )?
-            };
+            let out = mlx_gen::image_execution::with_primary_seed(opts.seed, || -> Result<_> {
+                Ok(if references.is_empty() {
+                    self.model.generate(
+                        &self.tokenizer,
+                        &req.prompt,
+                        w,
+                        h,
+                        &opts,
+                        None,
+                        Some(reporter),
+                    )?
+                } else {
+                    self.model.it2i_generate(
+                        &self.tokenizer,
+                        &req.prompt,
+                        &references,
+                        w,
+                        h,
+                        &opts,
+                        None,
+                        Some(reporter),
+                    )?
+                })
+            })?;
             images.push(decoded_to_image(&out.image)?);
         }
         Ok(GenerationOutput::Images(images))

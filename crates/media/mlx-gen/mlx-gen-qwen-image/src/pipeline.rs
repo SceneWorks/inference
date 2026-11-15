@@ -80,11 +80,14 @@ pub(crate) fn resolve_request_rungs(
     req: &GenerationRequest,
     contract: &mlx_gen::gen_core::MemoryProviderContract,
 ) -> Result<RequestRungs> {
-    Ok(RequestRungs {
+    let rungs = RequestRungs {
         block_window: crate::memory_strategy::resolve_window_size(req, contract)?,
         attention_budget: attention_budget(req),
         decode_tiling: decode_tiling(req),
-    })
+    };
+    mlx_gen::image_execution::policy_debug("qwen-image.block_window", &rungs.block_window);
+    mlx_gen::image_execution::policy_debug("qwen-image.decode_tiling", &rungs.decode_tiling);
+    Ok(rungs)
 }
 
 /// Complete Qwen's shared conditioning boundary by forcing a provider's prompt/reference graph and
@@ -565,6 +568,7 @@ pub(crate) fn denoise_with_progress_windowed(
     let sliced = &sigmas[start_step.min(sigmas.len().saturating_sub(1))..];
     let block_window = transformer.block_window(window_size, cancel)?;
     let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
+    mlx_gen::image_execution::policy_debug("qwen-image.attention", &attention.budget);
     // Preview (`PreviewSink`): emitted from this closure rather than from the engine-agnostic
     // sampler core, because only the provider knows the packed latent layout to project. The
     // closure sees the PRE-step latent, so frame 1 is essentially pure noise — the develop starts
@@ -695,6 +699,8 @@ pub(crate) fn denoise_control_with_progress_windowed(
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let block_window = transformer.block_window(window_size, cancel)?;
     let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
+    mlx_gen::image_execution::policy_debug("qwen-image.attention", &attention.budget);
+    observe_control_scale(control_scale);
     // Each step runs the base forward with the VACE control branch + the (constant) 132-ch control
     // context injected, scaled by `control_scale` (`= 0` reproduces base T2I). Under true CFG the
     // control forward runs once per guidance branch. Control is pose-only T2I (no img2img-with-control
@@ -822,6 +828,7 @@ pub(crate) fn denoise_edit_with_progress_windowed(
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let block_window = transformer.block_window(window_size, cancel)?;
     let attention = AttentionPlan::budgeted(attention_budget).with_cancel(cancel);
+    mlx_gen::image_execution::policy_debug("qwen-image.attention", &attention.budget);
     // Preview: identical to `denoise_with_progress`. The noise-prefix latent handed to this closure
     // IS the developing image — the reference tail is static conditioning and is not projected.
     let previews = mlx_gen::preview::PreviewCounter::new(sigmas);
@@ -1490,5 +1497,51 @@ mod tests {
         for (a, b) in got.iter().zip(want) {
             assert!((a - b).abs() < 1e-4);
         }
+    }
+}
+
+fn observe_control_scale(control_scale: f32) {
+    mlx_gen::image_execution::scalar("qwen-image.control_scale", control_scale);
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+
+    fn capture(observe: impl FnOnce()) -> mlx_gen::gen_core::generator::ExecutionIdentity {
+        let descriptor = crate::model_control::descriptor();
+        mlx_gen::image_execution::complete_image_attempt(
+            &descriptor,
+            &mlx_gen::CancelFlag::new(),
+            || {
+                mlx_gen::image_execution::policy_debug("test.output", &"rgb8");
+                observe();
+                mlx_gen::image_execution::sampled_native(
+                    "test-metadata",
+                    "resolved-sigmas",
+                    mlx_rs::Dtype::Float32,
+                    &[1.0, 0.5, 0.0],
+                    17,
+                );
+                Ok(mlx_gen::GenerationOutput::Images(vec![mlx_gen::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                }]))
+            },
+        )
+        .unwrap()
+        .execution
+    }
+
+    #[test]
+    fn execution_control_strength_distinguishes_same_seed_and_schedule() {
+        let weak = capture(|| observe_control_scale(0.25));
+        let strong = capture(|| observe_control_scale(0.75));
+        let weak = weak.resolved().unwrap();
+        let strong = strong.resolved().unwrap();
+        assert_eq!(weak.randomness, strong.randomness);
+        assert_eq!(weak.schedule, strong.schedule);
+        assert_ne!(weak.provider_choices, strong.provider_choices);
     }
 }

@@ -188,6 +188,7 @@ impl BooguTransformer {
         timestep: &Tensor,
         instruction_hidden: &Tensor,
     ) -> Result<Tensor> {
+        crate::observe_component_precision("dit", &self.device, self.dtype);
         let p = self.cfg.patch_size;
         let (_, _, h, w) = latent.dims4()?;
         let (ht, wt) = (h / p, w / p);

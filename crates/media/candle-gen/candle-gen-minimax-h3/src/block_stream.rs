@@ -56,6 +56,13 @@ impl RequestGuard {
                 })
             })
             .transpose()?;
+        candle_gen::execution::policy(
+            "h3_transformer_residency",
+            serde_json::json!({
+                "block_window": policy.as_ref().map(|p| p.window),
+                "load_shape": format!("{shape:?}"), "component_offload": "sequential"
+            }),
+        );
         ACTIVE.with(|active| {
             if active.borrow().is_some() {
                 return Err(CandleError::Msg(

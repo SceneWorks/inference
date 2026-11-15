@@ -283,6 +283,7 @@ pub fn denoise_cfg_with_progress_and_preview(
     preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    mlx_gen::image_execution::scalar("guidance", guidance);
     // Cond (and, when CFG is active, uncond) patchify metadata + RoPE freqs depend only on the
     // loop-constant latent dims + caption — build each once and reuse across steps (F-042).
     let sh = latents.shape();
@@ -522,6 +523,8 @@ pub fn denoise_control_cfg_with_progress_and_preview(
     preview: &PreviewSink,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    mlx_gen::image_execution::scalar("control_scale", control_context_scale);
+    mlx_gen::image_execution::scalar("guidance", guidance);
     // Cond (and, when CFG is active, uncond) control prep — patchify metadata + RoPE freqs + the
     // embedded constant control context — depend only on the loop-constant latent dims + caption +
     // control context, so build each once and reuse across steps (F-042).

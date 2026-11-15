@@ -45,6 +45,7 @@ pub(super) fn apply_additive_into(
             install_one_additive(host, spec, normalize, r)
         })?;
     }
+    record_execution_adapters(specs, &report, expert, "packed_additive");
     Ok(report)
 }
 

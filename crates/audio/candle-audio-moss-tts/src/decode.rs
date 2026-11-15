@@ -152,6 +152,11 @@ impl Decoder {
         let ch = cfg.channels;
         let strip = ch - 1;
         let params = DEFAULT_PARAMS;
+        params.observe_execution("moss-tts");
+        candle_audio::execution::policy(
+            "decode",
+            serde_json::json!({"budget":max_positions,"config":format!("{:?}",self.cfg)}),
+        );
         let mut rng = Rng::seed(seed);
 
         // Delay-shifted grid; strip the last `channels - 1` positions to get the prefill prompt.

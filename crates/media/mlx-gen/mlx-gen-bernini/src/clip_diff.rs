@@ -379,6 +379,15 @@ impl DiffLossFm {
             )));
         }
         self.scheduler.set_timesteps(num_steps);
+        mlx_gen::video_execution::sampling(
+            "bernini_clip_diff",
+            "flow_euler",
+            "flow_velocity",
+            serde_json::json!({"cfg_bits":cfg.to_bits(),"img_cfg_bits":img_cfg.map(f32::to_bits)}),
+        );
+        let mut execution_sigmas = self.scheduler.sigmas.clone();
+        execution_sigmas.push(0.0);
+        mlx_gen::video_execution::schedule("bernini_clip_diff", &execution_sigmas);
         let dtype = z.dtype();
         let tiles = if img_cfg.is_some() && cfg > 1.0 {
             3

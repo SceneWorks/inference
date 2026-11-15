@@ -902,7 +902,7 @@ impl Generator for Chroma {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -922,6 +922,45 @@ impl Generator for Chroma {
     ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
     {
         crate::memory_strategy::begin_request(&self.loaded_spec, &self.memory_strategy, context)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "Chroma.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Chroma.load_precision_policy",
+                    &self.loaded_spec.precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Chroma.load_quantization_policy",
+                    &self.loaded_spec.quantize,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl Chroma {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
 
@@ -963,6 +1002,7 @@ impl Chroma {
         let guidance = req
             .true_cfg
             .unwrap_or_else(|| self.variant.default_true_cfg());
+        mlx_gen::image_execution::scalar("chroma.guidance", guidance);
         let negative = req.negative_prompt.as_deref().unwrap_or("").to_string();
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let name = resolve_sampler_name(self.variant, req.sampler.as_deref());
@@ -985,11 +1025,13 @@ impl Chroma {
         // rather than a silently different execution than the selector chose.
         let plan = self.rung_plan(req)?;
         let attention = crate::memory_strategy::attention_plan(req);
+        mlx_gen::image_execution::policy_debug("chroma.attention", &attention.budget);
         let tiling = crate::memory_strategy::decode_tiling_for_contract(
             req,
             self.descriptor.id,
             &self.memory_strategy,
         )?;
+        mlx_gen::image_execution::policy_debug("chroma.tiling", &tiling);
 
         // Staged residency lifecycle (sc-10840): under `Sequential` the seam loads the T5 encoder,
         // encodes pos (+neg), materializes, then DROPS it + `clear_cache()` so it frees before the

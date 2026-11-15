@@ -10,6 +10,7 @@ categories = ["science"]
 autotests = false
 
 [dependencies]
+serde_json = { workspace = true }
 mlx-gen = { path = ".." }
 # SVD reuses SDXL's 2D VAE encoder + CLIP-vision encoder + conv/attn UNet patterns (epic 3040 spike).
 mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
@@ -21,7 +22,6 @@ sha2 = { workspace = true }
 [dev-dependencies]
 # Shared test comparison helpers (`mlx_gen::testing`, sc-27323).
 mlx-gen = { path = "..", features = ["test-support"] }
-serde_json = { workspace = true }
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.

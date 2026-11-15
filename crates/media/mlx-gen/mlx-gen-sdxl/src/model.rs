@@ -1209,7 +1209,7 @@ impl mlx_gen::gen_core::Generator for Sdxl {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -1234,6 +1234,49 @@ impl mlx_gen::gen_core::Generator for Sdxl {
             &self.memory_strategy,
             context,
         )
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "Sdxl.default_stage_residency",
+                    &self.default_stage_residency,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Sdxl.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Sdxl.load_precision_policy",
+                    &self.loaded_spec.precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Sdxl.load_quantization_policy",
+                    &self.loaded_spec.quantize,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl Sdxl {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
 
@@ -1458,6 +1501,7 @@ impl Sdxl {
     ) -> Result<SdxlDenoised> {
         let req = request.req;
         let heavy = heavy_owned.as_ref();
+        mlx_gen::image_execution::policy_debug("sdxl.sampling_route", &request.sampling.route());
         let (mode, guidance) = prepare_conditioning(request, heavy_owned, &heavy)?;
         let time_ids = text_time_ids(pooled.shape()[0]);
         let latent_shape = [1, (req.height / 8) as i32, (req.width / 8) as i32, 4];
@@ -1490,19 +1534,24 @@ impl Sdxl {
         };
         // The common serial owner seeds before this closure and retains the appended latents
         // through every subsequent output, exactly as the historical inline count loop did.
-        let finals = collect_serial_latents(req.count, request.base_seed, |seed, finals| {
-            crate::stages::run_output(&plan, seed, on_progress, |latents, _| {
-                mlx_gen::sampler::diagnostic_sampling_tensor(
-                    "sdxl",
-                    "serial-final-latent",
-                    finals.len() as u64,
-                    1,
-                    &latents,
-                );
-                finals.push(latents);
-                Ok(())
-            })
-        })?;
+        let finals = mlx_gen::image_execution::with_primary_rng_scheme(
+            request.sampling.route().execution_rng_scheme(),
+            || {
+                collect_serial_latents(req.count, request.base_seed, |seed, finals| {
+                    crate::stages::run_output(&plan, seed, on_progress, |latents, _| {
+                        mlx_gen::sampler::diagnostic_sampling_tensor(
+                            "sdxl",
+                            "serial-final-latent",
+                            finals.len() as u64,
+                            1,
+                            &latents,
+                        );
+                        finals.push(latents);
+                        Ok(())
+                    })
+                })
+            },
+        )?;
         Ok((finals, pid_decoder))
     }
 
@@ -1899,6 +1948,7 @@ impl<'a> SdxlRenderPlan<'a> {
             SdxlInitLatents::Image { x0, strength }
             | SdxlInitLatents::Inpaint { x0, strength, .. } => {
                 let strength = resolve_strength(*strength, DEFAULT_STRENGTH);
+                mlx_gen::image_execution::scalar("sdxl.strength", strength);
                 let rs = curated_strength_schedule(&full_sigmas, steps, strength);
                 let init = add(x0, &multiply(&noise, scalar(rs[0]))?)?;
                 (rs, init)
@@ -1940,6 +1990,7 @@ impl<'a> SdxlRenderPlan<'a> {
                 // noise so the per-step blend can pin the black (keep) region to the init noised to
                 // each step's σ. Default strength 0.85 (the worker's inpaint default).
                 let strength = resolve_strength(*strength, INPAINT_DEFAULT_STRENGTH);
+                mlx_gen::image_execution::scalar("sdxl.strength", strength);
                 let (eff, start_step) = ancestral_strength_schedule(steps, max_time, strength);
                 let noise = mlx_rs::random::normal::<f32>(&self.latent_shape, None, None, None)?;
                 let x_t = self.sampler.add_noise_with(x0, &noise, start_step)?;
@@ -1966,6 +2017,7 @@ impl<'a> SdxlRenderPlan<'a> {
                 // 1/steps ⇒ 0 steps ⇒ init returned unchanged, dodging the σ=0 ancestral `σ_up` 0/0
                 // → NaN).
                 let strength = resolve_strength(*strength, DEFAULT_STRENGTH);
+                mlx_gen::image_execution::scalar("sdxl.strength", strength);
                 let (eff, start_step) = ancestral_strength_schedule(steps, max_time, strength);
                 let x_t = self.sampler.add_noise(x0, start_step)?;
                 // PiD from_ldm early-stop (sc-8049): truncate to the VP-capture `keep` steps; the

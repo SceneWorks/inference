@@ -563,6 +563,7 @@ pub fn initial_latents(
 ) -> Result<(Array, Array)> {
     let g = &geometry.joint;
     let key = mlx_rs::random::key(seed)?;
+    mlx_gen::video_execution::draw(0, "h3_video_initial_normal", seed);
     let video = mlx_rs::random::normal::<f32>(
         &[
             1,
@@ -578,6 +579,7 @@ pub fn initial_latents(
     let video_rows = patchify_video_latents(&video, patch)?;
 
     let audio_key = mlx_rs::random::key(seed.wrapping_add(1))?;
+    mlx_gen::video_execution::draw(0, "h3_audio_initial_normal", seed.wrapping_add(1));
     let audio_rows = mlx_rs::random::normal::<f32>(
         &[
             1,

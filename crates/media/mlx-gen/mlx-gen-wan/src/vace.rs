@@ -1045,6 +1045,13 @@ pub fn denoise_vace(
 ) -> Result<Array> {
     let mut sched = make_scheduler(kind, num_train_timesteps);
     sched.set_timesteps(steps, shift);
+    mlx_gen::video_execution::sampling(
+        "wan_vace",
+        &format!("{kind:?}"),
+        "flow_velocity",
+        serde_json::json!({"guidance_bits":guidance.to_bits(),"control_scale_bits":scales.iter().map(|v|v.to_bits()).collect::<Vec<_>>()}),
+    );
+    mlx_gen::video_execution::schedule("wan_vace", sched.sigmas());
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
     // Hoist the step-invariant work out of the loop (F-023): the RoPE table + patch-embedded control
@@ -1135,6 +1142,13 @@ pub fn denoise_vace_moe(
 ) -> Result<Array> {
     let mut sched = make_scheduler(kind, num_train_timesteps);
     sched.set_timesteps(steps, shift);
+    mlx_gen::video_execution::sampling(
+        "wan_vace",
+        &format!("{kind:?}"),
+        "flow_velocity",
+        serde_json::json!({"low_guidance_bits":guidance_low.to_bits(),"high_guidance_bits":guidance_high.to_bits(),"boundary_bits":boundary_timestep.to_bits(),"control_scale_bits":scales.iter().map(|v|v.to_bits()).collect::<Vec<_>>()}),
+    );
+    mlx_gen::video_execution::schedule("wan_vace", sched.sigmas());
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
     let k = crate::pipeline::crossing_index(&timesteps, boundary_timestep);
