@@ -36,6 +36,15 @@ use crate::config::{ChromaTransformerConfig, ChromaVariant, DEFAULT_SAMPLER, HEU
 use crate::loader;
 use crate::transformer::{ChromaTransformer, RopeTable};
 
+/// The strict heavy loader installs these adapters in order after quantization.
+fn applied_adapter_controls(spec: &LoadSpec) -> Vec<(usize, mlx_gen::runtime::AdapterKind, f32)> {
+    spec.adapters
+        .iter()
+        .enumerate()
+        .map(|(index, adapter)| (index, adapter.kind, adapter.scale))
+        .collect()
+}
+
 pub fn descriptor_hd() -> ModelDescriptor {
     ChromaVariant::Hd.descriptor()
 }
@@ -945,6 +954,10 @@ impl Generator for Chroma {
                     "Chroma.load_quantization_policy",
                     &self.loaded_spec.quantize,
                 );
+                mlx_gen::image_execution::policy_debug(
+                    "Chroma.applied_adapter_controls",
+                    &applied_adapter_controls(&self.loaded_spec),
+                );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
                 self.generate_observed(req, &mut progress)
@@ -1275,6 +1288,32 @@ mod tests {
     use super::*;
     use mlx_gen::gen_core;
     use std::cell::Cell;
+
+    #[test]
+    fn applied_adapter_controls_distinguish_scale_and_order() {
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+        let first = AdapterSpec::new("/fixture/one".into(), 0.5, AdapterKind::Lora);
+        let second = AdapterSpec::new("/fixture/two".into(), 1.0, AdapterKind::Lokr);
+        let source = LoadSpec::new(WeightsSource::Dir("/fixture/base".into()))
+            .with_adapters(vec![first.clone(), second.clone()]);
+        let scaled = LoadSpec::new(WeightsSource::Dir("/fixture/base".into())).with_adapters(vec![
+            AdapterSpec::new(first.path, 0.75, first.kind),
+            second.clone(),
+        ]);
+        let reversed =
+            LoadSpec::new(WeightsSource::Dir("/fixture/base".into())).with_adapters(vec![
+                second,
+                AdapterSpec::new("/fixture/one".into(), 0.5, AdapterKind::Lora),
+            ]);
+        assert_ne!(
+            applied_adapter_controls(&source),
+            applied_adapter_controls(&scaled)
+        );
+        assert_ne!(
+            applied_adapter_controls(&source),
+            applied_adapter_controls(&reversed)
+        );
+    }
 
     struct DecodeSpy {
         output: Array,

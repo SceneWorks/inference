@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 #[derive(Default)]
 struct Observations {
+    selected_device: Option<&'static str>,
     sampling: Vec<Value>,
     schedules: Vec<NumericScheduleDigest>,
     seeds: Vec<u64>,
@@ -154,15 +155,56 @@ pub fn complete_image_report_attempt(
     body: impl FnOnce() -> crate::gen_core::Result<crate::gen_core::GenerationReport>,
 ) -> crate::gen_core::Result<CompletedGeneration> {
     let _scope = Scope::enter(Some(Observations::default()));
+    let device_before = selected_stream_device();
     let generation = body()?;
     if cancel.is_cancelled() {
         return Err(crate::gen_core::Error::Canceled);
     }
-    let observed = CURRENT
+    let mut observed = CURRENT
         .with(|current| current.borrow_mut().take())
         .unwrap_or_default();
+    let device_after = selected_stream_device();
+    if device_before.is_none()
+        || device_before != device_after
+        || observed.selected_device != device_before
+    {
+        observed.unavailable.get_or_insert_with(|| {
+            reason(
+            "mlx_image_device_unobserved",
+            "selected MLX stream device was unavailable or changed across sampling and execution",
+            "selected_stream_device",
+        )
+        });
+    }
     let execution = observed.finish(descriptor, generation.output.as_ref())?;
     CompletedGeneration::new(generation, execution, descriptor)
+}
+
+fn selected_stream_device() -> Option<&'static str> {
+    match mlx_rs::Stream::task_local_or_default()
+        .get_device()
+        .and_then(|device| device.get_type())
+        .ok()?
+    {
+        mlx_rs::DeviceType::Cpu => Some("mlx-cpu"),
+        mlx_rs::DeviceType::Gpu => Some("mlx-metal"),
+    }
+}
+
+fn observe_selected_device(observed: &mut Observations, selected: Option<&'static str>) {
+    match (observed.selected_device, selected) {
+        (None, Some(device)) => observed.selected_device = Some(device),
+        (Some(previous), Some(device)) if previous == device => {}
+        _ => {
+            observed.unavailable.get_or_insert_with(|| {
+                reason(
+                    "mlx_image_device_unobserved",
+                    "selected MLX stream device was unavailable or changed between sampling stages",
+                    "selected_stream_device",
+                )
+            });
+        }
+    }
 }
 
 /// Observe values already resolved by the provider and passed to its execution path.
@@ -246,11 +288,13 @@ pub fn sampled_native_with_rng(
 /// One completed auxiliary decoder per output, in output order. This stage is distinct from the
 /// primary image sampler and therefore does not inflate the number of completed image units.
 pub fn sampled_decode(sampling: Value, schedule: &[f32], seed: u64, rng_scheme: &str) {
+    let selected = selected_stream_device();
     CURRENT.with(|current| {
         let mut current = current.borrow_mut();
         let Some(observed) = current.as_mut() else {
             return;
         };
+        observe_selected_device(observed, selected);
         match NumericScheduleDigest::f32_values(schedule) {
             Ok(digest) if !rng_scheme.trim().is_empty() => {
                 observed
@@ -303,11 +347,13 @@ fn reason(code: &str, detail: &str, missing: &str) -> ExecutionUnavailable {
 /// Record the actual factory selection, consumed schedule, latent dtype and seed at the sampler
 /// boundary. Called only after that sampler succeeds. SCM records its consumed angle schedule.
 pub fn sampled(sampling: Value, schedule: &[f32], seed: u64) {
+    let selected = selected_stream_device();
     CURRENT.with(|current| {
         let mut current = current.borrow_mut();
         let Some(observed) = current.as_mut() else {
             return;
         };
+        observe_selected_device(observed, selected);
         match NumericScheduleDigest::f32_values(schedule) {
             Ok(digest) => {
                 let Some(scheme) = sampling
@@ -423,8 +469,9 @@ impl Observations {
                 provider_id: descriptor.id.into(),
                 backend: descriptor.backend.into(),
                 runtime_id: format!(
-                    "mlx-gen/{};image-execution-v1;{};{}",
+                    "mlx-gen/{};image-execution-v1;{};{};{}",
                     env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH,
+                    self.selected_device.expect("unobserved device is unavailable"),
                 ),
                 sampling: ExecutionFact::resolved(json!(self.sampling)),
                 schedule: ExecutionFact::resolved(json!(self.schedules)),
