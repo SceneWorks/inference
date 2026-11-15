@@ -355,7 +355,7 @@ impl Flux1DevControl {
             // The control variant has no PiD overlay; `use_pid` is inert for the heavy loader.
             req.use_pid,
             on_progress,
-            |text: &FluxTextOwned| text.encode(&req.prompt),
+            |text: &FluxTextOwned| text.encode_materialized(&req.prompt),
             |encoded| {
                 let Some((prompt_embeds, pooled_prompt_embeds)) = encoded else {
                     return Ok(());
