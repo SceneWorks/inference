@@ -425,6 +425,7 @@ fn synthetic_report() -> MossImageExecutionReport {
     };
     MossImageExecutionReport::new(MossImageExecutionData {
         execution_device: MossImageExecutionDevice::Cpu,
+        selected_stream_device: None,
         sampling: MossImageSamplingReceipt::Euler {
             sigmas: moss_image_schedule(r.steps, r.shift, r.training_shift).unwrap(),
         },

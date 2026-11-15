@@ -584,11 +584,19 @@ pub enum MossImageExecutionDevice {
     Cuda,
     Metal,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MossImageSelectedStreamDevice {
+    Cpu,
+    Metal,
+}
 /// Construction data. Only `MossImageExecutionReport::new` produces a validated completed receipt.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MossImageExecutionData {
     pub execution_device: MossImageExecutionDevice,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_stream_device: Option<MossImageSelectedStreamDevice>,
     pub resolved: MossImageResolved,
     pub assets: Vec<MossImageAssetReceipt>,
     pub sampling: MossImageSamplingReceipt,
@@ -730,6 +738,11 @@ fn receipt_asset_paths(mode: MossImageAcceleration) -> BTreeMap<(MossImageAssetR
 }
 fn validate_execution_receipt(data: &MossImageExecutionData) -> Result<()> {
     data.resolved.validate()?;
+    require(
+        data.execution_device == MossImageExecutionDevice::Mlx
+            || data.selected_stream_device.is_none(),
+        "selected MLX stream device cannot be attached to another backend",
+    )?;
     let r = &data.resolved;
     let expected = receipt_asset_paths(r.acceleration);
     let mut seen = BTreeSet::new();
@@ -1084,6 +1097,7 @@ mod execution_receipt_tests {
         }
         MossImageExecutionData {
             execution_device: MossImageExecutionDevice::Cuda,
+            selected_stream_device: None,
             resolved,
             assets,
             sampling,

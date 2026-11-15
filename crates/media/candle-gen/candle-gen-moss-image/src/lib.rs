@@ -548,6 +548,7 @@ impl MossImageGenerator {
             } else {
                 MossImageExecutionDevice::Metal
             },
+            selected_stream_device: None,
             resolved: r.clone(),
             assets: pipeline::receipts(&assets)?,
             sampling: sampled.sampling,

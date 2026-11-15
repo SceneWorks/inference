@@ -5,7 +5,10 @@ use gen_core::generator::{
     EXECUTION_IDENTITY_VERSION,
 };
 use gen_core::{
-    moss_image::{MossImageExecutionDevice, MossImageExecutionReport, MossImageSamplingReceipt},
+    moss_image::{
+        MossImageExecutionDevice, MossImageExecutionReport, MossImageSamplingReceipt,
+        MossImageSelectedStreamDevice,
+    },
     moss_image_edit::MossImageEditExecutionReport,
     ModelDescriptor, Result,
 };
@@ -40,6 +43,21 @@ pub fn completed_identity(
     };
     let data = report.data();
     let r = &data.resolved;
+    let selected_stream_device = if data.execution_device == MossImageExecutionDevice::Mlx {
+        match data.selected_stream_device {
+            Some(MossImageSelectedStreamDevice::Cpu) => Some("mlx-cpu"),
+            Some(MossImageSelectedStreamDevice::Metal) => Some("mlx-metal"),
+            None => {
+                return Ok(ExecutionIdentity::unavailable(ExecutionUnavailable {
+                    code: "moss_mlx_device_unobserved".into(),
+                    detail: "selected MLX stream device was unavailable or changed during the completed attempt".into(),
+                    missing_facts: vec!["selected_stream_device".into()],
+                }));
+            }
+        }
+    } else {
+        None
+    };
     let backend = if data.execution_device == MossImageExecutionDevice::Mlx {
         "mlx"
     } else {
@@ -77,6 +95,12 @@ pub fn completed_identity(
             ExecutionFact::resolved(data.images_per_prompt),
         ),
     ]);
+    if let Some(device) = selected_stream_device {
+        choices.insert(
+            "selected_stream_device".into(),
+            ExecutionFact::resolved(device),
+        );
+    }
     if let Some(edit) = edit {
         // Paths are operational locations, not replay identities.
         choices.insert(
@@ -95,7 +119,8 @@ pub fn completed_identity(
             version: EXECUTION_IDENTITY_VERSION,
             provider_id: r.variant.provider_id().into(),
             backend: backend.into(),
-            runtime_id: format!("{}-moss-image@{}-receipt-v1/{:?}", backend, env!("CARGO_PKG_VERSION"), data.execution_device),
+            runtime_id: format!("{}-moss-image@{}-receipt-v1/{:?}{}", backend, env!("CARGO_PKG_VERSION"), data.execution_device,
+                selected_stream_device.map_or(String::new(), |device| format!("/{device}"))),
             sampling: ExecutionFact::resolved(sampling),
             schedule: ExecutionFact::resolved(schedule),
             estimator: ExecutionFact::resolved("flow_velocity"),
@@ -312,6 +337,8 @@ mod tests {
         MossImageExecutionReport::new(MossImageExecutionData {
             resolved: r,
             execution_device: device,
+            selected_stream_device: (device == MossImageExecutionDevice::Mlx)
+                .then_some(MossImageSelectedStreamDevice::Metal),
             assets,
             sampling,
             samples: vec![
@@ -335,6 +362,26 @@ mod tests {
             adapter_reports,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn mlx_selected_stream_device_changes_identity_and_missing_observation_is_unavailable() {
+        let metal = receipt(MossImageAcceleration::Off, MossImageExecutionDevice::Mlx);
+        let mut cpu_data = metal.clone().into_data();
+        cpu_data.selected_stream_device = Some(MossImageSelectedStreamDevice::Cpu);
+        let cpu = MossImageExecutionReport::new(cpu_data).unwrap();
+        let metal_identity = completed_identity(Some(&metal), None, &descriptor("mlx")).unwrap();
+        let cpu_identity = completed_identity(Some(&cpu), None, &descriptor("mlx")).unwrap();
+        assert_ne!(
+            serde_json::to_value(metal_identity).unwrap(),
+            serde_json::to_value(cpu_identity).unwrap()
+        );
+
+        let mut unknown_data = metal.into_data();
+        unknown_data.selected_stream_device = None;
+        let unknown = MossImageExecutionReport::new(unknown_data).unwrap();
+        let identity = completed_identity(Some(&unknown), None, &descriptor("mlx")).unwrap();
+        assert!(matches!(identity, ExecutionIdentity::Unavailable { .. }));
     }
 
     #[test]

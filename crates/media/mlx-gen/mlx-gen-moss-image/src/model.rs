@@ -31,6 +31,17 @@ fn needs_prompt_encoding(
             && inputs.negative.is_none())
 }
 
+fn selected_stream_device() -> Option<MossImageSelectedStreamDevice> {
+    match mlx_rs::Stream::task_local_or_default()
+        .get_device()
+        .and_then(|device| device.get_type())
+        .ok()?
+    {
+        mlx_rs::DeviceType::Cpu => Some(MossImageSelectedStreamDevice::Cpu),
+        mlx_rs::DeviceType::Gpu => Some(MossImageSelectedStreamDevice::Metal),
+    }
+}
+
 fn incremental_peak(peak: u64, owned: u64, committed: u64) -> u64 {
     peak.saturating_sub(owned.min(committed))
 }
@@ -476,6 +487,7 @@ impl MossImage {
         edit: Option<MossImageEditInputs<'_>>,
     ) -> Result<MossImageAdvancedOutput> {
         check(&request.cancel)?;
+        let device_before = selected_stream_device();
         self.sources.ensure_unchanged()?;
         let (resolved, count, sources, edit_assets) = self.admit(request, inputs, edit)?;
         // Only the selected immutable renderer may overlap conditioning activations.
@@ -558,6 +570,8 @@ impl MossImage {
         }
         let report = MossImageExecutionReport::new(MossImageExecutionData {
             execution_device: MossImageExecutionDevice::Mlx,
+            selected_stream_device: device_before
+                .filter(|device| Some(*device) == selected_stream_device()),
             resolved,
             assets: asset_receipts,
             sampling,

@@ -20,10 +20,10 @@ pub use gen_core::moss_image::{
     MossImageConditioningReceipt, MossImageConditioningSource, MossImageDtype, MossImageEmbeddings,
     MossImageExecutionData, MossImageExecutionDevice, MossImageExecutionReport, MossImageOptions,
     MossImageOutputKind, MossImageResolved, MossImageSampleReceipt, MossImageSamplingReceipt,
-    MossImageVariant, MossSkipLayerGuidance, BASE_REPO, BASE_REVISION, DMD_DATASPACE_COMPONENT,
-    DMD_LORA_COMPONENT, DMD_PROJECTIONS, DMD_REPO, DMD_REVISION, DMD_TIME_COMPONENT,
-    DMD_TRANSFORMER_COMPONENT, LICENSE, MOSS_SHARED_SNAPSHOT_COMPONENT, PIPELINE_SHA256, SFT_REPO,
-    SFT_REVISION,
+    MossImageSelectedStreamDevice, MossImageVariant, MossSkipLayerGuidance, BASE_REPO,
+    BASE_REVISION, DMD_DATASPACE_COMPONENT, DMD_LORA_COMPONENT, DMD_PROJECTIONS, DMD_REPO,
+    DMD_REVISION, DMD_TIME_COMPONENT, DMD_TRANSFORMER_COMPONENT, LICENSE,
+    MOSS_SHARED_SNAPSHOT_COMPONENT, PIPELINE_SHA256, SFT_REPO, SFT_REVISION,
 };
 
 fn require(condition: bool, message: &str) -> Result<()> {
