@@ -586,10 +586,11 @@ pub fn resolve_alpha(w: &Weights) -> Result<Option<f32>> {
 }
 
 /// Parse a `__metadata__["alpha"]` string: a finite number at the start (after optional
-/// whitespace), followed by optional whitespace and arbitrary trailing text. `"8"`, `" 8 "`, `"128"`
-/// and the community spelling `"16 (scaling 1.0)"` (akhaliq/MiniMax-H3-Image-Character-Swap) all
-/// parse; a string with no leading number (`""`, `"abc 16"`, `"nan"`, `"inf"`) or one whose number is
-/// not finite is an error naming the key and quoting the raw value.
+/// whitespace), followed by the end of the string or by whitespace and arbitrary trailing text.
+/// `"8"`, `" 8 "`, `"128"` and the community spelling `"16 (scaling 1.0)"`
+/// (akhaliq/MiniMax-H3-Image-Character-Swap) all parse; a string with no leading number (`""`,
+/// `"abc 16"`, `"nan"`, `"inf"`), a number glued to more text (`"0x10"`, `"1_000"`, `"16/32"`), or a
+/// non-finite number is an error naming the key and quoting the raw value.
 pub fn parse_alpha_metadata(raw: &str) -> Result<f32> {
     let refuse = || {
         Error::Msg(format!(
@@ -597,10 +598,16 @@ pub fn parse_alpha_metadata(raw: &str) -> Result<f32> {
              with a finite number"
         ))
     };
-    let alpha = leading_number(raw.trim_start())
-        .ok_or_else(refuse)?
-        .parse::<f32>()
-        .map_err(|_| refuse())?;
+    let s = raw.trim_start();
+    let number = leading_number(s).ok_or_else(refuse)?;
+    if !s[number.len()..]
+        .chars()
+        .next()
+        .is_none_or(char::is_whitespace)
+    {
+        return Err(refuse());
+    }
+    let alpha = number.parse::<f32>().map_err(|_| refuse())?;
     if !alpha.is_finite() {
         return Err(refuse());
     }
@@ -1695,6 +1702,58 @@ mod tests {
         }
     }
 
+    /// A kohya file naming the native fused `attn.qkv_proj` with no alpha anywhere, under the
+    /// H3-Image policy: the kohya rewrite emits the FUSED rank as the stem's alpha and the ComfyUI
+    /// split then divides it with the rank, so each q/k/v target folds at exactly 1.0 — for the
+    /// block-diagonal and the shared-`A` forms.
+    #[test]
+    fn a_kohya_fused_qkv_without_alpha_folds_one_per_split_target_under_rank() {
+        let (r, out, inp) = (2i32, 4i32, 8i32);
+        let mut bd = vec![0.0f32; (3 * out * 3 * r) as usize];
+        for row in 0..3 * out {
+            let block = row / out;
+            for col in block * r..(block + 1) * r {
+                bd[(row * 3 * r + col) as usize] = 1.0 + (row + col) as f32;
+            }
+        }
+        let cases = [
+            (
+                seeded(&[3 * r, inp], 4),
+                Array::from_slice(&bd, &[3 * out, 3 * r]),
+            ),
+            (seeded(&[r, inp], 5), seeded(&[3 * out, r], 6)),
+        ];
+        for (down, up) in cases {
+            let w = Weights::from_map(std::collections::HashMap::from([
+                (
+                    "lora_unet_blocks_0_attn_qkv_proj.lora_down.weight".to_string(),
+                    down,
+                ),
+                (
+                    "lora_unet_blocks_0_attn_qkv_proj.lora_up.weight".to_string(),
+                    up,
+                ),
+            ]));
+            let rewritten = convert_kohya_key_space(&w, AbsentLoraAlpha::H3_IMAGE).unwrap();
+            assert!(is_comfyui_key_space(&rewritten));
+            let converted =
+                convert_comfyui_key_space(&rewritten, AbsentLoraAlpha::H3_IMAGE).unwrap();
+            for name in ["to_q", "to_k", "to_v"] {
+                let stem = format!("transformer_blocks.0.attn.{name}");
+                let a = converted.require(&format!("{stem}.lora_A.weight")).unwrap();
+                assert_eq!(a.shape()[0], r, "{stem}");
+                let alpha = to_f32(converted.require(&format!("{stem}.alpha")).unwrap())
+                    .unwrap()
+                    .item::<f32>();
+                assert_eq!(
+                    alpha_rank_fold(alpha, a.shape()[0] as f32),
+                    1.0,
+                    "{stem}: alpha {alpha}"
+                );
+            }
+        }
+    }
+
     /// A generic kohya file is rewritten on both module spellings, and every target leaves the
     /// rewrite with an explicit alpha: its own, else the file's resolved one (here the default 8).
     #[test]
@@ -2536,14 +2595,27 @@ mod tests {
             ("128", 128.0),
             (" 8 ", 8.0),
             ("16 (scaling 1.0)", 16.0),
-            ("16(scaling 1.0)", 16.0),
             ("0.5", 0.5),
             ("1e1 note", 10.0),
         ] {
             assert_eq!(parse_alpha_metadata(raw).unwrap(), want, "{raw:?}");
         }
         for bad in [
-            "", "   ", "abc 16", "nan", "inf", "-inf", "NaN 8", "1e400", "eight", ".",
+            "",
+            "   ",
+            "abc 16",
+            "nan",
+            "inf",
+            "-inf",
+            "NaN 8",
+            "1e400",
+            "eight",
+            ".",
+            "0x10",
+            "1_000",
+            "16/32",
+            "16(scaling 1.0)",
+            "16abc",
         ] {
             let error = parse_alpha_metadata(bad).unwrap_err().to_string();
             assert!(

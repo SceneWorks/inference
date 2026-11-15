@@ -573,10 +573,11 @@ pub fn resolve_alpha(meta: &HashMap<String, String>) -> Result<Option<f32>> {
 }
 
 /// Parse a `__metadata__["alpha"]` string: a finite number at the start (after optional
-/// whitespace), followed by optional whitespace and arbitrary trailing text. `"8"`, `" 8 "`, `"128"`
-/// and the community spelling `"16 (scaling 1.0)"` (akhaliq/MiniMax-H3-Image-Character-Swap) all
-/// parse; a string with no leading number (`""`, `"abc 16"`, `"nan"`, `"inf"`) or one whose number is
-/// not finite is an error naming the key and quoting the raw value.
+/// whitespace), followed by the end of the string or by whitespace and arbitrary trailing text.
+/// `"8"`, `" 8 "`, `"128"` and the community spelling `"16 (scaling 1.0)"`
+/// (akhaliq/MiniMax-H3-Image-Character-Swap) all parse; a string with no leading number (`""`,
+/// `"abc 16"`, `"nan"`, `"inf"`), a number glued to more text (`"0x10"`, `"1_000"`, `"16/32"`), or a
+/// non-finite number is an error naming the key and quoting the raw value.
 pub fn parse_alpha_metadata(raw: &str) -> Result<f32> {
     let refuse = || {
         CandleError::Msg(format!(
@@ -584,10 +585,16 @@ pub fn parse_alpha_metadata(raw: &str) -> Result<f32> {
              with a finite number"
         ))
     };
-    let alpha = leading_number(raw.trim_start())
-        .ok_or_else(refuse)?
-        .parse::<f32>()
-        .map_err(|_| refuse())?;
+    let s = raw.trim_start();
+    let number = leading_number(s).ok_or_else(refuse)?;
+    if !s[number.len()..]
+        .chars()
+        .next()
+        .is_none_or(char::is_whitespace)
+    {
+        return Err(refuse());
+    }
+    let alpha = number.parse::<f32>().map_err(|_| refuse())?;
     if !alpha.is_finite() {
         return Err(refuse());
     }
@@ -1503,7 +1510,7 @@ pub fn apply_minimax_h3_adapters(
     host: &mut MiniMaxH3Dit,
     specs: &[AdapterSpec],
 ) -> Result<MiniMaxH3LoraReport> {
-    apply_minimax_h3_adapters_with(host, specs, AbsentLoraAlpha::H3_VIDEO)
+    apply_minimax_h3_adapters_with(host, specs, VIDEO_ABSENT_ALPHA)
 }
 
 /// The **H3-Image** install: [`apply_minimax_h3_adapters`] with the [`AbsentLoraAlpha::H3_IMAGE`]
@@ -1513,8 +1520,14 @@ pub fn apply_minimax_h3_image_adapters(
     host: &mut MiniMaxH3Dit,
     specs: &[AdapterSpec],
 ) -> Result<MiniMaxH3LoraReport> {
-    apply_minimax_h3_adapters_with(host, specs, AbsentLoraAlpha::H3_IMAGE)
+    apply_minimax_h3_adapters_with(host, specs, IMAGE_ABSENT_ALPHA)
 }
+
+/// The policy [`apply_minimax_h3_adapters`] (H3 video) passes — a test seam, since no Candle host
+/// can be built without a model fixture.
+pub(crate) const VIDEO_ABSENT_ALPHA: AbsentLoraAlpha = AbsentLoraAlpha::H3_VIDEO;
+/// The policy [`apply_minimax_h3_image_adapters`] (H3-Image) passes.
+pub(crate) const IMAGE_ABSENT_ALPHA: AbsentLoraAlpha = AbsentLoraAlpha::H3_IMAGE;
 
 /// [`apply_minimax_h3_adapters`] with an explicit [`AbsentLoraAlpha`] policy, threaded through every
 /// conversion (kohya, ComfyUI, trainer) and the install.
@@ -1770,14 +1783,27 @@ mod alias_tests {
             ("128", 128.0),
             (" 8 ", 8.0),
             ("16 (scaling 1.0)", 16.0),
-            ("16(scaling 1.0)", 16.0),
             ("0.5", 0.5),
             ("1e1 note", 10.0),
         ] {
             assert_eq!(parse_alpha_metadata(raw).unwrap(), want, "{raw:?}");
         }
         for bad in [
-            "", "   ", "abc 16", "nan", "inf", "-inf", "NaN 8", "1e400", "eight", ".",
+            "",
+            "   ",
+            "abc 16",
+            "nan",
+            "inf",
+            "-inf",
+            "NaN 8",
+            "1e400",
+            "eight",
+            ".",
+            "0x10",
+            "1_000",
+            "16/32",
+            "16(scaling 1.0)",
+            "16abc",
         ] {
             let error = parse_alpha_metadata(bad).unwrap_err().to_string();
             assert!(
@@ -1837,6 +1863,82 @@ mod alias_tests {
                 );
             }
         }
+    }
+
+    /// A kohya file naming the native fused `attn.qkv_proj` with no alpha anywhere, under the
+    /// H3-Image policy: the kohya rewrite emits the FUSED rank as the stem's alpha and the ComfyUI
+    /// split then divides it with the rank, so each q/k/v target folds at exactly 1.0 — for the
+    /// block-diagonal and the shared-`A` forms.
+    #[test]
+    fn a_kohya_fused_qkv_without_alpha_folds_one_per_split_target_under_rank() {
+        let dev = Device::Cpu;
+        let (r, out, inp) = (2usize, 4usize, 8usize);
+        let mut bd = vec![0.0f32; 3 * out * 3 * r];
+        for row in 0..3 * out {
+            let block = row / out;
+            for col in block * r..(block + 1) * r {
+                bd[row * 3 * r + col] = 1.0 + (row + col) as f32;
+            }
+        }
+        let ones = |shape: &[usize]| Tensor::ones(shape, DType::F32, &dev).unwrap();
+        let cases = [
+            (
+                ones(&[3 * r, inp]),
+                Tensor::from_vec(bd, (3 * out, 3 * r), &dev).unwrap(),
+            ),
+            (ones(&[r, inp]), ones(&[3 * out, r])),
+        ];
+        let meta = HashMap::new();
+        for (down, up) in cases {
+            let tensors = HashMap::from([
+                (
+                    "lora_unet_blocks_0_attn_qkv_proj.lora_down.weight".to_string(),
+                    down,
+                ),
+                (
+                    "lora_unet_blocks_0_attn_qkv_proj.lora_up.weight".to_string(),
+                    up,
+                ),
+            ]);
+            let rewritten =
+                convert_kohya_key_space(&tensors, &meta, AbsentLoraAlpha::H3_IMAGE).unwrap();
+            assert!(is_comfyui_key_space(rewritten.keys().map(String::as_str)));
+            let converted =
+                convert_comfyui_key_space(&rewritten, &meta, AbsentLoraAlpha::H3_IMAGE).unwrap();
+            for name in ["to_q", "to_k", "to_v"] {
+                let stem = format!("transformer_blocks.0.attn.{name}");
+                let split_rank = converted[&format!("{stem}.lora_A.weight")].dims()[0];
+                assert_eq!(split_rank, r, "{stem}");
+                let alpha = converted[&format!("{stem}.alpha")]
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()[0];
+                assert_eq!(
+                    alpha_rank_fold(alpha, split_rank as f32),
+                    1.0,
+                    "{stem}: alpha {alpha}"
+                );
+            }
+        }
+    }
+
+    /// The H3-Image install entry passes the `alpha = rank` policy and the video entry upstream's
+    /// fixed 8. No Candle `MiniMaxH3Dit` host can be built without a model fixture (those tests are
+    /// manual-dispatch only), so this pins the policy constants both entries pass, and what each
+    /// folds an absent alpha to.
+    #[test]
+    fn each_install_entry_passes_its_family_absent_alpha_policy() {
+        assert_eq!(IMAGE_ABSENT_ALPHA, AbsentLoraAlpha::Rank);
+        assert_eq!(
+            VIDEO_ABSENT_ALPHA,
+            AbsentLoraAlpha::Fixed(DEFAULT_LORA_ALPHA)
+        );
+        let rank = 16.0;
+        let fold =
+            |absent| alpha_rank_fold(resolve_target_alpha(None, None, None, absent, rank), rank);
+        assert_eq!(fold(IMAGE_ABSENT_ALPHA), 1.0);
+        assert_eq!(fold(VIDEO_ABSENT_ALPHA), DEFAULT_LORA_ALPHA / rank);
     }
 
     /// SW-7096: a generic kohya file is rewritten on both module spellings, every target leaves
