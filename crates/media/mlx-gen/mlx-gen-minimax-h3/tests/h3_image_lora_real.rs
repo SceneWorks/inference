@@ -17,7 +17,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, Adapter};
 use mlx_gen::gen_core::{AdapterKind, AdapterSpec};
-use mlx_gen_minimax_h3::adapters::{apply_minimax_h3_adapters, BLOCK_TARGETS};
+use mlx_gen_minimax_h3::adapters::{apply_minimax_h3_image_adapters, BLOCK_TARGETS};
 use mlx_gen_minimax_h3::denoise::schedule::SigmaSchedule;
 use mlx_gen_minimax_h3::dit::config::MiniMaxH3ImageDitConfig;
 use mlx_gen_minimax_h3::dit::{MmRope, MmRopeTables};
@@ -300,7 +300,8 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit() {
     let bare = run_resident(&dit, &inputs);
 
     let peft = write_peft(&cfg, dir.path(), 1);
-    apply_minimax_h3_adapters(&mut dit, &[spec(peft.clone(), STRENGTH)]).expect("PEFT install");
+    apply_minimax_h3_image_adapters(&mut dit, &[spec(peft.clone(), STRENGTH)])
+        .expect("PEFT install");
     let with_peft = run_resident(&dit, &inputs);
     let moved = rel(&with_peft, &bare);
     println!("[sw-7096 mlx] LoRA moves the {BLOCKS}-block output by rel-max-abs {moved:.3e}");
@@ -313,7 +314,7 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit() {
         clear(&mut dit);
         let native = write_native(&cfg, dir.path(), 1, kohya);
         let report =
-            apply_minimax_h3_adapters(&mut dit, &[spec(native, STRENGTH)]).expect("install");
+            apply_minimax_h3_image_adapters(&mut dit, &[spec(native, STRENGTH)]).expect("install");
         assert_eq!(report.applied, BLOCKS * BLOCK_TARGETS.len());
         let got = run_resident(&dit, &inputs);
         let drift = rel_to_effect(&got, &with_peft, &bare);
@@ -339,7 +340,7 @@ fn h3_image_lora_layouts_fold_identically_on_the_real_dit() {
             spec(path, 0.1 * (i + 1) as f32 * STRENGTH)
         })
         .collect();
-    apply_minimax_h3_adapters(&mut dit, &specs).expect("ten stacked LoRAs");
+    apply_minimax_h3_image_adapters(&mut dit, &specs).expect("ten stacked LoRAs");
     for leaf in BLOCK_TARGETS {
         let path = format!("transformer_blocks.0.{leaf}");
         let segs: Vec<&str> = path.split('.').collect();
@@ -384,7 +385,7 @@ fn h3_image_streamed_blocks_carry_the_lora_like_resident_ones() {
     let peft = write_peft(&cfg, dir.path(), 3);
     let kohya = write_native(&cfg, dir.path(), 4, true);
     let specs = [spec(peft, 0.75 * STRENGTH), spec(kohya, 0.5 * STRENGTH)];
-    apply_minimax_h3_adapters(&mut dit, &specs).expect("resident install");
+    apply_minimax_h3_image_adapters(&mut dit, &specs).expect("resident install");
     let resident = run_resident(&dit, &inputs);
 
     // Modulation tables come from the resident blocks: a streamed body has no adaln_proj.
@@ -398,7 +399,7 @@ fn h3_image_streamed_blocks_carry_the_lora_like_resident_ones() {
         cfg.base.clone(),
     )
     .expect("stream over transformer_diffusers/");
-    apply_minimax_h3_adapters(&mut stream, &specs).expect("streamed install");
+    apply_minimax_h3_image_adapters(&mut stream, &specs).expect("streamed install");
     assert_eq!(
         stream.adapters().residual_count(),
         2 * BLOCK_TARGETS.len() * BLOCKS,
@@ -464,7 +465,7 @@ fn write_targets(dir: &Path, name: &str, targets: &[(&str, i32, i32)], seed: u32
 fn velocities(root: &Path, specs: &[AdapterSpec], steps: &[usize]) -> Vec<Array> {
     let mut dit = MiniMaxH3ImageDit::load(root, Dtype::Bfloat16).expect("image DiT");
     if !specs.is_empty() {
-        apply_minimax_h3_adapters(&mut dit, specs).expect("install");
+        apply_minimax_h3_image_adapters(&mut dit, specs).expect("install");
     }
     let cfg = dit.config().clone();
     let layout = ImageLayout::t2i(8, 16, 16, cfg.base.patch_size).unwrap();
@@ -594,7 +595,7 @@ fn h3_image_adaln_and_output_head_loras_reach_the_denoiser() {
         61,
     );
     let mut dit = MiniMaxH3ImageDit::load(&root, Dtype::Bfloat16).expect("image DiT");
-    let error = apply_minimax_h3_adapters(&mut dit, &[spec(missing, 1.0)])
+    let error = apply_minimax_h3_image_adapters(&mut dit, &[spec(missing, 1.0)])
         .unwrap_err()
         .to_string();
     assert!(error.contains("proj_out"), "{error}");
@@ -634,7 +635,8 @@ fn h3_image_adaln_and_output_head_loras_reach_the_denoiser() {
     }
     let native = dir.path().join("native-comfy.safetensors");
     write(&native, t, &[("alpha", &RANK.to_string())]);
-    let report = apply_minimax_h3_adapters(&mut dit, &[spec(native, 1.0)]).expect("native install");
+    let report =
+        apply_minimax_h3_image_adapters(&mut dit, &[spec(native, 1.0)]).expect("native install");
     assert_eq!(
         report.applied,
         6 + 4,

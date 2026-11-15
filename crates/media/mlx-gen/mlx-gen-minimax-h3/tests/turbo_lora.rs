@@ -47,7 +47,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen_minimax_h3::adapters::{
     adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, convert_comfyui_key_space,
     convert_minimax_h3_trainer_key_space, is_comfyui_key_space, resolve_alpha, resolve_rank,
-    unflatten_minimax_h3_trainer_tensors, DEFAULT_LORA_ALPHA,
+    unflatten_minimax_h3_trainer_tensors, AbsentLoraAlpha, DEFAULT_LORA_ALPHA,
 };
 use mlx_gen_minimax_h3::{MiniMaxH3Dit, MiniMaxH3DitConfig, SMALLEST_LEGAL_FRAMES};
 
@@ -618,7 +618,7 @@ fn the_conversion_leaves_no_comfyui_module_behind() {
 
     let w = Weights::from_file(&comfy).unwrap();
     assert!(is_comfyui_key_space(&w));
-    let converted = convert_comfyui_key_space(&w).unwrap();
+    let converted = convert_comfyui_key_space(&w, AbsentLoraAlpha::H3_VIDEO).unwrap();
     assert!(
         !is_comfyui_key_space(&converted),
         "the converted map must carry no ComfyUI module name at all"
@@ -694,7 +694,9 @@ fn published_turbo_files_resolve_to_dit_targets_at_the_measured_alphas() {
         );
         assert_eq!(w.len(), 624, "{stem} tensor count");
 
-        let alpha = resolve_alpha(&w).unwrap_or_else(|e| panic!("{stem} alpha: {e}"));
+        let alpha = resolve_alpha(&w)
+            .unwrap_or_else(|e| panic!("{stem} alpha: {e}"))
+            .unwrap_or(DEFAULT_LORA_ALPHA);
         assert_eq!(alpha, want_alpha, "{stem} alpha");
         // Provenance, so the three `8.0` arms are not just re-asserting `DEFAULT_LORA_ALPHA`.
         let raw = w.metadata("alpha");
@@ -791,12 +793,15 @@ fn published_turbo_files_resolve_to_dit_targets_at_the_measured_alphas() {
         );
         // sc-19443 converts these rather than refusing them. The alpha lives in `__metadata__` on
         // the real files too, so this is the exact route the review found unguarded.
-        let converted = convert_comfyui_key_space(&w).unwrap_or_else(|e| panic!("{stem}: {e}"));
+        let converted = convert_comfyui_key_space(&w, AbsentLoraAlpha::H3_VIDEO)
+            .unwrap_or_else(|e| panic!("{stem}: {e}"));
         assert!(
             !is_comfyui_key_space(&converted),
             "{stem}: the conversion must leave no ComfyUI module behind"
         );
-        let fused_alpha = resolve_alpha(&w).unwrap_or_else(|e| panic!("{stem} alpha: {e}"));
+        let fused_alpha = resolve_alpha(&w)
+            .unwrap_or_else(|e| panic!("{stem} alpha: {e}"))
+            .unwrap_or(DEFAULT_LORA_ALPHA);
         let per_target = converted
             .require("transformer_blocks.0.attn.to_q.alpha")
             .unwrap_or_else(|_| panic!("{stem}: no per-target alpha emitted"))
@@ -910,7 +915,7 @@ fn the_real_turbo_lora_folds_onto_the_real_dit() {
 
     // The 8-step file declares alpha 8 at rank 128, so it must fold at 0.0625 here too.
     let w = Weights::from_file(&lora).expect("read the LoRA");
-    assert_eq!(resolve_alpha(&w).unwrap(), 8.0);
+    assert_eq!(resolve_alpha(&w).unwrap(), Some(8.0));
     assert_eq!(alpha_rank_fold(8.0, 128.0), 0.0625);
     println!("[turbo e2e] EXAMINED the real DiT at fold 0.0625");
     crate::model_inference_device::record_model_inference_device();
@@ -1157,8 +1162,10 @@ fn exact_h3_trainer_file_receipt() {
 
     let adapter = Weights::from_file(&path)
         .unwrap_or_else(|error| panic!("read exact trainer file {}: {error}", path.display()));
-    let (converted, layout, mut alphas) = convert_minimax_h3_trainer_key_space(&adapter)
-        .unwrap_or_else(|error| panic!("validate exact trainer file {}: {error}", path.display()));
+    let (converted, layout, mut alphas) =
+        convert_minimax_h3_trainer_key_space(&adapter, AbsentLoraAlpha::H3_VIDEO).unwrap_or_else(
+            |error| panic!("validate exact trainer file {}: {error}", path.display()),
+        );
     assert_eq!(layout.source_targets, 200, "50 blocks × four source leaves");
     assert_eq!(layout.ranks, vec![16], "unique source factor ranks");
     assert!(layout.trunk_only, "the exact trainer export is trunk-only");

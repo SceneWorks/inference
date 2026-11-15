@@ -38,7 +38,8 @@ use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen_minimax_h3::adapters::{
     adapter_target_paths, alpha_rank_fold, apply_minimax_h3_adapters, convert_comfyui_key_space,
     convert_minimax_h3_trainer_key_space, is_comfyui_key_space, resolve_alpha, resolve_rank,
-    unflatten_minimax_h3_trainer_tensors, DEFAULT_LORA_ALPHA,
+    resolve_target_alpha, unflatten_minimax_h3_trainer_tensors, AbsentLoraAlpha,
+    DEFAULT_LORA_ALPHA,
 };
 use candle_gen_minimax_h3::{MiniMaxH3Dit, MiniMaxH3DitConfig};
 
@@ -381,16 +382,24 @@ fn alpha_resolution_covers_every_published_spelling() {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
     };
-    assert_eq!(resolve_alpha(&m(&[("alpha", "128")])).unwrap(), 128.0);
-    assert_eq!(resolve_alpha(&m(&[("alpha", "8")])).unwrap(), 8.0);
+    assert_eq!(resolve_alpha(&m(&[("alpha", "128")])).unwrap(), Some(128.0));
+    assert_eq!(resolve_alpha(&m(&[("alpha", "8")])).unwrap(), Some(8.0));
+    let declared = resolve_alpha(&m(&[("format", "pt")])).unwrap();
+    assert_eq!(declared, None);
     assert_eq!(
-        resolve_alpha(&m(&[("format", "pt")])).unwrap(),
+        resolve_target_alpha(None, None, declared, AbsentLoraAlpha::H3_VIDEO, 128.0),
         DEFAULT_LORA_ALPHA,
-        "an absent alpha must fall back to upstream's DEFAULT_LORA_ALPHA, never to the rank"
+        "an absent alpha must fall back to upstream's DEFAULT_LORA_ALPHA on H3 video, never to the \
+         rank"
+    );
+    // akhaliq/MiniMax-H3-Image-Character-Swap stamps a number followed by a note.
+    assert_eq!(
+        resolve_alpha(&m(&[("alpha", "16 (scaling 1.0)")])).unwrap(),
+        Some(16.0)
     );
     // A present-but-malformed alpha fails loudly rather than falling through to the default —
     // otherwise the correction is indistinguishable from the bug it replaces.
-    for bad in ["", "eight", "nan", "inf"] {
+    for bad in ["", "eight", "nan", "inf", "abc 16"] {
         assert!(
             resolve_alpha(&m(&[("alpha", bad)])).is_err(),
             "alpha={bad:?} must be rejected, not silently treated as {DEFAULT_LORA_ALPHA}"
@@ -1441,7 +1450,8 @@ fn trainer_namespace_converts_to_independent_expected_factors_at_relative_max_ab
         unflatten_minimax_h3_trainer_tensors(&trainer).expect("exact trainer unflatten");
     assert_eq!(alphas, vec![FC1_ALPHA, FUSED_ALPHA]);
 
-    let got = convert_comfyui_key_space(&raw, &adapter.meta).expect("trainer conversion");
+    let got = convert_comfyui_key_space(&raw, &adapter.meta, AbsentLoraAlpha::H3_VIDEO)
+        .expect("trainer conversion");
     assert_eq!(got.len(), 12, "q/k/v and fc1 each carry A/B/alpha");
     for (index, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
         for (suffix, expected) in [
@@ -1694,7 +1704,8 @@ fn assert_alpha_resolves_before_the_split(spelling: AlphaSpelling) {
 
     let read = |file: &PathBuf, key: &str| -> f32 {
         let af = candle_gen::train::merge::read_adapter(file).unwrap();
-        let converted = convert_comfyui_key_space(&af.tensors, &af.meta).unwrap();
+        let converted =
+            convert_comfyui_key_space(&af.tensors, &af.meta, AbsentLoraAlpha::H3_VIDEO).unwrap();
         converted
             .get(key)
             .unwrap_or_else(|| panic!("no converted alpha at {key}"))
@@ -1777,7 +1788,8 @@ fn the_alpha_division_tracks_the_rank_split_and_is_not_the_default() {
 
     let read_alpha = |file: &PathBuf| -> f32 {
         let af = candle_gen::train::merge::read_adapter(file).unwrap();
-        let converted = convert_comfyui_key_space(&af.tensors, &af.meta).unwrap();
+        let converted =
+            convert_comfyui_key_space(&af.tensors, &af.meta, AbsentLoraAlpha::H3_VIDEO).unwrap();
         converted
             .get("transformer_blocks.0.attn.to_q.alpha")
             .expect("the converted per-target alpha")
@@ -1860,7 +1872,8 @@ fn the_conversion_leaves_no_comfyui_module_behind() {
 
     let af = candle_gen::train::merge::read_adapter(&comfy).unwrap();
     assert!(is_comfyui_key_space(af.tensors.keys().map(String::as_str)));
-    let converted = convert_comfyui_key_space(&af.tensors, &af.meta).unwrap();
+    let converted =
+        convert_comfyui_key_space(&af.tensors, &af.meta, AbsentLoraAlpha::H3_VIDEO).unwrap();
     assert!(
         !is_comfyui_key_space(converted.keys().map(String::as_str)),
         "the converted map must carry no ComfyUI module name at all"
@@ -1920,7 +1933,8 @@ fn block_diagonality_is_measured_on_the_bytes_not_inferred_from_the_shape() {
         Tensor::new(&[48.0f32], &dev()).unwrap(),
     );
 
-    let converted = convert_comfyui_key_space(&m, &HashMap::new()).unwrap();
+    let converted =
+        convert_comfyui_key_space(&m, &HashMap::new(), AbsentLoraAlpha::H3_VIDEO).unwrap();
     let a = converted
         .get("transformer_blocks.0.attn.to_q.lora_A.weight")
         .expect("converted to_q down factor");
@@ -2114,7 +2128,7 @@ fn a_malformed_fused_qkv_is_refused_by_name() {
         "blocks.0.attn.qkv_proj.lora_B.weight".into(),
         bf16(&tensor(&[3 * out, r], 2.0)),
     );
-    let err = convert_comfyui_key_space(&m, &HashMap::new())
+    let err = convert_comfyui_key_space(&m, &HashMap::new(), AbsentLoraAlpha::H3_VIDEO)
         .unwrap_err()
         .to_string();
     assert!(err.contains("do not compose"), "{err}");
@@ -2130,7 +2144,7 @@ fn a_malformed_fused_qkv_is_refused_by_name() {
         "blocks.0.attn.qkv_proj.lora_B.weight".into(),
         bf16(&tensor(&[3 * out + 1, r], 2.0)),
     );
-    let err = convert_comfyui_key_space(&m, &HashMap::new())
+    let err = convert_comfyui_key_space(&m, &HashMap::new(), AbsentLoraAlpha::H3_VIDEO)
         .unwrap_err()
         .to_string();
     assert!(err.contains("three equal q/k/v projections"), "{err}");
@@ -2141,7 +2155,7 @@ fn a_malformed_fused_qkv_is_refused_by_name() {
         "blocks.0.attn.qkv_proj.lora_A.weight".into(),
         bf16(&tensor(&[r, cfg.hidden_size], 1.0)),
     );
-    let err = convert_comfyui_key_space(&m, &HashMap::new())
+    let err = convert_comfyui_key_space(&m, &HashMap::new(), AbsentLoraAlpha::H3_VIDEO)
         .unwrap_err()
         .to_string();
     assert!(err.contains("needs both"), "{err}");
@@ -2381,10 +2395,12 @@ fn exact_h3_trainer_file_receipt() {
 
     let adapter = candle_gen::train::merge::read_adapter(&path)
         .unwrap_or_else(|error| panic!("read exact trainer file {}: {error}", path.display()));
-    let (converted, layout, mut alphas) =
-        convert_minimax_h3_trainer_key_space(&adapter.tensors, &adapter.meta).unwrap_or_else(
-            |error| panic!("validate exact trainer file {}: {error}", path.display()),
-        );
+    let (converted, layout, mut alphas) = convert_minimax_h3_trainer_key_space(
+        &adapter.tensors,
+        &adapter.meta,
+        AbsentLoraAlpha::H3_VIDEO,
+    )
+    .unwrap_or_else(|error| panic!("validate exact trainer file {}: {error}", path.display()));
     assert_eq!(layout.source_targets, 200, "50 blocks × four source leaves");
     assert_eq!(layout.ranks, vec![16], "unique source factor ranks");
     assert!(layout.trunk_only, "the exact trainer export is trunk-only");
@@ -2652,8 +2668,10 @@ fn clay_raw_refiner_header_conversion_preserves_factors_alpha_and_strict_unknown
             )
         })
         .collect();
-    let converted = convert_comfyui_key_space(&raw, &HashMap::new()).unwrap();
-    let control = convert_comfyui_key_space(&canonical, &HashMap::new()).unwrap();
+    let converted =
+        convert_comfyui_key_space(&raw, &HashMap::new(), AbsentLoraAlpha::H3_VIDEO).unwrap();
+    let control =
+        convert_comfyui_key_space(&canonical, &HashMap::new(), AbsentLoraAlpha::H3_VIDEO).unwrap();
     let targets = adapter_target_paths(&MiniMaxH3DitConfig::default());
     let values = |t: &Tensor| {
         t.to_dtype(DType::F32)

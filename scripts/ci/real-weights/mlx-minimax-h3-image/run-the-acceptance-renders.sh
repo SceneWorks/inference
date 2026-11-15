@@ -23,7 +23,8 @@ for entry in \
   "tanaami:tanaami:MINIMAX_H3_IMAGE_LORA_TANAAMI_SNAPSHOT:syntaxdiffusion/tanaami-style-h3-image-lora:3804b381526a3e537c7961942ba4861a831b2d39:tanaami_h3_image_lora_2000.safetensors" \
   "domokun:domokun:MINIMAX_H3_IMAGE_LORA_DOMOKUN_SNAPSHOT:SimpleTuner/minimax-h3-image-domokun-2048:57214626f457eac87077c7035bb1b64d5264ebf3:pytorch_lora_weights.safetensors" \
   "fizgig:fizgig:MINIMAX_H3_IMAGE_LORA_FIZGIG_SNAPSHOT:ShootTheSound/Fizgig-MiniMax-H3-Image-Training-Adapter:f1a4547596faeb98bae568dd28da296c49fbe0a1:fizgig_minimax_h3_image_training_adapter.safetensors" \
-  "pdmd:pdmd:MINIMAX_H3_IMAGE_LORA_PDMD_SNAPSHOT:linoyts/MiniMax-H3-Image-pDMD-2steps:c07d96e5635311ed007d44654c2f98cc8d6e0a1e:pytorch_lora_weights.safetensors"; do
+  "pdmd:pdmd:MINIMAX_H3_IMAGE_LORA_PDMD_SNAPSHOT:linoyts/MiniMax-H3-Image-pDMD-2steps:c07d96e5635311ed007d44654c2f98cc8d6e0a1e:pytorch_lora_weights.safetensors" \
+  "character-swap:character-swap:MINIMAX_H3_IMAGE_LORA_CHARACTER_SWAP_SNAPSHOT:akhaliq/MiniMax-H3-Image-Character-Swap:0b7f918092f9e23c01ca62b63d7c17e4fce6faa9:lora/h3_image_character_swap_diffusers.safetensors"; do
   IFS=: read -r name row var repo rev file <<<"$entry"
   snapshot="$lane_hub/models--${repo//\//--}/snapshots/$rev"
   export "$var=$snapshot"

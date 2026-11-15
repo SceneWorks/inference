@@ -529,7 +529,7 @@ fn h3_image_refuses_the_unsupported_requests() {
         &path,
     )
     .unwrap();
-    let message = mlx_gen_minimax_h3::adapters::apply_minimax_h3_adapters(
+    let message = mlx_gen_minimax_h3::adapters::apply_minimax_h3_image_adapters(
         &mut dit,
         &[AdapterSpec::new(path, 1.0, AdapterKind::Lora)],
     )

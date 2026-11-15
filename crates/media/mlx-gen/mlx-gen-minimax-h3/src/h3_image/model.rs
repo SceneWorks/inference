@@ -731,8 +731,9 @@ impl MiniMaxH3Image {
         if !self.adapters.is_empty() {
             // Strict, like H3 video: an unmatched target or a file that matched nothing fails the
             // render here rather than producing an image the LoRA barely touched. Under rung 4 the
-            // block residuals land in the stream's overlay and are forced once here.
-            crate::adapters::apply_minimax_h3_adapters(&mut dit, &self.adapters)?;
+            // block residuals land in the stream's overlay and are forced once here. The image
+            // entry's absent-alpha fallback is `alpha = rank` (the diffusers/PEFT convention).
+            crate::adapters::apply_minimax_h3_image_adapters(&mut dit, &self.adapters)?;
             dit.materialize_streamed_adapters()?;
         }
         debug_assert_eq!(patch, dit.config().base.patch_size);

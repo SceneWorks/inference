@@ -774,8 +774,11 @@ fn the_comfyui_converted_qkv_namespace_installs_identically_on_the_pruned_curve(
     let entries: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), v)).collect();
     Array::save_safetensors(entries, Some(&meta), &comfy_path).expect("write the ComfyUI file");
 
-    let converted = convert_comfyui_key_space(&Weights::from_file(&comfy_path).expect("read back"))
-        .expect("the ComfyUI conversion");
+    let converted = convert_comfyui_key_space(
+        &Weights::from_file(&comfy_path).expect("read back"),
+        mlx_gen_minimax_h3::adapters::AbsentLoraAlpha::H3_VIDEO,
+    )
+    .expect("the ComfyUI conversion");
     assert!(
         !is_comfyui_key_space(&converted),
         "the conversion must leave no ComfyUI module behind"
