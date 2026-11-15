@@ -238,7 +238,9 @@ impl Ideogram4TextEncoder {
             .collect::<Result<_>>()?;
         let stacked = Tensor::cat(&expanded, D::Minus1)?; // [B, S, H, n]
         let (bb, ss, h, n) = stacked.dims4()?;
-        stacked.reshape((bb, ss, h * n))
+        let output = stacked.reshape((bb, ss, h * n))?;
+        crate::observe_component_precision("text_encoder", output.device(), output.dtype());
+        Ok(output)
     }
 }
 

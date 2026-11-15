@@ -259,6 +259,18 @@ use vae::QwenVae;
 const DIT_DTYPE: DType = DType::BF16;
 const ENC_DTYPE: DType = DType::F32;
 
+pub(crate) fn observe_component_precision(component: &str, device: &Device, dtype: DType) {
+    candle_gen::execution::runtime(device, dtype);
+    candle_gen::execution::policy(
+        "qwen_image/component_precision",
+        serde_json::json!({
+            "component": component,
+            "device": format!("{:?}", device.location()),
+            "compute_dtype": format!("{dtype:?}"),
+        }),
+    );
+}
+
 #[derive(Clone)]
 struct Components {
     te: Arc<QwenTextEncoder>,
@@ -376,6 +388,13 @@ struct Pipeline {
     /// (key-remapped, see [`comfyui::remap_vae_wan_to_diffusers`]); when `None` the VAE falls back to
     /// the snapshot's `vae/` dir. Independent of `comfyui_dit` (either can be in place).
     comfyui_vae: Option<gen_core::PinnedWeightsFile>,
+}
+
+fn resolved_guidance(requested: Option<f32>) -> f32 {
+    candle_gen::execution::f32_policy(
+        "qwen/effective_guidance",
+        requested.unwrap_or(DEFAULT_GUIDANCE),
+    )
 }
 
 impl Pipeline {
@@ -511,7 +530,7 @@ impl Pipeline {
         phase: &TextPhase,
         req: &GenerationRequest,
     ) -> CResult<(Tensor, Option<Tensor>, f32)> {
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        let guidance = resolved_guidance(req.guidance);
         let encode = |te: &QwenTextEncoder, tok: &TextTokenizer| -> CResult<_> {
             let pos = self.encode(te, tok, &req.prompt)?;
             let neg = if guidance > 1.0 {
@@ -854,6 +873,7 @@ fn decode_final_latents(
     if cancel.is_cancelled() {
         return Err(CandleError::Canceled);
     }
+    let selected_pid = decoder.is_some();
     let decoder = decoder.unwrap_or(native);
     candle_gen::ensure_decoder_compatible(
         Some(&candle_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
@@ -878,10 +898,14 @@ fn decode_final_latents(
             ))
         })
         .transpose()?;
-    match tiling.as_ref() {
+    let output = match tiling.as_ref() {
         Some(tiling) => decoder.decode_tiled(latents, tiling, Some(cancel)),
         None => decoder.decode(latents),
+    }?;
+    if selected_pid {
+        observe_component_precision("pid_decoder", output.device(), output.dtype());
     }
+    Ok(output)
 }
 
 /// The MLX packed `group_size` for the DiT, read from `transformer/config.json`'s `quantization`
@@ -952,6 +976,23 @@ pub struct QwenImageGenerator {
 }
 
 impl Generator for QwenImageGenerator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::unobserved_adapters(
+                self.pipe.adapters.len(),
+                "candle-gen-qwen-image/src/lib.rs",
+            );
+            candle_gen::execution::policy(
+                "loaded/loaded_quant",
+                format!("{:?}", self.loaded_quant).into(),
+            );
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -2161,5 +2202,78 @@ mod tests {
             pipe.root.join("tokenizer/tokenizer.json").is_file(),
             "loader must resolve the overlaid tokenizer.json under tokenizer/"
         );
+    }
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+
+    #[test]
+    fn consumed_component_precision_changes_completed_identity() {
+        let report = |dit_dtype| {
+            candle_gen::execution::capture_direct(
+                &descriptor(),
+                &gen_core::CancelFlag::default(),
+                || {
+                    candle_gen::execution::rng_scheme("precision-fixture");
+                    candle_gen::execution::draw("initial_noise", 7, 0);
+                    candle_gen::execution::without_schedule("fixture", "single-step", "flow");
+                    candle_gen::execution::policy("decoder", serde_json::json!("fixture"));
+                    observe_component_precision("text_encoder", &Device::Cpu, DType::F32);
+                    observe_component_precision("dit", &Device::Cpu, dit_dtype);
+                    observe_component_precision("vae", &Device::Cpu, DType::F32);
+                    Ok(GenerationOutput::Images(vec![Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0; 3],
+                    }]))
+                },
+            )
+            .unwrap()
+            .execution
+            .resolved()
+            .unwrap()
+            .quality_policy
+            .clone()
+        };
+        let bf16 = report(DType::BF16);
+        let f32 = report(DType::F32);
+        assert_ne!(bf16, f32);
+        let gen_core::generator::ExecutionFact::Resolved { value } = bf16 else {
+            panic!("completed precision policy must resolve")
+        };
+        assert_eq!(
+            value["operations"]["qwen_image/component_precision"][1]["value"]["component"],
+            "dit"
+        );
+        assert_eq!(
+            value["operations"]["qwen_image/component_precision"][1]["value"]["compute_dtype"],
+            "BF16"
+        );
+        assert_eq!(
+            value["operations"]["qwen_image/component_precision"][1]["value"]["device"],
+            "Cpu"
+        );
+        assert_eq!(
+            value["operations"]["qwen_image/component_precision"][0]["value"]["component"],
+            "text_encoder"
+        );
+        assert_eq!(
+            value["operations"]["qwen_image/component_precision"][2]["value"]["component"],
+            "vae"
+        );
+    }
+
+    #[test]
+    fn execution_guidance_distinguishes_default_off_and_override() {
+        let report = |requested| {
+            candle_gen::testkit::execution_policy(|| {
+                resolved_guidance(requested);
+            })
+        };
+        assert_eq!(report(None), report(Some(DEFAULT_GUIDANCE)));
+        assert_ne!(report(None), report(Some(1.0)));
+        assert_ne!(report(None), report(Some(DEFAULT_GUIDANCE + 1.0)));
     }
 }

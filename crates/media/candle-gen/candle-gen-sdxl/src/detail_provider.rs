@@ -90,6 +90,9 @@ pub struct SdxlDetail {
     sampler: EulerAncestralSampler,
     device: Device,
     memory_admission: Option<(SdxlArtifactSeal, MemoryRunContext)>,
+    /// The UNet loader applied this selected stack or refused the load. It does not retain a
+    /// byte-bound receipt of the targets and strengths that ran.
+    unobserved_adapter_count: usize,
 }
 
 impl SdxlDetail {
@@ -116,6 +119,7 @@ impl SdxlDetail {
             sampler: EulerAncestralSampler::sdxl(),
             device,
             memory_admission: None,
+            unobserved_adapter_count: paths.adapters.len(),
         })
     }
 
@@ -135,6 +139,25 @@ impl SdxlDetail {
     }
 
     /// Refine `source` while using `control` as the SDXL tile-ControlNet condition.
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &SdxlDetailRequest,
+        source: &Image,
+        control: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        capture_detail_execution(&req.cancel, self.unobserved_adapter_count, || {
+            let image = self
+                .generate(req, source, control, &mut report_progress)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate(
         &self,
         req: &SdxlDetailRequest,
@@ -163,6 +186,7 @@ impl SdxlDetail {
         let _attention = crate::enter_attention_memory(memory);
 
         let cfg_on = req.guidance > 1.0;
+        candle_gen::execution::policy("sdxl/detail_provider/cfg_on", format!("{cfg_on:?}").into());
         let (conditioning, pooled) = self
             .conditioner
             .encode(&req.prompt, &req.negative, cfg_on)?;
@@ -171,9 +195,13 @@ impl SdxlDetail {
 
         let x0 = self.encode_source(source, req.width, req.height)?;
         let (_, channels, latent_h, latent_w) = x0.dims4()?;
-        let strength = req.strength as f64;
+        let strength =
+            candle_gen::execution::f64_policy("sdxl/detail_strength", req.strength as f64);
         let start_time = self.sampler.max_time() * strength;
-        let mut init_rng = StdRng::seed_from_u64(req.seed);
+        let mut init_rng = StdRng::seed_from_u64(candle_gen::execution::seed(
+            "sdxl/detail_provider",
+            req.seed,
+        ));
         let init_noise = candle_gen::seeded_noise_nchw(
             &mut init_rng,
             channels,
@@ -193,7 +221,10 @@ impl SdxlDetail {
         let control_ctx = ControlContext {
             controlnet: &self.controlnet,
             cond_embed: self.controlnet.embed_cond(&control)?,
-            scale: req.control_scale as f64,
+            scale: candle_gen::execution::f64_policy(
+                "sdxl/detail_control_scale",
+                req.control_scale as f64,
+            ),
         };
 
         let effective_steps = ancestral_strength_steps(req.steps, req.strength);
@@ -202,7 +233,10 @@ impl SdxlDetail {
             unet: &self.unet,
             sampler: &self.sampler,
         };
-        let mut step_rng = StdRng::seed_from_u64(req.seed.wrapping_add(STEP_RNG_SALT));
+        let mut step_rng = StdRng::seed_from_u64(candle_gen::execution::seed(
+            "sdxl/detail_provider",
+            req.seed.wrapping_add(STEP_RNG_SALT),
+        ));
         let latents = denoise_ip_control(
             &denoiser,
             x_t,
@@ -245,6 +279,20 @@ impl SdxlDetail {
             .to_dtype(DTYPE)?;
         Ok(self.vae_encoder.encode_mean(&nchw)?)
     }
+}
+
+/// A selected adapter stack is not an installation receipt. Keep this fact in the same attempt as
+/// the bespoke detail output so an adapted completion cannot claim a resolved execution identity.
+fn capture_detail_execution(
+    cancel: &CancelFlag,
+    unobserved_adapter_count: usize,
+    body: impl FnOnce() -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationOutput>,
+) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+    candle_gen::execution::capture_direct(&crate::descriptor(), cancel, || {
+        candle_gen::execution::unobserved_adapters(unobserved_adapter_count, "SdxlDetail");
+        candle_gen::execution::policy("direct_route", "sdxl/detail_provider/generate".into());
+        body()
+    })
 }
 
 /// Match the authoritative MLX img2img schedule: strength selects a truncated prefix length.
@@ -312,6 +360,42 @@ fn validate_detail_request(req: &SdxlDetailRequest, source: &Image, control: &Im
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::gen_core::generator::ExecutionIdentity;
+
+    fn fake_completed_detail(
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::GenerationOutput> {
+        candle_gen::execution::rng_scheme("sdxl-detail-report-fixture");
+        candle_gen::execution::draw("initial_noise", 7, 0);
+        candle_gen::execution::without_schedule("fixture", "single-step", "ancestral");
+        candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+        Ok(candle_gen::gen_core::GenerationOutput::Images(vec![
+            Image {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 3],
+            },
+        ]))
+    }
+
+    #[test]
+    fn detail_report_refuses_adapted_completion_and_clears_on_clean_retry() {
+        let cancel = CancelFlag::default();
+        let adapted = capture_detail_execution(&cancel, 2, fake_completed_detail).unwrap();
+        let ExecutionIdentity::Unavailable { reason } = adapted.execution else {
+            panic!("an adapted detail output needs an installation receipt")
+        };
+        assert_eq!(reason.code, "candle_execution_observation_incomplete");
+        assert!(reason
+            .missing_facts
+            .iter()
+            .any(|fact| fact.contains("selected adapter count 2")));
+
+        let clean = capture_detail_execution(&cancel, 0, fake_completed_detail).unwrap();
+        assert!(matches!(
+            clean.execution,
+            ExecutionIdentity::Resolved { .. }
+        ));
+    }
 
     fn image(width: u32, height: u32) -> Image {
         Image {

@@ -41,6 +41,19 @@ fn control_input(request: &GenerationRequest) -> gen_core::Result<(&gen_core::Im
 }
 
 impl Generator for ControlGenerator {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture_with(self, req, on_progress, || {
+            candle_gen::execution::policy(
+                "loaded/loaded_quant",
+                format!("{:?}", self.loaded_quant).into(),
+            );
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -124,6 +137,10 @@ impl Generator for ControlGenerator {
         self.validate(request)?;
         let (image, scale) = control_input(request)?;
         let chunk_attention = request.memory.is_some_and(|memory| memory.chunk_attention);
+        candle_gen::execution::policy(
+            "krea/control_registry/chunk_attention",
+            format!("{chunk_attention:?}").into(),
+        );
         let mut state = self.model.borrow_mut();
         if state
             .as_ref()
@@ -142,6 +159,11 @@ impl Generator for ControlGenerator {
         let model = &state.as_ref().expect("control model initialized").1;
         let mut images = Vec::new();
         for index in 0..request.count {
+            candle_gen::execution::draw(
+                "image_initial_noise",
+                request.seed.unwrap_or(0).wrapping_add(index as u64),
+                index as usize,
+            );
             let control_request = Krea2ControlRequest {
                 guidance: request.guidance,
                 negative_prompt: request.negative_prompt.clone(),

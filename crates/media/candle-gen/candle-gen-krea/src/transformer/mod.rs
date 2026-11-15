@@ -750,6 +750,7 @@ impl Krea2Transformer {
 
         // Image patch embed + changing timestep front-end; text projection/RoPE are request-owned.
         let img = self.embed_image(latent)?; // [b, img_len, hidden]
+        candle_gen::execution::component_runtime("krea/transformer", img.device(), img.dtype());
         let (t, tvec) = self.prepared_time_front_end(timestep)?;
 
         // Fuse to the joint sequence and run the single-stream stack under the joint RoPE.
@@ -914,6 +915,7 @@ impl Krea2Transformer {
 
         // Target image tokens change per denoise step; text/reference tokens were prepared once.
         let img = self.embed_image(latent)?;
+        candle_gen::execution::component_runtime("krea/transformer", img.device(), img.dtype());
         let (t, tvec) = self.prepared_time_front_end(timestep)?;
 
         // Joint sequence `[ctx, refs…, target]` (references BEFORE the noise — the Krea2Edit contract).

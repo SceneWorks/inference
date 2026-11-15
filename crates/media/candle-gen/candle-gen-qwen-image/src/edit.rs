@@ -235,6 +235,7 @@ pub(crate) fn load_transformer(
     cancel: &CancelFlag,
 ) -> Result<QwenTransformer> {
     let cfg = TransformerConfig::qwen_image();
+
     let dit_dir = root.join("transformer");
     // The DiT packed-detects each `Linear`: an MLX-packed edit tier (`SceneWorks/qwen-image-edit-2511
     // -mlx` q4/q8) loads straight from the packed parts at the `group_size` read from
@@ -376,6 +377,7 @@ fn tokenizer_json_path(root: &Path) -> Result<PathBuf> {
 /// component pair or the two deferred phase loaders. The image processor, tokenizer, and
 /// `zero_cond_t` flag are cheap and always resident.
 pub struct QwenEdit {
+    unobserved_adapter_count: usize,
     device: Device,
     residency: candle_gen::Residency<EditText, EditHeavy>,
     lifecycle: Mutex<()>,
@@ -516,6 +518,7 @@ impl QwenEdit {
         );
 
         Ok(Self {
+            unobserved_adapter_count: paths.adapters.len(),
             zero_cond_t: read_zero_cond_t(&root)?,
             device,
             residency,
@@ -652,7 +655,8 @@ impl QwenEdit {
         let pos = self.encode_prompt(vl_encoder, &req.prompt, edit_img.n_image_tokens, &vision)?;
         // CFG-off on the lightning path: the distill LoRA is CFG-distilled, so a single forward per
         // step (no negative branch) — matching the MLX lightning recipe (sc-6220).
-        let neg = if req.guidance != 1.0 {
+        let guidance = candle_gen::execution::f32_policy("qwen/direct_guidance", req.guidance);
+        let neg = if guidance != 1.0 {
             let n = if req.negative.trim().is_empty() {
                 NEGATIVE_FALLBACK
             } else {
@@ -832,6 +836,26 @@ impl QwenEdit {
     /// **first** drives the VL prompt embeds, **all** are VAE-encoded into the dual-latent sequence,
     /// and the **last** sets the condition resolution (the fork's `_compute_dimensions`). The residency
     /// owner supplies either warm components or phased loads to these same encode/render bodies.
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_execution_report(
+        &self,
+        req: &QwenEditRequest,
+        references: &[Image],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::unobserved_adapters(self.unobserved_adapter_count, "QwenEdit");
+            candle_gen::execution::policy("direct_route", "qwen-image/edit/generate".into());
+            let image = self
+                .generate(req, references, &mut report_progress)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate(
         &self,
         req: &QwenEditRequest,
@@ -854,6 +878,30 @@ impl QwenEdit {
     /// Execute the exact request admitted at load. The retained context, load-time adapter profile,
     /// request geometry, reference count, recipe, and translated execution controls are rechecked
     /// while the lifecycle lock is held. A final device fence runs on success, cancellation, or error.
+    ///
+    /// Complete this standalone route with observations from this same attempt.
+    pub fn generate_with_memory_context_with_execution_report(
+        &self,
+        context: &MemoryRunContext,
+        req: &QwenEditRequest,
+        references: &[Image],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+        candle_gen::execution::capture_direct(&crate::descriptor(), &req.cancel, || {
+            candle_gen::execution::unobserved_adapters(self.unobserved_adapter_count, "QwenEdit");
+            candle_gen::execution::policy(
+                "direct_route",
+                "qwen-image/edit/generate_with_memory_context".into(),
+            );
+            let image = self
+                .generate_with_memory_context(context, req, references, &mut report_progress)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+        })
+    }
+
     pub fn generate_with_memory_context(
         &self,
         context: &MemoryRunContext,

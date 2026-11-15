@@ -180,6 +180,7 @@ impl FluxRefBackbone {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
     ) -> Result<(Tensor, Tensor)> {
+        self.pipeline.observe_adapter_provenance();
         candle_gen::check_cancel(cancel)?;
         if let Some(components) = &self.components {
             let encoded = candle_gen::gen_core::with_prompt_encoding(on_progress, || {

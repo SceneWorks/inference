@@ -1,0 +1,20 @@
+[package]
+name = "sceneworks-gen-core-supra2-policy"
+version = "0.1.0"
+edition = "2021"
+description = "Portable Supra2 request defaults and compatibility policy, with no tokenizer or runtime dependencies."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+
+[lib]
+name = "gen_core_supra2_policy"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[[example]]
+name = "wasm_corpus"
+crate-type = ["cdylib"]

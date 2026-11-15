@@ -865,6 +865,7 @@ impl QwenTransformer {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        crate::observe_component_precision("dit", &self.device, self.dtype);
         let temb = self
             .time_embed
             .forward(timestep, &self.device, self.dtype)?;
@@ -908,6 +909,7 @@ impl QwenTransformer {
         residuals: Option<&[Tensor]>,
         control_scale: f32,
     ) -> Result<Tensor> {
+        crate::observe_component_precision("dit", &self.device, self.dtype);
         let temb = self
             .time_embed
             .forward(timestep, &self.device, self.dtype)?;
@@ -1010,6 +1012,7 @@ impl QwenTransformer {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        crate::observe_component_precision("dit", &self.device, self.dtype);
         let img_seq = hidden_states.dim(1)?;
         let hidden = self.img_in.forward(hidden_states)?;
         let encoder = __model_proof_output!(self.txt_norm.forward(encoder_hidden_states))?;
@@ -1242,6 +1245,7 @@ impl QwenTransformer {
         control: Option<(&QwenFunControlBranch, &Tensor)>,
         control_scale: f32,
     ) -> Result<Tensor> {
+        crate::observe_component_precision("dit", &self.device, self.dtype);
         let temb = self
             .time_embed
             .forward(timestep, &self.device, self.dtype)?;
@@ -1264,6 +1268,9 @@ impl QwenTransformer {
                 let hints = branch.forward(
                     &hidden, &encoder, cc, &temb, &img_cos, &img_sin, &txt_cos, &txt_sin,
                 )?;
+                if let Some(hint) = hints.first() {
+                    crate::observe_component_precision("controlnet", hint.device(), hint.dtype());
+                }
                 Some(
                     hints
                         .iter()
