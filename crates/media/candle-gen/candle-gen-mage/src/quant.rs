@@ -45,11 +45,31 @@ pub(crate) fn component_quant(component: PrecisionFloorComponent, selected: Quan
     effective_component_quant(COMPONENT_PRECISION_FLOORS, component, selected)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum LoadedQuant {
+    Known(Option<Quant>),
+    PackedSource,
+}
+
+impl LoadedQuant {
+    pub(crate) fn from_loaded(
+        selected: Option<Quant>,
+        transformer_has_packed_source: bool,
+        text_has_packed_source: bool,
+    ) -> Self {
+        if transformer_has_packed_source || text_has_packed_source {
+            Self::PackedSource
+        } else {
+            Self::Known(selected)
+        }
+    }
+}
+
 /// Capture a direct Mage output with the tier retained after both quantized components loaded.
 pub(crate) fn capture_direct_with_loaded_quant(
     descriptor: &candle_gen::gen_core::ModelDescriptor,
     cancel: &candle_gen::gen_core::CancelFlag,
-    loaded_quant: Option<Quant>,
+    loaded_quant: LoadedQuant,
     adapter_count: usize,
     owner: &'static str,
     route: &'static str,
@@ -57,7 +77,14 @@ pub(crate) fn capture_direct_with_loaded_quant(
 ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
     candle_gen::execution::capture_direct(descriptor, cancel, || {
         candle_gen::execution::unobserved_adapters(adapter_count, owner);
-        candle_gen::execution::policy("loaded/loaded_quant", format!("{loaded_quant:?}").into());
+        match loaded_quant {
+            LoadedQuant::Known(quant) => {
+                candle_gen::execution::policy("loaded/loaded_quant", format!("{quant:?}").into());
+            }
+            LoadedQuant::PackedSource => candle_gen::execution::unavailable(
+                "Mage packed checkpoint may retain mixed projection widths; the direct loader does not attest every effective loaded quantization tier",
+            ),
+        }
         candle_gen::execution::policy("direct_route", route.into());
         body()
     })
@@ -144,7 +171,7 @@ mod execution_tests {
                 let completed = capture_direct_with_loaded_quant(
                     &descriptor,
                     &candle_gen::gen_core::CancelFlag::default(),
-                    quant,
+                    LoadedQuant::from_loaded(quant, false, false),
                     0,
                     "Mage fixture",
                     route,
@@ -174,6 +201,41 @@ mod execution_tests {
             }
             assert_ne!(identities[0], identities[1], "None and Q4 must differ");
             assert_ne!(identities[1], identities[2], "Q4 and Q8 must differ");
+        }
+    }
+
+    #[test]
+    fn packed_components_refuse_unattested_direct_execution() {
+        for (quant, transformer_packed, text_packed) in [
+            (None, true, false),
+            (Some(Quant::Q4), false, true),
+            (Some(Quant::Q8), true, false),
+        ] {
+            let completed = capture_direct_with_loaded_quant(
+                &crate::descriptor(),
+                &candle_gen::gen_core::CancelFlag::default(),
+                LoadedQuant::from_loaded(quant, transformer_packed, text_packed),
+                0,
+                "Mage fixture",
+                "mage/pipeline/generate",
+                || {
+                    candle_gen::execution::draw("fixture", 1, 0);
+                    candle_gen::execution::rng_scheme("fixture-metadata-v1");
+                    candle_gen::execution::schedule("fixture", &[1.0, 0.0], "fixture");
+                    candle_gen::execution::runtime(&Device::Cpu, candle_core::DType::F32);
+                    Ok(GenerationOutput::Images(vec![Image {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![0; 3],
+                    }]))
+                },
+            )
+            .expect("a synthetic image still produces a completed report");
+            assert!(matches!(
+                completed.execution,
+                candle_gen::gen_core::generator::ExecutionIdentity::Unavailable { reason }
+                    if reason.missing_facts.iter().any(|fact| fact.contains("mixed projection widths"))
+            ));
         }
     }
 }

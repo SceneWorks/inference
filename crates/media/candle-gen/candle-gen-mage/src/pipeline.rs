@@ -23,7 +23,7 @@ pub(crate) struct MageHeavy {
 
 pub struct MagePipeline {
     unobserved_adapter_count: usize,
-    loaded_quant: Option<Quant>,
+    loaded_quant: crate::quant::LoadedQuant,
     text: MageTextEncoder,
     transformer: MageTransformer,
     vae: MageVae,
@@ -59,15 +59,17 @@ impl MagePipeline {
             transformer.visit_adaptable_mut(visitor)
         })
         .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        let text =
+            MageTextEncoder::load_component_with_quant(&dirs.text_encoder, false, quant, device)?;
+        let loaded_quant = crate::quant::LoadedQuant::from_loaded(
+            quant,
+            transformer.has_packed_source(),
+            text.has_packed_source(),
+        );
         Ok(Self {
             unobserved_adapter_count: adapters.len(),
-            loaded_quant: quant,
-            text: MageTextEncoder::load_component_with_quant(
-                &dirs.text_encoder,
-                false,
-                quant,
-                device,
-            )?,
+            loaded_quant,
+            text,
             transformer,
             vae: MageVae::load(&dirs.vae, device)?,
         })

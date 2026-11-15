@@ -575,6 +575,7 @@ impl Block {
 }
 
 pub struct MageTransformer {
+    packed_source: bool,
     image_in: QLinear,
     text_norm: Tensor,
     text_in: QLinear,
@@ -843,6 +844,7 @@ impl MageTransformer {
             )?);
         }
         Ok(Self {
+            packed_source: weights.packed().is_some(),
             image_in: linear(weights, "img_in", true)?,
             text_norm: weights.get("txt_norm.weight")?,
             text_in: linear(weights, "txt_in", true)?,
@@ -891,6 +893,7 @@ impl MageTransformer {
             weights = Weights::from_dir(dir, target_device, DType::BF16)?;
         }
         let mut transformer = Self {
+            packed_source: weights.packed().is_some(),
             image_in: linear(&weights, "img_in", true)?,
             text_norm: weights.get("txt_norm.weight")?,
             text_in: linear(&weights, "txt_in", true)?,
@@ -946,6 +949,10 @@ impl MageTransformer {
                 .unwrap_or(0)
             + usize::from(self.final_mod.is_quantized())
             + usize::from(self.output.is_quantized())
+    }
+
+    pub(crate) fn has_packed_source(&self) -> bool {
+        self.packed_source
     }
 
     /// Inputs are packed `[1, image_tokens, 128]`, `[1, text_tokens, 2560]`, and one sigma per
