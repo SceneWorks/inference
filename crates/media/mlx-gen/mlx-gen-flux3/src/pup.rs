@@ -174,7 +174,9 @@ pub fn effective_prompt(
         &req.cancel,
         on_progress,
     )?;
-    req.prompt_enhancement.emit(outcome.report.clone());
+    mlx_gen::image_execution::without_capture(|| {
+        req.prompt_enhancement.emit(outcome.report.clone())
+    });
     Ok(outcome)
 }
 
