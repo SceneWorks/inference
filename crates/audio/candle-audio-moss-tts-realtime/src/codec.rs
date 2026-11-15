@@ -1177,6 +1177,11 @@ impl MossAudioCodec {
         }
         let debug = std::env::var_os("MOSS_CODEC_DEBUG").is_some();
         let mut x = self.quantizer.decode(&rows, &self.device)?;
+        candle_audio::execution::runtime(&self.device, x.dtype());
+        candle_audio::execution::policy(
+            "moss-realtime-codec",
+            serde_json::json!({"block_frames":frames.len(),"prior_frames":state.decoded_frames,"quantizers":nq,"context_duration":self.config.context_duration}),
+        );
         if debug {
             eprintln!(
                 "[codec] incremental block at frame {} after quantizer: {:?} rms={:.5}",
@@ -1218,6 +1223,31 @@ impl MossAudioCodec {
         Ok(Some(wav))
     }
 
+    /// Complete native PCM decoding while preserving the legacy optional waveform result.
+    pub fn decode_incremental_with_execution_report(
+        &self,
+        state: &mut MossAudioDecodeState,
+        frames: &[Vec<u32>],
+        cancel: &dyn Fn() -> bool,
+    ) -> candle_audio::Result<candle_audio::execution::CompletedNative<Option<Vec<f32>>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            cancel,
+            || {
+                candle_audio::execution::unavailable("native codec input frames have no bound originating generation receipt; the warm decode state is not exported as a replay identity");
+                self.decode_incremental(state, frames, &|| {
+                    candle_audio::execution::callback(cancel)
+                })
+                .map_err(candle_audio::AudioError::from)
+            },
+            |value| {
+                value.as_ref().map(|pcm| {
+                    candle_audio::execution::NativeOutput::pcm(pcm, self.sample_rate(), 1)
+                })
+            },
+        )
+    }
+
     /// Decode RVQ frames (`frames[f][q]` = codebook `q`'s code at frame `f`) into interleaved mono
     /// PCM. This one-shot entry point deliberately drives the same request-local incremental decoder
     /// in the caller's request-chosen partition schedule as live synthesis. The shared schedule
@@ -1257,6 +1287,33 @@ impl MossAudioCodec {
         }
         debug_assert_eq!(wav.len(), capacity);
         Ok(Some(wav))
+    }
+
+    /// Complete native PCM decoding while preserving the legacy optional waveform result.
+    pub fn decode_frames_with_execution_report(
+        &self,
+        frames: &[Vec<u32>],
+        schedule: DecodePartitionSchedule,
+        cancel: &dyn Fn() -> bool,
+    ) -> candle_audio::Result<candle_audio::execution::CompletedNative<Option<Vec<f32>>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            cancel,
+            || {
+                candle_audio::execution::unavailable(
+                    "native codec input frames have no bound originating generation receipt",
+                );
+                self.decode_frames(frames, schedule, &|| {
+                    candle_audio::execution::callback(cancel)
+                })
+                .map_err(candle_audio::AudioError::from)
+            },
+            |value| {
+                value.as_ref().map(|pcm| {
+                    candle_audio::execution::NativeOutput::pcm(pcm, self.sample_rate(), 1)
+                })
+            },
+        )
     }
 
     /// Encode a mono waveform into the codec's `num_code_quantizers` RVQ codes per frame — the

@@ -461,6 +461,11 @@ impl WanVae16 {
         preflight_streaming_decode(cancel, || self.reset_caches())?;
         let z = self.unnormalize(z)?;
         let t_lat = z.dim(2)?;
+        candle_gen::execution::runtime(z.device(), z.dtype());
+        candle_gen::execution::policy(
+            "wan_z16_causal_decode",
+            serde_json::json!({"latent_frames": t_lat, "chunk_latent_frames": 1, "spatial_shape": [z.dim(3)?, z.dim(4)?]}),
+        );
         // Collect the per-frame decoded chunks and `cat` once (sc-9037): cat-ing onto a growing
         // accumulator each iteration re-copies every prior frame → O(T²) copy traffic and briefly
         // holds old+new. A single `Tensor::cat` at the end is O(T) and equivalent (same frames, same
@@ -565,7 +570,12 @@ impl WanVae16 {
         let out_f = 1 + (f as i32 - 1) * Self::VAE_TILING.temporal_scale; // causal ×4
         let out_h = h as i32 * Self::VAE_TILING.spatial_scale; // ×8
         let out_w = w as i32 * Self::VAE_TILING.spatial_scale;
-        match wan_z16_decode_plan(out_h, out_w, out_f, max_tile_edge)? {
+        let plan = wan_z16_decode_plan(out_h, out_w, out_f, max_tile_edge)?;
+        candle_gen::execution::policy(
+            "wan_z16_decode",
+            serde_json::json!({"plan": format!("{plan:?}"), "causal_streaming": true}),
+        );
+        match plan {
             Some(cfg) => self.decode_tiled_with_cancel(z, &cfg, cancel),
             None => self.decode_with_cancel(z, cancel),
         }

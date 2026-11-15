@@ -13,6 +13,8 @@
 use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{matmul, multiply, split};
 use mlx_rs::Array;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use mlx_gen::array::scalar;
 use mlx_gen::attention::{sdpa_budgeted_bhsd, AttentionBudget, AttentionPlan};
@@ -21,6 +23,50 @@ use mlx_gen::{CancelFlag, Result};
 use mlx_gen_flux::transformer::DitImageInjector;
 
 const EPS: f32 = 1e-5;
+
+/// Facts observed at the injector seam during one completed PuLID attempt.
+#[derive(Default)]
+pub(crate) struct CaActivity {
+    forward_entered: AtomicBool,
+    attention_used: AtomicBool,
+    attention_chunked: AtomicBool,
+}
+
+impl CaActivity {
+    pub(crate) fn record_forward(&self) {
+        self.forward_entered.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn forward_entered(&self) -> bool {
+        self.forward_entered.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn attention_used(&self) -> bool {
+        self.attention_used.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn attention_chunked(&self) -> bool {
+        self.attention_chunked.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_attention(
+        &self,
+        id_weight: f32,
+        budget: AttentionBudget,
+        b: i32,
+        h: i32,
+        sq: i32,
+        sk: i32,
+    ) {
+        if id_weight == 0.0 {
+            return;
+        }
+        self.attention_used.store(true, Ordering::Relaxed);
+        if budget.query_block(b, h, sq, sk) < sq {
+            self.attention_chunked.store(true, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Cross-attention block: q from `latents` (image tokens, dim=3072), k/v from `x` (id_embedding,
 /// kv_dim=2048). All linears bias-free.
@@ -107,6 +153,7 @@ pub struct PulidCa {
     n_double_inject: usize,
     bounded_attention: bool,
     cancel: CancelFlag,
+    activity: Option<Arc<CaActivity>>,
 }
 
 impl PulidCa {
@@ -137,12 +184,18 @@ impl PulidCa {
             n_double_inject,
             bounded_attention: false,
             cancel: CancelFlag::default(),
+            activity: None,
         })
     }
 
     pub fn with_bounded_attention(mut self, cancel: CancelFlag, enabled: bool) -> Self {
         self.cancel = cancel;
         self.bounded_attention = enabled;
+        self
+    }
+
+    pub(crate) fn with_activity(mut self, activity: Arc<CaActivity>) -> Self {
+        self.activity = Some(activity);
         self
     }
 
@@ -178,17 +231,23 @@ impl PulidCa {
 
 impl DitImageInjector for PulidCa {
     fn after_double(&self, block_idx: usize, img_hidden: &Array) -> Result<Option<Array>> {
+        if let Some(activity) = &self.activity {
+            activity.record_forward();
+        }
         if self.id_weight == 0.0 {
             return Ok(None); // bit-identical to plain FLUX
         }
         match self.double_ca_idx(block_idx) {
-            Some(ca_idx) => Ok(Some(self.scaled(
-                self.ca[ca_idx].forward_with_attention(
+            Some(ca_idx) => {
+                let attention = self.attention();
+                let residual = self.ca[ca_idx].forward_with_attention(
                     &self.id_embedding,
                     img_hidden,
-                    self.attention(),
-                )?,
-            )?)),
+                    attention,
+                )?;
+                self.record_attention(&self.ca[ca_idx], img_hidden, attention);
+                Ok(Some(self.scaled(residual)?))
+            }
             None => Ok(None),
         }
     }
@@ -202,14 +261,60 @@ impl DitImageInjector for PulidCa {
             return Ok(None);
         }
         match self.single_ca_idx(block_idx) {
-            Some(ca_idx) => Ok(Some(self.scaled(
-                self.ca[ca_idx].forward_with_attention(
+            Some(ca_idx) => {
+                let attention = self.attention();
+                let residual = self.ca[ca_idx].forward_with_attention(
                     &self.id_embedding,
                     img_tokens,
-                    self.attention(),
-                )?,
-            )?)),
+                    attention,
+                )?;
+                self.record_attention(&self.ca[ca_idx], img_tokens, attention);
+                Ok(Some(self.scaled(residual)?))
+            }
             None => Ok(None),
         }
+    }
+}
+
+impl PulidCa {
+    fn record_attention(
+        &self,
+        ca: &PerceiverAttentionCA,
+        image: &Array,
+        attention: AttentionPlan<'_>,
+    ) {
+        if let Some(activity) = &self.activity {
+            let shape = image.shape();
+            activity.record_attention(
+                self.id_weight,
+                attention.budget,
+                shape[0],
+                ca.heads,
+                shape[1],
+                self.id_embedding.shape()[1],
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    #[test]
+    fn zero_strength_and_small_shapes_do_not_claim_chunked_ca() {
+        let activity = CaActivity::default();
+        activity.record_forward();
+        activity.record_attention(0.0, AttentionBudget::CONSTRAINED, 1, 16, 1024, 32);
+        assert!(activity.forward_entered());
+        assert!(!activity.attention_used());
+        assert!(!activity.attention_chunked());
+
+        activity.record_attention(1.0, AttentionBudget::CONSTRAINED, 1, 16, 1024, 32);
+        assert!(activity.attention_used());
+        assert!(!activity.attention_chunked());
+
+        activity.record_attention(1.0, AttentionBudget::CONSTRAINED, 1, 16, 1_000_000, 32);
+        assert!(activity.attention_chunked());
     }
 }

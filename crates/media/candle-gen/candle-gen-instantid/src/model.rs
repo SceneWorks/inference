@@ -148,6 +148,38 @@ pub const REQUIRED_COMPONENTS: &[&str] = &[
     COMPONENT_VAE_FP16_FIX,
 ];
 
+/// A report-only identity for the bespoke InstantID route. This does not register InstantID as a
+/// generic generator; its direct entry points still own loading and execution.
+fn report_descriptor() -> candle_gen::gen_core::ModelDescriptor {
+    let mut descriptor = candle_gen_sdxl::descriptor();
+    descriptor.id = MODEL_ID;
+    descriptor.family = "instantid";
+    descriptor.required_components = REQUIRED_COMPONENTS;
+    descriptor
+}
+
+fn record_loaded_unet_compute(device: &Device) {
+    // Both the initial load and resident reload construct the UNet on this device at DTYPE.
+    candle_gen::execution::runtime(device, DTYPE);
+}
+
+fn capture_instantid_action(
+    cancel: &CancelFlag,
+    action: &'static str,
+    selected_adapters: usize,
+    on_progress: &mut dyn FnMut(Progress),
+    run: impl FnOnce(&mut dyn FnMut(Progress)) -> Result<Image>,
+) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+    let descriptor = report_descriptor();
+    let mut report_progress = |event| candle_gen::execution::outside_attempt(|| on_progress(event));
+    candle_gen::execution::capture_direct(&descriptor, cancel, || {
+        candle_gen::execution::policy("direct_route", action.into());
+        candle_gen::execution::unobserved_adapters(selected_adapters, "instantid/loaded_sdxl_unet");
+        let image = run(&mut report_progress).map_err(candle_gen::gen_core::Error::from)?;
+        Ok(candle_gen::gen_core::GenerationOutput::Images(vec![image]))
+    })
+}
+
 /// The three SDXL component sources InstantID needs (the CLIP tokenizers + the fp16-fix VAE), resolved
 /// **and validated** from a [`gen_core::LoadSpec`](candle_gen::gen_core::LoadSpec) at load via
 /// [`SdxlComponents::from_spec`]. Fields are private: `from_spec` is the ONLY constructor, so an
@@ -910,6 +942,123 @@ impl InstantId {
         result
     }
 
+    pub fn generate_with_execution_report(
+        &mut self,
+        req: &InstantIdRequest,
+        reference: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        capture_instantid_action(
+            &req.cancel,
+            "instantid/generate",
+            self.reload.paths.adapters.len(),
+            on_progress,
+            |progress| self.generate(req, reference, progress),
+        )
+    }
+
+    pub fn generate_angle_with_execution_report(
+        &mut self,
+        req: &InstantIdRequest,
+        reference: &Image,
+        view_angle: &str,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        capture_instantid_action(
+            &req.cancel,
+            "instantid/generate_angle",
+            self.reload.paths.adapters.len(),
+            on_progress,
+            |progress| self.generate_angle(req, reference, view_angle, progress),
+        )
+    }
+
+    pub fn generate_with_kps_with_execution_report(
+        &mut self,
+        req: &InstantIdRequest,
+        reference: &Image,
+        kps_norm: &[(f32, f32)],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        capture_instantid_action(
+            &req.cancel,
+            "instantid/generate_with_kps",
+            self.reload.paths.adapters.len(),
+            on_progress,
+            |progress| self.generate_with_kps(req, reference, kps_norm, progress),
+        )
+    }
+
+    pub fn generate_with_parameters_with_execution_report(
+        &mut self,
+        req: &InstantIdRequest,
+        embedding: &[f32],
+        kps: &[(f32, f32)],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        capture_instantid_action(
+            &req.cancel,
+            "instantid/generate_with",
+            self.reload.paths.adapters.len(),
+            on_progress,
+            |progress| self.generate_with(req, embedding, kps, progress),
+        )
+    }
+
+    pub fn generate_pose_with_execution_report(
+        &mut self,
+        req: &InstantIdRequest,
+        reference: &Image,
+        keypoints: &[BodyPoint],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        capture_instantid_action(
+            &req.cancel,
+            "instantid/generate_pose",
+            self.reload.paths.adapters.len(),
+            on_progress,
+            |progress| self.generate_pose(req, reference, keypoints, progress),
+        )
+    }
+
+    pub fn generate_pose_with_parameters_with_execution_report(
+        &mut self,
+        req: &InstantIdRequest,
+        embedding: &[f32],
+        face_kps: Option<&[(f32, f32)]>,
+        keypoints: &[BodyPoint],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        capture_instantid_action(
+            &req.cancel,
+            "instantid/generate_pose_with",
+            self.reload.paths.adapters.len(),
+            on_progress,
+            |progress| self.generate_pose_with(req, embedding, face_kps, keypoints, progress),
+        )
+    }
+
+    pub fn restore_face_with_execution_report(
+        &mut self,
+        req: &InstantIdRequest,
+        base: &Image,
+        embedding: &[f32],
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        capture_instantid_action(
+            &req.cancel,
+            "instantid/restore_face",
+            self.reload.paths.adapters.len(),
+            on_progress,
+            |progress| {
+                candle_gen::execution::unavailable(
+                    "instantid/restore_face composites a prior base image whose execution identity is not supplied to this route",
+                );
+                self.restore_face(req, base, embedding, progress)
+            },
+        )
+    }
+
     /// Full T2I: letterbox the reference to the output size (the sc-2009 kps-distortion rule), detect
     /// the largest face, then generate. Requires [`with_face`](Self::with_face).
     pub fn generate(
@@ -1039,7 +1188,13 @@ impl InstantId {
         self.unet
             .as_mut()
             .ok_or_else(|| CandleError::Msg("instantid: UNet is not resident".into()))?
-            .set_ip_context(Some(&face_tokens), req.ip_adapter_scale as f64)?;
+            .set_ip_context(
+                Some(&face_tokens),
+                candle_gen::execution::f64_policy(
+                    "instantid/ip_adapter_scale",
+                    req.ip_adapter_scale as f64,
+                ),
+            )?;
 
         let control_ctx = ControlContext {
             controlnet: Self::require(&self.identitynet, "IdentityNet")?,
@@ -1063,6 +1218,15 @@ impl InstantId {
         // Decode the final latent: the native SDXL VAE by default, or the `sdxl` PiD student (4× SR)
         // when this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8373).
         let pid_decoder = self.pid_decoder_for(req)?;
+        candle_gen::execution::policy(
+            "instantid/decoder",
+            if pid_decoder.is_some() {
+                "pid-sdxl"
+            } else {
+                "native-sdxl-vae"
+            }
+            .into(),
+        );
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
         let image = decode_image(
             Self::require(&self.vae, "VAE")?,
@@ -1114,7 +1278,7 @@ impl InstantId {
     /// the prior and the per-step ancestral noise — drawn from a *separate* per-step stream — are
     /// reproducible). The prior stream is keyed by `seed`; the step stream by `seed + STEP_RNG_SALT`.
     fn seeded_prior_with(&self, seed: u64, width: u32, height: u32) -> Result<Tensor> {
-        let mut rng = StdRng::seed_from_u64(seed);
+        let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("instantid/prior", seed));
         seeded_prior(&self.sampler, &mut rng, width, height, &self.device, DTYPE)
     }
 
@@ -1140,6 +1304,8 @@ impl InstantId {
         controlnet_encoder: &Tensor,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
+        let unet = Self::require(&self.unet, "UNet")?;
+        record_loaded_unet_compute(&self.device);
         let sampler_name = req.sampler.as_deref().unwrap_or("euler_ancestral");
         let scheduler_curated = req
             .scheduler
@@ -1163,7 +1329,7 @@ impl InstantId {
                 candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, req.steps, &native);
             let prior = seeded_sigma_prior(req.seed, width, height, sigmas[0], &self.device)?;
             denoise_curated(
-                Self::require(&self.unet, "UNet")?,
+                unet,
                 Some(sampler_name),
                 &ms,
                 &sigmas,
@@ -1193,11 +1359,14 @@ impl InstantId {
             // bit-identical to the historical `denoise_ip_control`).
             let prior = self.seeded_prior_with(req.seed, width, height)?;
             let d = Denoiser {
-                unet: Self::require(&self.unet, "UNet")?,
+                unet,
                 sampler: &self.sampler,
             };
             let steps = self.sampler.timesteps(req.steps, self.sampler.max_time());
-            let mut rng = StdRng::seed_from_u64(req.seed.wrapping_add(STEP_RNG_SALT));
+            let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed(
+                "instantid/ancestral_step_noise",
+                req.seed.wrapping_add(STEP_RNG_SALT),
+            ));
             denoise_ip_multi_control(
                 &d,
                 prior,
@@ -1346,7 +1515,10 @@ impl InstantId {
         self.unet
             .as_mut()
             .ok_or_else(|| CandleError::Msg("instantid: UNet is not resident".into()))?
-            .set_ip_context(Some(&face_tokens), ip_scale)?;
+            .set_ip_context(
+                Some(&face_tokens),
+                candle_gen::execution::f64_policy("instantid/ip_adapter_scale", ip_scale),
+            )?;
 
         let op = self.openpose.as_ref().expect("openpose checked above");
         // MultiControlNet branch order matches the reference: [IdentityNet(kps), OpenPose(skeleton)].
@@ -1379,6 +1551,15 @@ impl InstantId {
         // Decode the final latent: the native SDXL VAE by default, or the `sdxl` PiD student (4× SR)
         // when this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8373).
         let pid_decoder = self.pid_decoder_for(req)?;
+        candle_gen::execution::policy(
+            "instantid/decoder",
+            if pid_decoder.is_some() {
+                "pid-sdxl"
+            } else {
+                "native-sdxl-vae"
+            }
+            .into(),
+        );
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
         let image = decode_image(
             Self::require(&self.vae, "VAE")?,
@@ -1411,11 +1592,23 @@ impl InstantId {
         self.release_conditioning_components()?;
         let dets = dets?;
         let Some(f) = dets.first() else {
+            candle_gen::execution::policy("instantid/restore_result", "no_face".into());
+            candle_gen::execution::unavailable(
+                "instantid/restore_face: no face was rendered; output is the input image",
+            );
             return Ok(base.clone()); // no face to restore — leave the base untouched
         };
 
         // Crop box: a square-ish window around the face center, padded ×1.9, clamped to the image.
         let [x1, y1, x2, y2] = f.bbox;
+        for (key, value) in [
+            ("instantid/restore_face_x1", x1),
+            ("instantid/restore_face_y1", y1),
+            ("instantid/restore_face_x2", x2),
+            ("instantid/restore_face_y2", y2),
+        ] {
+            candle_gen::execution::f32_policy(key, value);
+        }
         let (cx, cy) = ((x1 + x2) / 2.0, (y1 + y2) / 2.0);
         let half = (x2 - x1).max(y2 - y1) * FACE_RESTORE_CROP_PAD / 2.0;
         let ax = (cx - half).max(0.0) as usize;
@@ -1423,7 +1616,15 @@ impl InstantId {
         let right = (cx + half).min(base.width as f32) as usize;
         let bottom = (cy + half).min(base.height as f32) as usize;
         let (crop_w, crop_h) = (right.saturating_sub(ax), bottom.saturating_sub(ay));
+        candle_gen::execution::policy(
+            "instantid/restore_crop",
+            format!("{ax},{ay},{crop_w},{crop_h}").into(),
+        );
         if crop_w < 16 || crop_h < 16 {
+            candle_gen::execution::policy("instantid/restore_result", "degenerate_crop".into());
+            candle_gen::execution::unavailable(
+                "instantid/restore_face: crop was degenerate; output is the input image",
+            );
             return Ok(base.clone()); // degenerate crop — skip
         }
 
@@ -1456,6 +1657,7 @@ impl InstantId {
         let alpha = restore::feather_mask(crop_w, crop_h);
         let mut out = base.clone();
         restore::paste_alpha(&mut out, &small, crop_w, crop_h, ax, ay, &alpha);
+        candle_gen::execution::policy("instantid/restore_result", "composited".into());
         Ok(out)
     }
 }
@@ -1547,6 +1749,105 @@ fn place_face_kps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bespoke_report_capture_keeps_attempts_isolated_and_refuses_unobserved_adapters() {
+        use candle_gen::gen_core::generator::ExecutionIdentity;
+
+        let descriptor = report_descriptor();
+        assert_eq!(descriptor.id, MODEL_ID);
+        assert_eq!(descriptor.backend, "candle");
+
+        let image = || Image {
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0],
+        };
+        let observed = || {
+            candle_gen::execution::rng_scheme("fixture-std-rng");
+            candle_gen::execution::seed("instantid/prior", 7);
+            candle_gen::execution::schedule("fixture-ancestral", &[1.0, 0.0], "epsilon");
+            candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+            Ok(image())
+        };
+        let cancel = CancelFlag::new();
+        let first = capture_instantid_action(&cancel, "instantid/generate", 0, &mut |_| {}, |_| {
+            observed()
+        })
+        .expect("completed fixture image");
+        assert!(matches!(
+            first.execution,
+            ExecutionIdentity::Resolved { .. }
+        ));
+
+        let missing =
+            capture_instantid_action(&cancel, "instantid/generate_pose", 0, &mut |_| {}, |_| {
+                Ok(image())
+            })
+            .expect("completed fixture image");
+        assert!(matches!(
+            missing.execution,
+            ExecutionIdentity::Unavailable { .. }
+        ));
+
+        let adapter =
+            capture_instantid_action(&cancel, "instantid/restore_face", 1, &mut |_| {}, |_| {
+                observed()
+            })
+            .expect("completed fixture image");
+        assert!(matches!(
+            adapter.execution,
+            ExecutionIdentity::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn direct_report_records_loaded_unet_precision_in_its_own_attempt() {
+        use candle_gen::gen_core::generator::{ExecutionFact, ExecutionIdentity};
+
+        let cancel = CancelFlag::new();
+        let complete = |record_unet| {
+            capture_instantid_action(&cancel, "instantid/generate", 0, &mut |_| {}, |_| {
+                candle_gen::execution::rng_scheme("fixture-std-rng");
+                candle_gen::execution::seed("instantid/prior", 7);
+                candle_gen::execution::schedule("fixture-ancestral", &[1.0, 0.0], "epsilon");
+                if record_unet {
+                    record_loaded_unet_compute(&Device::Cpu);
+                }
+                candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+                Ok(Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                })
+            })
+            .expect("completed fixture image")
+        };
+
+        let with_unet = complete(true);
+        let ExecutionIdentity::Resolved { identity } = with_unet.execution else {
+            panic!("the observed direct action should have a resolved identity")
+        };
+        let ExecutionFact::Resolved { value } = identity.quality_policy else {
+            panic!("compute policy should be resolved")
+        };
+        assert_eq!(value["compute"].as_array().map(Vec::len), Some(2));
+        assert_eq!(value["compute"][0]["device"].as_str(), Some("Cpu"));
+        assert_eq!(value["compute"][0]["dtype"].as_str(), Some("F16"));
+        assert_eq!(value["compute"][1]["device"].as_str(), Some("Cpu"));
+        assert_eq!(value["compute"][1]["dtype"].as_str(), Some("F32"));
+
+        let without_unet = complete(false);
+        let ExecutionIdentity::Resolved { identity } = without_unet.execution else {
+            panic!("the later fixture action should have a resolved identity")
+        };
+        let ExecutionFact::Resolved { value } = identity.quality_policy else {
+            panic!("compute policy should be resolved")
+        };
+        assert_eq!(value["compute"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["compute"][0]["device"].as_str(), Some("Cpu"));
+        assert_eq!(value["compute"][0]["dtype"].as_str(), Some("F32"));
+    }
 
     struct RecordingScope(Rc<RefCell<Vec<String>>>);
 

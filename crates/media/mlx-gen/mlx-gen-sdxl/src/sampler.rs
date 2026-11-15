@@ -343,6 +343,22 @@ impl<'a> AncestralEuler<'a> {
 }
 
 impl DiffusionSampler for AncestralEuler<'_> {
+    fn execution_schedule(&self) -> Option<(&'static str, Vec<f32>)> {
+        // Store the exact source table and consumed time pairs. Interpolation uses the sampler's
+        // compute dtype (including f16 delta rounding), so host-interpolated sigmas would not
+        // faithfully describe its coefficients. Truncation preserves the nonzero terminal pair.
+        let mut values = vec![
+            if self.inner.ancestral { 1.0 } else { 0.0 },
+            mlx_gen::sampler::sampling_dtype_code(self.inner.dtype) as f32,
+            self.inner.sigmas.len() as f32,
+        ];
+        values.extend_from_slice(&self.inner.sigmas);
+        for &(time, previous) in &self.schedule {
+            values.extend([time, previous]);
+        }
+        Some(("sdxl-euler-time-pairs-sigma-table-v1", values))
+    }
+
     fn num_steps(&self) -> usize {
         self.schedule.len()
     }
@@ -364,6 +380,36 @@ impl DiffusionSampler for AncestralEuler<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_schedule_preserves_truncated_endpoint_and_sigma_source() {
+        let inner = EulerSampler {
+            sigmas: vec![0.0, 0.5, 1.5, 3.0],
+            ancestral: true,
+            dtype: Dtype::Float16,
+        };
+        let full = AncestralEuler {
+            inner: &inner,
+            schedule: vec![(3.0, 2.0), (2.0, 1.0), (1.0, 0.0)],
+        };
+        let (_, full_values) = full.execution_schedule().unwrap();
+        let truncated = full.truncate_to(2);
+        let (encoding, values) = truncated.execution_schedule().unwrap();
+        assert_eq!(encoding, "sdxl-euler-time-pairs-sigma-table-v1");
+        assert_eq!(&values[..7], &[1.0, 1.0, 4.0, 0.0, 0.5, 1.5, 3.0]);
+        assert_eq!(&values[7..], &[3.0, 2.0, 2.0, 1.0]);
+        assert_ne!(values, full_values);
+        let other = EulerSampler {
+            sigmas: vec![0.0, 0.6, 1.5, 3.0],
+            ancestral: true,
+            dtype: Dtype::Float16,
+        };
+        let changed = AncestralEuler {
+            inner: &other,
+            schedule: truncated.schedule.clone(),
+        };
+        assert_ne!(values, changed.execution_schedule().unwrap().1);
+    }
 
     #[test]
     fn constructors_return_ok_for_valid_config() {

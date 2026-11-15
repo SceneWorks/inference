@@ -29,29 +29,30 @@ use sha2::{Digest, Sha256};
 
 use crate::pth::{PthArchive, PthDtype, PthTensor, PthValue};
 use gen_core::{Error, GenerationRequest, GenerationWarning, Result};
+pub use gen_core_supra2_policy::cfg_enabled;
 
-/// Registry id of the text-to-image provider.
-pub const PROVIDER_ID: &str = "supra2_img";
 /// Provider family.
-pub const FAMILY: &str = "supra2";
+pub use gen_core_supra2_policy::FAMILY;
+/// Registry id of the text-to-image provider.
+pub use gen_core_supra2_policy::PROVIDER_ID;
 /// `LoadSpec::components` id carrying the `google/flan-t5-base` snapshot directory.
 pub const TEXT_ENCODER_COMPONENT: &str = "text_encoder";
 /// `LoadSpec::components` id carrying the `stabilityai/sd-vae-ft-mse` snapshot directory.
 pub const VAE_COMPONENT: &str = "vae";
 
-/// The only published output resolution (square).
-pub const IMAGE_SIZE: u32 = 256;
+pub use gen_core_supra2_policy::DEFAULT_GUIDANCE;
+pub use gen_core_supra2_policy::DEFAULT_SEED;
 /// Recommended defaults (`inference.py` argparse defaults and the model card).
-pub const DEFAULT_STEPS: u32 = 50;
-pub const DEFAULT_GUIDANCE: f32 = 3.0;
-pub const DEFAULT_SEED: u64 = 0;
+pub use gen_core_supra2_policy::DEFAULT_STEPS;
+/// The only published output resolution (square).
+pub use gen_core_supra2_policy::IMAGE_SIZE;
 /// Images per request. Upstream's `--n` has no cap; this bounds one request's latent batch.
-pub const MAX_IMAGES: u32 = 64;
+pub use gen_core_supra2_policy::MAX_IMAGES;
 /// SD VAE latent scaling (`VAE_SCALE`).
 pub const VAE_SCALE: f32 = 0.18215;
 /// Sampler / scheduler names advertised on the descriptor.
-pub const SAMPLER: &str = "euler";
-pub const SCHEDULER: &str = "supra2_uniform_flow";
+pub use gen_core_supra2_policy::SAMPLER;
+pub use gen_core_supra2_policy::SCHEDULER;
 /// The prompt context: upstream tokenizes with `truncation=True, max_length=128`, so a longer prompt
 /// conditions on its first 128 Flan-T5 tokens (the last one `</s>`). Advertised on both backends'
 /// descriptors as `Capabilities::max_prompt_tokens`.
@@ -996,58 +997,29 @@ pub struct Supra2Resolved {
 }
 
 impl Supra2Resolved {
-    /// Apply defaults and refuse what the published interface does not have. Call after the
-    /// descriptor's shared `Capabilities::validate_request` floor.
+    /// Apply the same portable request policy used by browser validation.
     pub fn resolve(req: &GenerationRequest) -> Result<Self> {
-        if req.width != IMAGE_SIZE || req.height != IMAGE_SIZE {
-            return Err(Error::Unsupported(format!(
-                "supra2: native resolution is {IMAGE_SIZE}x{IMAGE_SIZE} only (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        if req
-            .negative_prompt
-            .as_deref()
-            .is_some_and(|n| !n.is_empty())
-        {
-            return Err(Error::Unsupported(
-                "supra2: negative prompts are not part of the published interface (CFG uses the checkpoint's unconditional embedding)".into(),
-            ));
-        }
-        if !req.prompt_batch.is_empty() || !req.conditioning.is_empty() {
-            return Err(Error::Unsupported(
-                "supra2: one text prompt per request; prompt batches and image conditioning are unsupported".into(),
-            ));
-        }
-        let steps = req.steps.unwrap_or(DEFAULT_STEPS);
-        if steps == 0 {
-            return Err(Error::Unsupported(
-                "supra2: steps must be at least 1".into(),
-            ));
-        }
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-        if !guidance.is_finite() {
-            return Err(Error::Unsupported("supra2: guidance must be finite".into()));
-        }
-        let count = req.count.max(1);
-        if count > MAX_IMAGES {
-            return Err(Error::Unsupported(format!(
-                "supra2: at most {MAX_IMAGES} images per request (got {count})"
-            )));
-        }
-        Ok(Self {
-            steps,
-            guidance,
-            use_cfg: cfg_enabled(guidance),
-            seed: req.seed.unwrap_or(DEFAULT_SEED),
-            count,
-        })
+        let request = gen_core_supra2_policy::Supra2PolicyRequest {
+            width: req.width,
+            height: req.height,
+            count: req.count,
+            steps: req.steps,
+            guidance: req.guidance,
+            seed: req.seed,
+            negative_prompt: req.negative_prompt.clone(),
+            prompt_batch_present: !req.prompt_batch.is_empty(),
+            conditioning_present: !req.conditioning.is_empty(),
+        };
+        gen_core_supra2_policy::Supra2Resolved::resolve(&request)
+            .map(|resolved| Self {
+                steps: resolved.steps,
+                guidance: resolved.guidance,
+                use_cfg: resolved.use_cfg,
+                seed: resolved.seed,
+                count: resolved.count,
+            })
+            .map_err(|error| Error::Unsupported(error.0))
     }
-}
-
-/// Upstream's guidance branching: CFG runs only when `cfg > 1.0`.
-pub fn cfg_enabled(guidance: f32) -> bool {
-    guidance > 1.0
 }
 
 /// `v_uncond + g · (v_cond − v_uncond)` (host reference of the device-side mix).

@@ -16,6 +16,7 @@ name = "gen_core_moss_image"
 # The backend-neutral contract this crate builds on. Sibling crates depend on gen-core; gen-core
 # never depends on them (sc-27316). Tensor-free, like gen-core.
 sceneworks-gen-core = { workspace = true }
+sceneworks-gen-core-moss-image-policy = { workspace = true }
 sceneworks-gen-core-train = { workspace = true }
 # Training-recovery input decode.
 image = { workspace = true, features = ["bmp", "gif", "tiff", "webp"] }

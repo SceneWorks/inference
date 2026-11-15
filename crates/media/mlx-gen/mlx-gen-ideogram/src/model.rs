@@ -126,6 +126,7 @@ pub struct Ideogram4 {
     /// The numeric tier this load runs at, kept for the contract's own safety gate.
     precision: Precision,
     quant: Option<Quant>,
+    adapters: Vec<mlx_gen::AdapterSpec>,
     residency: Residency<Ideogram4Text, Ideogram4HeavyOwned>,
 }
 
@@ -162,6 +163,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(IDEOGRAM_4_ID, spec)?,
         precision: spec.precision,
         quant: spec.quantize,
+        adapters: spec.adapters.clone(),
         residency: build_residency(spec, false)?,
     }))
 }
@@ -199,6 +201,7 @@ pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         )?,
         precision: spec.precision,
         quant: spec.quantize,
+        adapters: spec.adapters.clone(),
         residency: build_residency(spec, true)?,
     }))
 }
@@ -328,7 +331,7 @@ impl Generator for Ideogram4 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     /// sc-22732: the loaded generator publishes its artifact-proven contract, which is what the
@@ -362,6 +365,43 @@ impl Generator for Ideogram4 {
             context,
         )
     }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug("Ideogram4.precision", &self.precision);
+                mlx_gen::image_execution::policy_debug("Ideogram4.quant", &self.quant);
+                mlx_gen::image_execution::policy_debug(
+                    "Ideogram4.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "Ideogram4.applied_adapter_controls",
+                    &self.adapters,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl Ideogram4 {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
 }
 
 impl Ideogram4 {
@@ -388,6 +428,7 @@ impl Ideogram4 {
         };
         let steps = req.steps.unwrap_or(default_steps) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        mlx_gen::image_execution::scalar("ideogram.guidance", guidance);
         let base_seed = req.seed.unwrap_or_else(default_seed);
         // Edit (img2img / inpaint): resolve a source `Reference` (+ optional `Mask`); the VAE encode
         // happens in the heavy render closure (the VAE is a heavy-phase component). `None` → T2I.

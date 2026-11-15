@@ -16,7 +16,7 @@
 //! through the same decode here ([`enhance`]), differing only in model + [`SampleParams`]. The
 //! decode is the shared MLX engine's token-at-a-time loop ([`generate_speculative`] with
 //! [`NoProposer`], epic sc-24432 E8) over the Gemma-3 decoder, drawing every token through the
-//! media pipelines' draw policy ([`sample_token`]: mlx-llm's heap-order host reference, from the
+//! media pipelines' draw policy ([`sample_token`](mlx_gen::text_sample::sample_token): mlx-llm's heap-order host reference, from the
 //! pipeline's own seeded [`SplitMix64`]) so a seeded enhancement is token-identical to the
 //! pre-engine loop drawing the same way.
 //!
@@ -41,8 +41,10 @@ use mlx_llm::{CausalLm, PrefixCache};
 // The token-draw knobs + the media pipelines' draw policy over mlx-llm's shared sampler and seeded
 // PRNG live in the core crate's `text_sample` module (sc-9561 / F-105, sc-24446) so the lens
 // PromptReasoner shares them. `SampleParams` stays part of this crate's public API via the re-export.
+#[cfg(test)]
+use mlx_gen::text_sample::sample_token;
 pub use mlx_gen::text_sample::SampleParams;
-use mlx_gen::text_sample::{sample_token, SplitMix64};
+use mlx_gen::text_sample::SplitMix64;
 
 use crate::gemma::{GemmaKvCache, GemmaModel};
 use crate::tokenizer::LtxTokenizer;
@@ -216,8 +218,27 @@ impl SpeculativeTarget for Gemma3Target<'_> {
     }
 }
 
+/// Observe consumed uniforms without changing the seeded stream or greedy fallbacks.
+struct EnhanceRng {
+    rng: SplitMix64,
+    seed: u64,
+    offset: u64,
+}
+impl mlx_llm::primitives::TokenRng for EnhanceRng {
+    fn next_f32(&mut self) -> f32 {
+        let value = self.rng.next_f32();
+        mlx_gen::video_execution::draw(
+            0,
+            &format!("ltx_gemma3_splitmix64_uniform_{}", self.offset),
+            self.seed,
+        );
+        self.offset += 1;
+        value
+    }
+}
+
 /// The LTX-2.3 enhancer's draw on the engine's sampler seam: the media pipelines' draw
-/// [`sample_token`] (mlx-llm's heap-order host reference) over the logits row and the running
+/// [`sample_token`](mlx_gen::text_sample::sample_token) (mlx-llm's heap-order host reference) over the logits row and the running
 /// prompt + generated history, from the pipeline's own seeded [`SplitMix64`] — its repetition
 /// penalty, top-k and nucleus follow the reference `make_sampler` / `make_logits_processors`, not
 /// mlx-llm's device sampler. It reads the history (the penalty window), so the engine never
@@ -226,7 +247,7 @@ struct EnhanceSampler<'a> {
     knobs: &'a SampleParams,
     /// The same knobs in the engine's vocabulary (reported, never drawn from).
     params: SamplingParams,
-    rng: SplitMix64,
+    rng: EnhanceRng,
     draws: u64,
     /// The last token drawn — on a stop-token end, the stop token the engine does not emit.
     last: Option<i32>,
@@ -246,7 +267,11 @@ impl<'a> EnhanceSampler<'a> {
                 repetition_penalty: knobs.repetition_penalty.unwrap_or(1.0),
                 repetition_context: knobs.repetition_context,
             },
-            rng: SplitMix64::new(seed),
+            rng: EnhanceRng {
+                rng: SplitMix64::new(seed),
+                seed,
+                offset: 0,
+            },
             draws: 0,
             last: None,
         }
@@ -269,8 +294,16 @@ impl TokenSampler for EnhanceSampler<'_> {
                 "the LTX-2.3 enhancer sampler takes no constraint mask".into(),
             ));
         }
-        let token = sample_token(logits, history, self.knobs, &mut self.rng)
-            .map_err(|e| mlx_llm::Error::Msg(e.to_string()))?;
+        // Same heap-order reference as text_sample::sample_token; the wrapper observes only
+        // consumed uniforms, including neither greedy nor degenerate-distribution fallbacks.
+        let token = mlx_llm::primitives::sample(
+            logits,
+            history,
+            &self.knobs.to_sampling(),
+            &mut self.rng,
+            None,
+        )
+        .map_err(|e| mlx_llm::Error::Msg(format!("text sample: {e}")))?;
         self.draws += 1;
         self.last = Some(token);
         Ok(SampledToken::Host(token))
@@ -330,6 +363,12 @@ fn decode_gemma3(
         return Err(Error::Canceled);
     }
     let mut draw = EnhanceSampler::new(sampler, cfg.seed);
+    mlx_gen::video_execution::sampling(
+        "ltx_gemma3_enhancer",
+        "categorical_splitmix64",
+        "autoregressive_tokens",
+        serde_json::json!({"sampling":format!("{sampler:?}"),"max_tokens":cfg.max_tokens}),
+    );
     let generation = GenerationConfig {
         max_new_tokens: cfg.max_tokens,
         sampling: draw.params,
@@ -518,6 +557,12 @@ fn decode_gemma4(
         Gemma4EnhancePrefill::Multimodal { input_ids, .. } => input_ids,
     };
     let generation = gemma4_generation(cfg);
+    mlx_gen::video_execution::sampling(
+        "ltx_gemma4_enhancer",
+        "greedy",
+        "autoregressive_tokens",
+        serde_json::json!({"max_tokens":cfg.max_tokens,"no_repeat_ngram":GEMMA4_NO_REPEAT_NGRAM}),
+    );
     let mut no_repeat = NoRepeatNgram::new(GEMMA4_NO_REPEAT_NGRAM, history.clone(), vocab_size);
     let decode_cancel = mlx_llm::CancelFlag::new();
     let bridged_cancel = decode_cancel.clone();
@@ -643,6 +688,21 @@ pub fn enhance_gemma4(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observed_enhancer_rng_preserves_splitmix64_draws() {
+        use mlx_llm::primitives::TokenRng as _;
+        let mut observed = EnhanceRng {
+            rng: SplitMix64::new(u64::MAX),
+            seed: u64::MAX,
+            offset: 0,
+        };
+        let mut original = SplitMix64::new(u64::MAX);
+        for _ in 0..32 {
+            assert_eq!(observed.next_f32().to_bits(), original.next_f32().to_bits());
+        }
+        assert_eq!(observed.offset, 32);
+    }
 
     /// The pre-engine LTX-2.3 enhancement loop (sc-2845), verbatim but for its tokenizer: the
     /// oracle the engine port must reproduce token for token (E1/E8). It returns the generated ids

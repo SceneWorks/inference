@@ -64,8 +64,7 @@ use core_llm::{
 use crate::decode::cancel::CancelFlag;
 use crate::decode::speculative::SpeculativeStats;
 use crate::decode::stream::{
-    default_seed, ConstraintMask, FinishReason, GenerationConfig, GenerationOutput,
-    GenerationTimer, StreamEvent,
+    ConstraintMask, FinishReason, GenerationConfig, GenerationOutput, GenerationTimer, StreamEvent,
 };
 use crate::decode::{BufferRelease, Decode};
 use crate::error::{Error, Result};
@@ -708,7 +707,7 @@ impl MlxSampler {
     /// The sampler a [`GenerationConfig`] asks for (its knobs, its seed or a fresh one) — the same
     /// seeded stream [`generate`](super::generate) draws from.
     pub fn from_config(config: &GenerationConfig) -> Self {
-        Self::new(config.sampling, config.seed.unwrap_or_else(default_seed))
+        Self::new(config.sampling, config.execution_seed())
     }
 
     fn penalized(&self) -> bool {
@@ -731,6 +730,7 @@ impl MlxSampler {
 impl TokenSampler for MlxSampler {
     fn begin_generation(&mut self, prompt_len: usize) -> Result<()> {
         self.params.presence_penalty_prompt_len = prompt_len;
+        core_llm::token_execution::observe_token_prompt_boundary(prompt_len);
         Ok(())
     }
 

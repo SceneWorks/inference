@@ -1139,6 +1139,7 @@ fn assemble(
         variant,
         descriptor: descriptor_for(variant),
         tier: spec.quantize,
+        adapters: spec.adapters.clone(),
         memory_strategy_contract,
         residency,
     }))
@@ -1281,6 +1282,7 @@ pub struct MageFlow {
     variant: MageVariant,
     descriptor: ModelDescriptor,
     tier: Option<Quant>,
+    adapters: Vec<mlx_gen::AdapterSpec>,
     memory_strategy_contract: MemoryProviderContract,
     residency: Residency<crate::MageTextEncoder, MageHeavyOwned>,
 }
@@ -1481,6 +1483,42 @@ impl Generator for MageFlow {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug("MageFlow.tier", &self.tier);
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "MageFlow.applied_adapter_controls",
+                    &self.adapters,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "MageFlow.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl MageFlow {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         self.validate(req)?;
         if req.memory.is_none() {
             crate::memory::ensure_generation_fits(
@@ -1496,11 +1534,13 @@ impl Generator for MageFlow {
         }
         let steps = req.steps.unwrap_or(self.variant.default_steps());
         let cfg = req.guidance.unwrap_or(self.variant.default_cfg());
+        mlx_gen::image_execution::scalar("mage.cfg", cfg);
         let seed = req.seed.unwrap_or(0) as i64;
         let key = resolve_gs_key(None)?;
         let negative_prompt = req.negative_prompt.as_deref().unwrap_or(" ");
         let memory = req.memory.unwrap_or_default();
         let stage_residency = memory.stage_residency;
+        mlx_gen::image_execution::policy_debug("mage.stage_residency", &stage_residency);
         let streamable = memory.stream_transformer_blocks;
         if self.variant.is_edit() {
             let references = edit_references(req)?;

@@ -581,6 +581,7 @@ impl Pipeline {
             .map(|s| s as usize)
             .unwrap_or_else(|| self.variant.default_steps());
         let cfg_scale = req.guidance.unwrap_or_else(|| self.variant.default_cfg());
+        candle_gen::execution::policy("sd3/pipeline/cfg_scale", format!("{cfg_scale:?}").into());
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / VAE_SCALE) as usize;
         let lat_w = (req.width / VAE_SCALE) as usize;
@@ -653,6 +654,7 @@ impl Pipeline {
             .map(|value| value as usize)
             .unwrap_or_else(|| self.variant.default_steps());
         let cfg_scale = req.guidance.unwrap_or_else(|| self.variant.default_cfg());
+        candle_gen::execution::policy("sd3/pipeline/cfg_scale", format!("{cfg_scale:?}").into());
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let latent_hw = (
             (req.height / VAE_SCALE) as usize,
@@ -706,6 +708,7 @@ impl Pipeline {
         for index in 0..req.count {
             candle_gen::check_cancel(&req.cancel)?;
             let seed = base_seed.wrapping_add(u64::from(index));
+            candle_gen::execution::draw("image_initial_noise", seed, index as usize);
             let preview = request_preview(req);
             latents.push(denoise_latents(
                 &denoiser,
@@ -734,7 +737,8 @@ impl Pipeline {
         let decoder =
             SynchronizedPhase::new(self.load_decoder()?, self.device.clone(), "decoder VAE");
         let mut images = Vec::with_capacity(latents.len());
-        for latent in &latents {
+        for (output_index, latent) in latents.iter().enumerate() {
+            candle_gen::execution::output_index(output_index);
             candle_gen::check_cancel(&req.cancel)?;
             on_progress(Progress::Decoding);
             images.push(decode_image(&decoder, latent)?);
@@ -794,7 +798,7 @@ pub(crate) fn render_core(
     // sc-3673 parity — deterministic, launch-portable initial noise: N(0,1) from a CPU RNG seeded by
     // `seed`, built on CPU then moved to the device.
     let n = LATENT_CHANNELS * lat_h * lat_w;
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("sd3/pipeline", seed));
     let noise = candle_gen::seeded_normal_vec(&mut rng, n);
     let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
         .to_device(&device)?
@@ -876,7 +880,7 @@ fn denoise_latents(
     let (lat_h, lat_w) = latent_hw;
     let sigmas = resolve_sd3_sigmas(scheduler, steps, shift);
     let n = LATENT_CHANNELS * lat_h * lat_w;
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("sd3/pipeline", seed));
     let noise = candle_gen::seeded_normal_vec(&mut rng, n);
     let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
         .to_device(&device)?

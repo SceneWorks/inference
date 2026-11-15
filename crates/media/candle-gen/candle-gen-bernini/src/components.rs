@@ -13,6 +13,22 @@ use candle_gen_wan::text_encoder::Umt5Encoder;
 use candle_gen_wan::transformer::WanTransformer;
 use gen_core_tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 
+/// The loader applies the selected stack, but does not retain a byte-bound record of the
+/// per-expert targets and strengths. A completed adapted render cannot claim exact identity.
+pub(crate) fn capture_renderer_execution<G: candle_gen::gen_core::Generator + ?Sized>(
+    generator: &G,
+    req: &candle_gen::gen_core::GenerationRequest,
+    on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    selected_adapter_count: usize,
+) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+    candle_gen::execution::capture_with(generator, req, on_progress, || {
+        candle_gen::execution::unobserved_adapters(
+            selected_adapter_count,
+            "candle-gen-bernini renderer",
+        );
+    })
+}
+
 const COMPONENT_PLAN: [(&str, DType); 4] = [
     ("text_encoder", DType::F32),
     ("transformer", DType::BF16),
@@ -141,6 +157,63 @@ fn tokenizer_error(provider_id: &str, detail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::gen_core::generator::ExecutionIdentity;
+    use candle_gen::gen_core::{
+        GenerationOutput, GenerationRequest, Generator, Image, ModelDescriptor, Progress,
+    };
+
+    struct ReportFixture(ModelDescriptor);
+
+    impl Generator for ReportFixture {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.0
+        }
+        fn validate(&self, _req: &GenerationRequest) -> candle_gen::gen_core::Result<()> {
+            Ok(())
+        }
+        fn generate(
+            &self,
+            _req: &GenerationRequest,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> candle_gen::gen_core::Result<GenerationOutput> {
+            candle_gen::execution::rng_scheme("bernini-report-fixture");
+            candle_gen::execution::draw("initial_noise", 7, 0);
+            candle_gen::execution::without_schedule("fixture", "single-step", "flow");
+            candle_gen::execution::policy("decoder", serde_json::json!("mock"));
+            candle_gen::execution::runtime(&Device::Cpu, DType::F32);
+            Ok(GenerationOutput::Video {
+                frames: vec![Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 3],
+                }],
+                fps: 1,
+                audio: None,
+            })
+        }
+    }
+
+    #[test]
+    fn both_bernini_routes_refuse_unobserved_adapter_stacks() {
+        for descriptor in [crate::pipeline::descriptor(), crate::bernini::descriptor()] {
+            let fixture = ReportFixture(descriptor);
+            let req = GenerationRequest::default();
+            let clean = capture_renderer_execution(&fixture, &req, &mut |_| {}, 0).unwrap();
+            assert!(matches!(
+                clean.execution,
+                ExecutionIdentity::Resolved { .. }
+            ));
+            let adapted = capture_renderer_execution(&fixture, &req, &mut |_| {}, 2).unwrap();
+            let ExecutionIdentity::Unavailable { reason } = adapted.execution else {
+                panic!("an adapted Bernini render needs an installation receipt")
+            };
+            assert_eq!(reason.code, "candle_execution_observation_incomplete");
+            assert!(reason
+                .missing_facts
+                .iter()
+                .any(|fact| fact.contains("selected adapter count 2")));
+        }
+    }
 
     #[test]
     fn shared_component_surface_is_exact() {

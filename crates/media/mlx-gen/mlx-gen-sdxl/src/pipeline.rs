@@ -845,6 +845,8 @@ fn denoise_core(
     control_encoder: Option<&Array>,
 ) -> Result<Array> {
     let steps = d.sampler.num_steps();
+    let execution_schedule = d.sampler.execution_schedule();
+    observe_denoise_policy(d.plan, cfg, controls, ip, inpaint.is_some());
     // A zero-step denoise (img2img at strength ≤ 1/steps) is a no-op: return the init latents
     // unchanged, matching the reference's `int(num_steps · strength)` loop count. Guards the
     // degenerate schedule and the σ=0 ancestral step that would otherwise NaN.
@@ -862,6 +864,7 @@ fn denoise_core(
                 ("state_elements", latents.size() as u64),
             ],
         );
+        observe_native_sampling(execution_schedule.as_ref(), latents.dtype());
         return Ok(latents);
     }
     // sc-2963 (rollout of sc-2957): fuse the UNet's SiLU activations via `mx.compile` — bit-exact in
@@ -1005,6 +1008,7 @@ fn denoise_core(
             total,
         });
     }
+    observe_native_sampling(execution_schedule.as_ref(), latents.dtype());
     Ok(latents)
 }
 
@@ -1094,7 +1098,7 @@ pub fn denoise_curated_with_preview(
     let cn_enc = control_encoder.unwrap_or(conditioning);
     let preview_counter = mlx_gen::preview::PreviewCounter::new(sigmas);
     let mut evaluation = 0u64;
-    mlx_gen::run_curated_sampler_with_latent_hook(
+    let out = mlx_gen::run_curated_sampler_with_latent_hook(
         mlx_gen::SamplerRun {
             sampler_name,
             sigmas,
@@ -1154,7 +1158,16 @@ pub fn denoise_curated_with_preview(
             );
             Ok(eps)
         },
-    )
+    )?;
+    observe_denoise_policy(plan, cfg, controls, ip, false);
+    mlx_gen::image_execution::sampled_native_from_primary_seed(
+        mlx_gen::sampler::canonical_solver(sampler_name, mlx_gen::Solver::Euler).name(),
+        "discrete-epsilon-ve-sigma",
+        out.dtype(),
+        sigmas,
+        "mlx-global-normal-initial-v1;curated-step=seed+golden-ratio*(step+1),wrapping-u64",
+    );
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1228,7 +1241,7 @@ pub fn denoise_cfgpp_with_preview(
     let cn_enc = control_encoder.unwrap_or(conditioning);
     let preview_counter = mlx_gen::preview::PreviewCounter::new(sigmas);
     let mut evaluation = 0u64;
-    mlx_gen::run_cfgpp_sampler_with_latent_hook(
+    let out = mlx_gen::run_cfgpp_sampler_with_latent_hook(
         mlx_gen::SamplerRun {
             sampler_name: base_sampler_name,
             sigmas,
@@ -1277,7 +1290,67 @@ pub fn denoise_cfgpp_with_preview(
             );
             Ok((guided, eps_neg))
         },
-    )
+    )?;
+    observe_denoise_policy(plan, cfg, controls, ip, false);
+    mlx_gen::image_execution::sampled_native_from_primary_seed(
+        &format!(
+            "{}_cfg++",
+            base_sampler_name
+                .and_then(mlx_gen::Solver::from_name)
+                .filter(|solver| mlx_gen::gen_core::sampling::base_supports_cfgpp(*solver))
+                .unwrap_or(mlx_gen::Solver::Euler)
+                .name()
+        ),
+        "discrete-epsilon-ve-sigma",
+        out.dtype(),
+        sigmas,
+        "mlx-global-normal-initial-v1;curated-step=seed+golden-ratio*(step+1),wrapping-u64",
+    );
+    Ok(out)
+}
+
+fn observe_native_sampling(schedule: Option<&(&str, Vec<f32>)>, dtype: mlx_rs::Dtype) {
+    match schedule {
+        Some((encoding, values)) => mlx_gen::image_execution::sampled_native_from_primary_seed(
+            encoding,
+            "native-sampler-scalar-state",
+            dtype,
+            values,
+            "mlx-global-normal-initial-v1;subsequent-draws=resolved-sampler-policy",
+        ),
+        None => mlx_gen::image_execution::unavailable(
+            "native_sampler_schedule_unobserved",
+            "the instantiated native sampler does not expose its consumed scalar state",
+            "schedule",
+        ),
+    }
+}
+
+fn observe_denoise_policy(
+    plan: crate::plan::SdxlForwardPlan<'_>,
+    cfg: f32,
+    controls: &[ControlContext],
+    ip: Option<(&Array, f32)>,
+    inpaint: bool,
+) {
+    mlx_gen::image_execution::policy_debug("sdxl-family.attention", &plan.attention.budget);
+    mlx_gen::image_execution::policy_debug(
+        "sdxl-family.window",
+        &plan.window.map(|window| window.size),
+    );
+    mlx_gen::image_execution::policy_debug("sdxl-family.cfg_batching", &plan.cfg_batching);
+    mlx_gen::image_execution::policy_debug("sdxl-family.inpaint", &inpaint);
+    mlx_gen::image_execution::scalar("sdxl-family.guidance", cfg);
+    mlx_gen::image_execution::policy_debug(
+        "sdxl-family.control_scales",
+        &controls
+            .iter()
+            .map(|control| control.scale.to_bits())
+            .collect::<Vec<_>>(),
+    );
+    if let Some((_, scale)) = ip {
+        mlx_gen::image_execution::scalar("sdxl-family.ip_scale", scale);
+    }
 }
 
 /// Actual callback arguments on either curated route. Evaluation is the real callback ordinal,

@@ -104,6 +104,7 @@ pub struct QwenImage {
     memory_strategy: gen_core::MemoryProviderContract,
     precision: Precision,
     quant: Option<Quant>,
+    adapters: Vec<mlx_gen::AdapterSpec>,
 }
 
 /// The heavy render-phase components (the MMDiT transformer, the VAE, and the optional PiD decoder) —
@@ -177,6 +178,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         precision: spec.precision,
         quant: spec.quantize,
+        adapters: spec.adapters.clone(),
     }))
 }
 
@@ -312,7 +314,7 @@ impl Generator for QwenImage {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -343,6 +345,43 @@ impl Generator for QwenImage {
             context,
         )
     }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug("QwenImage.precision", &self.precision);
+                mlx_gen::image_execution::policy_debug("QwenImage.quant", &self.quant);
+                mlx_gen::image_execution::policy_debug(
+                    "QwenImage.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                mlx_gen::image_execution::applied_adapter_controls(
+                    "QwenImage.applied_adapter_controls",
+                    &self.adapters,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl QwenImage {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
 }
 
 impl QwenImage {
@@ -369,6 +408,8 @@ impl QwenImage {
         // Shared step/sampler/guidance/seed resolution (F-117); `req.sampler == "lightning"` selects
         // the few-step recipe, else the production resolution-dependent schedule.
         let params = resolve_run_params(req, req.width, req.height)?;
+        mlx_gen::image_execution::scalar("qwen-image.guidance", params.guidance);
+        mlx_gen::image_execution::policy_debug("qwen-image.lightning", &params.is_lightning);
         // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
         // `start_step = 0` for pure txt2img (the fork's `Config.init_time_step`).
         let reference = resolve_reference(req, MODEL_ID)?;

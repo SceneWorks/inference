@@ -1462,6 +1462,11 @@ pub fn apply_minimax_h3_adapters_with(
     report
         .trainer_alphas
         .dedup_by(|left, right| *left == *right);
+    mlx_gen::video_execution::adapter_stack(
+        "h3_applied_adapters",
+        serde_json::json!({"outcome":format!("{report:?}")}),
+        report.applied,
+    );
     Ok(report)
 }
 

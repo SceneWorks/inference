@@ -303,7 +303,7 @@ impl PackedForward {
 
 /// All the per-step guidance knobs (the omegas are already `omega_scale`-rescaled when the low-noise
 /// expert is active — done by the caller).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct GuidanceParams {
     pub omega_vid: f32,
     pub omega_img: f32,
@@ -510,7 +510,7 @@ pub struct VitStreams<'a> {
 
 /// Per-step ViT-conditioned guidance knobs (already `omega_scale`-rescaled by the caller when the
 /// low-noise expert is active).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct VitGuidanceParams {
     pub omega_txt: f32,
     pub omega_img: f32,

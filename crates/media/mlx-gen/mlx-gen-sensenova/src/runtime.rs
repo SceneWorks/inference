@@ -30,6 +30,7 @@
 //! token-identical to the pre-engine loops. The pipeline's cancel is bridged onto the engine's
 //! flag, so a cancel ends a rollout as the engine's typed `Cancelled` finish.
 
+use mlx_llm::core_llm::token_execution as execution;
 use std::cell::RefCell;
 
 use mlx_rs::{Array, Dtype};
@@ -459,6 +460,12 @@ impl Qwen3Backbone {
             seed: Some(sampler.seed()),
             stop_tokens: stops.to_vec(),
         };
+        execution::observe_token_seed(
+            generation.sampling.to_core(),
+            sampler.seed(),
+            max_new_tokens,
+            stops,
+        );
         let start = cache.offset();
         // The engine's history is the penalty window and the stochastic draw reads none; the prefix
         // (spliced image rows included) is its length in placeholder ids.
@@ -508,6 +515,7 @@ impl Qwen3Backbone {
             mlx_llm::Error::Canceled => Error::Canceled,
             e => Error::Msg(format!("sensenova text decode: {e}")),
         })?;
+        execution::observe_decode(&run.report);
         if run.output.finish_reason == FinishReason::Cancelled {
             return Err(Error::Canceled);
         }

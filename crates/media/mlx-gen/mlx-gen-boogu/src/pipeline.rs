@@ -966,6 +966,16 @@ impl BooguHeavy {
                 total,
             });
         }
+        mlx_gen::image_execution::sampled_native_with_rng(
+            "boogu-dmd-predict-renoise-v1",
+            "clean-fraction",
+            lat.dtype(),
+            &sigmas[start..],
+            seed,
+            "mlx-keyed-normal-v1;initial=seed;renoise=seed+step,wrapping-u64",
+        );
+        mlx_gen::image_execution::scalar("boogu.turbo_guidance", guidance);
+        mlx_gen::image_execution::policy_debug("boogu.turbo_start", &start);
         Ok(lat)
     }
 

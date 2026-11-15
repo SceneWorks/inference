@@ -88,6 +88,7 @@ pub struct ZImageTurboControl {
     /// `LoadSpec` at load so its asset facts describe the snapshot this generator actually loaded.
     memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
     loaded_tier: mlx_gen::gen_core::MemoryNumericTier,
+    adapters: Vec<mlx_gen::AdapterSpec>,
     /// Request-scoped residency shared with the base control variant.
     residency: Residency<TextEncoder, ZImageControlHeavyOwned>,
 }
@@ -319,6 +320,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     Ok(Box::new(ZImageTurboControl {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
         loaded_tier,
+        adapters: spec.adapters.clone(),
         descriptor: descriptor(),
         tokenizer,
         residency,
@@ -386,6 +388,15 @@ impl ZImageTurboControl {
             block_window,
             encoder_window,
         } = pipeline::resolve_request_rungs(req, &self.memory_strategy, MODEL_ID)?;
+        mlx_gen::image_execution::policy_debug("stage_residency", &stage_residency);
+        mlx_gen::image_execution::policy_debug("streamable", &streamable);
+        mlx_gen::image_execution::policy_debug("decode_tiling", &tiling);
+        mlx_gen::image_execution::policy_debug("attention_budget", &attention_budget);
+        mlx_gen::image_execution::policy_debug("transformer_window", &block_window);
+        mlx_gen::image_execution::policy_debug(
+            "encoder_window",
+            &encoder_window.map(|scope| scope.window),
+        );
         let images = self.residency.run_staged_request_scoped(
             stage_residency,
             streamable,
@@ -536,7 +547,25 @@ impl Generator for ZImageTurboControl {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_impl(req, on_progress).map_err(Into::into)
+        })
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_attempt(&self.descriptor, &req.cancel, || {
+            mlx_gen::image_execution::applied_adapter_controls(
+                "ZImageTurboControl.applied_adapter_controls",
+                &self.adapters,
+            );
+            let mut progress =
+                |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+            self.generate_impl(req, &mut progress).map_err(Into::into)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {

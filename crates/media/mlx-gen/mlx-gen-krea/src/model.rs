@@ -33,6 +33,17 @@ use crate::pipeline::{
 /// `payload.model` and the manifest `engine_id` (sc-7572).
 pub const KREA_2_TURBO_ID: &str = "krea_2_turbo";
 
+/// Strict loader application makes these loaded controls effective on every completed render.
+pub(crate) fn applied_adapter_controls(
+    adapters: &[AdapterSpec],
+) -> Vec<(usize, mlx_gen::runtime::AdapterKind, f32)> {
+    adapters
+        .iter()
+        .enumerate()
+        .map(|(index, adapter)| (index, adapter.kind, adapter.scale))
+        .collect()
+}
+
 /// Qwen3-VL-4B conditioning architecture shared by every Krea 2 route.
 pub const TOKENIZER_CONTRACT: mlx_gen::gen_core::EncoderTokenizerContract =
     mlx_gen::gen_core::EncoderTokenizerContract {
@@ -1186,6 +1197,43 @@ impl Generator for Krea {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug("Krea.precision", &self.precision);
+                mlx_gen::image_execution::policy_debug("Krea.quant", &self.quant);
+                mlx_gen::image_execution::policy_debug(
+                    "Krea.applied_adapter_controls",
+                    &applied_adapter_controls(&self.adapters),
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Krea.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl Krea {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -1302,6 +1350,10 @@ impl Krea {
     /// steps, schedule and PiD capture, the reference roles, the CFG knobs and the multi-phase plan.
     fn resolve_request<'r>(&self, req: &'r GenerationRequest) -> Result<KreaRequest<'r>> {
         let transformer_window_size = resolve_transformer_window(req, self.streamable_transformer)?;
+        mlx_gen::image_execution::policy_debug(
+            "krea.transformer_window_size",
+            &transformer_window_size,
+        );
         let base_seed = req.seed.unwrap_or_else(default_seed);
         // Variant read back off the descriptor id: Raw = full-CFG undistilled (52-step, dynamic-mu);
         // Turbo = CFG-free distilled (8-step, fixed mu). One `Krea` struct, two render paths. The edit
@@ -1389,6 +1441,8 @@ impl Krea {
             .unwrap_or(if is_raw { DEFAULT_RAW_GUIDANCE } else { 0.0 });
         let negative = req.negative_prompt.clone().unwrap_or_default();
         let multiphase = self.resolve_multiphase(req, guidance)?;
+        mlx_gen::image_execution::scalar("krea.guidance", guidance);
+        mlx_gen::image_execution::policy_debug("krea.resolved_phases", &multiphase.phases);
         Ok(KreaRequest {
             req,
             transformer_window_size,
@@ -1556,13 +1610,9 @@ impl Krea {
             // hooks read. The one render body per path (sc-11101): the same
             // `KreaHeavy::render_*_from` for both residencies, so a Sequential job (text phase
             // already dropped) is byte-identical to Resident.
-            images.push(render_one(
-                heavy.heavy,
-                &plan,
-                request,
-                &opts,
-                decoder,
-                on_progress,
+            images.push(mlx_gen::image_execution::with_output_index(
+                n as usize,
+                || render_one(heavy.heavy, &plan, request, &opts, decoder, on_progress),
             )?);
         }
         Ok(GenerationOutput::Images(images))
@@ -1607,14 +1657,19 @@ impl Krea {
             // (`KreaHeavy::decode_latents`, pipeline.rs), where the produced latent and decoded image
             // actually exist; `opts` above carries the request-scoped `memory` + `provider_id` those
             // hooks read.
-            images.push(heavy.heavy.render_multiphase(
-                &plans,
-                full,
-                &opts,
-                decoder,
-                &req.cancel,
-                &req.preview,
-                on_progress,
+            images.push(mlx_gen::image_execution::with_output_index(
+                n as usize,
+                || {
+                    heavy.heavy.render_multiphase(
+                        &plans,
+                        full,
+                        &opts,
+                        decoder,
+                        &req.cancel,
+                        &req.preview,
+                        on_progress,
+                    )
+                },
             )?);
         }
         Ok(GenerationOutput::Images(images))
@@ -2220,6 +2275,29 @@ mod tests {
     use super::*;
     use mlx_gen::{AdapterKind, AdapterSpec, OffloadPolicy};
     use std::path::PathBuf;
+
+    #[test]
+    fn applied_adapter_controls_distinguish_scale_and_order() {
+        let first = AdapterSpec::new("/fixture/one".into(), 0.5, AdapterKind::Lora);
+        let second = AdapterSpec::new("/fixture/two".into(), 1.0, AdapterKind::Lokr);
+        let source = [first.clone(), second.clone()];
+        let scaled = [
+            AdapterSpec::new(first.path, 0.75, first.kind),
+            second.clone(),
+        ];
+        let reversed = [
+            second,
+            AdapterSpec::new("/fixture/one".into(), 0.5, AdapterKind::Lora),
+        ];
+        assert_ne!(
+            applied_adapter_controls(&source),
+            applied_adapter_controls(&scaled)
+        );
+        assert_ne!(
+            applied_adapter_controls(&source),
+            applied_adapter_controls(&reversed)
+        );
+    }
 
     /// The `generate_impl` body — the base t2i/img2img/edit/multi-phase render — as source text.
     /// The calibration-fault boundaries are structural claims about *where* in this body the fault

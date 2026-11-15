@@ -613,7 +613,11 @@ fn nsf_sine_bank(f0_frames: &[f32], seed: u64) -> (Vec<f32>, Vec<f32>, Vec<f32>)
     let len = f0_frames.len() * SAMPLES_PER_FRAME;
 
     // Random per-harmonic phase offset in [−π, π); the fundamental (h = 0) has no offset.
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_audio::execution::seed(
+        "chatterbox/hift.rs",
+        "rand-0.9-StdRng",
+        seed,
+    ));
     let mut phase_off = vec![0f32; dim];
     for slot in phase_off.iter_mut().skip(1) {
         let u: f32 = rng.random();
@@ -649,7 +653,11 @@ fn source_excitation_inner(
     let (sines, uv, _) = nsf_sine_bank(f0_frames, seed);
     let len = uv.len();
     // Additive noise is drawn after the sine phases (a fixed, deterministic RNG order).
-    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(1));
+    let mut rng = StdRng::seed_from_u64(candle_audio::execution::seed(
+        "chatterbox/hift.rs/phase",
+        "rand-0.9-StdRng",
+        seed.wrapping_add(1),
+    ));
     let mut out = vec![0f32; len];
     for i in 0..len {
         let noise_amp = uv[i] * NSF_NOISE_STD + (1.0 - uv[i]) * NSF_SINE_AMP / 3.0;

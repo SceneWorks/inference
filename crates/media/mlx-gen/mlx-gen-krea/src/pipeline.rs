@@ -677,6 +677,7 @@ impl KreaHeavy {
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
         let attention = opts.attention_plan(cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
@@ -855,6 +856,8 @@ impl KreaHeavy {
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
         let attention = opts.attention_plan(cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
+        observe_control_policy(control_scale, plan.guidance);
         let previews = KreaPreview::new(preview, &sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
@@ -1017,6 +1020,7 @@ impl KreaHeavy {
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
         let attention = opts.attention_plan(cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
@@ -1111,6 +1115,7 @@ impl KreaHeavy {
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
         let attention = opts.attention_plan(cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
@@ -1279,6 +1284,7 @@ impl KreaHeavy {
         let mut latent = init_noise(opts.height, opts.width, opts.seed)?;
         let previews = KreaPreview::new(preview, full);
         let attention = opts.attention_plan(cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         for mp in plans {
             let end = mp.slice.end.min(full.len().saturating_sub(1));
             let start = mp.slice.start.min(end);
@@ -1378,6 +1384,7 @@ impl KreaHeavy {
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
         let attention = opts.attention_plan(cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
 
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
@@ -1536,6 +1543,7 @@ impl KreaHeavy {
             .dit
             .block_window(opts.transformer_window_size, cancel)?;
         let attention = opts.attention_plan(cancel);
+        mlx_gen::image_execution::policy_debug("krea.attention", &attention.budget);
         let previews = KreaPreview::new(preview, sigmas);
         let lat = run_krea_sampler(
             opts.sampler.as_deref(),
@@ -1654,6 +1662,7 @@ fn decode_latents_via_seam(
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
+    observe_decode_policy(decode_tiling, decoder.is_some());
     let decoder = decoder.unwrap_or(native);
     mlx_gen::ensure_decoder_compatible(
         Some(&mlx_gen::gen_core::QWEN_KREA_Z16_LATENT_SPACE),
@@ -3113,5 +3122,76 @@ mod tests {
         job_local2.push(lora());
         assert_eq!(job_local2.adapters().len(), 1);
         assert_eq!(resident.adapters().len(), 1);
+    }
+}
+
+fn observe_control_policy(control_scale: f32, guidance: f32) {
+    mlx_gen::image_execution::scalar("krea.control_scale", control_scale);
+    mlx_gen::image_execution::scalar("krea.control_guidance", guidance);
+}
+
+fn observe_decode_policy(decode_tiling: Option<&TilingConfig>, decoder_override: bool) {
+    mlx_gen::image_execution::policy_debug("krea.actual_decode_tiling", &decode_tiling);
+    mlx_gen::image_execution::policy_debug("krea.decoder_override", &decoder_override);
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::*;
+
+    fn capture(observe: impl FnOnce()) -> mlx_gen::gen_core::generator::ExecutionIdentity {
+        let descriptor = crate::model::descriptor();
+        mlx_gen::image_execution::complete_image_attempt(
+            &descriptor,
+            &mlx_gen::CancelFlag::new(),
+            || {
+                mlx_gen::image_execution::policy_debug("test.output", &"rgb8");
+                observe();
+                mlx_gen::image_execution::sampled_native(
+                    "test-metadata",
+                    "resolved-sigmas",
+                    mlx_rs::Dtype::Float32,
+                    &[1.0, 0.5, 0.0],
+                    17,
+                );
+                Ok(mlx_gen::GenerationOutput::Images(vec![mlx_gen::Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                }]))
+            },
+        )
+        .unwrap()
+        .execution
+    }
+
+    #[test]
+    fn execution_control_strength_and_guidance_are_independent_facts() {
+        let base = capture(|| observe_control_policy(0.25, 1.0));
+        let strength = capture(|| observe_control_policy(0.75, 1.0));
+        let guidance = capture(|| observe_control_policy(0.25, 2.0));
+        assert_ne!(
+            base.resolved().unwrap().provider_choices,
+            strength.resolved().unwrap().provider_choices
+        );
+        assert_ne!(
+            base.resolved().unwrap().provider_choices,
+            guidance.resolved().unwrap().provider_choices
+        );
+    }
+
+    #[test]
+    fn execution_decode_seam_distinguishes_tiling_and_decoder_override() {
+        let native = capture(|| observe_decode_policy(None, false));
+        let tiled = capture(|| observe_decode_policy(Some(&TilingConfig::default_preset()), false));
+        let aggressive =
+            capture(|| observe_decode_policy(Some(&TilingConfig::aggressive()), false));
+        let overlay = capture(|| observe_decode_policy(None, true));
+        let quality = |report: &mlx_gen::gen_core::generator::ExecutionIdentity| {
+            report.resolved().unwrap().quality_policy.clone()
+        };
+        assert_ne!(quality(&native), quality(&tiled));
+        assert_ne!(quality(&tiled), quality(&aggressive));
+        assert_ne!(quality(&native), quality(&overlay));
     }
 }

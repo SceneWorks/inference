@@ -78,7 +78,7 @@ pub(crate) fn initial_noise(
     lat_w: usize,
 ) -> Result<Tensor> {
     let n = 4 * lat_h * lat_w;
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("kolors/common", seed));
     let noise = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(Tensor::from_vec(noise, (1, 4, lat_h, lat_w), &Device::Cpu)?.to_device(device)?)
 }

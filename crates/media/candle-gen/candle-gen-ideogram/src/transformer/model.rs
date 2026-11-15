@@ -560,6 +560,7 @@ impl Ideogram4Transformer {
         prepared
             .request
             .validate(self.load_id, host, x, llm_features, position_ids)?;
+        crate::observe_component_precision("dit", self.t_freqs.device(), self.dtype);
         let img_mask = &prepared.img_mask;
         let cos = &prepared.cos;
         let sin = &prepared.sin;

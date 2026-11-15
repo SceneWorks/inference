@@ -324,6 +324,15 @@ impl BerniniRenderer {
                 eta: Defaults::ETA,
                 norm_threshold: [Defaults::NORM_THRESHOLD, Defaults::NORM_THRESHOLD],
             };
+            candle_gen::execution::policy(
+                "bernini_renderer_guidance",
+                serde_json::json!({
+                    "mode": format!("{mode:?}"), "low_expert": switched,
+                    "omega_txt_bits": omega_txt.to_bits(), "omega_img_bits": omega_img.to_bits(),
+                    "omega_vid_bits": omega_vid.to_bits(), "eta_bits": g.eta.to_bits(),
+                    "norm_threshold_bits": g.norm_threshold.map(f32::to_bits)
+                }),
+            );
             let v = guided_velocity(
                 &pf, mode, expert, &latents, &videos, &images, t, sigmas[i], ctx_pos, ctx_neg, &g,
                 &mut mbufs,
@@ -481,6 +490,14 @@ impl Generator for BerniniRenderer {
         let mode = resolve_mode(req.video_mode.as_deref(), has_video, has_image);
         check_mode_conditioning(id, mode, has_video || has_image)?;
         Ok(())
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        crate::components::capture_renderer_execution(self, req, on_progress, self.adapters.len())
     }
 
     fn generate(
