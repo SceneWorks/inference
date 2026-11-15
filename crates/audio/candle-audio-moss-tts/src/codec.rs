@@ -573,7 +573,12 @@ impl XyTokenizerCodec {
             }
         }
         let debug = std::env::var_os("MOSS_TTSD_CODEC_DEBUG").is_some();
-        let mut x = self.rvq.decode(&rows, &self.device)?; // [1, CODE_DIM, T]
+        let mut x = self.rvq.decode(&rows, &self.device)?;
+        candle_audio::execution::runtime(&self.device, x.dtype());
+        candle_audio::execution::policy(
+            "xy-tokenizer",
+            serde_json::json!({"frames":t,"quantizers":nq,"mode":"full-decode"}),
+        ); // [1, CODE_DIM, T]
         if debug {
             eprintln!("[xytok] rvq: {:?} rms={:.5}", x.dims(), rms(&x));
         }
@@ -597,6 +602,30 @@ impl XyTokenizerCodec {
         }
         let wav = self.vocos.forward(&mel)?;
         Ok(Some(wav))
+    }
+
+    /// Complete native PCM decoding while preserving the legacy optional waveform result.
+    pub fn decode_frames_with_execution_report(
+        &self,
+        frames: &[Vec<u32>],
+        cancel: &dyn Fn() -> bool,
+    ) -> candle_audio::Result<candle_audio::execution::CompletedNative<Option<Vec<f32>>>> {
+        candle_audio::execution::capture_native(
+            &crate::model::descriptor(),
+            cancel,
+            || {
+                candle_audio::execution::unavailable(
+                    "native codec input frames have no bound originating generation receipt",
+                );
+                self.decode_frames(frames, &|| candle_audio::execution::callback(cancel))
+                    .map_err(candle_audio::AudioError::from)
+            },
+            |value| {
+                value.as_ref().map(|pcm| {
+                    candle_audio::execution::NativeOutput::pcm(pcm, self.sample_rate(), 1)
+                })
+            },
+        )
     }
 }
 

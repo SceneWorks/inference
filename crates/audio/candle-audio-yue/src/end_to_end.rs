@@ -679,3 +679,49 @@ fn production_wiring_refuses_instead_of_rendering_placeholder_audio() {
         "splice"
     );
 }
+
+/// This uses only StageSet::stubs (fixed codec/vocoder doubles); it runs no learned inference.
+#[test]
+fn native_execution_report_preserves_stems_and_rejects_late_cancel_without_stale_retry() {
+    use crate::config::YueRequest;
+    use crate::engine::YueEngine;
+    use candle_audio::gen_core::generator::ExecutionIdentity;
+    let engine = YueEngine::new(
+        cot(),
+        Assets {
+            stage1: "/unused/stage1".into(),
+            stage2: "/unused/stage2".into(),
+            xcodec: "/unused/xcodec".into(),
+        },
+        None,
+        StageSet::stubs(),
+    );
+    let request = YueRequest::new("pop", LYRICS);
+    let expected = engine
+        .render(&request, &CancelFlag::new(), &mut |_| {})
+        .unwrap();
+    let cancel = CancelFlag::new();
+    let canceled = engine.render_with_execution_report(&request, &cancel, &mut |event| {
+        if event == crate::engine::YueEvent::StageReleased(crate::engine::Stage::Vocoder) {
+            cancel.cancel();
+        }
+    });
+    assert!(matches!(canceled, Err(Error::Canceled)));
+    let completed = engine
+        .render_with_execution_report(&request, &CancelFlag::new(), &mut |_| {
+            // Caller observations cannot turn stub output into a provider-attested result.
+            candle_audio::execution::sampling("caller", serde_json::json!({"fake":true}));
+            candle_audio::execution::runtime(
+                &candle_audio::candle_core::Device::Cpu,
+                candle_audio::candle_core::DType::F32,
+            );
+            candle_audio::execution::seed("caller", "fake", 99);
+            candle_audio::execution::policy("caller", serde_json::json!(true));
+        })
+        .unwrap();
+    assert_eq!(completed.output, expected);
+    let ExecutionIdentity::Unavailable { reason } = completed.execution else {
+        panic!("stub stages cannot attest production execution")
+    };
+    assert!(reason.detail.contains("not observed"));
+}

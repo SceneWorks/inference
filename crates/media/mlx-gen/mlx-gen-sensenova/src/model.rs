@@ -278,6 +278,46 @@ impl SenseNova {
     }
 
     /// Progress-capable sibling preserving the original entry point.
+    /// Run the admitted operation and return facts captured from that same completed attempt.
+    /// Errors/cancellation drop the scope; retries cannot read a prior attempt's report.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_vqa_with_execution_report(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        request: GenerationRequest,
+        question: &str,
+        images: &[Array],
+        max_new_tokens: usize,
+        sampler: crate::runtime::Sampler,
+        options: T2iOptions,
+        cancel: Option<&gen_core::CancelFlag>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(String, mlx_llm::core_llm::ExecutionIdentity)> {
+        let scope = mlx_llm::core_llm::token_execution::TokenExecutionScope::new();
+        let output = self.run_vqa_with_progress(
+            context,
+            request,
+            question,
+            images,
+            max_new_tokens,
+            sampler,
+            options,
+            cancel,
+            &mut |event| {
+                mlx_llm::core_llm::token_execution::without_observations(|| on_progress(event))
+            },
+        )?;
+        let execution = scope.finish_document(
+            self.descriptor.id,
+            "mlx",
+            serde_json::json!({"format":"text","trim_whitespace":true,"think_mode":false}),
+        );
+        execution
+            .validate(self.descriptor.id, "mlx", 1)
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        Ok((output, execution))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn run_vqa_with_progress(
         &self,
@@ -316,6 +356,53 @@ impl SenseNova {
     }
 
     /// Run Document Studio interleave under the exact admitted request and lifecycle scope.
+    /// Run the admitted operation and return facts captured from that same completed attempt.
+    /// Errors/cancellation drop the scope; retries cannot read a prior attempt's report.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_interleave_with_execution_report(
+        &self,
+        context: &gen_core::MemoryRunContext,
+        request: GenerationRequest,
+        prompt: &str,
+        input_images: &[Array],
+        width: i32,
+        height: i32,
+        options: T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        init_noises: Option<&[Array]>,
+        cancel: &gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<(
+        crate::t2i::InterleaveOutput,
+        mlx_llm::core_llm::ExecutionIdentity,
+    )> {
+        let scope = mlx_llm::core_llm::token_execution::TokenExecutionScope::new();
+        let output = self.run_interleave(
+            context,
+            request,
+            prompt,
+            input_images,
+            width,
+            height,
+            options,
+            system_message,
+            max_new_tokens,
+            max_images,
+            init_noises,
+            cancel,
+            &mut |event| {
+                mlx_llm::core_llm::token_execution::without_observations(|| on_progress(event))
+            },
+        )?;
+        let execution = scope.finish_document(self.descriptor.id, "mlx", serde_json::json!({"format":"interleaved_document","image_encoding":"model_space_rgb_nchw","image_dtypes":output.images.iter().map(|image| format!("{:?}",image.dtype())).collect::<Vec<_>>(),"image_count":output.images.len(),"image_shapes":output.images.iter().map(|image| image.shape()).collect::<Vec<_>>()}));
+        execution
+            .validate(self.descriptor.id, "mlx", 1)
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        Ok((output, execution))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn run_interleave(
         &self,

@@ -302,3 +302,6 @@ mod tests {
         assert!(matches!(back, AudioError::Canceled));
     }
 }
+
+/// Provider-resolved audio execution identity observers and attempt scopes.
+pub mod execution;

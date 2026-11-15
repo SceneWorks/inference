@@ -315,6 +315,9 @@ trait SameNoiseSource {
 
 impl SameNoiseRng {
     pub fn from_entropy() -> Self {
+        candle_audio::execution::unavailable(
+            "SAME standalone entropy noise has no seed or captured noise identity",
+        );
         Self {
             rng: StdRng::from_os_rng(),
             capture: false,
@@ -324,7 +327,11 @@ impl SameNoiseRng {
 
     pub fn seeded(seed: u64) -> Self {
         Self {
-            rng: StdRng::seed_from_u64(seed),
+            rng: StdRng::seed_from_u64(candle_audio::execution::seed(
+                "stable-audio-3/same.rs",
+                "rand-0.9-StdRng",
+                seed,
+            )),
             capture: false,
             captures: Vec::new(),
         }
@@ -332,7 +339,11 @@ impl SameNoiseRng {
 
     pub fn capturing(seed: u64) -> Self {
         Self {
-            rng: StdRng::seed_from_u64(seed),
+            rng: StdRng::seed_from_u64(candle_audio::execution::seed(
+                "stable-audio-3/same.rs",
+                "rand-0.9-StdRng",
+                seed,
+            )),
             capture: true,
             captures: Vec::new(),
         }
@@ -759,13 +770,18 @@ impl TransformerResamplingBlock {
                     tokens.dtype(),
                     tokens.device(),
                 )?,
-                None => Tensor::randn(
-                    0f32,
-                    self.mask_noise as f32,
-                    tokens.shape(),
-                    tokens.device(),
-                )?
-                .to_dtype(tokens.dtype())?,
+                None => {
+                    candle_audio::execution::unavailable(
+                        "SAME device-global mask noise is not seeded or captured",
+                    );
+                    Tensor::randn(
+                        0f32,
+                        self.mask_noise as f32,
+                        tokens.shape(),
+                        tokens.device(),
+                    )?
+                    .to_dtype(tokens.dtype())?
+                }
             };
             tokens = (&tokens + noise)?;
         }
