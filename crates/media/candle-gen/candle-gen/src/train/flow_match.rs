@@ -1506,6 +1506,7 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     // Flush any pending (sub-`accum`) accumulation so the final partial step is applied. Average by the
     // ACTUAL `pending` micro-count, not the nominal `accum`, so this tail update is a true mean of the
     // grads it holds rather than a `pending/accum`-underweighted step (F-034, sc-9018).
+    let mut terminal_checkpoint_saved = false;
     if accumulated.is_some() {
         apply_update(
             &mut opt,
@@ -1518,17 +1519,19 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
             warmup_updates,
             cfg.seed,
         )?;
+        update_idx += 1;
         if resume_due {
             save_resume(
                 &req.output_dir,
                 &stem,
                 steps_run,
-                update_idx + 1,
+                update_idx,
                 &opt,
                 &set,
                 cfg,
                 &fingerprint,
             )?;
+            terminal_checkpoint_saved = steps_run == cfg.steps;
         }
     }
 
@@ -1577,8 +1580,27 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         eprintln!("KREA_PROFILE_RESULT updates=18 steady_updates_per_segment=4 reference_s={} optimized_s={} candidate_s={} candidate_dispatched={} loss_parity={} candidate_go={} selected_segment={} reduction={} target_met={}",means[0],means[1],means[2],profile_candidates[2],loss_parity,go,selected,1.-means[selected]/means[0],means[selected]<=0.75*means[0]);
     }
     // --- save final adapter ---
-    on_progress(TrainingProgress::Saving);
     create_output_dir(&req.output_dir)?;
+    if steps_run == cfg.steps
+        && !cfg.full_finetune
+        && !terminal_checkpoint_saved
+        && !bounded_profile
+        && !paired_profile
+        && !recovery_profile
+    {
+        save_resume(
+            &req.output_dir,
+            &stem,
+            steps_run,
+            update_idx,
+            &opt,
+            &set,
+            cfg,
+            &fingerprint,
+        )?;
+        on_progress(TrainingProgress::Checkpoint { step: steps_run });
+    }
+    on_progress(TrainingProgress::Saving);
     let adapter_path = req.output_dir.join(&req.file_name);
     model.save(&set, &adapter_path)?;
     Ok(TrainingOutput {
@@ -2522,6 +2544,96 @@ mod tests {
         assert_eq!(model.steps_seen.get(), 5);
         assert_eq!(model.saves.get(), 1, "only the final save");
         assert!(out.final_loss.is_finite());
+    }
+
+    #[test]
+    fn terminal_state_continues_in_an_independent_output_with_an_extended_cosine_schedule() {
+        let model = || MockTrainer {
+            device: Device::Cpu,
+            steps_seen: Cell::new(0),
+            saves: Cell::new(0),
+            cache_len: 2,
+        };
+        let (_fixture, mut req) = mock_request(2, 4, 1, 0, CancelFlag::new());
+        req.config.lr_scheduler = crate::gen_core::LrSchedule::Cosine;
+        run_flow_match_training(&model(), &req, &mut |_| {}, &mut Vec::new()).unwrap();
+        let snapshot = req.output_dir.join(format!(
+            "{}-step000004.resume.safetensors",
+            file_stem(&req.file_name)
+        ));
+        let original = std::fs::read(&snapshot).unwrap();
+        let tensors = candle_core::safetensors::load(&snapshot, &Device::Cpu).unwrap();
+        let mut metadata: HashMap<String, String> =
+            crate::gen_core::safetensors_file_metadata(&snapshot)
+                .unwrap()
+                .into_iter()
+                .collect();
+        assert_eq!(metadata["step"], "4");
+        assert_eq!(metadata["update_idx"], "4");
+        let identity = metadata["training_config"].replacen("steps=4;", "steps=6;", 1);
+        metadata.insert("training_config".into(), identity);
+        let next = tempfile::tempdir().unwrap();
+        let fork = next.path().join(snapshot.file_name().unwrap());
+        safetensors::serialize_to_file(tensors.iter(), Some(metadata), &fork).unwrap();
+        req.output_dir = next.path().to_path_buf();
+        req.config.steps = 6;
+        req.config.resume = true;
+        let mut steps = Vec::new();
+        let continued = model();
+        run_flow_match_training(
+            &continued,
+            &req,
+            &mut |event| {
+                if let TrainingProgress::Training { step, .. } = event {
+                    steps.push(step);
+                }
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(steps, [5, 6], "only the additional steps may run");
+        assert_eq!(continued.steps_seen.get(), 6);
+        let final_path = req.output_dir.join(format!(
+            "{}-step000006.resume.safetensors",
+            file_stem(&req.file_name)
+        ));
+        let final_meta = crate::gen_core::safetensors_file_metadata(&final_path).unwrap();
+        assert_eq!(final_meta["update_idx"], "6");
+        let final_tensors = candle_core::safetensors::load(final_path, &Device::Cpu).unwrap();
+        assert!(
+            tensors
+                .iter()
+                .filter(|(key, _)| key.starts_with("factor."))
+                .any(|(key, value)| {
+                    value.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                        != final_tensors[key]
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap()
+                }),
+            "the extended cosine schedule must advance learned factors"
+        );
+        assert_eq!(std::fs::read(snapshot).unwrap(), original);
+    }
+
+    #[test]
+    fn terminal_partial_window_is_saved_after_its_optimizer_flush() {
+        let model = MockTrainer {
+            device: Device::Cpu,
+            steps_seen: Cell::new(0),
+            saves: Cell::new(0),
+            cache_len: 2,
+        };
+        let (_fixture, req) = mock_request(2, 5, 3, 2, CancelFlag::new());
+        run_flow_match_training(&model, &req, &mut |_| {}, &mut Vec::new()).unwrap();
+        let snapshot = req.output_dir.join(format!(
+            "{}-step000005.resume.safetensors",
+            file_stem(&req.file_name)
+        ));
+        let metadata = crate::gen_core::safetensors_file_metadata(&snapshot).unwrap();
+        assert_eq!(metadata["step"], "5");
+        assert_eq!(metadata["update_idx"], "2");
     }
 
     /// `save_every` writes intermediate checkpoints (at steps that are multiples below the last) plus
