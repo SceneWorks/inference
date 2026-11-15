@@ -75,10 +75,10 @@ impl Drop for GenerationProgressGuard {
         let previous = self.previous.clone();
         let finished = CURRENT.with(|current| current.replace(previous.clone()));
         if let Some(observer) = finished.observer {
-            (observer.0)(None);
+            notify_observer(&observer, None);
         }
         if let Some(observer) = previous.observer {
-            (observer.0)(previous.phase);
+            notify_observer(&observer, previous.phase);
         }
     }
 }
@@ -99,8 +99,14 @@ fn set_phase(phase: Option<GenerationPhase>) {
         current.observer.clone()
     });
     if let Some(observer) = observer {
-        (observer.0)(phase);
+        notify_observer(&observer, phase);
     }
+}
+
+fn notify_observer(observer: &GenerationProgressObserver, phase: Option<GenerationPhase>) {
+    // Request callbacks may reenter legacy token generation on this thread. Their
+    // decoder observations cannot become part of the provider's active attempt.
+    crate::token_execution::without_observations(|| (observer.0)(phase));
 }
 
 thread_local! {
@@ -146,7 +152,7 @@ pub fn report_generation_phase_for(index: usize, phase: Option<GenerationPhase>)
         active.observer.clone()
     });
     if let Some(observer) = observer {
-        (observer.0)(phase);
+        notify_observer(&observer, phase);
     }
 }
 
@@ -155,7 +161,7 @@ impl Drop for GenerationBatchProgressGuard {
         let finished = BATCH.with(|batch| batch.replace(std::mem::take(&mut self.previous)));
         for active in finished {
             if let Some(observer) = active.observer {
-                (observer.0)(None);
+                notify_observer(&observer, None);
             }
         }
     }
@@ -191,6 +197,41 @@ impl Drop for GenerationProgressScope {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn phase_callbacks_cannot_add_legacy_decode_to_the_active_token_receipt() {
+        use crate::token_execution::{observe_decode, observe_token_seed, TokenExecutionScope};
+        use crate::{DecodeReport, ExecutionRandomness, Sampling};
+
+        let observer = GenerationProgressObserver::new(|_| {
+            observe_token_seed(Sampling::default(), 99, 8, &[]);
+            observe_decode(&DecodeReport::default());
+        });
+        let request = crate::TextLlmRequest {
+            progress: Some(observer.clone()),
+            ..Default::default()
+        };
+        let scope = TokenExecutionScope::new();
+        scope.observe_numeric_policy(serde_json::json!({"loaded_format":"dense","device":"cpu"}));
+        observe_token_seed(Sampling::default(), 7, 8, &[]);
+        observe_decode(&DecodeReport::default());
+        {
+            let _guard = request.install_progress();
+            report_generation_phase(GenerationPhase::Generating);
+        }
+        {
+            let _batch = install_generation_batch_progress([Some(observer)]);
+            report_generation_phase_for(0, Some(GenerationPhase::Prefilling));
+        }
+        let identity =
+            scope.finish_document("test", "candle", serde_json::json!({"format":"text"}));
+        let ExecutionRandomness::Draws { draws, .. } = &identity.resolved().unwrap().randomness
+        else {
+            panic!("expected one observed decode");
+        };
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].seed, Some(7));
+    }
 
     fn request(events: &Arc<Mutex<Vec<Option<GenerationPhase>>>>) -> crate::TextLlmRequest {
         let events = events.clone();
