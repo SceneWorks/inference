@@ -114,6 +114,36 @@ fn apply_recorded(
     Ok(())
 }
 
+/// The actual per-expert apply order and outcomes, before publication through the legacy mutable
+/// report getter. The loader may auto-detect adapter kind from content; never claim the spec hint
+/// is the detected format. Consumed content identity is unavailable until the loader supplies it.
+fn execution_adapter_policy(
+    specs: &[AdapterSpec],
+    report: &WanLoraReport,
+    expert: MoeExpert,
+    mode: &str,
+) -> serde_json::Value {
+    serde_json::json!({"mode":mode, "expert":format!("{expert:?}"),
+        "applied_targets":report.applied, "entries":report.per_spec.iter().map(|outcome| {
+            let spec = &specs[outcome.spec_index];
+            serde_json::json!({"load_index":outcome.spec_index, "path":spec.path,
+                "scale_bits":spec.scale.to_bits(), "applied":outcome.applied, "skipped":outcome.skipped})
+        }).collect::<Vec<_>>()})
+}
+
+fn record_execution_adapters(
+    specs: &[AdapterSpec],
+    report: &WanLoraReport,
+    expert: MoeExpert,
+    mode: &str,
+) {
+    mlx_gen::video_execution::adapter_stack(
+        "wan_applied_adapters",
+        execution_adapter_policy(specs, report, expert, mode),
+        report.applied,
+    );
+}
+
 /// Fold one or more experts' per-spec outcomes ([`WanLoraReport::per_spec`]) into the contract's
 /// per-adapter outcomes, one per
 /// `specs` entry in load order (sc-27451): `applied` sums the spec's targets across the experts it

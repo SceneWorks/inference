@@ -195,7 +195,39 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 // Hand-written so the load-exact SC-19236 contract is a property of the loaded provider. The
 // descriptor/validation/generation arms are otherwise the same delegation emitted by
 // `impl_generator!` for the other Wan routes.
+impl Wan {
+    fn generate_execution_attempt(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
+        mlx_gen::sc20686::observe_generation(
+            &self.root,
+            &req.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(req),
+            on_progress,
+            |on_progress| self.generate_impl(req, on_progress),
+        )
+        .map_err(Into::into)
+    }
+}
+
 impl Generator for Wan {
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            self.generate_execution_attempt(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })
+            .map(mlx_gen::gen_core::GenerationReport::from_output)
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -216,16 +248,9 @@ impl Generator for Wan {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
-        mlx_gen::sc20686::observe_generation(
-            &self.root,
-            &req.cancel,
-            self.descriptor.id,
-            || mlx_gen::sc20686::RequestFacts::from_request(req),
-            on_progress,
-            |on_progress| self.generate_impl(req, on_progress),
-        )
-        .map_err(Into::into)
+        mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {

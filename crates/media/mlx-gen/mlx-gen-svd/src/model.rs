@@ -110,6 +110,7 @@ pub fn descriptor() -> ModelDescriptor {
 
 /// The loaded SVD model: the assembled pipeline + the cached descriptor.
 pub struct Svd {
+    compute_dtype: Dtype,
     pipeline: SvdPipeline,
     descriptor: ModelDescriptor,
     memory: Option<crate::memory_strategy::PreparedSvdMemory>,
@@ -198,6 +199,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }
 
     Ok(Box::new(Svd {
+        compute_dtype: dense,
         pipeline: SvdPipeline::new(image_encoder, vae, unet, SchedulerConfig::default()),
         descriptor: descriptor(),
         memory,
@@ -383,6 +385,11 @@ impl Svd {
             mlx_gen::array::scalar(1.0),
         )?; // [-1,1]
         let key = random::key(seed.wrapping_add(7))?;
+        mlx_gen::video_execution::draw(
+            0,
+            "svd_conditioning_augmentation_normal",
+            seed.wrapping_add(7),
+        );
         let noise = random::normal::<f32>(centered.shape(), None, None, Some(&key))?;
         let augmented = add(
             &centered,
@@ -395,7 +402,30 @@ impl Svd {
     }
 }
 
+impl Svd {
+    fn generate_execution_attempt(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
 impl Generator for Svd {
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            self.generate_execution_attempt(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })
+            .map(mlx_gen::gen_core::GenerationReport::from_output)
+        })
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -409,7 +439,9 @@ impl Generator for Svd {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -520,11 +552,13 @@ impl Svd {
 
         // Seeded init noise scaled by `init_noise_sigma` (NHWC-with-frames).
         let sched = EdmSchedule::karras(params.num_inference_steps, &self.pipeline.scheduler);
+        mlx_gen::video_execution::schedule("svd_karras", &sched.sigmas);
         let (h, w) = (
             (req.height / VAE_SCALE) as i32,
             (req.width / VAE_SCALE) as i32,
         );
         let key = random::key(seed)?;
+        mlx_gen::video_execution::draw(0, "svd_initial_or_augmentation_normal", seed);
         let noise = random::normal::<f32>(
             &[1, params.num_frames, h, w, LATENT_CHANNELS as i32],
             None,
@@ -579,6 +613,10 @@ impl Svd {
         };
 
         on_progress(Progress::Decoding);
+        mlx_gen::video_execution::policy(
+            "svd_decode",
+            serde_json::json!({"decode_chunk_size":params.decode_chunk_size,"noise_aug_bits":params.noise_aug_strength.to_bits(),"motion_bucket_id":params.motion_bucket_id,"conditioning_fps":params.fps,"compute_dtype":format!("{:?}",self.compute_dtype),"vae_dtype":"Float32"}),
+        );
         let decoded = self.pipeline.decode(
             &final_latents,
             params.num_frames,

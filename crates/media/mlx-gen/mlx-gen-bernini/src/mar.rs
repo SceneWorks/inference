@@ -282,6 +282,10 @@ pub fn sample_vit_embed(
     let n_query = order.len() as i32;
     let h = mask_token.shape()[2];
     let schedule = mar_schedule(n_query, cfg.planning_step, order);
+    mlx_gen::video_execution::policy(
+        "bernini_mar",
+        serde_json::json!({"reveal_schedule":schedule,"vit_denoising_steps":cfg.vit_denoising_step,"vit_txt_cfg_bits":cfg.vit_txt_cfg.to_bits(),"vit_img_cfg_bits":cfg.vit_img_cfg.to_bits()}),
+    );
 
     // Single shared target buffer, init = mask_token broadcast over the n_query target slots.
     let mut target = mlx_rs::ops::broadcast_to(mask_token, &[1, n_query, h])?;

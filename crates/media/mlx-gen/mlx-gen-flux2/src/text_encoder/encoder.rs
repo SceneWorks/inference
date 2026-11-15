@@ -343,7 +343,15 @@ impl Qwen3TextEncoder {
             seed: Some(sampling.seed),
             stop_tokens: vec![eos_token],
         };
-        let mut draw = CaptionSampler::new(params, sampling.seed);
+        let execution = mlx_llm::core_llm::token_execution::TokenExecutionScope::new();
+        let seed = mlx_llm::core_llm::token_execution::observe_token_seed(
+            params.to_core(),
+            sampling.seed,
+            generation.max_new_tokens,
+            &generation.stop_tokens,
+        );
+        mlx_llm::core_llm::token_execution::observe_token_prompt_boundary(prompt_len as usize);
+        let mut draw = CaptionSampler::new(params, seed);
         let decode_cancel = mlx_llm::CancelFlag::new();
         let bridged_cancel = decode_cancel.clone();
         let mut on_event = |_event: StreamEvent| {
@@ -380,6 +388,23 @@ impl Qwen3TextEncoder {
         if run.output.finish_reason == FinishReason::Cancelled {
             return Err(Error::Canceled);
         }
+        mlx_llm::core_llm::token_execution::observe_decode(&run.report);
+        mlx_llm::core_llm::token_execution::observe_document_policy(serde_json::json!({
+            "sampler": "flux2-caption-host-heap-order-v1",
+            "prompt_embeds_dtype": format!("{:?}", prompt_embeds.dtype()),
+            "prompt_tokens": prompt_len,
+            "kv_cache": "contiguous-growable",
+            "pipelining": "off",
+        }));
+        super::generate::observe_enhancement_execution(execution.finish_document(
+            "flux2-dev-caption-upsampler",
+            "mlx",
+            serde_json::json!({
+                "format": "token_ids", "tokens": run.output.tokens.len(),
+                "finish_reason": format!("{:?}", run.output.finish_reason),
+                "stop_token_excluded": true,
+            }),
+        ));
         Ok(run.output.tokens)
     }
 }

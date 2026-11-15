@@ -49,6 +49,12 @@ pub trait DiffusionSampler {
     /// The conditioning timestep fed to the model at step `i` (the value the U-Net embeds).
     fn timestep(&self, i: usize) -> f32;
 
+    /// Actual scalar state consumed by this instantiated sampler, including truncated terminal
+    /// nodes. The encoding is provider-versioned; absent facts must not be inferred from a request.
+    fn execution_schedule(&self) -> Option<(&'static str, Vec<f32>)> {
+        None
+    }
+
     /// Scale the latents into the model's expected input space at step `i`. The default is identity
     /// (samplers that fold the scaling into [`Self::step`], e.g. the ancestral Euler sampler, and
     /// the flow-match sampler whose `c_in = 1`); diffusers' Euler divides by `√(σ²+1)`.
@@ -63,6 +69,27 @@ pub trait DiffusionSampler {
     /// CFG-combined) model output. `x` is the **un-scaled** latents (NOT the
     /// [`Self::scale_model_input`] output), matching diffusers' `step(model_output, t, sample)`.
     fn step(&self, model_output: &Array, x: &Array, i: usize) -> Result<Array>;
+}
+
+/// Numeric encoding v1: initial scale, update dtype (0=f32, 1=latents), input dtype code
+/// (0=no input cast), followed by (timestep,c_in,a_x,a_out,a_noise) per step.
+fn execution_policy_coefficients(
+    policy: &impl SamplerPolicy,
+    model_dtype: Option<Dtype>,
+) -> Vec<f32> {
+    let mut values = vec![
+        policy.init_noise_scale(),
+        match policy.step_dtype() {
+            StepDtype::F32 => 0.0,
+            StepDtype::Latents => 1.0,
+        },
+        model_dtype.map_or(0, sampling_dtype_code) as f32,
+    ];
+    for i in 0..policy.num_steps() {
+        let step = policy.coeffs(i);
+        values.extend([step.timestep, step.c_in, step.a_x, step.a_out, step.a_noise]);
+    }
+    values
 }
 
 // =================================================================================================
@@ -88,10 +115,15 @@ impl StepRng {
     /// Unit-normal noise for step `step`, drawn from a distinct subkey. The multiplier de-correlates
     /// consecutive steps; the `+1` keeps step 0 off the raw seed used for the init-noise prior.
     fn normal(&self, shape: &[i32], step: usize) -> Result<Array> {
+        self.normal_reported(shape, step, "curated_solver_step_normal")
+    }
+
+    fn normal_reported(&self, shape: &[i32], step: usize, purpose: &str) -> Result<Array> {
         let sub = self
             .seed
             .wrapping_add(0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(step as u64 + 1));
         let key = random::key(sub)?;
+        crate::video_execution::draw_current(purpose, sub);
         Ok(random::normal::<f32>(shape, None, None, Some(&key))?)
     }
 }
@@ -830,8 +862,16 @@ impl LatentOps for MlxAvLatentOps {
         // Distinct subkeys per stream (the audio seed is XOR-shifted) so the two streams' stochastic
         // noise is decorrelated; each reuses the per-step `StepRng` derivation.
         Ok(AvLatents {
-            video: MlxLatentOps.randn_like(&x.video, seed, step)?,
-            audio: MlxLatentOps.randn_like(&x.audio, seed ^ 0xA5A5_5A5A_C3C3_3C3C, step)?,
+            video: StepRng::new(seed).normal_reported(
+                x.video.shape(),
+                step,
+                "curated_video_step_normal",
+            )?,
+            audio: StepRng::new(seed ^ 0xA5A5_5A5A_C3C3_3C3C).normal_reported(
+                x.audio.shape(),
+                step,
+                "curated_audio_xor_step_normal",
+            )?,
         })
     }
 }
@@ -1022,6 +1062,13 @@ impl LcmSampler {
 }
 
 impl DiffusionSampler for LcmSampler {
+    fn execution_schedule(&self) -> Option<(&'static str, Vec<f32>)> {
+        Some((
+            "LcmSampler-coefficients-v1",
+            execution_policy_coefficients(&self.policy, Some(self.model_dtype)),
+        ))
+    }
+
     fn num_steps(&self) -> usize {
         self.policy.num_steps()
     }
@@ -1077,6 +1124,13 @@ impl LightningSampler {
 }
 
 impl DiffusionSampler for LightningSampler {
+    fn execution_schedule(&self) -> Option<(&'static str, Vec<f32>)> {
+        Some((
+            "LightningSampler-coefficients-v1",
+            execution_policy_coefficients(&self.policy, Some(self.model_dtype)),
+        ))
+    }
+
     fn num_steps(&self) -> usize {
         self.policy.num_steps()
     }
@@ -1162,6 +1216,13 @@ impl TcdSampler {
 }
 
 impl DiffusionSampler for TcdSampler {
+    fn execution_schedule(&self) -> Option<(&'static str, Vec<f32>)> {
+        Some((
+            "TcdSampler-coefficients-v1",
+            execution_policy_coefficients(&self.policy, Some(self.model_dtype)),
+        ))
+    }
+
     fn num_steps(&self) -> usize {
         self.policy.num_steps()
     }
@@ -1226,6 +1287,13 @@ impl FlowMatchSampler {
 }
 
 impl DiffusionSampler for FlowMatchSampler {
+    fn execution_schedule(&self) -> Option<(&'static str, Vec<f32>)> {
+        Some((
+            "FlowMatchSampler-coefficients-v1",
+            execution_policy_coefficients(&self.policy, None),
+        ))
+    }
+
     fn num_steps(&self) -> usize {
         self.policy.num_steps()
     }

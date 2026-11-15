@@ -1761,3 +1761,20 @@ fn an_unplannable_geometry_is_a_catchable_error_naming_the_budget() {
         "the error must name the mode: {err}"
     );
 }
+
+#[test]
+fn execution_report_schedule_matches_x0_and_velocity_terminal_branches() {
+    for timesteps in [vec![1.0], vec![1.0, 0.5]] {
+        assert_eq!(
+            ModelOutputType::X0.execution_schedule(&timesteps),
+            timesteps
+        );
+        let velocity = ModelOutputType::Velocity.execution_schedule(&timesteps);
+        assert_eq!(&velocity[..velocity.len() - 1], &timesteps);
+        assert_eq!(velocity.last(), Some(&0.0));
+        assert_ne!(
+            mlx_gen::gen_core::generator::NumericScheduleDigest::f32_values(&timesteps).unwrap(),
+            mlx_gen::gen_core::generator::NumericScheduleDigest::f32_values(&velocity).unwrap(),
+        );
+    }
+}

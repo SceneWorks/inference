@@ -726,10 +726,12 @@ impl KreaTurboControl {
                 // Resident and staged-residency requests remain single-pass: this provider must not run
                 // a second live-budget selector and silently upgrade either strategy to bounded decode.
                 let decode_tiling = selected_decode_tiling(req.memory)?;
+                mlx_gen::image_execution::policy_debug("krea.decode_tiling", &decode_tiling);
                 let decode_tile_edge = decode_tiling
                     .as_ref()
                     .and_then(|tiling| tiling.spatial.as_ref())
                     .map(|spatial| spatial.tile_px as u32);
+                mlx_gen::image_execution::policy_debug("krea.decode_tile_edge", &decode_tile_edge);
 
                 // Feasibility is evaluated at the requested geometry only. No provider path may rewrite
                 // width or height: an infeasible request is refused before control preprocessing or
@@ -809,7 +811,7 @@ impl Generator for KreaTurboControl {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(req, on_progress))
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -839,6 +841,45 @@ impl Generator for KreaTurboControl {
             self.loaded_quant,
             context,
         )
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "KreaTurboControl.loaded_precision",
+                    &self.loaded_precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "KreaTurboControl.loaded_quant",
+                    &self.loaded_quant,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "KreaTurboControl.loaded_sequential_residency",
+                    &self.residency.is_sequential(),
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_observed(req, &mut progress)
+                    .map(mlx_gen::gen_core::GenerationReport::from_output)
+            },
+        )
+    }
+}
+
+impl KreaTurboControl {
+    fn generate_observed(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
 

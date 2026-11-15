@@ -869,6 +869,30 @@ impl T2iModel {
         if let Some(r) = reporter.as_mut() {
             r.open_decode_phase();
         }
+        mlx_gen::image_execution::policy_debug(
+            "sensenova.attention_score_budget",
+            &opts.attention_score_budget,
+        );
+        mlx_gen::image_execution::policy_debug(
+            "sensenova.transformer_window",
+            &opts.transformer_window_size,
+        );
+        mlx_gen::image_execution::policy_debug("sensenova.cfg_norm", &opts.cfg_norm);
+        mlx_gen::image_execution::policy_debug(
+            "sensenova.cfg_interval_bits",
+            &(opts.cfg_interval.0.to_bits(), opts.cfg_interval.1.to_bits()),
+        );
+        mlx_gen::image_execution::scalar("sensenova.cfg_scale", opts.cfg_scale);
+        mlx_gen::image_execution::scalar("sensenova.img_cfg_scale", opts.img_cfg_scale);
+        mlx_gen::image_execution::scalar("sensenova.noise_scale", noise_scale);
+        mlx_gen::image_execution::scalar("sensenova.t_eps", opts.t_eps);
+        mlx_gen::image_execution::sampled_native_from_primary_seed(
+            "sensenova-denoise-euler-v1",
+            "noise-fraction",
+            image.dtype(),
+            &timesteps,
+            "splitmix64-offset-one-box-muller-f64-to-f32-v1;initial=output-seed;no-step-draws",
+        );
         Ok(traj)
     }
 
@@ -2053,6 +2077,30 @@ impl T2iModel {
         if let Some(r) = reporter.as_mut() {
             r.open_decode_phase();
         }
+        mlx_gen::image_execution::policy_debug(
+            "sensenova.attention_score_budget",
+            &opts.attention_score_budget,
+        );
+        mlx_gen::image_execution::policy_debug(
+            "sensenova.transformer_window",
+            &opts.transformer_window_size,
+        );
+        mlx_gen::image_execution::policy_debug("sensenova.cfg_norm", &opts.cfg_norm);
+        mlx_gen::image_execution::policy_debug(
+            "sensenova.cfg_interval_bits",
+            &(opts.cfg_interval.0.to_bits(), opts.cfg_interval.1.to_bits()),
+        );
+        mlx_gen::image_execution::scalar("sensenova.cfg_scale", opts.cfg_scale);
+        mlx_gen::image_execution::scalar("sensenova.img_cfg_scale", opts.img_cfg_scale);
+        mlx_gen::image_execution::scalar("sensenova.noise_scale", noise_scale);
+        mlx_gen::image_execution::scalar("sensenova.t_eps", opts.t_eps);
+        mlx_gen::image_execution::sampled_native_from_primary_seed(
+            "sensenova-it2i_denoise-euler-v1",
+            "noise-fraction",
+            image.dtype(),
+            &timesteps,
+            "splitmix64-offset-one-box-muller-f64-to-f32-v1;initial=output-seed;no-step-draws",
+        );
         Ok(traj)
     }
 }

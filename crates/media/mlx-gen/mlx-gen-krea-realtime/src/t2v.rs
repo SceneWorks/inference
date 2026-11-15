@@ -663,6 +663,7 @@ pub fn generate_v2v_from_components(
     let height = (params.latent_height * SPATIAL_STRIDE) as u32;
     // Stage 1: VAE-encode the source clip → clean source latent (deterministic eps from the seed).
     let key = random::key(params.seed)?;
+    mlx_gen::video_execution::draw(0, "krea_v2v_source_posterior_normal", params.seed);
     // The encoder's buffers (and the full-resolution source clip) must not persist into
     // generation: W2 run 36832899832 carried 43 GB of cached encode buffers into v2v generation.
     let source_latents = materialize_and_release_phase(|| {
@@ -817,12 +818,27 @@ fn load_transformer(
     // Reconcile the requested tier against the one actually on disk, then quantize a dense base if the
     // caller asked for it (a no-op over an already-packed base — hence the reconciliation, which turns
     // a width mismatch into a loud error instead of silently serving the stored tier).
-    if let Some(q) = resolve_load_time_quant(MODEL_ID, packed, quant)? {
+    let applied_quant = resolve_load_time_quant(MODEL_ID, packed, quant)?;
+    mlx_gen::video_execution::policy(
+        "krea_weight_tier",
+        serde_json::json!({"stored":format!("{packed:?}"),"applied":format!("{applied_quant:?}")}),
+    );
+    if let Some(q) = applied_quant {
         dit.quantize(q.bits(), None)?;
     }
     let mut transformer = CausalKreaTransformer::new(dit, cfg);
     let adapter_reports = apply_adapters_reported(&mut transformer, adapters)?;
     Ok((transformer, adapter_reports))
+}
+
+fn execution_adapter_policy(
+    adapters: &[AdapterSpec],
+    reports: &[AdapterApplyReport],
+) -> serde_json::Value {
+    serde_json::json!({"mode":"diff_patch_fold_then_low_rank_residual_after_quantization", "entries":adapters.iter().zip(reports).map(|(adapter, report)| {
+        serde_json::json!({"path":report.adapter_path, "scale_bits":adapter.scale.to_bits(),
+            "applied":report.applied,"skipped":report.skipped})
+    }).collect::<Vec<_>>()})
 }
 
 /// Install the ordered Krea adapter batch and preserve each engine-owned per-file outcome for the
@@ -853,6 +869,11 @@ pub fn apply_adapters_reported(
             skipped: report.diff_patch_unapplied,
         });
     }
+    mlx_gen::video_execution::adapter_stack(
+        "krea_applied_adapters",
+        execution_adapter_policy(adapters, &adapter_reports),
+        adapter_reports.iter().map(|report| report.applied).sum(),
+    );
     Ok(adapter_reports)
 }
 
@@ -919,6 +940,10 @@ pub(crate) fn generate_t2v_reported(
         )));
     }
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent_frames)?;
+    mlx_gen::video_execution::policy(
+        "krea_resolved_config",
+        serde_json::json!({"config":format!("{cfg:?}")}),
+    );
 
     // Stage the reused components (UMT5 prompt encode + Krea DiT + z16 Wan VAE); any inference LoRA(s)
     // are installed onto the DiT inside `stage_components` (sc-15015, S14). The Conditioning
@@ -1116,6 +1141,10 @@ pub(crate) fn generate_i2v_reported(
             )
         })?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, total_latent)?;
+    mlx_gen::video_execution::policy(
+        "krea_resolved_config",
+        serde_json::json!({"config":format!("{cfg:?}")}),
+    );
     // The Conditioning calibration boundary lives INSIDE `stage_components`, between the prompt
     // encode and the DiT load — see its doc comment.
     let (context, transformer, vae, adapter_reports) = stage_components(
@@ -1209,6 +1238,10 @@ pub(crate) fn generate_v2v_reported(
     }
     let (latent_h, latent_w) = resolve_latent_size(root, job, "v2v")?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent)?;
+    mlx_gen::video_execution::policy(
+        "krea_resolved_config",
+        serde_json::json!({"config":format!("{cfg:?}")}),
+    );
     // The Conditioning calibration boundary lives INSIDE `stage_components`, between the prompt
     // encode and the DiT load — see its doc comment.
     let (context, transformer, vae, adapter_reports) = stage_components(
@@ -1253,6 +1286,39 @@ pub(crate) fn generate_v2v_reported(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn execution_report_adapters_keep_default_and_partial_install_outcomes() {
+        let adapter = mlx_gen::AdapterSpec::new(
+            "adapter.safetensors".into(),
+            0.5,
+            mlx_gen::AdapterKind::Lora,
+        );
+        let report = mlx_gen::AdapterApplyReport {
+            adapter_path: adapter.path.clone(),
+            applied: 2,
+            skipped: vec!["unapplied_diff_patch".into()],
+        };
+        let partial = super::execution_adapter_policy(
+            std::slice::from_ref(&adapter),
+            std::slice::from_ref(&report),
+        );
+        assert_eq!(partial["entries"][0]["applied"], 2);
+        assert_eq!(partial["entries"][0]["scale_bits"], 0.5_f32.to_bits());
+        assert_eq!(
+            partial["entries"][0]["skipped"],
+            serde_json::json!(["unapplied_diff_patch"])
+        );
+        let mut changed = adapter.clone();
+        changed.scale = 1.0;
+        assert_ne!(
+            partial,
+            super::execution_adapter_policy(&[changed], &[report])
+        );
+        let empty = super::execution_adapter_policy(&[], &[]);
+        assert_eq!(empty["entries"], serde_json::json!([]));
+        assert_ne!(empty, partial);
+    }
+
     use super::*;
 
     /// sc-22738 (coordinator decision): the Conditioning fault fires at the conditioning phase's

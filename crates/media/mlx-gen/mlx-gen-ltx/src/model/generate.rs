@@ -191,6 +191,10 @@ impl Ltx {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         let dfr_plan = self.dfr_plan(req)?;
+        mlx_gen::video_execution::policy(
+            "ltx_dfr_plan",
+            serde_json::json!({"plan":format!("{dfr_plan:?}")}),
+        );
         let fps = Self::fps(req);
         // A temporal DFR request pads the canvas before the request's public trim point, so its
         // injected noises carry the authoritative latent geometry.  Ordinary LTX keeps the
@@ -476,6 +480,11 @@ impl Ltx {
             });
         }
         let prompted = request_with_effective_prompt(req, conditioning.enhanced_prompt.clone());
+        mlx_gen::video_execution::text_digest("ltx_effective_prompt", &prompted.prompt);
+        mlx_gen::video_execution::policy(
+            "ltx_prompt_enhancement",
+            serde_json::json!({"applied":conditioning.enhanced_prompt.is_some(),"fallback":conditioning.enhancer_fallback.is_some()}),
+        );
         let owned = self.apply_auto_frames(&prompted, &conditioning.video, &conditioning.audio)?;
         // Auto-duration supplies `frames` only after the text phase.  Re-run the ordinary provider
         // floor on that concrete request so its maximum/stride and DFR geometry bounds apply to the
@@ -486,6 +495,10 @@ impl Ltx {
         // frame count remains the trim contract.  Allocate the four ordinary provider noises for
         // that execution canvas; `generate_av_from_embeddings` consumes the same plan below.
         let dfr_plan = self.dfr_plan(req)?;
+        mlx_gen::video_execution::policy(
+            "ltx_dfr_plan",
+            serde_json::json!({"plan":format!("{dfr_plan:?}")}),
+        );
         let noise_request = match dfr_plan.as_ref() {
             Some(plan) if plan.canvas_frames != req.frames.unwrap_or(1) => GenerationRequest {
                 frames: Some(plan.canvas_frames),
@@ -502,17 +515,25 @@ impl Ltx {
         // a `Reference` is supplied) + the audio decode are handled inside `generate_with_noise`.
         let normal = |key: u64, shape: &[i32]| -> Result<Array> {
             let k = random::key(key)?;
+            mlx_gen::video_execution::policy(
+                "ltx_initial_noise",
+                serde_json::json!({"dtype":format!("{:?}",self.stat_dt),"shape":shape}),
+            );
             Ok(random::normal::<f32>(shape, None, None, Some(&k))?.as_dtype(self.stat_dt)?)
         };
+        mlx_gen::video_execution::draw(0, "ltx_video_s1_normal", seed);
         let video_s1 = normal(seed, &[1, LATENT_CHANNELS, lf as i32, h1 as i32, w1 as i32])?;
+        mlx_gen::video_execution::draw(0, "ltx_video_s2_normal", seed.wrapping_add(1));
         let video_s2 = normal(
             seed.wrapping_add(1),
             &[1, LATENT_CHANNELS, lf as i32, h2 as i32, w2 as i32],
         )?;
+        mlx_gen::video_execution::draw(0, "ltx_audio_s1_normal", seed.wrapping_add(2));
         let audio_s1 = normal(
             seed.wrapping_add(2),
             &[1, AUDIO_LATENT_CHANNELS, af, AUDIO_MEL_BINS],
         )?;
+        mlx_gen::video_execution::draw(0, "ltx_audio_s2_normal", seed.wrapping_add(3));
         let audio_s2 = normal(
             seed.wrapping_add(3),
             &[1, AUDIO_LATENT_CHANNELS, af, AUDIO_MEL_BINS],

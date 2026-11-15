@@ -385,6 +385,32 @@ impl Supra2Image {
             progress,
         )?;
         check(&request.cancel)?;
+        mlx_gen::image_execution::scalar("supra2.guidance", r.guidance);
+        mlx_gen::image_execution::policy_debug("supra2.use_cfg", &r.use_cfg);
+        mlx_gen::image_execution::policy_debug("supra2.stored_unconditional", &used_stored);
+        mlx_gen::image_execution::policy_debug(
+            "supra2.decoder",
+            &"resident-sd-vae-rgb8-round-half-up-v1",
+        );
+        if noise.is_some() {
+            mlx_gen::image_execution::unavailable(
+                "supra2_external_noise",
+                "explicit initial noise bypassed the seeded producer and has no recorded digest",
+                "initial_noise",
+            );
+        } else {
+            let consumed = s2::euler_timesteps(r.steps);
+            for i in 0..r.count {
+                mlx_gen::image_execution::sampled_native_with_rng(
+                    "supra2-euler-v1",
+                    "clean-fraction",
+                    z.dtype(),
+                    &consumed,
+                    image_seed(r.seed, i),
+                    "splitmix64-box-muller-f64-to-f32-v1;initial=output-seed;no-step-draws",
+                );
+            }
+        }
         let flat = mlx_gen::array::contiguous(&z)?;
         eval([&flat])?;
         let latents = flat.as_slice::<f32>().to_vec();
@@ -455,14 +481,65 @@ impl Generator for Supra2Image {
         request: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        self.generate_with_report(request, on_progress)?
-            .output
-            .ok_or_else(|| gen_core::Error::Msg("supra2: the render produced no output".into()))
+        mlx_gen::image_execution::without_capture(|| self.generate_observed(request, on_progress))
     }
 
     /// The render plus a [`s2::PROMPT_TRUNCATED_WARNING`] when the prompt exceeded the
     /// [`s2::MAX_PROMPT_TOKENS`]-token context (upstream truncates it and logs a warning).
     fn generate_with_report(
+        &self,
+        request: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationReport> {
+        mlx_gen::image_execution::without_capture(|| {
+            self.generate_with_report_observed(request, on_progress)
+        })
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
+        Some(&self.memory)
+    }
+
+    fn memory_strategy_safety_check(&self, context: &MemoryRunContext) -> MemorySafetyDecision {
+        memory_strategy::safety(&self.spec, &self.memory, context)
+    }
+
+    fn generate_with_execution_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::image_execution::complete_image_report_attempt(
+            self.descriptor(),
+            &req.cancel,
+            || {
+                mlx_gen::image_execution::policy_debug(
+                    "Supra2Image.load_precision_policy",
+                    &self.spec.precision,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Supra2Image.load_quantization_policy",
+                    &self.spec.quantize,
+                );
+                let mut progress =
+                    |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
+                self.generate_with_report_observed(req, &mut progress)
+            },
+        )
+    }
+}
+
+impl Supra2Image {
+    fn generate_observed(
+        &self,
+        request: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report(request, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("supra2: the render produced no output".into()))
+    }
+    fn generate_with_report_observed(
         &self,
         request: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -474,14 +551,6 @@ impl Generator for Supra2Image {
             self.config.ctx_len,
         ));
         Ok(report)
-    }
-
-    fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
-        Some(&self.memory)
-    }
-
-    fn memory_strategy_safety_check(&self, context: &MemoryRunContext) -> MemorySafetyDecision {
-        memory_strategy::safety(&self.spec, &self.memory, context)
     }
 }
 

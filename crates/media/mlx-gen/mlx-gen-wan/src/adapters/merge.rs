@@ -272,5 +272,6 @@ pub(super) fn merge_adapters_into(
     for (index, spec) in indexed().filter(|(_, s)| s.moe_expert == Some(expert)) {
         apply_recorded(&mut report, index, |r| merge_one(w, spec, normalize, r))?;
     }
+    record_execution_adapters(specs, &report, expert, "dense_fold");
     Ok(report)
 }

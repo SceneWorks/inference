@@ -308,7 +308,29 @@ const _: () = {
 /// encoder's GPU view of its weights needed re-reads before it verified (sc-23053, sc-27451).
 pub const GPU_VISIBILITY_RECOVERED: &str = "gpu_visibility_recovered";
 
+impl MiniMaxH3 {
+    fn generate_execution_attempt(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
 impl Generator for MiniMaxH3 {
+    fn generate_with_execution_report(
+        &self,
+        req: &mlx_gen::GenerationRequest,
+        on_progress: &mut dyn FnMut(mlx_gen::Progress),
+    ) -> mlx_gen::gen_core::Result<mlx_gen::gen_core::generator::CompletedGeneration> {
+        mlx_gen::video_execution::complete(self.descriptor(), &req.cancel, || {
+            self.generate_with_report(req, &mut |event| {
+                mlx_gen::video_execution::without_capture(|| on_progress(event));
+            })
+        })
+    }
+
     fn veda_execution_report(&self) -> Option<mlx_gen::gen_core::VedaExecutionReport> {
         Some(self.veda_report.borrow().clone())
     }
@@ -326,7 +348,9 @@ impl Generator for MiniMaxH3 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        mlx_gen::video_execution::without_capture(|| {
+            self.generate_execution_attempt(req, on_progress)
+        })
     }
 
     /// The render plus its non-fatal warnings (sc-27451): GPU weight-visibility re-reads the text
