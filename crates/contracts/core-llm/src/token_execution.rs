@@ -106,6 +106,9 @@ impl TokenExecutionScope {
     ) -> ExecutionIdentity {
         ATTEMPTS.with(|stack| {
             let stack=stack.borrow(); let observed=stack.iter().find(|frame| frame.id == self.0).expect("owned scope");
+            let Some(numeric_policy) = observed.numeric_policy.as_ref() else {
+                return unavailable("document_numeric_policy_unavailable", "The loaded weight format and device were not observed", "loaded_numeric_policy");
+            };
             if observed.decodes.is_empty() || observed.samplers.is_empty() {
                 return unavailable("document_execution_not_observed", "The direct runtime did not complete an observed token decode", "completed_token_decode");
             }
@@ -125,7 +128,7 @@ impl TokenExecutionScope {
                 } else {ExecutionRandomness::Draws {scheme:format!("splitmix64-token-stream-v1; images:{:?}",observed.image_schemes),draws:observed.document_draws.clone()}},
                 deterministic_replay:ExecutionReplaySupport::NonDeterministic {reason:"SenseNova document routes have no bitwise replay attestation for the complete token/image stream on this model, device and precision".into()},
                 geometry:ExecutionFact::resolved(output_policy.clone()),
-                quality_policy:ExecutionFact::resolved(json!({"decode":observed.decodes,"execution_policies":observed.policies})),
+                quality_policy:ExecutionFact::resolved(json!({"decode":observed.decodes,"execution_policies":observed.policies,"loaded_numeric_policy":numeric_policy})),
                 output_policy:ExecutionFact::resolved(output_policy), provider_choices:Default::default(),output_units:1,
             }) }
         })
@@ -569,9 +572,43 @@ mod tests {
 mod document_tests {
     use super::*;
 
+    fn fixture_scope() -> TokenExecutionScope {
+        let scope = TokenExecutionScope::new();
+        scope.observe_numeric_policy(json!({"loaded_format":"fixture_dense","device":"cpu"}));
+        scope
+    }
+
+    #[test]
+    fn document_without_loaded_numeric_policy_is_unavailable() {
+        let scope = TokenExecutionScope::new();
+        observe_token_seed(Sampling::default(), 42, 8, &[]);
+        observe_decode(&DecodeReport::default());
+        assert!(scope
+            .finish_document("vqa", "candle", json!({"format":"text"}))
+            .resolved()
+            .is_none());
+    }
+
+    #[test]
+    fn document_loaded_tiers_change_identity() {
+        let run = |tier| {
+            let scope = TokenExecutionScope::new();
+            scope.observe_numeric_policy(json!({"backbone_quantization":tier,"device":"cpu"}));
+            observe_token_seed(Sampling::default(), 42, 8, &[]);
+            observe_decode(&DecodeReport::default());
+            scope
+                .finish_document("vqa", "candle", json!({"format":"text"}))
+                .resolved()
+                .unwrap()
+                .quality_policy
+                .clone()
+        };
+        assert_ne!(run("Q4"), run("Q8"));
+    }
+
     #[test]
     fn interleave_keeps_draw_order_explicit_noise_and_actual_schedule() {
-        let scope = TokenExecutionScope::new();
+        let scope = fixture_scope();
         observe_token_seed(Sampling::default(), 0, 16, &[9]);
         observe_decode(&DecodeReport {
             path: "step_model".into(),
@@ -618,7 +655,7 @@ mod document_tests {
 
     #[test]
     fn positive_temperature_zero_budget_vqa_has_no_random_draws() {
-        let scope = TokenExecutionScope::new();
+        let scope = fixture_scope();
         observe_token_seed(Sampling::default(), 42, 0, &[]);
         observe_decode(&DecodeReport {
             sampler: "none".into(),
@@ -634,7 +671,7 @@ mod document_tests {
 
     #[test]
     fn zero_budget_segment_preserves_subsequent_image_and_token_draws() {
-        let scope = TokenExecutionScope::new();
+        let scope = fixture_scope();
         observe_token_seed(Sampling::default(), 42, 0, &[]);
         observe_decode(&DecodeReport {
             sampler: "none".into(),
@@ -669,7 +706,7 @@ mod document_tests {
 
     #[test]
     fn greedy_vqa_has_no_random_draws() {
-        let scope = TokenExecutionScope::new();
+        let scope = fixture_scope();
         observe_token_seed(Sampling::greedy(), 42, 8, &[]);
         observe_decode(&DecodeReport {
             sampler: "device".into(),
@@ -685,7 +722,7 @@ mod document_tests {
 
     #[test]
     fn missing_image_schedule_or_output_mapping_is_unavailable() {
-        let scope = TokenExecutionScope::new();
+        let scope = fixture_scope();
         observe_token_seed(Sampling::default(), 0, 8, &[]);
         observe_decode(&DecodeReport::default());
         observe_document_image(0, "splitmix64", Some(7), None);
@@ -697,10 +734,10 @@ mod document_tests {
 
     #[test]
     fn out_of_order_scope_completion_keeps_each_attempt_own_facts() {
-        let first = TokenExecutionScope::new();
+        let first = fixture_scope();
         observe_token_seed(Sampling::default(), 1, 8, &[]);
         observe_decode(&DecodeReport::default());
-        let second = TokenExecutionScope::new();
+        let second = fixture_scope();
         observe_token_seed(Sampling::default(), 2, 8, &[]);
         observe_decode(&DecodeReport::default());
         let a = first.finish_document("test", "mlx", json!({"format":"text"}));
@@ -718,14 +755,14 @@ mod document_tests {
 
     #[test]
     fn callback_legacy_decode_is_excluded_but_nested_report_retains_its_own_stream() {
-        let scope = TokenExecutionScope::new();
+        let scope = fixture_scope();
         observe_token_seed(Sampling::default(), 1, 8, &[]);
         observe_decode(&DecodeReport::default());
         without_observations(|| {
             assert!(!observing());
             observe_token_seed(Sampling::default(), 9, 8, &[]);
             observe_decode(&DecodeReport::default());
-            let nested = TokenExecutionScope::new();
+            let nested = fixture_scope();
             observe_token_seed(Sampling::default(), 2, 8, &[]);
             observe_decode(&DecodeReport::default());
             assert!(nested
@@ -771,8 +808,7 @@ mod document_tests {
 
     #[test]
     fn completed_svg_keeps_observed_facts_without_claiming_bitwise_replay() {
-        let scope = TokenExecutionScope::new();
-        scope.observe_numeric_policy(json!({"loaded_format":"fixture_dense","device":"cpu"}));
+        let scope = fixture_scope();
         observe_token_seed(Sampling::default(), 41, 19, &[]);
         let svg = StarVectorOutput {
             svg: Some("<svg/>".into()),

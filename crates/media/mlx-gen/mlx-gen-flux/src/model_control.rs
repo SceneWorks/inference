@@ -499,6 +499,10 @@ impl Generator for Flux1DevControl {
                     "Flux1DevControl.load_quantization_policy",
                     &self.loaded_spec.quantize,
                 );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux1DevControl.applied_adapter_controls",
+                    &crate::model::applied_adapter_controls(&self.loaded_spec),
+                );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
                 self.generate_observed(req, &mut progress)

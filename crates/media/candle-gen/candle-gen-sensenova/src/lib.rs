@@ -654,6 +654,7 @@ pub struct SenseNovaUnderstanding {
     spec: LoadSpec,
     contract: gen_core::MemoryProviderContract,
     inventory: memory_strategy::CheckpointInventory,
+    document_numeric_policy: Option<serde_json::Value>,
 }
 
 impl SenseNovaUnderstanding {
@@ -807,6 +808,9 @@ impl SenseNovaUnderstanding {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(String, candle_llm::core_llm::ExecutionIdentity)> {
         let scope = candle_llm::core_llm::token_execution::TokenExecutionScope::new();
+        if let Some(policy) = &self.document_numeric_policy {
+            scope.observe_numeric_policy(policy.clone());
+        }
         let output = self.run_vqa_with_progress(
             context,
             request,
@@ -820,6 +824,9 @@ impl SenseNovaUnderstanding {
                 candle_llm::core_llm::token_execution::without_observations(|| on_progress(event))
             },
         )?;
+        if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+            return Err(CandleError::Canceled);
+        }
         let execution = scope.finish_document(
             MODEL_ID,
             "candle",
@@ -922,6 +929,9 @@ impl SenseNovaUnderstanding {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(InterleaveOutput, candle_llm::core_llm::ExecutionIdentity)> {
         let scope = candle_llm::core_llm::token_execution::TokenExecutionScope::new();
+        if let Some(policy) = &self.document_numeric_policy {
+            scope.observe_numeric_policy(policy.clone());
+        }
         let output = self.run_interleave_with_progress(
             context,
             request,
@@ -938,6 +948,9 @@ impl SenseNovaUnderstanding {
                 candle_llm::core_llm::token_execution::without_observations(|| on_progress(event))
             },
         )?;
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
         let execution = scope.finish_document(MODEL_ID, "candle", serde_json::json!({"format":"interleaved_document","image_encoding":"model_space_rgb_nchw","image_dtypes":output.images.iter().map(|image| format!("{:?}",image.dtype())).collect::<Vec<_>>(),"image_count":output.images.len(),"image_shapes":output.images.iter().map(|image| image.dims()).collect::<Vec<_>>()}));
         execution
             .validate(MODEL_ID, "candle", 1)
@@ -1031,6 +1044,13 @@ pub fn load_understanding_with_spec(spec: &LoadSpec) -> Result<SenseNovaUndersta
     let tokenizer = SenseNovaTokenizer::from_dir(root)?;
     let contract = memory_strategy::provider_contract(MODEL_ID, spec).map_err(CandleError::from)?;
     inventory.ensure_unchanged().map_err(CandleError::from)?;
+    let document_numeric_policy = snapshot_store_dtype(root).map(|store_dtype| {
+        serde_json::json!({
+            "backbone_quantization": format!("{:?}", spec.quantize),
+            "store_dtype": format!("{store_dtype:?}"),
+            "device": format!("{device:?}")
+        })
+    });
     Ok(SenseNovaUnderstanding {
         model,
         tokenizer,
@@ -1038,6 +1058,7 @@ pub fn load_understanding_with_spec(spec: &LoadSpec) -> Result<SenseNovaUndersta
         spec: spec.clone(),
         contract,
         inventory,
+        document_numeric_policy,
     })
 }
 

@@ -41,6 +41,17 @@ pub const SIZE_MULTIPLE: u32 = 16;
 /// both FLUX.1 variants (dev + schnell) — they share the FLUX.1 VAE latent space.
 pub const PID_BACKBONE: &str = "flux";
 
+/// A completed FLUX.1 render has strict-applied every load-time adapter in this order.
+pub(crate) fn applied_adapter_controls(
+    spec: &LoadSpec,
+) -> Vec<(usize, mlx_gen::runtime::AdapterKind, f32)> {
+    spec.adapters
+        .iter()
+        .enumerate()
+        .map(|(index, adapter)| (index, adapter.kind, adapter.scale))
+        .collect()
+}
+
 pub fn descriptor_schnell() -> ModelDescriptor {
     descriptor_for(FluxVariant::Schnell)
 }
@@ -549,6 +560,10 @@ impl Generator for Flux1 {
                 mlx_gen::image_execution::policy_debug(
                     "Flux1.load_quantization_policy",
                     &self.loaded_spec.quantize,
+                );
+                mlx_gen::image_execution::policy_debug(
+                    "Flux1.applied_adapter_controls",
+                    &applied_adapter_controls(&self.loaded_spec),
                 );
                 let mut progress =
                     |event| mlx_gen::image_execution::without_capture(|| on_progress(event));
@@ -1200,6 +1215,32 @@ mod tests {
     use super::*;
     use crate::config::{FLUX1_DEV_ID, FLUX1_SCHNELL_ID};
     use std::cell::Cell;
+
+    #[test]
+    fn applied_adapter_controls_distinguish_scale_and_order() {
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+        let first = AdapterSpec::new("/fixture/one".into(), 0.5, AdapterKind::Lora);
+        let second = AdapterSpec::new("/fixture/two".into(), 1.0, AdapterKind::Lokr);
+        let source = LoadSpec::new(WeightsSource::Dir("/fixture/base".into()))
+            .with_adapters(vec![first.clone(), second.clone()]);
+        let scaled = LoadSpec::new(WeightsSource::Dir("/fixture/base".into())).with_adapters(vec![
+            AdapterSpec::new(first.path, 0.75, first.kind),
+            second.clone(),
+        ]);
+        let reversed =
+            LoadSpec::new(WeightsSource::Dir("/fixture/base".into())).with_adapters(vec![
+                second,
+                AdapterSpec::new("/fixture/one".into(), 0.5, AdapterKind::Lora),
+            ]);
+        assert_ne!(
+            applied_adapter_controls(&source),
+            applied_adapter_controls(&scaled)
+        );
+        assert_ne!(
+            applied_adapter_controls(&source),
+            applied_adapter_controls(&reversed)
+        );
+    }
 
     #[test]
     fn loaded_generator_accepts_native_and_pid_requests_when_pid_is_available() {

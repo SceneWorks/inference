@@ -132,6 +132,7 @@ pub struct SenseNova {
     fast: bool,
     memory_strategy: gen_core::MemoryProviderContract,
     loaded_quant: Option<Quant>,
+    document_numeric_policy: Option<serde_json::Value>,
     pinned_artifact: Option<crate::memory_strategy::PinnedArtifact>,
 }
 
@@ -294,6 +295,9 @@ impl SenseNova {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<(String, mlx_llm::core_llm::ExecutionIdentity)> {
         let scope = mlx_llm::core_llm::token_execution::TokenExecutionScope::new();
+        if let Some(policy) = &self.document_numeric_policy {
+            scope.observe_numeric_policy(policy.clone());
+        }
         let output = self.run_vqa_with_progress(
             context,
             request,
@@ -307,6 +311,9 @@ impl SenseNova {
                 mlx_llm::core_llm::token_execution::without_observations(|| on_progress(event))
             },
         )?;
+        if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+            return Err(Error::Canceled);
+        }
         let execution = scope.finish_document(
             self.descriptor.id,
             "mlx",
@@ -379,6 +386,9 @@ impl SenseNova {
         mlx_llm::core_llm::ExecutionIdentity,
     )> {
         let scope = mlx_llm::core_llm::token_execution::TokenExecutionScope::new();
+        if let Some(policy) = &self.document_numeric_policy {
+            scope.observe_numeric_policy(policy.clone());
+        }
         let output = self.run_interleave(
             context,
             request,
@@ -662,6 +672,16 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<SenseNova> {
             pinned_artifact.as_ref(),
         )?,
         loaded_quant: spec.quantize,
+        document_numeric_policy: crate::memory_strategy::resolved_artifact_tier(spec)
+            .ok()
+            .map(|artifact_tier| {
+                serde_json::json!({
+                    "artifact_tier": format!("{artifact_tier:?}"),
+                    "load_time_quantization": format!("{:?}", spec.quantize),
+                    "compute_precision": "bf16",
+                    "device": "metal"
+                })
+            }),
         pinned_artifact,
     })
 }
