@@ -318,7 +318,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 1116
+              "line": 1109
             }
           ],
           "creation": [
@@ -337,7 +337,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::reference_forward",
-              "line": 1668
+              "line": 1661
             }
           ],
           "reads": [
@@ -379,7 +379,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 1116
+              "line": 1109
             }
           ],
           "creation": [
