@@ -49,6 +49,9 @@ mod dit_io;
 #[path = "dit_parity.rs"]
 mod dit_parity;
 
+#[path = "h3_image_acceptance_real.rs"]
+mod h3_image_acceptance_real;
+
 #[path = "h3_image_lora_real.rs"]
 mod h3_image_lora_real;
 
