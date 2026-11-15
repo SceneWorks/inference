@@ -2720,11 +2720,13 @@ expected_files = [
 ]
 
 # SW-7104 (AT8, AT11) — community MiniMax-H3-Image LoRAs from the Hub, one row per file, covering
-# every layout the H3-Image adapter loader accepts: diffusers/PEFT (prefixed and bare), kohya
-# `lora_unet_`, and ComfyUI (with and without per-module alpha). Searched 2026-11-15 over the Hub's
+# every layout the H3-Image adapter loader accepts: diffusers/PEFT, kohya `lora_unet_`, and ComfyUI
+# (with and without per-module alpha). Searched 2026-11-15 over the Hub's
 # `MiniMax-H3-Image` / `h3-image` / `base_model:MiniMaxAI/MiniMax-H3-Image` listings and read each
 # candidate's safetensors header; LoKr files (ai-toolkit `lokr_w1`/`lokr_w2`) are not an accepted
-# layout and are not listed. Only the one LoRA file of each repository is fetched. The
+# layout and are not listed. akhaliq/MiniMax-H3-Image-Character-Swap's bare-path diffusers file is
+# not listed: the loader refuses its `__metadata__["alpha"] = "16 (scaling 1.0)"` as not a number
+# (run 43708981217). Only the one LoRA file of each repository is fetched. The
 # `minimax-h3-image` profile's acceptance step materializes them on both hosts.
 [[models]]
 # ComfyUI layout (`diffusion_model.blocks.*` native modules, fused qkv, no alpha; ai-toolkit), 155 MB, rank 16.
@@ -2773,18 +2775,6 @@ profiles = ["media-macos", "media-cuda"]
 environment = ["MINIMAX_H3_IMAGE_LORA_PDMD_SNAPSHOT"]
 download_files = ["pytorch_lora_weights.safetensors"]
 expected_files = ["pytorch_lora_weights.safetensors"]
-
-[[models]]
-# diffusers layout with bare module paths (`transformer_blocks.*`, `token_refiner.*`, no `transformer.` prefix), 173 MB, rank 16.
-key = "minimax-h3-image-community-lora-character-swap"
-repository = "akhaliq/MiniMax-H3-Image-Character-Swap"
-revision = "0b7f918092f9e23c01ca62b63d7c17e4fce6faa9"
-license = "MiniMax-H3-Image Community License Agreement (Hub tag `other`)"
-size_class = "small"
-profiles = ["media-macos", "media-cuda"]
-environment = ["MINIMAX_H3_IMAGE_LORA_CHARACTER_SWAP_SNAPSHOT"]
-download_files = ["lora/h3_image_character_swap_diffusers.safetensors"]
-expected_files = ["lora/h3_image_character_swap_diffusers.safetensors"]
 
 # ── MiniMax-H3 VRAM campaign (sc-20754) ──────────────────────────────────────────────────────────
 #

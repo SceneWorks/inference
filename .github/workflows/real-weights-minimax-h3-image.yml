@@ -6,6 +6,8 @@ name: Real-weight validation (MiniMax-H3-Image)
 # * `minimax-h3-image` — the diffusers reference, the MLX and Candle VAE / DiT parity / t2i / edit /
 #   tier / LoRA / sampler A/B gates (SW-7089..7096, SW-7106) and the feature acceptance renders
 #   (SW-7104: AT1/AT2, AT3, AT6, AT8, AT11);
+# * `minimax-h3-image-acceptance` — the reference job (a runner-store hit on a warm box) and only
+#   the acceptance renders of the two gate jobs, to re-run them without the earlier gates;
 # * `minimax-h3-image-pe` — the H3-Image-PE NVFP4 reference and tier scoring (SW-7099), then each
 #   backend renders a short prompt and its PE expansion (SW-7104, AT9);
 # * `minimax-h3-image-train` — the SW-7097 trainer: on the MLX real-weights Mac (the
@@ -39,7 +41,7 @@ env:
 jobs:
   minimax-h3-image-reference:
     name: H3-Image diffusers reference
-    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'minimax-h3-image'
+    if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'minimax-h3-image' || inputs.profile == 'minimax-h3-image-acceptance')
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
     timeout-minutes: 180
     steps:
@@ -81,7 +83,7 @@ jobs:
       run:
         shell: python3.12 -I scripts/ci/inference_metal_launcher.py --wait-seconds 9000 -- /bin/bash -e {0}
     name: MLX H3-Image VAE
-    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'minimax-h3-image'
+    if: github.event_name == 'workflow_dispatch' && (inputs.profile == 'minimax-h3-image' || inputs.profile == 'minimax-h3-image-acceptance')
     runs-on: [self-hosted, macOS, ARM64, rw-mage]
     timeout-minutes: 360
     env:
@@ -102,14 +104,16 @@ jobs:
       - name: Set up the MLX build environment
         run: source scripts/ci/real-weights/mlx-minimax-h3-image/set-up-the-mlx-build-environment.sh
       - name: Run the image VAE gates
+        if: inputs.profile == 'minimax-h3-image'
         run: source scripts/ci/real-weights/mlx-minimax-h3-image/run-the-image-vae-gates.sh
       - name: Run the DiT parity and the 2048 render
+        if: inputs.profile == 'minimax-h3-image'
         run: source scripts/ci/real-weights/mlx-minimax-h3-image/run-the-dit-parity-and-the-2048-render.sh
       - name: Run the sampler A/B
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && inputs.profile == 'minimax-h3-image' }}
         run: source scripts/ci/real-weights/mlx-minimax-h3-image/run-the-sampler-a-b.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && inputs.profile == 'minimax-h3-image' }}
         with:
           name: minimax-h3-image-sampler-ab-mlx
           path: ${{ runner.temp }}/minimax-h3-image-sampler-ab
@@ -126,7 +130,7 @@ jobs:
   candle-minimax-h3-image:
     needs: [minimax-h3-image-reference]
     name: Candle H3-Image VAE + t2i (CUDA)
-    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.profile == 'minimax-h3-image' }}
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && (inputs.profile == 'minimax-h3-image' || inputs.profile == 'minimax-h3-image-acceptance') }}
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 360
     env:
@@ -147,17 +151,19 @@ jobs:
           name: minimax-h3-image-vae-reference
           path: ${{ runner.temp }}/minimax-h3-image-vae-reference
       - name: Run the image VAE gates
+        if: inputs.profile == 'minimax-h3-image'
         shell: cmd
         run: call scripts\ci\real-weights\candle-minimax-h3-image\run-the-image-vae-gates.cmd
       - name: Run the image DiT and text-to-image gates
+        if: inputs.profile == 'minimax-h3-image'
         shell: cmd
         run: call scripts\ci\real-weights\candle-minimax-h3-image\run-the-image-dit-and-text-to-image-gates.cmd
       - name: Run the sampler A/B
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && inputs.profile == 'minimax-h3-image' }}
         shell: cmd
         run: call scripts\ci\real-weights\candle-minimax-h3-image\run-the-sampler-a-b.cmd
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && inputs.profile == 'minimax-h3-image' }}
         with:
           name: minimax-h3-image-sampler-ab-candle
           path: ${{ runner.temp }}/minimax-h3-image-sampler-ab

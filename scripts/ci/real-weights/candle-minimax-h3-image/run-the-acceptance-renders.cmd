@@ -2,10 +2,11 @@ rem SW-7104 - feature SW-F363's acceptance renders on candle/CUDA - tests/h3_ima
 rem AT2 - 2048x2048, 4096x4096 and 6272x2688 at the admitted strategy, one fresh process each; AT3 -
 rem a 3-reference edit that must draw on each reference; AT6 - the refusals; AT8 - 16 MP with two
 rem community LoRAs through bounded transformer residency and bounded decode; AT11 - every
-rem community LoRA applies. Runs after the earlier gate step, which materialized the image DiT, the
-rem text encoder and the vision tower and installed the pinned huggingface-hub; this step
-rem materializes the community LoRAs - the minimax-h3-image-community-lora-* rows - under
-rem CANDLE_GEN_MODELS_ROOT.
+rem community LoRA applies. Installs the pinned huggingface-hub and materializes - a verified
+rem snapshot is a no-op, so after the earlier gate step it reads nothing - the image DiT, VAE and
+rem tokenizer, MiniMax-H3's text encoder and vision tower, and the community LoRAs - the
+rem minimax-h3-image-community-lora-* rows - under CANDLE_GEN_MODELS_ROOT, so the
+rem minimax-h3-image-acceptance profile can run this step without the earlier gates.
 rem
 rem The card is the one with the MOST free memory, in PCI bus order, selected with
 rem CUDA_VISIBLE_DEVICES and recorded in acceptance-device-selection.txt, as the gate step does.
@@ -28,17 +29,20 @@ set "MINIMAX_H3_IMAGE_LORA_TANAAMI_SNAPSHOT=%CANDLE_GEN_MODELS_ROOT%\models--syn
 set "MINIMAX_H3_IMAGE_LORA_DOMOKUN_SNAPSHOT=%CANDLE_GEN_MODELS_ROOT%\models--SimpleTuner--minimax-h3-image-domokun-2048\snapshots\57214626f457eac87077c7035bb1b64d5264ebf3"
 set "MINIMAX_H3_IMAGE_LORA_FIZGIG_SNAPSHOT=%CANDLE_GEN_MODELS_ROOT%\models--ShootTheSound--Fizgig-MiniMax-H3-Image-Training-Adapter\snapshots\f1a4547596faeb98bae568dd28da296c49fbe0a1"
 set "MINIMAX_H3_IMAGE_LORA_PDMD_SNAPSHOT=%CANDLE_GEN_MODELS_ROOT%\models--linoyts--MiniMax-H3-Image-pDMD-2steps\snapshots\c07d96e5635311ed007d44654c2f98cc8d6e0a1e"
-set "MINIMAX_H3_IMAGE_LORA_CHARACTER_SWAP_SNAPSHOT=%CANDLE_GEN_MODELS_ROOT%\models--akhaliq--MiniMax-H3-Image-Character-Swap\snapshots\0b7f918092f9e23c01ca62b63d7c17e4fce6faa9"
 if not exist "%H3I_OUT%" mkdir "%H3I_OUT%"
+"%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
 set "HF_HUB_DISABLE_XET=1"
 set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+"%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3-image --snapshot "%MINIMAX_H3_IMAGE_SNAPSHOT%" || exit /b 1
+"%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3-image-dit --snapshot "%MINIMAX_H3_IMAGE_SNAPSHOT%" || exit /b 1
+"%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3-text-encoder --snapshot "%MINIMAX_H3_SNAPSHOT%" || exit /b 1
+"%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3-vision-tower --snapshot "%MINIMAX_H3_SNAPSHOT%" || exit /b 1
 call :materialize tanaami "%MINIMAX_H3_IMAGE_LORA_TANAAMI_SNAPSHOT%" || exit /b 1
 call :materialize domokun "%MINIMAX_H3_IMAGE_LORA_DOMOKUN_SNAPSHOT%" || exit /b 1
 call :materialize fizgig "%MINIMAX_H3_IMAGE_LORA_FIZGIG_SNAPSHOT%" || exit /b 1
 call :materialize pdmd "%MINIMAX_H3_IMAGE_LORA_PDMD_SNAPSHOT%" || exit /b 1
-call :materialize character-swap "%MINIMAX_H3_IMAGE_LORA_CHARACTER_SWAP_SNAPSHOT%" || exit /b 1
 set "PYTHONPATH="
-set "MINIMAX_H3_IMAGE_COMMUNITY_LORAS=tanaami=%MINIMAX_H3_IMAGE_LORA_TANAAMI_SNAPSHOT%\tanaami_h3_image_lora_2000.safetensors;domokun=%MINIMAX_H3_IMAGE_LORA_DOMOKUN_SNAPSHOT%\pytorch_lora_weights.safetensors;fizgig=%MINIMAX_H3_IMAGE_LORA_FIZGIG_SNAPSHOT%\fizgig_minimax_h3_image_training_adapter.safetensors;pdmd=%MINIMAX_H3_IMAGE_LORA_PDMD_SNAPSHOT%\pytorch_lora_weights.safetensors;character-swap=%MINIMAX_H3_IMAGE_LORA_CHARACTER_SWAP_SNAPSHOT%\lora\h3_image_character_swap_diffusers.safetensors"
+set "MINIMAX_H3_IMAGE_COMMUNITY_LORAS=tanaami=%MINIMAX_H3_IMAGE_LORA_TANAAMI_SNAPSHOT%\tanaami_h3_image_lora_2000.safetensors;domokun=%MINIMAX_H3_IMAGE_LORA_DOMOKUN_SNAPSHOT%\pytorch_lora_weights.safetensors;fizgig=%MINIMAX_H3_IMAGE_LORA_FIZGIG_SNAPSHOT%\fizgig_minimax_h3_image_training_adapter.safetensors;pdmd=%MINIMAX_H3_IMAGE_LORA_PDMD_SNAPSHOT%\pytorch_lora_weights.safetensors"
 set "MINIMAX_H3_IMAGE_AT8_LORAS=tanaami,domokun"
 
 set "CUDA_DEVICE_ORDER=PCI_BUS_ID"
