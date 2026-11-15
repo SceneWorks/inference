@@ -421,6 +421,42 @@ mod tests {
     }
 
     #[test]
+    fn default_terminal_audio_callback_cancellation_has_no_completed_report() {
+        struct Legacy(ModelDescriptor);
+        impl Generator for Legacy {
+            fn descriptor(&self) -> &ModelDescriptor {
+                &self.0
+            }
+            fn validate(&self, _req: &GenerationRequest) -> Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                _req: &GenerationRequest,
+                _on_progress: &mut dyn FnMut(Progress),
+            ) -> Result<GenerationOutput> {
+                Ok(GenerationOutput::Audio(track()))
+            }
+        }
+        let request = GenerationRequest::default();
+        let cancel = request.cancel.clone();
+        let result = Legacy(descriptor()).generate_streaming_with_execution_report(
+            &request,
+            &mut |_| cancel.cancel(),
+            &mut |_| {},
+        );
+        assert!(matches!(result, Err(Error::Canceled)));
+        let request = GenerationRequest::default();
+        let cancel = request.cancel.clone();
+        let result = Legacy(descriptor()).generate_streaming(
+            &request,
+            &mut |_| cancel.cancel(),
+            &mut |_| {},
+        );
+        assert!(matches!(result, Err(Error::Canceled)));
+    }
+
+    #[test]
     fn failed_attempt_has_no_completed_report() {
         struct Failing(ModelDescriptor);
         impl Generator for Failing {

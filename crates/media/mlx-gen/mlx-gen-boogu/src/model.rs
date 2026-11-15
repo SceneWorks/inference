@@ -159,6 +159,9 @@ pub fn descriptor_edit() -> ModelDescriptor {
 /// selects the sampler path), and the component-residency strategy.
 pub struct Boogu {
     descriptor: ModelDescriptor,
+    /// Effective Q4/Q8 tier for the text tower and DiT; `None` means source metadata could not
+    /// prove one of the two tiers, so a completed render must refuse exact execution identity.
+    quantization_bits: Option<(Option<i32>, Option<i32>)>,
     /// The tiny BPE-ish tokenizer stays always-warm on the generator (cheap); the heavy mllm↔DiT
     /// dispatch is the shared [`Residency`] seam.
     tokenizer: BooguTokenizer,
@@ -193,6 +196,7 @@ pub struct Boogu {
 /// use the same per-phase loaders, so the components are byte-identical.
 fn load_with(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
     let id = descriptor.id;
+    let quant_bits = spec.quantize.map(Quant::affine_bits).transpose()?;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{id}: only the default dense precision is wired (drop the precision override)"
@@ -214,14 +218,22 @@ fn load_with(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Gen
             )))
         }
     };
+    let quantization_bits = (
+        mlx_gen::quant::packed_bits_from_headers(&root.join("mllm")),
+        mlx_gen::quant::packed_bits_from_headers(&root.join("transformer")),
+    );
+    let quantization_bits = match quantization_bits {
+        (Ok(text), Ok(dit)) => effective_component_quant_bits(text, quant_bits)
+            .zip(effective_component_quant_bits(dit, quant_bits)),
+        _ => None,
+    };
     // F-181: a `Sequential` + `quantize` load re-quantizes over the dense snapshot on EVERY generate
     // (repeated compute + the dense per-phase transient). Boogu's per-phase `quantize` is a no-op on an
-    // already-packed turnkey (the shipped default), so this is conservative for that common case — but
-    // Boogu has no cheap packed-vs-dense detector at the dir level (the auto-detect happens inside the
-    // component load), so warn on the combination and let a packed snapshot no-op the quant.
-    if let Some(q) = spec.quantize {
+    // already-packed turnkey (the shipped default). The header-only tier read above records the
+    // effective policy, but dense sequential loads still pay the repeated quantization cost.
+    if let Some(bits) = quant_bits {
         if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
-            mlx_gen::residency::warn_sequential_requantize(id, q.bits());
+            mlx_gen::residency::warn_sequential_requantize(id, bits);
         }
     }
     let tokenizer = BooguTokenizer::from_snapshot(&root)?;
@@ -236,10 +248,24 @@ fn load_with(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Gen
         .transpose()?;
     Ok(Box::new(Boogu {
         descriptor,
+        quantization_bits,
         tokenizer,
         residency,
         pid,
     }))
+}
+
+/// The load quantizer changes dense layers but leaves packed layers alone. A conflicting packed
+/// tier and request may therefore produce mixed component numerics; do not claim one effective tier.
+fn effective_component_quant_bits(
+    stored: Option<i32>,
+    requested: Option<i32>,
+) -> Option<Option<i32>> {
+    match (stored, requested) {
+        (Some(stored), Some(requested)) if stored != requested => None,
+        (Some(stored), _) => Some(Some(stored)),
+        (None, requested) => Some(requested),
+    }
 }
 
 /// The policy→[`Residency`] dispatch every Boogu variant shares (sc-11126, F-180), routed through the
@@ -255,7 +281,7 @@ pub(crate) fn build_residency(
     spec: &LoadSpec,
     root: &Path,
 ) -> Result<Residency<BooguEncoders, BooguHeavy>> {
-    let quant = spec.quantize;
+    let quant_bits = spec.quantize.map(Quant::affine_bits).transpose()?;
     let root_text = root.to_path_buf();
     let root_heavy = root.to_path_buf();
     Residency::from_policy(
@@ -264,15 +290,15 @@ pub(crate) fn build_residency(
             let mut enc = BooguEncoders::load(&root_text)?;
             // No-op when the snapshot is already packed (the turnkey default); quantizes the dense
             // Qwen3-VL text tower otherwise (`AdaptableLinear::quantize` skips already-quantized bases).
-            if let Some(q) = quant {
-                enc.quantize(q.bits())?;
+            if let Some(bits) = quant_bits {
+                enc.quantize(bits)?;
             }
             Ok(enc)
         },
         move |_use_pid| {
             let mut heavy = BooguHeavy::load(&root_heavy)?;
-            if let Some(q) = quant {
-                heavy.quantize(q.bits())?;
+            if let Some(bits) = quant_bits {
+                heavy.quantize(bits)?;
             }
             Ok(heavy)
         },
@@ -318,6 +344,21 @@ impl Generator for Boogu {
             self.descriptor(),
             &req.cancel,
             || {
+                if let Some((text_bits, dit_bits)) = self.quantization_bits {
+                    mlx_gen::image_execution::policy(
+                        "Boogu.component_quantization",
+                        serde_json::json!({
+                            "text_encoder_bits": text_bits,
+                            "transformer_bits": dit_bits
+                        }),
+                    );
+                } else {
+                    mlx_gen::image_execution::unavailable(
+                        "boogu_component_quantization_unavailable",
+                        "the loaded Boogu text encoder or transformer has no single proven quantization tier",
+                        "component_quantization",
+                    );
+                }
                 mlx_gen::image_execution::policy_debug(
                     "Boogu.loaded_sequential_residency",
                     &self.residency.is_sequential(),
@@ -858,6 +899,21 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn component_quantization_reports_effective_affine_tier() {
+        assert_eq!(effective_component_quant_bits(None, None), Some(None));
+        assert_eq!(effective_component_quant_bits(None, Some(4)), Some(Some(4)));
+        assert_eq!(effective_component_quant_bits(Some(8), None), Some(Some(8)));
+        assert_eq!(
+            effective_component_quant_bits(Some(8), Some(8)),
+            Some(Some(8))
+        );
+        assert_eq!(effective_component_quant_bits(Some(8), Some(4)), None);
+        let mut unsupported = LoadSpec::new(WeightsSource::Dir("/unused".into()));
+        unsupported.quantize = Some(Quant::Nvfp4);
+        assert!(build_residency(&unsupported, Path::new("/unused")).is_err());
+    }
 
     fn write_tiny_tokenizer(root: &Path, overlong_negative: bool) {
         let mllm = root.join("mllm");

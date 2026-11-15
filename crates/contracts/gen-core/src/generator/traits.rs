@@ -245,6 +245,9 @@ pub trait Generator {
                 index: 0,
             });
         }
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         Ok(out)
     }
 
@@ -265,6 +268,9 @@ pub trait Generator {
                 channels: track.channels,
                 index: 0,
             });
+        }
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
         }
         Ok(completed)
     }
@@ -302,6 +308,9 @@ pub trait Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<CompletedGeneration> {
         let generation = self.generate_with_report(req, on_progress)?;
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         CompletedGeneration::new(
             generation,
             ExecutionIdentity::provider_default(),
