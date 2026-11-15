@@ -1031,8 +1031,8 @@ mod tests {
         );
         assert_eq!(
             stripped.matches("fn generate").count(),
-            2,
-            "control_provider.rs must expose exactly the two entry points this row reasons about"
+            4,
+            "control_provider.rs has two execution bodies and their two attempt-report wrappers"
         );
         assert_eq!(
             sampler_call_sites("control_provider.rs", source).len(),

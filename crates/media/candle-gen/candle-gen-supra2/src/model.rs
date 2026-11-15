@@ -116,6 +116,12 @@ pub struct Supra2Output {
     pub used_stored_unconditional: bool,
 }
 
+/// A direct render, retaining latents and prompt diagnostics with its completed identity.
+pub struct CompletedSupra2Output {
+    pub output: Supra2Output,
+    pub execution: gen_core::generator::ExecutionIdentity,
+}
+
 fn check(cancel: &CancelFlag) -> Result<()> {
     if cancel.is_cancelled() {
         Err(Error::Canceled)
@@ -206,6 +212,7 @@ impl Supra2Image {
         }
         let sources = Supra2Sources::resolve(spec)?;
         let memory = memory_strategy::contract_for(&sources)?;
+        candle_gen::execution::policy("supra2/model/memory", format!("{memory:?}").into());
         let tokenizer = Supra2Tokenizer::from_dir(&sources.text_encoder)?;
         let text_encoder = load_text_encoder(&sources, &device)?;
         let dit = load_denoiser(&sources.bundle, &device)?;
@@ -294,6 +301,7 @@ impl Supra2Image {
     /// Tokenize (truncate to `ctx_len`, pad, mask) and encode one prompt with Flan-T5.
     pub fn encode_prompt(&self, prompt: &str) -> Result<(TextConditioning, Supra2Tokens)> {
         let cfg = *self.config();
+
         let tokens = self.tokenizer.encode(prompt, cfg.ctx_len)?;
         let context = {
             let mut t5 = candle_gen::lock_recover(&self.text_encoder);
@@ -325,6 +333,27 @@ impl Supra2Image {
 
     /// Full generation. `noise` overrides the seeded initial latents (`count × C×S×S` f32) so a
     /// reference run can feed both sides the identical tensor.
+    /// Direct generation with optional externally supplied noise and an attempt-local report.
+    pub fn generate_with_noise_and_execution_report(
+        &self,
+        request: &GenerationRequest,
+        noise: Option<&[f32]>,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<CompletedSupra2Output> {
+        let mut report_progress =
+            |event| candle_gen::execution::outside_attempt(|| progress(event));
+        let attempt = candle_gen::execution::Attempt::begin();
+        let mut output = self.generate_with(request, noise, &mut report_progress)?;
+        check(&request.cancel)?;
+        let images = GenerationOutput::Images(std::mem::take(&mut output.images));
+        let execution = attempt.finish_image(&self.descriptor, &images);
+        let GenerationOutput::Images(images) = images else {
+            unreachable!()
+        };
+        output.images = images;
+        Ok(CompletedSupra2Output { output, execution })
+    }
+
     pub fn generate_with(
         &self,
         request: &GenerationRequest,
@@ -334,6 +363,7 @@ impl Supra2Image {
         self.validate_request(request)?;
         let r = Supra2Resolved::resolve(request)?;
         let cfg = *self.config();
+
         let n = r.count as usize;
         let per_image = cfg.latent_numel();
         check(&request.cancel)?;
@@ -362,10 +392,19 @@ impl Supra2Image {
                         n * per_image
                     )));
                 }
+                candle_gen::execution::rng_scheme("explicit-f32-noise-v1");
+                for (index, image_noise) in values.chunks_exact(per_image).enumerate() {
+                    candle_gen::execution::noise("supplied_initial_noise", image_noise, index);
+                }
                 values.to_vec()
             }
             None => (0..r.count)
-                .flat_map(|i| initial_noise(image_seed(r.seed, i), per_image))
+                .flat_map(|i| {
+                    let seed = image_seed(r.seed, i);
+                    candle_gen::execution::rng_scheme("splitmix64-box-muller-f32-v1");
+                    candle_gen::execution::draw("image_initial_noise", seed, i as usize);
+                    initial_noise(seed, per_image)
+                })
                 .collect(),
         };
         let s = cfg.latent_size;
@@ -475,6 +514,14 @@ fn load_stored_unconditional(
 }
 
 impl Generator for Supra2Image {
+    fn generate_with_execution_report(
+        &self,
+        req: &candle_gen::gen_core::GenerationRequest,
+        on_progress: &mut dyn FnMut(candle_gen::gen_core::Progress),
+    ) -> candle_gen::gen_core::Result<candle_gen::gen_core::generator::CompletedGeneration> {
+        candle_gen::execution::capture(self, req, on_progress)
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }

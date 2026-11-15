@@ -188,13 +188,15 @@ fn deliver<F>(sink: &PreviewSink, counter: &PreviewCounter, current: u32, projec
 where
     F: FnOnce() -> Result<Image>,
 {
-    if let Ok(image) = project() {
-        sink.emit(PreviewFrame {
-            current,
-            total: counter.total(),
-            image,
-        });
-    }
+    crate::execution::outside_attempt(|| {
+        if let Ok(image) = project() {
+            sink.emit(PreviewFrame {
+                current,
+                total: counter.total(),
+                image,
+            });
+        }
+    });
 }
 
 /// A family's opt-in preview seam for the shared sampler drivers

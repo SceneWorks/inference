@@ -226,6 +226,7 @@ impl Pipeline {
 
     fn load_denoise_components(&self) -> Result<DenoiseComponents> {
         let cfg = ChromaTransformerConfig::default();
+
         let dit_dir = self.root.join("transformer");
         let gs = self.transformer_group_size(&dit_dir);
         let mut transformer = ChromaTransformer::new_gs(cfg, self.vb(&dit_dir, DType::F32)?, gs)?;
@@ -298,6 +299,7 @@ impl Pipeline {
         let guidance = req
             .true_cfg
             .unwrap_or_else(|| self.variant.default_true_cfg());
+        candle_gen::execution::policy("chroma/pipeline/guidance", format!("{guidance:?}").into());
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
@@ -399,6 +401,7 @@ impl Pipeline {
         let guidance = req
             .true_cfg
             .unwrap_or_else(|| self.variant.default_true_cfg());
+        candle_gen::execution::policy("chroma/pipeline/guidance", format!("{guidance:?}").into());
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let sigmas = self.sigmas(steps);
@@ -441,6 +444,7 @@ impl Pipeline {
         for index in 0..req.count {
             candle_gen::check_cancel(&req.cancel)?;
             let seed = base_seed.wrapping_add(u64::from(index));
+            candle_gen::execution::draw("image_initial_noise", seed, index as usize);
             let noise = self.initial_packed_noise(seed, req.height, req.width)?;
             let preview = crate::preview::hook(&req.preview, req.width, req.height);
             latents.push(self.denoise(
@@ -493,7 +497,8 @@ impl Pipeline {
             DecoderComponents::Native(_) => None,
         };
         let mut images = Vec::with_capacity(latents.len());
-        for latent in &latents {
+        for (output_index, latent) in latents.iter().enumerate() {
+            candle_gen::execution::output_index(output_index);
             candle_gen::check_cancel(&req.cancel)?;
             on_progress(Progress::Decoding);
             images.push(match &*decoder {
@@ -522,7 +527,9 @@ impl Pipeline {
         prompt: &str,
     ) -> Result<Tensor> {
         let mut t5 = candle_gen::lock_recover(t5);
-        text::encode_prompt(tokenizer, &mut t5, prompt, &self.device)
+        let encoded = text::encode_prompt(tokenizer, &mut t5, prompt, &self.device)?;
+        candle_gen::execution::component_runtime("chroma/t5", encoded.device(), encoded.dtype());
+        Ok(encoded)
     }
 
     /// Chroma's flow-match sigma schedule (length `steps + 1`, descending to a trailing `0`). HD/Flash
@@ -556,7 +563,7 @@ impl Pipeline {
         let lat_h = (height as usize).div_ceil(16) * 2; // = h/8 for a multiple-of-16 request
         let lat_w = (width as usize).div_ceil(16) * 2;
         let n = LATENT_CHANNELS * lat_h * lat_w;
-        let mut rng = StdRng::seed_from_u64(seed);
+        let mut rng = StdRng::seed_from_u64(candle_gen::execution::seed("chroma/pipeline", seed));
         let noise = candle_gen::seeded_normal_vec(&mut rng, n);
         let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
             .to_device(&self.device)?;
@@ -620,6 +627,11 @@ impl Pipeline {
                 // pooled_temb depends only on the timestep — compute once and share across both branches.
                 let pooled = transformer.pooled_temb(&ts)?;
                 let pos = transformer.forward_prepared(latents, pos_embeds, &pooled, rope_pos)?;
+                candle_gen::execution::component_runtime(
+                    "chroma/transformer",
+                    pos.device(),
+                    pos.dtype(),
+                );
                 match (neg_embeds, rope_neg) {
                     (Some(neg), Some(rope_n)) => {
                         let neg = transformer.forward_prepared(latents, neg, &pooled, rope_n)?;
@@ -663,12 +675,25 @@ impl Pipeline {
                     Some(&candle_gen::gen_core::FLUX1_LATENT_SPACE),
                     pid,
                 )?;
-                pid.decode(&latents)?
+                let decoded = pid.decode(&latents)?;
+                candle_gen::execution::component_runtime(
+                    "chroma/pid_decoder",
+                    decoded.device(),
+                    decoded.dtype(),
+                );
+                decoded
             }
-            None => vae
-                .ok_or_else(|| CandleError::Msg("chroma: native decode lacks VAE".into()))?
-                .decode(&latents)?
-                .to_dtype(DType::F32)?, // [1, 3, H, W] in [-1, 1]
+            None => {
+                let decoded = vae
+                    .ok_or_else(|| CandleError::Msg("chroma: native decode lacks VAE".into()))?
+                    .decode(&latents)?;
+                candle_gen::execution::component_runtime(
+                    "chroma/vae",
+                    decoded.device(),
+                    decoded.dtype(),
+                );
+                decoded.to_dtype(DType::F32)? // [1, 3, H, W] in [-1, 1]
+            }
         };
         let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
         let img = candle_gen::round_rgb8(&scaled)?;

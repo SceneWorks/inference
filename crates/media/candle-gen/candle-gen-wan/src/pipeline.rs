@@ -76,6 +76,8 @@ pub fn create_noise(
     device: &Device,
 ) -> Result<Tensor> {
     let n = z_dim * t_lat * h_lat * w_lat;
+    candle_gen::execution::draw("wan_video_latents", seed, 0);
+    candle_gen::execution::runtime(device, candle_gen::candle_core::DType::F32);
     let mut rng = StdRng::seed_from_u64(seed);
     let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(data, (1, z_dim, t_lat, h_lat, w_lat), device)
