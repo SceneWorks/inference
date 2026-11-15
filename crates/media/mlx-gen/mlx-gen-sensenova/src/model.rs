@@ -396,6 +396,9 @@ impl SenseNova {
                 mlx_llm::core_llm::token_execution::without_observations(|| on_progress(event))
             },
         )?;
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let execution = scope.finish_document(self.descriptor.id, "mlx", serde_json::json!({"format":"interleaved_document","image_encoding":"model_space_rgb_nchw","image_dtypes":output.images.iter().map(|image| format!("{:?}",image.dtype())).collect::<Vec<_>>(),"image_count":output.images.len(),"image_shapes":output.images.iter().map(|image| image.shape()).collect::<Vec<_>>()}));
         execution
             .validate(self.descriptor.id, "mlx", 1)
