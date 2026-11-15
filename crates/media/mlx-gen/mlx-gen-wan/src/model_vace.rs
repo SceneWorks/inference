@@ -368,6 +368,22 @@ fn execution_weight_policy(quant: Option<Quant>) -> serde_json::Value {
         "adapter_order":"dense_fold_before_quantization"})
 }
 
+fn staged_vace_sampling_options(
+    shift: f32,
+    boundary_timestep: f32,
+    guidance_low: f32,
+    guidance_high: f32,
+    scales: &[f32],
+) -> serde_json::Value {
+    serde_json::json!({
+        "shift_bits": shift.to_bits(),
+        "boundary_bits": boundary_timestep.to_bits(),
+        "low_guidance_bits": guidance_low.to_bits(),
+        "high_guidance_bits": guidance_high.to_bits(),
+        "control_scale_bits": scales.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+    })
+}
+
 impl WanVace {
     /// The resolved VACE config (exposed for tests).
     pub fn config(&self) -> &WanVaceConfig {
@@ -836,7 +852,13 @@ impl WanVaceFun {
             "wan_vace",
             &format!("{kind:?}"),
             "flow_velocity",
-            serde_json::json!({"shift_bits":shift.to_bits()}),
+            staged_vace_sampling_options(
+                shift,
+                boundary_timestep,
+                guidance_low,
+                guidance_high,
+                scales,
+            ),
         );
         mlx_gen::video_execution::schedule("wan_vace", sched.sigmas());
         let timesteps = sched.timesteps().to_vec();
@@ -1426,6 +1448,29 @@ mod tests {
         assert_ne!(dense, q4);
         assert_ne!(q4, q8);
         assert_eq!(q8["adapter_order"], "dense_fold_before_quantization");
+    }
+
+    #[test]
+    fn staged_vace_execution_identity_tracks_each_consumed_control() {
+        let options = super::staged_vace_sampling_options;
+        let base = options(1.5, 300.0, 3.0, 5.0, &[0.7, 0.4]);
+        assert_eq!(base["shift_bits"], 1.5f32.to_bits());
+        assert_eq!(base["boundary_bits"], 300.0f32.to_bits());
+        assert_eq!(base["low_guidance_bits"], 3.0f32.to_bits());
+        assert_eq!(base["high_guidance_bits"], 5.0f32.to_bits());
+        assert_eq!(
+            base["control_scale_bits"],
+            serde_json::json!([0.7f32.to_bits(), 0.4f32.to_bits()])
+        );
+        for changed in [
+            options(1.6, 300.0, 3.0, 5.0, &[0.7, 0.4]),
+            options(1.5, 301.0, 3.0, 5.0, &[0.7, 0.4]),
+            options(1.5, 300.0, 3.5, 5.0, &[0.7, 0.4]),
+            options(1.5, 300.0, 3.0, 5.5, &[0.7, 0.4]),
+            options(1.5, 300.0, 3.0, 5.0, &[0.7, 0.5]),
+        ] {
+            assert_ne!(base, changed);
+        }
     }
 
     use super::*;
